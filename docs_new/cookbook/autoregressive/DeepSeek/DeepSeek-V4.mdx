@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4
-description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for the Flash (284B) and Pro (1.6T) Mixture-of-Experts models."
+description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, and Pro."
 tag: NEW
 ---
 
@@ -110,7 +110,7 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 The knobs come in two flavors:
 
 - **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode).
-- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
+- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only; Hopper SM90 uses a separate all-FP8 MegaMoE path — see Configuration Tips below).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
@@ -127,7 +127,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. It ships as two Instruct repos (one per variant) plus matching Base repos:
+**DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. The 0731 Flash refresh adds a checkpoint with a bundled DSpark draft head:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -152,6 +152,12 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); RTX PRO 6000 (TP=2); H100 (TP=8)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731">DeepSeek-V4-Flash-0731</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>304</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flash Official (0731), with a bundled DSpark draft head; verified on 8×B200, 4×GB300, and 4×H200</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
@@ -160,13 +166,13 @@ import { Playground } from "/src/snippets/_playground.jsx";
   </tbody>
 </table>
 
-Both Instruct repos ship as **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers every FP4-capable GPU). Matching `*-Base` repos ship pure FP8 mixed and are for further pre-training only — not for chat or tool calling.
+The Instruct checkpoints ship as **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers every FP4-capable GPU). Matching `*-Base` repos ship pure FP8 mixed and are for further pre-training only — not for chat or tool calling.
 
 **Highlights:** hybrid CSA + HCA attention (~27% inference FLOPs / ~10% KV cache vs DSv3.2 at 1M context), manifold-constrained hyper-connections (mHC), Muon optimizer, **1M-token context** (32T+ pre-training tokens), three reasoning modes (*Non-think* / *Think High* / *Think Max* — use ≥ 384K context for Think Max), and a dedicated `encoding_dsv4.encode_messages` Python encoder + DSML tool-call grammar.
 
 **Recommended generation:** `temperature=1.0`, `top_p=1.0`.
 
-**Resources:** HuggingFace · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
+**Resources:** HuggingFace · [Flash Official (0731)](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) · [Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)  ·  ModelScope · [Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash) · [Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro).
 
 ## 2. Configuration Tips
 
@@ -178,7 +184,11 @@ Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_D
 
 The generator currently picks values on the **conservative** side (mirroring an internal stress-test matrix). They run safely out of the box but likely leave throughput on the table — please tune them up toward your actual workload's peak concurrency and report findings back so the defaults can be revised.
 
-**MTP (Multi-Token Prediction, EAGLE)**
+**Speculative decoding**
+
+The original Flash and Pro recipes use EAGLE. Flash Official (0731) uses the bundled DSpark draft head; see [DSpark](#3-4-dspark-speculative-decoding) for its launch and tuning notes.
+
+For the original Flash and Pro checkpoints:
 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
 - `balanced`: steps=1, draft-tokens=2 → gentler MTP, reduces throughput hit at higher batch.
@@ -286,6 +296,8 @@ Two options are available for running DeepSeek-V4 on Hopper:
 - **Original FP4 checkpoints** — apply the W4A16 MoE kernels (Marlin) as the command generator picks for Hopper cells. This path works on both H100 and H200 and is the only option for H100 (no FP8 path). It is TP-only; on H200 the Pro variant fits on a single 8-GPU node, while H100 Pro needs 2 nodes (TP=16).
 - **Converted FP8 checkpoints** (H100 and H200 only) — pre-repackaged FP8 weights at [`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8) and [`sgl-project/DeepSeek-V4-Pro-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Pro-FP8) unlock DP-attention + DeepEP and richer parallelism (e.g. Pro TP=16 across 2 nodes).
 
+On these FP8 checkpoints you can additionally enable the all-FP8 **MegaMoE** path on SM90 for higher long-context / large-decode throughput — see the **SM90 (Hopper) FP8 MegaMoE** note in Configuration Tips below.
+
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
@@ -320,10 +332,37 @@ Two variants are exposed:
   (~89.5 GPQA on Pro).
 
 Notes:
-- MegaMoE is **only supported on Blackwell GPUs** (B200 / B300 / GB200 / GB300). The chip is hidden when the Deploy panel's base cell sits on Hopper (H100 / H200).
+- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.
 - MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
 - When running MegaMoE, don't set `--moe-runner-backend` manually.
 - Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 8320 for high-throughput).
+
+**SM90 (Hopper) FP8 MegaMoE (Experimental)**
+
+On SM90 (Hopper, H100 / H200), the all-FP8 MegaMoE path routes MoE through the
+DeepGEMM `mega_moe` runner for higher long-context / large-decode throughput on
+the FP8 checkpoints. Unlike the Blackwell W4A8 / W4A4 variants above, experts
+stay in **FP8** — keep `SGLANG_DSV4_FP4_EXPERTS=0`. It requires a `sgl-deep-gemm`
+build with SM90 FP8 MegaMoE support. **Please use the latest image for this
+feature.**
+
+Enable the MegaMoE path with `--moe-a2a-backend megamoe` — or equivalently set
+`SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1`, which auto-configures the same backend:
+
+```bash Command
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
+SGLANG_DSV4_FP4_EXPERTS=0 \
+sglang serve \
+  --model-path sgl-project/DeepSeek-V4-Flash-FP8 \
+  --tp 8 \
+  --moe-a2a-backend megamoe \
+  --chunked-prefill-size 4096
+```
+
+`SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` caps the number of tokens
+the MegaMoE path processes per rank (i.e. per GPU); the MegaMoE path is only used
+for batches at or below this cap. The right value depends on your parallelism /
+token-split scheme, and larger values reserve more HBM.
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
@@ -520,3 +559,35 @@ For AMD devices,
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 
 For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache).
+
+### 3.4 DSpark (Speculative Decoding)
+
+Flash Official (0731) bundles a DSpark draft head in `deepseek-ai/DeepSeek-V4-Flash-0731`. The target and draft weights therefore come from the same checkpoint: enable DSpark with `--speculative-algorithm DSPARK` and do not set a separate `--speculative-draft-model-path`.
+
+Unlike the EAGLE recipes for the original Flash and Pro checkpoints, this recipe omits `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. SGLang reads the DSpark shape from the checkpoint.
+
+The verified 4×GB300 FP4 low-latency command is:
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --tp 4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --mem-fraction-static 0.90 \
+  --chunked-prefill-size 4096 \
+  --swa-full-tokens-ratio 0.1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Keep `--mem-fraction-static 0.90` on this topology to leave enough headroom for the batch-256 verify graph. The first cold start can take 10–15 minutes while FlashInfer autotunes and SGLang captures the draft and verify graphs; later starts reuse the cache. This path is verified end-to-end on 4×GB300 with SGLang v0.5.16.
+
+**Tune proposed draft tokens.** `--speculative-dspark-block-size N` asks DSpark to propose `N` tokens per step; the target verifies a window of `N + 1`. If the flag is omitted, SGLang reads the value from the checkpoint. The current 0731 checkpoint resolves to five proposed tokens, which is the verified default. Use the **DSpark Proposed Draft Tokens** slider in the [Playground](#playground) to sweep one through five.
+
+Larger blocks can improve decode latency when acceptance stays high, but they also increase verification work and graph memory. Start from the checkpoint default, then sweep downward under the real prompt-length and concurrency distribution. The gain is usually largest for short interactive traffic and narrows as prefill dominates. Track P50/P99 TTFT and TPOT, total throughput, accepted length, GPU memory, and stop rate rather than choosing from acceptance alone.
+
+For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
+
+DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; turn DSpark off before selecting a prefill or decode role. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.

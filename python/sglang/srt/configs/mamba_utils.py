@@ -124,6 +124,24 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+        """Per-slot bytes of the ReplaySSM spec-verify fold window (all
+        layers). Not part of ``mamba_cache_per_req``, so the memory solver
+        must charge it separately. MUST mirror the ``MambaPool`` allocation:
+        raw v/k in the conv dtype + fp32 g and beta. GDN scalar-g layout
+        only."""
+        assert not self.is_kda, "replayssm ring accounting supports GDN only"
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        conv_b = self.dtype.conv.itemsize
+        fp32_b = 4
+        per_layer = (
+            hv * record_len * v_dim * conv_b
+            + h_k * record_len * k_dim * conv_b
+            + 2 * hv * record_len * fp32_b
+        )
+        return per_layer * len(self.layers)
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects

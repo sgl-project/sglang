@@ -11,7 +11,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image
@@ -34,6 +34,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
     sample_generated_shared_prefix_requests,
 )
 from sglang.benchmark.datasets.image import (
+    ImageDataset,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -42,6 +43,13 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from sglang.benchmark.serving import (
+    _BACKEND_API_PATHS,
+    _EMBEDDING_BACKENDS,
+    ASYNC_REQUEST_FUNCS,
+    async_request_openai_embeddings,
+    flush_server_cache,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
@@ -87,6 +95,33 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
     return hf_tokenizer
 
 
+class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+    def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
+        self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
+        self.assertIs(
+            ASYNC_REQUEST_FUNCS["vllm-embedding"], async_request_openai_embeddings
+        )
+        self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
+
+    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+        with (
+            patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
+            patch("sglang.benchmark.serving.requests.post") as post,
+        ):
+            post.return_value = MagicMock()
+
+            flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache", headers={}
+            )
+
+
 class DummyProcessor:
     def __init__(self, tokenizer: PreTrainedTokenizerFast):
         self.tokenizer = tokenizer
@@ -104,6 +139,21 @@ class DummyProcessor:
         text_len = len(self.tokenizer.encode(text[0]))
         image_tokens = 4 * len(images) if images else 0
         return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
+
+
+class KimiK3Processor(DummyProcessor):
+    """Mimics the Kimi K3 HF processor's media-kwargs interface (#32541)."""
+
+    def __init__(self, tokenizer: PreTrainedTokenizerFast):
+        super().__init__(tokenizer)
+        self.media_call_count = 0
+
+    def __call__(self, text, medias=None, **kwargs):
+        if medias is None:
+            raise ValueError("Kimi K3 requires medias with text")
+        self.media_call_count += 1
+        text_len = len(self.tokenizer.encode(text))
+        return {"input_ids": _DummyTokenTensor(text_len + 4 * len(medias))}
 
 
 class _FakeMMMUDataset:
@@ -447,6 +497,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 for marker in ("user:", "assistant:", "[IMAGE]"):
                     self.assertNotIn(marker, rows[0].prompt)
 
+    def test_image_sampler_uses_kimi_k3_media_contract(self):
+        processor = KimiK3Processor(self.tokenizer)
+        rows = sample_image_requests(
+            num_requests=1,
+            image_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang-oai-chat",
+            random_image_count=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(processor.media_call_count, 1)
+        self.assertTrue(rows[0].image_data)
+
     def test_image_sampler_random_resolution(self):
         state = np.random.get_state()
         np.random.seed(20260711)
@@ -478,6 +548,43 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             self.assertLessEqual(width, 32)
             self.assertGreaterEqual(height, 8)
             self.assertLessEqual(height, 16)
+
+    def test_image_dataset_seed_is_independent_of_processor_initialization(self):
+        dataset = ImageDataset.from_args(
+            make_args(
+                num_prompts=3,
+                image_resolution="random:8x16-16x32",
+                seed=20260717,
+            )
+        )
+        processor_init_count = 0
+
+        def get_processor_with_rng_side_effects(_model_id):
+            nonlocal processor_init_count
+            processor_init_count += 1
+            random.random()
+            np.random.random(processor_init_count)
+            return self.processor
+
+        with patch(
+            "sglang.benchmark.datasets.image.get_processor",
+            side_effect=get_processor_with_rng_side_effects,
+        ):
+            first = dataset.load(model_id="test-model")
+            random.seed(999)
+            np.random.seed(999)
+            second = dataset.load(model_id="test-model")
+
+        self.assertEqual(
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.image_data)
+                for row in first
+            ],
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.image_data)
+                for row in second
+            ],
+        )
 
     def test_parse_random_image_resolution(self):
         self.assertEqual(
@@ -519,6 +626,30 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         sampled_pool = set(captured_population["tokens"])
         self.assertFalse(special_token_ids & sampled_pool)
         self.assertTrue(sampled_pool)
+
+    def test_gen_mm_prompt_is_independent_of_vocab_order(self):
+        class OrderedVocabTokenizer:
+            all_special_ids = []
+
+            def __init__(self, items):
+                self.vocab = dict(items)
+
+            def get_vocab(self):
+                return self.vocab
+
+            def decode(self, token_ids):
+                return " ".join(map(str, token_ids))
+
+        items = [(f"token_{token_id}", token_id) for token_id in range(32)]
+        first = OrderedVocabTokenizer(items)
+        second = OrderedVocabTokenizer(reversed(items))
+
+        random.seed(20260717)
+        first_prompt = gen_mm_prompt(first, image_pad_id=None, token_num=16)
+        random.seed(20260717)
+        second_prompt = gen_mm_prompt(second, image_pad_id=None, token_num=16)
+
+        self.assertEqual(first_prompt, second_prompt)
 
     def test_mmmu_sampler(self):
         fake_records = [
