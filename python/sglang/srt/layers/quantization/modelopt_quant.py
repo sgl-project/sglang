@@ -680,8 +680,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             for prefix, info in self.quantized_layers.items()
         )
 
+    def _has_mxfp8_routed_experts(self) -> bool:
+        return any(
+            str(info.get("quant_algo", "")).upper() == "MXFP8"
+            and self._is_routed_expert_key(prefix)
+            for prefix, info in self.quantized_layers.items()
+        )
+
     def get_min_capability(self) -> int:
-        if self._has_mxfp8_linear_layers():
+        if self._has_mxfp8_linear_layers() or self._has_mxfp8_routed_experts():
             return 100
         return ModelOptFp4Config.get_min_capability()
 
@@ -856,8 +863,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptMxfp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
-            if quant_algo == "MXFP8":
-                return ModelOptMxfp8LinearMethod(self.mxfp8_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
             return UnquantizedLinearMethod()
@@ -871,16 +876,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "MXFP8":
+                if is_cuda() and not is_sm100_supported():
+                    # SM120 supports dense MXFP8, but not routed MXFP8 MoE.
+                    raise ValueError(
+                        "ModelOpt mixed MXFP8 routed experts require an "
+                        "NVIDIA SM100-class GPU."
+                    )
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
-            if quant_algo == "MXFP8":
-                raise NotImplementedError(
-                    "ModelOpt MIXED_PRECISION does not support MXFP8 routed "
-                    f"FusedMoE experts at {prefix}. MXFP8 is supported for "
-                    "shared-expert linear layers; routed FusedMoE experts must "
-                    "use a supported MoE quantization such as NVFP4."
-                )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
             return None
