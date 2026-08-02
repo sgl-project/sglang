@@ -48,6 +48,30 @@ enum TeeKind {
     Extend,
 }
 
+/// Per-request attribution an upstream gateway stamps on the request it
+/// dispatches (the `x-radixark-*` headers), read off the incoming request here
+/// and RE-ATTACHED verbatim to the cache-sim tee POST. Pure pass-through: the
+/// router never mints these — it relays what the upstream resolved (endpoint /
+/// key / slug at auth, correlation server-minted). The cache-sim receiver reads
+/// them back off the headers into each record, so the record is self-describing:
+/// it can be partitioned by `slug` and deduped / correlated by `correlation_id`
+/// without a separate lookup.
+///
+/// All optional: the upstream sets only non-empty values (a shared-bearer request
+/// has no `key_id`; a direct-to-router request with no such gateway has none),
+/// and each absent field is simply not sent — never as an empty header, which
+/// would look like a real value downstream.
+#[derive(Clone, Default)]
+pub struct Attribution {
+    /// `x-radixark-correlation-id` — the upstream's server-minted join key,
+    /// distinct from the tee body's `request_id` (the router's own rid). Used
+    /// downstream as the record's dedup + correlation key.
+    pub correlation_id: Option<String>,
+    pub endpoint_id: Option<String>,
+    pub key_id: Option<String>,
+    pub slug: Option<String>,
+}
+
 struct TeeMsg {
     kind: TeeKind,
     model: String,
@@ -56,6 +80,7 @@ struct TeeMsg {
     request_id: String,
     prompt_len: Option<usize>,
     choice: Option<Choice>,
+    attr: Attribution,
 }
 
 /// Which of an `n > 1` response's alternative continuations an extension is.
@@ -182,7 +207,7 @@ impl CacheSimTee {
     /// dropped + counted, a closed channel (sender task gone) likewise. Empty
     /// id lists are a no-op. Cheap enough to call unconditionally on the hot
     /// path.
-    pub fn offer(&self, model: &str, input_ids: &[u32], request_id: &str) {
+    pub fn offer(&self, model: &str, input_ids: &[u32], request_id: &str, attr: Attribution) {
         self.offer_kind(
             TeeKind::Ingest,
             model,
@@ -191,6 +216,7 @@ impl CacheSimTee {
             None,
             None,
             None,
+            attr,
         );
     }
 
@@ -209,6 +235,11 @@ impl CacheSimTee {
         choice: Option<Choice>,
         output_tokens: Option<u64>,
     ) {
+        // The extend (response-completion, insert-only) path runs in a detached
+        // task that no longer holds the ingress request headers, so it carries no
+        // attribution for now. The attributed path is the ingest tee above;
+        // threading attribution here is a follow-up (capture it at ingress
+        // alongside the extend prompt).
         self.offer_kind(
             TeeKind::Extend,
             model,
@@ -217,6 +248,7 @@ impl CacheSimTee {
             prompt_len,
             choice,
             output_tokens,
+            Attribution::default(),
         );
     }
 
@@ -230,6 +262,7 @@ impl CacheSimTee {
         prompt_len: Option<usize>,
         choice: Option<Choice>,
         output_tokens: Option<u64>,
+        attr: Attribution,
     ) {
         if input_ids.is_empty() {
             return;
@@ -265,6 +298,7 @@ impl CacheSimTee {
             prompt_len,
             choice,
             output_tokens,
+            attr,
         };
         match self.tx.try_send(msg) {
             Ok(()) => {}
@@ -330,13 +364,23 @@ async fn run_sender(
         // would blind the one health signal this counter exists to be. `error`
         // stays transport-only (connect refused / DNS / the 2s timeout) so a
         // dashboard can tell "cache-sim rejecting" from "cache-sim unreachable".
-        match client
-            .post(url)
-            .header("content-type", "application/json")
-            .body(bytes)
-            .send()
-            .await
-        {
+        // Re-attach the upstream's per-request attribution as x-radixark-* headers
+        // so the cache-sim receiver reads them into each record (it reads headers,
+        // not the JSON body). Non-empty values only — an empty header would look
+        // like a real value and collapse a downstream group-by / join. Pure
+        // pass-through: the router relays what the upstream stamped, minting nothing.
+        let mut rb = client.post(url).header("content-type", "application/json");
+        for (name, value) in [
+            ("x-radixark-correlation-id", &msg.attr.correlation_id),
+            ("x-radixark-endpoint-id", &msg.attr.endpoint_id),
+            ("x-radixark-key-id", &msg.attr.key_id),
+            ("x-radixark-endpoint-slug", &msg.attr.slug),
+        ] {
+            if let Some(v) = value.as_deref().filter(|s| !s.is_empty()) {
+                rb = rb.header(name, v);
+            }
+        }
+        match rb.body(bytes).send().await {
             Ok(r) if r.status().is_success() => metrics.record_cache_sim_tee(sent),
             Ok(_) => metrics.record_cache_sim_tee(http_error),
             Err(_) => metrics.record_cache_sim_tee(error),
@@ -371,43 +415,66 @@ mod tests {
 
     #[tokio::test]
     async fn offer_posts_input_ids_to_ingest_ids() {
-        // Mock cache-sim: capture the last /ingest_ids body, reply 204.
-        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-        let app =
-            Router::new()
-                .route(
-                    "/ingest_ids",
-                    post(
-                        |State(cap): State<Arc<Mutex<Option<Vec<u8>>>>>,
-                         body: axum::body::Bytes| async move {
-                            *cap.lock().unwrap() = Some(body.to_vec());
-                            axum::http::StatusCode::NO_CONTENT
-                        },
-                    ),
-                )
-                .with_state(Arc::clone(&captured));
+        // Mock cache-sim: capture the last /ingest_ids body + headers, reply 204.
+        type Captured = Arc<Mutex<Option<(Vec<u8>, axum::http::HeaderMap)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route(
+                "/ingest_ids",
+                post(
+                    |State(cap): State<Captured>,
+                     headers: axum::http::HeaderMap,
+                     body: axum::body::Bytes| async move {
+                        *cap.lock().unwrap() = Some((body.to_vec(), headers));
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&captured));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
-        tee.offer("m", &[10, 11, 12], "rid-1");
+        // Full attribution — plus an empty key_id, which must be OMITTED
+        // (not sent as a blank header).
+        tee.offer(
+            "m",
+            &[10, 11, 12],
+            "rid-1",
+            Attribution {
+                correlation_id: Some("corr-abc".into()),
+                endpoint_id: Some("ep-1".into()),
+                key_id: Some(String::new()),
+                slug: Some("demo-slug".into()),
+            },
+        );
 
         // The sender POSTs asynchronously; poll until the body lands.
-        let mut body = None;
+        let mut captured_pair = None;
         for _ in 0..80 {
-            if let Some(b) = captured.lock().unwrap().clone() {
-                body = Some(b);
+            if let Some(p) = captured.lock().unwrap().clone() {
+                captured_pair = Some(p);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let body = body.expect("cache-sim never received a POST");
+        let (body, headers) = captured_pair.expect("cache-sim never received a POST");
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "m");
         assert_eq!(v["input_ids"], serde_json::json!([10, 11, 12]));
         assert_eq!(v["request_id"], "rid-1", "the join key must reach the wire");
+        // Per-request attribution is forwarded as x-radixark-* headers
+        // (pass-through) so the cache-sim receiver can self-describe each record.
+        let hdr = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+        assert_eq!(hdr("x-radixark-correlation-id"), Some("corr-abc"));
+        assert_eq!(hdr("x-radixark-endpoint-id"), Some("ep-1"));
+        assert_eq!(hdr("x-radixark-endpoint-slug"), Some("demo-slug"));
+        assert!(
+            headers.get("x-radixark-key-id").is_none(),
+            "an empty attribution value must be omitted, never sent blank"
+        );
         // The ingest body IS the prompt, so a boundary would be redundant —
         // and its presence on this path would mean the receiver had two
         // disagreeing notions of where the prompt ends.
@@ -490,7 +557,7 @@ mod tests {
     async fn ingest_never_carries_a_boundary() {
         let metrics = Arc::new(MetricsRegistry::default());
         let (tee, mut rx) = unstarted(4, Arc::clone(&metrics));
-        tee.offer("m", &[1, 2, 3], "rid-1");
+        tee.offer("m", &[1, 2, 3], "rid-1", Attribution::default());
         let msg = rx.try_recv().unwrap();
         assert!(msg.prompt_len.is_none());
         assert_eq!(msg.request_id, "rid-1");
@@ -581,7 +648,7 @@ mod tests {
         // overflow and must be counted as dropped (and never block).
         let (tee, _rx) = unstarted(1, Arc::clone(&metrics));
         for _ in 0..5 {
-            tee.offer("m", &[1, 2, 3], "rid-1");
+            tee.offer("m", &[1, 2, 3], "rid-1", Attribution::default());
         }
         let rendered = metrics.render();
         assert!(
@@ -594,7 +661,7 @@ mod tests {
     async fn offer_ignores_empty_ids() {
         let metrics = MetricsRegistry::new();
         let (tee, mut rx) = unstarted(4, Arc::clone(&metrics));
-        tee.offer("m", &[], "rid-1");
+        tee.offer("m", &[], "rid-1", Attribution::default());
         // Nothing enqueued.
         assert!(rx.try_recv().is_err());
     }
@@ -613,7 +680,7 @@ mod tests {
 
         let metrics = MetricsRegistry::new();
         let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics), 64);
-        tee.offer("m", &[1, 2, 3], "rid-1");
+        tee.offer("m", &[1, 2, 3], "rid-1", Attribution::default());
 
         let mut rendered = String::new();
         for _ in 0..80 {
@@ -640,7 +707,7 @@ mod tests {
         let metrics = MetricsRegistry::new();
         let (tee, rx) = unstarted(4, Arc::clone(&metrics));
         drop(rx); // no receiver → channel closed
-        tee.offer("m", &[1, 2, 3], "rid-1");
+        tee.offer("m", &[1, 2, 3], "rid-1", Attribution::default());
         assert!(
             metrics
                 .render()
@@ -666,7 +733,11 @@ mod tests {
                 panic!("capture budget is not bounded");
             }
         }
-        assert_eq!(held.len(), 64, "exactly the budget many permits are granted");
+        assert_eq!(
+            held.len(),
+            64,
+            "exactly the budget many permits are granted"
+        );
         assert!(
             tee.try_acquire_capture_permit().is_none(),
             "an exhausted budget must refuse further captures",

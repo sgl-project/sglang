@@ -404,7 +404,12 @@ async fn chat_completions_inner(
     // downstream from a response that generated nothing. The bias would grow
     // exactly when the fleet is shedding, i.e. anti-correlated with health.
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
-        tee.offer(&model_str, &t.ids, &derived_request_id);
+        tee.offer(
+            &model_str,
+            &t.ids,
+            &derived_request_id,
+            tee_attribution(&headers),
+        );
     }
     if let Some(p) = &phase {
         p.set(RequestPhase::Dispatch);
@@ -1800,6 +1805,29 @@ fn derive_request_id(client_rid: Option<&str>, headers: &HeaderMap) -> String {
     {
         Some(id) => format!("router-{id}"),
         None => format!("router-{}", uuid::Uuid::new_v4().simple()),
+    }
+}
+
+/// Read the upstream's per-request attribution headers off the incoming request
+/// so the ingress tee can re-forward them verbatim to the cache-sim (an upstream
+/// gateway stamps them; the cache-sim receiver reads them back into each record).
+/// Pure pass-through — the router mints nothing here, it only relays what the
+/// upstream resolved. Empty headers are treated as absent (same contract as
+/// `derive_request_id`), so a blank never masquerades as a real
+/// endpoint/key/slug/correlation.
+fn tee_attribution(headers: &HeaderMap) -> crate::server::cache_sim_tee::Attribution {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    crate::server::cache_sim_tee::Attribution {
+        correlation_id: get("x-radixark-correlation-id"),
+        endpoint_id: get("x-radixark-endpoint-id"),
+        key_id: get("x-radixark-key-id"),
+        slug: get("x-radixark-endpoint-slug"),
     }
 }
 
