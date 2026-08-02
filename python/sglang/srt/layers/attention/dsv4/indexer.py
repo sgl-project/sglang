@@ -248,7 +248,52 @@ def fp8_paged_mqa_logits_torch_sm120(
     _per = max(1, batch_size * (head_dim + num_heads) * 2)
     pages_per_chunk = max(1, min(max_pages, (512 << 20) // (_per * block_size)))
 
-    for _p0 in range(0, max_pages, pages_per_chunk):
+    # Single-sequence prefill has an identical page_table on every row: all B
+    # query tokens address the same KV. Gathering per row copies it B times --
+    # around 70 GB of traffic at B=8192 with a 256K context. Gathering once and
+    # letting the bmm collapse to a single GEMM divides that traffic by B.
+    #
+    # The `.all()` check below is a device-to-host sync, which raises
+    # "operation not permitted when stream is capturing" inside a CUDA graph, so
+    # it is guarded by a host-side query first. Capture only happens on decode,
+    # where the batch is small enough that this path would not pay off anyway.
+    _shared = (
+        batch_size > 1
+        and not torch.cuda.is_current_stream_capturing()
+        and bool((page_ids == page_ids[0:1]).all())
+    )
+    if _shared:
+        _pg = page_ids[0]  # [max_pages]
+        for _p0 in range(0, max_pages, pages_per_chunk):
+            _p1 = min(max_pages, _p0 + pages_per_chunk)
+            _g = kvcache_flat[_pg[_p0:_p1]]  # [p, 64*132] -- gathered once
+            _n = (_p1 - _p0) * block_size
+            _kvv = (
+                _g[..., :SCALE_OFFSET]
+                .contiguous()
+                .view(dtype=FP8_DTYPE)
+                .to(torch.bfloat16)
+            ).view(
+                _n, head_dim
+            )  # [n, 128]
+            _kvs = (_g[..., SCALE_OFFSET:].contiguous().view(dtype=torch.float32)).view(
+                _n
+            )  # [n]
+            # [n,128] @ [128, B*NH] -> [n, B*NH]
+            _sc = _kvv @ q.reshape(batch_size * num_heads, head_dim).t()
+            _sc = F.relu(_sc).view(_n, batch_size, num_heads)
+            _sc = (_sc * weight.unsqueeze(0)).sum(dim=2)  # [n, B]
+            _sc = _sc.t() * _kvs.unsqueeze(0)  # [B, n]
+            _s0 = _p0 * block_size
+            _e = min(max_seq_len, _s0 + _n)
+            if _e > _s0:
+                logits[:, _s0:_e] = _sc[:, : _e - _s0]
+            del _g, _kvv, _kvs, _sc
+        _done_shared = True
+    else:
+        _done_shared = False
+
+    for _p0 in range(0, max_pages if not _done_shared else 0, pages_per_chunk):
         _p1 = min(max_pages, _p0 + pages_per_chunk)
         _g = kvcache_flat[page_ids[:, _p0:_p1]]
         _n = (_p1 - _p0) * block_size
