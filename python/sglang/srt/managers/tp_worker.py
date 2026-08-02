@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -39,6 +39,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.worker_contract import (
+    AttentionRequirements,
+    KVCacheLayout,
+    UnsupportedWorkerOperation,
+    WorkerMemoryUsage,
+    WorkerPoolState,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
@@ -59,7 +66,12 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -67,211 +79,224 @@ logger = logging.getLogger(__name__)
 
 
 class BaseTpWorker(ABC):
-    @abstractmethod
-    def forward_batch_generation(self, forward_batch: ForwardBatch):
-        pass
+    """Backend-neutral operations used by generic framework code."""
 
-    @property
     @abstractmethod
-    def model_runner(self) -> ModelRunner:
-        pass
+    def forward_batch_generation(
+        self,
+        batch: Optional[ScheduleBatch],
+        forward_batch: Optional[ForwardBatch] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        is_verify: bool = False,
+        skip_attn_backend_init: Optional[bool] = None,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+    ) -> GenerationBatchResult:
+        ...
 
-    @property
-    def war_fastpath_runner(self):
-        # The runner that runs the step's LAST shared-buffer-reading phase --
-        # it owns the read-done event the scheduler's WAR barrier waits on.
-        # For a plain worker that's its own runner.
-        return self.model_runner
+    def forward_batch_embedding(
+        self, batch: ScheduleBatch
+    ) -> Tuple[EmbeddingPoolerOutput, bool]:
+        raise UnsupportedWorkerOperation(
+            "embedding forward", type(self).__name__
+        )
+
+    def forward_batch_split_prefill(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        raise UnsupportedWorkerOperation("split prefill", type(self).__name__)
+
+    @abstractmethod
+    def get_worker_info(self):
+        ...
+
+    @abstractmethod
+    def get_kv_cache_layout(self) -> KVCacheLayout:
+        """Return scheduler-visible cache layout without exposing the runner."""
+        ...
 
     @property
     def sliding_window_size(self) -> Optional[int]:
-        return self.model_runner.sliding_window_size
+        return self.get_kv_cache_layout().sliding_window_size
 
     @property
     def is_hybrid_swa(self) -> bool:
-        return self.model_runner.is_hybrid_swa
+        return self.get_kv_cache_layout().is_hybrid_swa
 
     def get_tokens_per_layer_info(self):
+        layout = self.get_kv_cache_layout()
+        return layout.full_tokens_per_layer, layout.swa_tokens_per_layer
+
+    def get_pad_input_ids_func(self) -> Optional[Callable[..., Any]]:
+        return None
+
+    @abstractmethod
+    def get_memory_pool_state(self) -> WorkerPoolState:
+        """Return initialized scheduler bookkeeping pools."""
+        ...
+
+    def get_memory_pool(
+        self,
+    ) -> Tuple[
+        Optional[ReqToTokenPool],
+        Optional[BaseTokenToKVPoolAllocator],
+    ]:
+        state = self.get_memory_pool_state()
         return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+            state.req_to_token_pool,
+            state.token_to_kv_pool_allocator,
         )
 
-    def get_pad_input_ids_func(self):
-        return getattr(self.model_runner.model, "pad_input_ids", None)
+    @abstractmethod
+    def ensure_memory_pool(self) -> WorkerPoolState:
+        """Initialize scheduler pools if needed and return their resolved state."""
+        ...
 
-    def get_memory_pool(self) -> Tuple[ReqToTokenPool, BaseTokenToKVPoolAllocator]:
-        return (
-            self.model_runner.req_to_token_pool,
-            self.model_runner.token_to_kv_pool_allocator,
+    @abstractmethod
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+    ) -> None:
+        ...
+
+    def init_attention_backends(self) -> None:
+        """Initialize backend-specific attention state, if any."""
+        return None
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True) -> None:
+        """Initialize backend graph capture, if supported."""
+        return None
+
+    def on_radix_cache_initialized(self, cache: BasePrefixCache) -> None:
+        """Notify worker-owned observers that the framework cache is ready."""
+        return None
+
+    def finalize_graph_capture(self) -> None:
+        """Run backend-owned post-capture finalization."""
+        return None
+
+    def configure_hisparse_coordinator(
+        self, forward_stream: Any
+    ) -> Optional[HiSparseCoordinator]:
+        """Configure and return the framework HiSparse coordinator, if present."""
+        raise UnsupportedWorkerOperation("HiSparse", type(self).__name__)
+
+    def get_attention_requirements(self) -> AttentionRequirements:
+        """Return backend attention requirements used by the scheduler."""
+        return AttentionRequirements(needs_cpu_seq_lens=True)
+
+    def apply_war_barrier(
+        self,
+        schedule_stream: Any,
+        forward_stream: Any,
+        *,
+        force_coarse: bool,
+    ) -> None:
+        """Wait until the previous forward has finished shared-buffer reads."""
+        schedule_stream.wait_stream(forward_stream)
+
+    def prepare_ngram_embedding(
+        self,
+        batch: Optional[ScheduleBatch],
+        *,
+        chunked_req: Optional[Req],
+    ) -> Optional[ScheduleBatch]:
+        """Attach backend-owned n-gram state needed by the next forward."""
+        return batch
+
+    def init_lora_overlap_loader(self) -> None:
+        """Initialize backend-owned state for overlapping LoRA loads."""
+        raise UnsupportedWorkerOperation(
+            "overlapping LoRA loading", type(self).__name__
         )
+
+    def try_overlap_load_lora(
+        self,
+        lora_id: Optional[str],
+        running_loras: set[Optional[str]],
+    ) -> bool:
+        """Try to make one adapter available without exposing its manager."""
+        raise UnsupportedWorkerOperation(
+            "overlapping LoRA loading", type(self).__name__
+        )
+
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
+        """Validate a candidate batch against backend LoRA capacity."""
+        raise UnsupportedWorkerOperation("LoRA batching", type(self).__name__)
+
+    def take_pending_elastic_scale_update(
+        self,
+    ) -> Optional[ElasticScaleUpdateReq]:
+        """Atomically return and clear a pending elastic-scale update."""
+        return None
+
+    def get_memory_usage(self) -> WorkerMemoryUsage:
+        """Return backend-reported weight and graph memory usage."""
+        return WorkerMemoryUsage(weight_gb=None, graph_gb=None)
+
+    def register_hicache_layer_transfer_counter(
+        self, counter: LayerDoneCounter
+    ) -> None:
+        """Register optional HiCache transfer bookkeeping."""
+        raise UnsupportedWorkerOperation("HiCache", type(self).__name__)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        return success, message
+        raise UnsupportedWorkerOperation("disk weight update", type(self).__name__)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.weight_updater.init_weights_update_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank_offset,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
+        raise UnsupportedWorkerOperation(
+            "weight update group initialization", type(self).__name__
         )
-        return success, message
 
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
-        success, message = (
-            self.model_runner.weight_updater.destroy_weights_update_group(
-                recv_req.group_name,
-            )
+        raise UnsupportedWorkerOperation(
+            "weight update group destruction", type(self).__name__
         )
-        return success, message
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
-        success, message = (
-            self.model_runner.weight_exporter.init_weights_send_group_for_remote_instance(
-                recv_req.master_address,
-                recv_req.ports,
-                recv_req.group_rank,
-                recv_req.world_size,
-                recv_req.group_name,
-                recv_req.backend,
-            )
+        raise UnsupportedWorkerOperation(
+            "remote weight send group initialization", type(self).__name__
         )
-        return success, message
 
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
-        success, message = (
-            self.model_runner.weight_exporter.send_weights_to_remote_instance(
-                recv_req.master_address,
-                recv_req.ports,
-                recv_req.group_name,
-            )
+        raise UnsupportedWorkerOperation(
+            "remote weight transfer", type(self).__name__
         )
-        return success, message
 
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
-    def _deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index ps.tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
-        monkey_patch_torch_reductions()
-        return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.ps.tp_rank]
+        raise UnsupportedWorkerOperation(
+            "distributed weight update", type(self).__name__
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
-            load_format=recv_req.load_format,
-        )
-        return success, message
+        raise UnsupportedWorkerOperation("tensor weight update", type(self).__name__)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.weight_updater.update_weights_from_ipc(
-            recv_req
-        )
-        return success, message
+        raise UnsupportedWorkerOperation("IPC weight update", type(self).__name__)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
-        parameter = self.model_runner.weight_exporter.get_weights_by_name(
-            recv_req.name, recv_req.truncate_size
-        )
-        return parameter
+        raise UnsupportedWorkerOperation("weight export", type(self).__name__)
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
-        return result
+        raise UnsupportedWorkerOperation("LoRA loading", type(self).__name__)
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
-        return result
+        raise UnsupportedWorkerOperation("LoRA unloading", type(self).__name__)
 
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
-        # The LoRA code handles TP sharding internally using slice_lora_a_weights
-        # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
-        if recv_req.load_format == "flattened_bucket":
-            bucket = FlattenedTensorBucket(
-                flattened_tensor=data["flattened_tensor"],
-                metadata=data["metadata"],
-            )
-            tensors = dict(bucket.reconstruct_tensors())
-        else:
-            tensors = data
-        if recv_req.expected_checksums is not None:
-            import hashlib
-
-            exp = recv_req.expected_checksums
-            mismatch, missing = [], []
-            for name, want in exp.items():
-                if name not in tensors:
-                    missing.append(name)
-                    continue
-                got = hashlib.sha256(
-                    tensors[name]
-                    .detach()
-                    .cpu()
-                    .contiguous()
-                    .flatten()
-                    .view(torch.uint8)
-                    .numpy()
-                    .tobytes()
-                ).hexdigest()
-                if got != want:
-                    mismatch.append(name)
-            extra = [n for n in tensors if n not in exp]
-            if mismatch or missing or extra:
-                raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
-                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
-                    f"{len(extra)} extra {extra[:5]}"
-                )
-            logger.info(
-                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
-            )
-        result = self.model_runner.load_lora_adapter_from_tensors(
-            recv_req.to_ref(),
-            tensors,
-            recv_req.config_dict,
-            recv_req.added_tokens_config,
+        raise UnsupportedWorkerOperation(
+            "LoRA tensor loading", type(self).__name__
         )
-        return result
-
-    def forward_batch_embedding(self, batch: ScheduleBatch):
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self.model_runner,
-            return_hidden_states_before_norm=False,
-        )
-        output = self.model_runner.forward(forward_batch)
-        return output.logits_output, output.can_run_graph
 
 
 class TpModelWorker(BaseTpWorker):
@@ -367,7 +392,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
-    ):
+    ) -> None:
         """Allocate KV cache pools only (no backends or cuda graphs)."""
         if req_to_token_pool is not None:
             self.req_to_token_pool = req_to_token_pool
@@ -389,13 +414,13 @@ class TpModelWorker(BaseTpWorker):
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
-    def init_attention_backends(self):
+    def init_attention_backends(self) -> None:
         """Initialize attention backends for all model runners."""
         self.model_runner.init_attention_backends()
         for mr in self.model_runner_list[1:]:
             mr.init_attention_backends()
 
-    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True) -> None:
         """Capture cuda graphs for all model runners."""
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -472,7 +497,337 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
-    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
+    @property
+    def war_fastpath_runner(self):
+        # Compatibility surface for scheduler/spec workers. This is deliberately
+        # not part of BaseTpWorker.
+        return self._model_runner
+
+    def get_kv_cache_layout(self) -> KVCacheLayout:
+        runner = self._model_runner
+        is_hybrid_swa = runner.is_hybrid_swa
+        return KVCacheLayout(
+            is_hybrid_swa=is_hybrid_swa,
+            prefill_aware_swa=getattr(runner, "prefill_aware_swa", False),
+            sliding_window_size=getattr(runner, "sliding_window_size", None),
+            full_tokens_per_layer=(
+                getattr(runner, "full_max_total_num_tokens", None)
+                if is_hybrid_swa
+                else None
+            ),
+            swa_tokens_per_layer=(
+                getattr(runner, "swa_max_total_num_tokens", None)
+                if is_hybrid_swa
+                else None
+            ),
+        )
+
+    def get_pad_input_ids_func(self) -> Optional[Callable[..., Any]]:
+        return getattr(self._model_runner.model, "pad_input_ids", None)
+
+    def get_memory_pool_state(self) -> WorkerPoolState:
+        runner = self._model_runner
+        if (
+            runner.req_to_token_pool is None
+            or runner.token_to_kv_pool_allocator is None
+        ):
+            raise RuntimeError("Worker memory pool has not been initialized.")
+        return WorkerPoolState(
+            config=runner.memory_pool_config,
+            req_to_token_pool=runner.req_to_token_pool,
+            token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+        )
+
+    def get_memory_pool(
+        self,
+    ) -> Tuple[
+        Optional[ReqToTokenPool],
+        Optional[BaseTokenToKVPoolAllocator],
+    ]:
+        # Compatibility for speculative workers that inspect the target before
+        # scheduler-owned pool initialization.
+        return (
+            self._model_runner.req_to_token_pool,
+            self._model_runner.token_to_kv_pool_allocator,
+        )
+
+    def ensure_memory_pool(self) -> WorkerPoolState:
+        runner = self._model_runner
+        if (
+            runner.req_to_token_pool is None
+            or runner.token_to_kv_pool_allocator is None
+        ):
+            self.alloc_memory_pool()
+        return self.get_memory_pool_state()
+
+    def on_radix_cache_initialized(self, cache: BasePrefixCache) -> None:
+        if (
+            manager := getattr(self._model_runner, "canary_manager", None)
+        ) is not None:
+            manager.attach_radix_cache(cache)
+
+    def finalize_graph_capture(self) -> None:
+        runner = self._model_runner
+        if runner.token_to_kv_pool.post_capture_active:
+            runner.post_capture_resize_kv_pool()
+
+    def configure_hisparse_coordinator(
+        self, forward_stream: Any
+    ) -> Optional[HiSparseCoordinator]:
+        coordinator = self._model_runner.hisparse_coordinator
+        if coordinator is not None:
+            coordinator.set_decode_producer_stream(forward_stream)
+        return coordinator
+
+    def get_attention_requirements(self) -> AttentionRequirements:
+        backend = getattr(self._model_runner, "attn_backend", None)
+        return AttentionRequirements(
+            needs_cpu_seq_lens=(
+                True
+                if backend is None
+                else getattr(backend, "needs_cpu_seq_lens", True)
+            )
+        )
+
+    def apply_war_barrier(
+        self,
+        schedule_stream: Any,
+        forward_stream: Any,
+        *,
+        force_coarse: bool,
+    ) -> None:
+        runner = self._model_runner
+        event = runner.war_fastpath_read_done_event
+        runner.war_fastpath_read_done_event = None
+        if event is not None and not force_coarse:
+            schedule_stream.wait_event(event)
+        else:
+            schedule_stream.wait_stream(forward_stream)
+
+    def prepare_ngram_embedding(
+        self,
+        batch: Optional[ScheduleBatch],
+        *,
+        chunked_req: Optional[Req],
+    ) -> Optional[ScheduleBatch]:
+        return self._model_runner.ngram_embedding_manager.prepare_for_forward(
+            batch, chunked_req=chunked_req
+        )
+
+    def init_lora_overlap_loader(self) -> None:
+        from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+
+        self._lora_overlap_loader = LoRAOverlapLoader(
+            self._model_runner.lora_manager
+        )
+
+    def try_overlap_load_lora(
+        self,
+        lora_id: Optional[str],
+        running_loras: set[Optional[str]],
+    ) -> bool:
+        loader = getattr(self, "_lora_overlap_loader", None)
+        if loader is None:
+            raise RuntimeError("LoRA overlap loading has not been initialized.")
+        return loader.try_overlap_load_lora(lora_id, running_loras)
+
+    def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
+        return self._model_runner.lora_manager.validate_lora_batch(lora_ids)
+
+    def take_pending_elastic_scale_update(
+        self,
+    ) -> Optional[ElasticScaleUpdateReq]:
+        runner = self._model_runner
+        pending = runner._pending_elastic_scale_update
+        runner._pending_elastic_scale_update = None
+        return pending
+
+    def get_memory_usage(self) -> WorkerMemoryUsage:
+        return WorkerMemoryUsage(
+            weight_gb=getattr(self._model_runner, "weight_load_mem_usage", None),
+            graph_gb=getattr(self._model_runner, "graph_mem_usage", None),
+        )
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = (
+            self._model_runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+        )
+        return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = (
+            self._model_runner.weight_updater.init_weights_update_group(
+                recv_req.master_address,
+                recv_req.master_port,
+                recv_req.rank_offset,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = (
+            self._model_runner.weight_updater.destroy_weights_update_group(
+                recv_req.group_name,
+            )
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self._model_runner.weight_exporter.init_weights_send_group_for_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_rank,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = (
+            self._model_runner.weight_exporter.send_weights_to_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_name,
+            )
+        )
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = (
+            self._model_runner.weight_updater.update_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+                recv_req.load_format,
+            )
+        )
+        return success, message
+
+    def _deserialize_own_rank(self, serialized_named_tensors):
+        """Each rank deserializes only its own payload (index ps.tp_rank);
+        deserializing another rank's copy would break producer-side CUDA-IPC
+        refcounting."""
+        monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.deserialize(
+            serialized_named_tensors[self.ps.tp_rank]
+        )
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        success, message = (
+            self._model_runner.weight_updater.update_weights_from_tensor(
+                named_tensors=self._deserialize_own_rank(
+                    recv_req.serialized_named_tensors
+                ),
+                load_format=recv_req.load_format,
+            )
+        )
+        return success, message
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update weights from IPC for checkpoint-engine integration."""
+        success, message = self._model_runner.weight_updater.update_weights_from_ipc(
+            recv_req
+        )
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self._model_runner.weight_exporter.get_weights_by_name(
+            recv_req.name, recv_req.truncate_size
+        )
+        return parameter
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        result = self._model_runner.load_lora_adapter(recv_req.to_ref())
+        return result
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        result = self._model_runner.unload_lora_adapter(recv_req.to_ref())
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ):
+        # The LoRA code handles TP sharding internally using slice_lora_a_weights
+        # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
+        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        if recv_req.load_format == "flattened_bucket":
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=data["flattened_tensor"],
+                metadata=data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = data
+        if recv_req.expected_checksums is not None:
+            import hashlib
+
+            exp = recv_req.expected_checksums
+            mismatch, missing = [], []
+            for name, want in exp.items():
+                if name not in tensors:
+                    missing.append(name)
+                    continue
+                got = hashlib.sha256(
+                    tensors[name]
+                    .detach()
+                    .cpu()
+                    .contiguous()
+                    .flatten()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                ).hexdigest()
+                if got != want:
+                    mismatch.append(name)
+            extra = [n for n in tensors if n not in exp]
+            if mismatch or missing or extra:
+                raise RuntimeError(
+                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
+                    f"{len(extra)} extra {extra[:5]}"
+                )
+            logger.info(
+                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            )
+        result = self._model_runner.load_lora_adapter_from_tensors(
+            recv_req.to_ref(),
+            tensors,
+            recv_req.config_dict,
+            recv_req.added_tokens_config,
+        )
+        return result
+
+    def forward_batch_embedding(
+        self, batch: ScheduleBatch
+    ) -> Tuple[EmbeddingPoolerOutput, bool]:
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self._model_runner,
+            return_hidden_states_before_norm=False,
+        )
+        output = self._model_runner.forward(forward_batch)
+        return output.logits_output, output.can_run_graph
+
+    def register_hicache_layer_transfer_counter(
+        self, counter: LayerDoneCounter
+    ) -> None:
         self.hicache_layer_transfer_counter = counter
 
     def set_hicache_consumer(self, consumer_index: int):
