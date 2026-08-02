@@ -38,7 +38,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
