@@ -1125,6 +1125,9 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def combine_b(self, **kwargs):
         return self._execute("combine_b", **kwargs)
 
+    def prefetch_weight(self, **kwargs):
+        return self._execute("prefetch_weight", **kwargs)
+
     def register_deepep_dispatch_hook(self, hook):
         handle_list = []
         for inner in self._inners:
