@@ -30,6 +30,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    MOONEP = "moonep"
     MOONCAKE = "mooncake"
     NIXL = "nixl"
     MORI = "mori"
@@ -54,6 +55,9 @@ class MoeA2ABackend(Enum):
 
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
+
+    def is_moonep(self):
+        return self == MoeA2ABackend.MOONEP
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE

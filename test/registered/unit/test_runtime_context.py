@@ -440,6 +440,12 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(is_tbo_enabled())
         self.assertEqual(get_flags().moe.deepep_config, "")
 
+    def test_initialize_materializes_moonep_backend(self):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        self._init(moe_a2a_backend="moonep")
+        self.assertTrue(get_moe_a2a_backend().is_moonep())
+
     def test_speculative_swap_and_restore(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,

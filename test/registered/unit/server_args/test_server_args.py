@@ -1500,6 +1500,22 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
+class TestMoonEPArgs(CustomTestCase):
+    def test_moonep_backend_is_recognized_but_guarded(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="moonep",
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "MoonEP"):
+            server_args._handle_a2a_moe()
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
+        self.assertEqual(resolved_view(server_args).ep_size, server_args.tp_size)
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 
