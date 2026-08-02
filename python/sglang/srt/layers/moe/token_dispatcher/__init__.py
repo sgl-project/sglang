@@ -31,6 +31,8 @@ from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
+    MoonEPBuffer,
+    MoonEPBufferKey,
     MoonEPCombineInput,
     MoonEPDispatcher,
     MoonEPDispatchOutput,
@@ -73,6 +75,8 @@ __all__ = [
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
     "MoonEPCombineInput",
+    "MoonEPBuffer",
+    "MoonEPBufferKey",
     "MoonEPDispatcher",
     "MoonEPDispatchOutput",
     "MoriEPNormalDispatchOutput",

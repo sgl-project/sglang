@@ -79,12 +79,14 @@ The initial patch should:
 
 ## Follow-up tickets
 
-1. **MoonEP dispatch output contract**
+1. **MoonEP dispatch output contract** — done in
+   `9865fc123 Add MoonEP dispatcher data contract`
    - Add `DispatchOutputFormat.MOONEP` and `CombineInputFormat.MOONEP`.
    - Carry `hidden_nvsh`, `route_weights_nvs`, `cu_seqlens`, and
      `MoonEPCommPlan` through the MoE core.
 
-2. **MoonEP buffer lifecycle**
+2. **MoonEP buffer lifecycle** — initial facade done in
+   `MoonEPBuffer`; runtime sizing policy still needs validation
    - Add a process-wide MoonEP buffer facade similar to `DeepEPBuffer`.
    - Key the buffer by static `S`, `H`, `K`, `E`, EP group, and `B`.
    - Decide how SGLang should choose `S` for prefill/decode/cuda-graph capture.
