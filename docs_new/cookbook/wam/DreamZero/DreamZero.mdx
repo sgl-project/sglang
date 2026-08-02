@@ -110,49 +110,10 @@ For DreamZero, metadata reports `policy_family: "dreamzero"`, action shape defau
 
 ### 5.2 Generic Action HTTP API
 
-Use `/v1/actions/generations` for direct action inference. JSON is useful for small smoke tests, but closed-loop DreamZero rollouts should use msgpack so tensors can be sent without expanding large image arrays into JSON.
-
-The example below shows the generic request shape. Replace `normalized_observation` with the output of your DreamZero data transform.
-
-```python Example
-import numpy as np
-import requests
-
-normalized_observation = {
-    "state": np.zeros((1, 1, 7), dtype=np.float32).tolist(),
-    "embodiment_id": [0],
-    # Add the image/video tensors expected by your DreamZero data transform.
-}
-
-payload = {
-    "input": {
-        "prompt": ["pick up the cube"],
-        "observation": normalized_observation,
-    },
-    "parameters": {
-        "session_ids": ["rollout-r0-slot0"],
-        "reset_mask": [False],
-        "negative_prompts": [""],
-    },
-    "runtime": {
-        "response_format": "envelope",
-        "output_format": "list",
-    },
-}
-
-response = requests.post(
-    "http://127.0.0.1:30000/v1/actions/generations",
-    json=payload,
-    timeout=60,
-)
-response.raise_for_status()
-data = response.json()
-
-actions = data["data"][0]["action"]["values"]
-print(len(actions), len(actions[0]))
-```
-
-### 5.3 Msgpack Rollout Path
+Use `/v1/actions/generations` for direct action inference. Closed-loop DreamZero
+rollouts should use msgpack so tensor observations keep their ndarray dtype and
+shape metadata. Do not convert DreamZero image or state tensors with `.tolist()`
+for JSON transport.
 
 For production-style action rollouts, send msgpack and request numpy output:
 
@@ -191,6 +152,12 @@ def unpack_array(obj):
         return np.dtype(dtype).type(data)
     return obj
 
+
+normalized_observation = {
+    "state": np.zeros((1, 1, 7), dtype=np.float32),
+    "embodiment_id": np.zeros((1,), dtype=np.int64),
+    # Add the image/video ndarrays expected by your DreamZero data transform.
+}
 
 payload = {
     "input": {

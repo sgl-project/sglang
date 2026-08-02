@@ -9,6 +9,7 @@ https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/acti
 from __future__ import annotations
 
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,54 +22,43 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_ulysses_parallel_rank,
-)
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
+    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.usp import (
-    _usp_input_all_to_all_varlen,
-    _usp_output_all_to_all_varlen,
-)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
     tensor_parallel_rms_norm,
 )
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all_varlen,
+    _usp_output_all_to_all_varlen,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
-from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    sp_gather_tensor,
-    sp_shard_sequence,
-    sp_shard_tensor,
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
 )
 
 _DREAMZERO_SUPPORTED_ATTENTION_BACKENDS = {
     AttentionBackendEnum.FA,
     AttentionBackendEnum.TORCH_SDPA,
 }
-
-
-def rope_params(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
-    return rope_params_polar(max_seq_len, dim, theta)
-
-
-def rope_params_polar(max_seq_len: int, dim: int, theta: int = 10000) -> torch.Tensor:
-    assert dim % 2 == 0
-    freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0
-        / torch.pow(
-            theta,
-            torch.arange(0, dim, 2).to(torch.float64).div(dim),
-        ),
-    )
-    return torch.polar(torch.ones_like(freqs), freqs)
+_is_cuda = current_platform.is_cuda()
 
 
 def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -91,6 +81,77 @@ def _maybe_qk_norm(
     return norm(x)
 
 
+def _sp_shard_lengths(seq_len: int) -> list[int]:
+    sp_size = get_ulysses_parallel_world_size()
+    base, extra = divmod(seq_len, sp_size)
+    return [base + (rank < extra) for rank in range(sp_size)]
+
+
+def _sp_local_slice(seq_lens: list[int]) -> slice:
+    rank = get_ulysses_parallel_rank()
+    begin = sum(seq_lens[:rank])
+    return slice(begin, begin + seq_lens[rank])
+
+
+def _sp_shard_sequence(
+    seqs: torch.Tensor,
+    freqs_cis: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], list[int]]:
+    cos, sin = freqs_cis
+    if seqs.shape[1] != cos.shape[0]:
+        raise ValueError(
+            "DreamZero SP requires matching sequence and frequency lengths, got "
+            f"{seqs.shape[1]} and {cos.shape[0]}"
+        )
+    if get_ulysses_parallel_world_size() == 1:
+        return seqs, freqs_cis, [seqs.shape[1]]
+
+    seq_lens = _sp_shard_lengths(seqs.shape[1])
+    local = _sp_local_slice(seq_lens)
+    return seqs[:, local], (cos[local], sin[local]), seq_lens
+
+
+def _sp_shard_tensor(tensor: torch.Tensor, seq_lens: list[int]) -> torch.Tensor:
+    if get_ulysses_parallel_world_size() == 1:
+        return tensor
+    if tensor.shape[1] != sum(seq_lens):
+        raise ValueError(
+            "DreamZero SP tensor length does not match shard plan: "
+            f"got {tensor.shape[1]}, expected {sum(seq_lens)}"
+        )
+    return tensor[:, _sp_local_slice(seq_lens)]
+
+
+def _sp_gather_tensor(tensor: torch.Tensor, seq_lens: list[int]) -> torch.Tensor:
+    sp_size = get_ulysses_parallel_world_size()
+    if sp_size == 1:
+        return tensor
+    rank = get_ulysses_parallel_rank()
+    if tensor.shape[1] != seq_lens[rank]:
+        raise ValueError(
+            "DreamZero local tensor length does not match shard plan: "
+            f"got {tensor.shape[1]}, expected {seq_lens[rank]}"
+        )
+
+    max_seq_len = max(seq_lens)
+    if tensor.shape[1] < max_seq_len:
+        pad = tensor.new_zeros(
+            tensor.shape[0], max_seq_len - tensor.shape[1], *tensor.shape[2:]
+        )
+        tensor = torch.cat([tensor, pad], dim=1)
+
+    gathered = [torch.empty_like(tensor) for _ in range(sp_size)]
+    torch.distributed.all_gather(
+        gathered,
+        tensor.contiguous(),
+        group=get_sp_group().ulysses_group,
+    )
+    return torch.cat(
+        [chunk[:, :seq_len] for chunk, seq_len in zip(gathered, seq_lens)],
+        dim=1,
+    )
+
+
 def align_modulation(
     parts: tuple[torch.Tensor, ...], target_len: int
 ) -> tuple[torch.Tensor, ...]:
@@ -105,6 +166,27 @@ def align_modulation(
             repeat = (target_len + part_len - 1) // part_len
             aligned.append(part.repeat_interleave(repeat, dim=1)[:, :target_len])
     return tuple(aligned)
+
+
+def _apply_rope_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos, sin = freqs_cis
+    if _is_cuda:
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32).contiguous(),
+                sin.to(dtype=torch.float32).contiguous(),
+            ],
+            dim=-1,
+        )
+        return apply_flashinfer_rope_qk_inplace(q, k, cos_sin_cache, is_neox=False)
+    return (
+        _apply_rotary_emb(q, cos, sin, is_neox_style=False),
+        _apply_rotary_emb(k, cos, sin, is_neox_style=False),
+    )
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -174,39 +256,6 @@ class MultiEmbodimentActionEncoder(nn.Module):
         return self.W3(x, cat_ids)
 
 
-def rope_action_apply_polar(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int | None = None,
-    num_state_per_block: int | None = None,
-) -> torch.Tensor:
-    batch, seq_len, num_heads, _ = x.shape
-    out_dtype = x.dtype
-    x = torch.view_as_complex(
-        x.to(torch.float64).reshape(batch, seq_len, num_heads, -1, 2)
-    )
-
-    if action_register_length is not None:
-        assert num_action_per_block is not None
-        assert num_state_per_block is not None
-        chunk_size = action_register_length // (
-            num_action_per_block + num_state_per_block
-        )
-        freqs_action = freqs_action[: chunk_size * num_action_per_block].view(
-            chunk_size * num_action_per_block, 1, -1
-        )
-        freqs_state = freqs_state[: chunk_size * num_state_per_block].view(
-            chunk_size * num_state_per_block, 1, -1
-        )
-        freqs = torch.cat([freqs, freqs_action, freqs_state], dim=0)
-
-    freqs = freqs.unsqueeze(0)
-    return torch.view_as_real(x * freqs).flatten(3).to(out_dtype)
-
-
 class DreamZeroT2VCrossAttention(nn.Module):
     def __init__(
         self,
@@ -224,6 +273,7 @@ class DreamZeroT2VCrossAttention(nn.Module):
         )
         self.head_dim = dim // num_heads
         self.use_tensor_parallel = use_tensor_parallel
+
         def linear_out():
             return (
                 RowParallelLinear(
@@ -479,9 +529,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
         action_register_length: int | None,
         kv_cache: torch.Tensor | None = None,
         seq_lens: list[int] | None = None,
@@ -501,20 +549,9 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         ).view(batch, seq_len, self.local_num_heads, self.head_dim)
         v = _linear(self.v, x).view(batch, seq_len, self.local_num_heads, self.head_dim)
 
-        roped_query = rope_action_apply_polar(
-            q,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length=None,
-        ).type_as(v)
-        roped_key = rope_action_apply_polar(
-            k,
-            freqs,
-            freqs_action,
-            freqs_state,
-            action_register_length=None,
-        ).type_as(v)
+        roped_query, roped_key = _apply_rope_qk(q, k, freqs_cis)
+        roped_query = roped_query.type_as(v)
+        roped_key = roped_key.type_as(v)
 
         if seq_lens is None:
             current_video_k = roped_key[:, :video_sequence_length]
@@ -525,12 +562,10 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 torch.cat([kv_cache[1], v], dim=1),
             )
         else:
-            current_video_k = sp_gather_tensor(roped_key, seq_lens)[
+            current_video_k = _sp_gather_tensor(roped_key, seq_lens)[
                 :, :video_sequence_length
             ]
-            current_video_v = sp_gather_tensor(v, seq_lens)[
-                :, :video_sequence_length
-            ]
+            current_video_v = _sp_gather_tensor(v, seq_lens)[:, :video_sequence_length]
             out = self._sequence_parallel_attention_with_replicated_prefix(
                 roped_query,
                 roped_key,
@@ -640,9 +675,7 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         e: torch.Tensor,
-        freqs: torch.Tensor,
-        freqs_action: torch.Tensor,
-        freqs_state: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
         action_register_length: int | None,
         context: torch.Tensor,
         kv_cache: torch.Tensor | None = None,
@@ -660,9 +693,7 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         )
         y, updated_kv_cache = self.self_attn(
             x=self_attn_input,
-            freqs=freqs,
-            freqs_action=freqs_action,
-            freqs_state=freqs_state,
+            freqs_cis=freqs_cis,
             action_register_length=action_register_length,
             kv_cache=kv_cache,
             seq_lens=seq_lens,
@@ -868,56 +899,56 @@ class DreamZeroCausalWanModel(CachableDiT):
         self.head = DreamZeroCausalHead(dim, out_dim, patch_size, eps)
 
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        self._init_rope_freqs(torch.device("cpu"))
+        head_dim = dim // num_heads
+        rope_dtype = (
+            torch.float64 if current_platform.is_float64_supported() else torch.float32
+        )
+        self.rope_dim_list = [
+            head_dim - 4 * (head_dim // 6),
+            2 * (head_dim // 6),
+            2 * (head_dim // 6),
+        ]
+        self.rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=self.rope_dim_list,
+            rope_theta=10000,
+            dtype=rope_dtype,
+        )
+        self.action_rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=[head_dim],
+            rope_theta=10000,
+            dtype=rope_dtype,
+        )
+        self.state_rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=[head_dim],
+            rope_theta=10000,
+            dtype=rope_dtype,
+        )
         if model_type in ("i2v", "ti2v"):
             self.img_emb = MLPProj(1280, dim)
 
-    def _init_rope_freqs(self, device: torch.device) -> None:
-        head_dim = self.dim // self.num_heads
-        max_frames, max_height, max_width = self.rope_video_max_positions
-        with torch.device(device):
-            self.freqs_action = rope_params(self.rope_action_max_positions, head_dim)
-            self.freqs_state = rope_params(self.rope_state_max_positions, head_dim)
-            self.freqs = [
-                rope_params(max_frames, head_dim - 4 * (head_dim // 6)),
-                rope_params(max_height, 2 * (head_dim // 6)),
-                rope_params(max_width, 2 * (head_dim // 6)),
-            ]
-
-    def post_load_weights(self) -> None:
-        self._init_rope_freqs(self.patch_embedding.weight.device)
-
-    def _create_freqs(self, grid_size: torch.Tensor, start_frame: int) -> torch.Tensor:
+    def _create_freqs(
+        self, grid_size: torch.Tensor, start_frame: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.patch_embedding.weight.device
-        if any(freq.device != device for freq in self.freqs):
-            self.freqs = [freq.to(device) for freq in self.freqs]
-        if self.freqs_action.device != device:
-            self.freqs_action = self.freqs_action.to(device)
-        if self.freqs_state.device != device:
-            self.freqs_state = self.freqs_state.to(device)
-
         frames, height, width = grid_size.tolist()
-        freqs = torch.cat(
+        t = torch.arange(start_frame, start_frame + frames, device=device)
+        h = torch.arange(height, device=device)
+        w = torch.arange(width, device=device)
+        positions = torch.stack(
             [
-                self.freqs[0][start_frame : start_frame + frames]
-                .view(frames, 1, 1, -1)
-                .expand(frames, height, width, -1),
-                self.freqs[1][:height]
-                .view(1, height, 1, -1)
-                .expand(frames, height, width, -1),
-                self.freqs[2][:width]
-                .view(1, 1, width, -1)
-                .expand(frames, height, width, -1),
+                t.repeat_interleave(height * width),
+                h.repeat_interleave(width).repeat(frames),
+                w.repeat(frames * height),
             ],
-            dim=-1,
-        ).reshape(frames * height * width, 1, -1)
-        return freqs
+            dim=1,
+        )
+        return self.rotary_emb.forward_uncached(positions)
 
     def _forward_blocks(
         self,
         x: torch.Tensor,
         seq_len: int,
-        freqs: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
         timestep: torch.Tensor,
         context: torch.Tensor,
         clip_feature: torch.Tensor | None,
@@ -951,21 +982,30 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         if action_register_length is not None:
             action_state_index = (current_start_frame - 1) // self.num_frame_per_block
-            action_freqs = self.freqs_action[
-                action_state_index
-                * self.num_action_per_block : (action_state_index + 1)
-                * self.num_action_per_block
-            ].view(self.num_action_per_block, 1, -1)
-            state_freqs = self.freqs_state[
-                action_state_index
-                * self.num_state_per_block : (action_state_index + 1)
-                * self.num_state_per_block
-            ].view(self.num_state_per_block, 1, -1)
-            freqs = torch.cat([freqs, action_freqs, state_freqs], dim=0)
+            action_positions = torch.arange(
+                action_state_index * self.num_action_per_block,
+                (action_state_index + 1) * self.num_action_per_block,
+                device=x.device,
+            ).unsqueeze(1)
+            state_positions = torch.arange(
+                action_state_index * self.num_state_per_block,
+                (action_state_index + 1) * self.num_state_per_block,
+                device=x.device,
+            ).unsqueeze(1)
+            action_cos, action_sin = self.action_rotary_emb.forward_uncached(
+                action_positions
+            )
+            state_cos, state_sin = self.state_rotary_emb.forward_uncached(
+                state_positions
+            )
+            freqs_cis = (
+                torch.cat([freqs_cis[0], action_cos, state_cos], dim=0),
+                torch.cat([freqs_cis[1], action_sin, state_sin], dim=0),
+            )
 
         seq_lens = None
         if enable_sequence_parallel:
-            x, freqs, seq_lens = sp_shard_sequence(x, freqs)
+            x, freqs_cis, seq_lens = _sp_shard_sequence(x, freqs_cis)
 
         if num_timestep_frames <= seq_len:
             repeat = (seq_len + num_timestep_frames - 1) // num_timestep_frames
@@ -997,7 +1037,7 @@ class DreamZeroCausalWanModel(CachableDiT):
         e0 = self.time_projection(e).unflatten(dim=2, sizes=(6, self.dim))
         if enable_sequence_parallel:
             assert seq_lens is not None
-            e0 = sp_shard_tensor(e0, seq_lens)
+            e0 = _sp_shard_tensor(e0, seq_lens)
 
         context = self.text_embedding(context)
         if clip_feature is not None:
@@ -1008,9 +1048,7 @@ class DreamZeroCausalWanModel(CachableDiT):
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
-                freqs=freqs,
-                freqs_action=self.freqs_action,
-                freqs_state=self.freqs_state,
+                freqs_cis=freqs_cis,
                 context=context,
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index],
@@ -1026,7 +1064,7 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         if enable_sequence_parallel:
             assert seq_lens is not None
-            x = sp_gather_tensor(x, seq_lens)
+            x = _sp_gather_tensor(x, seq_lens)
 
         if action is not None:
             action_noise_pred = x[:, seq_len : seq_len + action_length]
@@ -1065,12 +1103,14 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         x = self.patch_embedding(x)
         grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
-        freqs = self._create_freqs(grid_size=grid_size, start_frame=current_start_frame)
+        freqs_cis = self._create_freqs(
+            grid_size=grid_size, start_frame=current_start_frame
+        )
 
         x_video, action_noise_pred, updated_kv_caches = self._forward_blocks(
             x=x,
             seq_len=seq_len,
-            freqs=freqs,
+            freqs_cis=freqs_cis,
             timestep=timestep,
             context=context,
             clip_feature=clip_feature,

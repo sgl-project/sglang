@@ -55,8 +55,6 @@ def dreamzero_t5_postprocess_text(
 
 @dataclass
 class DreamZeroPipelineConfig(PipelineConfig):
-    """Configuration for the DreamZero DROID one-shot action pipeline."""
-
     # DreamZero is a WAM-style policy, exposed through the shared action endpoint.
     task_type: ModelTaskType = ModelTaskType.VLA_ACTION
 

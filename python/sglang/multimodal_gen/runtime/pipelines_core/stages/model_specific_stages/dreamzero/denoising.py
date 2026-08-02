@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from typing import Any
 
 import msgspec
@@ -14,17 +16,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
-    BRANCH_COND,
-    BRANCH_UNCOND,
-    DreamZeroCachePoolManager,
-    DreamZeroRequestCache,
-    record_session_timing,
-)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -32,6 +27,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
+    BRANCH_COND,
+    BRANCH_UNCOND,
+    DreamZeroCachePoolManager,
+    DreamZeroRequestCache,
+    record_session_timing,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -112,6 +114,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = scheduler
         self.cache_manager = cache_manager
+        self._scheduler_step = self._build_scheduler_step(scheduler)
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -391,8 +394,22 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             use_dynamic_shifting=False,
         )
 
+    @classmethod
+    def _build_scheduler_step(
+        cls,
+        scheduler: Any | None,
+    ) -> Callable[..., torch.Tensor]:
+        scheduler_cls = (
+            scheduler.__class__
+            if scheduler is not None
+            else FlowUniPCMultistepScheduler
+        )
+        if "step_index" in inspect.signature(scheduler_cls.step).parameters:
+            return cls._scheduler_step_with_index
+        return cls._scheduler_step_without_index
+
     @staticmethod
-    def _scheduler_step(
+    def _scheduler_step_with_index(
         scheduler: Any,
         *,
         model_output: torch.Tensor,
@@ -400,23 +417,30 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         sample: torch.Tensor,
         step_index: int,
     ) -> torch.Tensor:
-        try:
-            return scheduler.step(
-                model_output=model_output,
-                timestep=timestep,
-                sample=sample,
-                step_index=step_index,
-                return_dict=False,
-            )[0]
-        except TypeError as exc:
-            if "step_index" not in str(exc):
-                raise
-            return scheduler.step(
-                model_output=model_output,
-                timestep=timestep,
-                sample=sample,
-                return_dict=False,
-            )[0]
+        return scheduler.step(
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            step_index=step_index,
+            return_dict=False,
+        )[0]
+
+    @staticmethod
+    def _scheduler_step_without_index(
+        scheduler: Any,
+        *,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        step_index: int,
+    ) -> torch.Tensor:
+        del step_index
+        return scheduler.step(
+            model_output=model_output,
+            timestep=timestep,
+            sample=sample,
+            return_dict=False,
+        )[0]
 
     def _validate_dreamzero_batch(self, batch: Req) -> None:
         if not batch.dreamzero_inputs:
@@ -930,8 +954,6 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
 
 
 class DreamZeroActionOutputStage(PipelineStage):
-    """Publish normalized DreamZero action chunks as pipeline output."""
-
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(

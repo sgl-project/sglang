@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import types
 import time
+import types
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,6 +10,18 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
+    ImageEncoderLoader,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     DreamZeroCachePool,
     DreamZeroCachePoolManager,
@@ -17,25 +29,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
     normalize_batched_session_fields,
     record_session_timing,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentUse,
-)
-from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
-    ImageEncoderLoader,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
-    ImageEncodingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    infer_dreamzero_batch_size,
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum, current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -197,8 +197,6 @@ def _dreamzero_videos(batch: Req) -> torch.Tensor:
 
 
 class DreamZeroObsPrepStage(PipelineStage):
-    """Prepare DreamZero request-local observation inputs."""
-
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
@@ -240,8 +238,14 @@ class DreamZeroObsPrepStage(PipelineStage):
                     model_inputs[key] = value.to(dtype=torch.bfloat16)
 
         batch.dreamzero_inputs = model_inputs
-        batch_size = infer_dreamzero_batch_size(
-            model_inputs.get(k) for k in ("images", "videos", "state")
+        batch_size = next(
+            int(value.shape[0])
+            for value in (
+                model_inputs.get("images"),
+                model_inputs.get("videos"),
+                model_inputs.get("state"),
+            )
+            if torch.is_tensor(value) and value.ndim > 0
         )
         session_ids, reset_mask = normalize_batched_session_fields(
             session_ids=batch.extra.get("dreamzero_session_ids"),
@@ -259,8 +263,6 @@ class DreamZeroObsPrepStage(PipelineStage):
 
 
 class DreamZeroVisualEncodingStage(ImageEncodingStage):
-    """Encode DreamZero visual context into CLIP and VAE conditioning tensors."""
-
     deduplicated_output_fields = ()
 
     def __init__(

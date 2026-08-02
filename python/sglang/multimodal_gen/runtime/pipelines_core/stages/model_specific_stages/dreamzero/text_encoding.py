@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
     BRANCH_COND,
     BRANCH_UNCOND,
@@ -15,23 +16,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
     apply_request_lifecycle_resets,
     resolve_request_cache,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.utils import (
-    infer_dreamzero_batch_size,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class DreamZeroTextEncodingStage(TextEncodingStage):
-    """DreamZero text stage with session-cache aware prompt embeddings."""
-
     def __init__(
         self,
         text_encoder: torch.nn.Module | None = None,
@@ -157,9 +154,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
     ) -> None:
         batch.dreamzero_cfg_branch_index = None
         batch.prompt_embeds = prompt_embs[0]
-        batch.negative_prompt_embeds = (
-            prompt_embs[1] if len(prompt_embs) > 1 else None
-        )
+        batch.negative_prompt_embeds = prompt_embs[1] if len(prompt_embs) > 1 else None
         batch.dreamzero_prompt_embs = prompt_embs
 
     def _encode_prompt_texts(
@@ -189,7 +184,9 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         )
         prompt = self._fit_text_len(prompt_embeds_list[0], text_len)
         attention_mask = prompt_masks_list[0] if prompt_masks_list else None
-        return self._mask_prompt_padding(prompt, attention_mask).to(dtype=torch.bfloat16)
+        return self._mask_prompt_padding(prompt, attention_mask).to(
+            dtype=torch.bfloat16
+        )
 
     @staticmethod
     def _local_attn_size(server_args: ServerArgs) -> int:
@@ -216,7 +213,11 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         inputs: dict[str, Any] = batch.dreamzero_inputs
-        batch_size = infer_dreamzero_batch_size(inputs.values())
+        batch_size = next(
+            int(value.shape[0])
+            for value in inputs.values()
+            if torch.is_tensor(value) and value.ndim > 0
+        )
         self._ensure_prompt_extra(batch, batch_size)
         request_cache = resolve_request_cache(
             batch,

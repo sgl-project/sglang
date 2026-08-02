@@ -9,8 +9,6 @@ from sglang.multimodal_gen.configs.sample.vla import VLASamplingParams
 
 @dataclass
 class DreamZeroSamplingParams(VLASamplingParams):
-    """Request parameters for DreamZero observation-to-action inference."""
-
     prompt: str | list[str] | None = None
     negative_prompt: str = ""
 

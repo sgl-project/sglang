@@ -3,13 +3,13 @@ import types
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
-    DreamZeroPipelineConfig,
-)
 from sglang.multimodal_gen.configs.models.dits.dreamzero_causal import (
     DreamZeroCausalWanArchConfig,
     DreamZeroCausalWanConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
+    DreamZeroPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.dreamzero import DreamZeroSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -26,26 +26,19 @@ from sglang.multimodal_gen.runtime.entrypoints.vla.protocol import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
-    BRANCH_COND,
-    BRANCH_UNCOND,
-    DreamZeroCachePoolManager,
-    apply_request_lifecycle_resets,
-    normalize_batched_session_fields,
-    resolve_request_cache,
-)
+from sglang.multimodal_gen.runtime.models.dits import dreamzero_causal as dreamzero_dit
 from sglang.multimodal_gen.runtime.models.dits.dreamzero_causal import (
-    DreamZeroCausalWanSelfAttention,
     DreamZeroCausalWanModel,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero import (
-    utils as dreamzero_utils,
+    DreamZeroCausalWanSelfAttention,
 )
 from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import (
     DreamZeroPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.denoising import (
     DreamZeroActionOutputStage,
@@ -54,11 +47,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.image_encoding import (
     DreamZeroVisualEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
+    BRANCH_COND,
+    BRANCH_UNCOND,
+    DreamZeroCachePoolManager,
+    apply_request_lifecycle_resets,
+    normalize_batched_session_fields,
+    resolve_request_cache,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
-    ImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -106,7 +104,9 @@ class _FakeTokenizer:
         return _FakeTokenizedText(input_ids, attention_mask)
 
 
-def _make_text_server_args(*, enable_cfg_parallel: bool = False) -> types.SimpleNamespace:
+def _make_text_server_args(
+    *, enable_cfg_parallel: bool = False
+) -> types.SimpleNamespace:
     server_args = types.SimpleNamespace(
         enable_cfg_parallel=enable_cfg_parallel,
         pipeline_config=DreamZeroPipelineConfig(),
@@ -213,11 +213,12 @@ def test_dreamzero_dit_rope_lengths_are_configurable():
         config=config,
     )
 
-    assert model.freqs[0].shape[0] == 7
-    assert model.freqs[1].shape[0] == 8
-    assert model.freqs[2].shape[0] == 9
-    assert model.freqs_action.shape[0] == 10
-    assert model.freqs_state.shape[0] == 11
+    assert model.rope_video_max_positions == (7, 8, 9)
+    assert model.rope_action_max_positions == 10
+    assert model.rope_state_max_positions == 11
+    assert model.rotary_emb.rope_dim_list == [8, 4, 4]
+    assert model.action_rotary_emb.rope_dim_list == [16]
+    assert model.state_rotary_emb.rope_dim_list == [16]
 
 
 def test_dreamzero_dit_keeps_cross_attention_norm_for_native_loading(monkeypatch):
@@ -286,16 +287,12 @@ def test_dreamzero_cached_self_attention_attends_prefix_and_current_tokens(monke
     stage.attn = fake_attn
 
     x = torch.randn(1, 4, 8)
-    freqs = torch.ones(4, 1, 2, dtype=torch.complex64)
-    freqs_action = torch.ones(8, 2, dtype=torch.complex64)
-    freqs_state = torch.ones(8, 2, dtype=torch.complex64)
+    freqs_cis = (torch.ones(4, 2), torch.zeros(4, 2))
     kv_cache = torch.zeros(2, 1, 0, 2, 4)
 
     output, updated_cache = stage(
         x=x,
-        freqs=freqs,
-        freqs_action=freqs_action,
-        freqs_state=freqs_state,
+        freqs_cis=freqs_cis,
         action_register_length=None,
         kv_cache=kv_cache,
     )
@@ -313,20 +310,20 @@ def test_dreamzero_cached_self_attention_attends_prefix_and_current_tokens(monke
 
 def test_dreamzero_global_sequence_shard_includes_action_state(monkeypatch):
     seqs = torch.arange(10, dtype=torch.float32).reshape(1, 5, 2)
-    freqs = torch.ones(5, 1, 1, dtype=torch.complex64)
+    freqs = (torch.ones(5, 4), torch.zeros(5, 4))
 
-    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 0)
-    local0, freqs0, seq_lens = dreamzero_utils.sp_shard_sequence(seqs, freqs)
+    monkeypatch.setattr(dreamzero_dit, "get_ulysses_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(dreamzero_dit, "get_ulysses_parallel_rank", lambda: 0)
+    local0, freqs0, seq_lens = dreamzero_dit._sp_shard_sequence(seqs, freqs)
 
-    monkeypatch.setattr(dreamzero_utils, "get_ulysses_parallel_rank", lambda: 1)
-    local1, freqs1, _ = dreamzero_utils.sp_shard_sequence(seqs, freqs)
+    monkeypatch.setattr(dreamzero_dit, "get_ulysses_parallel_rank", lambda: 1)
+    local1, freqs1, _ = dreamzero_dit._sp_shard_sequence(seqs, freqs)
 
     assert seq_lens == [3, 2]
     assert torch.equal(local0, seqs[:, :3])
     assert torch.equal(local1, seqs[:, 3:])
-    assert freqs0.shape[0] == 3
-    assert freqs1.shape[0] == 2
+    assert freqs0[0].shape[0] == 3
+    assert freqs1[0].shape[0] == 2
 
 
 def test_dreamzero_text_stage_inherits_standard_text_encoding_and_preserves_folding():
@@ -635,9 +632,15 @@ def test_dreamzero_scheduler_step_supports_optional_step_index():
     sample = torch.tensor([3.0])
     model_output = torch.tensor([1.0])
     timestep = torch.tensor(4)
+    step_with_index = DreamZeroCausalDenoisingStage._build_scheduler_step(
+        SchedulerWithStepIndex()
+    )
+    step_without_index = DreamZeroCausalDenoisingStage._build_scheduler_step(
+        SchedulerWithoutStepIndex()
+    )
 
     assert torch.equal(
-        DreamZeroCausalDenoisingStage._scheduler_step(
+        step_with_index(
             SchedulerWithStepIndex(),
             model_output=model_output,
             timestep=timestep,
@@ -647,7 +650,7 @@ def test_dreamzero_scheduler_step_supports_optional_step_index():
         torch.tensor([2.0]),
     )
     assert torch.equal(
-        DreamZeroCausalDenoisingStage._scheduler_step(
+        step_without_index(
             SchedulerWithoutStepIndex(),
             model_output=model_output,
             timestep=timestep,

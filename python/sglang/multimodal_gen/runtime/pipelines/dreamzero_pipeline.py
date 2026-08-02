@@ -17,9 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_world_size,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
-    DreamZeroCachePoolManager,
-)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -34,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
     DreamZeroObsPrepStage,
     DreamZeroVisualEncodingStage,
     load_dreamzero_image_encoder,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.session_cache import (
+    DreamZeroCachePoolManager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.dreamzero.text_encoding import (
     DreamZeroTextEncodingStage,
@@ -136,8 +136,8 @@ class DreamZeroPipeline(ComposedPipelineBase):
             )
 
         server_args.pipeline_config.dit_config.arch_config.use_tensor_parallel = (
-            (getattr(server_args, "tp_size", 1) or 1) > 1
-        )
+            getattr(server_args, "tp_size", 1) or 1
+        ) > 1
         modules["image_encoder"] = load_dreamzero_image_encoder(
             server_args,
             self._resolve_component_path(server_args, "image_encoder", "image_encoder"),
