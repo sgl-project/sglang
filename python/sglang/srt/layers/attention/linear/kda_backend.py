@@ -890,8 +890,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
         # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # specialized per block size, with a single-request width-16 split-V path.
+        if not (
+            2 <= draft_token_num <= 8
+            or (draft_token_num == 16 and mixed_qkv.shape[0] == 16)
+        ):
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -969,11 +972,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
-            fused_kda_decode_mtp_dspark,
-        )
-
         seq_len = mixed_qkv.shape[0]
+        split_v = seq_len == 16 and query_start_loc.shape[0] == 2
+        if split_v:
+            from sglang.kernels.ops.kimi_k3.kda_decode_mtp_split import (
+                fused_kda_decode_mtp_dspark,
+            )
+        else:
+            from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+                fused_kda_decode_mtp_dspark,
+            )
+
         h = layer.num_v_heads
         x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
@@ -1039,6 +1048,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
+            **({"split_v": True} if split_v else {}),
         )
         if apply_onorm:
             layer._k3_onorm_consumed = True
