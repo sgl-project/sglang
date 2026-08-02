@@ -22,36 +22,28 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
 
-import types
 import unittest
 
+from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.models.laguna import LagunaForCausalLM, LagunaModel
 
 
 def _make_fake_laguna(num_attention_heads_per_layer):
-    """Build a `LagunaModel` stand-in exposing only the config fields
-    `get_hidden_dim` reads, without running `__init__`.
+    """Build a `LagunaModel` stand-in around a real `LagunaConfig`, without
+    running `__init__` (no weights, CPU-only).
 
-    Mirrors a `Laguna-XS.2`-style checkpoint: per-layer Q-head asymmetry
-    (e.g. 48/64) with a single shared KV-head count. The global
-    `num_attention_heads` deliberately equals the *first* layer's count (this
-    is what `LagunaConfig.__init__` does), so any later layer with a different
-    width would break the generic fallback.
+    `head_dim` (128) is deliberately not `hidden_size // num_attention_heads`,
+    matching every real Laguna checkpoint — so the hook must read `head_dim`
+    directly, never derive it. `LagunaConfig` sets the global
+    `num_attention_heads` from the first full-attention layer.
     """
-    num_layers = len(num_attention_heads_per_layer)
-    config = types.SimpleNamespace(
+    config = LagunaConfig(
         hidden_size=2048,
         head_dim=128,
         num_key_value_heads=8,
-        num_attention_heads=num_attention_heads_per_layer[0],
+        num_hidden_layers=len(num_attention_heads_per_layer),
         num_attention_heads_per_layer=list(num_attention_heads_per_layer),
-        num_hidden_layers=num_layers,
-        intermediate_size=8192,
-        moe_intermediate_size=512,
-        n_shared_experts=1,
-        first_k_dense_replace=1,
-        vocab_size=100352,
     )
     model = LagunaModel.__new__(LagunaModel)
     model.config = config
@@ -110,6 +102,14 @@ class TestLagunaPerLayerAttentionDims(unittest.TestCase):
             hook = self.model.get_hidden_dim(module_name, layer_idx=0)
             generic = get_default_hidden_dim(module_name, self.model.config, 0)
             self.assertEqual(hook, generic)
+
+    def test_missing_head_dim_raises_not_derives(self):
+        """Removing the fallback means an absent head_dim fails loudly instead
+        of silently deriving a wrong hidden_size // num_attention_heads."""
+        cfg = self.model.config
+        del cfg.head_dim
+        with self.assertRaises(AttributeError):
+            self.model.get_hidden_dim("o_proj", layer_idx=1)
 
 
 class TestLagunaNonAttentionDelegates(unittest.TestCase):

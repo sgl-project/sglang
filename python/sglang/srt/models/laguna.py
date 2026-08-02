@@ -582,9 +582,8 @@ class LagunaModel(nn.Module):
         module (MLP, MoE, embed, lm_head, ...) to the shared helper.
         """
         config = self.config
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        # No fallback; Laguna's head_dim is non-standard.
+        head_dim = config.head_dim
         num_heads = config.num_attention_heads_per_layer[layer_idx]
         num_kv_heads = config.num_key_value_heads
         if module_name == "qkv_proj":
