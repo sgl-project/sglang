@@ -341,6 +341,7 @@ def expand_request_outputs(
         req.seed = seeds[0]
         req.seeds = None
         req.generator = None
+        req.sampling_params.refresh_request_extra_after_output_expansion(req)
         return [req]
 
     expanded: list[Req] = []
@@ -365,6 +366,9 @@ def expand_request_outputs(
             output_req.output_file_name = _with_output_index_suffix(
                 req.output_file_name, output_index
             )
+        output_req.sampling_params.refresh_request_extra_after_output_expansion(
+            output_req
+        )
         output_req.validate()
         expanded.append(output_req)
 
@@ -487,7 +491,7 @@ def _try_save_cuda_video_direct(
     if video.shape[0] != 3:
         return False
 
-    frames = (video * 255).clamp(0, 255).to(torch.uint8)
+    frames = (video * 255).clamp_(0, 255).to(torch.uint8)
     frames = frames.permute(1, 2, 3, 0).contiguous()
     num_frames, height, width, _ = frames.shape
 
