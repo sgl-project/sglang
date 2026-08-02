@@ -1117,7 +1117,9 @@ def publish_shared_ep_forward_flags(forward_batch: Any) -> None:
         use_shared_ep = get_exec().moe.moe_a2a_backend == "shared_ep"
     except (AttributeError, ValueError):
         use_shared_ep = False
+    force_shared_ep_fallback = False
     if use_shared_ep:
+        import torch
         import torch.distributed as dist
 
         parallel = get_parallel()
@@ -1139,40 +1141,52 @@ def publish_shared_ep_forward_flags(forward_batch: Any) -> None:
                     "before model forward"
                 )
             local_num_tokens = int(input_ids.shape[0])
-        gathered_state: list[tuple[int, int] | None] = [None] * world_size
-        dist.all_gather_object(
+        buffers = get_resources().buffers
+        state_buffers = buffers.get("shared_ep_forward_state_cpu")
+        if state_buffers is None:
+            state_buffers = (
+                torch.empty(2, dtype=torch.int64, device="cpu"),
+                torch.empty(world_size * 2, dtype=torch.int64, device="cpu"),
+            )
+            buffers["shared_ep_forward_state_cpu"] = state_buffers
+        local_state, gathered_state = state_buffers
+        local_state[0] = int(local_num_tokens)
+        local_state[1] = int(mode)
+        dist.all_gather_into_tensor(
             gathered_state,
-            (int(local_num_tokens), int(mode)),
+            local_state,
             group=parallel.moe_ep_group.cpu_group,
         )
-        if any(value is None for value in gathered_state):
-            raise RuntimeError("SharedEP failed to gather every DP forward state")
-        gathered = [value for value in gathered_state if value is not None]
-        global_num_tokens = tuple(value[0] for value in gathered)
+        gathered = gathered_state.view(world_size, 2)
+        global_num_tokens = tuple(int(value) for value in gathered[:, 0])
         mode_type = type(local_mode)
-        gathered_modes = [mode_type(value[1]) for value in gathered]
+        gathered_modes = [mode_type(int(value)) for value in gathered[:, 1]]
         decode_modes = [value for value in gathered_modes if value.is_decode()]
         prefill_modes = [
             value for value in gathered_modes if value.is_extend_without_speculative()
         ]
         if decode_modes:
-            if not all(value.is_decode_or_idle() for value in gathered_modes):
-                raise RuntimeError(
-                    f"SharedEP ranks disagree on decode phase: {gathered_modes}"
-                )
-            mode = decode_modes[0]
+            if all(value.is_decode_or_idle() for value in gathered_modes):
+                mode = decode_modes[0]
+            else:
+                force_shared_ep_fallback = True
         elif prefill_modes:
-            if not all(
+            if all(
                 value.is_extend_without_speculative() or value.is_idle()
                 for value in gathered_modes
             ):
-                raise RuntimeError(
-                    f"SharedEP ranks disagree on prefill phase: {gathered_modes}"
-                )
-            mode = prefill_modes[0]
+                mode = prefill_modes[0]
+            else:
+                force_shared_ep_fallback = True
         counts_synchronized = True
-    forward.set("shared_ep_is_decode", mode.is_decode())
-    forward.set("shared_ep_is_prefill", mode.is_extend_without_speculative())
+    forward.set(
+        "shared_ep_is_decode",
+        mode.is_decode() and not force_shared_ep_fallback,
+    )
+    forward.set(
+        "shared_ep_is_prefill",
+        mode.is_extend_without_speculative() and not force_shared_ep_fallback,
+    )
     forward.set(
         "shared_ep_global_num_tokens",
         global_num_tokens,

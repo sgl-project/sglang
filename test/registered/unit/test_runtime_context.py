@@ -751,6 +751,8 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_shared_ep_gathers_rank_consistent_counts_before_forward(self):
         from types import SimpleNamespace
 
+        import torch
+
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.runtime_context import (
             get_forward,
@@ -766,17 +768,22 @@ class TestForwardFlags(_IsolatedServerArgs):
 
         def gather_counts(output, value, *, group):
             self.assertEqual(group, "cpu_group")
-            self.assertEqual(value, (3, int(ForwardMode.DECODE)))
-            output[:] = [
-                (3, int(ForwardMode.DECODE)),
-                (4, int(ForwardMode.IDLE)),
-                (2, int(ForwardMode.IDLE)),
-                (1, int(ForwardMode.IDLE)),
-                (1, int(ForwardMode.IDLE)),
-                (1, int(ForwardMode.IDLE)),
-                (1, int(ForwardMode.IDLE)),
-                (1, int(ForwardMode.IDLE)),
-            ]
+            self.assertEqual(value.tolist(), [3, int(ForwardMode.DECODE)])
+            output.copy_(
+                torch.tensor(
+                    [
+                        (3, int(ForwardMode.DECODE)),
+                        (4, int(ForwardMode.IDLE)),
+                        (2, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                    ],
+                    dtype=torch.int64,
+                ).view(-1)
+            )
 
         reset_context()
         with (
@@ -792,7 +799,7 @@ class TestForwardFlags(_IsolatedServerArgs):
             ),
             patch("torch.distributed.get_world_size", return_value=8),
             patch(
-                "torch.distributed.all_gather_object",
+                "torch.distributed.all_gather_into_tensor",
                 side_effect=gather_counts,
             ),
         ):
@@ -812,6 +819,74 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertTrue(get_forward().shared_ep_counts_synchronized)
         self.assertTrue(get_forward().shared_ep_is_decode)
         self.assertFalse(get_forward().shared_ep_is_prefill)
+
+    def test_shared_ep_mixed_dp_phases_force_materialized_fallback(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        parallel = SimpleNamespace(
+            moe_ep_group=SimpleNamespace(cpu_group="cpu_group"),
+            moe_ep_size=8,
+            attn_dp_size=8,
+            attn_dp_rank=0,
+        )
+
+        def gather_state(output, value, *, group):
+            self.assertEqual(group, "cpu_group")
+            self.assertEqual(value.tolist(), [1024, int(ForwardMode.EXTEND)])
+            output.copy_(
+                torch.tensor(
+                    [
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1, int(ForwardMode.DECODE)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                    ],
+                    dtype=torch.int64,
+                ).view(-1)
+            )
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="shared_ep")
+                ),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=parallel,
+            ),
+            patch("torch.distributed.get_world_size", return_value=8),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=gather_state,
+            ),
+        ):
+            publish_shared_ep_forward_flags(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    global_forward_mode=None,
+                    shared_ep_generation=0,
+                    global_num_tokens_cpu=(1024,),
+                )
+            )
+
+        self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+        self.assertTrue(get_forward().shared_ep_counts_synchronized)
 
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward
