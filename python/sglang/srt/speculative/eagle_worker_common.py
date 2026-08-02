@@ -191,10 +191,10 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_cuda_graph:
+    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
@@ -204,7 +204,7 @@ def prepare_for_draft_extend(
         # On NPU with --disable-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
-        if not is_npu() or can_cuda_graph:
+        if not is_npu() or can_run_decode_cuda_graph:
             forward_batch.mark_forward_metadata_ready()
     return forward_batch
 
@@ -307,10 +307,10 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph
 
 
 def build_eagle_verify_input(
@@ -351,9 +351,7 @@ def build_eagle_verify_input(
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
     else:
         mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
-        tree_mask_buf = (
-            verify_mask.buffer if verify_mask.fits(bs, num_draft_tokens) else None
-        )
+        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
     # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
