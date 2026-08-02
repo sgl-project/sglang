@@ -64,6 +64,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         override_kv_cache_dim: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        from sglang.srt.layers.dcp.comm import dcp_enabled, get_attention_dcp_world_size
+
+        if dcp_enabled():
+            assert (
+                page_size % get_attention_dcp_world_size() == 0
+            ), "page_size must be divisible by the attention DCP world size"
+            page_size = page_size // get_attention_dcp_world_size()
         super().__init__(
             device_pool,
             host_to_device_ratio,
