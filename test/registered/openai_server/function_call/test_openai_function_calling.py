@@ -63,7 +63,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
     def test_function_calling_format(self):
         """
         Test: Whether the function call format returned by the AI is correct.
-        When returning a tool call, message.content should be None, and tool_calls should be a list.
+        Require a tool call so this tests the response format rather than the
+        model's stochastic decision to call a tool. message.content should be
+        None, and tool_calls should be a list.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -103,6 +105,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             top_p=0.8,
             stream=False,
             tools=tools,
+            tool_choice="required",
         )
 
         tool_calls = response.choices[0].message.tool_calls

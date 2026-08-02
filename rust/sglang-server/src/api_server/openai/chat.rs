@@ -13,7 +13,7 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::Annotated;
+use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -30,7 +30,7 @@ use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
-    parse_chat_tool_calls, parse_streaming_tool_calls,
+    parse_chat_tool_calls,
 };
 use super::{
     AppState, ChatFormatter, collect_output, contains_media, indexed_egress_stream, openai_error,
@@ -262,8 +262,8 @@ pub(super) async fn prepare_chat_request(
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
 /// handler: endpoint defaults → tool-choice validation + constraint → clamp.
-/// Shared by the chat and responses handlers; the tool-choice checks run
-/// regardless of whether a parser is configured (see `apply_tool_constraint`).
+/// The tool-choice checks run regardless of whether a parser is configured
+/// (see `apply_tool_constraint`).
 pub(super) fn chat_sampling(
     request: &CreateChatCompletionRequest,
     defaults: SamplingDefaults,
@@ -307,11 +307,11 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
         OneOrMany::One(one) => vec![one],
         OneOrMany::Many(many) => many,
     };
-    match &request.stop {
-        Some(Stop::String(one)) => stops.push(one.clone()),
-        Some(Stop::StringArray(many)) => stops.extend(many.iter().cloned()),
-        Some(Stop::TokenIdArray(_)) => return,
-        None => {}
+    if let Some(request_stop) = &request.stop {
+        let Some(request_stops) = request_stop.strings() else {
+            return;
+        };
+        stops.extend(request_stops);
     }
     request.stop = Some(Stop::StringArray(stops));
 }
@@ -722,17 +722,12 @@ pub(super) fn chat_event_stream(
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
     > = if let Some(parser) = parser {
-        let starts_immediately = !uses_tool_call_structural_tag
-            && matches!(
-                tool_choice,
-                Some(ChatCompletionToolChoiceOption::Required)
-                    | Some(ChatCompletionToolChoiceOption::Named(_))
-            );
-        Box::pin(parse_streaming_tool_calls(
-            raw,
-            dynamo_parser_name(&parser).to_owned(),
+        Box::pin(apply_tool_calling_jail(
+            Some(dynamo_parser_name(&parser).to_owned()),
+            tool_choice,
             tools,
-            starts_immediately,
+            uses_tool_call_structural_tag,
+            raw,
         ))
     } else {
         Box::pin(raw)

@@ -1,4 +1,4 @@
-//! Tool-choice constraints and streaming tool-call parsing.
+//! Tool-choice constraints and unary tool-call parsing.
 //!
 //! Two complementary mechanisms, mirroring the Python frontend
 //! (`serving_chat.py` + dynamo-parsers):
@@ -8,11 +8,9 @@
 //!   when strict tools need the llama3 triggered-tag format), otherwise a
 //!   `json_schema` array restricting the output to tool calls. It validates
 //!   `tool_choice`/`tools` agreement first.
-//! - [`parse_streaming_tool_calls`] / [`parse_chat_tool_calls`] strip the
-//!   model's tool-call markers out of the *output*: the streaming form buffers
-//!   text until a complete call is available (so a marker split across chunks
-//!   never leaks), the unary form parses the finished content. Both return the
-//!   calls alongside any non-tool text.
+//! - [`parse_chat_tool_calls`] strips the model's tool-call markers out of a
+//!   finished response. Streaming responses use Dynamo's
+//!   `apply_tool_calling_jail` directly in `chat.rs`.
 //!
 //! [`dynamo_parser_name`] canonicalizes the SGLang CLI parser names onto the
 //! dynamo-parsers registry keys, [`chat_delta`] builds the stream deltas these
@@ -21,316 +19,40 @@
 //!
 //! # Test coverage
 //!
-//! The `tests` module below covers each item directly: the marker-suffix
-//! holdback ([`partial_marker_suffix_len`]), parser-name canonicalization,
-//! every `tool_choice` branch of [`apply_tool_constraint`] (required/named
-//! schemas, the strict llama3 triggered tag, validation failures, no-ops),
-//! the streaming state machine (whole-call buffering, split markers, release
-//! at done, `tool_calls` finish rewriting), unary parsing (marker formats and
-//! the no-parser passthrough), and the finish-reason mapping. The end-to-end
-//! wiring is covered where the pieces are assembled in `chat.rs` (streaming
-//! deltas, role framing, and reasoning).
-
-use std::collections::HashMap;
+//! The tests cover parser-name canonicalization, every `tool_choice` branch of
+//! [`apply_tool_constraint`], Dynamo's streaming jail integration, unary
+//! parsing, and finish-reason mapping.
 
 use dynamo_parsers::parsers::get_tool_parser_map;
-use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{
     StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
-    ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig, detect_tool_call_start,
-    find_tool_call_end_position, try_tool_call_parse_aggregate,
+    ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig,
     try_tool_call_parse_aggregate_finalize,
 };
 use dynamo_protocols::types::{
-    ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
+    ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
-    ChatCompletionToolChoiceOption, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
+    ChatCompletionToolChoiceOption, FinishReason as OpenAIFinishReason, FunctionCall, FunctionType,
+    Role,
 };
-use futures::StreamExt;
 
 use crate::message::{ChunkEvent, SamplingParams};
 
-/// Per-choice state of the streaming parser: the text buffered since the last
-/// emission, whether the current buffer has entered a tool-call marker, and
-/// how many calls were already emitted (which rewrites the terminal
-/// `finish_reason` to `tool_calls`).
-#[derive(Default)]
-struct StreamingToolState {
-    buffered: String,
-    parsing_tool: bool,
-    emitted_calls: usize,
-}
-
-/// How many trailing characters of `text` form a proper prefix of one of the
-/// start markers. Those characters must be held back until the next chunk (or
-/// released at `done`), so a marker split across chunks is never flushed into
-/// the output as literal text. Returns 0 when nothing is a partial marker.
-fn partial_marker_suffix_len(text: &str, markers: &[String]) -> usize {
-    markers
-        .iter()
-        .flat_map(|marker| text.char_indices().map(move |(start, _)| (marker, start)))
-        .filter_map(|(marker, start)| {
-            let suffix = &text[start..];
-            (suffix.len() < marker.len() && marker.starts_with(suffix)).then_some(suffix.len())
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// Map a stream of chat deltas through the Dynamo tool-call parser, splitting
-/// tool calls out of `content` into `tool_calls` deltas.
-///
-/// `parser` is the configured tool-call parser name (see
-/// [`dynamo_parser_name`]); `tools` are the request's definitions, used to
-/// recover from malformed calls. `starts_immediately` is true when the request
-/// carried no structural-tag constraint, so generation can begin in the middle
-/// of a call and parsing must start before any start marker arrives.
-///
-/// The stream is buffered until a complete call parses — each emitted item
-/// carries either plain text (possibly truncated at a partial start marker)
-/// or one or more tool-call chunks. When the underlying stream finished
-/// (`finish_reason` set), the terminal item's reason becomes `tool_calls` if
-/// any call was emitted, and an incomplete marker is released as literal text.
-///
-/// `parser` must already be canonicalized (the callers apply
-/// [`dynamo_parser_name`] before entering this function).
-pub(super) fn parse_streaming_tool_calls<S>(
-    stream: S,
-    parser: String,
-    tools: Option<Vec<ToolDefinition>>,
-    starts_immediately: bool,
-) -> impl futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send
-where
-    S: futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
-{
-    let start_markers = get_tool_parser_map()
-        .get(parser.as_str())
-        .map(|config| {
-            config
-                .parser_config
-                .tool_call_start_tokens()
-                .into_iter()
-                .filter(|marker| !marker.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    async_stream::stream! {
-        let mut states = HashMap::<u32, StreamingToolState>::new();
-        futures::pin_mut!(stream);
-        while let Some(item) = stream.next().await {
-            let Some(response) = item.data.as_ref() else {
-                yield item;
-                continue;
-            };
-            if response.choices.is_empty() {
-                yield item;
-                continue;
-            }
-
-            let mut emitted = Vec::new();
-            for choice in &response.choices {
-                let Some(ChatCompletionMessageContent::Text(content)) =
-                    choice.delta.content.as_ref()
-                else {
-                    if choice.finish_reason.is_some()
-                        && let Some(state) = states.get_mut(&choice.index)
-                        && !state.buffered.is_empty()
-                    {
-                        let text = std::mem::take(&mut state.buffered);
-                        state.parsing_tool = false;
-                        emitted.push(ChatChoiceStream {
-                            index: choice.index,
-                            delta: chat_delta(Some(text), choice.delta.role, None, None),
-                            finish_reason: Some(if state.emitted_calls == 0 {
-                                choice.finish_reason.unwrap_or(OpenAIFinishReason::Stop)
-                            } else {
-                                OpenAIFinishReason::ToolCalls
-                            }),
-                            logprobs: choice.logprobs.clone(),
-                        });
-                        continue;
-                    }
-                    let mut choice = choice.clone();
-                    if choice.finish_reason.is_some()
-                        && states
-                            .get(&choice.index)
-                            .is_some_and(|state| state.emitted_calls != 0)
-                    {
-                        choice.finish_reason = Some(OpenAIFinishReason::ToolCalls);
-                    }
-                    emitted.push(choice);
-                    continue;
-                };
-                let state = states.entry(choice.index).or_insert_with(|| StreamingToolState {
-                    parsing_tool: starts_immediately,
-                    ..Default::default()
-                });
-                state.buffered.push_str(content);
-
-                if !state.parsing_tool {
-                    let partial_marker_len = if choice.finish_reason.is_some() {
-                        0
-                    } else {
-                        partial_marker_suffix_len(&state.buffered, &start_markers)
-                    };
-                    if let Some(position) = start_markers
-                        .iter()
-                        .filter_map(|marker| state.buffered.find(marker))
-                        .min()
-                    {
-                        if position != 0 {
-                            let prefix = state.buffered[..position].to_owned();
-                            state.buffered.drain(..position);
-                            emitted.push(ChatChoiceStream {
-                                index: choice.index,
-                                delta: chat_delta(Some(prefix), choice.delta.role, None, None),
-                                finish_reason: None,
-                                logprobs: choice.logprobs.clone(),
-                            });
-                        }
-                        state.parsing_tool = true;
-                    } else if partial_marker_len == 0
-                        && detect_tool_call_start(&state.buffered, Some(&parser))
-                            .unwrap_or(false)
-                    {
-                        state.parsing_tool = true;
-                    } else {
-                        let safe_len = state.buffered.len().saturating_sub(partial_marker_len);
-                        if safe_len != 0 {
-                            let text = state.buffered[..safe_len].to_owned();
-                            state.buffered.drain(..safe_len);
-                            emitted.push(ChatChoiceStream {
-                                index: choice.index,
-                                delta: chat_delta(Some(text), choice.delta.role, None, None),
-                                finish_reason: choice.finish_reason.map(|reason| {
-                                    if state.emitted_calls == 0 {
-                                        reason
-                                    } else {
-                                        OpenAIFinishReason::ToolCalls
-                                    }
-                                }),
-                                logprobs: choice.logprobs.clone(),
-                            });
-                        }
-                    }
-                }
-
-                if state.parsing_tool {
-                    if choice.finish_reason.is_none()
-                        && find_tool_call_end_position(&state.buffered, Some(&parser)).is_none()
-                    {
-                        continue;
-                    }
-                    let parsed = if choice.finish_reason.is_some() {
-                        try_tool_call_parse_aggregate_finalize(
-                            &state.buffered,
-                            Some(&parser),
-                            tools.as_deref(),
-                        )
-                        .await
-                    } else {
-                        try_tool_call_parse_aggregate(
-                            &state.buffered,
-                            Some(&parser),
-                            tools.as_deref(),
-                        )
-                        .await
-                    };
-                    if let Ok((calls, normal)) = parsed
-                        && !calls.is_empty()
-                    {
-                        let tool_calls = calls
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, call)| ChatCompletionMessageToolCallChunk {
-                                index: u32::try_from(state.emitted_calls + index)
-                                    .unwrap_or(u32::MAX),
-                                id: Some(call.id),
-                                r#type: Some(FunctionType::Function),
-                                function: Some(FunctionCallStream {
-                                    name: Some(call.function.name),
-                                    arguments: Some(call.function.arguments),
-                                }),
-                            })
-                            .collect::<Vec<_>>();
-                        state.emitted_calls += tool_calls.len();
-                        state.buffered.clear();
-                        state.parsing_tool = false;
-                        emitted.push(ChatChoiceStream {
-                            index: choice.index,
-                            delta: chat_delta(
-                                normal.filter(|text| !text.is_empty()),
-                                choice.delta.role,
-                                Some(tool_calls),
-                                None,
-                            ),
-                            finish_reason: choice
-                                .finish_reason
-                                .map(|_| OpenAIFinishReason::ToolCalls),
-                            logprobs: choice.logprobs.clone(),
-                        });
-                    } else if choice.finish_reason.is_some() {
-                        let text = std::mem::take(&mut state.buffered);
-                        state.parsing_tool = false;
-                        emitted.push(ChatChoiceStream {
-                            index: choice.index,
-                            delta: chat_delta(
-                                (!text.is_empty()).then_some(text),
-                                choice.delta.role,
-                                None,
-                                None,
-                            ),
-                            finish_reason: choice.finish_reason.map(|reason| {
-                                if state.emitted_calls == 0 {
-                                    reason
-                                } else {
-                                    OpenAIFinishReason::ToolCalls
-                                }
-                            }),
-                            logprobs: choice.logprobs.clone(),
-                        });
-                    }
-                } else if choice.finish_reason.is_some()
-                    && !emitted.iter().any(|emission| emission.index == choice.index)
-                {
-                    emitted.push(choice.clone());
-                }
-            }
-
-            for choice in emitted {
-                let mut output = response.clone();
-                output.choices = vec![choice];
-                yield Annotated {
-                    data: Some(output),
-                    id: item.id.clone(),
-                    event: item.event.clone(),
-                    comment: item.comment.clone(),
-                    error: item.error.clone(),
-                };
-            }
-        }
-    }
-}
-
 /// Canonicalize a tool-call parser name onto the dynamo-parsers registry keys.
 ///
-/// SGLang canonicalizes these legacy CLI names in the opposite direction;
-/// Dynamo 5.0 still registers the older parser keys.
+/// SGLang canonicalizes these legacy CLI names in the opposite direction from
+/// the current Dynamo parser registry.
 pub(super) fn dynamo_parser_name(parser: &str) -> &str {
     match parser {
         "llama3" => "llama3_json",
-        // SGLang canonicalizes these legacy CLI names in the opposite
-        // direction; Dynamo 5.0 still registers the older parser keys.
         "qwen" => "qwen25",
         "glm" | "glm45" => "glm47",
         other => other,
     }
 }
 
-/// Map the OpenAI wire `tool_choice` onto the Dynamo choice. Shared by the
-/// chat and responses handlers; a missing/auto choice reads as `Auto`.
+/// Map the OpenAI wire `tool_choice` onto the Dynamo choice. A missing/auto
+/// choice reads as `Auto`.
 pub(super) fn dynamo_tool_choice(
     choice: &Option<ChatCompletionToolChoiceOption>,
 ) -> DynamoToolChoice {
@@ -539,11 +261,10 @@ pub(super) fn chat_finish_reason(output: &ChunkEvent) -> Option<OpenAIFinishReas
 mod tests {
     use super::{
         apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
-        dynamo_tool_choice, parse_chat_tool_calls, parse_streaming_tool_calls,
-        partial_marker_suffix_len,
+        dynamo_tool_choice, parse_chat_tool_calls,
     };
     use crate::message::{ChunkEvent, SamplingParams};
-    use dynamo_parsers::tool_calling::jail::Annotated;
+    use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
     use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
     use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
     use dynamo_protocols::types::{
@@ -626,29 +347,19 @@ mod tests {
         }
     }
 
-    async fn parse(
+    async fn apply_jail(
         items: Vec<Annotated<StreamResponse>>,
         parser: &str,
-        starts_immediately: bool,
     ) -> Vec<Annotated<StreamResponse>> {
-        parse_streaming_tool_calls(stream::iter(items), parser.into(), None, starts_immediately)
-            .collect()
-            .await
-    }
-
-    #[test]
-    fn partial_marker_suffix_len_holds_only_a_real_prefix() {
-        let markers = vec!["<|python_tag|>".to_string(), "<tool_call>".to_string()];
-        // A trailing "<|python_" (9 chars) is a proper prefix of the marker.
-        assert_eq!(partial_marker_suffix_len("Before <|python_", &markers), 9);
-        // A complete marker is not a partial one.
-        assert_eq!(partial_marker_suffix_len("a<|python_tag|>b", &markers), 0);
-        // A suffix that matches both candidates picks the longest.
-        assert_eq!(partial_marker_suffix_len("x<tool_", &markers), 6);
-        // Nothing marker-shaped.
-        assert_eq!(partial_marker_suffix_len("plain text", &markers), 0);
-        assert_eq!(partial_marker_suffix_len("", &markers), 0);
-        assert_eq!(partial_marker_suffix_len("x", &[]), 0);
+        apply_tool_calling_jail(
+            Some(parser.into()),
+            Some(ChatCompletionToolChoiceOption::Auto),
+            None,
+            false,
+            stream::iter(items),
+        )
+        .collect()
+        .await
     }
 
     #[test]
@@ -870,14 +581,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_emits_plain_text_without_buffering() {
-        let items = parse(
+    async fn streaming_jail_emits_plain_text_without_buffering() {
+        let items = apply_jail(
             vec![
                 stream_item("Par", None),
                 stream_item("is", Some(OpenAIFinishReason::Stop)),
             ],
             "llama3_json",
-            false,
         )
         .await;
         assert_eq!(items.len(), 2);
@@ -891,19 +601,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_buffers_a_whole_call_until_done() {
-        let items = parse(
+    async fn streaming_jail_buffers_a_whole_call_until_done() {
+        let items = apply_jail(
             vec![stream_item(
                 r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
                 Some(OpenAIFinishReason::Stop),
             )],
             "llama3_json",
-            false,
         )
         .await;
         assert_eq!(items.len(), 1);
         let terminal = choice(&items[0]);
-        assert!(terminal.delta.content.is_none());
+        assert!(matches!(
+            terminal.delta.content.as_ref(),
+            Some(ChatCompletionMessageContent::Text(text)) if text.is_empty()
+        ));
         assert_eq!(
             terminal.delta.tool_calls.as_ref().unwrap()[0]
                 .function
@@ -917,19 +629,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_detects_bare_json_without_a_start_marker() {
-        let items = parse(
+    async fn streaming_jail_detects_bare_json_without_a_start_marker() {
+        let items = apply_jail(
             vec![
                 stream_item(r#"{"name":"get_weather","parameters":{"#, None),
                 stream_item(r#""city":"Paris"}}"#, Some(OpenAIFinishReason::Stop)),
             ],
             "llama3_json",
-            false,
         )
         .await;
         assert_eq!(items.len(), 1);
         let terminal = choice(&items[0]);
-        assert!(terminal.delta.content.is_none());
+        assert!(matches!(
+            terminal.delta.content.as_ref(),
+            Some(ChatCompletionMessageContent::Text(text)) if text.is_empty()
+        ));
         assert_eq!(
             terminal.delta.tool_calls.as_ref().unwrap()[0]
                 .function
@@ -942,8 +656,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_holds_only_a_split_marker() {
-        let items = parse(
+    async fn streaming_jail_holds_only_a_split_marker() {
+        let items = apply_jail(
             vec![
                 stream_item("Before <|python_", None),
                 stream_item(
@@ -952,14 +666,16 @@ mod tests {
                 ),
             ],
             "llama3_json",
-            false,
         )
         .await;
         // The safe prefix streams immediately; the held marker suffix joins
         // the next chunk, which parses into a tool call.
         assert_eq!(delta_text(&items[0]), "Before ");
         let tool_call = choice(&items[1]);
-        assert!(tool_call.delta.content.is_none());
+        assert!(matches!(
+            tool_call.delta.content.as_ref(),
+            Some(ChatCompletionMessageContent::Text(text)) if text.is_empty()
+        ));
         assert_eq!(
             tool_call.delta.tool_calls.as_ref().unwrap()[0]
                 .function
@@ -972,14 +688,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_releases_an_incomplete_marker_at_done() {
-        let items = parse(
+    async fn streaming_jail_releases_an_incomplete_marker_at_done() {
+        let items = apply_jail(
             vec![
                 stream_item("Before <|python_", None),
                 stream_done(OpenAIFinishReason::Stop),
             ],
             "llama3_json",
-            false,
         )
         .await;
         let text = items
@@ -998,8 +713,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_parser_emits_a_complete_tool_call_before_done() {
-        let items = parse(
+    async fn streaming_jail_emits_a_complete_tool_call_before_done() {
+        let items = apply_jail(
             vec![
                 stream_item(
                     r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
@@ -1008,7 +723,6 @@ mod tests {
                 stream_done(OpenAIFinishReason::Stop),
             ],
             "llama3_json",
-            false,
         )
         .await;
         let tool_position = items
