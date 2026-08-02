@@ -170,6 +170,17 @@ def _aiter_fp8_paged_mqa_logits(
     return logits
 
 
+def _indexer_logits_chunk_pages(block_size: int, max_pages: int) -> int:
+    """Sequence-axis chunk width in KV pages for the torch paged MQA logits path."""
+    chunk_positions = envs.SGLANG_DSV4_INDEXER_LOGITS_SEQ_CHUNK.get()
+    chunk_pages = max_pages
+    if chunk_positions and chunk_positions > 0:
+        # Round down to whole pages so a chunk never straddles a page boundary,
+        # but never below a single page.
+        chunk_pages = min(max_pages, max(1, int(chunk_positions) // block_size))
+    return max(1, chunk_pages)
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -219,36 +230,60 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert clean_logits == False
 
     max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
 
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
     page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
-
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
-
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
-
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
     q = q_fp8[:, 0].to(torch.bfloat16)
+    q_t = q.transpose(1, 2)
+    weight_row = weight.unsqueeze(1)
 
-    score = torch.bmm(kv_value, q.transpose(1, 2))
+    # `bmm` produces a [batch, positions, num_heads] score block whose head axis
+    # is summed away two ops later, so a whole-sequence pass peaks at num_heads
+    # times the returned [batch, max_seq_len]. Walk the sequence in page-aligned
+    # chunks instead and write each chunk straight into the output: no reduction
+    # crosses a chunk boundary (relu is elementwise, the bmm reduces over
+    # head_dim, the head sum stays within one row), so the result is unchanged.
+    # bmm(bf16, bf16) -> bf16, scaled by `weight` and then by the float32 KV
+    # scales; mirror that promotion so the output dtype matches a single pass.
+    logits_dtype = torch.promote_types(
+        torch.promote_types(q.dtype, weight.dtype), torch.float32
+    )
+    logits = torch.full(
+        (batch_size, max_seq_len), float("-inf"), dtype=logits_dtype, device=device
+    )
 
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
+    chunk_pages = _indexer_logits_chunk_pages(block_size, max_pages)
+    for page_start in range(0, max_pages, chunk_pages):
+        page_stop = min(max_pages, page_start + chunk_pages)
+        seq_start = page_start * block_size
+        chunk_seq = (page_stop - page_start) * block_size
 
-    score = score * kv_scale
+        kvcache_gathered = kvcache_flat[page_ids[:, page_start:page_stop]]
 
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
+        kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
+        kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+
+        kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
+        kv_value = kv_value.view(batch_size, chunk_seq, head_dim)
+
+        kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
+        kv_scale = kv_scale.view(batch_size, chunk_seq)
+
+        score = torch.bmm(kv_value, q_t)
+
+        score = F.relu(score)
+        score = score * weight_row
+        score = score.sum(dim=2)
+
+        score = score * kv_scale
+
+        # Only the last chunk can run past max_seq_len, since the padded span is
+        # a whole number of pages; every earlier chunk copies in full.
+        out_width = min(seq_start + chunk_seq, max_seq_len) - seq_start
+        logits[:, seq_start : seq_start + out_width] = score[:, :out_width]
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
