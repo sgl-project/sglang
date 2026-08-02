@@ -142,6 +142,8 @@ class DummyProcessor:
 
 
 class KimiK3Processor(DummyProcessor):
+    """Mimics the Kimi K3 HF processor's media-kwargs interface (#32541)."""
+
     def __init__(self, tokenizer: PreTrainedTokenizerFast):
         super().__init__(tokenizer)
         self.media_call_count = 0

@@ -67,6 +67,8 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get valid token ids from the tokenizer vocabulary."""
+    # Canonical order: vocab dict iteration order varies across tokenizers
+    # versions, which would break --seed reproducibility.
     return sorted(
         token_id
         for token_id in tokenizer.get_vocab().values()
