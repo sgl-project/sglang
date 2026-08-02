@@ -62,6 +62,8 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    # PP-last local cache lookup result. This never enters PP raw/layout state.
+    corrected_logits_ready: Optional[torch.Tensor] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     SelectMixedAccept,
     SoftmaxTemp,
     accept_greedy_triton,
+    accept_target_only_sampling,
     finalize_accept_lens_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
@@ -85,6 +86,89 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
 
 
 @dataclass
+class DSparkPPLocalSamplingCache:
+    """PP-last-only proposal distributions owned by one scheduler microbatch."""
+
+    corrected_logits: torch.Tensor
+    request_keys: List[Tuple[str, int]]
+
+    @classmethod
+    def from_proposal(
+        cls,
+        corrected_logits: torch.Tensor,
+        reqs,
+        seq_lens,
+    ) -> DSparkPPLocalSamplingCache:
+        # Folded CUDA graph proposals alias a replay output buffer.
+        request_keys = cls._request_keys(reqs, seq_lens)
+        return cls(
+            corrected_logits=corrected_logits.detach().clone(),
+            request_keys=request_keys,
+        )
+
+    @staticmethod
+    def _request_keys(reqs, seq_lens) -> List[Tuple[str, int]]:
+        return [
+            (req.rid, int(seq_len)) for req, seq_len in zip(reqs, seq_lens)
+        ]
+
+    def match(
+        self,
+        reqs,
+        seq_lens,
+        *,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        expected_keys = self._request_keys(reqs, seq_lens)
+        cached_rows = {key: row for row, key in enumerate(self.request_keys)}
+        matched_rows = [cached_rows.get(key) for key in expected_keys]
+        ready = [row is not None for row in matched_rows]
+        if not any(ready):
+            return None, None
+        if all(ready) and matched_rows == list(range(len(self.request_keys))):
+            return self.corrected_logits, None
+
+        corrected_logits = torch.zeros(
+            (len(expected_keys), *self.corrected_logits.shape[1:]),
+            dtype=self.corrected_logits.dtype,
+            device=self.corrected_logits.device,
+        )
+        dst_rows = [row for row, is_ready in enumerate(ready) if is_ready]
+        src_rows = [row for row in matched_rows if row is not None]
+        corrected_logits[dst_rows] = self.corrected_logits[src_rows]
+        ready_mask = (
+            None if all(ready) else torch.tensor(ready, dtype=torch.bool, device=device)
+        )
+        return corrected_logits, ready_mask
+
+
+class DSparkPPMicroBatchSamplingCache:
+    """Process-local corrected logits keyed by the stable PP microbatch slot."""
+
+    def __init__(self):
+        self._slots: Dict[int, DSparkPPLocalSamplingCache] = {}
+
+    def publish(self, mb_id: int, cache: DSparkPPLocalSamplingCache) -> None:
+        self._slots[mb_id] = cache
+
+    def consume(
+        self,
+        mb_id: int,
+        reqs,
+        seq_lens,
+        *,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        cache = self._slots.pop(mb_id, None)
+        if cache is None:
+            return None, None
+        return cache.match(reqs, seq_lens, device=device)
+
+    def clear(self) -> None:
+        self._slots.clear()
+
+
+@dataclass
 class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     """DSpark PP relay data carrier.
 
@@ -126,6 +210,14 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return (1, 1)
+
+    def prepare_local_sampling_metadata(self, reqs) -> None:
+        """Build PP-last-only sampling hints without adding them to PP raw."""
+        top_ks = [int(req.sampling_params.top_k) for req in reqs]
+        self.max_top_k = max(max(top_ks, default=1), 1)
+        self.uniform_top_k_value = (
+            top_ks[0] if top_ks and all(top_k == top_ks[0] for top_k in top_ks) else None
+        )
 
     def to_tensor_dict(self) -> dict:
         return {"pp_spec_output": asdict(self)}
@@ -854,6 +946,15 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    if draft_block.corrected_logits is None:
+        # PP first-decode dummy drafts have no proposal distribution. Keep the
+        # full verify layout stable across PP/CUDA graph, but accept none of
+        # those drafts and sample exactly one token from the target instead.
+        return accept_target_only_sampling(
+            target_logits=target_logits,
+            sampling_info=sampling_info,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+        )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
@@ -862,7 +963,7 @@ def accept_draft_tokens(
     ).view(bs, gamma_rows, vocab)
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+        normal_len, normal_bonus, normal_trim = AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -872,29 +973,56 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
-        candidates=candidates,
+    else:
+        greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+        sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+        normal = SelectMixedAccept.execute(
+            greedy_mask=greedy_mask,
+            greedy_len=greedy_len,
+            greedy_bonus=greedy_bonus,
+            greedy_trim=greedy_trim,
+            sampling_len=sampling_len,
+            sampling_bonus=sampling_bonus,
+            sampling_trim=sampling_trim,
+        )
+        normal_len, normal_bonus, normal_trim = (
+            normal.correct_len,
+            normal.bonus,
+            normal.cap_trim_lens,
+        )
+
+    corrected_ready = draft_block.corrected_logits_ready
+    if corrected_ready is None:
+        return normal_len, normal_bonus, normal_trim
+
+    target_len, target_bonus, target_trim = accept_target_only_sampling(
         target_logits=target_logits,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
-    )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
         sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
     )
     selected = SelectMixedAccept.execute(
-        greedy_mask=greedy_mask,
-        greedy_len=greedy_len,
-        greedy_bonus=greedy_bonus,
-        greedy_trim=greedy_trim,
-        sampling_len=sampling_len,
-        sampling_bonus=sampling_bonus,
-        sampling_trim=sampling_trim,
+        # Greedy rows never need corrected logits; sampling rows use the
+        # speculative result only when their PP-last cache lookup succeeded.
+        greedy_mask=greedy_mask | corrected_ready,
+        greedy_len=normal_len,
+        greedy_bonus=normal_bonus,
+        greedy_trim=normal_trim,
+        sampling_len=target_len,
+        sampling_bonus=target_bonus,
+        sampling_trim=target_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens

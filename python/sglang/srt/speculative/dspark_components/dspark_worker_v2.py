@@ -58,6 +58,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
+    DSparkPPLocalSamplingCache,
+    DSparkPPMicroBatchSamplingCache,
     DSparkPPVerifyInputRaw,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
@@ -100,6 +102,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._pp_is_last_rank = target_worker.pp_group.is_last_rank
         self._pp_enabled = server_args.pp_size > 1
+        self._pp_sampling_cache = DSparkPPMicroBatchSamplingCache()
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -448,7 +451,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._pp_sampling_cache.clear()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -611,10 +614,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _draft_block_from_pp_raw(self, pp_raw, batch, sampling_info):
-        # PP path: rebuild verify candidates + a placeholder draft block from
-        # the last rank's relayed raw. Under the all-greedy commit guard the
-        # accept path does not read corrected_logits, so a None placeholder is
-        # safe; only shape-compatible temperatures/greedy_mask are needed.
+        # PP path: rebuild verify candidates from the relayed compact raw. The
+        # last rank restores sampling distributions from its device-local
+        # per-request cache; cache-miss rows (newly admitted requests) remain
+        # target-only for this iteration.
         device = batch.seq_lens.device
         bs = len(batch.seq_lens)
         bonus = torch.tensor(pp_raw.bonus_tokens, device=device, dtype=torch.int64)
@@ -626,13 +629,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         else:
             temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+        corrected_logits = None
+        corrected_logits_ready = None
+        if self._pp_is_last_rank:
+            pp_raw.prepare_local_sampling_metadata(batch.reqs)
+            pp_mb_id = getattr(batch, "pp_mb_id", None)
+            assert pp_mb_id is not None, "DSpark PP sampling requires pp_mb_id"
+            corrected_logits, corrected_logits_ready = (
+                self._pp_sampling_cache.consume(
+                    pp_mb_id,
+                    batch.reqs,
+                    pp_raw.new_seq_lens,
+                    device=device,
+                )
+            )
         draft_block = DraftBlockResult(
             draft_tokens=drafts,
-            corrected_logits=None,
+            corrected_logits=corrected_logits,
             greedy_mask=resolve_greedy_mask(
                 bs=bs, sampling_info=sampling_info, device=device
             ),
             temperatures=temperatures,
+            corrected_logits_ready=corrected_logits_ready,
         )
         confidence = (
             torch.tensor(pp_raw.confidence, device=device, dtype=torch.float32)
@@ -937,10 +955,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=proposal_next.draft_block.draft_tokens,
                     confidence_tap=proposal_next.confidence_tap,
                 )
+            next_seq_lens = accept.new_seq_lens.tolist()
+            corrected_logits = proposal_next.draft_block.corrected_logits
+            if corrected_logits is not None:
+                pp_mb_id = getattr(batch, "pp_mb_id", None)
+                assert pp_mb_id is not None, "DSpark PP sampling requires pp_mb_id"
+                self._pp_sampling_cache.publish(
+                    pp_mb_id,
+                    DSparkPPLocalSamplingCache.from_proposal(
+                        corrected_logits,
+                        batch.reqs,
+                        next_seq_lens,
+                    ),
+                )
             pp_raw_out = DSparkPPVerifyInputRaw(
                 bonus_tokens=accept.bonus.tolist(),
                 draft_tokens=proposal_next.draft_block.draft_tokens.tolist(),
-                new_seq_lens=accept.new_seq_lens.tolist(),
+                new_seq_lens=next_seq_lens,
                 confidence=(con.tolist() if con is not None else None),
                 accept_lens=accept.commit_lens.tolist(),
                 cap_trim_lens=accept.cap_trim_lens.tolist(),
