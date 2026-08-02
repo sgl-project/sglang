@@ -289,6 +289,17 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_structural_tag_with_other_grammar_raises(self):
+        """Test that structural_tag is mutually exclusive with other grammars."""
+        for grammar in ("json_schema", "regex", "ebnf"):
+            with self.subTest(grammar=grammar):
+                sp = self._make(
+                    **{grammar: "constraint"},
+                    structural_tag='{"type":"structural_tag","structures":[]}',
+                )
+                with self.assertRaisesRegex(ValueError, "structural_tag"):
+                    sp.verify(self.VOCAB_SIZE)
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
 
