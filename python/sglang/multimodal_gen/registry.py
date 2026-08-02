@@ -1035,7 +1035,7 @@ def _register_configs():
 
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # Both Nano (16B) and Super (64B) share the same pipeline; arch dimensions
     # come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,

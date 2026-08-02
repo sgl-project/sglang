@@ -403,5 +403,5 @@ When documenting results:
 | `tools/build_modelopt_nvfp4_transformer.py` | Build mixed BF16+NVFP4 transformer directories when a family needs preserved BF16 layers |
 | `tools/compare_diffusion_trajectory_similarity.py` | reduced deterministic BF16-vs-quantized validation |
 | `docs_new/docs/sglang-diffusion/quantization.mdx` | public ModelOpt support matrix and CLI examples |
-| `test/server/testcase_configs.py` | reusable ModelOpt testcase constants, thresholds, and helpers |
-| `test/server/gpu_cases.py` | concrete GPU and B200 ModelOpt CI case lists |
+| `python/sglang/multimodal_gen/test/server/testcase_configs.py` | reusable ModelOpt testcase constants, thresholds, and helpers |
+| `python/sglang/multimodal_gen/test/server/gpu_cases.py` | concrete GPU and B200 ModelOpt CI case lists |
