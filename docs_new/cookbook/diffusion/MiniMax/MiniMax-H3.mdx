@@ -41,12 +41,13 @@ For platform-specific setup, see the [SGLang Diffusion installation guide](/docs
 
 ## 3. Serve MiniMax-H3
 
-Use the interactive selector to choose a hardware platform, memory topology,
+Use the interactive selector to choose a hardware platform, deployment profile,
 one of the two checkpoint partitions, a request mode, and deployment features.
-It generates both the Python and Docker launch forms. The **$ cURL** button
-follows the selected request mode and switches the payload across text-only,
-all three first/last-frame signatures, and the image/audio/video reference
-combinations listed below.
+It generates Python and, where available, Docker launch forms. AMD selections
+use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
+button follows the selected request mode and switches the payload across
+text-only, all three first/last-frame signatures, and the image/audio/video
+reference combinations listed below.
 Set **Outputs per prompt** in the picker’s **Env** panel to generate more than
 one output without mixing request sampling controls into the deployment
 matrix.
@@ -63,10 +64,10 @@ quantization are called out separately in the generated command. Sampling
 behavior such as Cache-DiT is documented separately below.
 
 The picker hides deployment rows when the selected hardware has no verified
-choice to make. **Memory / Topology** appears only on B200 and H100, where both
-resident and FSDP recipes were exercised. **Transformer Precision** appears
-only on B200, the only platform with a validated online-FP8 recipe. H200, AMD,
-and RTX 5090 keep their fixed verified BF16/FP32 placement without showing a
+choice to make. **Deployment Profile** appears only on B200 and H100, where
+more than one topology was exercised. **Online Quantization** appears only on
+B200 and B300, the platforms with validated online-FP8 runs. H200, AMD, and
+RTX 5090 keep their fixed verified BF16/FP32 placement without showing a
 one-option selector.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -80,124 +81,10 @@ picker above. It regenerates as you change the selection, so the payload it
 shows always matches the serve command next to it.
 </Note>
 
-### Request capability matrix
-
-The picker first selects one of only two resident weight partitions. It then
-shows the request modes that partition accepts; changing the request mode does
-not reload another checkpoint. The selected pair controls the serve command
-and canonical JSON request under **$ cURL**. These exact 5-second, 1344×768
-profiles completed on the resident 8× B200 topology:
-
-| Picker mode | Weight variant | Canonical request shape | Status |
-| --- | --- | --- | --- |
-| Text only (T2VA) | `fl2va` | `task: "t2va"`, no conditions | Verified |
-| First frame | `fl2va` | keyframe `frame_index: 0` | Verified |
-| Last frame | `fl2va` | keyframe `frame_index: -1` | Verified |
-| First + last frames (FL2VA) | `fl2va` | ordered keyframes `[0, -1]` | Verified |
-| Image reference | `ref2va` | one image reference | Verified |
-| Image + audio | `ref2va` | image and audio references | Verified |
-| Video reference (V2V) | `ref2va` | `type: "video"`; silent input is accepted | Verified |
-| Video + soundtrack (V2V) | `ref2va` | `type: "video_audio"`; both streams required | Verified |
-| Audio reference | `ref2va` | one audio reference | Verified |
-| Mixed references | `ref2va` | multiple images, audios, and videos in semantic order | Verified |
-
-The first/last-frame profile was also exercised with
-`num_outputs_per_prompt: 2`; both output variants completed and were distinct.
-`type: "video"` accepts either a silent input or a video with a soundtrack,
-while `type: "video_audio"` deliberately rejects a missing audio stream.
-
-### AMD Instinct validation
-
-The AMD recipes keep the released BF16/FP32 precision policy and use AITER
-packed attention. The command picker emits the fastest measured topology,
-8 GPUs with Ulysses degree 8. All runs below completed full H.264/AAC decoding
-and representative-frame inspection.
-
-| Hardware | Task | Denoise | Decode | Peak/GPU |
-| --- | --- | ---: | ---: | ---: |
-| MI355X | T2VA | 55.2907 s | 9.5344 s | 97,444 MB |
-| MI355X | FL2VA | 53.7978 s | 9.4477 s | 96,922 MB |
-| MI355X | Ref2VA | 41.3812 s | 6.8247 s | 94,518 MB |
-| MI300X | T2VA | 167.4878 s | 25.3244 s | 97,272 MB |
-| MI300X | FL2VA | 150.2311 s | 12.5684 s | 96,750 MB |
-| MI300X | Ref2VA | 107.6232 s | 11.3768 s | 94,268 MB |
-
-The task matrix above used 8 GPUs and 50 denoising steps. The following
-capacity matrix uses one canonical 1344×768, 209-frame T2VA request and changes
-only the GPU count and matching Ulysses degree:
-
-| Hardware | GPUs | Denoise | Decode | Peak/GPU |
-| --- | ---: | ---: | ---: | ---: |
-| MI355X | 8 | 55.2907 s | 9.5344 s | 97,444 MB |
-| MI355X | 4 | 104.2294 s | 11.1824 s | 103,350 MB |
-| MI355X | 2 | 223.0246 s | 15.5330 s | 115,250 MB |
-| MI355X | 1 | 288.7968 s | 24.0472 s | 137,676 MB |
-| MI300X | 8 | 167.4878 s | 25.3244 s | 97,272 MB |
-| MI300X | 4 | 297.3727 s | 26.5067 s | 103,436 MB |
-| MI300X | 2 | 585.5401 s | 29.4909 s | 115,010 MB |
-| MI300X | 1 | 978.0886 s | 36.0142 s | 137,626 MB |
-
-For a measured lower-count deployment, set both `--num-gpus` and
-`--ulysses-degree` to 4, 2, or 1. AITER packed attention matched segment-wise
-BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
-MI300X.
-
-The interactive selector uses the Hugging Face model ID. The tagged quick
-commands below show both Hub IDs explicitly and still use the same semantic
-`--model-variant` knob.
-
-<CodeGroup dropdown>
-
-```bash title="FL2VA weights (T2VA and keyframes)"
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant fl2va \
-  --num-gpus 8 \
-  --ulysses-degree 8 \
-  --performance-mode speed \
-  --port 30010
-```
-
-```bash title="Ref2VA weights (references and V2V)"
-sglang serve \
-  --model-path MiniMaxAI/MiniMax-H3 \
-  --model-variant ref2va \
-  --num-gpus 8 \
-  --ulysses-degree 8 \
-  --performance-mode speed \
-  --port 30010
-```
-
-</CodeGroup>
-
-Use the corresponding ModelScope command below through the same normal
-`sglang serve` path. `SGLANG_USE_MODELSCOPE=true` switches every model
-component and selected checkpoint partition to ModelScope; no manual download
-step is required.
-
-<CodeGroup dropdown>
-
-```bash title="ModelScope (FL2VA weights)"
-SGLANG_USE_MODELSCOPE=true sglang serve \
-  --model-path MiniMax/MiniMax-H3 \
-  --model-variant fl2va \
-  --num-gpus 8 \
-  --ulysses-degree 8 \
-  --performance-mode speed \
-  --port 30010
-```
-
-```bash title="ModelScope (Ref2VA weights)"
-SGLANG_USE_MODELSCOPE=true sglang serve \
-  --model-path MiniMax/MiniMax-H3 \
-  --model-variant ref2va \
-  --num-gpus 8 \
-  --ulysses-degree 8 \
-  --performance-mode speed \
-  --port 30010
-```
-
-</CodeGroup>
+The selector uses the verified Hugging Face ID. To use ModelScope through the
+same normal `sglang serve` path, prefix the copied command with
+`SGLANG_USE_MODELSCOPE=true` and replace the model path with
+`MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
 
 For a four-card H200 host, keep the full BF16/FP32 model resident. The model
 fits without FSDP, and avoiding per-block parameter all-gathers is the faster
@@ -228,13 +115,10 @@ sglang serve \
   --port 30010
 ```
 
-The measured steady pipeline latency / peak memory was 13.25 seconds / 66.04
-GB for TP2 + Ulysses2, 13.36 seconds / 57.01 GB for FSDP + Ulysses4, and 13.86
-seconds / 49.80 GB for TP4 + Ulysses1. Pure Ulysses4 could not keep the full
-pipeline resident on 80 GB H100s. Use `--tp-size 4 --ulysses-degree 1` when
-lower resident memory matters more than the last few percent of latency. FSDP
-remains a verified capacity option, but its per-block weight all-gathers do
-not make it the H100 speed default:
+Pure Ulysses4 could not keep the full pipeline resident on 80 GB H100s. Use
+`--tp-size 4 --ulysses-degree 1` when lower resident memory matters more than
+the last few percent of latency. FSDP remains a verified capacity option, but
+its per-block weight all-gathers do not make it the H100 speed default:
 
 ```bash 4×H100 FSDP capacity
 sglang serve \
@@ -273,24 +157,8 @@ prefetch with zero resident layers. The video VAE encoder stays resident
 because its indexed down blocks cannot host executable layerwise hooks; the
 roughly 577 MiB audio VAE also stays resident because offloading it only adds
 transfer overhead. This exact recipe was validated on
-2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine.
-The full 50-step canonical request completed in 559.67 seconds: 525.05 seconds
-of denoising and 33.61 seconds of decoding, with a 26.3 GiB sampled peak per
-GPU. The resulting 5.175-second MP4 contained 1344×768 H.264 video and 32 kHz
-stereo AAC audio.
-
-The canonical 1344×768, 5-second T2VA short-run comparison was:
-
-| Topology | DiT settings | 5-step denoise | Inference | Peak per GPU | Result |
-| --- | --- | ---: | ---: | ---: | --- |
-| TP2 | prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Recommended |
-| TP2 | prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain; +1.2 GiB |
-| Ulysses2 | prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected: TP1 replicated the complete DiT per rank and used about 249 GiB scheduler RSS |
-
-The verified RTX 5090 host communicates over PCIe rather than NVLink. TP2 is
-important here: the Ulysses2 control spent more than eight minutes in CPU
-staging without reaching warmup, whereas TP2 both fit and completed real
-audio/video requests.
+2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine. The
+latency and memory comparison is collected in the benchmark section below.
 
 The first launch downloads the model through the selected Hub. If the Hugging
 Face repository requires authentication, export a Hugging Face token in the
@@ -693,7 +561,7 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 
 | Feature | Validation status | Notes |
 | --- | --- | --- |
-| Ulysses sequence parallelism | Verified: 8× B200, 8× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`; Ring is not compatible with H3's packed multi-segment attention. |
+| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`; Ring is not compatible with H3's packed multi-segment attention. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
@@ -763,8 +631,8 @@ sglang serve \
 Online FP8 is approximate and is not a consistency ground-truth mode. It can
 be combined with Cache-DiT, but the two approximations compound. Validate
 visual quality, audio quality, memory use, and latency on the target workload.
-The picker exposes this option only on the B200 topology used for the real H3
-validation run.
+The picker exposes this option only on the B200 and B300 topologies used for
+real H3 validation runs.
 </Warning>
 
 </Tab>
@@ -783,13 +651,28 @@ validation run.
 - The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Do not enable it: `--enable-cfg-parallel true` or `--cfg-parallel-size` greater than 1 is rejected instead of duplicating the positive branch. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
-- On multi-GPU launches with peer-to-peer access between the GPUs (single-node H100/H200/B200), the default `--encoder-parallel auto` folds the text encoder over the otherwise idle world group, bitwise-identical to single-GPU encoding. This is separate from DiT tensor parallelism and does not require a separate `--tp-size`. On the verified PCIe-only 2× RTX 5090 host, `auto` keeps the encoder replicated instead, avoiding per-layer all-reduce over host-routed PCIe.
+- On multi-GPU launches with peer-to-peer access between the GPUs (single-node H100/H200/B200/B300), the default `--encoder-parallel auto` folds the text encoder over the otherwise idle world group, bitwise-identical to single-GPU encoding. This is separate from DiT tensor parallelism and does not require a separate `--tp-size`. On the verified PCIe-only 2× RTX 5090 host, `auto` keeps the encoder replicated instead, avoiding per-layer all-reduce over host-routed PCIe.
 - Keep the default `auto` for single-request latency. Explicit `--encoder-parallel dp` only helps a compatible multi-request batch (`--batching-max-size` greater than 1), provides no benefit for a batch of one, is not bitwise-identical to the folded deployment, and requires every rank to keep the full unsharded text encoder resident.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
 - `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 8. Measured latency on 8× B300
+## 8. Benchmarks
+
+The picker exposes one exact verified recipe per selected profile. GPU counts
+are properties of those measured recipes, not a claim that every platform
+requires that many GPUs:
+
+| Hardware | Picker recipe | Other measured topology |
+| --- | --- | --- |
+| B300 | 8× Ulysses8 resident | The 8-GPU sweep below is not a minimum-GPU claim. |
+| B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
+| H200 | 4× Ulysses4 resident | — |
+| H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
+| MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
+| RTX 5090 | 2× TP2 + layerwise offload | — |
+
+### B300 precision and encoder placement
 
 A 12-configuration sweep on a single 8× B300 host, covering both checkpoint
 partitions, both transformer precisions, and all three text-encoder
@@ -860,3 +743,63 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 | Ref2VA | FP8 | auto | 124.0 s | 34.30 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | fold | 112.0 s | 34.44 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | replicate | 116.0 s | 33.42 s | **27.12 s** | 93,396 MB |
+
+### H100 topology comparison
+
+The same four-card H100 host completed three lossless placements. TP2 with
+Ulysses2 was the fastest; TP4 used the least memory:
+
+| Topology | Pipeline latency | Peak/GPU |
+| --- | ---: | ---: |
+| TP2 + Ulysses2 | 13.25 s | 66.04 GB |
+| FSDP + Ulysses4 | 13.36 s | 57.01 GB |
+| TP4 + Ulysses1 | 13.86 s | 49.80 GB |
+
+### RTX 5090 capacity run
+
+The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
+50-step, 1344×768, 5-second request completed in 559.67 seconds: 525.05
+seconds of denoising and 33.61 seconds of decoding, with a 26.3 GiB sampled
+peak per GPU.
+
+| DiT settings | 5-step denoise | Inference | Peak/GPU | Result |
+| --- | ---: | ---: | ---: | --- |
+| prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Selected recipe |
+| prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
+| Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
+
+### AMD Instinct task and scaling runs
+
+The AMD recipes keep the released BF16/FP32 precision policy and use AITER
+packed attention. The picker emits the fastest measured topology, 8 GPUs with
+Ulysses degree 8. All runs below completed full H.264/AAC decoding and
+representative-frame inspection.
+
+| Hardware | Task | Denoise | Decode | Peak/GPU |
+| --- | --- | ---: | ---: | ---: |
+| MI355X | T2VA | 55.2907 s | 9.5344 s | 97,444 MB |
+| MI355X | FL2VA | 53.7978 s | 9.4477 s | 96,922 MB |
+| MI355X | Ref2VA | 41.3812 s | 6.8247 s | 94,518 MB |
+| MI300X | T2VA | 167.4878 s | 25.3244 s | 97,272 MB |
+| MI300X | FL2VA | 150.2311 s | 12.5684 s | 96,750 MB |
+| MI300X | Ref2VA | 107.6232 s | 11.3768 s | 94,268 MB |
+
+The task matrix used 8 GPUs and 50 denoising steps. The scaling matrix uses
+one 1344×768, 209-frame T2VA request and changes only the GPU count and
+matching Ulysses degree:
+
+| Hardware | GPUs | Denoise | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| MI355X | 8 | 55.2907 s | 9.5344 s | 97,444 MB |
+| MI355X | 4 | 104.2294 s | 11.1824 s | 103,350 MB |
+| MI355X | 2 | 223.0246 s | 15.5330 s | 115,250 MB |
+| MI355X | 1 | 288.7968 s | 24.0472 s | 137,676 MB |
+| MI300X | 8 | 167.4878 s | 25.3244 s | 97,272 MB |
+| MI300X | 4 | 297.3727 s | 26.5067 s | 103,436 MB |
+| MI300X | 2 | 585.5401 s | 29.4909 s | 115,010 MB |
+| MI300X | 1 | 978.0886 s | 36.0142 s | 137,626 MB |
+
+For a measured lower-count AMD deployment, set both `--num-gpus` and
+`--ulysses-degree` to 4, 2, or 1. AITER packed attention matched segment-wise
+BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
+MI300X.

@@ -29,7 +29,7 @@ export const config = {
   matchDims: [
     {
       id: "profile",
-      title: "Memory / Topology",
+      title: "Deployment Profile",
       showWhen: (s) => ["b200", "h100"].includes(s.hw),
       options: [
         { id: "resident", label: "Resident (fastest)" },
@@ -124,22 +124,22 @@ export const config = {
     },
     {
       id: "quant",
-      title: "Transformer Precision",
+      title: "Online Quantization",
       default: "bf16",
-      showWhen: (s) => s.hw === "b200",
+      showWhen: (s) => ["b200", "b300"].includes(s.hw),
       options: [
-        { id: "bf16", label: "BF16 / FP32 (lossless)" },
+        { id: "bf16", label: "Off — Native BF16/FP32" },
         {
           id: "fp8",
-          label: "Online FP8",
-          showWhen: (s) => s.hw === "b200",
+          label: "FP8 — Approximate",
+          showWhen: (s) => ["b200", "b300"].includes(s.hw),
           disabled: (s) => s.profile !== "resident",
           disableReason:
             "The documented FP8 operating point keeps the transformer resident; FSDP combinations have not been validated.",
           flags: ["--quantization fp8"],
           hints: [
             "Online FP8 is approximate. Validate both video and audio quality;",
-            "the verified B200 run substantially reduced memory; re-benchmark latency on the target workload.",
+            "verified B200 and B300 runs reduced memory; re-benchmark latency on the target workload.",
           ],
         },
       ],
@@ -435,6 +435,8 @@ export const config = {
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
+      warn:
+        "This is the B300 topology used for the documented benchmark sweep, not a claimed minimum GPU count.",
     },
     {
       match: { hw: "h200", profile: "resident" },
@@ -442,8 +444,8 @@ export const config = {
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--num-gpus 8",
-        "--ulysses-degree 8",
+        "--num-gpus 4",
+        "--ulysses-degree 4",
         "--performance-mode speed",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
