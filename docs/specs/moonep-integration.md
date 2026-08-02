@@ -123,6 +123,16 @@ The layout must preserve SGLang checkpoint loading semantics while exposing the
 MoonEP contiguous row contract to the expert GEMM. Prefer a small adapter around
 existing expert weight ownership before introducing broad abstractions.
 
+PoC weight-layout limitation:
+
+- The first SGLang integration slice stores global BF16 expert rows in the
+  layer's `w13_weight`/`w2_weight` tensors and derives cached contiguous
+  gate/up/down tensors with `B` prefetch slots. This makes the BF16 runtime path
+  easy to validate but is memory-heavy for production-scale Kimi-K3.
+- A production Kimi-K3 implementation should replace this with true
+  symmetric-memory expert rows whose physical storage remains sharded by home
+  rank.
+
 ### Expert runner
 
 The first runnable path should be BF16 inference:
@@ -147,8 +157,8 @@ later cloned or summarized upstream to `sgl-project/sglang` before upstream PRs.
 | 3 | Done | Add MoonEP dispatch/combine data contract (`wirybeaver/sglang#10`). |
 | 4 | Done | Add process-wide MoonEP buffer facade (`wirybeaver/sglang#11`). |
 | 5 | Done | Decide static token-capacity policy (`wirybeaver/sglang#12`). |
-| 6 | Next | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
-| 7 | Pending | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
+| 6 | Done | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
+| 7 | Next | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
 | 8 | Pending | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
 | 9 | Pending | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
 

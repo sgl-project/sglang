@@ -53,6 +53,7 @@ class MoonEPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     route_weights_nvs: Optional[torch.Tensor]
     plan: Any
+    num_tokens: int
 
     @property
     def format(self) -> CombineInputFormat:
@@ -60,6 +61,15 @@ class MoonEPCombineInput(NamedTuple):
 
 
 assert isinstance(MoonEPCombineInput, CombineInput)
+
+
+class MoonEPExpertWeightLayout(NamedTuple):
+    """Contiguous BF16 expert weights in MoonEP prefetch layout."""
+
+    full_gate_weight: torch.Tensor
+    full_up_weight: torch.Tensor
+    full_down_weight: torch.Tensor
+    num_prefetch_slots: int
 
 
 @dataclass(frozen=True)
@@ -284,6 +294,120 @@ class MoonEPBuffer:
         for key in list(state.buffers):
             cls.destroy_buffer(key)
         state.active_key = None
+
+
+def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:
+    return MoonEPBuffer._resolve_num_prefetch_slots(
+        num_prefetch_slots=None,
+        num_experts=num_experts,
+        num_ep_ranks=num_ep_ranks,
+    )
+
+
+def get_moonep_expert_weight_layout(
+    layer: torch.nn.Module,
+    num_prefetch_slots: int,
+) -> MoonEPExpertWeightLayout:
+    """Return cached contiguous BF16 gate/up/down tensors for MoonEP.
+
+    The first executable PoC path supports only unquantized BF16 weights stored
+    in global expert-id order.  Rows ``[E, E+B)`` are mutable prefetch slots and
+    are intentionally preserved across calls so ``buffer.prefetch_weight`` can
+    fill them before the MoonEP expert runner consumes the layout.
+    """
+
+    if num_prefetch_slots <= 0:
+        raise ValueError(
+            f"num_prefetch_slots must be positive, got {num_prefetch_slots}"
+        )
+
+    quant_config = getattr(layer, "quant_config", None)
+    if quant_config is not None:
+        raise NotImplementedError(
+            "MoonEP PoC expert weight layout supports unquantized BF16 only."
+        )
+
+    if getattr(layer.moe_runner_config, "num_fused_shared_experts", 0) != 0:
+        raise NotImplementedError(
+            "MoonEP PoC does not support fused shared experts yet."
+        )
+    if not getattr(layer.moe_runner_config, "is_gated", True):
+        raise NotImplementedError("MoonEP PoC requires gated w13 experts.")
+    if getattr(layer, "use_triton_kernels", False):
+        raise NotImplementedError(
+            "MoonEP PoC expects canonical [E, 2I, H] w13 layout, not "
+            "triton-kernels transposed weight layout."
+        )
+
+    w13_weight = layer.w13_weight
+    w2_weight = layer.w2_weight
+    if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "MoonEP PoC expert runner supports BF16 weights only."
+        )
+    if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
+        raise ValueError("MoonEP expert source weights must be contiguous.")
+
+    num_experts = int(layer.num_experts)
+    intermediate_size = int(layer.intermediate_size_per_partition)
+    hidden_size = int(layer.hidden_size)
+    expected_w13_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    expected_w2_shape = (num_experts, hidden_size, intermediate_size)
+    if tuple(w13_weight.shape) != expected_w13_shape:
+        raise ValueError(
+            "MoonEP PoC requires global w13_weight shape "
+            f"{expected_w13_shape}, got {tuple(w13_weight.shape)}."
+        )
+    if tuple(w2_weight.shape) != expected_w2_shape:
+        raise ValueError(
+            "MoonEP PoC requires global w2_weight shape "
+            f"{expected_w2_shape}, got {tuple(w2_weight.shape)}."
+        )
+
+    cache_key = (
+        num_prefetch_slots,
+        w13_weight.data_ptr(),
+        w2_weight.data_ptr(),
+        tuple(w13_weight.shape),
+        tuple(w2_weight.shape),
+    )
+    cache = getattr(layer, "_moonep_weight_layout_cache", None)
+    if cache is not None and cache[0] == cache_key:
+        return cache[1]
+
+    full_gate_weight = torch.empty(
+        num_experts + num_prefetch_slots,
+        intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=w13_weight.device,
+    )
+    full_up_weight = torch.empty_like(full_gate_weight)
+    full_down_weight = torch.empty(
+        num_experts + num_prefetch_slots,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device=w2_weight.device,
+    )
+
+    full_gate_weight[:num_experts].copy_(w13_weight[:, :intermediate_size, :])
+    full_up_weight[:num_experts].copy_(
+        w13_weight[:, intermediate_size : 2 * intermediate_size, :]
+    )
+    full_down_weight[:num_experts].copy_(w2_weight)
+    full_gate_weight[num_experts:].zero_()
+    full_up_weight[num_experts:].zero_()
+    full_down_weight[num_experts:].zero_()
+
+    layout = MoonEPExpertWeightLayout(
+        full_gate_weight=full_gate_weight.contiguous(),
+        full_up_weight=full_up_weight.contiguous(),
+        full_down_weight=full_down_weight.contiguous(),
+        num_prefetch_slots=num_prefetch_slots,
+    )
+    layer._moonep_weight_layout_cache = (cache_key, layout)
+    return layout
 
 
 class MoonEPDispatcher(BaseDispatcher):
