@@ -1025,6 +1025,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             get_tp_world_size() > 1
             and not torch.compiler.is_compiling()
             and not envs.SGLANG_CACHE_DIT_ENABLED
+            and not hasattr(self, "_sglang_cache_dit_adapter")
             and not is_layerwise_offloaded_module(self)
             and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
         )
