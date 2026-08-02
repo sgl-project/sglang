@@ -31,7 +31,6 @@ from .protocol import (
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
-    ipc_postprocess_reshapes,
     recv_msg,
     send_msg,
 )
@@ -338,7 +337,15 @@ class IpcModelLoader(BaseModelLoader):
         reshaped_count = 0
         map_tic = time.perf_counter()
 
-        postprocess_reshapes = ipc_postprocess_reshapes(quant_method)
+        # Ask the model itself, rather than matching on a quant method name:
+        # a method whose post-processing pads/swizzles declares it, and the
+        # client then rebinds to the daemon's shapes instead of treating the
+        # difference from its own create_weights as daemon/client drift.
+        postprocess_reshapes = any(
+            module.quant_method.ipc_reshapes_weights()
+            for _, module in model.named_modules()
+            if getattr(module, "quant_method", None) is not None
+        )
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
@@ -463,49 +470,27 @@ class IpcModelLoader(BaseModelLoader):
 
     @staticmethod
     def _rebind_quant_state_after_import(model) -> None:
-        """Re-establish quant state that depends on tensor identity.
+        """Let each quant method re-establish state that depends on tensor identity.
 
-        Post-processing also wires up Python objects holding references to the
-        tensors it produced -- NVFP4 MoE hands its input global scale to the
-        token dispatcher. Those are the daemon's objects, so the client redoes
-        just that wiring against its own IPC-mapped tensors.
-
-        Kept here rather than as a hook on the quant method so the weight cache
-        stays self-contained. The cost is that the expression below duplicates
-        the dispatcher call at the end of
-        ModelOptNvFp4FusedMoEMethod.process_weights_after_loading; if that call
-        changes, this must change with it, and only end-to-end output parity
-        would notice.
+        Post-processing may hand other objects references to the tensors it
+        produced (NVFP4 MoE gives the token dispatcher its input global scale).
+        Those are the daemon's objects, so every quant method gets a chance to
+        redo that wiring against this process's IPC-mapped tensors; the base
+        implementation is a no-op, so methods with nothing to rebind cost a call.
         """
-        from sglang.srt.layers.moe.utils import (
-            should_use_flashinfer_cutlass_moe_fp4_allgather,
-        )
-        from sglang.srt.layers.quantization.modelopt_quant import (
-            MOE_NVFP4_DISPATCH,
-            ModelOptNvFp4FusedMoEMethod,
-        )
-
-        # Map each quant method to a function that rebinds the quant state.
-        quant_rebinds = {
-            ModelOptNvFp4FusedMoEMethod: lambda mod: mod.dispatcher.set_quant_config(
-                {
-                    "input_global_scale": (
-                        mod.w13_input_scale_quant
-                        if MOE_NVFP4_DISPATCH
-                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                        else None
-                    )
-                }
-            )
-        }
+        from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
         rebound = 0
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if not quant_method or quant_method not in quant_rebinds:
+            if quant_method is None:
                 continue
-            quant_rebinds[quant_method](module)
-            rebound += 1
+            quant_method.ipc_rebind_after_import(module)
+            if (
+                type(quant_method).ipc_rebind_after_import
+                is not QuantizeMethodBase.ipc_rebind_after_import
+            ):
+                rebound += 1
         if rebound:
             logger.info(f"[IpcModelLoader] Rebound quant state on {rebound} module(s)")
 

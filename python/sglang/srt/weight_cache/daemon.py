@@ -325,7 +325,7 @@ class WeightCacheDaemon:
         # risk observing half-written weights.
         current_platform.synchronize()
 
-        self.module_attrs = capture_module_attrs(self.model, quant_method)
+        self.module_attrs = capture_module_attrs(self.model)
         self.moe_runner_backend = get_moe_runner_backend().value
 
         # Export all parameters and buffers as IPC handles

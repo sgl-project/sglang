@@ -174,19 +174,6 @@ IPC_QUANT_ALLOWLIST = {
     "modelopt_fp4": _nvfp4_round_trips_via_ipc,  # NVFP4
 }
 
-# quant methods whose post-processing changes tensor shapes (padding for kernel
-# alignment, swizzled scale layouts). Their exported tensors legitimately do not
-# match the shapes the client's create_weights registered, so the client rebinds
-# to the daemon's shape instead of hard-erroring on the mismatch. Correctness
-# still rests on the CacheConfig fingerprint (quant config, resolved backends,
-# device capability, torch version) matching.
-IPC_POSTPROCESS_RESHAPES_QUANTS = {"modelopt_fp4"}
-
-
-def ipc_postprocess_reshapes(quant_method: str) -> bool:
-    """Whether this method's post-processing changes exported tensor shapes."""
-    return quant_method in IPC_POSTPROCESS_RESHAPES_QUANTS
-
 
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
     """Return True if `quant_method` is verified safe for IPC zero-copy sharing."""
@@ -305,25 +292,14 @@ def compute_env_stamp() -> Dict[str, str]:
     }
 
 
-_TRANSFERABLE_ATTR_NAMES = {
-    # Unquantized: post-processing stamps no layout state.
-    "": frozenset(),
-    "fp8": frozenset(),
-    "modelopt_fp4": frozenset(
-        {
-            "weights_padding_cols",
-            "output_size_per_partition",
-            "intermediate_size_per_partition",
-            "_w13_deinterleaved",
-        }
-    ),
-}
+# Values simple enough to survive the daemon -> client boundary. A guard
+# against a declared name holding something process-local: tensors travel as
+# IPC handles, and configs/callables/sub-modules cannot cross at all.
 _TRANSFERABLE_ATTR_TYPES = (int, float, bool, str, type(None))
 
 
-def capture_module_attrs(model, quant_method: str) -> Dict[str, Dict[str, Any]]:
-    """Snapshot the layout attributes this quant method stamps (see
-    _TRANSFERABLE_ATTR_NAMES).
+def capture_module_attrs(model) -> Dict[str, Dict[str, Any]]:
+    """Snapshot the layout attributes each quant method declares.
 
     process_weights_after_loading does not only rewrite tensors: it stamps plain
     Python attributes that the kernels read later. Tensors ride the IPC handles;
@@ -336,12 +312,14 @@ def capture_module_attrs(model, quant_method: str) -> Dict[str, Dict[str, Any]]:
     the client applies these onto an identically-configured model, so an
     unchanged value is a harmless no-op.
     """
-    names = _TRANSFERABLE_ATTR_NAMES.get(quant_method, frozenset())
-    if not names:
-        return {}
-
     attrs: Dict[str, Dict[str, Any]] = {}
     for name, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        names = quant_method.ipc_transferable_attrs()
+        if not names:
+            continue
         captured = {
             key: value
             for key, value in module.__dict__.items()

@@ -33,7 +33,6 @@ from sglang.srt.weight_cache.protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
-    ipc_postprocess_reshapes,
     is_ipc_quant_supported,
     recv_msg,
     send_msg,
@@ -277,11 +276,6 @@ class TestIpcQuantAllowlist(CustomTestCase):
         check_ipc_quant_support(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
-
-    def test_only_reshaping_methods_relax_the_shape_check(self):
-        self.assertTrue(ipc_postprocess_reshapes("modelopt_fp4"))
-        self.assertFalse(ipc_postprocess_reshapes("fp8"))
-        self.assertFalse(ipc_postprocess_reshapes(""))
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
