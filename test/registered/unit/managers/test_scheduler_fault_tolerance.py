@@ -1,143 +1,208 @@
-"""Unit tests for the dev-only fault-tolerant scheduler event loop recovery.
+"""Unit tests for the dev-only fault-tolerant scheduler event loop (--debug-mode).
 
-Covers Scheduler._all_inflight_reqs / _abort_all_and_reset /
-_recover_from_iteration_error (see --debug-mode). These run the
-recovery logic directly on a hand-built Scheduler stub, so no model, GPU, or
-event loop is needed.
+Two layers are covered:
+
+1. ``SchedulerDebugFaultHandler.discard_batch`` — the teardown primitive. Built with
+   narrow fakes (no Scheduler, no model, no GPU).
+2. ``Scheduler._discard_failed_batch`` — the orchestration around it, including the
+   best-effort re-raise contract and the invariant that it touches *only* the
+   pointers to the discarded batch. That last test is the guard against the design
+   regressing back into a whole-scheduler reset.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.debug_fault_handler import (
+    ABORT_MESSAGE,
+    SchedulerDebugFaultHandler,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    def __init__(self, rid: str):
+    """Only the fields the teardown path reads/writes."""
+
+    def __init__(self, rid: str, finished: bool = False):
         self.rid = rid
+        self.finished_reason = "done" if finished else None
+        self.to_finish = "staged"
+        self.time_stats = MagicMock()
+        self.return_logprob = False
+        self.req_pool_idx = 0
+
+    def finished(self) -> bool:
+        return self.finished_reason is not None
 
 
-def _fake_batch(rids):
-    return MagicMock(reqs=[_FakeReq(r) for r in rids])
+def _fake_batch(rids, finished_rids=()):
+    return MagicMock(reqs=[_FakeReq(r, finished=r in finished_rids) for r in rids])
 
 
-def _make_scheduler_stub(
-    *, running_rids=(), last_rids=(), cur_rids=(), chunked_rid=None
-) -> Scheduler:
-    """A Scheduler carrying only the attributes the recovery path reads/writes,
-    built without the heavy __init__ (no model / GPU)."""
+def _make_handler(**overrides):
+    kwargs = dict(
+        tree_cache=MagicMock(),
+        hisparse_coordinator=None,
+        ipc_channels=MagicMock(),
+        enable_hicache_storage=lambda: False,
+    )
+    kwargs.update(overrides)
+    return SchedulerDebugFaultHandler(**kwargs), kwargs
+
+
+def _notified_rids(ipc_channels) -> set:
+    return {
+        call.args[0].rid
+        for call in ipc_channels.send_to_tokenizer.send_output.call_args_list
+    }
+
+
+class TestDebugFaultHandler(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # release_kv_cache reads global server args and the real pool objects; the
+        # contract under test is that we delegate to it once per discarded request,
+        # so patch it and assert the delegation.
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.debug_fault_handler.release_kv_cache"
+        )
+        self.release_kv_cache = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_discard_batch_aborts_and_releases_each_unfinished_req(self):
+        handler, kwargs = _make_handler()
+        batch = _fake_batch(("r1", "r2"))
+
+        aborted = handler.discard_batch(batch)
+
+        self.assertEqual(sorted(aborted), ["r1", "r2"])
+        # Every request ends up finished (so the next filter_batch drops it from
+        # running_batch) with its KV released -- the forward pass that would
+        # normally do both is exactly what failed.
+        for req in batch.reqs:
+            self.assertTrue(req.finished())
+            self.assertIsNone(req.to_finish)
+        self.assertEqual(
+            {call.args[0].rid for call in self.release_kv_cache.call_args_list},
+            {"r1", "r2"},
+        )
+        # Never insert an aborted request's partial KV into the radix tree.
+        for call in self.release_kv_cache.call_args_list:
+            self.assertFalse(call.kwargs["is_insert"])
+        # The client is told, once per request, with the debug-mode reason.
+        self.assertEqual(_notified_rids(kwargs["ipc_channels"]), {"r1", "r2"})
+        for call in kwargs["ipc_channels"].send_to_tokenizer.send_output.call_args_list:
+            self.assertEqual(call.args[0].abort_message, ABORT_MESSAGE)
+
+    def test_discard_batch_skips_already_finished_reqs(self):
+        # A request that finished normally before the exception already had its
+        # final output streamed and its KV released. Re-notifying it would send an
+        # abort for a completed rid and double-release its KV.
+        handler, kwargs = _make_handler()
+        batch = _fake_batch(("done", "live"), finished_rids=("done",))
+
+        aborted = handler.discard_batch(batch)
+
+        self.assertEqual(aborted, ["live"])
+        self.assertEqual(_notified_rids(kwargs["ipc_channels"]), {"live"})
+        self.assertEqual(
+            [call.args[0].rid for call in self.release_kv_cache.call_args_list],
+            ["live"],
+        )
+
+    def test_discard_batch_retracts_hisparse_before_abort(self):
+        # release_req guards hisparse retraction on `not req.finished()`, so the
+        # retraction must happen before prepare_abort sets the finish reason.
+        seen_finished = []
+        coordinator = MagicMock()
+        coordinator.retract_req.side_effect = lambda req: seen_finished.append(
+            req.finished()
+        )
+        handler, _ = _make_handler(hisparse_coordinator=coordinator)
+
+        handler.discard_batch(_fake_batch(("r1",)))
+
+        self.assertEqual(seen_finished, [False])
+
+
+def _make_scheduler_stub(*, batch, chunked_req=None, discard_raises=False) -> Scheduler:
+    """A Scheduler carrying only what _discard_failed_batch reads/writes, built
+    without the heavy __init__ (no model / GPU)."""
     sched = Scheduler.__new__(Scheduler)
-
-    sched.running_batch = _fake_batch(running_rids)
-    sched.last_batch = _fake_batch(last_rids) if last_rids else None
-    sched.cur_batch_for_debug = _fake_batch(cur_rids) if cur_rids else None
-    sched.chunked_req = _FakeReq(chunked_rid) if chunked_rid else None
-    sched.waiting_queue = [_FakeReq("w1")]
-    sched._pending_chunked_abort_req = _FakeReq("stale")
-
-    sched.abort_request = MagicMock()
-    sched.ipc_channels = MagicMock()
-    sched.tree_cache = MagicMock()
-    sched.req_to_token_pool = MagicMock()
-    sched.token_to_kv_pool_allocator = MagicMock()
-    sched.grammar_manager = MagicMock()
-    sched.draft_worker = None
-    # Post-reset verification hook; individual tests override the return value.
-    sched.is_fully_idle = MagicMock(return_value=True)
+    sched.running_batch = MagicMock(reqs=[], batch_is_full=True)
+    sched.last_batch = batch
+    sched.cur_batch_for_debug = batch
+    sched.chunked_req = chunked_req
+    sched._pending_chunked_abort_req = chunked_req
+    sched.waiting_queue = [_FakeReq("queued")]
+    sched.debug_fault_handler = MagicMock()
+    if discard_raises:
+        sched.debug_fault_handler.discard_batch.side_effect = RuntimeError("teardown")
+    else:
+        sched.debug_fault_handler.discard_batch.return_value = ["r1"]
     return sched
 
 
-class TestDevFaultToleranceRecovery(CustomTestCase):
-    def test_all_inflight_reqs_dedups_by_rid(self):
-        # r1 is in both running and last batches; the chunked req adds c1. A
-        # req must be reported once, or _abort_all_and_reset double-notifies it.
-        sched = _make_scheduler_stub(
-            running_rids=("r1", "r2"), last_rids=("r1",), chunked_rid="c1"
-        )
-        rids = sorted(req.rid for req in sched._all_inflight_reqs())
-        self.assertEqual(rids, ["c1", "r1", "r2"])
+class TestDiscardFailedBatchOrchestration(CustomTestCase):
+    def test_discards_batch_and_clears_only_pointers_to_it(self):
+        batch = _fake_batch(("r1",))
+        sched = _make_scheduler_stub(batch=batch)
 
-    def test_abort_all_and_reset_notifies_inflight_and_resets_state(self):
-        sched = _make_scheduler_stub(running_rids=("r1", "r2"), chunked_rid="c1")
+        sched._discard_failed_batch(batch, RuntimeError("boom"))  # must not raise
 
-        sched._abort_all_and_reset()
-
-        # Queued requests are handled via abort_request(abort_all=True).
-        sched.abort_request.assert_called_once()
-        (abort_arg,) = sched.abort_request.call_args.args
-        self.assertIsInstance(abort_arg, AbortReq)
-        self.assertTrue(abort_arg.abort_all)
-
-        # Running/chunked requests are notified EXPLICITLY: abort_request only
-        # marks them (relying on a later forward), so without this loop their
-        # clients would hang forever. Guard that every in-flight rid is sent.
-        notified = {
-            call.args[0].rid
-            for call in sched.ipc_channels.send_to_tokenizer.send_output.call_args_list
-        }
-        self.assertEqual(notified, {"r1", "r2", "c1"})
-
-        # All memory pools are wiped so no KV is leaked across the reset.
-        sched.tree_cache.reset.assert_called_once()
-        sched.req_to_token_pool.clear.assert_called_once()
-        sched.token_to_kv_pool_allocator.clear.assert_called_once()
-        sched.grammar_manager.clear.assert_called_once()
-
-        # Loop-carried state returns to the empty __init__ values.
-        self.assertEqual(sched.waiting_queue, [])
-        self.assertIsInstance(sched.running_batch, ScheduleBatch)
-        self.assertEqual(len(sched.running_batch.reqs), 0)
+        sched.debug_fault_handler.discard_batch.assert_called_once_with(batch)
+        # Pointers to the discarded batch are dropped...
         self.assertIsNone(sched.last_batch)
         self.assertIsNone(sched.cur_batch_for_debug)
+        self.assertFalse(sched.running_batch.batch_is_full)
+        # ...and nothing else is. This is the whole point of the batch-scoped
+        # design: the waiting queue keeps its requests and the memory pools are
+        # never wiped, so no field enumeration has to be kept in sync as
+        # scheduler state grows. A whole-scheduler reset would fail here.
+        self.assertEqual([r.rid for r in sched.waiting_queue], ["queued"])
+
+    def test_clears_chunked_req_only_when_it_was_in_the_failed_batch(self):
+        chunked = _FakeReq("c1")
+        batch = _fake_batch(("r1",))
+        batch.reqs.append(chunked)
+        sched = _make_scheduler_stub(batch=batch, chunked_req=chunked)
+
+        sched._discard_failed_batch(batch, RuntimeError("boom"))
+
         self.assertIsNone(sched.chunked_req)
-        # Dropping this marker prevents next iteration's
+        # Dropping this marker prevents the next iteration's
         # process_pending_chunked_abort from touching a discarded req.
         self.assertIsNone(sched._pending_chunked_abort_req)
 
-    def test_recover_drives_reset_and_verification_on_success(self):
-        # Guards the success-path orchestration of _recover: it must drive the
-        # reset (abort_request) AND the post-reset verification (is_fully_idle),
-        # then return without raising. This is the only case exercising the happy
-        # path, so it catches a _recover that wrongly raises even on success.
-        sched = _make_scheduler_stub(running_rids=("r1",))
+    def test_keeps_chunked_req_that_survived_the_failed_batch(self):
+        chunked = _FakeReq("c1")
+        batch = _fake_batch(("r1",))
+        sched = _make_scheduler_stub(batch=batch, chunked_req=chunked)
 
-        sched._recover_from_iteration_error(RuntimeError("boom"))  # must not raise
+        sched._discard_failed_batch(batch, RuntimeError("boom"))
 
-        sched.abort_request.assert_called_once()
-        sched.is_fully_idle.assert_called_once()
+        self.assertIs(sched.chunked_req, chunked)
 
-    def test_recover_reraises_when_reset_leaves_non_idle_state(self):
-        # Post-reset verification: if the scheduler is not fully idle after the
-        # reset, the recovery is unrecoverable and must re-raise the ORIGINAL
-        # exception (crash path) rather than resuming on stale state.
-        sched = _make_scheduler_stub(running_rids=("r1",))
-        sched.is_fully_idle = MagicMock(return_value=False)
+    def test_reraises_original_exception_when_teardown_fails(self):
+        # Best-effort contract: if the teardown itself fails the state is unknown,
+        # so the ORIGINAL exception must propagate (falling back to the normal
+        # crash path) rather than being swallowed.
+        batch = _fake_batch(("r1",))
+        sched = _make_scheduler_stub(batch=batch, discard_raises=True)
         original = RuntimeError("boom")
 
         with self.assertRaises(RuntimeError) as ctx:
-            sched._recover_from_iteration_error(original)
+            sched._discard_failed_batch(batch, original)
         self.assertIs(ctx.exception, original)
-
-    def test_recover_reraises_original_when_reset_fails(self):
-        # Best-effort contract: if the reset itself fails the state is
-        # unrecoverable, so the ORIGINAL exception must propagate (falling back
-        # to the normal crash path) rather than being swallowed.
-        sched = _make_scheduler_stub(running_rids=("r1",))
-        sched.abort_request.side_effect = RuntimeError("cleanup failed")
-        original = RuntimeError("boom")
-
-        with self.assertRaises(RuntimeError) as ctx:
-            sched._recover_from_iteration_error(original)
-        self.assertIs(ctx.exception, original)
+        # State must not be half-updated when we bail out to the crash path.
+        self.assertIs(sched.last_batch, batch)
 
 
 if __name__ == "__main__":

@@ -1558,12 +1558,15 @@ class ServerArgs:
     debug_mode: A[
         bool,
         "Dev-only debug mode (never use in production). Keeps the system alive when a "
-        "serving-time exception is raised inside the event loop. On error, all "
-        "in-flight and queued requests are aborted (their clients receive an abort), "
-        "the KV cache and scheduler queues are reset, and the loop resumes, so a "
-        "serving-time bug can be reproduced repeatedly without paying weight load + "
-        "graph capture on every crash. Only supported with tp_size=pp_size=dp_size=1 "
-        "and the non-overlap scheduler (overlap is force-disabled).",
+        "batch's forward pass raises inside the event loop. On error the failed batch "
+        "is discarded: the requests it owns are aborted (their clients receive an "
+        "abort) and their KV is released, then the loop resumes -- the waiting queue, "
+        "the memory pools and the rest of the scheduler state are left untouched. A "
+        "serving-time bug can therefore be reproduced repeatedly without paying weight "
+        "load + graph capture on every crash. Exceptions outside the batch forward "
+        "(request intake, batch scheduling) still crash the process as usual. Only "
+        "supported with tp_size=pp_size=dp_size=1 and the non-overlap scheduler "
+        "(overlap is force-disabled).",
     ] = False
 
     # -------------------------------------------------------------------------
