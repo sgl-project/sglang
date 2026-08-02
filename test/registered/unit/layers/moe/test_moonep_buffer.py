@@ -9,7 +9,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPBuffer,
+    MoonEPDispatchOutput,
+    MoonEPExpertWeightLayout,
     get_moonep_expert_weight_layout,
+    run_moonep_bf16_expert,
 )
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -236,6 +239,67 @@ class TestMoonEPExpertWeightLayout(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "global w13_weight"):
             get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
+
+
+class TestMoonEPBf16ExpertRunner(unittest.TestCase):
+    def test_segment_runner_applies_expert_weights_and_route_weights(self):
+        hidden_states = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            dtype=torch.float32,
+        )
+        route_weights = torch.tensor([1.0, 0.5, 2.0], dtype=torch.float32)
+        cu_seqlens = torch.tensor([2, 3], dtype=torch.int32)
+        expert_ids = torch.tensor([0, 1], dtype=torch.int32)
+        gate = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.5, 0.0], [0.0, 0.5]],
+            ]
+        )
+        up = torch.tensor(
+            [
+                [[2.0, 0.0], [0.0, 2.0]],
+                [[1.5, 0.0], [0.0, 1.5]],
+            ]
+        )
+        down = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [0.0, 2.0]],
+            ]
+        )
+        layout = MoonEPExpertWeightLayout(
+            full_gate_weight=gate,
+            full_up_weight=up,
+            full_down_weight=down,
+            num_prefetch_slots=0,
+        )
+        dispatch_output = MoonEPDispatchOutput(
+            hidden_states=hidden_states,
+            route_weights_nvs=route_weights,
+            cu_seqlens=cu_seqlens,
+            plan=object(),
+            expert_ids=expert_ids,
+            num_tokens=2,
+        )
+
+        combine_input = run_moonep_bf16_expert(dispatch_output, layout)
+
+        expected = torch.empty_like(hidden_states)
+        for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
+            x = hidden_states[start:end]
+            y = torch.nn.functional.linear(
+                torch.nn.functional.silu(
+                    torch.nn.functional.linear(x, gate[expert])
+                )
+                * torch.nn.functional.linear(x, up[expert]),
+                down[expert],
+            )
+            expected[start:end] = y * route_weights[start:end, None]
+
+        torch.testing.assert_close(combine_input.hidden_states, expected)
+        self.assertIs(combine_input.plan, dispatch_output.plan)
+        self.assertEqual(combine_input.num_tokens, 2)
 
 
 if __name__ == "__main__":

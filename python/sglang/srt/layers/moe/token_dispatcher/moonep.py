@@ -5,6 +5,7 @@ from typing import Any, NamedTuple, NoReturn, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -38,6 +39,8 @@ class MoonEPDispatchOutput(NamedTuple):
     route_weights_nvs: Optional[torch.Tensor]
     cu_seqlens: torch.Tensor
     plan: Any
+    expert_ids: torch.Tensor
+    num_tokens: int
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -408,6 +411,88 @@ def get_moonep_expert_weight_layout(
     )
     layer._moonep_weight_layout_cache = (cache_key, layout)
     return layout
+
+
+def run_moonep_bf16_expert(
+    dispatch_output: MoonEPDispatchOutput,
+    weight_layout: MoonEPExpertWeightLayout,
+    *,
+    activation: str = "silu",
+) -> MoonEPCombineInput:
+    """Run a simple BF16 MoonEP expert core over ``cu_seqlens`` segments.
+
+    This is a correctness-first PoC runner.  It consumes MoonEP's already
+    expert-grouped ``[NvS, H]`` token layout, applies gate/up/down expert
+    weights for each non-empty `cu_seqlens` segment, multiplies each dispatched
+    row by its route weight, and returns a `MoonEPCombineInput` for
+    `MoonEPDispatcher.combine`.
+    """
+
+    if activation != "silu":
+        raise NotImplementedError(
+            f"MoonEP BF16 PoC runner only supports silu, got {activation!r}"
+        )
+
+    hidden_states = dispatch_output.hidden_states
+    route_weights_nvs = dispatch_output.route_weights_nvs
+    cu_seqlens = dispatch_output.cu_seqlens
+    expert_ids = dispatch_output.expert_ids
+
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            f"MoonEP hidden states must be [NvS, H], got {hidden_states.shape}"
+        )
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.shape}")
+    if expert_ids.shape != cu_seqlens.shape:
+        raise ValueError(
+            f"expert_ids shape {expert_ids.shape} must match cu_seqlens "
+            f"shape {cu_seqlens.shape}"
+        )
+    if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
+        raise ValueError(
+            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
+        )
+
+    output = torch.empty_like(hidden_states)
+    prev = 0
+    for group_id in range(cu_seqlens.numel()):
+        cur = int(cu_seqlens[group_id].item())
+        if cur < prev:
+            raise ValueError("MoonEP cu_seqlens must be non-decreasing")
+        if cur == prev:
+            continue
+
+        expert_id = int(expert_ids[group_id].item())
+        if expert_id < 0:
+            output[prev:cur].zero_()
+            prev = cur
+            continue
+        if expert_id >= weight_layout.full_gate_weight.shape[0]:
+            raise ValueError(
+                f"expert_id {expert_id} exceeds MoonEP weight rows "
+                f"{weight_layout.full_gate_weight.shape[0]}"
+            )
+
+        x = hidden_states[prev:cur]
+        gate = F.linear(x, weight_layout.full_gate_weight[expert_id])
+        up = F.linear(x, weight_layout.full_up_weight[expert_id])
+        activated = F.silu(gate) * up
+        y = F.linear(activated, weight_layout.full_down_weight[expert_id])
+        if route_weights_nvs is not None:
+            y = y * route_weights_nvs[prev:cur].to(dtype=y.dtype).unsqueeze(-1)
+        output[prev:cur].copy_(y)
+        prev = cur
+
+    if prev < hidden_states.shape[0]:
+        output[prev:].zero_()
+
+    return MoonEPCombineInput(
+        hidden_states=output,
+        route_weights_nvs=route_weights_nvs,
+        plan=dispatch_output.plan,
+        num_tokens=dispatch_output.num_tokens,
+    )
 
 
 class MoonEPDispatcher(BaseDispatcher):
