@@ -640,7 +640,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         on_trace_ready = None
         if envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
             trace_dir = os.path.join(
-                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "graph_capture_traces"
+                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"),
+                "graph_capture_traces",
             )
             os.makedirs(trace_dir, exist_ok=True)
 
