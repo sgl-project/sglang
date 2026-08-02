@@ -12,15 +12,19 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-
-from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 

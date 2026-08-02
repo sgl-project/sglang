@@ -2054,9 +2054,14 @@ class TestDeepEPv2RunnerResolution(CustomTestCase):
         return sa
 
     def test_auto_fp8_resolves_to_deep_gemm(self):
+        from sglang.srt.arg_groups.overrides import materialize_declarations
+
         sa = self._make()
         sa._handle_a2a_moe()
         self.assertEqual(sa.moe_runner_backend, "deep_gemm")
+        # ep_size / shared-experts fusion are declared by the a2a passes and
+        # land on the fields only at materialization, like every other backend.
+        materialize_declarations(sa)
         self.assertEqual(sa.ep_size, sa.tp_size)
         self.assertTrue(sa.disable_shared_experts_fusion)
 

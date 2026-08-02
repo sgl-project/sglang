@@ -2144,9 +2144,16 @@ def fp8_per_token_to_per_tensor_quant_triton(
 # psum[e-1] is expert e's aligned group start (consumed by ep_scatter_from_psum).
 # ---------------------------------------------------------------------------
 
-_EPV2_REPACK_WORKERS_PER_EXPERT = 64
+_DEEPEP_V2_REPACK_WORKERS_PER_EXPERT = 64
 
 
+# Repack kernel for the DeepEP v2 masked decode path: expand the
+# [total, hidden] dispatch output (valid rows packed per expert via psum
+# offsets) into per-expert masked slabs [E_local, max_m, hidden] for
+# DeepGEMM's masked grouped GEMM, copying activations and, for FP8
+# dispatch, the block scales. recv_x_scale_stride1 carries the scale
+# pack-dim stride so both row-major (Hopper) and column-major packed
+# UE8M0 (Blackwell) scale layouts are read correctly.
 @triton.jit
 def _fwd_kernel_expand_to_masked_slab(
     psum_ptr,
@@ -2155,10 +2162,9 @@ def _fwd_kernel_expand_to_masked_slab(
     recv_x_scale_ptr,
     recv_x_scale_stride0,
     recv_x_scale_stride1,
-    slab_ptr,
-    slab_stride0,
-    slab_scale_ptr,
-    slab_scale_stride0,
+    output_tensor_ptr,
+    output_tensor_stride0,
+    output_tensor_scale_ptr,
     masked_m_ptr,
     overflow_ptr,
     MAX_M: tl.constexpr,
@@ -2198,7 +2204,7 @@ def _fwd_kernel_expand_to_masked_slab(
         src = (start + j).to(tl.int64)
         dst = (e * MAX_M + j).to(tl.int64)
         v = tl.load(recv_x_ptr + src * recv_x_stride0 + off, mask=mask)
-        tl.store(slab_ptr + dst * slab_stride0 + off, v, mask=mask)
+        tl.store(output_tensor_ptr + dst * output_tensor_stride0 + off, v, mask=mask)
         if IS_FP8:
             vs = tl.load(
                 recv_x_scale_ptr
@@ -2211,7 +2217,7 @@ def _fwd_kernel_expand_to_masked_slab(
             # TMA-aligned layout deep_gemm wants, so the GEMM-side transpose
             # (get_mn_major_tma_aligned_tensor) becomes a no-op.
             tl.store(
-                slab_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
+                output_tensor_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
                 vs,
                 mask=mask_s,
             )
@@ -2229,7 +2235,7 @@ def expand_to_masked_slab(
     """expanded [total, hidden] -> ([E_local, max_m, hidden], [E_local, max_m, sh] or None, masked_m[E_local])."""
     hidden = recv_x.shape[1]
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
-    slab = torch.empty(
+    output_tensor = torch.empty(
         (num_local_experts * max_m, hidden), device=recv_x.device, dtype=recv_x.dtype
     )
     masked_m = torch.empty(
@@ -2243,13 +2249,13 @@ def expand_to_masked_slab(
     )
     if is_fp8:
         sh = recv_x_scale.shape[1]
-        # mn-major slab_scale: store physically as [E, sh, max_m] (contiguous),
+        # mn-major scale: store physically as [E, sh, max_m] (contiguous),
         # return a [E, max_m, sh] view with mn-major stride. This matches
         # deep_gemm's mn-major TMA-aligned scale layout, so the per-layer
         # get_mn_major_tma_aligned_tensor call on the GEMM side is a no-op.
         # (That call still runs and would transpose if the layout ever failed to
         # match, so correctness does not depend on this optimization.)
-        slab_scale = torch.empty(
+        output_tensor_scale = torch.empty(
             (num_local_experts * sh, max_m),
             device=recv_x.device,
             dtype=recv_x_scale.dtype,
@@ -2257,15 +2263,13 @@ def expand_to_masked_slab(
         scale_arg = recv_x_scale
         scale_s0 = recv_x_scale.stride(0)
         scale_s1 = recv_x_scale.stride(1)
-        slab_scale_s0 = 0  # unused: scale write uses mn-major addressing
     else:
         sh = 1
-        slab_scale = None
+        output_tensor_scale = None
         scale_arg = recv_x
         scale_s0 = 0
         scale_s1 = 0
-        slab_scale_s0 = 0
-    num_workers = min(max_m, _EPV2_REPACK_WORKERS_PER_EXPERT)
+    num_workers = min(max_m, _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT)
     _fwd_kernel_expand_to_masked_slab[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
         recv_x,
@@ -2273,10 +2277,9 @@ def expand_to_masked_slab(
         scale_arg,
         scale_s0,
         scale_s1,
-        slab,
-        slab.stride(0),
-        slab_scale if is_fp8 else scale_arg,
-        slab_scale_s0,
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor_scale if is_fp8 else scale_arg,
         masked_m,
         overflow,
         MAX_M=max_m,
@@ -2304,20 +2307,22 @@ def expand_to_masked_slab(
             f"{max_m} tokens; increase "
             f"SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
         )
-    slab = slab.view(num_local_experts, max_m, hidden)
+    output_tensor = output_tensor.view(num_local_experts, max_m, hidden)
     if is_fp8:
         # physical [E, sh, max_m] -> [E, max_m, sh] view with mn-major stride (no copy)
-        slab_scale = slab_scale.view(num_local_experts, sh, max_m).transpose(1, 2)
-    return slab, slab_scale, masked_m
+        output_tensor_scale = output_tensor_scale.view(
+            num_local_experts, sh, max_m
+        ).transpose(1, 2)
+    return output_tensor, output_tensor_scale, masked_m
 
 
 @triton.jit
 def _fwd_kernel_masked_slab_to_expand(
     psum_ptr,
-    slab_ptr,
-    slab_stride0,
-    out_ptr,
-    out_stride0,
+    input_tensor_ptr,
+    input_tensor_stride0,
+    output_tensor_ptr,
+    output_tensor_stride0,
     weight_ptr,
     MAX_M: tl.constexpr,
     ALIGN: tl.constexpr,
@@ -2339,16 +2344,16 @@ def _fwd_kernel_masked_slab_to_expand(
     for j in tl.range(worker, count, NUM_WORKERS):
         src = (e * MAX_M + j).to(tl.int64)
         dst = (start + j).to(tl.int64)
-        v = tl.load(slab_ptr + src * slab_stride0 + off, mask=mask)
+        v = tl.load(input_tensor_ptr + src * input_tensor_stride0 + off, mask=mask)
         if HAS_W:
             w = tl.load(weight_ptr + dst)
             v = (v.to(tl.float32) * w).to(v.dtype)
-        tl.store(out_ptr + dst * out_stride0 + off, v, mask=mask)
+        tl.store(output_tensor_ptr + dst * output_tensor_stride0 + off, v, mask=mask)
 
 
 @torch.no_grad()
 def masked_slab_to_expand(
-    slab: torch.Tensor,
+    input_tensor: torch.Tensor,
     psum_num_recv_tokens_per_expert: torch.Tensor,
     total_expanded_tokens: int,
     expert_alignment: int,
@@ -2362,25 +2367,27 @@ def masked_slab_to_expand(
     top-k weight is fused into the copy so the weighted-combine multiply happens
     only on real rows (not the worst-case buffer).
     """
-    num_local_experts, max_m, hidden = slab.shape
+    num_local_experts, max_m, hidden = input_tensor.shape
     # combine reads only real rows via handle metadata, so padding need not be
     # zeroed -> use empty to skip the worst-case-buffer memset.
-    out = torch.empty(
-        (total_expanded_tokens, hidden), device=slab.device, dtype=slab.dtype
+    output_tensor = torch.empty(
+        (total_expanded_tokens, hidden),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
     )
-    slab2d = slab.view(num_local_experts * max_m, hidden)
+    input_tensor2d = input_tensor.view(num_local_experts * max_m, hidden)
     has_w = topk_weights is not None
     if has_w:
         weight_arg = topk_weights.reshape(-1).to(torch.float32).contiguous()
     else:
-        weight_arg = slab2d  # dummy, unused
-    num_workers = min(max_m, _EPV2_REPACK_WORKERS_PER_EXPERT)
+        weight_arg = input_tensor2d  # dummy, unused
+    num_workers = min(max_m, _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT)
     _fwd_kernel_masked_slab_to_expand[(num_local_experts, num_workers)](
         psum_num_recv_tokens_per_expert,
-        slab2d,
-        slab2d.stride(0),
-        out,
-        out.stride(0),
+        input_tensor2d,
+        input_tensor2d.stride(0),
+        output_tensor,
+        output_tensor.stride(0),
         weight_arg,
         MAX_M=max_m,
         ALIGN=expert_alignment,
@@ -2390,7 +2397,7 @@ def masked_slab_to_expand(
         NUM_WORKERS=num_workers,
         num_warps=4,
     )
-    return out
+    return output_tensor
 
 
 def moe_permute(

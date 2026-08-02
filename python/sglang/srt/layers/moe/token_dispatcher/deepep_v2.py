@@ -254,14 +254,16 @@ class _DeepEPv2Impl:
         )
 
     def _resolve_num_sms_qps(self, buffer: ElasticBuffer) -> Tuple[int, int]:
-        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0;
-        # 0 means "0 SMs / 0 QPs". Multi-node RDMA dispatch needs real QPs, so
-        # resolve them from the theoretical helpers (matches the DeepEP elastic
-        # test harness). Single-node NVLink works with 0 QPs.
-        # get_theoretical_num_sms is @weak_lru-cached in DeepEP with fixed inputs
-        # here, and its first (modeling) call happens during eager warmup -- so on
-        # the CUDA-graph decode path this is a cache lookup: pure host work, no
-        # device sync, capture-safe.
+        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0
+        # (0 means "0 SMs / 0 QPs"). Resolve both from the theoretical helpers
+        # (matches the DeepEP elastic test harness): num_sms from
+        # SGLANG_DEEPEP_V2_NUM_SMS or get_theoretical_num_sms, and num_qps always
+        # from get_theoretical_num_qps(num_sms). Multi-node RDMA dispatch needs
+        # the real QPs; single-node NVLink is unaffected by the extra QPs.
+        # Both helpers are host-only: get_theoretical_num_sms is cached in DeepEP
+        # for the fixed inputs here (and first runs during eager warmup), and
+        # get_theoretical_num_qps is plain arithmetic. On the CUDA-graph decode
+        # path this costs no device work, so it is capture-safe.
         num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
         if num_sms == 0:
             num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)

@@ -6753,8 +6753,6 @@ class ServerArgs:
                         f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
                         "communication buffer) or lower --chunked-prefill-size."
                     )
-            self.ep_size = self.tp_size
-            self.disable_shared_experts_fusion = True
             # CUDA graph is safe on the DeepEP v2 decode masked-GEMM path under ANY
             # comm mode (direct or hybrid): the masked layout is chosen per-batch by
             # inference phase (decode), not by the comm mode, giving static shapes

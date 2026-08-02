@@ -1152,7 +1152,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             from sglang.kernels.ops.moe.ep_moe_kernels import expand_to_masked_slab
 
             num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
-            slab, slab_scale, masked_m = expand_to_masked_slab(
+            input_tensor, input_tensor_scale, masked_m = expand_to_masked_slab(
                 hidden_states,
                 hidden_states_scale,
                 psum_num_recv_tokens_per_expert,
@@ -1165,8 +1165,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
             running_state["deepep_v2_total_expanded"] = deepep_v2_total_expanded
             running_state["deepep_v2_expert_alignment"] = deepep_v2_expert_alignment
             return DeepGemmRunnerInput(
-                hidden_states=slab,
-                hidden_states_scale=slab_scale,
+                hidden_states=input_tensor,
+                hidden_states_scale=input_tensor_scale,
                 use_masked_gemm=True,
                 masked_m=masked_m,
                 expected_m=deepep_v2_expected_m,
@@ -1288,8 +1288,11 @@ def post_permute_deep_gemm_to_deepep_v2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if running_state.get("deepep_v2_masked", False):
-            # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
-            # it back to expanded row order (padding rows zeroed) before combine.
+            # Masked path: GEMM output is the [E_local, max_m, hidden] slab.
+            # Repack it back to expanded row order (only real rows written;
+            # padding left uninitialized and never read) and fold in the
+            # top-k weights before combine (expanded combine does not
+            # consume them).
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(

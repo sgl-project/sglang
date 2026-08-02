@@ -1,8 +1,8 @@
-"""Unit tests for the DeepEP v2 masked-slab repack Triton kernels.
+"""Unit tests for the DeepEP v2 masked-masked_x repack Triton kernels.
 
 Covers the corner cases flagged in review: empty expert, single hot expert,
 per-expert count near / over max_m (overflow -> fail-fast, not silent truncation),
-top-k weight fusion on real rows only, expanded<->slab round-trip layout, and the
+top-k weight fusion on real rows only, expanded<->masked_x round-trip layout, and the
 fp8 activation+scale path.
 """
 
@@ -73,21 +73,23 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             counts, self.ALIGN, self.HIDDEN, dtype, with_scale=with_scale
         )
         E = len(counts)
-        slab, slab_scale, masked_m = expand_to_masked_slab(
+        masked_x, masked_x_scale, masked_m = expand_to_masked_slab(
             recv_x, scale, psum, E, self.MAX_M, self.ALIGN
         )
 
         # masked_m == real per-expert count
         self.assertEqual(masked_m.tolist(), list(counts))
-        self.assertEqual(tuple(slab.shape), (E, self.MAX_M, self.HIDDEN))
+        self.assertEqual(tuple(masked_x.shape), (E, self.MAX_M, self.HIDDEN))
 
-        # slab real rows == source expanded rows
+        # masked_x real rows == source expanded rows
         for e, (s, c) in enumerate(zip(starts, counts)):
             for j in range(c):
-                torch.testing.assert_close(slab[e, j].float(), recv_x[s + j].float())
+                torch.testing.assert_close(
+                    masked_x[e, j].float(), recv_x[s + j].float()
+                )
                 if with_scale:
                     torch.testing.assert_close(
-                        slab_scale[e, j].float(), scale[s + j].float()
+                        masked_x_scale[e, j].float(), scale[s + j].float()
                     )
 
         # round-trip back to expanded order
@@ -96,13 +98,15 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             weights = torch.zeros(total, dtype=torch.float32, device=DEVICE)
             for r in _real_rows(starts, counts):
                 weights[r] = 0.25 + (r % 7) * 0.1
-        out = masked_slab_to_expand(slab, psum, total, self.ALIGN, topk_weights=weights)
+        out = masked_slab_to_expand(
+            masked_x, psum, total, self.ALIGN, topk_weights=weights
+        )
         self.assertEqual(tuple(out.shape), (total, self.HIDDEN))
         for e, (s, c) in enumerate(zip(starts, counts)):
             for j in range(c):
-                expected = slab[e, j].float()
+                expected = masked_x[e, j].float()
                 if topk:
-                    expected = (expected * weights[s + j]).to(slab.dtype).float()
+                    expected = (expected * weights[s + j]).to(masked_x.dtype).float()
                 torch.testing.assert_close(out[s + j].float(), expected)
 
     def test_roundtrip_bf16(self):
@@ -142,6 +146,76 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             expand_to_masked_slab(
                 recv_x, None, psum, len(counts), self.MAX_M, self.ALIGN
             )
+
+    def _production_packed_ue8m0_layout(self, counts):
+        """Expanded FP8 rows + scales built by the PRODUCTION quantizer with the
+        Blackwell flags (packed ue8m0, column-major): scale is int32 with
+        pack-dim stride != 1, unlike Hopper's row-major fp32."""
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        hidden = 512  # multiple of the 128 quant group size
+        raw, _, psum, starts, total = _build_layout(
+            counts, self.ALIGN, hidden, torch.bfloat16
+        )
+        recv_x, recv_x_scale = sglang_per_token_group_quant_fp8(
+            raw,
+            128,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        self.assertEqual(recv_x_scale.dtype, torch.int32)
+        self.assertNotEqual(recv_x_scale.stride(1), 1)
+        return recv_x, recv_x_scale, psum, starts, total, hidden
+
+    def test_fp8_packed_ue8m0_scale_from_production_quantizer(self):
+        # The Blackwell dispatch scale is packed ue8m0 in column-major layout,
+        # so the repack must honor the scale pack-dim stride; the row-major
+        # fp32 cases above (stride(1) == 1) cannot regress it.
+        counts = [3, 1, 6, 2]
+        recv_x, recv_x_scale, psum, starts, _, hidden = (
+            self._production_packed_ue8m0_layout(counts)
+        )
+        E = len(counts)
+        masked_x, masked_x_scale, masked_m = expand_to_masked_slab(
+            recv_x, recv_x_scale, psum, E, self.MAX_M, self.ALIGN
+        )
+        self.assertEqual(masked_m.tolist(), list(counts))
+        self.assertEqual(tuple(masked_x.shape), (E, self.MAX_M, hidden))
+        for e, (s, c) in enumerate(zip(starts, counts)):
+            for j in range(c):
+                torch.testing.assert_close(
+                    masked_x[e, j].float(), recv_x[s + j].float()
+                )
+                torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
+
+    def test_expand_under_cuda_graph_capture(self):
+        # The masked repack runs inside the captured decode CUDA graph, so it
+        # must be capture-safe (no host sync) and correct after replay, with the
+        # production packed ue8m0 scale layout.
+        counts = [3, 1, 6, 2]
+        recv_x, recv_x_scale, psum, starts, _, _ = self._production_packed_ue8m0_layout(
+            counts
+        )
+        E = len(counts)
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm):
+            expand_to_masked_slab(recv_x, recv_x_scale, psum, E, self.MAX_M, self.ALIGN)
+        torch.cuda.current_stream().wait_stream(warm)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            masked_x, masked_x_scale, masked_m = expand_to_masked_slab(
+                recv_x, recv_x_scale, psum, E, self.MAX_M, self.ALIGN
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(masked_m.tolist(), list(counts))
+        for e, (s, c) in enumerate(zip(starts, counts)):
+            for j in range(c):
+                torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
 
 
 class TestDeepEPv2HandleLifecycle(CustomTestCase):
