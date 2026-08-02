@@ -28,9 +28,8 @@
 //! the streaming state machine (whole-call buffering, split markers, release
 //! at done, `tool_calls` finish rewriting), unary parsing (marker formats and
 //! the no-parser passthrough), and the finish-reason mapping. The end-to-end
-//! wiring is covered where the pieces are assembled: `chat.rs` (streaming
-//! deltas, role framing, reasoning), `response_stream.rs`, and the
-//! responses tests (function-call lifecycle events).
+//! wiring is covered where the pieces are assembled in `chat.rs` (streaming
+//! deltas, role framing, and reasoning).
 
 use std::collections::HashMap;
 
