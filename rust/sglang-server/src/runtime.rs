@@ -94,21 +94,11 @@ impl Drop for Runtime {
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Bind the API server port before spawning any thread, so an unavailable
     // port (EADDRINUSE) is a hard startup error.
-    let addr = cfg.rust_server_args.http_addr;
-    let socket = match addr {
-        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
-        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
-    }
-    .map_err(|e| format!("socket for {addr} failed: {e}"))?;
-    socket
-        .set_reuseaddr(true)
-        .map_err(|e| format!("set_reuseaddr failed: {e}"))?;
-    if let Err(e) = socket.set_recv_buffer_size(16 * 1024 * 1024) {
-        eprintln!("warning: set_recv_buffer_size on listener failed: {e}");
-    }
-    socket
-        .bind(addr)
-        .map_err(|e| format!("bind {addr} failed: {e}"))?;
+    let listener = std::net::TcpListener::bind(cfg.rust_server_args.http_addr)
+        .map_err(|e| format!("bind {} failed: {e}", cfg.rust_server_args.http_addr))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
 
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
@@ -277,7 +267,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::serve(
-                    socket,
+                    listener,
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),

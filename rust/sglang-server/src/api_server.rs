@@ -31,7 +31,7 @@ struct AppState {
 }
 
 pub async fn serve(
-    socket: tokio::net::TcpSocket,
+    listener: std::net::TcpListener,
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -61,12 +61,12 @@ pub async fn serve(
         .with_state(state);
     let app = log::apply(app, &server_args);
 
-    // The socket was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); start listening here, on the api runtime.
-    let listener = match socket.listen(1024) {
+    // The listener was already bound synchronously in `runtime::start` (so a port
+    // conflict fails startup); adopt it into the tokio reactor here.
+    let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, "listen failed");
+            tracing::error!(error = %e, "failed to adopt pre-bound listener");
             return;
         }
     };
@@ -79,14 +79,6 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
-    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
-    // Nagle/delayed-ACK penalty on keep-alive connections.
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|io| {
-        if let Err(e) = io.set_nodelay(true) {
-            tracing::debug!(error = %e, "set_nodelay failed");
-        }
-    });
     // `with_connect_info` exposes the peer address to the access-log middleware.
     let serve = axum::serve(
         listener,
