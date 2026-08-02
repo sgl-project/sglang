@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import msgspec
@@ -45,6 +46,10 @@ logger = logging.getLogger(__name__)
 WEAVER_TREE_EXPAND_WIDTH = 8
 WEAVER_TREE_BATCH_EXPAND_WIDTH = 8
 WEAVER_TREE_BATCH_EXPAND_BUDGET_UNIT = 16
+
+
+def weaver_fused_frontier_materialize_enabled() -> bool:
+    return os.environ.get("SGLANG_WEAVER_FUSED_FRONTIER_MATERIALIZE", "1") == "1"
 
 
 @triton.jit
@@ -113,6 +118,224 @@ def _weaver_candidate_frontier_kernel(
         )
         tl.store(frontier_active_ptr + out_index, child_valid)
         scores = tl.where(offsets == top_index, -float("inf"), scores)
+
+@triton.jit
+def _weaver_bitonic_step(
+    keys,
+    values,
+    valid,
+    lanes,
+    SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    FINAL: tl.constexpr,
+):
+    low_lanes = lanes - (lanes & STRIDE)
+    high_lanes = low_lanes + STRIDE
+    low_keys = tl.gather(keys, low_lanes, axis=0)
+    high_keys = tl.gather(keys, high_lanes, axis=0)
+    low_values = tl.gather(values, low_lanes, axis=0)
+    high_values = tl.gather(values, high_lanes, axis=0)
+    low_valid = tl.gather(valid, low_lanes, axis=0)
+    high_valid = tl.gather(valid, high_lanes, axis=0)
+
+    swap = ((low_keys > high_keys) & low_valid) | (~high_valid)
+    if FINAL:
+        direction = tl.full((32,), False, tl.int1)
+    else:
+        thread = (low_lanes // (2 * STRIDE)) * STRIDE + low_lanes % STRIDE
+        direction = (thread & (SIZE // 2)) != 0
+    swap = swap == direction
+    is_low = (lanes & STRIDE) == 0
+    keys = tl.where(
+        is_low,
+        tl.where(swap, high_keys, low_keys),
+        tl.where(swap, low_keys, high_keys),
+    )
+    values = tl.where(
+        is_low,
+        tl.where(swap, high_values, low_values),
+        tl.where(swap, low_values, high_values),
+    )
+    valid = tl.where(
+        is_low,
+        tl.where(swap, high_valid, low_valid),
+        tl.where(swap, low_valid, high_valid),
+    )
+    return keys, values, valid
+
+
+@triton.jit
+def _weaver_materialize_frontier_kernel(
+    selected_indices_ptr,
+    frontier_tokens_ptr,
+    frontier_parents_ptr,
+    frontier_depths_ptr,
+    frontier_scores_ptr,
+    frontier_logprobs_ptr,
+    frontier_active_ptr,
+    slot_ancestors_ptr,
+    tokens_ptr,
+    parents_ptr,
+    depths_ptr,
+    node_mask_ptr,
+    draft_logprobs_ptr,
+    selected_tokens_ptr,
+    selected_depths_ptr,
+    selected_position_ids_ptr,
+    selected_candidate_rows_ptr,
+    selected_batch_indices_ptr,
+    selected_scores_ptr,
+    selected_active_ptr,
+    selected_parent_ancestors_ptr,
+    slot_start,
+    NUM_NODES: tl.constexpr,
+    DEPTH: tl.constexpr,
+    FRONTIER_SLOTS: tl.constexpr,
+    SELECT_WIDTH: tl.constexpr,
+    SCRATCH_WIDTH: tl.constexpr,
+    BLOCK_DEPTH: tl.constexpr,
+    WRITE_ANCESTORS: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    selected_offset = tl.arange(0, 32)
+    selected_mask = selected_offset < SELECT_WIDTH
+    frontier_index = tl.load(
+        selected_indices_ptr + batch * SELECT_WIDTH + selected_offset,
+        mask=selected_mask,
+        other=0,
+    )
+    selected_index = batch * FRONTIER_SLOTS + frontier_index
+    score = tl.load(
+        frontier_scores_ptr + selected_index,
+        mask=selected_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sort_valid = selected_mask
+    for stage in tl.static_range(1, 5):
+        size = 1 << stage
+        for pass_index in tl.static_range(0, stage):
+            stride = size >> (pass_index + 1)
+            score, frontier_index, sort_valid = _weaver_bitonic_step(
+                score,
+                frontier_index,
+                sort_valid,
+                selected_offset,
+                SIZE=size,
+                STRIDE=stride,
+                FINAL=False,
+            )
+    for pass_index in tl.static_range(0, 5):
+        stride = 16 >> pass_index
+        score, frontier_index, sort_valid = _weaver_bitonic_step(
+            score,
+            frontier_index,
+            sort_valid,
+            selected_offset,
+            SIZE=32,
+            STRIDE=stride,
+            FINAL=True,
+        )
+
+    selected_index = batch * FRONTIER_SLOTS + frontier_index
+    valid = (
+        tl.load(frontier_active_ptr + selected_index, mask=selected_mask, other=0)
+        != 0
+    )
+    token = tl.load(frontier_tokens_ptr + selected_index, mask=selected_mask, other=0)
+    parent = tl.load(frontier_parents_ptr + selected_index, mask=selected_mask, other=0)
+    depth = tl.load(frontier_depths_ptr + selected_index, mask=selected_mask, other=0)
+    logprob = tl.load(
+        frontier_logprobs_ptr + selected_index,
+        mask=selected_mask,
+        other=-float("inf"),
+    )
+
+    output_index = batch * NUM_NODES + slot_start + selected_offset
+    tl.store(
+        tokens_ptr + output_index,
+        tl.where(valid, token, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        parents_ptr + output_index,
+        tl.where(valid, parent, -1),
+        mask=selected_mask,
+    )
+    tl.store(
+        depths_ptr + output_index,
+        tl.where(valid, depth, 0),
+        mask=selected_mask,
+    )
+    tl.store(node_mask_ptr + output_index, valid, mask=selected_mask)
+    tl.store(
+        draft_logprobs_ptr + output_index,
+        tl.where(valid, logprob, -float("inf")),
+        mask=selected_mask,
+    )
+
+    scratch_index = batch * SCRATCH_WIDTH + selected_offset
+    tl.store(
+        selected_tokens_ptr + scratch_index,
+        tl.where(valid, token, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_depths_ptr + scratch_index,
+        tl.where(valid, depth, 0),
+        mask=selected_mask,
+    )
+    position = tl.minimum(depth, DEPTH - 1)
+    tl.store(
+        selected_position_ids_ptr + scratch_index,
+        tl.where(valid, position, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_candidate_rows_ptr + scratch_index,
+        tl.where(valid, batch * DEPTH + position, 0),
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_batch_indices_ptr + scratch_index,
+        batch,
+        mask=selected_mask,
+    )
+    tl.store(
+        selected_scores_ptr + scratch_index,
+        tl.where(valid, score, -float("inf")),
+        mask=selected_mask,
+    )
+    tl.store(selected_active_ptr + scratch_index, valid, mask=selected_mask)
+    tl.store(
+        frontier_active_ptr + selected_index,
+        False,
+        mask=selected_mask,
+    )
+    tl.store(
+        frontier_scores_ptr + selected_index,
+        -float("inf"),
+        mask=selected_mask,
+    )
+
+    if WRITE_ANCESTORS:
+        ancestor_offsets = tl.arange(0, BLOCK_DEPTH)[None, :]
+        ancestor_mask = (ancestor_offsets < DEPTH) & selected_mask[:, None]
+        parent_safe = tl.minimum(tl.maximum(parent, 0), NUM_NODES - 1)[:, None]
+        ancestors = tl.load(
+            slot_ancestors_ptr
+            + (batch * NUM_NODES + parent_safe) * DEPTH
+            + ancestor_offsets,
+            mask=ancestor_mask & valid[:, None],
+            other=-1,
+        )
+        tl.store(
+            selected_parent_ancestors_ptr
+            + scratch_index[:, None] * DEPTH
+            + ancestor_offsets,
+            ancestors,
+            mask=ancestor_mask,
+        )
+
 
 @triton.jit
 def _weaver_indexed_attention_kernel(
@@ -729,6 +952,155 @@ def _weaver_current_cache_write_kernel(
     ancestor_value = tl.where(ancestor_valid, ancestor_value, -1)
     out_index = (ancestor_batch * NUM_NODES + ancestor_slot) * DEPTH + ancestor_depth
     tl.store(slot_ancestors_ptr + out_index, ancestor_value, mask=ancestor_mask)
+
+
+@triton.jit
+def _weaver_publish_frontier_kernel(
+    current_keys_ptr,
+    current_values_ptr,
+    node_keys_ptr,
+    node_values_ptr,
+    parent_ancestors_ptr,
+    slot_ancestors_ptr,
+    logits_ptr,
+    candidate_ids_ptr,
+    prefix_score_ptr,
+    valid_ptr,
+    node_depth_ptr,
+    frontier_tokens_ptr,
+    frontier_parents_ptr,
+    frontier_depths_ptr,
+    frontier_scores_ptr,
+    frontier_logprobs_ptr,
+    frontier_active_ptr,
+    slot_start,
+    BS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    DEPTH: tl.constexpr,
+    NUM_NODES: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOTAL_KV: tl.constexpr,
+    TOTAL_ANCESTORS: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    EXPAND_WIDTH: tl.constexpr,
+    FRONTIER_SLOTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_POOL: tl.constexpr,
+):
+    program = tl.program_id(0)
+    offsets = program * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    kv_mask = offsets < TOTAL_KV
+    hd = offsets % HEAD_DIM
+    head = (offsets // HEAD_DIM) % NUM_HEADS
+    layer = (offsets // (HEAD_DIM * NUM_HEADS)) % NUM_LAYERS
+    row_in_width = (offsets // (HEAD_DIM * NUM_HEADS * NUM_LAYERS)) % WIDTH
+    batch = (offsets // (HEAD_DIM * NUM_HEADS * NUM_LAYERS * WIDTH)) % BS
+    row = batch * WIDTH + row_in_width
+    valid = tl.load(valid_ptr + row, mask=kv_mask, other=0) != 0
+    current_index = (((layer * BS * WIDTH + row) * NUM_HEADS + head) * HEAD_DIM + hd)
+    slot = slot_start + row_in_width
+    node_index = (
+        ((((batch * NUM_NODES + slot) * NUM_LAYERS + layer) * NUM_HEADS + head)
+        * HEAD_DIM
+        + hd)
+    )
+    key_value = tl.load(current_keys_ptr + current_index, mask=kv_mask & valid, other=0.0)
+    value_value = tl.load(
+        current_values_ptr + current_index, mask=kv_mask & valid, other=0.0
+    )
+    tl.store(node_keys_ptr + node_index, key_value, mask=kv_mask)
+    tl.store(node_values_ptr + node_index, value_value, mask=kv_mask)
+
+    ancestor_mask = offsets < TOTAL_ANCESTORS
+    ancestor_depth = offsets % DEPTH
+    ancestor_row = (offsets // DEPTH) % WIDTH
+    ancestor_batch = (offsets // (DEPTH * WIDTH)) % BS
+    ancestor_flat_row = ancestor_batch * WIDTH + ancestor_row
+    ancestor_valid = (
+        tl.load(valid_ptr + ancestor_flat_row, mask=ancestor_mask, other=0) != 0
+    )
+    current_pos = tl.load(
+        node_depth_ptr + ancestor_flat_row,
+        mask=ancestor_mask,
+        other=0,
+    )
+    current_pos = tl.minimum(current_pos, DEPTH - 1)
+    parent_value = tl.load(parent_ancestors_ptr + offsets, mask=ancestor_mask, other=-1)
+    ancestor_slot = slot_start + ancestor_row
+    ancestor_value = tl.where(ancestor_depth == current_pos, ancestor_slot, parent_value)
+    ancestor_value = tl.where(ancestor_valid, ancestor_value, -1)
+    out_index = (ancestor_batch * NUM_NODES + ancestor_slot) * DEPTH + ancestor_depth
+    tl.store(slot_ancestors_ptr + out_index, ancestor_value, mask=ancestor_mask)
+
+    if program < BS * WIDTH:
+        candidate_offsets = tl.arange(0, BLOCK_POOL)
+        pool_mask = candidate_offsets < POOL_SIZE
+        candidate_base = program * POOL_SIZE + candidate_offsets
+        token_ids = tl.load(
+            candidate_ids_ptr + candidate_base, mask=pool_mask, other=-1
+        )
+        scores = tl.load(
+            logits_ptr + candidate_base,
+            mask=pool_mask,
+            other=-float("inf"),
+        ).to(tl.float32)
+        scores = tl.where((token_ids >= 0) & pool_mask, scores, -float("inf"))
+        parent_score = tl.load(prefix_score_ptr + program)
+        parent_depth = tl.load(node_depth_ptr + program)
+        parent_active = (tl.load(valid_ptr + program) != 0) & (parent_depth < DEPTH)
+        frontier_batch = program // WIDTH
+        frontier_row = program - frontier_batch * WIDTH
+        max_score = tl.max(scores, axis=0)
+        exp_scores = tl.where(
+            scores == -float("inf"), 0.0, tl.exp(scores - max_score)
+        )
+        log_denom = tl.log(tl.sum(exp_scores, axis=0)) + max_score
+        child_base = (
+            frontier_batch * FRONTIER_SLOTS
+            + (slot_start + frontier_row) * EXPAND_WIDTH
+        )
+        child_depth = parent_depth + 1
+        for child in tl.static_range(0, EXPAND_WIDTH):
+            top_value, top_index = tl.max(
+                scores,
+                axis=0,
+                return_indices=True,
+                return_indices_tie_break_left=True,
+            )
+            child_token = tl.load(candidate_ids_ptr + program * POOL_SIZE + top_index)
+            child_valid = (
+                parent_active & (child_token >= 0) & (top_value != -float("inf"))
+            )
+            child_index = child_base + child
+            tl.store(
+                frontier_tokens_ptr + child_index,
+                tl.where(child_valid, child_token, 0),
+            )
+            tl.store(
+                frontier_parents_ptr + child_index,
+                tl.where(child_valid, slot_start + frontier_row, 0),
+            )
+            tl.store(
+                frontier_depths_ptr + child_index,
+                tl.where(child_valid, child_depth, 0),
+            )
+            tl.store(
+                frontier_scores_ptr + child_index,
+                tl.where(
+                    child_valid,
+                    parent_score + top_value - log_denom,
+                    -float("inf"),
+                ),
+            )
+            tl.store(
+                frontier_logprobs_ptr + child_index,
+                tl.where(child_valid, top_value - log_denom, -float("inf")),
+            )
+            tl.store(frontier_active_ptr + child_index, child_valid)
+            scores = tl.where(candidate_offsets == top_index, -float("inf"), scores)
+
 
 def weaver_tree_batch_expand_width(tree_budget: Optional[int] = None) -> int:
     """Weaver expansion batch width: one Weaver call expands this many nodes.
@@ -1933,6 +2305,11 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 
 
 class DFlashTfmWorker(DFlashWorkerV2):
+    def _maybe_build_draft_sampler(self):
+        # Weaver selects a top-k candidate pool from the draft hidden states.
+        # The inherited greedy sampler computes a second, unused LM-head pass.
+        return None
+
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
     ) -> None:
@@ -2151,6 +2528,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_ids: torch.Tensor,
         candidate_weights: torch.Tensor,
         candidate_scores: torch.Tensor,
+        candidate_row_index: torch.Tensor,
         external_keys: torch.Tensor,
         external_values: torch.Tensor,
         external_mask: torch.Tensor,
@@ -2160,7 +2538,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
         parent_ancestors: torch.Tensor,
         row_batch_indices: torch.Tensor,
         token_embed: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gather_candidates: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         key = (
             tuple(token_ids.shape),
             token_ids.dtype,
@@ -2170,6 +2549,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_weights.dtype,
             tuple(candidate_scores.shape),
             candidate_scores.dtype,
+            tuple(candidate_row_index.shape),
+            candidate_row_index.dtype,
+            gather_candidates,
             tuple(external_keys.shape),
             external_keys.dtype,
             tuple(external_values.shape),
@@ -2201,6 +2583,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 candidate_ids,
                 candidate_weights,
                 candidate_scores,
+                candidate_row_index,
                 external_keys,
                 external_values,
                 external_mask,
@@ -2211,7 +2594,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 row_batch_indices,
                 token_embed,
             ):
-                return self.weaver.step_indexed(
+                if gather_candidates:
+                    candidate_ids = candidate_ids[candidate_row_index]
+                    candidate_weights = candidate_weights[candidate_row_index]
+                    candidate_scores = candidate_scores[candidate_row_index]
+                outputs = self.weaver.step_indexed(
                     token_ids=token_ids,
                     candidate_ids=candidate_ids,
                     candidate_weights=candidate_weights,
@@ -2226,6 +2613,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     row_batch_indices=row_batch_indices,
                     token_embed=token_embed,
                 )
+                return (*outputs, candidate_ids)
 
             compiled_step = torch.compile(
                 step_fn,
@@ -2242,6 +2630,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_ids,
             candidate_weights,
             candidate_scores,
+            candidate_row_index,
             external_keys,
             external_values,
             external_mask,
@@ -2368,7 +2757,6 @@ class DFlashTfmWorker(DFlashWorkerV2):
         node_budget = int(self.tree_budget)
         num_nodes = node_budget + 1
         device = root_ids.device
-        node_indices = torch.arange(num_nodes, dtype=torch.long, device=device)
         tokens = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
         parents = torch.full((bs, num_nodes), -1, dtype=torch.long, device=device)
         depths = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
@@ -2391,7 +2779,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
         batch_expand_width = min(
             weaver_tree_batch_expand_width(node_budget), node_budget
         )
-
+        use_fused_frontier_materialize = weaver_fused_frontier_materialize_enabled()
+        if use_fused_frontier_materialize and batch_expand_width > 32:
+            raise RuntimeError(
+                "Fused Weaver frontier materialization supports at most "
+                f"32 selected nodes per expansion, got {batch_expand_width}."
+            )
         external_keys, external_values, external_mask = (
             self.weaver.prompt_external_kv(output_norm[:, None], proposal_features)
         )
@@ -2400,31 +2793,71 @@ class DFlashTfmWorker(DFlashWorkerV2):
             bs * depth, pool_size, candidate_weights.shape[-1]
         )
         candidate_scores_rows = candidate_scores.reshape(bs * depth, pool_size)
-        node_keys = torch.zeros(
+        node_keys = torch.empty(
             (bs, num_nodes, num_layers, num_heads, head_dim),
             dtype=proposal_features.dtype,
             device=device,
         )
-        node_values = torch.zeros_like(node_keys)
-        slot_ancestors = torch.full(
-            (bs, num_nodes, depth), -1, dtype=torch.long, device=device
+        node_values = torch.empty_like(node_keys)
+        slot_ancestors = torch.empty(
+            (bs, num_nodes, depth), dtype=torch.long, device=device
         )
-        slot_ancestors[:, 0, 0] = 0
 
-        frontier_tokens = torch.zeros((bs, frontier_slots), dtype=torch.long, device=device)
-        frontier_parents = torch.zeros(
+        frontier_tokens = torch.empty(
             (bs, frontier_slots), dtype=torch.long, device=device
         )
-        frontier_depths = torch.zeros(
-            (bs, frontier_slots), dtype=torch.long, device=device
+        frontier_parents = torch.empty_like(frontier_tokens)
+        frontier_depths = torch.empty_like(frontier_tokens)
+        frontier_scores = torch.empty(
+            (bs, frontier_slots), dtype=torch.float32, device=device
         )
-        frontier_scores = torch.full(
-            (bs, frontier_slots), -torch.inf, dtype=torch.float32, device=device
-        )
-        frontier_logprobs = torch.full_like(frontier_scores, -torch.inf)
-        frontier_active = torch.zeros(
+        frontier_logprobs = torch.empty_like(frontier_scores)
+        frontier_active = torch.empty(
             (bs, frontier_slots), dtype=torch.bool, device=device
         )
+        if not use_fused_frontier_materialize:
+            node_keys.zero_()
+            node_values.zero_()
+            slot_ancestors.fill_(-1)
+            slot_ancestors[:, 0, 0] = 0
+            frontier_tokens.zero_()
+            frontier_parents.zero_()
+            frontier_depths.zero_()
+            frontier_scores.fill_(-torch.inf)
+            frontier_logprobs.fill_(-torch.inf)
+            frontier_active.zero_()
+        elif batch_expand_width > expand_width:
+            padding = slice(expand_width, batch_expand_width)
+            frontier_scores[:, padding].fill_(-torch.inf)
+            frontier_active[:, padding].zero_()
+        if use_fused_frontier_materialize:
+            selected_tokens = torch.empty(
+                (bs, batch_expand_width), dtype=torch.long, device=device
+            )
+            selected_depths = torch.empty_like(selected_tokens)
+            selected_position_ids = torch.empty_like(selected_tokens)
+            selected_candidate_rows = torch.empty_like(selected_tokens)
+            selected_batch_indices = torch.empty_like(selected_tokens)
+            selected_scores = torch.empty(
+                (bs, batch_expand_width), dtype=torch.float32, device=device
+            )
+            selected_active = torch.empty(
+                (bs, batch_expand_width), dtype=torch.bool, device=device
+            )
+            selected_parent_ancestors = torch.empty(
+                (bs, batch_expand_width, depth),
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            selected_tokens = None
+            selected_depths = None
+            selected_position_ids = None
+            selected_candidate_rows = None
+            selected_batch_indices = None
+            selected_scores = None
+            selected_active = None
+            selected_parent_ancestors = None
         if device.type != "cuda" or expand_width != 8:
             raise RuntimeError(
                 "Weaver tree construction requires Triton on CUDA with "
@@ -2497,25 +2930,136 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 BLOCK_SIZE=int(block_size),
             )
 
-        def expand_node_indexed(
-            token: torch.Tensor,
-            node_depth: torch.Tensor,
+        def publish_frontier(
+            logits: torch.Tensor,
+            row_candidate_ids: torch.Tensor,
+            current_keys: torch.Tensor,
+            current_values: torch.Tensor,
             parent_ancestors: torch.Tensor,
-            active: torch.Tensor,
+            prefix_score: torch.Tensor,
+            valid: torch.Tensor,
+            node_depth: torch.Tensor,
+            slot_start: int,
+            width: int,
+        ) -> None:
+            total_kv = bs * width * num_layers * num_heads * head_dim
+            total_ancestors = bs * width * depth
+            block_size = 256
+            grid = (
+                max(
+                    triton.cdiv(total_kv, block_size),
+                    triton.cdiv(total_ancestors, block_size),
+                    bs * width,
+                ),
+            )
+            _weaver_publish_frontier_kernel[grid](
+                current_keys,
+                current_values,
+                node_keys,
+                node_values,
+                parent_ancestors,
+                slot_ancestors,
+                logits,
+                row_candidate_ids,
+                prefix_score,
+                valid,
+                node_depth,
+                frontier_tokens,
+                frontier_parents,
+                frontier_depths,
+                frontier_scores,
+                frontier_logprobs,
+                frontier_active,
+                int(slot_start),
+                BS=int(bs),
+                WIDTH=int(width),
+                DEPTH=int(depth),
+                NUM_NODES=int(num_nodes),
+                NUM_LAYERS=int(num_layers),
+                NUM_HEADS=int(num_heads),
+                HEAD_DIM=int(head_dim),
+                TOTAL_KV=int(total_kv),
+                TOTAL_ANCESTORS=int(total_ancestors),
+                POOL_SIZE=int(pool_size),
+                EXPAND_WIDTH=int(expand_width),
+                FRONTIER_SLOTS=int(frontier_slots),
+                BLOCK_SIZE=int(block_size),
+                BLOCK_POOL=int(triton.next_power_of_2(pool_size)),
+            )
+
+        def materialize_frontier(
+            frontier_index: torch.Tensor, slot_start: int, width: int
+        ) -> None:
+            assert selected_tokens is not None
+            assert selected_depths is not None
+            assert selected_position_ids is not None
+            assert selected_candidate_rows is not None
+            assert selected_batch_indices is not None
+            assert selected_scores is not None
+            assert selected_active is not None
+            assert selected_parent_ancestors is not None
+            _weaver_materialize_frontier_kernel[(bs,)](
+                frontier_index,
+                frontier_tokens,
+                frontier_parents,
+                frontier_depths,
+                frontier_scores,
+                frontier_logprobs,
+                frontier_active,
+                slot_ancestors,
+                tokens,
+                parents,
+                depths,
+                node_mask,
+                draft_logprobs,
+                selected_tokens,
+                selected_depths,
+                selected_position_ids,
+                selected_candidate_rows,
+                selected_batch_indices,
+                selected_scores,
+                selected_active,
+                selected_parent_ancestors,
+                int(slot_start),
+                NUM_NODES=int(num_nodes),
+                DEPTH=int(depth),
+                FRONTIER_SLOTS=int(frontier_slots),
+                SELECT_WIDTH=int(width),
+                SCRATCH_WIDTH=int(batch_expand_width),
+                BLOCK_DEPTH=int(triton.next_power_of_2(depth)),
+                WRITE_ANCESTORS=slot_start + width <= node_budget,
+                num_warps=1,
+            )
+
+        def expand_node_indexed(
+            token_ids: torch.Tensor,
+            position_ids: torch.Tensor,
+            candidate_row_index: torch.Tensor,
+            parent_ancestors: torch.Tensor,
             row_batch_indices: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            depth_index = node_depth.clamp(max=depth - 1)
-            candidate_row_index = row_batch_indices * depth + depth_index
-            row_candidate_ids = candidate_ids_rows[candidate_row_index]
+            if use_fused_frontier_materialize:
+                selected_candidate_ids = candidate_ids_rows
+                selected_candidate_weights = candidate_weights_rows
+                selected_candidate_scores = candidate_scores_rows
+            else:
+                selected_candidate_ids = candidate_ids_rows[candidate_row_index]
+                selected_candidate_weights = candidate_weights_rows[
+                    candidate_row_index
+                ]
+                selected_candidate_scores = candidate_scores_rows[
+                    candidate_row_index
+                ]
             step_kwargs = dict(
-                token_ids=torch.where(active, token, torch.zeros_like(token)),
-                candidate_ids=row_candidate_ids,
-                candidate_weights=candidate_weights_rows[candidate_row_index],
-                candidate_scores=candidate_scores_rows[candidate_row_index],
+                token_ids=token_ids,
+                candidate_ids=selected_candidate_ids,
+                candidate_weights=selected_candidate_weights,
+                candidate_scores=selected_candidate_scores,
+                candidate_row_index=candidate_row_index,
                 external_keys=external_keys,
                 external_values=external_values,
                 external_mask=external_mask,
-                position_ids=depth_index,
+                position_ids=position_ids,
                 node_keys=node_keys,
                 node_values=node_values,
                 parent_ancestors=parent_ancestors.reshape(
@@ -2523,8 +3067,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 ).contiguous(),
                 row_batch_indices=row_batch_indices,
                 token_embed=token_embed,
+                gather_candidates=use_fused_frontier_materialize,
             )
-            logits, current_keys, current_values = (
+            logits, current_keys, current_values, row_candidate_ids = (
                 self._weaver_indexed_step_compiled(
                     **step_kwargs,
                 )
@@ -2540,28 +3085,42 @@ class DFlashTfmWorker(DFlashWorkerV2):
         root_logits, root_candidate_ids, root_keys, root_values = expand_node_indexed(
             root_ids,
             root_depth,
+            batch_indices * depth,
             root_parent_ancestors,
-            root_active,
             batch_indices,
         )
-        write_current_slot_cache(
-            root_keys,
-            root_values,
-            root_parent_ancestors,
-            root_active[:, None],
-            root_depth[:, None],
-            0,
-            1,
-        )
-        write_candidate_frontier(
-            root_logits,
-            root_candidate_ids,
-            root_prefix_score,
-            root_depth,
-            root_active,
-            0,
-            1,
-        )
+        if use_fused_frontier_materialize:
+            publish_frontier(
+                root_logits,
+                root_candidate_ids,
+                root_keys,
+                root_values,
+                root_parent_ancestors,
+                root_prefix_score,
+                root_active[:, None],
+                root_depth[:, None],
+                0,
+                1,
+            )
+        else:
+            write_current_slot_cache(
+                root_keys,
+                root_values,
+                root_parent_ancestors,
+                root_active[:, None],
+                root_depth[:, None],
+                0,
+                1,
+            )
+            write_candidate_frontier(
+                root_logits,
+                root_candidate_ids,
+                root_prefix_score,
+                root_depth,
+                root_active,
+                0,
+                1,
+            )
 
         def gather_parent_ancestors(parent: torch.Tensor) -> torch.Tensor:
             width = parent.shape[1]
@@ -2576,70 +3135,117 @@ class DFlashTfmWorker(DFlashWorkerV2):
             width = min(batch_expand_width, node_budget - slot_start + 1)
             slot_stop = slot_start + width
             slot_slice = slice(slot_start, slot_stop)
-            slot_indices = node_indices[slot_slice]
-            masked_priorities = frontier_scores.masked_fill(
-                ~frontier_active, -torch.inf
-            )
-            _, frontier_index = torch.topk(masked_priorities, width, dim=1)
-            valid = frontier_active.gather(1, frontier_index)
-            token = frontier_tokens.gather(1, frontier_index)
-            parent = frontier_parents.gather(1, frontier_index)
-            node_depth = frontier_depths.gather(1, frontier_index)
-            node_score = frontier_scores.gather(1, frontier_index)
-            node_logprob = frontier_logprobs.gather(1, frontier_index)
+            if use_fused_frontier_materialize:
+                _, frontier_index = torch.topk(
+                    frontier_scores[
+                        :, : max(width, slot_start * expand_width)
+                    ],
+                    width,
+                    dim=1,
+                    sorted=False,
+                )
+                materialize_frontier(frontier_index, slot_start, width)
+                valid = selected_active[:, :width]
+                token = selected_tokens[:, :width]
+                node_depth = selected_depths[:, :width]
+                node_score = selected_scores[:, :width]
+                parent_ancestors = selected_parent_ancestors[:, :width]
+                position_ids = selected_position_ids[:, :width]
+                candidate_row_index = selected_candidate_rows[:, :width]
+                row_batch_indices = selected_batch_indices[:, :width]
+            else:
+                masked_priorities = frontier_scores.masked_fill(
+                    ~frontier_active, -torch.inf
+                )
+                _, frontier_index = torch.topk(masked_priorities, width, dim=1)
+                valid = frontier_active.gather(1, frontier_index)
+                token = frontier_tokens.gather(1, frontier_index)
+                parent = frontier_parents.gather(1, frontier_index)
+                node_depth = frontier_depths.gather(1, frontier_index)
+                node_score = frontier_scores.gather(1, frontier_index)
+                node_logprob = frontier_logprobs.gather(1, frontier_index)
 
-            tokens[:, slot_slice] = torch.where(
-                valid, token, torch.zeros_like(token)
-            )
-            parents[:, slot_slice] = torch.where(
-                valid, parent, torch.full_like(parent, -1)
-            )
-            depths[:, slot_slice] = torch.where(
-                valid, node_depth, torch.zeros_like(node_depth)
-            )
-            node_mask[:, slot_slice] = valid
-            draft_logprobs[:, slot_slice] = torch.where(
-                valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
-            )
-            frontier_active.scatter_(1, frontier_index, False)
+                tokens[:, slot_slice] = torch.where(
+                    valid, token, torch.zeros_like(token)
+                )
+                parents[:, slot_slice] = torch.where(
+                    valid, parent, torch.full_like(parent, -1)
+                )
+                depths[:, slot_slice] = torch.where(
+                    valid, node_depth, torch.zeros_like(node_depth)
+                )
+                node_mask[:, slot_slice] = valid
+                draft_logprobs[:, slot_slice] = torch.where(
+                    valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
+                )
+                frontier_active.scatter_(1, frontier_index, False)
 
             if slot_stop > node_budget:
                 break
 
-            parent_ancestors = gather_parent_ancestors(parent)
+            if not use_fused_frontier_materialize:
+                parent_ancestors = gather_parent_ancestors(parent)
             token_flat = token.reshape(bs * width)
             node_score_flat = node_score.reshape(bs * width)
             node_depth_flat = node_depth.reshape(bs * width)
             valid_flat = valid.reshape(bs * width)
-            row_batch_indices = (
-                row_base.expand(bs, width).reshape(bs * width).contiguous()
-            )
+            if use_fused_frontier_materialize:
+                position_ids_flat = position_ids.reshape(bs * width)
+                candidate_row_index_flat = candidate_row_index.reshape(bs * width)
+                row_batch_indices_flat = row_batch_indices.reshape(bs * width)
+            else:
+                token_flat = torch.where(
+                    valid_flat,
+                    token_flat,
+                    torch.zeros_like(token_flat),
+                )
+                position_ids_flat = node_depth_flat.clamp(max=depth - 1)
+                row_batch_indices_flat = (
+                    row_base.expand(bs, width).reshape(bs * width).contiguous()
+                )
+                candidate_row_index_flat = (
+                    row_batch_indices_flat * depth + position_ids_flat
+                )
 
             logits, row_candidate_ids, current_keys, current_values = expand_node_indexed(
                 token_flat,
-                node_depth_flat,
+                position_ids_flat,
+                candidate_row_index_flat,
                 parent_ancestors,
-                valid_flat,
-                row_batch_indices,
+                row_batch_indices_flat,
             )
-            write_current_slot_cache(
-                current_keys,
-                current_values,
-                parent_ancestors,
-                valid,
-                node_depth,
-                slot_start,
-                width,
-            )
-            write_candidate_frontier(
-                logits,
-                row_candidate_ids,
-                node_score_flat,
-                node_depth_flat,
-                valid_flat,
-                slot_start,
-                width,
-            )
+            if use_fused_frontier_materialize:
+                publish_frontier(
+                    logits,
+                    row_candidate_ids,
+                    current_keys,
+                    current_values,
+                    parent_ancestors,
+                    node_score_flat,
+                    valid_flat,
+                    node_depth_flat,
+                    slot_start,
+                    width,
+                )
+            else:
+                write_current_slot_cache(
+                    current_keys,
+                    current_values,
+                    parent_ancestors,
+                    valid,
+                    node_depth,
+                    slot_start,
+                    width,
+                )
+                write_candidate_frontier(
+                    logits,
+                    row_candidate_ids,
+                    node_score_flat,
+                    node_depth_flat,
+                    valid_flat,
+                    slot_start,
+                    width,
+                )
             slot_start = slot_stop
         return WeaverTree(tokens, parents, depths, node_mask, draft_logprobs)
 
@@ -3120,6 +3726,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         key = (
             int(self.tree_budget),
             int(weaver_tree_batch_expand_width(self.tree_budget)),
+            weaver_fused_frontier_materialize_enabled(),
             root_ids.device.index,
             tuple(root_ids.shape),
             root_ids.dtype,
