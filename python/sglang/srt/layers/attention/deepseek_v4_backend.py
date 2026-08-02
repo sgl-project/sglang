@@ -81,13 +81,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
-# The FlashMLA sparse CUDA kernels are compiled for SM90a and SM100f only --
-# that list is the kernel's own error message, not an inference. Everything
-# else has to take the portable path. Naming the architectures that *do* have
-# the kernel (rather than the ones that don't) is what makes the polarity
-# right: an architecture nobody has enumerated yet falls back instead of
-# dispatching into a kernel that was never built for it.
-_flashmla_kernel_capabilities = ((9, 0), (10, 0))
+# The FlashMLA sparse CUDA kernels are arch-conditional builds; the target
+# list lives in kernels/aot/cmake/flashmla.cmake: sm_90a, sm_100a, and (with
+# CUDA 13+) sm_103a. 'a' binaries do not carry forward across compute
+# capabilities, so this is an exact-match list. Naming the architectures that
+# *do* have the kernel (rather than the ones that don't) is what makes the
+# polarity right: an architecture nobody has enumerated yet falls back instead
+# of dispatching into a kernel that was never built for it.
+_flashmla_kernel_capabilities = ((9, 0), (10, 0), (10, 3))
 _use_mla_fallback = (
     torch.cuda.get_device_capability() not in _flashmla_kernel_capabilities
     if torch.cuda.is_available()
