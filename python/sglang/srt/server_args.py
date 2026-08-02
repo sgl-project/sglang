@@ -267,6 +267,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "moonep",
     "mooncake",
     "nixl",
     "mori",
@@ -2249,6 +2250,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "moonep",
             "mooncake",
             "nixl",
             "mori",
@@ -6620,6 +6622,15 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if a2a_backend == "moonep":
+            raise NotImplementedError(
+                "moe_a2a_backend='moonep' is recognized, but runtime execution "
+                "is not implemented yet. MoonEP requires a new dispatcher output "
+                "contract carrying MoonEPCommPlan/cu_seqlens, a contiguous "
+                "symmetric-memory [E+B, H, H'] expert weight layout, and a "
+                "MoonEP-compatible grouped expert GEMM."
             )
 
         if a2a_backend == "mooncake":

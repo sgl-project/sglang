@@ -2201,6 +2201,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
+        "moonep",
         "mooncake",
         "nixl",
         "ascend_fuseep",
