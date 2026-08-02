@@ -22,7 +22,10 @@ Map: #7 https://github.com/wirybeaver/sglang/issues/7
 
 - #14 https://github.com/wirybeaver/sglang/issues/14 — Add BF16 expert runner for cu_seqlens
 
-## Open frontier
+## Completed
 
 - #15 https://github.com/wirybeaver/sglang/issues/15 — Wire runtime dispatch/prefetch/compute/combine path
+
+## Open frontier
+
 - #16 https://github.com/wirybeaver/sglang/issues/16 — Validate Kimi-K3 PoC and prepare upstream handoff

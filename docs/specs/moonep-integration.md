@@ -151,6 +151,26 @@ MoonEP-dispatched route weights, and returns `MoonEPCombineInput`. This is not
 the final performance kernel; it exists to validate the dispatcher/data/weight
 contracts before replacing the segment loop with a grouped GEMM.
 
+Runtime wiring now performs the full eager PoC sequence in SGLang:
+
+1. pad the runtime token batch to the static MoonEP `S` capacity;
+2. compute `tokens_per_expert` for the padded top-k ids;
+3. call `MoonEPBuffer.dispatch`;
+4. derive active expert ids for each `cu_seqlens` segment;
+5. call `MoonEPBuffer.prefetch_weight` with the cached BF16 layout;
+6. run the BF16 segment runner;
+7. call `MoonEPBuffer.combine`; and
+8. slice the combined output back to the original token count.
+
+Known runtime limitations:
+
+- eager only; CUDA graph capture is disabled by server-args handling;
+- BF16/unquantized only;
+- no training backward support;
+- no production-scale non-replicated weight mapping yet;
+- dispatch and prefetch currently run synchronously for correctness-first
+  validation.
+
 ## Phased tickets
 
 The GitHub issue tracker lives on `wirybeaver/sglang`; completed PoC issues are
@@ -165,8 +185,8 @@ later cloned or summarized upstream to `sgl-project/sglang` before upstream PRs.
 | 5 | Done | Decide static token-capacity policy (`wirybeaver/sglang#12`). |
 | 6 | Done | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
 | 7 | Done | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
-| 8 | Next | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
-| 9 | Pending | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
+| 8 | Done | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
+| 9 | Next | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
 
 Issue links are tracked in `.scratch/moonep/tickets.md`.
 

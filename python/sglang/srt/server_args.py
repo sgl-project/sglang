@@ -6625,13 +6625,13 @@ class ServerArgs:
             )
 
         if a2a_backend == "moonep":
-            raise NotImplementedError(
-                "moe_a2a_backend='moonep' is recognized, but runtime execution "
-                "is not implemented yet. MoonEP requires a new dispatcher output "
-                "contract carrying MoonEPCommPlan/cu_seqlens, a contiguous "
-                "symmetric-memory [E+B, H, H'] expert weight layout, and a "
-                "MoonEP-compatible grouped expert GEMM."
+            logger.warning(
+                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
+                "Cuda graph is disabled while the eager MoonEP dispatch/"
+                "prefetch/compute/combine path is validated."
             )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "mooncake":
             logger.warning(
