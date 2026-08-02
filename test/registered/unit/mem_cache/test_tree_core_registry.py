@@ -65,6 +65,15 @@ class _StubFullComponent(TreeComponent):
     def _evict_device_end(self) -> None:
         pass
 
+    def _dec_session_coverage(self, session_id, leaf) -> None:
+        pass
+
+    def _advance_session_coverage(self, session_id, leaf, old_ancestor) -> None:
+        pass
+
+    def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
+        pass
+
 
 class _StubMambaComponent(_StubFullComponent):
     component_type = ComponentType.MAMBA

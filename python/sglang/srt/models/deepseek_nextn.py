@@ -59,12 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_server_args,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
@@ -388,7 +383,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
