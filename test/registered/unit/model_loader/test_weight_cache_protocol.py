@@ -22,6 +22,8 @@ import socket
 import struct
 import unittest
 
+import torch
+
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
@@ -37,6 +39,11 @@ from sglang.srt.weight_cache.protocol import (
     is_ipc_quant_supported,
     recv_msg,
     send_msg,
+)
+from sglang.srt.weight_cache.transport import (
+    TORCH_IPC_BACKEND,
+    TorchIpcTransportBackend,
+    get_client_transport_backend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -109,6 +116,38 @@ class TestProtocolFraming(CustomTestCase):
             with self.assertRaises(ConnectionError):
                 recv_msg(b)
         finally:
+            b.close()
+
+
+class TestTransportBackend(CustomTestCase):
+    def test_default_backend_is_torch_ipc(self):
+        backend = get_client_transport_backend(None)
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_unknown_backend_raises(self):
+        with self.assertRaises(RuntimeError):
+            get_client_transport_backend("does_not_exist")
+
+    def test_torch_ipc_backend_round_trip(self):
+        backend = TorchIpcTransportBackend()
+        state_tensors = {"x": (torch.arange(8, dtype=torch.float32), True)}
+        entries = backend.prepare_export(state_tensors)
+
+        a, b = socket.socketpair()
+        try:
+            backend.send_fetch_state_response(
+                a,
+                config={"k": "v"},
+                entries=entries,
+                pid=123,
+            )
+            resp = recv_msg(b)
+            resp = backend.recv_fetch_state_response(b, resp)
+            imported = backend.import_tensor(resp["entries"]["x"])
+            self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
+            self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
+        finally:
+            a.close()
             b.close()
 
 
