@@ -9,8 +9,8 @@ use dynamo_protocols::types::responses::{
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
     ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent,
     ResponseInProgressEvent, ResponseIncompleteEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
-    ResponseTextDoneEvent, ResponseUsage, Status,
+    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent, ResponseReasoningTextDoneEvent,
+    ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseUsage, Status,
 };
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -22,7 +22,10 @@ use tokio::sync::mpsc;
 
 use super::super::frame::OutputAccumulator;
 use super::super::guard::AbortGuard;
-use super::responses::{append_response_output, response_function_call};
+use super::reasoning::ReasoningStreamSplitter;
+use super::responses::{
+    append_response_output, pending_reasoning_item, response_function_call, response_reasoning_item,
+};
 use super::tools::{
     chat_delta, chat_finish_reason, dynamo_parser_name, parse_streaming_tool_calls,
 };
@@ -40,6 +43,7 @@ pub(super) fn responses_event_stream(
     model: String,
     request: CreateResponse,
     parser: Option<String>,
+    reasoning_parser: Option<String>,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -52,6 +56,9 @@ pub(super) fn responses_event_stream(
     let raw = async_stream::stream! {
         let mut output_tx = Some(output_tx);
         let mut accumulator = OutputAccumulator::default();
+        // One stateful reasoning splitter for the stream (mirrors the chat
+        // path's per-choice state).
+        let mut splitter = ReasoningStreamSplitter::new(reasoning_parser.as_deref());
         loop {
             let (output, done) = match rx.recv().await {
                 Some(EgressItem::Frame(output)) => (output, false),
@@ -99,32 +106,91 @@ pub(super) fn responses_event_stream(
 
             accumulator.fold(&output);
             let finish_reason = chat_finish_reason(&output);
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: stream_id.clone(),
-                    choices: vec![ChatChoiceStream {
+            // Split the frame's text into (reasoning, normal) chat deltas when
+            // `--reasoning-parser` is set, mirroring chat_event_stream: the
+            // reasoning delta comes first, then the normal delta; the
+            // parser-buffered tail flushes before the terminal frame — both
+            // columns, since parsers like MiniMax M3 hold the answer text
+            // until EOF — and the finish reason rides the last emitted chunk.
+            let mut choices = Vec::with_capacity(2);
+            if splitter.enabled() {
+                let (reasoning_text, normal_text) =
+                    splitter.split(&output.text, &output.token_ids);
+                if !reasoning_text.is_empty() {
+                    choices.push(ChatChoiceStream {
                         index: 0,
-                        delta: chat_delta(
-                            (!output.text.is_empty()).then_some(output.text),
-                            None,
-                            None,
-                            None,
-                        ),
+                        delta: chat_delta(None, None, None, Some(reasoning_text)),
+                        finish_reason: None,
+                        logprobs: None,
+                    });
+                }
+                if !normal_text.is_empty() {
+                    choices.push(ChatChoiceStream {
+                        index: 0,
+                        delta: chat_delta(Some(normal_text), None, None, None),
+                        finish_reason: None,
+                        logprobs: None,
+                    });
+                }
+                if finish_reason.is_some() {
+                    let (reasoning_tail, normal_tail) = splitter.finish();
+                    if !reasoning_tail.is_empty() {
+                        choices.push(ChatChoiceStream {
+                            index: 0,
+                            delta: chat_delta(None, None, None, Some(reasoning_tail)),
+                            finish_reason: None,
+                            logprobs: None,
+                        });
+                    }
+                    if !normal_tail.is_empty() {
+                        choices.push(ChatChoiceStream {
+                            index: 0,
+                            delta: chat_delta(Some(normal_tail), None, None, None),
+                            finish_reason: None,
+                            logprobs: None,
+                        });
+                    }
+                }
+                match choices.last_mut() {
+                    Some(last) => last.finish_reason = finish_reason,
+                    None => choices.push(ChatChoiceStream {
+                        index: 0,
+                        delta: chat_delta(None, None, None, None),
                         finish_reason,
                         logprobs: None,
-                    }],
-                    created: u32::try_from(created_at).unwrap_or(u32::MAX),
-                    model: stream_model.clone(),
-                    service_tier: None,
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: None,
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
+                    }),
+                }
+            } else {
+                choices.push(ChatChoiceStream {
+                    index: 0,
+                    delta: chat_delta(
+                        (!output.text.is_empty()).then_some(output.text),
+                        None,
+                        None,
+                        None,
+                    ),
+                    finish_reason,
+                    logprobs: None,
+                });
+            }
+            for choice in choices {
+                yield Annotated {
+                    data: Some(CreateChatCompletionStreamResponse {
+                        id: stream_id.clone(),
+                        choices: vec![choice],
+                        created: u32::try_from(created_at).unwrap_or(u32::MAX),
+                        model: stream_model.clone(),
+                        service_tier: None,
+                        system_fingerprint: None,
+                        object: "chat.completion.chunk".into(),
+                        usage: None,
+                    }),
+                    id: None,
+                    event: None,
+                    comment: None,
+                    error: None,
+                };
+            }
             if done {
                 if let Some(tx) = output_tx.take() {
                     let _ = tx.send(accumulator.into_output());
@@ -180,6 +246,10 @@ pub(super) fn responses_event_stream(
 
         let mut completed_items = Vec::new();
         let mut open_message: Option<(String, u32, String)> = None;
+        // Open reasoning item (item_id, output_index, text). Python keeps the
+        // same single-open-item invariant: reasoning closes the message, and
+        // normal text or tool calls close the reasoning item.
+        let mut reasoning_state: Option<(String, u32, String)> = None;
         let mut tool_call_emitted = false;
         futures::pin_mut!(parsed);
         while let Some(item) = parsed.next().await {
@@ -192,6 +262,62 @@ pub(super) fn responses_event_stream(
                 continue;
             };
             for choice in response.choices {
+                // Reasoning deltas first (Python `parse_stream_chunk` emits
+                // the reasoning chunk before the normal one; a reasoning chunk
+                // closes any open message item).
+                if let Some(reasoning) = choice
+                    .delta
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                {
+                    if let Some((item_id, output_index, text)) = open_message.take() {
+                        for event in finish_response_text_item(
+                            &mut sequence,
+                            &item_id,
+                            output_index,
+                            &text,
+                        ) {
+                            yield event;
+                        }
+                        completed_items.push(text_response_message(
+                            item_id,
+                            text,
+                            OutputStatus::Completed,
+                        ));
+                    }
+                    if reasoning_state.is_none() {
+                        let item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
+                        let output_index =
+                            u32::try_from(completed_items.len()).unwrap_or(u32::MAX);
+                        yield serialize_response_event(
+                            ResponseStreamEvent::ResponseOutputItemAdded(
+                                ResponseOutputItemAddedEvent {
+                                    sequence_number: sequence,
+                                    output_index,
+                                    item: pending_reasoning_item(item_id.clone()),
+                                },
+                            ),
+                        );
+                        sequence += 1;
+                        reasoning_state = Some((item_id, output_index, String::new()));
+                    }
+                    if let Some((item_id, output_index, text)) = reasoning_state.as_mut() {
+                        text.push_str(reasoning);
+                        yield serialize_response_event(
+                            ResponseStreamEvent::ResponseReasoningTextDelta(
+                                ResponseReasoningTextDeltaEvent {
+                                    sequence_number: sequence,
+                                    item_id: item_id.clone(),
+                                    output_index: *output_index,
+                                    content_index: 0,
+                                    delta: reasoning.to_owned(),
+                                },
+                            ),
+                        );
+                        sequence += 1;
+                    }
+                }
                 let mut calls = choice.delta.tool_calls.unwrap_or_default();
                 if !request.parallel_tool_calls.unwrap_or(true) {
                     if tool_call_emitted {
@@ -201,6 +327,18 @@ pub(super) fn responses_event_stream(
                     }
                 }
                 if !calls.is_empty() {
+                    // Python closes the reasoning item before opening tool-call
+                    // items.
+                    if let Some((item_id, output_index, text)) = reasoning_state.take() {
+                        for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+                            yield event;
+                        }
+                        completed_items.push(response_reasoning_item(
+                            item_id,
+                            text,
+                            Some(OutputStatus::Completed),
+                        ));
+                    }
                     if let Some((item_id, output_index, text)) = open_message.take() {
                         for event in finish_response_text_item(
                             &mut sequence,
@@ -302,6 +440,18 @@ pub(super) fn responses_event_stream(
                 if let Some(ChatCompletionMessageContent::Text(delta)) = choice.delta.content
                     && !delta.is_empty()
                 {
+                    // Python closes the reasoning item when normal text
+                    // resumes, before opening or continuing the message.
+                    if let Some((item_id, output_index, text)) = reasoning_state.take() {
+                        for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+                            yield event;
+                        }
+                        completed_items.push(response_reasoning_item(
+                            item_id,
+                            text,
+                            Some(OutputStatus::Completed),
+                        ));
+                    }
                     if open_message.is_none() {
                         let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                         let output_index =
@@ -361,6 +511,16 @@ pub(super) fn responses_event_stream(
                 return;
             }
         };
+        if let Some((item_id, output_index, text)) = reasoning_state.take() {
+            for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+                yield event;
+            }
+            completed_items.push(response_reasoning_item(
+                item_id,
+                text,
+                Some(OutputStatus::Completed),
+            ));
+        }
         if open_message.is_none() && completed_items.is_empty() {
             let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
             let output_index = 0;
@@ -476,6 +636,41 @@ fn finish_response_text_item(
     ));
     *sequence += 1;
     [text_done, part_done, item_done]
+}
+
+/// Close an open reasoning item: the `reasoning_text.done` event followed by
+/// the item's `output_item.done` (Python `_close_reasoning_item` without the
+/// summary events — summary requests are rejected up front).
+fn finish_reasoning_item(
+    sequence: &mut u64,
+    item_id: &str,
+    output_index: u32,
+    text: &str,
+) -> [String; 2] {
+    let text_done = serialize_response_event(ResponseStreamEvent::ResponseReasoningTextDone(
+        ResponseReasoningTextDoneEvent {
+            sequence_number: *sequence,
+            item_id: item_id.to_owned(),
+            output_index,
+            content_index: 0,
+            text: text.to_owned(),
+        },
+    ));
+    *sequence += 1;
+    let item = response_reasoning_item(
+        item_id.to_owned(),
+        text.to_owned(),
+        Some(OutputStatus::Completed),
+    );
+    let item_done = serialize_response_event(ResponseStreamEvent::ResponseOutputItemDone(
+        ResponseOutputItemDoneEvent {
+            sequence_number: *sequence,
+            output_index,
+            item,
+        },
+    ));
+    *sequence += 1;
+    [text_done, item_done]
 }
 
 fn serialize_response_event(event: ResponseStreamEvent) -> String {

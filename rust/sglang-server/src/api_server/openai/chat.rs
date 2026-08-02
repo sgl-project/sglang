@@ -13,7 +13,6 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::reasoning::{ReasoningParser as _, ReasoningParserWrapper};
 use dynamo_parsers::tool_calling::jail::Annotated;
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
@@ -28,7 +27,7 @@ use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
-use super::reasoning::build_reasoning_parser;
+use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls, parse_streaming_tool_calls,
@@ -450,18 +449,8 @@ pub(super) async fn unary_chat(
         // Split reasoning markers out of the content first (Python splits
         // before tool-call parsing too), then parse tool calls on the clean
         // normal text.
-        let (reasoning_text, text) = if let Some(name) = reasoning_parser.as_deref() {
-            let mut reasoning_parser = build_reasoning_parser(name);
-            let token_ids = output
-                .token_ids
-                .iter()
-                .filter_map(|&id| u32::try_from(id).ok())
-                .collect::<Vec<_>>();
-            let split = reasoning_parser.detect_and_parse_reasoning(&output.text, &token_ids);
-            (split.reasoning_text, split.normal_text)
-        } else {
-            (String::new(), output.text)
-        };
+        let (reasoning_text, text) =
+            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
             parser.as_deref(),
@@ -533,11 +522,17 @@ pub(super) fn chat_event_stream(
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u64;
-        // One stateful reasoning parser per choice, built lazily on the first
-        // content delta (Python keeps a `reasoning_parser_dict` per index).
-        let mut reasoning_parsers: Vec<Option<ReasoningParserWrapper>> =
-            if reasoning_parser.is_some() { (0..count).map(|_| None).collect() } else { vec![] };
-        let reasoning_name = reasoning_parser.as_deref();
+        // One stateful reasoning splitter per choice (Python keeps a
+        // `reasoning_parser_dict` per index).
+        let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
+            if reasoning_parser.is_some() {
+                (0..count)
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
+                    .collect()
+            } else {
+                vec![]
+            };
+        let reasoning_enabled = !reasoning_splitters.is_empty();
 
         for (index, rid, rx) in submitted {
             rids.push(rid);
@@ -620,30 +615,24 @@ pub(super) fn chat_event_stream(
             // `--reasoning-parser` is set. Mirrors Python's per-step emission:
             // reasoning chunk first (logprobs ride it), then the content chunk.
             let mut emitted = Vec::with_capacity(2);
-            if let Some(name) = reasoning_name {
-                let parser = reasoning_parsers[index]
-                    .get_or_insert_with(|| build_reasoning_parser(name));
-                let token_ids = output
-                    .token_ids
-                    .iter()
-                    .filter_map(|&id| u32::try_from(id).ok())
-                    .collect::<Vec<_>>();
-                let split = parser.parse_reasoning_streaming_incremental(&output.text, &token_ids);
+            if reasoning_enabled {
+                let (reasoning_text, normal_text) =
+                    reasoning_splitters[index].split(&output.text, &output.token_ids);
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-                if !split.reasoning_text.is_empty() {
+                if !reasoning_text.is_empty() {
                     emitted.push(ChatChoiceStream {
                         index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(split.reasoning_text)),
+                        delta: chat_delta(None, None, None, Some(reasoning_text)),
                         finish_reason: None,
                         logprobs: remaining_logprobs.clone(),
                     });
                     remaining_logprobs = None;
                 }
-                if !split.normal_text.is_empty() {
+                if !normal_text.is_empty() {
                     emitted.push(ChatChoiceStream {
                         index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(split.normal_text), None, None, None),
+                        delta: chat_delta(Some(normal_text), None, None, None),
                         finish_reason: None,
                         logprobs: remaining_logprobs,
                     });
@@ -663,16 +652,22 @@ pub(super) fn chat_event_stream(
             };
             // Flush the choice's buffered reasoning tail before its terminal
             // frame (Python `parse_stream_end`, which skips aborts — abort
-            // frames already became error chunks above).
-            if reasoning_name.is_some()
-                && finish_reason.is_some()
-                && let Some(parser) = reasoning_parsers[index].as_mut()
-            {
-                let tail = parser.finish_reasoning_stream();
-                if !tail.reasoning_text.is_empty() {
+            // frames already became error chunks above). Both columns flush:
+            // some parsers buffer the answer text until EOF.
+            if reasoning_enabled && finish_reason.is_some() {
+                let (reasoning_tail, normal_tail) = reasoning_splitters[index].finish();
+                if !reasoning_tail.is_empty() {
                     emitted.push(ChatChoiceStream {
                         index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(tail.reasoning_text)),
+                        delta: chat_delta(None, None, None, Some(reasoning_tail)),
+                        finish_reason: None,
+                        logprobs: None,
+                    });
+                }
+                if !normal_tail.is_empty() {
+                    emitted.push(ChatChoiceStream {
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        delta: chat_delta(Some(normal_tail), None, None, None),
                         finish_reason: None,
                         logprobs: None,
                     });

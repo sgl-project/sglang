@@ -16,9 +16,9 @@ use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::responses::{
     CreateResponse, EasyInputContent, FunctionCallOutput, FunctionToolCall, InputContent,
     InputItem, InputOutputMessageContent, InputParam, InputRole, Item, MessageItem, OutputItem,
-    OutputMessageContent, OutputStatus, Response as OpenAIResponse, Status,
-    TextResponseFormatConfiguration, Tool as ResponseTool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation, UpstreamInputContent,
+    OutputMessageContent, OutputStatus, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
+    Response as OpenAIResponse, Status, TextResponseFormatConfiguration, Tool as ResponseTool,
+    ToolChoiceOptions, ToolChoiceParam, Truncation, UpstreamInputContent,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -28,13 +28,15 @@ use dynamo_protocols::types::{
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionToolType, CreateChatCompletionRequest, FunctionCall, FunctionName,
-    FunctionObject, FunctionType, ReasoningEffort as ChatReasoningEffort, ResponseFormat,
+    FunctionObject, FunctionType, ReasoningContent, ReasoningEffort as ChatReasoningEffort,
+    ResponseFormat,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
 use super::chat::{SamplingDefaults, chat_sampling, prepare_chat_request};
+use super::reasoning::split_reasoning_unary;
 use super::response_stream::{
     response_object, response_status, responses_event_stream, responses_usage,
     text_response_message,
@@ -506,6 +508,7 @@ async fn responses(
             "tool calls require --tool-call-parser",
         );
     }
+    let reasoning_parser = state.server_args.reasoning_parser.clone();
 
     let (chat_request, prompt) = match prepare_chat_request(&state, chat_request).await {
         Ok(prepared) => prepared,
@@ -593,6 +596,7 @@ async fn responses(
                 guard,
                 &rid,
                 parser.as_deref(),
+                reasoning_parser.as_deref(),
                 tools.as_deref(),
                 request.parallel_tool_calls.unwrap_or(true),
             )
@@ -649,6 +653,7 @@ async fn responses(
             model,
             request,
             parser,
+            reasoning_parser,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -672,6 +677,7 @@ async fn responses(
             model,
             request,
             parser,
+            reasoning_parser,
             tools,
             state.response_store,
             response_messages,
@@ -690,6 +696,7 @@ pub(super) async fn unary_responses(
     model: String,
     request: CreateResponse,
     parser: Option<String>,
+    reasoning_parser: Option<String>,
     tools: Option<Vec<ToolDefinition>>,
     store: ResponseStore,
     mut messages: Vec<ChatCompletionRequestMessage>,
@@ -699,6 +706,7 @@ pub(super) async fn unary_responses(
         guard,
         &rid,
         parser.as_deref(),
+        reasoning_parser.as_deref(),
         tools.as_deref(),
         request.parallel_tool_calls.unwrap_or(true),
     )
@@ -739,17 +747,30 @@ async fn collect_response_items(
     mut guard: AbortGuard,
     rid: &Rid,
     parser: Option<&str>,
+    reasoning_parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
     parallel_tool_calls: bool,
 ) -> Result<(ChunkEvent, Vec<OutputItem>), (StatusCode, String)> {
     let output = collect_output(rx, &mut guard, rid).await?;
-    let (text, tool_calls) =
-        parse_chat_tool_calls(output.text.clone(), parser, tools, parallel_tool_calls).await;
-    let mut items = tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .map(response_function_call)
-        .collect::<Vec<_>>();
+    // Split reasoning markers out of the content first (Python splits before
+    // tool-call parsing too), then parse tool calls on the clean normal text.
+    let (reasoning_text, text) =
+        split_reasoning_unary(reasoning_parser, &output.text, &output.token_ids);
+    let (text, tool_calls) = parse_chat_tool_calls(text, parser, tools, parallel_tool_calls).await;
+    let mut items = Vec::new();
+    if !reasoning_text.is_empty() {
+        items.push(response_reasoning_item(
+            format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            reasoning_text,
+            None,
+        ));
+    }
+    items.extend(
+        tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(response_function_call),
+    );
     if !text.is_empty() || items.is_empty() {
         items.push(text_response_message(
             format!("msg_{}", uuid::Uuid::new_v4().simple()),
@@ -758,6 +779,36 @@ async fn collect_response_items(
         ));
     }
     Ok((output, items))
+}
+
+pub(super) fn response_reasoning_item(
+    id: String,
+    text: String,
+    status: Option<OutputStatus>,
+) -> OutputItem {
+    OutputItem::Reasoning(ReasoningItem {
+        id: Some(id),
+        summary: vec![],
+        content: Some(vec![ReasoningItemContent::ReasoningText(
+            ReasoningTextContent { text },
+        )]),
+        encrypted_content: None,
+        status,
+    })
+}
+
+/// The in-progress item behind a `response.output_item.added` event. Python
+/// opens the reasoning item with an empty `content: []` and fills the content
+/// only in the completed item of the close event
+/// (`serving_responses.py._open_reasoning_item` vs `_close_reasoning_item`).
+pub(super) fn pending_reasoning_item(id: String) -> OutputItem {
+    OutputItem::Reasoning(ReasoningItem {
+        id: Some(id),
+        summary: vec![],
+        content: Some(vec![]),
+        encrypted_content: None,
+        status: Some(OutputStatus::InProgress),
+    })
 }
 
 pub(super) fn response_function_call(call: ChatCompletionMessageToolCall) -> OutputItem {
@@ -777,6 +828,7 @@ pub(super) fn append_response_output(
     items: &[OutputItem],
 ) {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for item in items {
         match item {
@@ -785,6 +837,16 @@ pub(super) fn append_response_output(
                     match content {
                         OutputMessageContent::OutputText(content) => text.push_str(&content.text),
                         OutputMessageContent::Refusal(content) => text.push_str(&content.refusal),
+                    }
+                }
+            }
+            // Reasoning items render as `reasoning_content` on the assistant
+            // message (Python `_response_to_chat_messages`).
+            OutputItem::Reasoning(item) => {
+                if let Some(content) = item.content.as_deref() {
+                    for part in content {
+                        let ReasoningItemContent::ReasoningText(content) = part;
+                        reasoning.push_str(&content.text);
                     }
                 }
             }
@@ -805,7 +867,7 @@ pub(super) fn append_response_output(
         ChatCompletionRequestAssistantMessage {
             content: (!text.is_empty())
                 .then_some(ChatCompletionRequestAssistantMessageContent::Text(text)),
-            reasoning_content: None,
+            reasoning_content: (!reasoning.is_empty()).then_some(ReasoningContent::Text(reasoning)),
             refusal: None,
             name: None,
             audio: None,
@@ -895,6 +957,7 @@ mod tests {
             response_request(false),
             None,
             None,
+            None,
             super::super::new_response_store(),
             vec![],
         )
@@ -927,6 +990,7 @@ mod tests {
             1_234_567_890,
             "model".into(),
             response_request(true),
+            None,
             None,
             None,
             None,
@@ -1013,6 +1077,7 @@ mod tests {
             Some("llama3".into()),
             None,
             None,
+            None,
             false,
             super::super::new_response_store(),
             vec![],
@@ -1049,6 +1114,7 @@ mod tests {
             Some("llama3".into()),
             None,
             None,
+            None,
             false,
             super::super::new_response_store(),
             vec![],
@@ -1065,5 +1131,311 @@ mod tests {
         assert!(event_types.contains(&"response.function_call_arguments.done".into()));
         assert!(event_types.contains(&"response.output_item.done".into()));
         assert!(event_types.contains(&"response.completed".into()));
+    }
+
+    /// `--reasoning-parser` splits the think block into a reasoning item
+    /// before tool-call parsing sees the text, and the stored conversation
+    /// carries it as `reasoning_content`.
+    #[tokio::test]
+    async fn unary_responses_splits_reasoning_before_tool_parsing() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk(
+            "r0",
+            r#"<think>check the weather</think><|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}"#,
+            true,
+        ))
+        .await
+        .unwrap();
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(false),
+            Some("llama3".into()),
+            Some("deepseek-r1".into()),
+            None,
+            super::super::new_response_store(),
+            vec![],
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let output = value["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(output[0]["content"][0]["text"], "check the weather");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "get_weather");
+        assert_eq!(output[1]["arguments"], r#"{"city":"Paris"}"#);
+        assert_eq!(
+            output.len(),
+            2,
+            "think markers must not leak into a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_responses_emits_reasoning_item_without_tools() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "<think>think hard</think>Paris", true))
+            .await
+            .unwrap();
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(false),
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            super::super::new_response_store(),
+            vec![],
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let output = value["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "think hard");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Paris");
+    }
+
+    /// Streaming with `--reasoning-parser`: the split chunks become a
+    /// reasoning item (added → deltas → done) opened before the message item,
+    /// and the completed snapshot carries both items.
+    #[tokio::test]
+    async fn streaming_responses_emits_reasoning_item_and_clean_text() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "<think>rea", false)).await.unwrap();
+        tx.send(chunk("r0", "son</think>Par", false)).await.unwrap();
+        tx.send(chunk("r0", "is", true)).await.unwrap();
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(true),
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            None,
+            false,
+            super::super::new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let events = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .collect::<Vec<_>>();
+        let types = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        // Deltas split into reasoning_text.delta then output_text.delta, with
+        // the reasoning item added before the message item.
+        let added_index = types
+            .iter()
+            .position(|event| event == "response.output_item.added")
+            .unwrap();
+        assert_eq!(events[added_index]["item"]["type"], "reasoning");
+        assert_eq!(events[added_index]["item"]["status"], "in_progress");
+        // Python opens the reasoning item with empty content/summary and fills
+        // them only in the completed close event.
+        assert_eq!(
+            events[added_index]["item"]["content"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            events[added_index]["item"]["summary"],
+            serde_json::json!([])
+        );
+        let reasoning_deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.reasoning_text.delta")
+            .map(|event| event["delta"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning_deltas, ["rea", "son"]);
+        let text_deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .map(|event| event["delta"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(text_deltas, ["Par", "is"]);
+        assert!(
+            events
+                .iter()
+                .flat_map(|event| event["delta"].as_str())
+                .all(|delta| !delta.contains("<think>")),
+            "markers must never surface as deltas"
+        );
+        // The reasoning item closes before the message item opens.
+        let reasoning_done = types
+            .iter()
+            .position(|event| event == "response.reasoning_text.done")
+            .unwrap();
+        assert_eq!(events[reasoning_done]["text"], "reason");
+        let message_added = types
+            .iter()
+            .rposition(|event| event == "response.output_item.added")
+            .unwrap();
+        assert!(reasoning_done < message_added);
+        // Completed snapshot: reasoning item first, then the clean message.
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "reason");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Paris");
+        assert_eq!(output.len(), 2);
+    }
+
+    /// MiniMax M3's implicit-tool-start recovery buffers the answer text until
+    /// a boundary establishes the mode; with no `<mm:think>` opener the whole
+    /// message body is released by the terminal tail flush — both columns,
+    /// not just the reasoning half.
+    #[tokio::test]
+    async fn streaming_responses_releases_normal_tail_at_completion() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "The answer is", false)).await.unwrap();
+        tx.send(chunk("r0", " 42", true)).await.unwrap();
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(true),
+            None,
+            Some("minimax_m3".into()),
+            None,
+            None,
+            false,
+            super::super::new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let events = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .collect::<Vec<_>>();
+        let text_deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .map(|event| event["delta"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(text_deltas, ["The answer is 42"]);
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            "The answer is 42"
+        );
+        assert_eq!(completed["response"]["output"][0]["type"], "message");
+    }
+
+    /// The unary response is stored with the assistant message carrying
+    /// `reasoning_content`, and feeding those stored messages into the next
+    /// turn (what a `previous_response_id` chain does) keeps the reasoning —
+    /// Python renders reasoning items as `{role: assistant, reasoning_content}`
+    /// when rebuilding conversation state.
+    #[tokio::test]
+    async fn unary_responses_stores_reasoning_for_the_next_turn() {
+        use dynamo_protocols::types::ChatCompletionRequestMessage;
+
+        let store = super::super::new_response_store();
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "<think>think hard</think>Paris", true))
+            .await
+            .unwrap();
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(false),
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            store.clone(),
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let stored = store
+            .read()
+            .await
+            .get("resp_test")
+            .expect("the response must be stored")
+            .clone();
+        let ChatCompletionRequestMessage::Assistant(first) = &stored.messages[0] else {
+            panic!("expected an assistant message, got {:?}", stored.messages);
+        };
+        assert_eq!(
+            first.reasoning_content,
+            Some(dynamo_protocols::types::ReasoningContent::Text(
+                "think hard".into()
+            ))
+        );
+
+        // Follow-up turn seeded with the previous turn's stored messages.
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(chunk("r0", "done", true)).await.unwrap();
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test2".into(),
+            1_234_567_890,
+            "model".into(),
+            response_request(false),
+            None,
+            Some("deepseek-r1".into()),
+            None,
+            store.clone(),
+            stored.messages,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let stored = store
+            .read()
+            .await
+            .get("resp_test2")
+            .expect("the follow-up response must be stored")
+            .clone();
+        assert_eq!(stored.messages.len(), 2);
+        let ChatCompletionRequestMessage::Assistant(chained) = &stored.messages[0] else {
+            panic!("expected the chained assistant message");
+        };
+        assert_eq!(
+            chained.reasoning_content,
+            Some(dynamo_protocols::types::ReasoningContent::Text(
+                "think hard".into()
+            ))
+        );
     }
 }
