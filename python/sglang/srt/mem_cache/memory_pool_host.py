@@ -650,6 +650,8 @@ class LogicalHostPool:
                 f"got size={size}, page_size={page_size}"
             )
         self.size = size
+        # Stands in for a host pool (and group anchor); DCP never widens it.
+        self.logical_size = size
         self.page_size = page_size
         self.device = "cpu"
         self.layout = layout
@@ -1528,6 +1530,7 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
+        self.logical_size = self.anchor_entry.host_pool.logical_size
         child_write_back_jit = [
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries

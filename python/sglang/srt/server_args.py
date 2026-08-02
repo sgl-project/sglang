@@ -1409,7 +1409,7 @@ class ServerArgs:
     ] = False
     enable_session_radix_cache: A[
         bool,
-        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
+        "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
         NS("memory"),
     ] = False
 
@@ -3305,8 +3305,21 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
     enable_return_hidden_states: A[
-        bool, "Enable returning hidden states with responses.", NS("exec.features")
+        bool,
+        "Enable returning full hidden states with responses. Equivalent to "
+        "`--return-hidden-states-mode full`.",
+        NS("exec.features"),
     ] = False
+    return_hidden_states_mode: A[
+        Optional[str],
+        Arg(
+            help="Set the maximum hidden-state return mode supported by the "
+            "server. `last` allows requests with return_hidden_states=False or "
+            "`last`; `full` also allows return_hidden_states=True.",
+            choices=["last", "full"],
+        ),
+        NS("exec.features"),
+    ] = None
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",
@@ -3408,6 +3421,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3583,6 +3597,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_return_hidden_states_mode(self):
+        if self.return_hidden_states_mode not in (None, "last", "full"):
+            raise ValueError(
+                "return_hidden_states_mode must be one of: None, 'last', or 'full'."
+            )
+        if self.return_hidden_states_mode is None:
+            if self.enable_return_hidden_states:
+                self.return_hidden_states_mode = "full"
+        else:
+            self.enable_return_hidden_states = True
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -4426,7 +4451,11 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+        from sglang.srt.configs.model_config import (
+            is_deepseek_dsa,
+            is_deepseek_v4,
+            is_nemotron_h,
+        )
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4436,6 +4465,13 @@ class ServerArgs:
                 "MLA attention (non-DSA)",
                 lambda: self.use_mla_backend()
                 and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
+            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
+            # state-track write is not wired into the captured buffers, so a
+            # replay can commit a cache slot it never wrote.
+            (
+                "NemotronH (hybrid Mamba2 prefill)",
+                lambda: is_nemotron_h(self.get_model_config().hf_config),
             ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -6192,19 +6228,13 @@ class ServerArgs:
             hf_config = model_config.hf_config
             model_arch = hf_config.architectures[0]
             if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-                if getattr(hf_config, "index_share_for_mtp_iteration", False):
-                    # GLM 5.2 (DSA index-share MTP): CP-v2 is not ready for it
-                    # yet, so default the env to off and keep the legacy CP path.
-                    if not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(False)
-                else:
-                    is_dsa_default_model = is_deepseek_dsa(hf_config)
-                    # DSA CP-v2 currently supports only the interleave strategy.
-                    enable_default_cp_v2 = not is_dsa_default_model or (
-                        self.enable_prefill_cp and self.cp_strategy == "interleave"
-                    )
-                    if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(True)
+                is_dsa_default_model = is_deepseek_dsa(hf_config)
+                # DSA CP-v2 currently supports only the interleave strategy.
+                enable_default_cp_v2 = not is_dsa_default_model or (
+                    self.enable_prefill_cp and self.cp_strategy == "interleave"
+                )
+                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                    envs.SGLANG_ENABLE_CP_V2.set(True)
 
             if (
                 self.enable_prefill_cp
@@ -7090,6 +7120,49 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
+        # Step 3: DCP compatibility for the L2 (device<->host) path.
+        self._resolve_hicache_dcp_compatibility()
+
+    def _resolve_hicache_dcp_compatibility(self):
+        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+            return
+        if self.hicache_storage_backend is not None:
+            raise NotImplementedError(
+                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
+                "supported yet: under DCP each rank holds a distinct "
+                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
+                "backup and the storage keys must become dcp_rank-aware "
+                "first. Run HiCache+DCP with L1/L2 only."
+            )
+        if self.speculative_algorithm is not None:
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 does not support speculative "
+                "decoding yet (the draft-model host pool has no DCP index "
+                "translation)."
+            )
+        if self.enable_lmcache:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation."
+            )
+        if self.enable_hisparse:
+            raise NotImplementedError(
+                "--enable-hisparse with --dcp-size > 1 is not supported: the "
+                "HiSparse host pool is constructed without DCP translation."
+            )
+        if not self.use_mla_backend():
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 is only supported for MLA models: "
+                "the index translation lives in MLATokenToKVPoolHost, and the "
+                "MHA host pool has none."
+            )
+        logger.info(
+            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+            "logical slot accounting with per-rank physical translation at "
+            "the transfer boundary (dcp_size=%d).",
+            self.dcp_size,
+        )
+
     def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -7563,11 +7636,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
-        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
-            raise ValueError(
-                "--enable-session-radix-cache requires --radix-eviction-policy priority"
-            )
-
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
