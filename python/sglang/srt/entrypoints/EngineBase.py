@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -23,7 +23,9 @@ class EngineBase(ABC):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        return_hidden_states: Optional[bool] = None,
+        return_hidden_states: Optional[
+            Union[bool, Literal["last"], List[Union[bool, Literal["last"]]]]
+        ] = None,
         stream: Optional[bool] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,

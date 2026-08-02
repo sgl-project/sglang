@@ -443,3 +443,28 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        output = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            ver=fa_ver,
+        )
+        return output[0] if isinstance(output, tuple) else output
