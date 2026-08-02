@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -98,16 +97,10 @@ class BatchedDecodeContext:
         block_paged_metadata = None
         if block_paged_attention_supported and block_kv_pool is not None:
             try:
-                tables = [block_kv_pool.block_table(req_id) for req_id in req_ids]
-                max_blocks = max((len(table) for table in tables), default=0)
-                req_to_block = mx.array(
-                    [table + [-1] * (max_blocks - len(table)) for table in tables],
-                    dtype=mx.int32,
-                )
                 block_paged_metadata = build_decode_block_metadata(
                     req_ids=req_ids,
-                    req_pool_idx={req_id: idx for idx, req_id in enumerate(req_ids)},
-                    req_to_block_pool=SimpleNamespace(req_to_block=req_to_block),
+                    req_pool_idx=req_pool_idx,
+                    req_to_block_pool=block_kv_pool,
                     seq_lens_before_decode=seq_lens,
                     block_size=block_kv_pool.block_size,
                 )

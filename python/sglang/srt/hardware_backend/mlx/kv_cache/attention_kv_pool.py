@@ -97,6 +97,7 @@ class MlxBlockAttentionKVPool:
         n_kv_heads: int,
         head_dim: int,
         dtype: mx.Dtype = mx.float16,
+        req_capacity: int | None = None,
     ):
         # Block 0 is reserved for padding/invalid use. Allocated request blocks start
         # at physical block 1.
@@ -111,8 +112,15 @@ class MlxBlockAttentionKVPool:
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.dtype = dtype
+        self.req_capacity = max(
+            1, req_capacity if req_capacity is not None else num_blocks
+        )
         self._free_blocks: list[int] = list(range(1, num_blocks))
         self._req_block_tables: dict[str, list[int]] = {}
+        self._req_pool_rows: dict[str, int] = {}
+        self.req_to_block = (
+            mx.zeros((self.req_capacity, num_blocks), dtype=mx.int32) - 1
+        )
 
         shape = (num_blocks, block_size, n_kv_heads, head_dim)
         self.k_buffer: list[mx.array] = [
@@ -131,13 +139,39 @@ class MlxBlockAttentionKVPool:
             * num_layers
             * dtype.size
         ) / (1024 * 1024)
+        metadata_mem_mb = (self.req_capacity * num_blocks * mx.int32.size) / (
+            1024 * 1024
+        )
         logger.info(
             f"MlxBlockAttentionKVPool: {num_blocks} blocks x block_size={block_size} "
             f"x {num_layers} layers x {n_kv_heads} heads x {head_dim} dim, "
-            f"dtype={dtype}, ~{mem_mb:.1f} MB"
+            f"dtype={dtype}, ~{mem_mb:.1f} MB KV + "
+            f"~{metadata_mem_mb:.1f} MB req_to_block"
         )
 
-    def alloc_blocks(self, req_id: str, num_blocks: int) -> list[int] | None:
+    def _check_req_pool_idx(self, req_pool_idx: int) -> int:
+        row = int(req_pool_idx)
+        if row < 0 or row >= self.req_capacity:
+            raise ValueError(
+                f"req_pool_idx must be in [0, {self.req_capacity}), got {row}"
+            )
+        return row
+
+    def _set_req_to_block_row(self, req_id: str, req_pool_idx: int) -> None:
+        row = self._check_req_pool_idx(req_pool_idx)
+        existing = self._req_pool_rows.get(req_id)
+        if existing is not None and existing != row:
+            self.req_to_block[existing] = (
+                mx.zeros((self.num_blocks,), dtype=mx.int32) - 1
+            )
+        self._req_pool_rows[req_id] = row
+        blocks = self._req_block_tables.get(req_id, [])
+        row_values = blocks + [-1] * (self.num_blocks - len(blocks))
+        self.req_to_block[row] = mx.array(row_values, dtype=mx.int32)
+
+    def alloc_blocks(
+        self, req_id: str, num_blocks: int, req_pool_idx: int | None = None
+    ) -> list[int] | None:
         """Allocate physical blocks for a request, or return None if full."""
         if num_blocks < 0:
             raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
@@ -148,15 +182,21 @@ class MlxBlockAttentionKVPool:
         blocks = self._free_blocks[:num_blocks]
         del self._free_blocks[:num_blocks]
         self._req_block_tables[req_id] = blocks
+        if req_pool_idx is not None:
+            self._set_req_to_block_row(req_id, req_pool_idx)
         return list(blocks)
 
-    def ensure_blocks(self, req_id: str, num_blocks: int) -> list[int] | None:
+    def ensure_blocks(
+        self, req_id: str, num_blocks: int, req_pool_idx: int | None = None
+    ) -> list[int] | None:
         """Ensure a request owns at least ``num_blocks`` physical blocks."""
         if num_blocks < 0:
             raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
         existing = self._req_block_tables.get(req_id, [])
         needed = num_blocks - len(existing)
         if needed <= 0:
+            if req_pool_idx is not None:
+                self._set_req_to_block_row(req_id, req_pool_idx)
             return list(existing)
         if needed > len(self._free_blocks):
             return None
@@ -166,6 +206,8 @@ class MlxBlockAttentionKVPool:
             existing = []
             self._req_block_tables[req_id] = existing
         existing.extend(new_blocks)
+        if req_pool_idx is not None:
+            self._set_req_to_block_row(req_id, req_pool_idx)
         return list(existing)
 
     def block_table(self, req_id: str) -> list[int]:
@@ -175,6 +217,9 @@ class MlxBlockAttentionKVPool:
     def free_request(self, req_id: str) -> None:
         """Release a request's blocks back to the free list."""
         blocks = self._req_block_tables.pop(req_id, None)
+        row = self._req_pool_rows.pop(req_id, None)
+        if row is not None:
+            self.req_to_block[row] = mx.zeros((self.num_blocks,), dtype=mx.int32) - 1
         if not blocks:
             return
         self._free_blocks = sorted(blocks + self._free_blocks)
@@ -208,7 +253,11 @@ class MlxBlockAttentionKVPool:
 
     def all_buffers(self) -> list[mx.array]:
         """Return all buffer arrays (for ``mx.eval``)."""
-        return self.k_buffer + self.v_buffer
+        return self.k_buffer + self.v_buffer + [self.req_to_block]
+
+    def materialize(self) -> None:
+        """Force lazy block-pool buffers to be allocated before serving decode."""
+        mx.eval(*self.all_buffers())
 
     def clear(self) -> None:
         """Zero all buffers and clear request ownership."""
@@ -216,5 +265,9 @@ class MlxBlockAttentionKVPool:
         for i in range(self.num_layers):
             self.k_buffer[i] = mx.zeros(shape, dtype=self.dtype)
             self.v_buffer[i] = mx.zeros(shape, dtype=self.dtype)
+        self.req_to_block = (
+            mx.zeros((self.req_capacity, self.num_blocks), dtype=mx.int32) - 1
+        )
         self._free_blocks = list(range(1, self.num_blocks))
         self._req_block_tables.clear()
+        self._req_pool_rows.clear()

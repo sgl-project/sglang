@@ -620,7 +620,7 @@ class MlxModelRunner:
             if req_to_token_pool is not None:
                 req_capacity = int(req_to_token_pool.req_to_token.shape[0])
             else:
-                req_capacity = int(get_server_args().max_running_requests or 0)
+                req_capacity = max(1, int(get_server_args().max_running_requests or 0))
             token_blocks = (self._pool_size + self._block_size - 1) // self._block_size
             # Blocks are owned per request. Add one partial-block headroom block
             # per request row so token-slot admission does not over-admit many
@@ -633,7 +633,9 @@ class MlxModelRunner:
                 n_kv_heads=n_kv_heads,
                 head_dim=head_dim,
                 dtype=dtype,
+                req_capacity=req_capacity,
             )
+            self._block_attention_kv_pool.materialize()
             logger.info(
                 f"Block attention KV pool initialized: num_blocks={num_blocks} "
                 f"(block 0 reserved, token_blocks={token_blocks}, "
@@ -663,12 +665,16 @@ class MlxModelRunner:
             f"{n_kv_heads} kv_heads, {head_dim} head_dim"
         )
 
-    def _ensure_block_request_capacity(self, req_id: str, token_count: int) -> None:
+    def _ensure_block_request_capacity(
+        self, req_id: str, token_count: int, req_pool_idx: int
+    ) -> None:
         """Ensure block KV storage exists for ``token_count`` logical tokens."""
         if self._block_attention_kv_pool is None:
             return
         needed_blocks = (token_count + self._block_size - 1) // self._block_size
-        blocks = self._block_attention_kv_pool.ensure_blocks(req_id, needed_blocks)
+        blocks = self._block_attention_kv_pool.ensure_blocks(
+            req_id, needed_blocks, req_pool_idx=req_pool_idx
+        )
         if blocks is None:
             raise RuntimeError(
                 "MLX block paged attention KV pool exhausted while allocating "
@@ -685,7 +691,7 @@ class MlxModelRunner:
         """Sync contiguous attention KV into the block-table pool."""
         if self._block_attention_kv_pool is None or end <= start:
             return
-        self._ensure_block_request_capacity(req_id, end)
+        self._ensure_block_request_capacity(req_id, end, self._req_pool_idx[req_id])
         table = self._block_attention_kv_pool.block_table(req_id)
         positions = mx.arange(start, end, dtype=mx.int32)
         logical_blocks = positions // self._block_size
@@ -720,7 +726,9 @@ class MlxModelRunner:
         for req_id, cache in zip(req_ids, caches):
             # +1 for the current decode token that the attention wrapper will scatter.
             self._ensure_block_request_capacity(
-                req_id, self._first_attention_cache(cache).offset + 1
+                req_id,
+                self._first_attention_cache(cache).offset + 1,
+                self._req_pool_idx[req_id],
             )
 
     def prefill(
@@ -965,7 +973,9 @@ class MlxModelRunner:
         next_token = int(pending.lazy_token.item())
         if self._block_attention_kv_pool is not None:
             self._ensure_block_request_capacity(
-                pending.req_id, self._first_attention_cache(pending.cache).offset
+                pending.req_id,
+                self._first_attention_cache(pending.cache).offset,
+                pending.req_pool_idx,
             )
         self._req_token_ids[pending.req_id] = list(pending.full_token_ids) + [
             next_token
@@ -991,7 +1001,9 @@ class MlxModelRunner:
         cache = self._req_caches[req_id]
         if self._block_attention_kv_pool is not None:
             self._ensure_block_request_capacity(
-                req_id, self._first_attention_cache(cache).offset + len(new_token_ids)
+                req_id,
+                self._first_attention_cache(cache).offset + len(new_token_ids),
+                self._req_pool_idx[req_id],
             )
 
         input_ids = mx.array([new_token_ids], dtype=mx.int32)
