@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -57,6 +58,29 @@ def test_replace_offsets_with_tokens_per_frame():
     from sglang.srt.multimodal.evs.evs_core import replace_offsets_with_tokens_per_frame
 
     run_doctests(replace_offsets_with_tokens_per_frame)
+
+
+def test_evs_items_store_wire_data_in_model_specific_data():
+    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+    from sglang.srt.multimodal.evs import EVSConfig, EVSProcessor
+
+    processor = EVSProcessor.__new__(EVSProcessor)
+    processor.evs_config = EVSConfig(video_pruning_rate=0.1)
+    make_items, _ = processor.static_size_data_items(
+        frames_per_video=[2], num_images=1, rows=2, cols=3
+    )
+    items = make_items(
+        input_ids_list=[1, 2, 3],
+        image=torch.zeros(1),
+        image_offsets=[(0, 0)],
+        video=torch.zeros(1),
+        video_offsets=[(1, 2)],
+    )
+
+    assert all(type(item) is MultimodalDataItem for item in items)
+    assert items[0].thw_grids == [(1, 2, 3)]
+    assert items[1].thw_grids == [(2, 2, 3)]
+    assert items[1].pre_chunked_input_ids == [1, 2, 3]
 
 
 if __name__ == "__main__":
