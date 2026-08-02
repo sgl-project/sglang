@@ -300,7 +300,6 @@ export const config = {
       model: "{{MODEL_NAME}}",
       prompt:
         "Night-vision bedroom footage: while the owner sleeps, three cats burst in playing tiny brass instruments at full volume, freeze, then march out as if nothing happened.",
-      size: "1344x768",
       seconds: "{{DURATION_SECONDS}}",
       task: "t2va",
       conditions: [],

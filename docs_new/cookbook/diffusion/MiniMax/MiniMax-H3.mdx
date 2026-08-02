@@ -187,7 +187,6 @@ video_id=$(
     -d '{
       "model": "MiniMaxAI/MiniMax-H3",
       "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
-      "size": "1344x768",
       "seconds": 5,
       "task": "t2va",
       "conditions": [],
@@ -239,7 +238,6 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   -d '{
     "model": "MiniMaxAI/MiniMax-H3",
     "prompt": "The supplied frame continues with calm, natural motion and synchronized ambient sound.",
-    "size": "1344x768",
     "seconds": 5,
     "task": "fl2va",
     "conditions": [
@@ -295,7 +293,6 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   -d '{
     "model": "MiniMaxAI/MiniMax-H3",
     "prompt": "Follow the motion and appearance of <Video 1>, changing the setting to a moonlit bedroom while preserving coherent timing.",
-    "size": "1344x768",
     "seconds": 5,
     "task": "ref2va",
     "conditions": [
@@ -342,7 +339,6 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   -d '{
     "model": "MiniMaxAI/MiniMax-H3",
     "prompt": "Use <Picture 1> as the visual subject and <Audio 1> as the sound reference, with coherent natural motion.",
-    "size": "1344x768",
     "seconds": 5,
     "task": "ref2va",
     "conditions": [
@@ -718,7 +714,7 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
   --dataset vbench --task text-to-video \
   --num-prompts 1 --max-concurrency 1 \
   --warmup-requests 1 --warmup-inference-steps 50 \
-  --extra-body '{"task":"t2va","conditions":[],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5.0},"size":"1344x768","seconds":5,"flow_shift":12.0,"audio_flow_shift":3.0}'
+  --extra-body '{"task":"t2va","conditions":[],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5.0},"seconds":5,"flow_shift":12.0,"audio_flow_shift":3.0}'
 ```
 
 **Workload**
