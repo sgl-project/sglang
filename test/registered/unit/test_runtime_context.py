@@ -446,6 +446,30 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self._init(moe_a2a_backend="moonep")
         self.assertTrue(get_moe_a2a_backend().is_moonep())
 
+    def test_moonep_dispatch_contract_formats(self):
+        from sglang.srt.layers.moe.token_dispatcher import (
+            CombineInputChecker,
+            DispatchOutputChecker,
+            MoonEPCombineInput,
+            MoonEPDispatchOutput,
+        )
+
+        dispatch_output = MoonEPDispatchOutput(
+            hidden_states=object(),
+            route_weights_nvs=None,
+            cu_seqlens=object(),
+            plan=object(),
+        )
+        combine_input = MoonEPCombineInput(
+            hidden_states=object(),
+            route_weights_nvs=None,
+            plan=dispatch_output.plan,
+        )
+
+        self.assertTrue(dispatch_output.format.is_moonep())
+        self.assertTrue(DispatchOutputChecker.format_is_moonep(dispatch_output))
+        self.assertTrue(CombineInputChecker.format_is_moonep(combine_input))
+
     def test_speculative_swap_and_restore(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_a2a_backend,

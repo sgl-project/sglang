@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from typing import Any, NamedTuple, NoReturn, Optional
+
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
+    CombineInputFormat,
     DispatchOutput,
+    DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
@@ -17,6 +21,42 @@ _MOONEP_UNSUPPORTED_MESSAGE = (
     "returns a MoonEPCommPlan/cu_seqlens and requires MoonEP-compatible "
     "contiguous symmetric-memory expert weights plus a VM-group expert GEMM."
 )
+
+
+class MoonEPDispatchOutput(NamedTuple):
+    """MoonEP dispatch output.
+
+    ``plan`` is intentionally typed as ``Any`` so this module can define the
+    SGLang-side contract without importing the optional ``moonep`` package at
+    module import time.
+    """
+
+    hidden_states: torch.Tensor
+    route_weights_nvs: Optional[torch.Tensor]
+    cu_seqlens: torch.Tensor
+    plan: Any
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.MOONEP
+
+
+assert isinstance(MoonEPDispatchOutput, DispatchOutput)
+
+
+class MoonEPCombineInput(NamedTuple):
+    """MoonEP combine input."""
+
+    hidden_states: torch.Tensor
+    route_weights_nvs: Optional[torch.Tensor]
+    plan: Any
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.MOONEP
+
+
+assert isinstance(MoonEPCombineInput, CombineInput)
 
 
 class MoonEPDispatcher(BaseDispatcher):
@@ -54,7 +94,7 @@ class MoonEPDispatcher(BaseDispatcher):
         self.expert_mask_gpu = None
 
     @staticmethod
-    def _raise_unimplemented():
+    def _raise_unimplemented() -> NoReturn:
         raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
 
     def dispatch(
