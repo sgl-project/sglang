@@ -10,9 +10,12 @@ Map: #7 https://github.com/wirybeaver/sglang/issues/7
 - #10 https://github.com/wirybeaver/sglang/issues/10 — Add dispatcher data contract
 - #11 https://github.com/wirybeaver/sglang/issues/11 — Add buffer facade and env sizing knobs
 
-## Open frontier
+## Completed
 
 - #12 https://github.com/wirybeaver/sglang/issues/12 — Decide static token-capacity policy
+
+## Open frontier
+
 - #13 https://github.com/wirybeaver/sglang/issues/13 — Add contiguous symmetric expert weight layout
 - #14 https://github.com/wirybeaver/sglang/issues/14 — Add BF16 expert runner for cu_seqlens
 - #15 https://github.com/wirybeaver/sglang/issues/15 — Wire runtime dispatch/prefetch/compute/combine path

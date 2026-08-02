@@ -96,8 +96,20 @@ Environment knobs:
 - `SGLANG_MOONEP_TOKEN_PADDING` defaults to `128`.
 - `SGLANG_MOONEP_NUM_SMS` defaults to `32`.
 
-The next runtime slice must decide how SGLang chooses `S` across prefill,
-decode, and CUDA graph capture. Until then, the backend remains guarded.
+Accepted static token-capacity policy for the PoC:
+
+- `SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is the single static `S`
+  capacity for both prefill and decode on each process.
+- The dispatcher pads runtime batches with `num_tokens <= S` up to `S` before
+  calling MoonEP. Padding rows use zero hidden states, zero route weights, and
+  expert `0` top-k ids so MoonEP's `topk_experts_sk` and `tokens_per_expert`
+  remain internally consistent. The combined output is sliced back to the
+  original token count.
+- Runtime batches with `num_tokens > S` fail fast and instruct the operator to
+  increase `SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`.
+- CUDA graph capture is disabled for the initial PoC. MoonEP has static buffer
+  shapes, but the first executable SGLang path should validate correctness and
+  NVLink behavior in eager mode before making capture/replay guarantees.
 
 ### Weight layout
 
@@ -134,8 +146,8 @@ later cloned or summarized upstream to `sgl-project/sglang` before upstream PRs.
 | 2 | Done | Recognize `moonep` backend and fail fast (`wirybeaver/sglang#9`). |
 | 3 | Done | Add MoonEP dispatch/combine data contract (`wirybeaver/sglang#10`). |
 | 4 | Done | Add process-wide MoonEP buffer facade (`wirybeaver/sglang#11`). |
-| 5 | Next | Decide static token-capacity policy (`wirybeaver/sglang#12`). |
-| 6 | Pending | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
+| 5 | Done | Decide static token-capacity policy (`wirybeaver/sglang#12`). |
+| 6 | Next | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
 | 7 | Pending | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
 | 8 | Pending | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
 | 9 | Pending | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
