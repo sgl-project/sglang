@@ -31,10 +31,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import (
-    get_tp_world_size,
-    tensor_model_parallel_all_gather,
-)
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -960,20 +957,18 @@ class MiniMaxH3FinalLayer(nn.Module):
             expand_ratio=2,
             modality_num=1,
         )
-        self.video_out = ColumnParallelLinear(
+        self.video_out = ReplicatedLinear(
             arch.hidden_size,
             video_patch_dim,
             bias=True,
-            gather_output=False,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix=f"{prefix}.video_out",
         )
-        self.audio_out = ColumnParallelLinear(
+        self.audio_out = ReplicatedLinear(
             arch.hidden_size,
             arch.audio_latents_dim,
             bias=True,
-            gather_output=False,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix=f"{prefix}.audio_out",
@@ -986,12 +981,12 @@ class MiniMaxH3FinalLayer(nn.Module):
         adaln_input: torch.Tensor,
         inverse_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project all rows into TP-local video/audio output shards.
+        """Project all rows into replicated video/audio outputs.
 
         Apply single-modality shift/scale AdaLN to the final normalized
         activations, cast to fp32, then apply both output heads to all rows.
-        The model gathers output columns only after selecting live media rows,
-        preserving the GEMM shape while reducing collective payload.
+        The narrow output heads stay replicated across TP ranks so the model
+        can return live media rows without output-column gathers.
         """
         shift, scale = self.adaln_proj(adaln_input)
         h = self.norm(x)
@@ -1097,23 +1092,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ring_size=_ring_world_size(),
         )
 
-        # tp peers own the same Ulysses row shard; replicate these narrow
-        # projections instead of gathering their wide fp32 token outputs
-        self.video_patch_proj = ReplicatedLinear(
+        self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim
             * arch.patch_size[0]
             * arch.patch_size[1]
             * arch.patch_size[2],
             arch.hidden_size,
             bias=True,
+            gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ReplicatedLinear(
+        self.audio_patch_proj = ColumnParallelLinear(
             arch.audio_latents_dim,
             arch.hidden_size,
             bias=True,
+            gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix="audio_patch_proj",
@@ -1627,15 +1622,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 (video_width, logits.shape[-1] - video_width), dim=-1
             )
 
-        # Preserve the full-row output GEMM (and therefore its numerical
-        # contract), but defer TP column gathers until after dead text/padding
-        # rows have been removed. For hybrid TP+Ulysses, the preceding SP row
-        # gather also carries only the TP-local output width.
+        # preserve the full-row output GEMM before removing text/padding rows
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
-        if get_tp_world_size() > 1:
-            video_logits = tensor_model_parallel_all_gather(video_logits)
-            audio_logits = tensor_model_parallel_all_gather(audio_logits)
         if not skip_mask_out_condition:
             update_mask = update_mask.view(-1).to(device)
             if update_mask.shape[0] != video_logits.shape[0]:

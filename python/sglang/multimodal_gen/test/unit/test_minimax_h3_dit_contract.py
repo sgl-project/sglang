@@ -143,8 +143,8 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         )
 
     assert model._fsdp_mixed_dtype_params
-    assert isinstance(model.video_patch_proj, ReplicatedLinear)
-    assert isinstance(model.audio_patch_proj, ReplicatedLinear)
+    assert isinstance(model.final_layer.video_out, ReplicatedLinear)
+    assert isinstance(model.final_layer.audio_out, ReplicatedLinear)
     for name, tensor in model.state_dict().items():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name
