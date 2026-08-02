@@ -294,10 +294,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
-        index_head_dim: Optional[int],
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
