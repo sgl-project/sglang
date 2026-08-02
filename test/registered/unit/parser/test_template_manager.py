@@ -15,7 +15,7 @@ from sglang.srt.parser.template_detection import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(est_time=2.0, suite="base-a-test-cpu")
 
 
 class _DummyTokenizer:
@@ -871,6 +871,34 @@ class TestResolveAutoParsers(unittest.TestCase):
 
         self.assertEqual(args.reasoning_parser, "deepseek-v4")
         self.assertEqual(args.tool_call_parser, "deepseekv4")
+
+    def test_kimi_k3_arch_without_chat_template_uses_custom_encoder(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(
+            architectures=["KimiK3ForConditionalGeneration"], model_type="kimi_k3"
+        )
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "kimi_k3")
+        self.assertEqual(args.tool_call_parser, "kimi_k3")
+
+    def test_kimi_k3_model_type_without_architecture_uses_custom_encoder(self):
+        args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([])
+        config = SimpleNamespace(architectures=None, model_type="kimi_k3")
+
+        with _patch_hf_transformers_utils(
+            Mock(return_value=tokenizer), Mock(return_value=config)
+        ):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(args.reasoning_parser, "kimi_k3")
+        self.assertEqual(args.tool_call_parser, "kimi_k3")
 
     def test_deepseek_arch_fallback_runs_when_tokenizer_load_fails(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")
