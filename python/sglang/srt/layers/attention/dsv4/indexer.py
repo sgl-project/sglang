@@ -230,25 +230,43 @@ def fp8_paged_mqa_logits_torch_sm120(
     kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
     kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
 
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
+    # Chunk along the sequence axis. The unchunked form materialises a
+    # [B, S, num_heads] score tensor -- num_heads times larger than the [B, S]
+    # it reduces to, and growing linearly with context -- which OOMs at 512K.
+    # Chunking is bit-identical: each output element reduces over head_dim only,
+    # so no reduction ever crosses a chunk boundary.
+    q = q_fp8[:, 0].to(torch.bfloat16)  # [B, NH, 128]
+    # The output dtype has to match the unchunked path: there the score is
+    # multiplied by fp32 weight/kv_scale, so it lands in fp32.
+    logits = torch.full(
+        (batch_size, max_seq_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    # Peak is roughly B * chunk * (head_dim + num_heads) * 2 bytes; sized for ~512 MB.
+    _per = max(1, batch_size * (head_dim + num_heads) * 2)
+    pages_per_chunk = max(1, min(max_pages, (512 << 20) // (_per * block_size)))
 
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
-
-    q = q_fp8[:, 0].to(torch.bfloat16)
-
-    score = torch.bmm(kv_value, q.transpose(1, 2))
-
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
-
-    score = score * kv_scale
-
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
+    for _p0 in range(0, max_pages, pages_per_chunk):
+        _p1 = min(max_pages, _p0 + pages_per_chunk)
+        _g = kvcache_flat[page_ids[:, _p0:_p1]]
+        _n = (_p1 - _p0) * block_size
+        _kvv = (
+            _g[..., :SCALE_OFFSET].contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
+        ).view(batch_size, _n, head_dim)
+        _kvs = (_g[..., SCALE_OFFSET:].contiguous().view(dtype=torch.float32)).view(
+            batch_size, _n
+        )
+        _sc = torch.bmm(_kvv, q.transpose(1, 2))  # [B, _n, NH]
+        _sc = F.relu(_sc)
+        _sc = _sc * weight.unsqueeze(1)
+        _sc = _sc.sum(dim=2) * _kvs  # [B, _n]
+        _s0 = _p0 * block_size
+        _e = min(max_seq_len, _s0 + _n)
+        if _e > _s0:
+            logits[:, _s0:_e] = _sc[:, : _e - _s0]
+        del _g, _kvv, _kvs, _sc
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
@@ -710,7 +728,10 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
+            if is_sm120_supported() or (
+                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+            ):
+                # Ampere needs the same CUDA-graph-safe variant (no .item())
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
