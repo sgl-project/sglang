@@ -18,6 +18,7 @@ from sglang.srt.models.deepseek_v4 import (
     _is_dense_linear,
     _pop_fused_weight,
     _reject_unfusable_leaf,
+    _summarize_unplaced_weights,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -332,6 +333,47 @@ class TestPackedLayerFallback(unittest.TestCase):
         )
 
         torch.testing.assert_close(params[f"{ATTN_PREFIX}.wq_a.qweight"].data, qweight)
+
+
+class TestUnplacedWeightSummary(unittest.TestCase):
+    def test_summary_counts_and_collapses_layer_indices(self):
+        names = [
+            f"model.layers.{layer}.self_attn.{module}.{leaf}"
+            for layer in range(43)
+            for module in ("wq_a", "wkv")
+            for leaf in ("qweight", "qzeros", "scales")
+        ]
+
+        summary = _summarize_unplaced_weights(names)
+
+        self.assertIn("258 checkpoint weights were not placed", summary)
+        self.assertIn("model.layers.*.self_attn.wq_a (129)", summary)
+        self.assertIn("model.layers.*.self_attn.wkv (129)", summary)
+
+    def test_summary_lists_at_most_top_prefixes(self):
+        names = [f"module_{i}.leaf" for i in range(20)]
+        summary = _summarize_unplaced_weights(names, top=2)
+        self.assertIn("20 checkpoint weights were not placed", summary)
+        self.assertEqual(summary.count("(1)"), 2)
+
+    def test_load_weights_emits_one_summary(self):
+        params = {f"{ATTN_PREFIX}.wq_b.weight": torch.nn.Parameter(torch.zeros(2, 2))}
+        weights = [
+            (f"model.layers.{layer}.self_attn.q_norm.stray", torch.zeros(2))
+            for layer in range(3)
+        ]
+
+        with self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING") as logs:
+            run_load_weights(params, weights)
+
+        summaries = [
+            record
+            for record in logs.output
+            if "checkpoint weights were not placed" in record
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("3 checkpoint weights were not placed", summaries[0])
+        self.assertIn("model.layers.*.self_attn.q_norm (3)", summaries[0])
 
 
 class TestFusedShardBuffer(unittest.TestCase):

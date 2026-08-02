@@ -4,6 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
@@ -2866,6 +2867,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ".wqkv_a." in param_name for param_name in params_dict
         )
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+        unplaced_weight_names: List[str] = []
 
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -3131,6 +3133,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         logger.warning(
                                             f"{name} not found in params_dict."
                                         )
+                                        unplaced_weight_names.append(name)
                                     continue
                                 param = params_dict[name]
 
@@ -3152,6 +3155,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+
+        if unplaced_weight_names:
+            logger.warning(_summarize_unplaced_weights(unplaced_weight_names))
+
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = [
@@ -3225,6 +3232,23 @@ _COMPRESSOR_SHARD_ORDER = ("kv", "wgate")
 # geometry, so their join axis differs and is not handled here.
 _WQKV_A_FUSABLE_LEAVES = frozenset({"weight", "weight_scale_inv"})
 _COMPRESSOR_FUSABLE_LEAVES = frozenset({"weight"})
+
+
+def _generalize_module_prefix(name: str) -> str:
+    """Drop the leaf and collapse layer indices, so per-layer names aggregate."""
+    parts = name.split(".")[:-1]
+    return ".".join("*" if part.isdigit() else part for part in parts)
+
+
+def _summarize_unplaced_weights(names: List[str], top: int = 5) -> str:
+    prefixes = Counter(_generalize_module_prefix(name) for name in names)
+    top_prefixes = ", ".join(
+        f"{prefix} ({count})" for prefix, count in prefixes.most_common(top)
+    )
+    return (
+        f"{len(names)} checkpoint weights were not placed into any parameter. "
+        f"Top module prefixes: {top_prefixes}"
+    )
 
 
 def _is_dense_linear(layer: nn.Module) -> bool:
