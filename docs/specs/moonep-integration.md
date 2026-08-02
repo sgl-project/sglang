@@ -145,6 +145,12 @@ The first runnable path should be BF16 inference:
 
 Quantized Kimi-K3 variants should come after this path is correct.
 
+The initial runner is a correctness-first Python segment loop over
+`cu_seqlens`. It applies BF16 gate/up/down weights per segment, multiplies by
+MoonEP-dispatched route weights, and returns `MoonEPCombineInput`. This is not
+the final performance kernel; it exists to validate the dispatcher/data/weight
+contracts before replacing the segment loop with a grouped GEMM.
+
 ## Phased tickets
 
 The GitHub issue tracker lives on `wirybeaver/sglang`; completed PoC issues are
@@ -158,8 +164,8 @@ later cloned or summarized upstream to `sgl-project/sglang` before upstream PRs.
 | 4 | Done | Add process-wide MoonEP buffer facade (`wirybeaver/sglang#11`). |
 | 5 | Done | Decide static token-capacity policy (`wirybeaver/sglang#12`). |
 | 6 | Done | Add MoonEP contiguous symmetric weight layout (`wirybeaver/sglang#13`). |
-| 7 | Next | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
-| 8 | Pending | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
+| 7 | Done | Add BF16 MoonEP expert runner consuming `cu_seqlens` (`wirybeaver/sglang#14`). |
+| 8 | Next | Wire runtime dispatcher dispatch/prefetch/compute/combine (`wirybeaver/sglang#15`). |
 | 9 | Pending | Add Kimi-K3 recipe, validation, and upstream handoff notes (`wirybeaver/sglang#16`). |
 
 Issue links are tracked in `.scratch/moonep/tickets.md`.

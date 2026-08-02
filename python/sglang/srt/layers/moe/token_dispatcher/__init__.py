@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.token_dispatcher.moonep import (
     MoonEPExpertWeightLayout,
     get_moonep_expert_weight_layout,
     get_moonep_num_prefetch_slots,
+    run_moonep_bf16_expert,
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPDispatcher,
@@ -85,6 +86,7 @@ __all__ = [
     "MoonEPExpertWeightLayout",
     "get_moonep_expert_weight_layout",
     "get_moonep_num_prefetch_slots",
+    "run_moonep_bf16_expert",
     "MoriEPNormalDispatchOutput",
     "MoriEPNormalCombineInput",
     "MoriEPLLDispatchOutput",

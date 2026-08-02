@@ -18,8 +18,11 @@ Map: #7 https://github.com/wirybeaver/sglang/issues/7
 
 - #13 https://github.com/wirybeaver/sglang/issues/13 — Add contiguous symmetric expert weight layout
 
-## Open frontier
+## Completed
 
 - #14 https://github.com/wirybeaver/sglang/issues/14 — Add BF16 expert runner for cu_seqlens
+
+## Open frontier
+
 - #15 https://github.com/wirybeaver/sglang/issues/15 — Wire runtime dispatch/prefetch/compute/combine path
 - #16 https://github.com/wirybeaver/sglang/issues/16 — Validate Kimi-K3 PoC and prepare upstream handoff
