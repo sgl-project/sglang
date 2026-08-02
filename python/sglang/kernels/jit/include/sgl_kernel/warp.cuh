@@ -184,7 +184,7 @@ SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
 #ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
 #else
-    uint32_t n = __shfl_up(val, offset, kWarpThreads);
+    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
 #endif
     if (lane_id >= offset) val += n;
   }
