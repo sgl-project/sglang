@@ -1008,10 +1008,9 @@ class SchedulerMetricsReporter:
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
-        self.stats.hicache_host_used_tokens = (
-            host_pool.size - host_pool.available_size()
-        )
-        self.stats.hicache_host_total_tokens = host_pool.size
+        host_total = host_pool.logical_size
+        self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
+        self.stats.hicache_host_total_tokens = host_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
