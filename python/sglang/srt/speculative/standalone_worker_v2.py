@@ -11,6 +11,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
 )
+from sglang.srt.speculative.draft_worker_common import draft_server_args_copy
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -150,10 +151,8 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
+        server_args = draft_server_args_copy(
+            server_args, target_worker.model_runner.model_config
         )
 
         # Create our custom draft worker that doesn't share embeddings/lm_head

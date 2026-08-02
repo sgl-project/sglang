@@ -42,6 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_worker_common import draft_server_args_copy
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -907,10 +908,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
+        server_args = draft_server_args_copy(
+            server_args, target_worker.model_runner.model_config
         )
 
         self._draft_worker = MultiLayerEagleDraftWorker(

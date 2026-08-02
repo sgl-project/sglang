@@ -44,6 +44,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
+from sglang.srt.speculative.draft_worker_common import draft_server_args_copy
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -679,10 +680,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        # Match the draft context length to the target (assistant reads target KV).
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
+        server_args = draft_server_args_copy(
+            server_args, target_worker.model_runner.model_config
         )
 
         self._draft_worker = FrozenKVMTPDraftWorker(

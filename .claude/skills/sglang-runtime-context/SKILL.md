@@ -240,7 +240,9 @@ Never module-skip a test "until the migration settles" — seed the context inst
   are the easiest thing to lose when relocating a method body. Only drafts built through
   `build_draft_tp_worker()` get private bags (a preserved publish of the rewritten copy);
   drafts constructed directly with `is_draft_worker=True` skip publish and **share the
-  target's bags** — a draft-side write there poisons the target.
+  target's bags** — a draft-side write there poisons the target. Their `ServerArgs`
+  instance is private either way: the v2 spec workers build it with
+  `draft_server_args_copy()` before constructing the draft.
 - **Registry-completeness timing**: a gate that consults an extensible list is only correct
   after the registrars ran (platform `init_backend()` at module import). See "load-time vs
   resolution-time".

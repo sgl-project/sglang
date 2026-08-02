@@ -57,6 +57,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_worker_common import draft_server_args_copy
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -264,12 +265,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
         elif get_spec().speculative_token_map is not None:
             self.hot_token_id = load_token_map(get_spec().speculative_token_map)
-            self.server_args.override(
-                "eagle_worker.hot_token_map",
-                json_model_override_args=(
-                    f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-                ),
-            )
         else:
             self.hot_token_id = None
 
@@ -1010,10 +1005,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
+        server_args = draft_server_args_copy(
+            server_args, target_worker.model_runner.model_config
         )
 
         self._draft_worker = EagleDraftWorker(
