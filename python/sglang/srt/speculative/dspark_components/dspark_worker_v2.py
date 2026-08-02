@@ -592,6 +592,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
+            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # sampling batches must take the eager accept path even when the
+            # draft proposal itself folded.
+            and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar

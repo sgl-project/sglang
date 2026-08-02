@@ -10,7 +10,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -26,6 +26,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -77,37 +78,116 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 
 class DsparkDraftSampler:
+    """Graph-folded draft proposal head (base logits + markov chain sampling).
 
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
+    Captured as a draft-graph tail hook. With folded_sampling it handles
+    greedy and sampling rows in one pass: the per-step fused kernel
+    (SampleStepTokens) argmaxes greedy rows and Gumbel-samples the rest with
+    in-graph philox noise (CUDAGraph advances the generator per replay).
+    Per-step sampling params live in static buffers refreshed by
+    stage_sampling_params before each replay; corrected block logits are
+    exported for the sampling accept path. Without folded_sampling the hook
+    argmaxes every row and allocates none of those buffers; sampling batches
+    then take the eager proposal path.
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        gamma,
+        max_bs,
+        device,
+        confidence_fn=None,
+        out=None,
+        folded_sampling: bool = True,
+    ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        max_bs = int(max_bs)
         if out is not None:
-            assert out.shape == (int(max_bs) * self.gamma,) and out.dtype == torch.int64
+            assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
             self.out = out
         else:
             self.out = torch.empty(
-                (int(max_bs) * self.gamma,), dtype=torch.int64, device=device
+                (max_bs * self.gamma,), dtype=torch.int64, device=device
             )
         self.confidence_fn = confidence_fn
         self.confidence_out = (
-            torch.empty((int(max_bs), self.gamma), dtype=torch.float32, device=device)
+            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
             if confidence_fn is not None
             else None
         )
+        self.folded_sampling = folded_sampling
+        self.temperatures = None
+        self.greedy_mask = None
+        self.exp_noise = None
+        self.corrected_out = None
+        if folded_sampling:
+            vocab = int(model.lm_head.org_vocab_size)
+            self.temperatures = torch.ones(
+                (max_bs,), dtype=torch.float32, device=device
+            )
+            self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+            self.exp_noise = torch.empty(
+                (max_bs, vocab), dtype=torch.float32, device=device
+            )
+            self.corrected_out = torch.empty(
+                (max_bs * self.gamma, vocab),
+                dtype=model.lm_head.weight.dtype,
+                device=device,
+            )
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+        """Host-side refresh of the static sampling params; must run before
+        the draft graph replay that consumes them."""
+        if not self.folded_sampling:
+            return
+        if sampling_info is None:
+            self.temperatures[:bs].fill_(1.0)
+            self.greedy_mask[:bs].fill_(True)
+            return
+        torch.clamp(
+            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            min=1e-5,
+            out=self.temperatures[:bs],
+        )
+        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
-        draft_tokens, _ = self.markov_head.sample_block(
+
+        if self.folded_sampling:
+
+            def _step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                del step_idx
+                noise = self.exp_noise[:bs].exponential_()
+                return SampleStepTokens.execute(
+                    step_logits=step_logits,
+                    temperatures=self.temperatures[:bs],
+                    greedy_mask=self.greedy_mask[:bs],
+                    exp_noise=noise,
+                )
+
+            sampler = _step_sampler
+        else:
+            sampler = greedy_step_sampler
+
+        draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
             hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=greedy_step_sampler,
+            sampler=sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
+        if self.folded_sampling:
+            self.corrected_out[: bs * self.gamma].copy_(
+                corrected_logits.reshape(bs * self.gamma, -1)
+            )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
                 draft_hidden=hidden_states.view(bs, self.gamma, -1),
@@ -116,6 +196,40 @@ class DsparkDraftSampler:
                 confidence_tap=confidence_tap,
             )
             self.confidence_out[:bs].copy_(confidence)
+
+
+def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
+    """Decide whether the folded sampler allocates its sampling buffers.
+
+    The exp-noise and corrected-logits buffers are captured into the draft
+    graph, so they must exist before capture and stay resident. AUTO takes
+    them only when they fit in the free memory left after target init,
+    keeping the same 1 GB floor the draft-graph capture requires (local
+    probe, mirroring init_cuda_graphs).
+    """
+    mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
+    if mode == DsparkFoldedSampling.OFF:
+        return False
+    if mode == DsparkFoldedSampling.FORCE:
+        return True
+    vocab = int(model.lm_head.org_vocab_size)
+    noise_bytes = max_bs * vocab * 4
+    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
+    need_gb = (noise_bytes + logits_bytes) / (1 << 30)
+    available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
+    if available_gb - need_gb >= 1.0:
+        return True
+    if tp_rank == 0:
+        logger.warning(
+            "DSpark folded sampling disabled: its static buffers need %.2f GB "
+            "but only %.2f GB GPU memory is free; sampling batches will take "
+            "the eager proposal path. Set SGLANG_DSPARK_FOLDED_SAMPLING=%d "
+            "to force.",
+            need_gb,
+            available_gb,
+            int(DsparkFoldedSampling.FORCE),
+        )
+    return False
 
 
 def maybe_build_draft_sampler(
@@ -128,13 +242,13 @@ def maybe_build_draft_sampler(
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded greedy draft sampler, or return None (with the
-    reason logged) when the draft model cannot support folding and the
-    proposal must stay eager."""
+    """Build the graph-folded draft sampler, or return None (with the reason
+    logged) when the draft model cannot support folding and the proposal must
+    stay eager."""
 
     def _eager(reason):
         if tp_rank == 0:
-            logger.info("DSpark draft greedy proposal kept eager (reason=%s).", reason)
+            logger.info("DSpark draft proposal kept eager (reason=%s).", reason)
         return None
 
     if gamma <= 0:
@@ -143,8 +257,14 @@ def maybe_build_draft_sampler(
         return _eager("no compute_base_logits")
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
+    folded_sampling = _resolve_folded_sampling(
+        model=draft_model, gamma=gamma, max_bs=max_bs, device=device, tp_rank=tp_rank
+    )
     if tp_rank == 0:
-        logger.info("DSpark draft greedy proposal folded into the draft cuda graph.")
+        logger.info(
+            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "greedy + sampling" if folded_sampling else "greedy only",
+        )
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
@@ -152,6 +272,7 @@ def maybe_build_draft_sampler(
         device=device,
         confidence_fn=confidence_fn,
         out=out,
+        folded_sampling=folded_sampling,
     )
 
 
@@ -277,6 +398,8 @@ class DraftBlockProposer:
         sampling_info,
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
+        draft_sampler = self._draft_sampler
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -284,32 +407,58 @@ class DraftBlockProposer:
             bs=bs,
             device=device,
             embed_module=embed_module,
+            draft_sampler=draft_sampler,
+            sampling_info=sampling_info,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        draft_sampler = self._draft_sampler
-        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        if (
+            draft_sampler is not None
+            and fwd.can_run_graph
+            and (all_greedy or draft_sampler.folded_sampling)
+        ):
             folded = True
-            if sampling_info is None:
-                temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-            else:
-                temperatures = (
-                    sampling_info.temperatures.view(-1)
-                    .to(torch.float32)
-                    .clamp_min(1e-5)
+            if draft_sampler.folded_sampling:
+                draft_block = DraftBlockResult(
+                    draft_tokens=draft_sampler.out[: bs * self.gamma].view(
+                        bs, self.gamma
+                    ),
+                    # The sampling accept path needs the markov-corrected block
+                    # logits; greedy accept only compares tokens.
+                    corrected_logits=(
+                        None
+                        if all_greedy
+                        else draft_sampler.corrected_out[: bs * self.gamma].view(
+                            bs, self.gamma, -1
+                        )
+                    ),
+                    greedy_mask=draft_sampler.greedy_mask[:bs],
+                    temperatures=draft_sampler.temperatures[:bs],
                 )
-            draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=None,
-                greedy_mask=resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                ),
-                temperatures=temperatures,
-            )
+            else:
+                # Greedy-only folding: the hook argmaxed every row and kept no
+                # sampling buffers, so derive the params on the fly.
+                if sampling_info is None:
+                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+                else:
+                    temperatures = (
+                        sampling_info.temperatures.view(-1)
+                        .to(torch.float32)
+                        .clamp_min(1e-5)
+                    )
+                draft_block = DraftBlockResult(
+                    draft_tokens=draft_sampler.out[: bs * self.gamma].view(
+                        bs, self.gamma
+                    ),
+                    corrected_logits=None,
+                    greedy_mask=resolve_greedy_mask(
+                        bs=bs, sampling_info=sampling_info, device=device
+                    ),
+                    temperatures=temperatures,
+                )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
@@ -367,6 +516,8 @@ class DraftBlockProposer:
         bs: int,
         device: str,
         embed_module,
+        draft_sampler=None,
+        sampling_info=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
         prefix_lens = batch.seq_lens
@@ -411,6 +562,13 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if (
+            draft_sampler is not None
+            and graph_runner is not None
+            and graph_runner.can_run_graph(draft_forward_batch)
+        ):
+            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output

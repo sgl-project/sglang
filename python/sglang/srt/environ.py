@@ -226,6 +226,21 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class DsparkFoldedSampling(IntEnum):
+    """Whether the graph-folded DSpark draft sampler supports sampling rows.
+
+    OFF: greedy-only folding; sampling batches take the eager proposal path.
+    AUTO: enable sampling support when the static noise/logits buffers fit in
+    the free GPU memory left after target init (leaving the same 1 GB floor
+    the draft-graph capture requires); otherwise fall back to greedy-only.
+    FORCE: always allocate the sampling buffers.
+    """
+
+    OFF = 0
+    AUTO = 1
+    FORCE = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
@@ -326,6 +341,7 @@ class Envs:
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
+    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
