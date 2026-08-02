@@ -31,19 +31,6 @@ def _make_inputs(batch_size: int, seq_len: int, k: int):
     return scores, seq_lens, page_table, out
 
 
-def _make_p1_table(batch_size: int, seq_len: int):
-    # flashinfer / torch do a per-token (page_size=1) gather, so they need a
-    # (batch, seq) table (one entry per position) rather than the page-size-64 one.
-    src_page_table = (
-        torch.arange(seq_len, dtype=torch.int32, device="cuda")
-        .unsqueeze(0)
-        .expand(batch_size, -1)
-        .contiguous()
-    )
-    lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
-    return src_page_table, lengths
-
-
 def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
     scores, seq_lens, page_table, out = _make_inputs(batch_size, seq_len, k)
     N = PAGE_SIZE
@@ -58,15 +45,23 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
         elif provider == "flashinfer":
             from flashinfer import top_k_page_table_transform
 
-            return top_k_page_table_transform(scores, page_table, seq_lens, k)
+            return top_k_page_table_transform(
+                scores,
+                page_table,
+                seq_lens,
+                k,
+                dsa_graph_safe=True,
+                page_size=N,
+                out=out,
+            )
         elif provider == "torch":
-            idx = scores.topk(k, dim=-1).indices  # (batch, k) int64
-            return torch.gather(page_table, 1, idx)
+            raw_indices = scores.topk(k, dim=-1).indices
+            physical_pages = torch.gather(page_table, 1, raw_indices // N)
+            out.copy_(physical_pages * N + raw_indices % N)
+            return out
         else:
             raise ValueError(f"unknown provider {provider}")
 
-    if provider in ("flashinfer", "torch"):
-        page_table, seq_lens = _make_p1_table(batch_size, seq_len)
     if provider == "jit_v2":
         metadata = plan_topk_v2(seq_lens)
     return fn, (scores, seq_lens, page_table)
