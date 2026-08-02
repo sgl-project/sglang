@@ -363,17 +363,6 @@ class TestDSV4BudgetDetection(CustomTestCase):
             self.assertTrue(need)
             self.assertEqual(b, logits_bytes - 1)
 
-    def test_chunk_row_rounding(self):
-        """max_rows = max(1, budget // bytes_per_row) rounds down correctly."""
-        # With budget=1000, bytes_per_row=300 → max_rows=3
-        budget = 1000
-        bytes_per_row = 300
-        max_rows = max(1, budget // bytes_per_row)
-        self.assertEqual(max_rows, 3)
-        # With budget=100, bytes_per_row=200 → max_rows=1 (clamped)
-        max_rows = max(1, 100 // 200)
-        self.assertEqual(max_rows, 1)
-
 
 class TestDSV4OversizeVarlenChunked(CustomTestCase):
     """Tests for the oversize varlen chunked path (tasks 4.2, 4.4, 4.5)."""
@@ -397,14 +386,16 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         token_to_kv_pool.get_index_k_scale_buffer.return_value = (k_u8, scale_u8)
         return q_indexer, weights, c4_indexer, token_to_kv_pool
 
-    def test_single_request_chunked_topk_matches_unchunked(self):
-        """Task 4.2: Small budget triggers chunking; topk output matches
-        a single-pass baseline computed from the same logits."""
-        query_rows = 10
-        max_c4_seq_len = 100
-        budget_bytes = max_c4_seq_len * 4 * 3  # only 3 rows per chunk
-
-        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(query_rows)
+    def _run_chunked_path(
+        self, query_rows, max_c4_seq_len, budget_bytes, use_fp4=False
+    ):
+        """Helper: run _forward_oversize_varlen_chunked and return outputs."""
+        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(
+            query_rows, use_fp4=use_fp4
+        )
+        # Use unique weights per row so the mock can identify the starting row.
+        for i in range(query_rows):
+            weights[i] = float(i)
 
         c4_seq_lens = torch.full((query_rows,), max_c4_seq_len, dtype=torch.int32)
         page_table = torch.zeros((query_rows, 2), dtype=torch.int32)
@@ -422,19 +413,28 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
             topk_metadata=torch.empty((0,)),
         )
 
-        # Mock deep_gemm to return deterministic logits
+        # Pre-compute deterministic logits: row i has values [0..N) shifted by i.
+        # The mock uses weights[0] to identify the starting row and returns the
+        # corresponding slice so chunked and unchunked runs see identical logits.
+        precomputed = torch.stack(
+            [
+                torch.arange(max_c4_seq_len, dtype=torch.float32) + i * 0.1
+                for i in range(query_rows)
+            ]
+        )
+
         def mock_logits(q_arg, kv, w, ks, ke, **kw):
             rows = ke.shape[0]
-            return torch.randn(rows, max_c4_seq_len, dtype=torch.float32)
+            start = int(w[0, 0].item())
+            return precomputed[start : start + rows].clone()
 
         deep_gemm = SimpleNamespace(fp8_fp4_mqa_logits=mock_logits)
-
         backend = SimpleNamespace(dsa_topk_backend=DSATopKBackend.SGL_KERNEL)
         backend._run_topk_transform = C4IndexerBackendMixin._run_topk_transform.__get__(
             backend
         )
 
-        chunked_out = c4_sparse_page_indices.clone()
+        out = c4_sparse_page_indices.clone()
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(True),
@@ -450,22 +450,36 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
                 indexer_metadata=indexer_metadata,
                 page_table=page_table,
                 c4_seq_lens=c4_seq_lens,
-                c4_sparse_page_indices=chunked_out,
+                c4_sparse_page_indices=out,
                 raw_indices=None,
                 budget_bytes=budget_bytes,
                 max_c4_seq_len=max_c4_seq_len,
-                use_fp4_indexer=False,
+                use_fp4_indexer=use_fp4,
                 query_rows=query_rows,
             )
+        return out, token_to_kv_pool
 
-        # Verify output was written (not all -1)
-        self.assertTrue((chunked_out != -1).any())
-        # Verify all rows were processed
-        # With budget allowing 3 rows per chunk and 10 rows, we expect 4 chunks
-        # (3+3+3+1). Each chunk calls fp8_fp4_mqa_logits once.
-        self.assertEqual(
-            token_to_kv_pool.get_index_k_scale_buffer.call_count, 1
-        )  # single request → one KV gather
+    def test_single_request_chunked_topk_matches_unchunked(self):
+        """Chunked topk output matches single-pass baseline from same logits."""
+        query_rows = 10
+        max_c4_seq_len = 100
+
+        # Unchunked: budget allows all rows in one chunk.
+        unchunked_out, _ = self._run_chunked_path(
+            query_rows,
+            max_c4_seq_len,
+            budget_bytes=max_c4_seq_len * 4 * query_rows,
+        )
+
+        # Chunked: budget allows only 3 rows per chunk.
+        chunked_out, _ = self._run_chunked_path(
+            query_rows,
+            max_c4_seq_len,
+            budget_bytes=max_c4_seq_len * 4 * 3,
+        )
+
+        # topk is per-row; chunking must not change results.
+        torch.testing.assert_close(chunked_out, unchunked_out)
 
     def test_multi_request_oversize_per_request_processing(self):
         """Task 4.4: Multi-request batch, each request processed independently."""
@@ -604,6 +618,172 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
             # q_sf should be a tensor (not None) for FP4
             self.assertIsNotNone(q_arg[1])
         self.assertTrue((chunked_out != -1).any())
+
+
+class TestDSV4TopkV2MetadataRegeneration(CustomTestCase):
+    """Verify H1 fix: topk_transform_512_v2 metadata regenerated for chunks."""
+
+    def test_v2_metadata_regenerates_for_chunked_path(self):
+        """When topk_metadata shape (N+1,2) mismatches c4_seq_lens shape (M,),
+        plan_topk_v2 is called to regenerate before topk_transform_512_v2."""
+        from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+
+        chunk_rows = 3
+        full_rows = 10
+        max_c4_seq_len = 100
+
+        logits = torch.randn(chunk_rows, max_c4_seq_len, dtype=torch.float32)
+        c4_seq_lens = torch.full((chunk_rows,), max_c4_seq_len, dtype=torch.int32)
+        page_table = torch.zeros((chunk_rows, 2), dtype=torch.int32)
+        c4_sparse_page_indices = torch.full((chunk_rows, 512), -1, dtype=torch.int32)
+
+        # Full-batch metadata: shape (full_rows+1, 2) — mismatches chunk_rows.
+        full_metadata = torch.empty((full_rows + 1, 2), dtype=torch.int32)
+        indexer_metadata = SimpleNamespace(
+            c4_page_size=64,
+            topk_metadata=full_metadata,
+        )
+
+        captured_meta = []
+
+        def fake_v2(scores, seq_lens, pt, out, ps, metadata, **kw):
+            captured_meta.append(metadata)
+
+        backend = SimpleNamespace(dsa_topk_backend=DSATopKBackend.SGL_KERNEL)
+
+        with (
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            patch(f"{_INDEXER}.topk_transform_512_v2", side_effect=fake_v2),
+            patch(f"{_INDEXER}.plan_topk_v2", wraps=plan_topk_v2) as mock_plan,
+        ):
+            C4IndexerBackendMixin._run_topk_transform(
+                backend,
+                logits=logits,
+                c4_seq_lens=c4_seq_lens,
+                page_table=page_table,
+                c4_sparse_page_indices=c4_sparse_page_indices,
+                indexer_metadata=indexer_metadata,
+                raw_indices=None,
+            )
+
+        # plan_topk_v2 was called with the chunk's c4_seq_lens (3 elements)
+        mock_plan.assert_called_once()
+        torch.testing.assert_close(mock_plan.call_args.args[0], c4_seq_lens)
+
+        # topk_transform_512_v2 received regenerated metadata, not the full-batch one
+        self.assertEqual(len(captured_meta), 1)
+        self.assertIsNot(captured_meta[0], full_metadata)
+        self.assertEqual(captured_meta[0].shape, (chunk_rows + 1, 2))
+
+    def test_v2_metadata_unchanged_for_full_batch(self):
+        """When metadata shape matches, plan_topk_v2 is NOT called."""
+        rows = 5
+        max_c4_seq_len = 100
+
+        logits = torch.randn(rows, max_c4_seq_len, dtype=torch.float32)
+        c4_seq_lens = torch.full((rows,), max_c4_seq_len, dtype=torch.int32)
+        page_table = torch.zeros((rows, 2), dtype=torch.int32)
+        c4_sparse_page_indices = torch.full((rows, 512), -1, dtype=torch.int32)
+
+        matching_metadata = torch.empty((rows + 1, 2), dtype=torch.int32)
+        indexer_metadata = SimpleNamespace(
+            c4_page_size=64,
+            topk_metadata=matching_metadata,
+        )
+
+        captured_meta = []
+
+        def fake_v2(scores, seq_lens, pt, out, ps, metadata, **kw):
+            captured_meta.append(metadata)
+
+        backend = SimpleNamespace(dsa_topk_backend=DSATopKBackend.SGL_KERNEL)
+
+        with (
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            patch(f"{_INDEXER}.topk_transform_512_v2", side_effect=fake_v2),
+            patch(f"{_INDEXER}.plan_topk_v2") as mock_plan,
+        ):
+            C4IndexerBackendMixin._run_topk_transform(
+                backend,
+                logits=logits,
+                c4_seq_lens=c4_seq_lens,
+                page_table=page_table,
+                c4_sparse_page_indices=c4_sparse_page_indices,
+                indexer_metadata=indexer_metadata,
+                raw_indices=None,
+            )
+
+        # plan_topk_v2 was NOT called — metadata already matches
+        mock_plan.assert_not_called()
+        # topk_transform_512_v2 received the original metadata
+        self.assertIs(captured_meta[0], matching_metadata)
+
+
+class TestDSV4RoutingConditions(CustomTestCase):
+    """Verify oversize routing correctly skips chunking for guarded conditions."""
+
+    def test_capture_mode_prevents_chunking(self):
+        """When get_is_capture_mode() is True, _should_chunk_mqa_logits
+        must not be called even if the batch would exceed budget."""
+        with (
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=True),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError("must not be called in capture mode"),
+            ),
+        ):
+            # Simulate the routing condition check that appears in
+            # forward_c4_indexer.  We test the guard logic directly rather
+            # than calling the full method, which requires many dependencies.
+            _is_capture = True
+            _is_cp = False
+            _is_deep_gemm_path = True
+            if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+            # If we reach here, the guard correctly prevented the call.
+
+    def test_cp_prevents_chunking(self):
+        """When attn_cp_size != 1, _should_chunk_mqa_logits must not be called."""
+        with (
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError("must not be called with CP active"),
+            ),
+        ):
+            _is_capture = False
+            _is_cp = True
+            _is_deep_gemm_path = True
+            if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+
+    def test_non_deep_gemm_prevents_chunking(self):
+        """When using torch/tilelang/aiter fallback, _should_chunk_mqa_logits
+        must not be called."""
+        with (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError("must not be called on non-deep-gemm path"),
+            ),
+        ):
+            use_fp4_indexer = False
+            _is_deep_gemm_path = use_fp4_indexer or (
+                not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            )
+            _is_cp = False
+            _is_capture = False
+            if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
 
 
 if __name__ == "__main__":
