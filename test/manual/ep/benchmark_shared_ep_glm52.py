@@ -34,6 +34,13 @@ def main() -> None:
         "SGLANG_SHARED_EP_BENCHMARK_OUTPUT",
         f"/tmp/glm52-{backend}-batch64.jsonl",
     )
+    num_prompts = os.environ.get("SGLANG_SHARED_EP_NUM_PROMPTS", "64")
+    input_len = os.environ.get("SGLANG_SHARED_EP_INPUT_LEN", "8192")
+    output_len = os.environ.get("SGLANG_SHARED_EP_OUTPUT_LEN", "1024")
+    concurrency = os.environ.get("SGLANG_SHARED_EP_CONCURRENCY", "64")
+    warmup_requests = os.environ.get("SGLANG_SHARED_EP_WARMUP_REQUESTS", "1")
+    profile_enabled = os.environ.get("SGLANG_SHARED_EP_PROFILE", "0") == "1"
+    profile_steps = os.environ.get("SGLANG_SHARED_EP_PROFILE_STEPS", "4")
     os.environ.setdefault("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
     os.environ.setdefault("SGLANG_USE_AITER", "1")
 
@@ -130,17 +137,17 @@ def main() -> None:
             "--tokenizer",
             model,
             "--num-prompts",
-            "64",
+            num_prompts,
             "--random-input-len",
-            "8192",
+            input_len,
             "--random-output-len",
-            "1024",
+            output_len,
             "--random-range-ratio",
             "1.0",
             "--request-rate",
             "inf",
             "--max-concurrency",
-            "64",
+            concurrency,
             "--output-file",
             output_file,
             "--output-details",
@@ -151,10 +158,27 @@ def main() -> None:
             "20260730",
             "--flush-cache",
             "--warmup-requests",
-            "1",
+            warmup_requests,
             "--tokenize-prompt",
             "--cache-report",
         ]
+        if profile_enabled:
+            command.extend(
+                [
+                    "--profile",
+                    "--profile-by-stage",
+                    "--profile-num-steps",
+                    profile_steps,
+                    "--profile-stages",
+                    "prefill",
+                    "decode",
+                    "--profile-activities",
+                    "CPU",
+                    "GPU",
+                    "--profile-prefix",
+                    backend,
+                ]
+            )
         print(f"Running aligned GLM-5.2 benchmark: backend={backend}")
         print(" ".join(command))
         subprocess.run(command, check=True, timeout=7200)
