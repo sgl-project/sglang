@@ -25,6 +25,7 @@ from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_scale_shift_bf16_,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
@@ -46,6 +47,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -760,18 +762,27 @@ class MiniMaxH3AdalnProj(nn.Module):
             arch.time_embed_dim,
             out_features,
             bias=True,
-            gather_output=True,
+            gather_output=False,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
 
-    def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
+    def project_local(self, adaln_input: torch.Tensor) -> torch.Tensor:
         x, _ = self.linear(adaln_input)
+        return x
+
+    def split_output(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         m = x.shape[0]
         x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
         return tuple(x.chunk(self.expand_ratio, dim=-1))
+
+    def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
+        x = self.project_local(adaln_input)
+        if get_tp_world_size() > 1:
+            x = tensor_model_parallel_all_gather(x)
+        return self.split_output(x)
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -892,6 +903,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
         ulysses_active: bool = False,
+        adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -900,14 +912,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaln_proj(adaln_input)
+        if adaln_params is None:
+            adaln_params = self.adaln_proj(adaln_input)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
 
         residual = x
         h = self.norm1(x)
@@ -1012,6 +1019,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
+
+    def _can_batch_block_adaln(self) -> bool:
+        return (
+            get_tp_world_size() > 1
+            and not torch.compiler.is_compiling()
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and not hasattr(self, "_sglang_cache_dit_adapter")
+            and not is_layerwise_offloaded_module(self)
+            and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+        )
 
     def _validate_tp_config(
         self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int
@@ -1594,10 +1611,20 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
+        block_adaln_params = None
+        if self._can_batch_block_adaln():
+            local_adaln = torch.stack(
+                [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
+            )
+            gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+            block_adaln_params = tuple(
+                block.adaln_proj.split_output(output)
+                for block, output in zip(self.blocks, gathered_adaln)
+            )
         # With Ulysses sequence parallelism, shard rows across the group for
         # the block stack. Attention trades sequence for heads internally;
         # everything else, including the final layer, is row-local.
-        for block in self.blocks:
+        for index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
                 adaln_input=adaln_input,
@@ -1607,6 +1634,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 cu_seqlens_host=cu_seqlens_host,
                 max_seqlen=max_seqlen,
                 ulysses_active=sp_ws > 1,
+                adaln_params=(
+                    None if block_adaln_params is None else block_adaln_params[index]
+                ),
             )
         video_logits, audio_logits = self.final_layer(
             hidden,
