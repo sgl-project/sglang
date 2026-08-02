@@ -3,9 +3,8 @@
 //! `data: {json}` … `[DONE]`, byte-compatible with Python
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
-//! tuples, cumulative vs incremental streams) lives here, as does
-//! generate-request submission (`submit`); the shared `AppState` lives in the
-//! parent `api_server` module.
+//! tuples, cumulative vs incremental streams) lives here; submission primitives
+//! live in the sibling `submit` module, and shared `AppState` in the parent.
 
 use std::convert::Infallible;
 
@@ -20,6 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::AppState;
@@ -28,7 +28,7 @@ use super::frame::{
     tag_value,
 };
 use super::guard::AbortGuard;
-use super::submit::{pre_submit_error, submit};
+use super::submit::{GenerationReceiver, pre_submit_error, submit, submit_all};
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
@@ -122,7 +122,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 
 /// `POST /generate` — the native generation endpoint. Splits the body
 /// into per-request payloads (a scalar body → one, a list body → a batch) and
-/// dispatches to the single or batch path; a malformed body is a 400 before
+/// dispatches by response mode and shape; a malformed body is a 400 before
 /// anything reaches the scheduler.
 ///
 /// The body is extracted as a `Result` so a deserialization failure is answered
@@ -145,59 +145,42 @@ async fn generate(
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
     let (payloads, is_batch) = match body.into_requests() {
-        Ok(v) => v,
+        Ok((payloads, is_batch)) => {
+            if !is_batch && payloads.len() != 1 {
+                return pre_submit_error(
+                    StatusCode::BAD_REQUEST,
+                    "non-batch request must produce exactly one request",
+                    stream,
+                );
+            }
+            (payloads, is_batch)
+        }
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
-    if !is_batch {
-        // `into_requests` guarantees exactly one payload for a non-batch body.
-        let payload = payloads
-            .into_iter()
-            .next()
-            .expect("into_requests yields >=1 payload");
-        generate_single(&state, payload, stream).await
-    } else {
-        generate_batch(&state, payloads, stream).await
-    }
-}
-
-/// Answer an error raised *before* anything was submitted, in the shape the client
-/// asked for.
-///
-/// A single (non-batched) `/generate`: submit one request, then either stream its
-/// SSE frames or fold to one unary response.
-async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
-    // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
-    // `frame_value` just reads them — no tokenizer needed here.
-    let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
-    {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    // Abort on client disconnect: the guard fires when dropped before the request
-    // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
-    // `rid_str` is the response `meta_info.id`, reused for every frame.
-    let mut guard = AbortGuard::new(state.senders.clone(), rid_str.clone());
-    // Cumulative frames (SGLang default) vs per-step deltas.
-    let incremental = state.server_args.incremental_streaming_output;
-
     if stream {
-        // A single request is a 1-element batch without the `index` field — reuse
-        // the same stream so the frame/abort/truncation logic lives in one place.
-        use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx)], guard, incremental, false)
-            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        return generate_stream(&state, payloads, is_batch).await;
+    }
+
+    let results = match generate_unary(&state, payloads).await {
+        Ok(results) => results,
+        Err(response) => return response,
+    };
+    if is_batch {
+        let values = results.into_iter().map(|(_, value)| value).collect();
+        Json(Value::Array(values)).into_response()
     } else {
-        // Unary: fold to the terminal, respond once. Disarm only on a real terminal
-        // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
-        if terminal {
-            guard.disarm(&rid_str);
-        }
+        let Some((status, value)) = results.into_iter().next() else {
+            tracing::error!("non-batch generation returned no result");
+            return pre_submit_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation returned no result",
+                false,
+            );
+        };
         (status, Json(value)).into_response()
     }
 }
@@ -245,51 +228,47 @@ async fn drain_unary(
     )
 }
 
-/// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
-/// then either (unary) drain each in order into a JSON array, or (streaming)
-/// multiplex their streams into one SSE response, each frame carrying its `index`.
-/// One [`AbortGuard`] covers the batch. A failed unary item is its own
-/// `{ "error": … }` entry; the batch response is 200.
-pub(super) async fn generate_batch(
+/// Run one or more non-streaming generations to completion. Submit the entire
+/// set before draining, then return each final status/value in request order.
+/// Native scalar responses surface the status; native batch and Vertex callers
+/// return an overall 200 with item errors kept in-band.
+pub(super) async fn generate_unary(
     state: &AppState,
     requests: Vec<GenerateRequest>,
-    stream: bool,
-) -> Response {
-    // No cross-item rid collision to worry about: `into_requests` rejected duplicate
-    // rids within this batch, and `Rid::from_client` made each one unique against
-    // every other in-flight request.
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut receivers = Vec::with_capacity(requests.len());
-    for req in requests {
-        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
-            Ok((rid, rx)) => {
-                guard.arm(rid.clone());
-                receivers.push((rid, rx));
-            }
-            Err(resp) => return resp,
+) -> Result<Vec<(StatusCode, Value)>, Response> {
+    let submitted = submit_all(state, requests, false).await?;
+    let (receivers, mut guard) = submitted.into_parts();
+    let mut results = Vec::with_capacity(receivers.len());
+
+    for (rid, mut receiver) in receivers {
+        let (status, value, terminal) = drain_unary(&mut receiver, rid.client_facing()).await;
+        if terminal {
+            guard.disarm(&rid);
         }
+        results.push((status, value));
     }
 
-    if stream {
-        // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
-        // `guard` moves into the stream so a disconnect aborts what's unfinished.
-        use futures::StreamExt;
-        let incremental = state.server_args.incremental_streaming_output;
-        let s = generation_event_stream(receivers, guard, incremental, true)
-            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
-    } else {
-        // Unary: drain each in order (already all submitted, so they run together).
-        let mut results = Vec::with_capacity(receivers.len());
-        for (rid_str, mut rx) in receivers {
-            let (_status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
-            if terminal {
-                guard.disarm(&rid_str);
-            }
-            results.push(value);
-        }
-        (StatusCode::OK, Json(serde_json::Value::Array(results))).into_response()
-    }
+    Ok(results)
+}
+
+/// Submit and multiplex one or more generations into an SSE response. Batch
+/// streams tag every frame with its request index; a native scalar omits it.
+pub(super) async fn generate_stream(
+    state: &AppState,
+    requests: Vec<GenerateRequest>,
+    is_batch: bool,
+) -> Response {
+    let submitted = match submit_all(state, requests, true).await {
+        Ok(submitted) => submitted,
+        Err(response) => return response,
+    };
+    let (receivers, guard) = submitted.into_parts();
+    let incremental = state.server_args.incremental_streaming_output;
+
+    use futures::StreamExt;
+    let stream = generation_event_stream(receivers, guard, incremental, is_batch)
+        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+    Sse::new(stream).into_response()
 }
 
 /// Await the next item from `rx`, then drain whatever queued behind it (so the caller
@@ -314,7 +293,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>)>,
+    receivers: Vec<GenerationReceiver>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -396,8 +375,11 @@ fn generation_event_stream(
 mod tests {
     use super::*;
     use crate::message::ChunkEvent;
-    use crate::tokenizer_manager::Senders;
+    use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
+    use axum::body::to_bytes;
     use futures::StreamExt;
+    use std::sync::{Arc, atomic::AtomicU64};
+
     fn senders() -> Senders {
         Senders {
             tm: flume::unbounded().0,
@@ -405,6 +387,37 @@ mod tests {
             tok: flume::unbounded().0,
             detok: vec![],
         }
+    }
+
+    fn state() -> (
+        AppState,
+        flume::Receiver<TmEvent>,
+        flume::Receiver<AbortSource>,
+    ) {
+        let (tm, tm_rx) = flume::unbounded();
+        let (abort, abort_rx) = flume::unbounded();
+        (
+            AppState {
+                senders: Senders {
+                    tm,
+                    abort,
+                    tok: flume::unbounded().0,
+                    detok: vec![],
+                },
+                egress_buf: 8,
+                server_args: Arc::new(
+                    crate::runtime::ServerArgs::from_json(r#"{"model_path": "/m"}"#).unwrap(),
+                ),
+                egress_activity: Arc::new(AtomicU64::new(0)),
+            },
+            tm_rx,
+            abort_rx,
+        )
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     fn frame(rid: u64, text: &str) -> EgressItem {
@@ -430,6 +443,99 @@ mod tests {
     }
     fn parse(s: &str) -> serde_json::Value {
         serde_json::from_str(s).expect("frame is JSON")
+    }
+
+    #[tokio::test]
+    async fn native_unary_single_surfaces_terminal_error_status() {
+        let (state, tm_rx, abort_rx) = state();
+        let backend = tokio::spawn(async move {
+            let TmEvent::Ingress(request) = tm_rx.recv_async().await.unwrap() else {
+                panic!("generation must enter through the TM inbox");
+            };
+            request
+                .sink
+                .try_send(EgressItem::Error(crate::error::Error::Validation(
+                    "bad request".into(),
+                )))
+                .unwrap();
+        });
+        let body =
+            serde_json::from_value::<GenerateBody>(serde_json::json!({"text": "hello"})).unwrap();
+
+        let response = generate(State(state), Ok(Json(body))).await;
+        backend.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"]["code"], 400);
+        assert!(
+            abort_rx.try_recv().is_err(),
+            "a terminal error must disarm its request"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_unary_batch_keeps_item_errors_in_band_and_ordered() {
+        let (state, tm_rx, abort_rx) = state();
+        let backend = tokio::spawn(async move {
+            for (index, expected_text) in ["bad", "good"].into_iter().enumerate() {
+                let TmEvent::Ingress(request) = tm_rx.recv_async().await.unwrap() else {
+                    panic!("generation must enter through the TM inbox");
+                };
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("expected a generate request");
+                };
+                assert_eq!(generate.text.as_deref(), Some(expected_text));
+                let item = if index == 0 {
+                    EgressItem::Error(crate::error::Error::Validation("bad request".into()))
+                } else {
+                    EgressItem::Done(ChunkEvent {
+                        text: "ok".into(),
+                        completion_tokens: 1,
+                        ..Default::default()
+                    })
+                };
+                request.sink.try_send(item).unwrap();
+            }
+        });
+        let body = serde_json::from_value::<GenerateBody>(serde_json::json!({
+            "text": ["bad", "good"]
+        }))
+        .unwrap();
+
+        let response = generate(State(state), Ok(Json(body))).await;
+        backend.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["error"]["code"], 400);
+        assert_eq!(body[1]["text"], "ok");
+        assert!(abort_rx.try_recv().is_err(), "both items terminated");
+    }
+
+    #[tokio::test]
+    async fn unary_truncation_keeps_the_request_armed() {
+        let (state, tm_rx, abort_rx) = state();
+        let backend = tokio::spawn(async move {
+            let TmEvent::Ingress(request) = tm_rx.recv_async().await.unwrap() else {
+                panic!("generation must enter through the TM inbox");
+            };
+            drop(request);
+        });
+        let request = GenerateRequest {
+            rid: "truncated".into(),
+            text: Some("hello".into()),
+            ..Default::default()
+        };
+
+        let results = generate_unary(&state, vec![request]).await.unwrap();
+        backend.await.unwrap();
+
+        assert_eq!(results[0].0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(results[0].1["error"]["code"], 500);
+        assert!(matches!(
+            abort_rx.recv().unwrap(),
+            AbortSource::Guard(rid) if rid.client_facing() == "truncated"
+        ));
     }
 
     /// Two sub-requests' frames interleave into one stream, each tagged with its

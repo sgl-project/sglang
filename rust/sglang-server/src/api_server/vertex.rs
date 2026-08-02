@@ -1,24 +1,27 @@
 //! Vertex AI custom prediction endpoint.
 //!
 //! The Vertex wire envelope (`instances` + `parameters`) is translated into the
-//! protocol-neutral generation requests used by the native batch executor.
+//! protocol-neutral generation requests used by the shared native execution
+//! primitives.
 //! Successful unary output is wrapped in `{"predictions": ...}`; streaming
 //! responses pass through unchanged, matching the Python frontend.
 
 use axum::{
     Json, Router,
-    body::to_bytes,
     extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::{Deserialize, de::IgnoredAny};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    api_server::{AppState, native_api::generate_batch},
+    api_server::{
+        AppState,
+        native_api::{generate_stream, generate_unary},
+    },
     message::{GenerateBody, OneOrMany, TokenIds},
 };
 
@@ -51,6 +54,11 @@ struct VertexInstance {
     input_embeds: Option<Vec<IgnoredAny>>,
     #[serde(default)]
     image_data: Option<rmpv::Value>,
+}
+
+#[derive(Serialize)]
+struct VertexGenerateResponse {
+    predictions: Vec<Value>,
 }
 
 #[derive(Debug, Error)]
@@ -155,41 +163,6 @@ impl TryFrom<VertexGenerateRequest> for GenerateBody {
     }
 }
 
-/// Wrap a successful unary native result. Errors and SSE are already complete
-/// HTTP responses and must remain unwrapped, as in Python's `isinstance(ret,
-/// Response)` branch.
-async fn vertex_response(response: Response, stream: bool) -> Response {
-    if stream || !response.status().is_success() {
-        return response;
-    }
-
-    let (parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": error.to_string()}})),
-            )
-                .into_response();
-        }
-    };
-    let predictions = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => value,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": error.to_string()}})),
-            )
-                .into_response();
-        }
-    };
-
-    let mut response = Json(json!({"predictions": predictions})).into_response();
-    *response.status_mut() = parts.status;
-    response
-}
-
 async fn vertex_generate(
     State(state): State<AppState>,
     body: Result<Json<VertexGenerateRequest>, JsonRejection>,
@@ -201,7 +174,16 @@ async fn vertex_generate(
     let body = GenerateBody::try_from(body)?;
     let stream = body.stream;
     let (requests, _) = body.into_requests()?;
-    Ok(vertex_response(generate_batch(&state, requests, stream).await, stream).await)
+    if stream {
+        return Ok(generate_stream(&state, requests, true).await);
+    }
+
+    let results = match generate_unary(&state, requests).await {
+        Ok(results) => results,
+        Err(response) => return Ok(response),
+    };
+    let predictions = results.into_iter().map(|(_, value)| value).collect();
+    Ok(Json(VertexGenerateResponse { predictions }).into_response())
 }
 
 #[cfg(test)]
@@ -212,7 +194,7 @@ mod tests {
         tokenizer_manager::{Senders, TmEvent},
     };
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Method, Request},
     };
     use std::sync::{Arc, atomic::AtomicU64};
@@ -531,20 +513,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_and_error_responses_are_not_wrapped() {
-        let stream = Response::new(Body::from("event stream"));
-        let stream = vertex_response(stream, true).await;
-        assert_eq!(
-            to_bytes(stream.into_body(), usize::MAX).await.unwrap(),
-            "event stream"
-        );
+    async fn submit_errors_are_not_wrapped() {
+        let (app, tm_rx) = app_at(DEFAULT_PREDICT_ROUTE);
+        drop(tm_rx);
 
-        let error = (StatusCode::BAD_REQUEST, Json(json!({"error": "bad"}))).into_response();
-        let error = vertex_response(error, false).await;
-        let bytes = to_bytes(error.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap(),
-            json!({"error": "bad"})
-        );
+        let response = post_json(
+            app,
+            DEFAULT_PREDICT_ROUTE,
+            r#"{"instances":[{"text":"hello"}]}"#,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], 503);
+        assert!(body.get("predictions").is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_response_passes_through_with_batch_index() {
+        let (app, tm_rx) = app_at(DEFAULT_PREDICT_ROUTE);
+        let backend = tokio::spawn(async move {
+            let event = tm_rx.recv_async().await.unwrap();
+            let TmEvent::Ingress(request) = event else {
+                panic!("Vertex generation must enter through the TM inbox");
+            };
+            request
+                .sink
+                .try_send(EgressItem::Done(ChunkEvent {
+                    text: "done".to_string(),
+                    completion_tokens: 1,
+                    ..Default::default()
+                }))
+                .unwrap();
+        });
+
+        let response = post_json(
+            app,
+            DEFAULT_PREDICT_ROUTE,
+            r#"{
+                "instances": [{"text": "hello"}],
+                "parameters": {"stream": true}
+            }"#,
+        )
+        .await;
+        backend.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(r#""index":0"#));
+        assert!(!text.contains("predictions"));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
     }
 }
