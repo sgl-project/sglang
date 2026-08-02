@@ -48,8 +48,6 @@ numpy = { version = "0.29", optional = true }
 
 base64 = "0.22"
 blake3 = "1"
-# Safe POD slice casts (`TensorData::as_bytes`); no default features, no deps.
-bytemuck = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rayon = { version = "1.10", optional = true }

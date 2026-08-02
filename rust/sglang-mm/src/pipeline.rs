@@ -15,16 +15,6 @@ pub enum TensorData {
     I64(Vec<i64>),
 }
 
-impl TensorData {
-    /// Raw native-endian bytes, for content hashing and zero-copy handoff.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            TensorData::F32(v) => bytemuck::cast_slice(v),
-            TensorData::I64(v) => bytemuck::cast_slice(v),
-        }
-    }
-}
-
 pub struct Tensor {
     pub shape: Vec<usize>,
     pub data: TensorData,
@@ -56,10 +46,8 @@ pub enum Geometry {
 }
 
 /// One processed media item, mirroring Python's `MultimodalDataItem`: the
-/// primary feature tensor (its bytes are the item's identity — the driver
-/// hashes them, standing in for the Python path's `hash_feature`), named
-/// auxiliary tensors, and the geometry the family's own `layout`/`positions`
-/// hooks need.
+/// primary feature tensor, named auxiliary tensors, and the geometry the
+/// family's own `layout`/`positions` hooks need.
 pub struct ProcessedItem {
     /// The model's feature tensor for this item (qwen: `pixel_values`).
     pub feature: Tensor,

@@ -29,7 +29,7 @@ pub struct MmInput {
 pub struct OutputItem {
     pub feature: crate::pipeline::Tensor,
     pub aux: crate::pipeline::NamedTensors,
-    /// [`common::content_hash_u64`] of the feature tensor bytes — the same
+    /// [`common::content_hash_u64`] of the raw encoded source bytes — the same
     /// identity role as the Python path's `hash_feature`, but a different
     /// algorithm, so hashes are consistent within the server pipeline and
     /// never comparable across the two paths.
@@ -78,11 +78,11 @@ pub fn process(
         .collect::<Result<_, _>>()?;
     let processed: Vec<(ProcessedItem, u64)> =
         par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
+            let hash = common::content_hash_u64(bytes);
             // The Python (PIL) path decodes more formats (GIF/WebP/BMP, 16-bit
             // PNG); those error here and reject the request.
             let (rgb, height, width) = common::decode_rgb(bytes)?;
             let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
-            let hash = common::content_hash_u64(item.feature.data.as_bytes());
             Ok((item, hash))
         })?;
 
