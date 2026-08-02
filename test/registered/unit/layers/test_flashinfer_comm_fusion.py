@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
@@ -85,7 +86,7 @@ def _torch_allreduce_residual_rmsnorm_baseline(
     return norm_out, residual_out
 
 
-class TestFlashInferCommFusion(unittest.TestCase):
+class TestFlashInferCommFusion(CustomTestCase):
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
@@ -254,13 +255,11 @@ class TestFlashInferCommFusion(unittest.TestCase):
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
 
-# Stand-ins for the (device_group, cpu_group) pair a GroupCoordinator passes as
-# the workspace identity. Only object identity matters to the guard.
 _GROUP_KEY = ("device_group", "cpu_group")
 _OTHER_GROUP_KEY = ("other_device_group", "other_cpu_group")
 
 
-class TestFlashInferAllReduceOnly(unittest.TestCase):
+class TestFlashInferAllReduceOnly(CustomTestCase):
     def _make_manager(self, world_size, group_key=_GROUP_KEY):
         manager = fusion.FlashInferWorkspaceManager()
         manager.workspace = _FakeWorkspace(None, world_size)
@@ -269,11 +268,11 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         manager.group = group_key
         manager.max_token_num = 2048
         manager.hidden_dim = 4096
+        manager.dtype = torch.float32
         return manager
 
     @contextlib.contextmanager
     def _patched_attn_workspace(self, manager):
-        """Install `manager` as the attention-TP workspace with flashinfer faked."""
         from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
@@ -373,6 +372,22 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
                 self.assertTrue(self._can_use(torch.randn(8, 16)))
                 self.assertFalse(self._can_use(torch.randn(9, 16)))
 
+    def test_rejects_when_hidden_dim_exceeds_workspace_capacity(self):
+        manager = self._make_manager(4)
+        manager.hidden_dim = 16
+        with self._patched_attn_workspace(manager):
+            with patch.object(torch.compiler, "is_compiling", return_value=True):
+                self.assertTrue(self._can_use(torch.randn(8, 16)))
+                self.assertFalse(self._can_use(torch.randn(8, 17)))
+
+    def test_rejects_when_dtype_mismatches_workspace(self):
+        manager = self._make_manager(4)
+        manager.dtype = torch.bfloat16
+        with self._patched_attn_workspace(manager):
+            with patch.object(torch.compiler, "is_compiling", return_value=True):
+                self.assertTrue(self._can_use(torch.randn(8, 16, dtype=torch.bfloat16)))
+                self.assertFalse(self._can_use(torch.randn(8, 16, dtype=torch.float32)))
+
 
 class _FakeGroupCoordinator:
     def __init__(self, world_size):
@@ -380,7 +395,7 @@ class _FakeGroupCoordinator:
         self._fi_workspace_hint = None
 
 
-class TestTagGroupsForFlashInferAllReduceOnly(unittest.TestCase):
+class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
     """The MoE workspace rendezvouses on the EP group when moe_ep_size > 1 and
     on the MoE-TP group otherwise, so only that one group may be tagged."""
 

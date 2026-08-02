@@ -6,12 +6,12 @@ from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _fake_communicator():
-    """Minimal stand-in for the attributes should_fuse_mlp_allreduce_with_next_layer reads."""
     return types.SimpleNamespace(
         _speculative_algo=None,
         layer_scatter_modes=types.SimpleNamespace(mlp_mode=ScatterMode.TP_ATTN_FULL),
@@ -20,7 +20,7 @@ def _fake_communicator():
     )
 
 
-class TestFuseMlpAllReduceGate(unittest.TestCase):
+class TestFuseMlpAllReduceGate(CustomTestCase):
     """Hybrid EP+TP must not fuse the post-experts all-reduce away.
 
     The fused residual+LN reduces over a single group, but with moe_ep_size > 1
@@ -55,12 +55,9 @@ class TestFuseMlpAllReduceGate(unittest.TestCase):
         self.assertFalse(self._should_fuse(moe_ep_size=2, moe_tp_size=2))
 
     def test_pure_tp_still_fuses(self):
-        # moe_ep_size == 1: the whole post-experts reduction is the _MOE_TP one,
-        # so a single fused all-reduce does cover every peer.
         self.assertTrue(self._should_fuse(moe_ep_size=1, moe_tp_size=4))
 
     def test_pure_ep_still_fuses(self):
-        # moe_tp_size == 1: symmetric, the _MOE_EP reduce covers every peer.
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
 
 

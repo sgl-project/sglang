@@ -910,14 +910,17 @@ def can_use_flashinfer_allreduce(
     token_num, hidden_dim = input_.shape
     if torch.compiler.is_compiling():
         # Don't call into the flashinfer workspace object while tracing. The
-        # workspace was allocated for (max_token_num, hidden_dim) and vetted by
-        # is_buffer_size_sufficient() at init; the requirement is monotone in
-        # token_num, so staying within the allocation is sufficient here.
+        # workspace was allocated for (max_token_num, hidden_dim, dtype) and
+        # vetted by is_buffer_size_sufficient() at init; the requirement is
+        # monotone in token_num/hidden_dim, so staying within the allocation
+        # (including dtype) is a conservative stand-in here.
         return (
             workspace_manager.max_token_num is not None
             and workspace_manager.hidden_dim is not None
+            and workspace_manager.dtype is not None
             and token_num <= workspace_manager.max_token_num
             and hidden_dim <= workspace_manager.hidden_dim
+            and workspace_manager.dtype == input_.dtype
         )
 
     return workspace_manager.is_buffer_size_sufficient(
@@ -941,13 +944,7 @@ def flashinfer_allreduce(
     """
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
 
-    # Allocate the output rather than letting flashinfer do it, so the tensor
-    # the op returns is the one the fake impl describes.
     output = torch.empty_like(input_)
-
-    # Keep the numerics identical to the fused path: both default to
-    # fp32_acc=False, and flashinfer's own trigger_completion_at_end default is
-    # True, so it has to be passed explicitly (ignored by the mnnvl backend).
     kwargs = dict(
         input=input_,
         workspace=workspace_manager.workspace,

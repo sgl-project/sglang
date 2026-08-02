@@ -686,9 +686,6 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if torch.compiler.is_compiling():
-            # kAllReduce is a custom op, so it stays opaque to Dynamo and can be
-            # captured inside a piecewise CUDA graph. Applicability is resolved
-            # here, in plain Python, so nothing data-dependent leaks into the op.
             if self._can_use_flashinfer_allreduce(input_):
                 return flashinfer_allreduce(input_, group_name=self.unique_name)
 
