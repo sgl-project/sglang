@@ -192,7 +192,7 @@ jobs:
     needs: [set-image-config]
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 6
       matrix:
         test_config:
           # Performance test cases with an average execution time of no more than 1.5h
@@ -381,11 +381,9 @@ jobs:
     needs: [set-image-config, nightly-poc-single-node-tests-short-accuracy, nightly-poc-single-node-tests-short-performance]
     strategy:
       fail-fast: false
-      # Run up to 2 multi-node cases in parallel to cut the serial wall time
-      # (glm5_1 alone takes ~3h each). Requires the NPU cluster to have enough
-      # free resources for 2 concurrent multi-node deployments (glm5_1 uses
-      # 32 NPUs across prefill/decode/router nodes); tune per cluster capacity.
-      max-parallel: 2
+      # Multi-node cases must run strictly serially: the NPU cluster can only
+      # host one multi-node deployment at a time.
+      max-parallel: 1
       matrix:
         test_config:
           # glm5_1 performance tests
@@ -437,8 +435,8 @@ jobs:
     needs: [set-image-config, nightly-poc-single-node-tests-short-accuracy, nightly-poc-single-node-tests-short-performance, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
-      # Run up to 2 mix cases in parallel (kimi_k2_6 uses 2 nodes each).
-      max-parallel: 2
+      # Mix cases also run serially (kimi_k2_6 uses 2 nodes each).
+      max-parallel: 1
       matrix:
         test_config:
           # kimi_k2_6 performance tests
