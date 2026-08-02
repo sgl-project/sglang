@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_bac
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -1096,23 +1097,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ring_size=_ring_world_size(),
         )
 
-        self.video_patch_proj = ColumnParallelLinear(
+        # tp peers own the same Ulysses row shard; replicate these narrow
+        # projections instead of gathering their wide fp32 token outputs
+        self.video_patch_proj = ReplicatedLinear(
             arch.latents_dim
             * arch.patch_size[0]
             * arch.patch_size[1]
             * arch.patch_size[2],
             arch.hidden_size,
             bias=True,
-            gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ColumnParallelLinear(
+        self.audio_patch_proj = ReplicatedLinear(
             arch.audio_latents_dim,
             arch.hidden_size,
             bias=True,
-            gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
             prefix="audio_patch_proj",
