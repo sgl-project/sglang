@@ -255,6 +255,11 @@ def main():
         action="store_true",
         help="Only partition DiffusionTestCase parametrized cases.",
     )
+    parser.add_argument(
+        "--case-ids",
+        nargs="*",
+        help="Only schedule partitions containing these parametrized case IDs.",
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -284,6 +289,19 @@ def main():
         baseline_path,
     )
     validate_suite_case_coverage(suites)
+
+    requested_case_ids = set(args.case_ids or [])
+    if requested_case_ids:
+        known_case_ids = {
+            case.case_id
+            for suite_name, suite_info in suites.items()
+            if suite_name in SUITE_OUTPUT_NAMES
+            for case in suite_info.cases
+        }
+        unknown_case_ids = sorted(requested_case_ids - known_case_ids)
+        if unknown_case_ids:
+            print(f"Error: Unknown case IDs: {' '.join(unknown_case_ids)}")
+            sys.exit(1)
 
     print("=== Diffusion Partition Computation ===")
     print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")
@@ -316,7 +334,19 @@ def main():
         )
 
         output_name = SUITE_OUTPUT_NAMES[suite_name]
-        output_github_value(f"matrix-{output_name}", build_matrix(partition_count))
+        matrix = build_matrix(partition_count)
+        if requested_case_ids:
+            matrix = {
+                "include": [
+                    {"part": idx}
+                    for idx, partition in enumerate(partitions)
+                    if any(
+                        item.kind == "case" and item.item_id in requested_case_ids
+                        for item in partition
+                    )
+                ]
+            }
+        output_github_value(f"matrix-{output_name}", matrix)
         output_github_scalar(f"partition-count-{output_name}", str(partition_count))
         output_github_value(
             f"plan-{output_name}", build_partition_plan(suite_name, partitions)
