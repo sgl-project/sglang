@@ -33,13 +33,13 @@
 //! internal task-classification rendering and never appear on router traffic.
 //!
 //! Tokenization does not auto-prepend special tokens (the `dynamo_tokenizers`
-//! HF wrapper hardcodes `add_special_tokens = false`;
-//! [`super::adapter::encode`] adds none of its own), so the literal marker text
+//! HF wrapper defaults `add_special_tokens` to false and the router never
+//! overrides it; [`super::adapter::encode`] adds none of its own), so the literal marker text
 //! below is what maps to the special token ids. Pinned byte-exact against the
 //! live engine's `/tokenize` (DeepSeek-V4-Flash, snapshot `6976c7ff`):
 //! `[{user:"ABCD"}]` → `[0, 128803, 51453, 128804, 128822]`.
 
-use serde::Serialize;
+use super::pyjson::py_json;
 
 /// Beginning-of-sequence marker (token id 0).
 const BOS: &str = "<｜begin▁of▁sentence｜>";
@@ -796,65 +796,6 @@ fn canonical_function(tool: &serde_json::Value) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(m)
-}
-
-/// Serialize `value` the way Python's `json.dumps(v, ensure_ascii=False)` does:
-/// `", "` between elements/members and `": "` after each key (serde's compact
-/// form omits those spaces, changing the bytes the engine's block hashes key
-/// on). Key order and non-ASCII pass through unchanged (`ensure_ascii=False` +
-/// the crate's `preserve_order` feature).
-///
-/// CAVEAT: number formatting matches Python for the ints/floats/bools that
-/// appear in real tool schemas, but not universally — scientific-notation floats
-/// (`1e-5` renders `0.00001` here vs Python `1e-05`) and integers beyond f64's
-/// exact range diverge from Python's `repr`. Such a value in a tool schema would
-/// miss the exact cache match and degrade to min-load; none appear in observed
-/// (OpenCode) tool schemas, so this is left as a known edge rather than
-/// reimplementing Python float formatting.
-fn py_json(value: &serde_json::Value) -> String {
-    let mut buf = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, PyJsonFormatter);
-    value
-        .serialize(&mut serializer)
-        .expect("serializing a serde_json::Value into a Vec is infallible");
-    String::from_utf8(buf).expect("serde_json emits valid UTF-8")
-}
-
-/// serde_json formatter emitting Python `json.dumps` default separators
-/// (`", "` / `": "`) instead of serde's compact `,` / `:`.
-struct PyJsonFormatter;
-
-impl serde_json::ser::Formatter for PyJsonFormatter {
-    fn begin_array_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    fn begin_object_key<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-        first: bool,
-    ) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    fn begin_object_value<W: ?Sized + std::io::Write>(
-        &mut self,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        writer.write_all(b": ")
-    }
 }
 
 #[cfg(test)]

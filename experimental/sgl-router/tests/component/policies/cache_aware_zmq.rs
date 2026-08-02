@@ -118,6 +118,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             bootstrap_timeout_ms: 5_000,
+            ..Default::default()
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),

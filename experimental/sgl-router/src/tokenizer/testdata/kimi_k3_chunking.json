@@ -1,0 +1,12 @@
+{
+ "content_char": "x",
+ "content_count": 26000,
+ "tiny": {
+  "ids_len": 26240,
+  "ids_sha256": "bf20a4b892a7d6a1f170cef91b39c17a5b80b5078dd3dda3b6e3322a21474295"
+ },
+ "full": {
+  "ids_len": 3338,
+  "ids_sha256": "2d19269c55066e7252bb7f1561756c328cc8d4df016c49d932d439b7bc2bbcb3"
+ }
+}
