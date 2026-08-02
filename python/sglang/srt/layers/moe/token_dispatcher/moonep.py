@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, NamedTuple, NoReturn, Optional
 
 import torch
+import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -57,6 +60,230 @@ class MoonEPCombineInput(NamedTuple):
 
 
 assert isinstance(MoonEPCombineInput, CombineInput)
+
+
+@dataclass(frozen=True)
+class MoonEPBufferKey:
+    """Static MoonEP buffer dimensions.
+
+    MoonEP allocates its communication buffers from static shape parameters,
+    unlike DeepEP's normal-dispatch path.  Keep the dimensions explicit so the
+    process-wide facade never reuses a buffer with incompatible token capacity,
+    model shape, EP topology, or prefetch-slot layout.
+    """
+
+    num_max_dispatch_tokens_per_rank: int
+    hidden_size: int
+    router_topk: int
+    num_experts: int
+    num_ep_ranks: int
+    group_id: int
+    num_prefetch_slots: int
+    token_padding: int
+    num_sms: int
+
+
+class MoonEPBuffer:
+    """Process-wide facade for MoonEP communication buffers.
+
+    The underlying ``moonep.Buffer`` owns NVLink/VMM allocations and is keyed by
+    MoonEP's static allocation dimensions.  The state lives on
+    ``ctx.resources.buffers`` so tests can reset it with ``reset_context()`` and
+    future runtime code has one lifecycle hook per process.
+    """
+
+    @classmethod
+    def _state(cls):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        state = buffers.get("moonep_ep_state")
+        if state is None:
+            state = SimpleNamespace(
+                buffers={},
+                active_key=None,
+            )
+            buffers["moonep_ep_state"] = state
+        return state
+
+    @staticmethod
+    def _require_positive_int(name: str, value: int) -> int:
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        return value
+
+    @staticmethod
+    def _resolve_num_ep_ranks(group: dist.ProcessGroup) -> int:
+        try:
+            num_ep_ranks = dist.get_world_size(group=group)
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            group_size = getattr(group, "size", None)
+            if not callable(group_size):
+                raise
+            num_ep_ranks = group_size()
+        return MoonEPBuffer._require_positive_int("num_ep_ranks", int(num_ep_ranks))
+
+    @staticmethod
+    def _resolve_num_prefetch_slots(
+        num_prefetch_slots: int | None,
+        num_experts: int,
+        num_ep_ranks: int,
+    ) -> int:
+        if num_experts % num_ep_ranks != 0:
+            raise ValueError(
+                "MoonEP requires num_experts to be divisible by the EP group size: "
+                f"num_experts={num_experts}, num_ep_ranks={num_ep_ranks}"
+            )
+
+        if num_prefetch_slots is None:
+            num_prefetch_slots = envs.SGLANG_MOONEP_NUM_PREFETCH_SLOTS.get()
+        num_prefetch_slots = int(num_prefetch_slots)
+        if num_prefetch_slots <= 0:
+            return num_experts // num_ep_ranks
+        return MoonEPBuffer._require_positive_int(
+            "num_prefetch_slots", num_prefetch_slots
+        )
+
+    @classmethod
+    def build_key(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        router_topk: int,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int | None = None,
+        num_prefetch_slots: int | None = None,
+        token_padding: int | None = None,
+        num_sms: int | None = None,
+    ) -> MoonEPBufferKey:
+        if num_max_dispatch_tokens_per_rank is None:
+            num_max_dispatch_tokens_per_rank = (
+                envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        if token_padding is None:
+            token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
+        if num_sms is None:
+            num_sms = envs.SGLANG_MOONEP_NUM_SMS.get()
+
+        num_ep_ranks = cls._resolve_num_ep_ranks(group)
+        num_experts = cls._require_positive_int("num_experts", int(num_experts))
+        num_prefetch_slots = cls._resolve_num_prefetch_slots(
+            num_prefetch_slots,
+            num_experts,
+            num_ep_ranks,
+        )
+
+        return MoonEPBufferKey(
+            num_max_dispatch_tokens_per_rank=cls._require_positive_int(
+                "num_max_dispatch_tokens_per_rank",
+                int(num_max_dispatch_tokens_per_rank),
+            ),
+            hidden_size=cls._require_positive_int("hidden_size", int(hidden_size)),
+            router_topk=cls._require_positive_int("router_topk", int(router_topk)),
+            num_experts=num_experts,
+            num_ep_ranks=num_ep_ranks,
+            group_id=id(group),
+            num_prefetch_slots=num_prefetch_slots,
+            token_padding=cls._require_positive_int(
+                "token_padding", int(token_padding)
+            ),
+            num_sms=cls._require_positive_int("num_sms", int(num_sms)),
+        )
+
+    @classmethod
+    def get_existing_buffer(
+        cls,
+        key: MoonEPBufferKey | None = None,
+    ):
+        """Return an already-created buffer, if any.
+
+        Without a key this returns the most recently requested MoonEP buffer.
+        Future runtime code should pass an explicit key when multiple static
+        capacities are in play.
+        """
+
+        state = cls._state()
+        if key is None:
+            key = state.active_key
+        if key is None:
+            return None
+        return state.buffers.get(key)
+
+    @classmethod
+    def get_moonep_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        router_topk: int,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int | None = None,
+        num_prefetch_slots: int | None = None,
+        token_padding: int | None = None,
+        num_sms: int | None = None,
+    ):
+        key = cls.build_key(
+            group=group,
+            hidden_size=hidden_size,
+            router_topk=router_topk,
+            num_experts=num_experts,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            num_prefetch_slots=num_prefetch_slots,
+            token_padding=token_padding,
+            num_sms=num_sms,
+        )
+
+        state = cls._state()
+        buffer = state.buffers.get(key)
+        if buffer is not None:
+            state.active_key = key
+            return buffer
+
+        try:
+            from moonep import Buffer
+        except ImportError as exc:
+            raise ImportError(
+                "MoonEP is not installed. Install MoonEP before running SGLang "
+                "with --moe-a2a-backend moonep."
+            ) from exc
+
+        buffer = Buffer(
+            S=key.num_max_dispatch_tokens_per_rank,
+            H=key.hidden_size,
+            K=key.router_topk,
+            E=key.num_experts,
+            num_ep_ranks=key.num_ep_ranks,
+            num_sms=key.num_sms,
+            token_padding=key.token_padding,
+            B=key.num_prefetch_slots,
+            group=group,
+        )
+        state.buffers[key] = buffer
+        state.active_key = key
+        return buffer
+
+    @classmethod
+    def destroy_buffer(cls, key: MoonEPBufferKey | None = None) -> None:
+        state = cls._state()
+        if key is None:
+            key = state.active_key
+        if key is None:
+            return
+
+        buffer = state.buffers.pop(key, None)
+        destroy = getattr(buffer, "destroy", None)
+        if callable(destroy):
+            destroy()
+        if state.active_key == key:
+            state.active_key = next(reversed(state.buffers), None)
+
+    @classmethod
+    def destroy_all_buffers(cls) -> None:
+        state = cls._state()
+        for key in list(state.buffers):
+            cls.destroy_buffer(key)
+        state.active_key = None
 
 
 class MoonEPDispatcher(BaseDispatcher):
