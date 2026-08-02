@@ -71,11 +71,8 @@ pub fn process(
     // CPU workers other requests need for decode/resize. The server supplies
     // concurrency across requests, and its request shape is pre-fetched
     // `Bytes` anyway; give fetch its own I/O pool before ever fanning it out.
-    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = input
-        .images
-        .iter()
-        .map(resolve)
-        .collect::<Result<_, _>>()?;
+    let fetched: Vec<std::borrow::Cow<'_, [u8]>> =
+        input.images.iter().map(resolve).collect::<Result<_, _>>()?;
     let processed: Vec<(ProcessedItem, u64)> =
         par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
             let hash = common::content_hash_u64(bytes);
