@@ -63,12 +63,11 @@ that exact GPU model. Approximate load-time features such as online
 quantization are called out separately in the generated command. Sampling
 behavior such as Cache-DiT is documented separately below.
 
-The picker hides deployment rows when the selected hardware has no verified
-choice to make. **Deployment Profile** appears only on B200 and H100, where
-more than one topology was exercised. **Online Quantization** appears only on
-B200 and B300, the platforms with validated online-FP8 runs. H200, AMD, and
-RTX 5090 keep their fixed verified BF16/FP32 placement without showing a
-one-option selector.
+**Deployment Profile** exposes resident and FSDP placement on B200, B300,
+H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
+weight residency at the cost of per-block parameter collectives. **Online
+Quantization** appears only on B200 and B300. AMD keeps its resident AITER
+recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
@@ -86,9 +85,9 @@ same normal `sglang serve` path, prefix the copied command with
 `SGLANG_USE_MODELSCOPE=true` and replace the model path with
 `MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
 
-For a four-card H200 host, keep the full BF16/FP32 model resident. The model
-fits without FSDP, and avoiding per-block parameter all-gathers is the faster
-lossless configuration for this topology:
+For a four-card H200 host, keep the full BF16/FP32 model resident by default.
+The model fits without FSDP, so this path avoids the per-block parameter
+all-gathers of the memory-oriented FSDP profile:
 
 ```bash 4×H200 resident
 sglang serve \
@@ -651,23 +650,25 @@ real H3 validation runs.
 - The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Do not enable it: `--enable-cfg-parallel true` or `--cfg-parallel-size` greater than 1 is rejected instead of duplicating the positive branch. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
-- On multi-GPU launches with peer-to-peer access between the GPUs (single-node H100/H200/B200/B300), the default `--encoder-parallel auto` folds the text encoder over the otherwise idle world group, bitwise-identical to single-GPU encoding. This is separate from DiT tensor parallelism and does not require a separate `--tp-size`. On the verified PCIe-only 2× RTX 5090 host, `auto` keeps the encoder replicated instead, avoiding per-layer all-reduce over host-routed PCIe.
-- Keep the default `auto` for single-request latency. Explicit `--encoder-parallel dp` only helps a compatible multi-request batch (`--batching-max-size` greater than 1), provides no benefit for a batch of one, is not bitwise-identical to the folded deployment, and requires every rank to keep the full unsharded text encoder resident.
+- Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
+- For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
+- Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
 - `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
 ## 8. Benchmarks
 
-The picker exposes one exact verified recipe per selected profile. GPU counts
-are properties of those measured recipes, not a claim that every platform
-requires that many GPUs:
+The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
+counts are properties of the selected recipes, not a claim that every platform
+requires that many GPUs. The detailed tables below report performance only for
+the configurations with collected measurements:
 
-| Hardware | Picker recipe | Other measured topology |
+| Hardware | Default resident recipe | Other profile or topology |
 | --- | --- | --- |
-| B300 | 8× Ulysses8 resident | The 8-GPU sweep below is not a minimum-GPU claim. |
+| B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
-| H200 | 4× Ulysses4 resident | — |
+| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4 |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
@@ -702,6 +703,11 @@ sglang serve \
 The swept axes are `--model-variant` (`fl2va` / `ref2va`), `--quantization`
 (unset for BF16 / `fp8`), and `--encoder-parallel` (`auto` / `fold` /
 `replicate`). Nothing else differs between the 12 servers.
+
+This is a single-request latency sweep (`batching_max_size: 1`), so encoder DP
+is intentionally excluded: it cannot distribute a batch of one. Use the
+picker’s **DP (batched throughput)** option for a multi-request throughput
+deployment; the table below does not claim a measured H3 DP speedup.
 
 **Driver.**
 

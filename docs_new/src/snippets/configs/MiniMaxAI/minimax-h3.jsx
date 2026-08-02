@@ -30,13 +30,14 @@ export const config = {
     {
       id: "profile",
       title: "Deployment Profile",
-      showWhen: (s) => ["b200", "h100"].includes(s.hw),
+      showWhen: (s) => ["b200", "b300", "h200", "h100"].includes(s.hw),
       options: [
-        { id: "resident", label: "Resident (fastest)" },
+        { id: "resident", label: "Resident" },
         {
           id: "fsdp",
           label: "FSDP sharded",
-          showWhen: (s) => ["b200", "h100"].includes(s.hw),
+          showWhen: (s) =>
+            ["b200", "b300", "h200", "h100"].includes(s.hw),
         },
         {
           id: "offload",
@@ -149,10 +150,17 @@ export const config = {
       title: "Text Encoder Parallel",
       default: "auto",
       options: [
-        { id: "auto", label: "Auto (recommended)" },
+        {
+          id: "auto",
+          label: "Auto (recommended)",
+          hints: [
+            "Auto uses folding for the single-request recipes below and can",
+            "select data parallel encoding for a compatible TP1 request batch.",
+          ],
+        },
         {
           id: "fold",
-          label: "Fold",
+          label: "Fold (single-request)",
           flags: ["--encoder-parallel fold"],
           hints: [
             "Fold shards the resident Qwen3-VL encoder across the replica and is",
@@ -160,8 +168,25 @@ export const config = {
           ],
         },
         {
+          id: "dp",
+          label: "DP (batched throughput)",
+          disabled: (s) =>
+            s.hw === "rtx5090" ||
+            (s.hw === "h100" && s.profile === "resident"),
+          disableReason:
+            "Encoder DP requires TP1 and DiT DP1; this verified recipe uses TP2.",
+          flags: [
+            "--encoder-parallel dp",
+            "--batching-max-size {{BATCHING_MAX_SIZE}}",
+          ],
+          hints: [
+            "DP distributes a compatible multi-request text batch across ranks;",
+            "it does not improve a batch of one and replicates encoder weights.",
+          ],
+        },
+        {
           id: "replicate",
-          label: "Replicate",
+          label: "Replicate (compatibility)",
           flags: ["--encoder-parallel replicate"],
         },
       ],
@@ -207,6 +232,11 @@ export const config = {
       target: "curl",
       label: "Outputs per prompt (1-10)",
       default: "1",
+    },
+    BATCHING_MAX_SIZE: {
+      target: "command",
+      label: "Maximum request batch size",
+      default: "2",
     },
     DURATION_SECONDS: {
       target: "curl",
@@ -452,6 +482,38 @@ export const config = {
       ],
     },
     {
+      match: { hw: "b300", profile: "fsdp" },
+      nnodes: 1,
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--num-gpus 8",
+        "--ulysses-degree 8",
+        "--performance-mode speed",
+        "--use-fsdp-inference true",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+      warn:
+        "FSDP reduces resident DiT memory but adds per-block parameter collectives. Prefer Resident when the full pipeline fits.",
+    },
+    {
+      match: { hw: "h200", profile: "fsdp" },
+      nnodes: 1,
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--num-gpus 4",
+        "--ulysses-degree 4",
+        "--performance-mode speed",
+        "--use-fsdp-inference true",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+      warn:
+        "FSDP reduces resident DiT memory but adds per-block parameter collectives. Prefer Resident when the full pipeline fits.",
+    },
+    {
       match: { hw: "b200", profile: "fsdp" },
       nnodes: 1,
       verified: true,
@@ -465,7 +527,7 @@ export const config = {
         "--port {{PORT}}",
       ],
       warn:
-        "The verified 4-GPU FSDP path is lossless but slower than the 8-GPU resident recipe.",
+        "The 4-GPU FSDP path is lossless but slower than the 8-GPU resident recipe.",
     },
     {
       match: { hw: "h100", profile: "resident" },
@@ -497,7 +559,7 @@ export const config = {
         "--port {{PORT}}",
       ],
       warn:
-        "Verified capacity path on 4× H100 80 GB. Prefer the resident TP2 + Ulysses2 profile for latency.",
+        "Capacity path on 4× H100 80 GB. Prefer the resident TP2 + Ulysses2 profile for latency.",
     },
     {
       match: { hw: "mi300x", profile: "resident" },
