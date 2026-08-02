@@ -23,24 +23,24 @@ class HybridAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         prefill_backend: AttentionBackend,
         decode_backend: AttentionBackend,
+        verify_backend: Optional[AttentionBackend] = None,
     ):
         self.model_runner = model_runner
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        # Independent target_verify backend; falls back to the decode backend.
+        self.verify_backend = (
+            verify_backend if verify_backend is not None else decode_backend
+        )
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.spec_attn_is_decode = (
-            model_runner.server_args.speculative_attention_mode == "decode"
-        )
-        self.spec_attn_is_prefill = (
-            model_runner.server_args.speculative_attention_mode == "prefill"
-        )
-        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
-        # delegation the base-class default (True) forces a per-step seq_lens
-        # D2H + host sync even when both sub-backends opted out.
-        self.needs_cpu_seq_lens = (
-            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        # Backends the spec decode loop can route to: verify (target_verify) and
+        # decode (idle batches keep ForwardMode.IDLE). A prefill backend serves
+        # neither, so a host-plan prefill backend must not force the D2H.
+        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
+            model_runner.server_args.speculative_algorithm is not None
+            and self.verify_backend.needs_cpu_seq_lens
         )
         self.max_context_len = model_runner.model_config.context_len
 
@@ -48,25 +48,15 @@ class HybridAttnBackend(AttentionBackend):
         """
         Select the appropriate attention backend based on the forward mode.
 
-        Args:
-            forward_mode: The current forward mode indicating the operation type
-
-        Returns:
-            The selected attention backend (prefill or decode)
-
         Note:
-            - decode_or_idle: Always uses decode backend
-            - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
-            - prefill: Always uses prefill backend
+            - decode_or_idle: decode backend
+            - target_verify: verify backend
+            - prefill/extend: prefill backend
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
         elif forward_mode.is_target_verify():
-            return (
-                self.decode_backend
-                if self.spec_attn_is_decode
-                else self.prefill_backend
-            )
+            return self.verify_backend
         else:
             return self.prefill_backend
 
@@ -104,11 +94,10 @@ class HybridAttnBackend(AttentionBackend):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if (
             self.model_runner.server_args.speculative_algorithm is not None
-            and self.spec_attn_is_prefill
+            and self.verify_backend is not self.decode_backend
         ):
-            # When speculative decoding is enabled, we need to initialize the backend
-            # that will be used for target_verify.
-            self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+            # target_verify runs on a distinct backend; capture its graph too.
+            self.verify_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
@@ -189,11 +178,7 @@ class HybridAttnBackend(AttentionBackend):
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
-        if self.spec_attn_is_decode:
-            backend = self.decode_backend
-        else:
-            backend = self.prefill_backend
-        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+        return self.verify_backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
 
     def forward(
         self,

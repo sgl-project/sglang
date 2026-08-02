@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class ResolvedAttentionBackendStr(msgspec.Struct, frozen=True, kw_only=True):
     prefill: str
     decode: str
+    verify: str
     is_draft_override: bool = False
 
 
@@ -157,14 +158,20 @@ def _resolve_attention_backend_strs(
     draft_attn_backend = server_args.speculative_draft_attention_backend
     if is_draft_worker and draft_attn_backend:
         logger.warning(f"Overriding draft attention backend to {draft_attn_backend}.")
-        # Single backend for all draft modes (no prefill/decode split).
+        # Single backend for all draft modes (no prefill/decode/verify split).
         return ResolvedAttentionBackendStr(
             prefill=draft_attn_backend,
             decode=draft_attn_backend,
+            verify=draft_attn_backend,
             is_draft_override=True,
         )
     prefill, decode = server_args.get_attention_backends()
-    return ResolvedAttentionBackendStr(prefill=prefill, decode=decode)
+    # Independent target-verify backend. --verify-attention-backend names it;
+    # unset falls back to the deprecated --speculative-attention-mode routing.
+    verify = server_args.verify_attention_backend or (
+        prefill if server_args.speculative_attention_mode == "prefill" else decode
+    )
+    return ResolvedAttentionBackendStr(prefill=prefill, decode=decode, verify=verify)
 
 
 def _build_resolved_backend(
@@ -179,37 +186,42 @@ def _build_resolved_backend(
             backend_str=resolved.prefill,
             init_new_workspace=init_new_workspace,
         )
-    elif resolved.decode != resolved.prefill:
+    elif resolved.decode != resolved.prefill or resolved.verify != resolved.decode:
         from sglang.srt.layers.attention.hybrid_attn_backend import (
             HybridAttnBackend,
         )
 
-        # Compose the two full-attention backends first, then apply model-level
+        # Build one backend per unique backend string, then apply model-level
         # wrappers once.  Wrapping each child independently duplicates the
         # linear/sparse side backend for hybrid models (for example, two GDN
         # dispatchers for Qwen3.5 when prefill and decode use different MHA
         # backends), duplicating initialization and associated state while only
         # one side backend can be active in a forward pass.
+        _built: dict[str, AttentionBackend] = {}
+
+        def _build_once(backend_str: str) -> AttentionBackend:
+            if backend_str not in _built:
+                _built[backend_str] = _build_full_attention_backend_from_str(
+                    model_runner=model_runner,
+                    backend_str=backend_str,
+                    init_new_workspace=init_new_workspace,
+                )
+            return _built[backend_str]
+
         attn_backend = attn_backend_wrapper(
             model_runner,
             HybridAttnBackend(
                 model_runner=model_runner,
-                decode_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.decode,
-                    init_new_workspace=init_new_workspace,
-                ),
-                prefill_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.prefill,
-                    init_new_workspace=init_new_workspace,
-                ),
+                decode_backend=_build_once(resolved.decode),
+                prefill_backend=_build_once(resolved.prefill),
+                verify_backend=_build_once(resolved.verify),
             ),
         )
         logger.info(
-            f"Using hybrid attention backend for decode and prefill: "
+            f"Using hybrid attention backend: "
             f"decode_backend={resolved.decode}, "
-            f"prefill_backend={resolved.prefill}."
+            f"prefill_backend={resolved.prefill}, "
+            f"verify_backend={resolved.verify}."
         )
         logger.warning(
             "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
