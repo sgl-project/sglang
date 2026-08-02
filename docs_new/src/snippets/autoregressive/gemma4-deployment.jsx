@@ -33,6 +33,15 @@ export const Gemma4Deployment = () => {
         ];
       }
     },
+    multimodal: {
+      name: 'multimodal',
+      title: 'Multimodal Inputs',
+      items: [
+        { id: 'disabled', label: 'Disabled', subtitle: 'Text only', default: true },
+        { id: 'enabled', label: 'Enabled', subtitle: 'Image, video, and audio', default: false }
+      ],
+      commandRule: (value) => value === 'enabled' ? '--enable-multimodal' : null
+    },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',

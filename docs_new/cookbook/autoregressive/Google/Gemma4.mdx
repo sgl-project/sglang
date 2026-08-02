@@ -103,6 +103,7 @@ For other installation methods, please refer to the [official SGLang installatio
 
 ### 3.2 Configuration Tips
 
+- **Multimodal loading is opt-in**: Gemma 4 starts in text-only mode and does not load the vision or audio modules. Add `--enable-multimodal` to accept image, video, or audio inputs.
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
 - **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for text but applies *causal* attention to image tokens. For multimodal (image) workloads on B200, pass `--attention-backend triton` to restore bidirectional image-token attention and full vision quality. Text-only and audio workloads are unaffected by the default.
 - **Gemma 4 26B-A4B on B200**: Use `--mem-fraction-static 0.75` to leave workspace headroom for the Triton MoE path.
@@ -306,6 +307,8 @@ Protocol)** lies in how they prioritize data integrity versus speed.
 ### 4.2 Vision Input
 
 Gemma 4 multimodal variants accept images alongside text:
+
+<Note>Launch the server with `--enable-multimodal` before sending image, video, or audio inputs.</Note>
 
 ```python Example
 from openai import OpenAI
