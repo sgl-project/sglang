@@ -71,7 +71,7 @@ class OnlineC128MTPController:
             return False
         spec_alg = self.backend.model_runner.spec_algorithm
         if spec_alg.is_dspark():
-            return True
+            return envs.SGLANG_EXPERIMENTAL_ONLINE_C128_DSPARK.get()
         return (
             envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
             and spec_alg.is_eagle()

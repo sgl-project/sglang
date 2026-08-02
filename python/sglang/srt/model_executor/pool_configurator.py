@@ -679,7 +679,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Speculative online c128 writes each verified prefix into a separate
         # request-scoped bank, then commits only the accepted prefix.
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            from sglang.jit_kernel.dsv4.online_c128_mtp import (
+            from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
                 ONLINE_C128_MAX_VERIFY_TOKENS,
             )
 
@@ -687,7 +687,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
                 and kvc.spec_algorithm.is_eagle()
             )
-            allow_dspark = kvc.spec_algorithm.is_dspark()
+            allow_dspark = (
+                envs.SGLANG_EXPERIMENTAL_ONLINE_C128_DSPARK.get()
+                and kvc.spec_algorithm.is_dspark()
+            )
             assert (
                 kvc.spec_algorithm.is_none()
                 or allow_experimental_online_c128_mtp
@@ -695,7 +698,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             ), (
                 "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
                 "except DSpark and the experimental EAGLE topk=1 path gated by "
-                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_DSPARK=1 or "
+                "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1, respectively."
             )
             if allow_experimental_online_c128_mtp or allow_dspark:
                 assert self.online_c128_mtp_max_draft_tokens > 0, (

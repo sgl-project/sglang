@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4.online_c128_mtp import (
+from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
     _jit_online_c128_mtp_module,
 )
 from sglang.srt.utils import get_device
