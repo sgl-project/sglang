@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_serving,
 )
 from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -554,7 +555,7 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
         return
     # The pool's recycler counts the whole TP group, so the acknowledgement must
     # match that count even when an attention subgroup is smaller.
-    consumer_count = max(get_server_args().tp_size, 1)
+    consumer_count = max(parallel.tp_size, 1)
     for item in items:
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
@@ -2024,7 +2025,7 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
 
     if obj.mm_inputs:
@@ -2085,7 +2086,7 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):
