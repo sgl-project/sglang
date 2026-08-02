@@ -4426,7 +4426,11 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+        from sglang.srt.configs.model_config import (
+            is_deepseek_dsa,
+            is_deepseek_v4,
+            is_nemotron_h,
+        )
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4436,6 +4440,13 @@ class ServerArgs:
                 "MLA attention (non-DSA)",
                 lambda: self.use_mla_backend()
                 and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
+            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
+            # state-track write is not wired into the captured buffers, so a
+            # replay can commit a cache slot it never wrote.
+            (
+                "NemotronH (hybrid Mamba2 prefill)",
+                lambda: is_nemotron_h(self.get_model_config().hf_config),
             ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -6192,19 +6203,13 @@ class ServerArgs:
             hf_config = model_config.hf_config
             model_arch = hf_config.architectures[0]
             if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-                if getattr(hf_config, "index_share_for_mtp_iteration", False):
-                    # GLM 5.2 (DSA index-share MTP): CP-v2 is not ready for it
-                    # yet, so default the env to off and keep the legacy CP path.
-                    if not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(False)
-                else:
-                    is_dsa_default_model = is_deepseek_dsa(hf_config)
-                    # DSA CP-v2 currently supports only the interleave strategy.
-                    enable_default_cp_v2 = not is_dsa_default_model or (
-                        self.enable_prefill_cp and self.cp_strategy == "interleave"
-                    )
-                    if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(True)
+                is_dsa_default_model = is_deepseek_dsa(hf_config)
+                # DSA CP-v2 currently supports only the interleave strategy.
+                enable_default_cp_v2 = not is_dsa_default_model or (
+                    self.enable_prefill_cp and self.cp_strategy == "interleave"
+                )
+                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                    envs.SGLANG_ENABLE_CP_V2.set(True)
 
             if (
                 self.enable_prefill_cp
