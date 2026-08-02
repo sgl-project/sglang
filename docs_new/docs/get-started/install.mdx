@@ -25,6 +25,12 @@ pip install uv
 uv pip install --prerelease=allow sglang
 ```
 
+The standard install uses SGLang's vendored FA4 implementation and does not install the external `flash-attn-4` package. If you have configured SGLang to use the external pip FA4 implementation, install its dependency with:
+
+```bash Command
+uv pip install --prerelease=allow "sglang[fa4]"
+```
+
 The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 ```bash Command
 pip install --upgrade pip

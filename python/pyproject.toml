@@ -30,7 +30,6 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "helion==0.2.6",
@@ -99,6 +98,7 @@ default = true
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+fa4 = ["flash-attn-4>=4.0.0b18"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
@@ -176,6 +176,7 @@ dev = ["sglang[test]"]
 
 all = [
   "sglang[diffusion]",
+  "sglang[fa4]",
   "sglang[http2]",
   "sglang[tracing]",
 ]
