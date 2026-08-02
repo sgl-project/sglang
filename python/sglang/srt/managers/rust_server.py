@@ -43,6 +43,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Resolved parameters of the native Rust MM pipeline for one model —
+    the single carrier between :meth:`NativeMmHost.resolve_native_spec`
+    (launch time) and its two consumers: the Rust worker pool
+    (:meth:`rust_json`) and the drain adapter
+    (:meth:`NativeMmHost.build_native_mm`)."""
+
+    family: str
+    feature_shm: bool
+    image_token_id: int
+    patch_size: int
+    merge_size: int
+    temporal_patch_size: int
+    min_pixels: int
+    max_pixels: int
+    image_mean: Tuple[float, ...]
+    image_std: Tuple[float, ...]
+    # Drain-side only; never sent to Rust.
+    vision_start_token_id: Optional[int]
+    vision_end_token_id: Optional[int]
+    video_token_id: Optional[int]
+
+    @property
+    def feature_dim(self) -> int:
+        return 3 * self.temporal_patch_size * self.patch_size * self.patch_size
+
+    def rust_json(self) -> str:
+        """The subset `sglang_mm::registry::pipeline_from_spec` parses."""
+        import json
+
+        return json.dumps(
+            {
+                "family": self.family,
+                "feature_shm": self.feature_shm,
+                "image_token_id": self.image_token_id,
+                "patch_size": self.patch_size,
+                "merge_size": self.merge_size,
+                "temporal_patch_size": self.temporal_patch_size,
+                "min_pixels": self.min_pixels,
+                "max_pixels": self.max_pixels,
+                "image_mean": list(self.image_mean),
+                "image_std": list(self.image_std),
+            }
+        )
+
+
 class NativeMmHost:
     """Builds and validates the native Rust MM pipeline for one model.
 
@@ -94,19 +140,14 @@ class NativeMmHost:
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper(self.server_args)
-        # Set by resolve_native_spec() when the model family has a pure-Rust
-        # pipeline; consumed by build_native_mm (the drain-time adapter).
-        self._native: Optional[Dict[str, Any]] = None
 
-    def resolve_native_spec(self) -> Optional[str]:
-        """JSON spec for the Rust-native MM pipeline, or ``None`` when the
-        model has no native pipeline (the launch gate turns that into a hard
-        error). Only resolved settings are carried (patch geometry, pixel
-        limits, normalization, token ids) — never the HF config. Conservative
-        by design: any unrecognized knob disables the native path rather than
-        approximating it."""
-        import json
-
+    def resolve_native_spec(self) -> Optional[NativeMmSpec]:
+        """The [`NativeMmSpec`] for the Rust-native MM pipeline, or ``None``
+        when the model has no native pipeline (the launch gate turns that into
+        a hard error). Only resolved settings are carried (patch geometry,
+        pixel limits, normalization, token ids) — never the HF config.
+        Conservative by design: any unrecognized knob disables the native path
+        rather than approximating it."""
         from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
         from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
@@ -143,32 +184,25 @@ class NativeMmHost:
             "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
         )
         try:
-            spec = {
-                "family": "qwen_vl",
-                "feature_shm": self._use_feature_shm(),
-                "image_token_id": hf_config.image_token_id,
-                "patch_size": ip.patch_size,
-                "merge_size": ip.merge_size,
-                "temporal_patch_size": ip.temporal_patch_size,
-                "min_pixels": int(min_pixels),
-                "max_pixels": int(max_pixels),
-                "image_mean": [float(x) for x in ip.image_mean],
-                "image_std": [float(x) for x in ip.image_std],
-            }
+            spec = NativeMmSpec(
+                family="qwen_vl",
+                feature_shm=self._use_feature_shm(),
+                image_token_id=hf_config.image_token_id,
+                patch_size=ip.patch_size,
+                merge_size=ip.merge_size,
+                temporal_patch_size=ip.temporal_patch_size,
+                min_pixels=int(min_pixels),
+                max_pixels=int(max_pixels),
+                image_mean=tuple(float(x) for x in ip.image_mean),
+                image_std=tuple(float(x) for x in ip.image_std),
+                vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
+                vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
+                video_token_id=getattr(hf_config, "video_token_id", None),
+            )
         except (AttributeError, TypeError):  # missing/odd processor attrs
             return None
-        self._native = {
-            **spec,
-            "vision_start_token_id": getattr(hf_config, "vision_start_token_id", None),
-            "vision_end_token_id": getattr(hf_config, "vision_end_token_id", None),
-            "video_token_id": getattr(hf_config, "video_token_id", None),
-            "feature_dim": 3
-            * spec["temporal_patch_size"]
-            * spec["patch_size"]
-            * spec["patch_size"],
-        }
         logger.info("rust server: native MM pipeline enabled (family=qwen_vl)")
-        return json.dumps(spec)
+        return spec
 
     def _use_feature_shm(self) -> bool:
         """Park native feature buffers in POSIX shm instead of the sidecar.
@@ -195,7 +229,8 @@ class NativeMmHost:
             and not self.server_args.skip_tokenizer_init
         )
 
-    def build_native_mm(self, entry: tuple):
+    @staticmethod
+    def build_native_mm(spec: NativeMmSpec, entry: tuple):
         """Drain-time adapter: wrap the Rust-produced buffers into the
         scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
         here — all processing (load, resize, patchify, token expansion, M-RoPE)
@@ -215,12 +250,9 @@ class NativeMmHost:
             MultimodalProcessorOutput,
         )
 
-        native = self._native
         features_arr, shm_names, grids, hashes, offsets, mrope_arr, mrope_delta = entry
         if shm_names is None:
-            features = torch.from_numpy(
-                features_arr.reshape(-1, native["feature_dim"])
-            )
+            features = torch.from_numpy(features_arr.reshape(-1, spec.feature_dim))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
@@ -239,7 +271,7 @@ class NativeMmHost:
                 feature.__setstate__(
                     {
                         "shm_name": shm_names[index],
-                        "shape": (n, native["feature_dim"]),
+                        "shape": (n, spec.feature_dim),
                         "dtype": torch.float32,
                         "precomputed_hash": item_hash,
                     }
@@ -262,10 +294,10 @@ class NativeMmHost:
         mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
         return MultimodalProcessorOutput(
             mm_items=items,
-            im_token_id=native["image_token_id"],
-            im_start_id=native["vision_start_token_id"],
-            im_end_id=native["vision_end_token_id"],
-            video_token_id=native["video_token_id"],
+            im_token_id=spec.image_token_id,
+            im_start_id=spec.vision_start_token_id,
+            im_end_id=spec.vision_end_token_id,
+            video_token_id=spec.video_token_id,
             mrope_positions=mrope_positions,
             mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
         )
@@ -281,11 +313,11 @@ class RustServer:
     def __init__(
         self,
         server: Server,
-        mm_host: Optional[NativeMmHost] = None,
+        mm_spec: Optional[NativeMmSpec] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
-        self.mm_host = mm_host
+        self.mm_spec = mm_spec
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -341,7 +373,7 @@ class RustServer:
         # Python fallback. The host resolves/validates the spec from the same
         # processor stack the Python TokenizerManager would build; the Rust
         # worker pool then processes every mm request natively.
-        mm_host = None
+        mm_spec = None
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's CPU affinity, and this
             # launch thread still has the full mask here. Narrow it to the
@@ -362,15 +394,15 @@ class RustServer:
                 model_config=scheduler.model_config,
                 processor=scheduler.processor,
             )
-            spec = mm_host.resolve_native_spec()
-            if spec is None:
+            mm_spec = mm_host.resolve_native_spec()
+            if mm_spec is None:
                 raise RuntimeError(
                     "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
                     f"model_type={scheduler.model_config.hf_config.model_type!r} "
                     f"(supported: {', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
                 )
-            server.start_mm_workers(spec, mm_host.mm_workers)
+            server.start_mm_workers(mm_spec.rust_json(), mm_host.mm_workers)
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -391,7 +423,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_host=mm_host)
+        return cls(server, mm_spec=mm_spec)
 
     def wait_ingress(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -442,14 +474,14 @@ class RustServer:
                 ids.frombytes(ids_view[pos : pos + nbytes])
                 obj.input_ids = ids
                 pos += nbytes
-            if self.mm_host is not None and isinstance(obj, TokenizedGenerateReqInput):
+            if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
                 # Natively processed: the buffers rode a Rust sidecar (stored
                 # strictly before the ring push); wrap them into tensors here —
                 # the only Python step of the native path. `None` for text-only
                 # requests on a multimodal model.
                 native = self.server.take_mm(obj.rid)
                 if native is not None:
-                    obj.mm_inputs = self.mm_host.build_native_mm(native)
+                    obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
             out.append(obj)
         return out
 

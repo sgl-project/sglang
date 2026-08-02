@@ -57,11 +57,10 @@ class TestQwenNativeMmHost(CustomTestCase):
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
-        host._native = None
         return host, host.resolve_native_spec()
 
     def compare(self, sources):
-        host, spec = self.make_host()
+        _host, spec = self.make_host()
         self.assertIsNotNone(
             spec, "resolve_native_spec() rejected the fixture processor"
         )
@@ -69,10 +68,11 @@ class TestQwenNativeMmHost(CustomTestCase):
         input_ids = []
         for _ in sources:
             input_ids.extend((1, 2, 3, 4))
-        raw = DRIVER(input_ids, sources, spec)
+        raw = DRIVER(input_ids, sources, spec.rust_json())
         ids, features, grids, hashes, offsets, mrope, delta = raw
 
-        rust_output = host.build_native_mm(
+        rust_output = NativeMmHost.build_native_mm(
+            spec,
             # Inline entry shape (single-rank; `shm_names=None`). The shm
             # shape's wrapping contract is pinned by test_build_native_mm.
             (features, None, grids, hashes, offsets, mrope, delta)

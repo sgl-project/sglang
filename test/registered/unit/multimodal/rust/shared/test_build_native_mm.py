@@ -15,21 +15,29 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
+from sglang.srt.managers.rust_server import NativeMmHost, NativeMmSpec  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestBuildNativeMm(CustomTestCase):
     def setUp(self):
-        self.host = NativeMmHost.__new__(NativeMmHost)
-        self.host._native = {
-            "feature_dim": 6,
-            "image_token_id": 10,
-            "vision_start_token_id": 11,
-            "vision_end_token_id": 12,
-            "video_token_id": 13,
-        }
+        # feature_dim == 3 * temporal_patch_size * patch_size**2 == 6.
+        self.spec = NativeMmSpec(
+            family="qwen_vl",
+            feature_shm=False,
+            image_token_id=10,
+            patch_size=1,
+            merge_size=1,
+            temporal_patch_size=2,
+            min_pixels=1,
+            max_pixels=1 << 30,
+            image_mean=(0.0, 0.0, 0.0),
+            image_std=(1.0, 1.0, 1.0),
+            vision_start_token_id=11,
+            vision_end_token_id=12,
+            video_token_id=13,
+        )
 
     GRIDS = [(1, 2, 2), (1, 1, 1)]
     HASHES = [101, 202]
@@ -37,7 +45,8 @@ class TestBuildNativeMm(CustomTestCase):
 
     def build(self, shm_names=None):
         features = np.arange(30, dtype=np.float32)
-        output = self.host.build_native_mm(
+        output = NativeMmHost.build_native_mm(
+            self.spec,
             (
                 None if shm_names else features,
                 shm_names,
@@ -122,7 +131,8 @@ class TestBuildNativeMmShm(TestBuildNativeMm):
     def build(self, shm_names=None):
         features = np.arange(30, dtype=np.float32)
         names = self._park(features)
-        output = self.host.build_native_mm(
+        output = NativeMmHost.build_native_mm(
+            self.spec,
             (
                 None,
                 names,
