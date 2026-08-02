@@ -98,8 +98,7 @@ class TestQwenNativeMmHost(CustomTestCase):
         self.assertLess(diff.max(), 0.06)
         self.assertLess(diff.mean(), 1e-3)
 
-        # The native item hash is blake3 of the raw encoded source bytes
-        # (`sglang-mm` driver convention), not of the feature tensor.
+        # Native item hashes are of the raw encoded source bytes, not the feature.
         def raw_bytes(source):
             if isinstance(source, bytes):
                 return source

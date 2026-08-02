@@ -44,11 +44,9 @@ logger = logging.getLogger(__name__)
 
 
 class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
-    """Resolved parameters of the native Rust MM pipeline for one model —
-    the single carrier between :meth:`NativeMmHost.resolve_native_spec`
-    (launch time) and its two consumers: the Rust worker pool
-    (:meth:`rust_json`) and the drain adapter
-    (:meth:`NativeMmHost.build_native_mm`)."""
+    """Resolved parameters of the native Rust MM pipeline for one model,
+    consumed by the Rust worker pool (:meth:`rust_json`) and the drain
+    adapter (:meth:`NativeMmHost.build_native_mm`)."""
 
     family: str
     feature_shm: bool

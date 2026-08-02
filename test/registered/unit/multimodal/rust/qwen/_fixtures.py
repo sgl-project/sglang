@@ -62,8 +62,7 @@ def make_processor(config):
         vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=2),
     )
     server_args = SimpleNamespace(
-        # Non-auto, so the native-MM gate never calls
-        # get_resolved_model_impl on this SimpleNamespace.
+        # Non-auto: get_resolved_model_impl would choke on a SimpleNamespace.
         model_impl="sglang",
         keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
