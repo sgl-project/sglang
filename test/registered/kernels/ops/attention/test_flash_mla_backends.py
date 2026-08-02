@@ -60,6 +60,11 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
 
 _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+# Everything below exercises the Triton and PyTorch paths, which are portable.
+# Gating the whole file on SM120 meant the Triton-vs-torch oracle never ran on
+# the architectures that actually reach the Triton fallback. Only the FlashInfer
+# case needs SM120, and it guards itself.
+_HAS_CUDA = torch.cuda.is_available()
 
 
 def _build_kvcache(
@@ -187,7 +192,7 @@ def _build_q_indices(
     return q, indices
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(_HAS_CUDA, "CUDA required")
 class TestGatherAndDequant(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -237,7 +242,7 @@ class TestGatherAndDequant(CustomTestCase):
         )
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(_HAS_CUDA, "CUDA required")
 class TestSparseDecodeTritonVsTorch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -350,7 +355,7 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
         )
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(_HAS_CUDA, "CUDA required")
 class TestApplyAttnSink(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -393,7 +398,7 @@ class TestApplyAttnSink(CustomTestCase):
         )
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(_HAS_CUDA, "CUDA required")
 class TestMergePartialAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -435,7 +440,7 @@ class TestMergePartialAttn(CustomTestCase):
         torch.testing.assert_close(merged_lse, lse1, atol=1e-5, rtol=1e-5)
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(_HAS_CUDA, "CUDA required")
 class TestEntryPointDispatch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -475,6 +480,8 @@ class TestEntryPointDispatch(CustomTestCase):
         """FlashInfer SM120 sparse MLA decode matches Triton reference."""
         import importlib
 
+        if not _IS_SM120:
+            self.skipTest("SM120 (compute capability 12.0) required")
         if importlib.util.find_spec("flashinfer.sparse_mla_sm120") is None:
             self.skipTest("FlashInfer SM120 sparse MLA not available")
 
