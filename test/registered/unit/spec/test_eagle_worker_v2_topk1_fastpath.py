@@ -212,8 +212,16 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 ),
             ),
             patch(
-                "sglang.srt.speculative.eagle_info.get_server_args",
-                return_value=worker.server_args,
+                "sglang.srt.speculative.eagle_info.get_spec",
+                return_value=SimpleNamespace(
+                    speculative_use_rejection_sampling=use_rejection_sampling
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                return_value=SimpleNamespace(
+                    speculative_use_rejection_sampling=use_rejection_sampling
+                ),
             ),
             patch(
                 "sglang.srt.speculative.eagle_worker_v2.maybe_detect_nan"
