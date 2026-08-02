@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from enum import Enum, IntFlag
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
@@ -50,6 +51,8 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
+    session_ref: int = 0
+    session_ids: Optional[set[str]] = None
 
 
 class EvictLayer(IntFlag):
@@ -112,9 +115,188 @@ class TreeComponent(ABC):
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
+        # Per-session frontier nodes (the deepest registered node per cached
+        # path), not physical tree leaves: a frontier node may have children.
+        self._session_leaves: dict[str, set[UnifiedTreeNode]] = defaultdict(set)
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
+
+    def reset_session_state(self) -> None:
+        self._session_leaves = defaultdict(set)
+
+    def session_ref(self, node: UnifiedTreeNode) -> int:
+        return node.component_data[self.component_type].session_ref
+
+    def _can_evict_leaf_atomically(self, node: UnifiedTreeNode) -> bool:
+        # Don't allow a non-session-ref component to cascade-evict
+        # a high-priority session-ref component.
+        if self.session_ref(node) > 0:
+            return True
+        priority = self.eviction_priority(is_leaf=False)
+        return not any(
+            comp.eviction_priority(is_leaf=False) >= priority
+            and comp.session_ref(node) > 0
+            for comp in self.tree_core.components
+        )
+
+    def _refresh_session_partition(self, node: UnifiedTreeNode) -> None:
+        ct = self.component_type
+        lru = self.tree_core.lru_lists[ct]
+        if lru.in_list(node):
+            lru.reset_node_mru(node)
+        host_lru = self.tree_core.host_lru_lists[ct]
+        if host_lru.in_list(node):
+            host_lru.reset_node_mru(node)
+
+    def _find_reusable_session_leaf(
+        self, node: Optional[UnifiedTreeNode]
+    ) -> Optional[UnifiedTreeNode]:
+        root_node = self.tree_core.root_node
+        if node is None or node is root_node:
+            return None
+
+        validator = self.create_match_validator(match_device_only=False)
+        cur = node
+        while cur is not None and cur is not root_node:
+            if validator(cur):
+                return cur
+            cur = cur.parent
+        return None
+
+    def resolve_session_leaf(
+        self, req: Req, last_node: Optional[UnifiedTreeNode]
+    ) -> Optional[UnifiedTreeNode]:
+        return self._find_reusable_session_leaf(last_node)
+
+    def _mark_session_leaf(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        self._session_leaves[session_id].add(leaf)
+        cd = leaf.component_data[self.component_type]
+        if cd.session_ids is None:
+            cd.session_ids = set()
+        cd.session_ids.add(session_id)
+
+    def _unmark_session_leaf(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        leaves = self._session_leaves.get(session_id)
+        assert leaves is not None and leaf in leaves
+        leaves.remove(leaf)
+        cd = leaf.component_data[self.component_type]
+        assert cd.session_ids is not None and session_id in cd.session_ids
+        cd.session_ids.remove(session_id)
+        if not cd.session_ids:
+            cd.session_ids = None
+        if not leaves:
+            self._session_leaves.pop(session_id, None)
+
+    def _nearest_session_ancestor(
+        self, new_leaf: UnifiedTreeNode, current_leaves: set[UnifiedTreeNode]
+    ) -> Optional[UnifiedTreeNode]:
+        cur = new_leaf.parent
+        while cur is not None and cur is not self.tree_core.root_node:
+            if cur in current_leaves:
+                return cur
+            cur = cur.parent
+        return None
+
+    @abstractmethod
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        """Remove one session reference from the coverage anchored at `leaf`."""
+        ...
+
+    @abstractmethod
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        """Move the session's coverage from `old_ancestor` forward to `leaf`."""
+        ...
+
+    @abstractmethod
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        """Move the session's coverage backward from `leaf` to `fallback`."""
+        ...
+
+    def register_session_leaf(
+        self, session_id: str, leaf: Optional[UnifiedTreeNode]
+    ) -> None:
+        if (
+            not self.tree_core.enable_session_radix_cache
+            or leaf is None
+            or leaf is self.tree_core.root_node
+        ):
+            return
+
+        current_leaves = self._session_leaves[session_id]
+        if leaf in current_leaves:
+            return
+
+        old_ancestor = self._nearest_session_ancestor(leaf, current_leaves)
+        self._advance_session_coverage(session_id, leaf, old_ancestor)
+        self._mark_session_leaf(session_id, leaf)
+        if old_ancestor is not None:
+            self._unmark_session_leaf(session_id, old_ancestor)
+
+    def release_session(self, session_id: str) -> int:
+        leaves = tuple(self._session_leaves.get(session_id, ()))
+        for leaf in leaves:
+            self._dec_session_coverage(session_id, leaf)
+            self._unmark_session_leaf(session_id, leaf)
+        return len(leaves)
+
+    def discard_deleted_session_leaf(self, node: UnifiedTreeNode) -> None:
+        cd = node.component_data[self.component_type]
+        for session_id in tuple(cd.session_ids or ()):
+            leaves = self._session_leaves.get(session_id)
+            assert leaves is not None and node in leaves
+            fallback = self._find_reusable_session_leaf(node.parent)
+            if fallback is not None and fallback in self._session_leaves.get(
+                session_id, ()
+            ):
+                fallback = None
+            self._recede_session_coverage(session_id, node, fallback)
+            self._unmark_session_leaf(session_id, node)
+            if fallback is not None:
+                self._mark_session_leaf(session_id, fallback)
+
+    def validate_session_state(
+        self,
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        reachable_nodes = set(reachable_nodes)
+        ct = self.component_type
+
+        for session_id, leaves in self._session_leaves.items():
+            if not leaves:
+                report_error(f"{ct} session {session_id!r} has an empty leaf index")
+            for leaf in leaves:
+                if leaf not in reachable_nodes:
+                    report_error(
+                        f"{ct} session {session_id!r} indexes unreachable leaf {leaf.id}"
+                    )
+                if session_id not in (leaf.component_data[ct].session_ids or ()):
+                    report_error(
+                        f"{ct} session {session_id!r} leaf {leaf.id} is missing its marker"
+                    )
+
+        for node in reachable_nodes:
+            cd = node.component_data[ct]
+            if cd.session_ref < 0:
+                report_error(f"node {node.id} {ct} session_ref={cd.session_ref}")
+            if cd.session_ids is not None and not cd.session_ids:
+                report_error(f"node {node.id} {ct} has an empty session_ids marker")
+            for session_id in cd.session_ids or ():
+                if node not in self._session_leaves.get(session_id, ()):
+                    report_error(
+                        f"node {node.id} {ct} session {session_id!r} marker is not indexed"
+                    )
 
     def node_has_component_data(
         self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
