@@ -352,6 +352,8 @@ class DeepseekV2MLP(nn.Module):
             if (
                 gemm_output_zero_allocator is not None
                 and x.shape[0] <= 256
+                # A packed layer has qweight, not weight.
+                and getattr(self.gate_up_proj, "weight", None) is not None
                 and self.gate_up_proj.weight.dtype == torch.uint8
             ):
                 y = gemm_output_zero_allocator.allocate(
@@ -366,6 +368,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -771,13 +774,14 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            # Ask the layer that was built, not a list of quantization names.
+            # Any packed layout stores qweight/qzeros/scales and exposes no plain
+            # `weight`, so this covers gptq and auto_round without naming them --
+            # the enumeration below used to miss both, and the two dtype reads
+            # that follow raise AttributeError on a layer it failed to classify.
+            is_packed_weight = (
+                getattr(self.shared_experts.gate_up_proj, "weight", None) is None
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -1952,19 +1956,18 @@ class DeepseekV2AttentionMLA(
         )
 
         self.has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        self.is_packed_weight = (
-            self.has_fused_proj
-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+        self.is_packed_weight = self.has_fused_proj and (
+            getattr(self.fused_qkv_a_proj_with_mqa, "weight", None) is None
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
-        self._q_b_proj_verified_shape = self.has_q_b_proj and (
-            tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+        self._q_b_proj_verified_shape = (
+            self.has_q_b_proj
+            and getattr(self.q_b_proj, "weight", None) is not None
+            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 
