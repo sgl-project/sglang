@@ -43,6 +43,14 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = ["--cuda-graph-max-bs-decode=4"]
 
 
+class TestMageVLServer(ImageOpenAITestMixin):
+    model = "microsoft/Mage-VL"
+    extra_args = [
+        "--trust-remote-code",
+        "--cuda-graph-max-bs-decode=4",
+    ]
+
+
 class TestQwen3OmniServer(OmniOpenAITestMixin):
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     extra_args = [  # workaround to fit into H100
