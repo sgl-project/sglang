@@ -447,6 +447,8 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             route_weights_nvs=None,
             cu_seqlens=object(),
             plan=object(),
+            expert_ids=object(),
+            num_tokens=1,
         )
         combine_input = MoonEPCombineInput(
             hidden_states=object(),
