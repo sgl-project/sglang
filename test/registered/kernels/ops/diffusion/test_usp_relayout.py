@@ -1,5 +1,6 @@
 """Bitwise tests for the generic Ulysses output head-merge fast path."""
 
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -65,4 +66,4 @@ def test_usp_merge_heads_fast_path_rejects_wrong_rank():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
