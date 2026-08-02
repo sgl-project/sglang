@@ -633,23 +633,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _init_profile_context_and_memory_record(self):
         rank = get_parallel().tp_rank
+        runner_name = type(self).__name__
 
         # Per-bs capture traces are opt-in via SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
-        #
-        # - Without the env var (default), --enable-profile-cuda-graph behaves as
-        #   it does on main: an unscheduled profiler records the *entire* capture
-        #   phase in a single pass, and _post_process_after_profile emits aggregate
-        #   key-averages summary tables + a memory snapshot over all batch sizes.
-        #   No per-bs trace files are written (on_trace_ready stays None) and the
-        #   profiler is not stepped (see capture() / FullCudaGraphBackend).
-        # - With the env var, the profiler runs on a wait=2/warmup=0/active=1
-        #   schedule that is stepped per batch size (FullCudaGraphBackend.capture_one),
-        #   so the two dummy runs are skipped and one Chrome trace is written per bs.
         schedule = None
         on_trace_ready = None
         if envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
             trace_dir = os.path.join(
-                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
+                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "graph_capture_traces"
             )
             os.makedirs(trace_dir, exist_ok=True)
 
@@ -659,7 +650,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             def on_trace_ready(prof):
                 bs = self._profile_bs_list[self._profile_bs_idx]
-                trace_file = os.path.join(trace_dir, f"bs_{bs}_rank{rank}.json.gz")
+                trace_file = os.path.join(
+                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                )
                 prof.export_chrome_trace(trace_file)
                 logger.info(f"Saved trace for bs={bs} to {trace_file}")
                 self._profile_bs_idx += 1
@@ -867,11 +860,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         profile_context = empty_context()
         # Holds the active torch profiler during capture so the backend can
-        # advance its schedule (profiler.step()) per batch size. Only the
-        # scheduled (per-bs trace) profiler needs stepping; the default
-        # unscheduled profiler records the whole capture in one pass, so it
-        # stays None to keep the backend from stepping it. None when profiling
-        # is disabled.
+        # advance its schedule (profiler.step()) per batch size.
         self._profiler = None
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
