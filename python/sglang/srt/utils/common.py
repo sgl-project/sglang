@@ -3541,10 +3541,12 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
-        if server_args.elastic_ep_backend is not None:
+    # elastic-EP scale-up rewrites dp_size on the published config
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
             )
@@ -3552,10 +3554,10 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             if elastic_expanded_world_enabled():
                 return True
         if (
-            server_args.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3571,8 +3573,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         else:
             return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
+                get_parallel().moe_dense_tp_size
+                > server_args.tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3586,14 +3588,19 @@ def require_attn_tp_gather(server_args: ServerArgs):
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    if server_args.disable_attn_tp_gather:
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
-        if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < server_args.tp_size
         else:
             return True
     else:
@@ -3605,7 +3612,34 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:

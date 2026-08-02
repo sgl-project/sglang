@@ -199,4 +199,45 @@ void sparse_prefill_q8kv8_dispatch_full(
   _run_q8kv8(params, true, true);
 }
 
+void sparse_prefill_q8kv8_dispatch_topk_length(
+    tvm::ffi::TensorView q,
+    tvm::ffi::TensorView kv,
+    tvm::ffi::TensorView indices,
+    tvm::ffi::TensorView q_scale,
+    tvm::ffi::TensorView kv_scale,
+    tvm::ffi::TensorView topk_length,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView max_logits,
+    tvm::ffi::TensorView lse,
+    int64_t s_q_val,
+    int64_t s_kv_val,
+    int64_t h_q_val,
+    int64_t h_kv_val,
+    int64_t d_qk_val,
+    int64_t d_v_val,
+    int64_t topk_val,
+    double sm_scale_val,
+    int64_t cuda_stream) {
+  SparseMlaQ8Kv8PrefillParams params = _make_common_params(
+      q,
+      kv,
+      indices,
+      q_scale,
+      kv_scale,
+      out,
+      max_logits,
+      lse,
+      s_q_val,
+      s_kv_val,
+      h_q_val,
+      h_kv_val,
+      d_qk_val,
+      d_v_val,
+      topk_val,
+      sm_scale_val,
+      cuda_stream);
+  params.topk_length = static_cast<int*>(topk_length.data_ptr());
+  _run_q8kv8(params, true, false);
+}
+
 }  // namespace

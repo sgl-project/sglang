@@ -22,10 +22,10 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
-plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
-dispatch are inherited unchanged from the parent.
+Subclasses :class:`TRTLLMMLABackend` to share its MLA data preparation and
+prefill plumbing. Decode-context parallelism is implemented here because the
+TokenSpeed decode kernel natively accepts CP rank/world metadata and returns
+the partial log-sum-exp needed by the cross-rank merge.
 """
 
 import logging
@@ -34,14 +34,28 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_mla_kv_page_table_for_dcp,
+)
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
+)
+from sglang.kernels.ops.attention.utils import (
+    mla_quantize_and_rope_for_fp8,
+    mla_quantize_without_rope_for_fp8,
+)
+from sglang.kernels.ops.kvcache.kv_indices import (
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -66,14 +80,21 @@ _TOKENSPEED_MAX_Q_LEN = 8
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
 ) -> torch.Tensor:
     from sglang.srt.runtime_context import get_resources
 
+    # DCP target verification gathers Q to the full head count before launching
+    # TokenSpeed; size for that launch shape, not the rank-local head count.
+    num_heads *= get_parallel().attn_dcp_size
+    max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
+        * max_q_len
         * (kv_lora_rank + 1)
         * 4
     )
@@ -119,7 +140,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                max_q_len=(
+                    model_runner.server_args.max_speculative_num_draft_tokens or 1
+                ),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -273,6 +299,162 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
 
+    def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return seq_lens
+        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
+            torch.int32
+        )
+
+    def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return max_seq_len
+        local_max = max_seq_len // parallel.dcp_size + int(
+            parallel.dcp_rank < max_seq_len % parallel.dcp_size
+        )
+        # TokenSpeed requires a positive scheduling bound even when every
+        # sequence in a padded graph row is empty on this rank.
+        return max(local_max, 1)
+
+    def _fill_dcp_block_kv_indices(
+        self,
+        block_kv_indices: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        local_seq_lens: torch.Tensor,
+    ) -> None:
+        parallel = get_parallel()
+        pages_per_block = get_num_page_per_block_flashmla(self.page_size)
+        create_mla_kv_page_table_for_dcp[
+            (
+                block_kv_indices.shape[0],
+                get_num_kv_index_blocks_flashmla(
+                    block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
+            self.req_to_token,
+            req_pool_indices,
+            local_seq_lens,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            block_kv_indices.stride(0),
+            PHYSICAL_PAGE_SIZE=self.page_size,
+            DCP_SIZE=parallel.dcp_size,
+            DCP_RANK=parallel.dcp_rank,
+            PAGES_PER_BLOCK=pages_per_block,
+        )
+
+    def _create_block_kv_indices(
+        self,
+        batch_size: int,
+        max_blocks: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not get_parallel().dcp_enabled:
+            return super()._create_block_kv_indices(
+                batch_size,
+                max_blocks,
+                req_pool_indices,
+                seq_lens,
+                device,
+            )
+
+        block_kv_indices = torch.full(
+            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+        )
+        self._fill_dcp_block_kv_indices(
+            block_kv_indices,
+            req_pool_indices,
+            self._get_dcp_local_seq_lens(seq_lens),
+        )
+        return block_kv_indices
+
+    def _init_cuda_graph_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ):
+        super()._init_cuda_graph_metadata(
+            bs, num_tokens, forward_mode, seq_lens, device
+        )
+        if get_parallel().dcp_enabled:
+            self.forward_decode_metadata.max_seq_len_k = (
+                self._get_dcp_local_max_seq_len(
+                    self.max_context_len
+                    + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
+                )
+            )
+
+    def _apply_cuda_graph_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode,
+    ):
+        if not get_parallel().dcp_enabled:
+            return super()._apply_cuda_graph_metadata(
+                bs, req_pool_indices, seq_lens, forward_mode
+            )
+
+        metadata = self.decode_cuda_graph_metadata[bs]
+        if forward_mode.is_target_verify():
+            torch.add(
+                seq_lens[:bs],
+                self.num_draft_tokens,
+                out=metadata.global_seq_lens_k,
+            )
+            metadata.seq_lens_k.copy_(
+                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
+            )
+            local_seq_lens = metadata.seq_lens_k
+        elif forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
+            seq_lens = seq_lens[:bs]
+            metadata.seq_lens_k.copy_(seq_lens)
+            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+        else:
+            seq_lens = seq_lens[:bs]
+            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+
+        self._fill_dcp_block_kv_indices(
+            metadata.block_kv_indices,
+            req_pool_indices[:bs],
+            local_seq_lens,
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if (
+            get_parallel().dcp_enabled
+            and self.forward_decode_metadata is not None
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
+            if forward_batch.forward_mode.is_target_verify():
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
+            self.forward_decode_metadata.max_seq_len_k = (
+                self._get_dcp_local_max_seq_len(
+                    self.forward_decode_metadata.max_seq_len_k
+                )
+            )
+
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -281,7 +463,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
-    ) -> torch.Tensor:
+        *,
+        causal_seqs: Optional[torch.Tensor] = None,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        return_lse: bool = False,
+    ):
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -303,7 +490,110 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             enable_pdl=is_arch_support_pdl(),
+            return_lse=return_lse,
+            causal_seqs=causal_seqs,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
         )
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ):
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return super().forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling,
+            )
+
+        assert q_rope is not None and k_rope is not None
+        if cos_sin_cache is None:
+            q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+            )
+        else:
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch.positions,
+                cos_sin_cache,
+                is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+
+        if save_kv_cache:
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
+
+        query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if llama_4_scaling is not None:
+            query = (query.to(self.q_data_type) * llama_4_scaling).to(self.data_type)
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_decode_metadata
+        )
+        metadata_batch_size = getattr(metadata, "batch_size", None)
+        if (
+            metadata_batch_size is not None
+            and metadata_batch_size < forward_batch.batch_size
+        ):
+            self.init_forward_metadata(forward_batch)
+            metadata = forward_batch.decode_trtllm_mla_metadata
+
+        global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+        local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
+        raw_out, lse = self._run_decode_kernel(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=metadata.block_kv_indices,
+            seq_lens=local_seq_lens,
+            max_seq_len=metadata.max_seq_len_k,
+            layer=layer,
+            causal_seqs=global_seq_lens,
+            cp_world=parallel.dcp_size,
+            cp_rank=parallel.dcp_rank,
+            return_lse=True,
+        )
+
+        output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        lse = lse.view(-1, layer.tp_q_head_num)
+        fixup_zero_kv_rows(
+            output,
+            lse,
+            local_seq_lens,
+            self.q_indptr_decode[: forward_batch.batch_size + 1],
+            1,
+        )
+        return output.flatten(1), lse
 
     def _run_prefill_kernel(
         self,
@@ -323,6 +613,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
+        # Hybrid MLA models resolve the model-side hook through the outer
+        # HybridLinearAttnBackend, so their fallback MHA path can pass V as a
+        # last-dimension slice of kv_b_proj (stride(-2) > size(-1)). The
+        # TokenSpeed prefill kernel requires dense Q/K/V layouts even though
+        # the public wrapper accepts arbitrary torch tensors.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         return tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
             key=k,

@@ -26,6 +26,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -39,7 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
@@ -164,7 +165,7 @@ def _aiter_fp8_paged_mqa_logits(
         page_table.to(torch.int32),
         max_seq_len,
         KVBlockSize=kv_block_size,
-        Preshuffle=True,
+        Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
     )
     return logits
 
@@ -921,9 +922,8 @@ class C4Indexer(nn.Module):
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        from sglang.srt.runtime_context import get_server_args
 
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
 
     def compute_q(
