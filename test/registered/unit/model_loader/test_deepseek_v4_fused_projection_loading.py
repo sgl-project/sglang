@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     _COMPRESSOR_FUSABLE_LEAVES,
     _COMPRESSOR_SHARD_IDS,
@@ -14,6 +15,7 @@ from sglang.srt.models.deepseek_v4 import (
     _WQKV_A_SHARD_ORDER,
     DeepseekV4ForCausalLM,
     _classify_fused_shard,
+    _is_dense_linear,
     _pop_fused_weight,
     _reject_unfusable_leaf,
 )
@@ -298,6 +300,35 @@ class TestLoadWeightsFusedProjection(unittest.TestCase):
             params,
             [(f"{ATTN_PREFIX}.wq_a.qweight", qweight)],
             fuse_wqa_wkv=False,
+        )
+
+        torch.testing.assert_close(params[f"{ATTN_PREFIX}.wq_a.qweight"].data, qweight)
+
+
+class TestPackedLayerFallback(unittest.TestCase):
+    def test_unquantized_replicated_linear_is_dense(self):
+        layer = ReplicatedLinear(8, 4, bias=False, quant_config=None)
+        self.assertTrue(_is_dense_linear(layer))
+
+    def test_packed_layer_is_not_dense(self):
+        layer = torch.nn.Module()
+        for packed_name in ("qweight", "qzeros", "scales"):
+            layer.register_parameter(packed_name, torch.nn.Parameter(torch.zeros(2, 2)))
+        self.assertFalse(_is_dense_linear(layer))
+
+    def test_loader_skips_fusion_when_the_model_has_no_wqkv_a(self):
+        # MqaAttentionBase built the unfused pair because the quantization
+        # method produced a packed layer, so load_weights must not try to fuse
+        # even though SGLANG_OPT_FUSE_WQA_WKV is on.
+        qweight = torch.ones(4, 8)
+        params = {
+            f"{ATTN_PREFIX}.wq_a.qweight": torch.nn.Parameter(torch.zeros(4, 8)),
+        }
+
+        run_load_weights(
+            params,
+            [(f"{ATTN_PREFIX}.wq_a.qweight", qweight)],
+            fuse_wqa_wkv=True,
         )
 
         torch.testing.assert_close(params[f"{ATTN_PREFIX}.wq_a.qweight"].data, qweight)

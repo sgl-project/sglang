@@ -156,6 +156,7 @@ from sglang.srt.utils import (
     is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
+    print_warning_once,
 )
 from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
@@ -474,7 +475,21 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wqkv_a", prefix),
             )
-        else:
+            if not _is_dense_linear(self.wqkv_a):
+                # The quantization method built a packed layer instead of a
+                # plain weight. The wq_a+wkv fusion concatenates the two
+                # checkpoint tensors on dim 0, which is the output axis of the
+                # dense layout only, so fall back to the separate projections
+                # rather than joining tensors on the wrong axis.
+                print_warning_once(
+                    "Disabling the wq_a+wkv fusion: quantization method "
+                    f"{type(self.wqkv_a.quant_method).__name__} builds a packed "
+                    "layer with no plain 'weight' parameter."
+                )
+                del self.wqkv_a
+                fuse = False
+                self.fuse_wqa_wkv = False
+        if not fuse:
             self.wq_a = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank,
@@ -2844,7 +2859,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        # The built model is authoritative: MqaAttentionBase falls back to
+        # separate wq_a/wkv projections when the quantization method builds a
+        # packed layer, in which case there is no wqkv_a to load into.
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get() and any(
+            ".wqkv_a." in param_name for param_name in params_dict
+        )
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -3205,6 +3225,17 @@ _COMPRESSOR_SHARD_ORDER = ("kv", "wgate")
 # geometry, so their join axis differs and is not handled here.
 _WQKV_A_FUSABLE_LEAVES = frozenset({"weight", "weight_scale_inv"})
 _COMPRESSOR_FUSABLE_LEAVES = frozenset({"weight"})
+
+
+def _is_dense_linear(layer: nn.Module) -> bool:
+    """Whether the layer's quantization method built a plain dense weight.
+
+    Format-agnostic: packed schemes register their own parameters
+    (`.qweight`/`.qzeros`/`.scales` and friends) and no `weight`, so a missing
+    `weight` is the signal that the layer cannot take a dim-0 concatenation of
+    two dense checkpoint tensors.
+    """
+    return hasattr(layer, "weight")
 
 
 def _classify_fused_shard(
