@@ -111,7 +111,7 @@ jobs:
     needs: [ set-image-config ]
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 3
       matrix:
         test_config:
           - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2
@@ -138,7 +138,7 @@ jobs:
     needs: [set-image-config]
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 4
       matrix:
         test_config:
           # Performance test cases (single-node)
@@ -265,7 +265,7 @@ jobs:
     needs: [set-image-config]
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 4
       matrix:
         test_config:
           # Accuracy test cases with an average execution time of no more than 1.5h
@@ -335,7 +335,7 @@ jobs:
     needs: [set-image-config]
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 3
       matrix:
         test_config:
           # Accuracy test cases with an average execution time of more than 1.5h
