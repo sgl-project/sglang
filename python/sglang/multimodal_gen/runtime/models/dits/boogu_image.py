@@ -876,24 +876,40 @@ class BooguRopeEmbedder(nn.Module):
                 .unsqueeze(-1)
                 .repeat(1, self.num_pos_axes)
             )
-            shift = cap_len
+            # Two separate counters, as in the upstream reference:
+            #   pe_shift     - the value written on axis 0 (the image-index /
+            #                  stream axis); advances by the larger grid side so
+            #                  successive images occupy disjoint index bands.
+            #   pe_shift_len - the sequence position where each image's tokens
+            #                  are written; advances by the token count.
+            # Axes 1 and 2 (row / col) use the raw 0-based grid coordinates so a
+            # reference token and the noise token at the same (row, col) share a
+            # spatial position — that alignment is what lets the DiT copy
+            # structure from the reference. Offsetting the spatial axes by the
+            # index shift (as an earlier version did) desynchronizes the
+            # reference and noise grids and corrupts the edit.
+            pe_shift = cap_len
+            pe_shift_len = cap_len
             if ref_img_sizes[i] is not None:
                 for (height, width), ref_len in zip(
                     ref_img_sizes[i], ref_img_lengths[i]
                 ):
                     rows, cols = self._token_grid(height, width, device)
-                    end = shift + ref_len
-                    position_ids[i, shift:end, 0] = shift
-                    position_ids[i, shift:end, 1] = rows + shift
-                    position_ids[i, shift:end, 2] = cols + shift
-                    shift += max(height // self.patch_size, width // self.patch_size)
+                    end = pe_shift_len + ref_len
+                    position_ids[i, pe_shift_len:end, 0] = pe_shift
+                    position_ids[i, pe_shift_len:end, 1] = rows
+                    position_ids[i, pe_shift_len:end, 2] = cols
+                    pe_shift += max(
+                        height // self.patch_size, width // self.patch_size
+                    )
+                    pe_shift_len += ref_len
 
             height, width = img_sizes[i]
             rows, cols = self._token_grid(height, width, device)
             start = seq_lengths[i] - img_lengths[i]
-            position_ids[i, start : seq_lengths[i], 0] = shift
-            position_ids[i, start : seq_lengths[i], 1] = rows + shift
-            position_ids[i, start : seq_lengths[i], 2] = cols + shift
+            position_ids[i, start : seq_lengths[i], 0] = pe_shift
+            position_ids[i, start : seq_lengths[i], 1] = rows
+            position_ids[i, start : seq_lengths[i], 2] = cols
         return position_ids
 
     def _token_grid(
