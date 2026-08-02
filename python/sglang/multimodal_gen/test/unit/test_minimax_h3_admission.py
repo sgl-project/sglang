@@ -182,7 +182,11 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         imgvid_cond_noise_aug_for_inference=0.75,
         audio_cond_noise_aug_for_inference=0.5,
     )
-    generic = {"prompt": request.prompt, "seed": request.seed}
+    generic = {
+        "prompt": request.prompt,
+        "seed": request.seed,
+        "flow_shift": request.flow_shift,
+    }
 
     lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(request, generic)
     assert lowered == {
