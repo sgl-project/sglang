@@ -31,7 +31,7 @@ struct AppState {
 }
 
 pub async fn serve(
-    socket: tokio::net::TcpSocket,
+    listener: std::net::TcpListener,
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -61,12 +61,12 @@ pub async fn serve(
         .with_state(state);
     let app = log::apply(app, &server_args);
 
-    // The socket was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); start listening here, on the api runtime.
-    let listener = match socket.listen(1024) {
+    // The listener was already bound synchronously in `runtime::start` (so a port
+    // conflict fails startup); adopt it into the tokio reactor here.
+    let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, "listen failed");
+            tracing::error!(error = %e, "failed to adopt pre-bound listener");
             return;
         }
     };
