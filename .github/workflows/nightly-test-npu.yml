@@ -415,11 +415,6 @@ jobs:
           single_result="${{ needs.nightly-poc-single-node-tests.result }}"
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
-          nightly_1_result="${{ needs.nightly-1-npu-a3.result }}"
-          nightly_2_result="${{ needs.nightly-2-npu-a3.result }}"
-          nightly_4_result="${{ needs.nightly-4-npu-a3.result }}"
-          nightly_8_result="${{ needs.nightly-8-npu-a3.result }}"
-          nightly_16_result="${{ needs.nightly-16-npu-a3.result }}"
 
           group_icon() {
             case "$1" in
@@ -438,8 +433,7 @@ jobs:
           echo "| single-node-poc-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-poc | $(group_icon ${single_result}) ${single_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
-          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |"
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
 
           echo "## Per-Test Metrics" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
