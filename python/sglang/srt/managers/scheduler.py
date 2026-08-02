@@ -1871,7 +1871,7 @@ class Scheduler(
         # Kept only to hold a reference — the server dies if it is collected.
         self.disagg_bootstrap_server = (
             start_rust_disagg_service(self.server_args)
-            if self._hosts_rust_server()
+            if self._hosts_rust_server() and self.ps.attn_dp_rank == 0
             else None
         )
 
@@ -2329,10 +2329,7 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    # Rust-ingress requests carry no time_stats (the embedded
-                    # server owns observability), so this abort path must not
-                    # assume one.
-                    if recv_req.time_stats is not None:
+                    if not envs.SGLANG_RUST_SERVER.get():
                         recv_req.time_stats.trace_ctx.abort(
                             abort_info={"reason": error_msg}
                         )
