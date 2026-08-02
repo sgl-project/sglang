@@ -59,7 +59,13 @@ def cuda_platform_plugin() -> str | None:
             try:
                 import torch
 
-                is_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+                # ROCm also exposes devices through torch.cuda, so keep this
+                # non-NVML fallback limited to non-HIP runtimes.
+                is_cuda = (
+                    getattr(torch.version, "hip", None) is None
+                    and torch.cuda.is_available()
+                    and torch.cuda.device_count() > 0
+                )
                 if is_cuda:
                     logger.debug("CUDA detected via torch (NVML unavailable)")
             except Exception as exc:
