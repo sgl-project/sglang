@@ -364,6 +364,7 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
+        self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -2920,15 +2921,21 @@ class DeepseekSparseAttnBackend(
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
-        # Use explicit num_blocks so this also works when qk_rope_dim == 0.
         num_blocks = kv_cache.shape[0] // page_size
-        k_rope_cache = k_rope_cache.view(num_blocks, page_size, 1, qk_rope_dim)
+        only_qv = qk_rope_dim == 0
+        if only_qv:
+            k_rope_cache = None
+        else:
+            k_rope_cache = k_rope_cache.view(num_blocks, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(num_blocks, page_size, 1, v_head_dim)
+        if self.dsa_index_kpool > 1:
+            page_table = page_table.clamp(min=0)
         o = flash_attn_with_kvcache(
-            q=q_rope,
+            q=None if only_qv else q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
             qv=q_nope,
+            only_qv=only_qv,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,

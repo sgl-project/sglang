@@ -548,7 +548,7 @@ def _compute_pool_schedule_metadata(
         import deep_gemm
 
         return deep_gemm.get_paged_mqa_logits_metadata(
-            pool_seqlens.contiguous().view(-1, 1),
+            pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
             slots_per_page,
             deep_gemm.get_num_sms(),
         )
