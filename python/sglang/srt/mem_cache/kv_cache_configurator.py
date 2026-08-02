@@ -1558,14 +1558,11 @@ class KVCacheConfigurator:
                 dvr_proposal_buffer_bytes,
             )
 
-            rest_memory -= (
-                dvr_proposal_buffer_bytes(
-                    spec_algorithm=self.spec_algorithm,
-                    server_args=self.server_args,
-                    vocab_size=self.model_config.vocab_size,
-                )
-                / (1 << 30)
-            )
+            rest_memory -= dvr_proposal_buffer_bytes(
+                spec_algorithm=self.spec_algorithm,
+                server_args=self.server_args,
+                vocab_size=self.model_config.vocab_size,
+            ) / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
@@ -1736,9 +1733,7 @@ class KVCacheConfigurator:
                 )
 
                 num_local_layers = sum(
-                    self.layer_info.start_layer
-                    <= layer_id
-                    < self.layer_info.end_layer
+                    self.layer_info.start_layer <= layer_id < self.layer_info.end_layer
                     for layer_id in config.mamba2_cache_params.layers
                 )
                 workspace_slots_per_request = dvr_gdn_workspace_state_slots(
@@ -1824,9 +1819,7 @@ class KVCacheConfigurator:
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    per_req * capped_reqs * workspace_slots_per_request
-                )
+                intermediate_size = per_req * capped_reqs * workspace_slots_per_request
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(

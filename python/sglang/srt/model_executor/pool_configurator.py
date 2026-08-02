@@ -154,8 +154,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if (
-            kvc.spec_algorithm.is_dflash_family()
-            or kvc.spec_algorithm.is_dvr_dflash()
+            kvc.spec_algorithm.is_dflash_family() or kvc.spec_algorithm.is_dvr_dflash()
         ) and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,

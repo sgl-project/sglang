@@ -11,8 +11,8 @@ from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker

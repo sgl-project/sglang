@@ -5,6 +5,9 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.dvr.gdn_kernels import (
     _compact_gdn_transition_windows,
     _gather_verify_output,
@@ -15,11 +18,6 @@ from sglang.srt.layers.attention.dvr.gdn_kernels import (
     dvr_scatter_conv_window,
     dvr_scatter_state,
 )
-from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
-from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.linear import gdn_backend as base_gdn
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention

@@ -190,12 +190,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # - Breakable EAGLE target: FULL.
         # - Return-hidden-states or DFLASH: FULL.
         # - Otherwise: NULL.
-        is_breakable_eagle = (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and (
-                model_runner.spec_algorithm.is_eagle()
-                or model_runner.spec_algorithm.is_dvr_eagle()
-            )
+        is_breakable_eagle = self.prefill_backend_name == Backend.BREAKABLE and (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_dvr_eagle()
         )
         needs_full_hidden_states = (
             model_runner.server_args.enable_return_hidden_states

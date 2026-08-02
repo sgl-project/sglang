@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.utils import is_hip
 

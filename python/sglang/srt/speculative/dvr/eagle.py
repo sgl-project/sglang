@@ -4,11 +4,11 @@ from contextlib import contextmanager
 
 import torch
 
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dvr.cuda_graph_runner import dvr_draft_decode_context
 from sglang.srt.speculative.dvr.draft import DVRDraftBackend
@@ -58,8 +58,10 @@ class DVREagleDraftWorker(EagleDraftWorker):
         probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
         probs = dvr_sampling_probs(probs, sampling_info)
         if probs.shape[0] == 0:
-            return probs, probs[:, :1], torch.empty(
-                (0, 1), dtype=torch.int64, device=logits.device
+            return (
+                probs,
+                probs[:, :1],
+                torch.empty((0, 1), dtype=torch.int64, device=logits.device),
             )
         seeds = sampling_info.sampling_seed
         if seeds is None:
