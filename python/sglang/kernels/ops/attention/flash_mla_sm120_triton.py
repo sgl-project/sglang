@@ -174,7 +174,6 @@ def _tiled_sparse_decode_kernel_mh(
     h_mask = h_offs < H
 
     nope_offs = tl.arange(0, NOPE_PAD)
-    nope_mask = nope_offs < NOPE_DIM_RT
     rope_offs = tl.arange(0, ROPE_DIM)
 
     # ---- Q: [BLOCK_H, NOPE_PAD] / [BLOCK_H, ROPE_DIM] ----
@@ -236,6 +235,13 @@ def _tiled_sparse_decode_kernel_mh(
         # alignment holds.
         w_ptrs = cache_i32_ptr + (token_data_bases // 4)
         kv_w = tl.load(w_ptrs[:, None] + w_offs[None, :])  # [BLOCK_T, 128] int32
+        # Zero the tail past NOPE_DIM_RT on the packed word instead of on the four
+        # decoded slices: one select replaces four. A zero byte decodes through the
+        # subnormal branch to exactly 0.0, so this is not an approximation -- and it
+        # must stay a mask rather than be dropped, because the bytes past the nope
+        # section are rope bf16 reinterpreted as E4M3 and can decode to inf, which
+        # would turn a 0 * inf product into NaN.
+        kv_w = tl.where((w_offs < (NOPE_DIM_RT // 4))[None, :], kv_w, 0)
         b0 = kv_w & 0xFF
         b1 = (kv_w >> 8) & 0xFF
         b2 = (kv_w >> 16) & 0xFF
@@ -264,11 +270,10 @@ def _tiled_sparse_decode_kernel_mh(
 
         # Zero the tail past 448: element 4m+j < 448 iff m < 112 (448/4).
         # Folding this into the scale to save 4 wheres was also slower; reverted.
-        w_keep = (w_offs < (NOPE_DIM_RT // 4))[None, :]
-        kv0 = tl.where(w_keep, _e4m3_scaled(b0, sc_i), 0.0).to(tl.bfloat16)
-        kv1 = tl.where(w_keep, _e4m3_scaled(b1, sc_i), 0.0).to(tl.bfloat16)
-        kv2 = tl.where(w_keep, _e4m3_scaled(b2, sc_i), 0.0).to(tl.bfloat16)
-        kv3 = tl.where(w_keep, _e4m3_scaled(b3, sc_i), 0.0).to(tl.bfloat16)
+        kv0 = _e4m3_scaled(b0, sc_i).to(tl.bfloat16)
+        kv1 = _e4m3_scaled(b1, sc_i).to(tl.bfloat16)
+        kv2 = _e4m3_scaled(b2, sc_i).to(tl.bfloat16)
+        kv3 = _e4m3_scaled(b3, sc_i).to(tl.bfloat16)
 
         rope_base_ptrs = cache_bf16_ptr + ((token_data_bases + 448) // 2)
         kv_rope = tl.load(rope_base_ptrs[:, None] + rope_offs[None, :])
