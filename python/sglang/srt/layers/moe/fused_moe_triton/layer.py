@@ -397,9 +397,24 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
+        moonep_global_weight_storage = get_moe_a2a_backend().is_moonep()
+        if moonep_global_weight_storage:
+            if quant_config is not None:
+                raise NotImplementedError(
+                    "MoonEP PoC supports unquantized BF16 MoE weights only."
+                )
+            if num_fused_shared_experts != 0:
+                raise NotImplementedError(
+                    "MoonEP PoC does not support fused shared experts yet."
+                )
+
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.num_local_experts,
+            num_experts=(
+                self.num_experts
+                if moonep_global_weight_storage
+                else self.num_local_experts
+            ),
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
@@ -411,6 +426,13 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
             moe_intermediate_size=intermediate_size,
         )
+        if moonep_global_weight_storage:
+            self.w13_weight._sglang_require_global_experts = True
+            self.w2_weight._sglang_require_global_experts = True
+            if getattr(self, "w13_weight_bias", None) is not None:
+                self.w13_weight_bias._sglang_require_global_experts = True
+            if getattr(self, "w2_weight_bias", None) is not None:
+                self.w2_weight_bias._sglang_require_global_experts = True
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)

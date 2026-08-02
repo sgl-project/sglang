@@ -493,9 +493,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Check if the MoE backend is DeepEP-family."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_moonep()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:

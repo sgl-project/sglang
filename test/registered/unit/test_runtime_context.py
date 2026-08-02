@@ -464,6 +464,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             hidden_states=object(),
             route_weights_nvs=None,
             plan=dispatch_output.plan,
+            num_tokens=1,
         )
 
         self.assertTrue(dispatch_output.format.is_moonep())

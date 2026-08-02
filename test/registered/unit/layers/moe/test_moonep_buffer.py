@@ -1,10 +1,16 @@
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPBuffer
+from sglang.srt.layers.moe.token_dispatcher.moonep import (
+    MoonEPBuffer,
+    get_moonep_expert_weight_layout,
+)
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -167,6 +173,69 @@ class TestMoonEPBuffer(unittest.TestCase):
 
         self.assertEqual(buffer.destroy_calls, 1)
         self.assertIsNone(MoonEPBuffer.get_existing_buffer())
+
+
+class TestMoonEPExpertWeightLayout(unittest.TestCase):
+    def _fake_layer(self):
+        num_experts, hidden_size, intermediate_size = 3, 4, 5
+        w13_weight = torch.arange(
+            num_experts * 2 * intermediate_size * hidden_size,
+            dtype=torch.bfloat16,
+        ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+        w2_weight = torch.arange(
+            num_experts * hidden_size * intermediate_size,
+            dtype=torch.bfloat16,
+        ).reshape(num_experts, hidden_size, intermediate_size)
+
+        return SimpleNamespace(
+            quant_config=None,
+            moe_runner_config=SimpleNamespace(
+                num_fused_shared_experts=0,
+                is_gated=True,
+            ),
+            use_triton_kernels=False,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            num_experts=num_experts,
+            intermediate_size_per_partition=intermediate_size,
+            hidden_size=hidden_size,
+        )
+
+    def test_layout_splits_gate_up_down_and_adds_prefetch_slots(self):
+        layer = self._fake_layer()
+
+        layout = get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
+
+        self.assertEqual(tuple(layout.full_gate_weight.shape), (5, 5, 4))
+        self.assertEqual(tuple(layout.full_up_weight.shape), (5, 5, 4))
+        self.assertEqual(tuple(layout.full_down_weight.shape), (5, 4, 5))
+        torch.testing.assert_close(
+            layout.full_gate_weight[:3],
+            layer.w13_weight[:, :5, :],
+        )
+        torch.testing.assert_close(
+            layout.full_up_weight[:3],
+            layer.w13_weight[:, 5:10, :],
+        )
+        torch.testing.assert_close(layout.full_down_weight[:3], layer.w2_weight)
+        self.assertTrue(torch.all(layout.full_gate_weight[3:] == 0))
+        self.assertTrue(torch.all(layout.full_up_weight[3:] == 0))
+        self.assertTrue(torch.all(layout.full_down_weight[3:] == 0))
+
+    def test_layout_is_cached_for_same_weight_storage(self):
+        layer = self._fake_layer()
+
+        first = get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
+        second = get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
+
+        self.assertIs(first, second)
+
+    def test_layout_rejects_local_expert_storage(self):
+        layer = self._fake_layer()
+        layer.w13_weight = layer.w13_weight[:2].contiguous()
+
+        with self.assertRaisesRegex(ValueError, "global w13_weight"):
+            get_moonep_expert_weight_layout(layer, num_prefetch_slots=2)
 
 
 if __name__ == "__main__":
