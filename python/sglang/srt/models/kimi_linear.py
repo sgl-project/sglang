@@ -866,6 +866,15 @@ class KimiLinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        # Extract the MLA w_kc / w_vc projections from kv_b_proj for the full
+        # attention (MLA) layers. Kept as a standalone method so that loaders
+        # which bypass `load_weights()` (e.g. DummyModelLoader, sharded state,
+        # remote instance) can trigger the fixup explicitly via
+        # `_post_load_weights()` in model_loader/loader.py; `load_weights()`
+        # calls it internally on the normal path. Idempotent.
         for layer_id in self.config.full_attention_layer_ids:
             if not self.model.start_layer <= layer_id < self.model.end_layer:
                 continue
