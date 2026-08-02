@@ -679,12 +679,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        # Match the draft context length to the target (assistant reads target KV).
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
-        )
-
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,

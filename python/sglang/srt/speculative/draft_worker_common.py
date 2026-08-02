@@ -10,7 +10,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_schedule
+from sglang.srt.runtime_context import get_context, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -61,6 +61,13 @@ def _resolve_draft_attention_backend_fallback(
     return draft_backend
 
 
+def _draft_load_format_fields() -> dict:
+    draft_load_format = get_spec().speculative_draft_load_format
+    if draft_load_format is None:
+        return {}
+    return dict(load_format=draft_load_format)
+
+
 def draft_server_args_overrides(target_model_config, draft_backend) -> dict:
     """Pre-publish field adjustments for a draft ``ServerArgs`` copy.
 
@@ -78,7 +85,39 @@ def draft_server_args_overrides(target_model_config, draft_backend) -> dict:
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
         disable_chunked_prefix_cache=get_schedule().disable_chunked_prefix_cache,
+        **_draft_load_format_fields(),
     )
+
+
+def draft_server_args_copy(server_args: ServerArgs, target_model_config) -> ServerArgs:
+    """A draft-only ``ServerArgs`` for the workers that build their own draft.
+
+    Starts from the config the process resolved, not from the pristine seed:
+    the copy is published while the draft builds, and load-time overrides made
+    before this point (the chunked-prefix gate, the SM100 GDN prefill default)
+    are part of what the draft's layers must see. On top of that,
+    ``context_length`` follows the target (the draft reads target KV) and
+    ``load_format`` follows ``--speculative-draft-load-format``. The target's
+    own instance is untouched.
+    """
+    draft_load_format = get_spec().speculative_draft_load_format
+    if draft_load_format is not None:
+        logger.info(f"Using draft model load_format: '{draft_load_format}'")
+
+    resolved = {}
+    for _source, fields in get_context().overrides_log():
+        resolved.update(fields)
+
+    draft_server_args = deepcopy(server_args)
+    draft_server_args.override(
+        "draft_worker.copy",
+        **{
+            **resolved,
+            "context_length": target_model_config.context_len,
+            **_draft_load_format_fields(),
+        },
+    )
+    return draft_server_args
 
 
 def build_draft_tp_worker(
