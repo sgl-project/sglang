@@ -8,7 +8,6 @@ from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
-from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
 from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
@@ -17,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
@@ -36,7 +36,7 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         for buf in (cls._stdout_buf, cls._stderr_buf):
             if buf is not None:
                 buf.close()
