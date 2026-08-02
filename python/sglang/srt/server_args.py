@@ -2047,6 +2047,28 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = None
+    speculative_draft_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Data type for the DFlash/DSpark draft worker's separate KV "
+                "cache. If not specified, it inherits --kv-cache-dtype from "
+                "the target."
+            ),
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "mxfp8",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "fp4_mx_block16",
+                "fp4_e2m1",
+            ],
+        ),
+        NS("spec"),
+    ] = None
     speculative_num_steps: A[
         Optional[int],
         "The number of steps sampled from draft model in Speculative Decoding.",

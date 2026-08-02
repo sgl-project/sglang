@@ -1268,9 +1268,19 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
+        # A draft worker shares the target's ServerArgs object; honor the
+        # draft-specific KV-cache dtype override when it is set.
+        server_args_kv_cache_dtype = self.server_args.kv_cache_dtype
+        if (
+            getattr(self, "is_draft_worker", False)
+            and self.server_args.speculative_draft_kv_cache_dtype is not None
+        ):
+            server_args_kv_cache_dtype = (
+                self.server_args.speculative_draft_kv_cache_dtype
+            )
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                server_args_kv_cache_dtype=server_args_kv_cache_dtype,
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
