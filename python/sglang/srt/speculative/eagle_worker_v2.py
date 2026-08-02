@@ -1210,7 +1210,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_mask = attn_backend.verify_mask
         # Every position in a 1-node tree is visible, so an all-True fill is
         # correct under either layout.
-        if verify_mask is not None and verify_mask.fits(bs, 1):
+        if verify_mask is not None and verify_mask.fits(bs):
             custom_mask = verify_mask.buffer
             custom_mask.fill_(True)
         else:

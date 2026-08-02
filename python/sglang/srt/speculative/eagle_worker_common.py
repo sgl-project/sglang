@@ -351,9 +351,7 @@ def build_eagle_verify_input(
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
     else:
         mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
-        tree_mask_buf = (
-            verify_mask.buffer if verify_mask.fits(bs, num_draft_tokens) else None
-        )
+        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
     # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.

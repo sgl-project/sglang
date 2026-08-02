@@ -4,14 +4,14 @@
 # (deepseek-ai@d28bd67 at /sgl-workspace/DeepEP), the deep_gemm pip package,
 # and the CUDA 13 toolchain (nvcc + /usr/local/cuda/include/cccl).
 #
-# This image adds the three Kimi-K3-specific pieces that stock lacks:
+# This image adds the four Kimi-K3-specific pieces that stock lacks:
 #   1. the Kimi-K3 SGLang code (this repo), editable-installed
 #   2. DeepEP patch + rebuild:
 #        topk 11->16, SWITCH_HIDDEN += 3584, EP>8 SourceMeta alignment,
 #        cross-node timeout headroom, CUDA-13 cccl include; rebuilt for
 #        sm_90, sm_100a, and sm_103a
-#   3. DeepGEMM mega-MoE SiTU patch:
-#        JIT-header sentinel (activation_clamp==0.03125 -> K3 SiTU); no rebuild
+#   3. DeepGEMM upgrade to 0.1.5.post1:
+#        official MegaMoE runtime-JIT header with Kimi-K3 SiTU support
 #   4. FlashInfer CuTeDSL MLA DCP patch:
 #        apply the seven runtime-file diffs; exclude tests absent from the wheel
 #
@@ -25,6 +25,8 @@
 # cached.
 
 FROM lmsysorg/sglang:v0.5.16 AS base
+
+ARG SGL_DEEP_GEMM_VERSION="0.1.5.post1"
 
 # Current Kimi-K3 source auto-discovers and builds its PyO3 extensions.
 ARG RUST_VERSION="1.90.0"
@@ -70,8 +72,10 @@ RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
     bash /sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh && \
     rm -rf /sgl-workspace/DeepEP/build /sgl-workspace/DeepEP/dist
 
-# --- 3. DeepGEMM mega-MoE: SiTU JIT-header patch (runtime-JIT, no rebuild) ---
-RUN python3 /sgl-workspace/sglang/docker/kimi_k3/apply_deepgemm_situ_patch.py
+# --- 3. DeepGEMM: upgrade to the first release with Kimi-K3 SiTU ---
+# The v0.5.16 base contains DeepGEMM 0.1.4.post1.
+RUN python3 -m pip install --no-deps --force-reinstall \
+    "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}"
 
 # Install the pinned FlashInfer MXFP4 MoE runner cubin pool.
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
