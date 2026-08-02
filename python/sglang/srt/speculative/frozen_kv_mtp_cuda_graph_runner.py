@@ -125,7 +125,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.draft_attn_backend.init_cuda_graph_state(
+            self.max_bs * self.topk, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
