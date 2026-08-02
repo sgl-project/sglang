@@ -8,6 +8,31 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+
+# Triton on SM80 accepts only ('fp8e4b15', 'fp8e5') as fp8 element types, so a
+# kernel whose signature carries an fp8e4nv pointer fails to compile there.
+# E4M3 is 8 bits wide, which makes its 256 values enumerable: load the bytes as
+# uint8 and index a table built once per device. The decode is exact.
+#
+# The sparse decode kernel solves the same problem with bit arithmetic instead,
+# because there the table gather was 65% of its runtime. This path is not
+# gather-bound, and a table is the simpler exact decode.
+_E4M3_LUT_CACHE = {}
+
+
+def _e4m3_lut(device):
+    t = _E4M3_LUT_CACHE.get(device)
+    if t is None:
+        t = (
+            torch.arange(256, dtype=torch.uint8)
+            .view(fp8_dtype)
+            .to(torch.float32)
+            .to(device)
+        )
+        _E4M3_LUT_CACHE[device] = t
+    return t
+
+
 # v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
 #              7 ue8m0 scales padded to 8 bytes.
@@ -67,7 +92,7 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
+        _e4m3_lut(quant_k_cache.device),
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
@@ -88,7 +113,8 @@ def dequantize_k_cache_paged(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
+    e4m3_lut_ptr,  # was buf_fp8_ptr; an fp8 pointer in the signature will not
+    # compile on SM80
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
@@ -119,7 +145,8 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        fp8_bytes = tl.load(buf_uint8_ptr + fp8_off).to(tl.int32)
+        fp8_vals = tl.load(e4m3_lut_ptr + fp8_bytes)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
