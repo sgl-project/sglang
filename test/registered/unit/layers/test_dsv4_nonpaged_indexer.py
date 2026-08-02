@@ -283,9 +283,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         token_to_kv_pool.get_index_k_scale_buffer.return_value = (k_u8, scale_u8)
         c4_indexer = SimpleNamespace(layer_id=17, use_fp4_indexer=False)
         expected = MagicMock(name="logits")
-        deep_gemm = SimpleNamespace(
-            fp8_fp4_mqa_logits=MagicMock(return_value=expected)
-        )
+        deep_gemm = SimpleNamespace(fp8_fp4_mqa_logits=MagicMock(return_value=expected))
 
         with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
             actual = C4IndexerBackendMixin._forward_nonpaged_indexer(
@@ -333,9 +331,7 @@ class TestDSV4BudgetDetection(CustomTestCase):
         qr = 100
         mcsl = 100
         self.assertLess(qr * mcsl, _MQA_LOGITS_STATIC_SKIP_ELEMS)
-        need, budget = C4IndexerBackendMixin._should_chunk_mqa_logits(
-            qr, mcsl, 0
-        )
+        need, budget = C4IndexerBackendMixin._should_chunk_mqa_logits(qr, mcsl, 0)
         self.assertFalse(need)
         self.assertEqual(budget, 0)
 
@@ -390,13 +386,11 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
                 torch.zeros((query_rows, 2), dtype=torch.float32),
             )
         else:
-            q_indexer = torch.zeros(
-                (query_rows, 2, 128), dtype=torch.uint8
-            ).view(FP8_DTYPE)
+            q_indexer = torch.zeros((query_rows, 2, 128), dtype=torch.uint8).view(
+                FP8_DTYPE
+            )
         weights = torch.ones((query_rows, 2), dtype=torch.float32)
-        c4_indexer = SimpleNamespace(
-            layer_id=17, use_fp4_indexer=use_fp4
-        )
+        c4_indexer = SimpleNamespace(layer_id=17, use_fp4_indexer=use_fp4)
         k_u8 = torch.zeros((1000, 128), dtype=torch.uint8)
         scale_u8 = torch.zeros((1000, 4), dtype=torch.uint8)
         token_to_kv_pool = MagicMock()
@@ -410,17 +404,11 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         max_c4_seq_len = 100
         budget_bytes = max_c4_seq_len * 4 * 3  # only 3 rows per chunk
 
-        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(
-            query_rows
-        )
+        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(query_rows)
 
-        c4_seq_lens = torch.full(
-            (query_rows,), max_c4_seq_len, dtype=torch.int32
-        )
+        c4_seq_lens = torch.full((query_rows,), max_c4_seq_len, dtype=torch.int32)
         page_table = torch.zeros((query_rows, 2), dtype=torch.int32)
-        c4_sparse_page_indices = torch.full(
-            (query_rows, 512), -1, dtype=torch.int32
-        )
+        c4_sparse_page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
 
         forward_batch = SimpleNamespace(
             batch_size=1,
@@ -487,16 +475,10 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         max_c4_seq_len = 100
         budget_bytes = max_c4_seq_len * 4 * 2  # 2 rows per chunk
 
-        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(
-            query_rows
-        )
-        c4_seq_lens = torch.full(
-            (query_rows,), max_c4_seq_len, dtype=torch.int32
-        )
+        q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(query_rows)
+        c4_seq_lens = torch.full((query_rows,), max_c4_seq_len, dtype=torch.int32)
         page_table = torch.zeros((query_rows, 2), dtype=torch.int32)
-        c4_sparse_page_indices = torch.full(
-            (query_rows, 512), -1, dtype=torch.int32
-        )
+        c4_sparse_page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
 
         forward_batch = SimpleNamespace(
             batch_size=2,
@@ -505,9 +487,7 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
                 [max_c4_seq_len * 4, max_c4_seq_len * 4], dtype=torch.int32
             ),
             extend_start_loc=torch.tensor([0, req1_rows], dtype=torch.int32),
-            extend_seq_lens=torch.tensor(
-                [req1_rows, req2_rows], dtype=torch.int32
-            ),
+            extend_seq_lens=torch.tensor([req1_rows, req2_rows], dtype=torch.int32),
         )
         indexer_metadata = SimpleNamespace(
             c4_page_size=64,
@@ -549,9 +529,7 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
             )
 
         # Two requests → two KV gathers
-        self.assertEqual(
-            token_to_kv_pool.get_index_k_scale_buffer.call_count, 2
-        )
+        self.assertEqual(token_to_kv_pool.get_index_k_scale_buffer.call_count, 2)
         # Output was written for all rows
         self.assertTrue((chunked_out[:req1_rows] != -1).any())
         self.assertTrue((chunked_out[req1_rows:] != -1).any())
@@ -565,13 +543,9 @@ class TestDSV4OversizeVarlenChunked(CustomTestCase):
         q_indexer, weights, c4_indexer, token_to_kv_pool = self._make_mocks(
             query_rows, use_fp4=True
         )
-        c4_seq_lens = torch.full(
-            (query_rows,), max_c4_seq_len, dtype=torch.int32
-        )
+        c4_seq_lens = torch.full((query_rows,), max_c4_seq_len, dtype=torch.int32)
         page_table = torch.zeros((query_rows, 2), dtype=torch.int32)
-        c4_sparse_page_indices = torch.full(
-            (query_rows, 512), -1, dtype=torch.int32
-        )
+        c4_sparse_page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
 
         forward_batch = SimpleNamespace(
             batch_size=1,

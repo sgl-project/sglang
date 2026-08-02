@@ -34,13 +34,13 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
@@ -443,9 +443,7 @@ class C4IndexerBackendMixin:
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:
-            static_free_mem = int(
-                total_mem * max(0.0, 1.0 - mem_fraction_static)
-            )
+            static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
             static_budget = min(
                 int(static_free_mem * free_mem_fraction),
                 total_mem_budget,
@@ -475,9 +473,7 @@ class C4IndexerBackendMixin:
             return False, 0
 
         logits_bytes = query_rows * max_c4_seq_len * _MQA_LOGITS_BYTES_PER_ELEM
-        budget_bytes = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(
-            device_index
-        )
+        budget_bytes = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(device_index)
         need_chunk = logits_bytes > budget_bytes
         return need_chunk, budget_bytes
 
@@ -785,10 +781,7 @@ class C4IndexerBackendMixin:
 
             request_page_table = page_table[req_start : req_start + 1].contiguous()
             req_ke = (
-                c4_seq_lens[req_start:req_end]
-                .reshape(-1)
-                .to(torch.int32)
-                .contiguous()
+                c4_seq_lens[req_start:req_end].reshape(-1).to(torch.int32).contiguous()
             )
             gather_seq_lens = req_ke[-1:]
             req_ks = torch.zeros_like(req_ke)
@@ -821,9 +814,10 @@ class C4IndexerBackendMixin:
                     assert isinstance(q_indexer, tuple)
                     q_fp4_chunk = q_indexer[0][abs_start:abs_end]
                     q_sf_chunk = q_indexer[1][abs_start:abs_end]
-                    q_arg: Union[
-                        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]
-                    ] = (q_fp4_chunk, q_sf_chunk)
+                    q_arg: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = (
+                        q_fp4_chunk,
+                        q_sf_chunk,
+                    )
                 else:
                     assert isinstance(q_indexer, torch.Tensor)
                     q_arg = (q_indexer[abs_start:abs_end], None)
@@ -842,9 +836,7 @@ class C4IndexerBackendMixin:
                 chunk_page_table = page_table[abs_start:abs_end]
                 chunk_out = c4_sparse_page_indices[abs_start:abs_end]
                 chunk_raw = (
-                    raw_indices[abs_start:abs_end]
-                    if raw_indices is not None
-                    else None
+                    raw_indices[abs_start:abs_end] if raw_indices is not None else None
                 )
 
                 self._run_topk_transform(
@@ -1026,19 +1018,14 @@ class C4IndexerBackendMixin:
             _c4sl = _c4sl.unsqueeze(-1)
 
         # --- Budget detection: route oversize prefill to varlen chunked path ---
-        _is_deep_gemm_path = (
-            use_fp4_indexer
-            or (
-                not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-                and not is_xpu()
-            )
+        _is_deep_gemm_path = use_fp4_indexer or (
+            not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not is_xpu()
         )
         _is_cp = get_parallel().attn_cp_size != 1
-        _is_capture = (
-            get_is_capture_mode() or indexer_metadata.use_prefill_cuda_graph
-        )
+        _is_capture = get_is_capture_mode() or indexer_metadata.use_prefill_cuda_graph
         max_c4_seq_len = indexer_metadata.max_c4_seq_len
 
         need_chunk = False
