@@ -269,7 +269,7 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
                 self._run_fusion_test(*params)
 
     def test_forward_cuda_quant_linear_dispatch(self):
-        """forward_cuda routes to the fused path only when enabled + applicable."""
+        """forward_cuda routes to the fused path only when applicable."""
         import sglang.srt.layers.layernorm as ln_mod
 
         torch.manual_seed(self.SEED)
@@ -278,28 +278,17 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
         residual = torch.randn_like(x)
         scale = torch.tensor([0.05], dtype=torch.float32)
 
-        class _ServerArgs:
-            enable_flashinfer_rmsnorm_fp8_quant = True
-            rl_on_policy_target = None
-
-        server_args = _ServerArgs()
-        orig_get_server_args = ln_mod.get_server_args
         orig_static_scale = ln_mod._fp8_static_input_scale
-        ln_mod.get_server_args = lambda: server_args
         ln_mod._fp8_static_input_scale = lambda linear: scale
         try:
             plain = RMSNorm(hidden_size).to(dtype=torch.bfloat16)
             plain.weight.data.normal_(mean=1.0, std=0.1)
 
             with torch.inference_mode():
-                # Enabled + plain norm -> fused (fp8, scale, dtype) + bf16 residual.
+                # Plain norm -> fused (fp8, scale, dtype) + bf16 residual.
                 (q, s, out_dtype), r = plain(
                     x.clone(), residual.clone(), quant_linear=object()
                 )
-                # Disabled -> normal path (plain tensors), even with quant_linear.
-                server_args.enable_flashinfer_rmsnorm_fp8_quant = False
-                out_off = plain(x.clone(), residual.clone(), quant_linear=object())
-                server_args.enable_flashinfer_rmsnorm_fp8_quant = True
 
                 # variance_size_override is incompatible -> must not fuse.
                 var_layer = RMSNorm(hidden_size, var_hidden_size=hidden_size // 2).to(
@@ -314,7 +303,6 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
                     x.clone(), residual.clone(), quant_linear=object()
                 )
         finally:
-            ln_mod.get_server_args = orig_get_server_args
             ln_mod._fp8_static_input_scale = orig_static_scale
 
         self.assertEqual(q.dtype, self.FP8_DTYPE)
@@ -322,7 +310,6 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
         self.assertEqual(out_dtype, torch.bfloat16)
         self.assertEqual(r.dtype, torch.bfloat16)
 
-        self.assertEqual(out_off[0].dtype, torch.bfloat16)
         self.assertEqual(var_out[0].dtype, torch.bfloat16)
         self.assertEqual(cast_out[0].dtype, torch.bfloat16)
 

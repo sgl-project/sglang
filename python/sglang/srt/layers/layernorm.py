@@ -32,7 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -502,14 +502,13 @@ class RMSNorm(MultiPlatformOp):
                 out = out.reshape(original_shape)
             return out
         # Fuse the downstream FP8 static per-tensor activation quant into the
-        # norm when enabled. Placed after the empty / variance-override /
+        # norm when supported. Placed after the empty / variance-override /
         # batch-invariant guards above (all incompatible with the fused kernel)
         # and gated on not-HF-cast, so it only runs on the standard RMSNorm path.
         if (
             quant_linear is not None
             and not self.cast_x_before_out_mul
             and _flashinfer_rmsnorm_quant_available
-            and get_server_args().enable_flashinfer_rmsnorm_fp8_quant
         ):
             scale = _fp8_static_input_scale(quant_linear)
             if scale is not None:
