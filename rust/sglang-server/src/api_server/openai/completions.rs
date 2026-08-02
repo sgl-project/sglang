@@ -21,14 +21,15 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
+use super::super::submit::submit;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, indexed_egress_stream, openai_error,
     streaming_error, submit_generation, unix_seconds_u32,
 };
 use crate::ids::Rid;
 use crate::message::{
-    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, SamplingParams,
-    TokenIds,
+    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
+    SamplingParams, TokenIds,
 };
 
 pub(super) fn routes() -> Router<AppState> {
@@ -149,7 +150,7 @@ async fn completions(
                 && sample_index == 0
                 && let Some(token_ids) = &input_ids
             {
-                prompt_echo = match decode_prompt_echo(&state, &rid, token_ids.clone()).await {
+                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
                     Ok(echo) => echo,
                     Err(response) => return response,
                 };
@@ -222,17 +223,31 @@ async fn completions(
     }
 }
 
-async fn decode_prompt_echo(
-    state: &AppState,
-    rid: &Rid,
-    token_ids: TokenIds,
-) -> Result<String, Response> {
-    match state.senders.decode_once(rid, token_ids).await {
-        Ok(text) => Ok(text),
-        Err(crate::error::Error::Validation(message)) => {
+/// Decode a token-id prompt back to text for `echo=true`, via a
+/// `RequestKind::Detokenize` request through the regular submit path — the
+/// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
+/// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
+async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
+    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
+    else {
+        // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
+        // error shape rather than forwarding the native-shaped response.
+        return Err(openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+        ));
+    };
+    match rx.recv().await {
+        Some(EgressItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "detokenized prompt is not valid UTF-8",
+            )
+        }),
+        Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
             Err(openai_error(StatusCode::BAD_REQUEST, message))
         }
-        Err(error) => {
+        Some(EgressItem::Error(error)) => {
             let status = StatusCode::from_u16(error.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err(openai_error(
@@ -240,6 +255,10 @@ async fn decode_prompt_echo(
                 format!("failed to decode prompt for echo: {error}"),
             ))
         }
+        Some(_) | None => Err(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to decode prompt for echo: reply channel closed",
+        )),
     }
 }
 
@@ -520,7 +539,7 @@ pub(super) fn completion_event_stream(
                     yield streaming_error(error.http_status(), error.to_string());
                     continue;
                 }
-                EgressItem::Control(_) => continue,
+                EgressItem::Control(_) | EgressItem::Data(_) => continue,
             };
 
             if let Some((code, message)) = output

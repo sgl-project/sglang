@@ -178,7 +178,7 @@ async fn collect_output(
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return Err((status, error.to_string()));
             }
-            Some(EgressItem::Control(_)) => {}
+            Some(EgressItem::Control(_)) | Some(EgressItem::Data(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,

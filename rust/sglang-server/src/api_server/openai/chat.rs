@@ -589,7 +589,7 @@ pub(super) fn chat_event_stream(
                     };
                     continue;
                 }
-                EgressItem::Control(_) => continue,
+                EgressItem::Control(_) | EgressItem::Data(_) => continue,
             };
             if let Some((code, message)) = output
                 .finish_reason

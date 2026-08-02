@@ -77,7 +77,7 @@ pub(super) fn responses_event_stream(
                     };
                     return;
                 }
-                Some(EgressItem::Control(_)) => continue,
+                Some(EgressItem::Control(_)) | Some(EgressItem::Data(_)) => continue,
                 None => {
                     yield Annotated {
                         data: None,
