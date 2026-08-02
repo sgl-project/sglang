@@ -1026,11 +1026,19 @@ class C4IndexerBackendMixin:
             _c4sl = _c4sl.unsqueeze(-1)
 
         # --- Budget detection: route oversize prefill to varlen chunked path ---
-        _is_deep_gemm_path = use_fp4_indexer or (
-            not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            and not is_xpu()
+        # deep_gemm's varlen kernels (fp8_mqa_logits / fp8_fp4_mqa_logits)
+        # assert arch_major >= 9 (Hopper/Blackwell).  Ampere (sm80/sm89) can
+        # import deep_gemm but the kernel refuses at runtime, so the varlen
+        # routing must not fire there.  See sgl-project/sglang#33246.
+        _varlen_arch_ok = is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+        _is_deep_gemm_path = _varlen_arch_ok and (
+            use_fp4_indexer
+            or (
+                not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                and not is_xpu()
+            )
         )
         _is_cp = get_parallel().attn_cp_size != 1
         _is_capture = get_is_capture_mode() or indexer_metadata.use_prefill_cuda_graph

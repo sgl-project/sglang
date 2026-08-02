@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -784,6 +785,36 @@ class TestDSV4RoutingConditions(CustomTestCase):
             _is_capture = False
             if _is_deep_gemm_path and not _is_cp and not _is_capture:
                 C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+
+    def test_sm80_prevents_varlen_routing(self):
+        """On sm80/sm89 (Ampere), deep_gemm varlen kernels assert arch_major
+        >= 9.  The routing guard must prevent varlen routing there."""
+        with (
+            patch(f"{_INDEXER}.is_cuda", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+            patch.object(
+                C4IndexerBackendMixin,
+                "_should_chunk_mqa_logits",
+                side_effect=AssertionError(
+                    "must not be called on sm80 — varlen kernel asserts arch >= 9"
+                ),
+            ),
+        ):
+            _varlen_arch_ok = is_cuda() and (torch.cuda.get_device_capability()[0] >= 9)
+            _is_deep_gemm_path = _varlen_arch_ok
+            _is_cp = False
+            _is_capture = False
+            if _is_deep_gemm_path and not _is_cp and not _is_capture:
+                C4IndexerBackendMixin._should_chunk_mqa_logits(1, 1, 0)
+
+    def test_sm90_allows_varlen_routing(self):
+        """On sm90+ (Hopper/Blackwell), varlen kernels are supported."""
+        with (
+            patch(f"{_INDEXER}.is_cuda", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            _varlen_arch_ok = is_cuda() and (torch.cuda.get_device_capability()[0] >= 9)
+            self.assertTrue(_varlen_arch_ok)
 
 
 if __name__ == "__main__":
