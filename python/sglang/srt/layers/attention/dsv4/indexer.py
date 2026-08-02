@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -883,13 +884,20 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+            # topk_metadata is pre-computed for the full batch c4_seq_lens.
+            # In the chunked path, c4_seq_lens is a slice (shape M < N),
+            # so the metadata shape (N+1, 2) won't match. Regenerate for
+            # the current slice to keep the v2 kernel contract intact.
+            topk_meta = indexer_metadata.topk_metadata
+            if topk_meta.shape[0] != c4_seq_lens.shape[0] + 1:
+                topk_meta = plan_topk_v2(c4_seq_lens)
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
+                topk_meta,
             )
         else:
             topk_transform_512(
