@@ -83,6 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
+- `--encoder-parallel {auto|fold|dp|replicate}`: how the text/image encoders use the GPUs the DiT replica leaves idle during encoding. `auto` (the default for `generate`) TP-folds an encoder wide enough to pay for the per-layer all-reduce and replicates the rest; `fold` forces the shard whenever the dims allow it; `dp` splits a batched encode across ranks (needs `--batching-max-size > 1` to engage, and is the `serve` default); `replicate` encodes redundantly on every rank. `fold` and `replicate` are bitwise-identical to single-GPU encoding. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
@@ -91,10 +92,10 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
-- `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models
+- `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](../models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
-- `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image)
+- `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](../models_with_pe).
 
 ### Sampling and output
 

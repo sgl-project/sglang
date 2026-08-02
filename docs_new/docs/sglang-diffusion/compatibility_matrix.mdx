@@ -612,8 +612,8 @@ Optimization columns are abbreviated to keep the matrix readable:
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
    - Deprecated compatibility: `snapshot` is accepted as an alias for `original` and may be removed after two release cycles.
-5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
-   `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
+5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (16B) and
+   `nvidia/Cosmos3-Super` (64B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).

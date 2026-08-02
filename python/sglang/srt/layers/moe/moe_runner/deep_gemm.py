@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -8,6 +9,9 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
+
+logger = logging.getLogger(__name__)
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -448,9 +452,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        try:
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+        except torch.OutOfMemoryError:
+            logger.error(
+                "Masked grouped-GEMM workspace allocation failed "
+                "(num_groups=%d m=%d n=%d). If this happens under saturated "
+                "dp-attention prefill, try SGLANG_OPT_DG_MASKED_M_CAP=1.",
+                num_groups,
+                m,
+                n,
+            )
+            raise
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
