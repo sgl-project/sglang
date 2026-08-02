@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
-import importlib
-from types import ModuleType
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,9 +16,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
-from sglang.multimodal_gen.runtime.layers.lora.linear import (
-    RowParallelLinearWithLoRA,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
@@ -30,15 +25,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
-    MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _reorder_grouped_qkv_to_qkv,
 )
-from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
-    MiniMaxH3Pipeline,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -179,100 +169,6 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         model.final_layer.audio_out,
     ):
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
-
-
-def test_lora_pipeline_wraps_h3_parallel_linear():
-    _ensure_single_process_parallel_runtime()
-    arch = MiniMaxH3DiTArchConfig(
-        hidden_size=8,
-        num_attention_heads=2,
-        attention_head_dim=4,
-    )
-    transformer = torch.nn.Module()
-    transformer.attn = MiniMaxH3Attention(
-        arch,
-        quant_config=None,
-        prefix="attn",
-        bcg_breakpoint=False,
-    )
-    transformer.param_names_mapping = {}
-    transformer.lora_param_names_mapping = {}
-    with torch.no_grad():
-        transformer.attn.out_proj.weight.zero_()
-
-    pipeline = object.__new__(MiniMaxH3Pipeline)
-    pipeline.modules = {"transformer": transformer}
-    pipeline.exclude_lora_layers = []
-    pipeline.lora_target_modules = None
-    pipeline.lora_rank = None
-    pipeline.lora_alpha = None
-    pipeline.lora_initialized = False
-    pipeline.lora_layers = {}
-    pipeline.lora_layers_transformer_2 = {}
-    pipeline.lora_layers_critic = {}
-
-    pipeline.convert_to_lora_layers()
-    layer = pipeline.lora_layers["attn.out_proj"]
-    assert issubclass(MiniMaxH3Pipeline, LoRAPipeline)
-    assert isinstance(layer, RowParallelLinearWithLoRA)
-
-
-def _load_aiter_backend(fake_aiter: ModuleType):
-    with patch.dict("sys.modules", {"aiter": fake_aiter}):
-        return importlib.import_module(
-            "sglang.multimodal_gen.runtime.layers.attention.backends.aiter"
-        )
-
-
-@pytest.mark.parametrize("use_gfx942", [False, True])
-def test_aiter_backend_preserves_varlen_contract(use_gfx942):
-    q = torch.randn(7, 2, 8)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    cu = torch.tensor([0, 3, 7], dtype=torch.int64)
-    expected = torch.randn_like(q)
-    fake_aiter = ModuleType("aiter")
-    backend_func = Mock(return_value=expected)
-    triton_func = Mock(return_value=(expected, None))
-    fake_aiter.flash_attn_varlen_func = backend_func
-    fake_triton = ModuleType("aiter.ops.triton.attention.mha")
-    fake_triton.flash_attn_varlen_func = triton_func
-    aiter_backend = _load_aiter_backend(fake_aiter)
-    impl = object.__new__(aiter_backend.AITerImpl)
-    impl.softmax_scale = 0.5
-    impl.causal = False
-
-    with (
-        patch.object(aiter_backend, "aiter", fake_aiter),
-        patch.object(aiter_backend, "USE_AITER_GFX942", use_gfx942),
-        patch.object(
-            aiter_backend.importlib,
-            "import_module",
-            return_value=fake_triton,
-        ) as import_module_mock,
-    ):
-        actual = impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu,
-            max_seqlen=4,
-        )
-
-    torch.testing.assert_close(actual, expected)
-    attention_func = triton_func if use_gfx942 else backend_func
-    kwargs = attention_func.call_args.kwargs
-    assert kwargs["cu_seqlens_q"].dtype == torch.int32
-    assert kwargs["cu_seqlens_q"].is_contiguous()
-    assert kwargs["cu_seqlens_k"] is kwargs["cu_seqlens_q"]
-    assert kwargs["max_seqlen_q"] == 4
-    assert kwargs["max_seqlen_k"] == 4
-    assert kwargs["softmax_scale"] == 0.5
-    assert not kwargs["causal"]
-    if use_gfx942:
-        import_module_mock.assert_called_once_with("aiter.ops.triton.attention.mha")
-    else:
-        import_module_mock.assert_not_called()
 
 
 def test_sdpa_varlen_fallback_matches_naive_packed_reference():

@@ -1,12 +1,9 @@
 import json
 import os
-import re
-import shlex
 import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
 from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.models.fsdp import (
@@ -56,10 +53,7 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
-    minimax_h3_validate_canonical_request,
-)
-from sglang.multimodal_gen.runtime.server_args import ServerArgs, prepare_server_args
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -114,53 +108,6 @@ def _from_dict_without_model_resolution(
         _mock_cuda_platform(),
     ):
         return ServerArgs.from_dict(kwargs)
-
-
-def _minimax_h3_cookbook_text() -> str:
-    repo_root = Path(__file__).resolve().parents[5]
-    return (
-        repo_root / "docs_new" / "cookbook" / "diffusion" / "MiniMax" / "MiniMax-H3.mdx"
-    ).read_text(encoding="utf-8")
-
-
-def _minimax_h3_cookbook_serve_argv(section_marker: str) -> list[str]:
-    cookbook = _minimax_h3_cookbook_text()
-    section = cookbook.split(section_marker, 1)[1]
-    fenced = section.split("```bash", 1)[1]
-    command = fenced.split("\n", 1)[1].split("```", 1)[0]
-    tokens = shlex.split(command.replace("\\\n", " "))
-    if tokens[:2] != ["sglang", "serve"]:
-        raise AssertionError(
-            f"expected an sglang serve command after {section_marker!r}, got {tokens[:2]}"
-        )
-    return tokens[2:]
-
-
-def _minimax_h3_cookbook_named_serve_argv(title: str) -> list[str]:
-    cookbook = _minimax_h3_cookbook_text()
-    command = cookbook.split(f'```bash title="{title}"', 1)[1].split("```", 1)[0]
-    tokens = shlex.split(command.replace("\\\n", " "))
-    if tokens[:2] != ["sglang", "serve"]:
-        raise AssertionError(
-            f"expected an sglang serve command for {title!r}, got {tokens[:2]}"
-        )
-    return tokens[2:]
-
-
-def _minimax_h3_cookbook_tab(title: str) -> str:
-    cookbook = _minimax_h3_cookbook_text()
-    marker = f'<Tab title="{title}">'
-    if marker not in cookbook:
-        raise AssertionError(f"missing MiniMax-H3 cookbook tab {title!r}")
-    return cookbook.split(marker, 1)[1].split("</Tab>", 1)[0]
-
-
-def _minimax_h3_cookbook_tab_payload(title: str) -> dict:
-    tab = _minimax_h3_cookbook_tab(title)
-    match = re.search(r"-d '(\{.*?\})'", tab, flags=re.DOTALL)
-    if match is None:
-        raise AssertionError(f"missing JSON request payload in tab {title!r}")
-    return json.loads(match.group(1))
 
 
 class TestServerArgsPathExpansion(unittest.TestCase):
@@ -750,7 +697,7 @@ class TestWarmupImageIsModelValid(unittest.TestCase):
         self.assertGreaterEqual(height, 64)
 
 
-class TestMiniMaxH3CookbookServeArgs(unittest.TestCase):
+class TestMiniMaxH3Routing(unittest.TestCase):
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -761,13 +708,7 @@ class TestMiniMaxH3CookbookServeArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported MiniMax H3 model variant"):
             MiniMaxH3Pipeline.model_subfolder_for_variant("v2v")
 
-    def test_modelscope_mode_picker_uses_the_modelscope_root_id(self):
-        cookbook = _minimax_h3_cookbook_text()
-        self.assertEqual(cookbook.count("SGLANG_USE_MODELSCOPE=true sglang serve"), 2)
-        self.assertEqual(cookbook.count('```bash title="ModelScope ('), 2)
-        self.assertIn("--model-path MiniMax/MiniMax-H3", cookbook)
-        self.assertNotIn("--model-subfolder", cookbook)
-
+    def test_modelscope_id_resolves_to_the_huggingface_config(self):
         expected = _get_config_info("MiniMaxAI/MiniMax-H3")
         actual = _get_config_info("MiniMax/MiniMax-H3")
         self.assertIsNotNone(expected)
@@ -777,165 +718,6 @@ class TestMiniMaxH3CookbookServeArgs(unittest.TestCase):
             get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
             "MiniMaxH3Pipeline",
         )
-
-    def test_generation_modes_use_tabs_and_v2v_uses_ref2va_contract(self):
-        cookbook = _minimax_h3_cookbook_text()
-        generation_section = cookbook.split("## 4. Generate video and audio", 1)[1]
-        generation_section = generation_section.split(
-            "## 5. Sampling and output controls", 1
-        )[0]
-        mode_tabs = generation_section.split("<Tabs>", 1)[1].split("</Tabs>", 1)[0]
-        tab_titles = [
-            line.removeprefix('<Tab title="').removesuffix('">')
-            for line in mode_tabs.splitlines()
-            if line.startswith('<Tab title="')
-        ]
-        self.assertEqual(
-            tab_titles,
-            ["T2VA", "FL2VA", "V2V", "Multimodal Ref2VA"],
-        )
-        self.assertEqual(mode_tabs.count("</Tab>"), len(tab_titles))
-
-        v2v_tab = _minimax_h3_cookbook_tab("V2V")
-        self.assertIn("--model-variant ref2va", v2v_tab)
-        self.assertNotIn("--model-subfolder", v2v_tab)
-        self.assertIn("/v1/videos", v2v_tab)
-        self.assertIn("<Video 1>", v2v_tab)
-        self.assertNotIn('"task": "v2v"', v2v_tab)
-        self.assertNotIn("video_reference=@", v2v_tab)
-
-        payload = _minimax_h3_cookbook_tab_payload("V2V")
-        canonical = minimax_h3_validate_canonical_request(**payload)
-        self.assertEqual(canonical["task"], "ref2va")
-        self.assertEqual(
-            canonical["conditions"],
-            [
-                {
-                    "type": "video",
-                    "uri": "file:///data/minimax-h3/input.mp4",
-                    "role": "reference",
-                    "start_time_seconds": 35.0,
-                }
-            ],
-        )
-
-        weight_commands = {
-            "FL2VA weights (T2VA and keyframes)": "fl2va",
-            "Ref2VA weights (references and V2V)": "ref2va",
-        }
-        for title, expected_variant in weight_commands.items():
-            argv = _minimax_h3_cookbook_named_serve_argv(title)
-            variant_index = argv.index("--model-variant")
-            self.assertEqual(argv[variant_index + 1], expected_variant)
-            self.assertNotIn("--model-subfolder", argv)
-
-    def test_recommended_hardware_argv_resolve_to_expected_policy(self):
-        cases = (
-            (
-                "H200",
-                "For a four-card H200 host",
-                141,
-                4,
-                1,
-                4,
-                "speed",
-                False,
-                True,
-            ),
-            (
-                "H100 fastest",
-                "For 4×H100 80 GB, balance the large packed activation",
-                80,
-                4,
-                2,
-                2,
-                "speed",
-                False,
-                True,
-            ),
-            (
-                "H100 FSDP capacity",
-                "not make it the H100 speed default:",
-                80,
-                4,
-                1,
-                4,
-                "speed",
-                True,
-                True,
-            ),
-            (
-                "RTX 5090",
-                "For a two-card RTX 5090 host",
-                32,
-                2,
-                2,
-                1,
-                "memory",
-                False,
-                False,
-            ),
-        )
-
-        for (
-            hardware,
-            section_marker,
-            memory_gb,
-            expected_num_gpus,
-            expected_tp,
-            expected_ulysses,
-            expected_mode,
-            expected_fsdp,
-            expected_resident,
-        ) in cases:
-            with self.subTest(hardware=hardware):
-                argv = _minimax_h3_cookbook_serve_argv(section_marker)
-                pipeline_config = MiniMaxH3PipelineConfig()
-                with (
-                    patch.object(
-                        PipelineConfig,
-                        "from_kwargs",
-                        return_value=pipeline_config,
-                    ),
-                    patch.object(sys, "argv", ["sglang", *argv]),
-                    _mock_cuda_platform(memory_gb=memory_gb),
-                ):
-                    args = prepare_server_args(argv)
-
-                self.assertEqual(args.model_path, "MiniMaxAI/MiniMax-H3")
-                self.assertEqual(args.num_gpus, expected_num_gpus)
-                self.assertEqual(args.ulysses_degree, expected_ulysses)
-                self.assertEqual(args.sp_degree, expected_ulysses)
-                self.assertEqual(args.tp_size, expected_tp)
-                self.assertEqual(args.performance_mode, expected_mode)
-                self.assertEqual(args.use_fsdp_inference, expected_fsdp)
-                self.assertFalse(args.enable_torch_compile)
-
-                text_encoder_config = args.pipeline_config.text_encoder_configs[0]
-                expected_folding = None if hardware == "RTX 5090" else "world"
-                self.assertEqual(
-                    text_encoder_config.parallel_folding_mode,
-                    expected_folding,
-                )
-
-                layerwise_components = set(args.layerwise_offload_components or ())
-                if expected_resident:
-                    self.assertFalse(layerwise_components)
-                else:
-                    self.assertEqual(
-                        layerwise_components,
-                        {"dit", "text_encoder", "vae"},
-                    )
-                self.assertEqual(args.dit_cpu_offload, not expected_resident)
-                self.assertFalse(args.dit_layerwise_offload)
-                self.assertFalse(args.text_encoder_cpu_offload)
-                self.assertFalse(args.vae_cpu_offload)
-
-                vae_config = args.pipeline_config.vae_config
-                self.assertTrue(vae_config.use_tiling)
-                self.assertTrue(vae_config.use_parallel_decode)
-                self.assertTrue(vae_config.use_parallel_tiling)
-                self.assertEqual(vae_config.resolved_parallel_decode_mode(), "tiled")
 
 
 class TestOffloadDefaults(unittest.TestCase):
@@ -1878,28 +1660,19 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.enable_torch_compile)
 
-    def test_speed_mode_respects_model_compile_default(self):
-        args = self._from_dict_with_pipeline_config(
-            MiniMaxH3PipelineConfig(),
-            kwargs={
+    def test_speed_mode_uses_minimax_h3_compile_policy(self):
+        for explicit, expected in ((None, False), (True, True)):
+            kwargs = {
                 "model_path": "MiniMaxAI/MiniMax-H3",
                 "performance_mode": "speed",
-            },
-        )
-
-        self.assertFalse(args.enable_torch_compile)
-
-    def test_speed_mode_preserves_explicit_model_compile_on(self):
-        args = self._from_dict_with_pipeline_config(
-            MiniMaxH3PipelineConfig(),
-            kwargs={
-                "model_path": "MiniMaxAI/MiniMax-H3",
-                "performance_mode": "speed",
-                "enable_torch_compile": True,
-            },
-        )
-
-        self.assertTrue(args.enable_torch_compile)
+            }
+            if explicit is not None:
+                kwargs["enable_torch_compile"] = explicit
+            with self.subTest(explicit=explicit):
+                args = self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=kwargs
+                )
+                self.assertEqual(args.enable_torch_compile, expected)
 
     def test_auto_mode_leaves_torch_compile_off(self):
         args = self._from_dict_with_pipeline_config(

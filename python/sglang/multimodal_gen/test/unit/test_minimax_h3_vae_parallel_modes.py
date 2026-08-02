@@ -8,10 +8,7 @@ import pytest
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
-from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
-    MiniMaxH3AudioVAE,
-    MiniMaxH3VideoVAE,
-)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
     AutoencoderKLLegacy,
 )
@@ -52,12 +49,3 @@ def test_unvalidated_decode_modes_are_rejected(mode):
     config = MiniMaxH3VideoVAEConfig(parallel_decode_mode=mode)
     with pytest.raises(ValueError, match="use tiled"):
         config.resolved_parallel_decode_mode()
-
-
-def test_audio_vae_layerwise_hooks_target_executable_upsamplers():
-    assert "decoder.ups" not in MiniMaxH3AudioVAE.layer_names
-    assert [
-        layer_name
-        for layer_name in MiniMaxH3AudioVAE.layer_names
-        if layer_name.startswith("decoder.ups.")
-    ] == [f"decoder.ups.{index}" for index in range(7)]

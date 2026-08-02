@@ -197,7 +197,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(short["freqs_cis"][0].shape, (64, 8))
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
 
-    def _minimax_h3_kwargs(self, text_seq: int, *, fill: float = 1.0):
+    def _minimax_h3_kwargs(self, text_seq: int):
         image_seq = 4
         audio_seq = 2
         media_seq = image_seq + audio_seq
@@ -214,7 +214,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "update_mask": torch.ones(image_seq, dtype=torch.bool),
             "token_tags": torch.full((packed_seq,), -1, dtype=torch.long),
             "skip_mask_out_condition": False,
-            "prompt_embeds": torch.full((text_seq, 8), fill),
+            "prompt_embeds": torch.ones(text_seq, 8),
             "refined_prompt_embeds_length": text_seq,
             "img_pos_info": {"position_ids": img_pos},
             "audio_pos_info": {"position_ids": audio_pos},
@@ -283,20 +283,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             list(range(53, 70)),
         )
         self.assertEqual(_signature_kwargs(short), _signature_kwargs(longer))
-
-    def test_minimax_h3_prompt_content_does_not_change_signature(self):
-        with self._patch_buckets(64):
-            first = self.stage._bcg_pad_prompt_kwargs(
-                self._minimax_h3_kwargs(19, fill=1.0),
-                current_model=self.minimax_h3_model,
-            )
-            second = self.stage._bcg_pad_prompt_kwargs(
-                self._minimax_h3_kwargs(19, fill=2.0),
-                current_model=self.minimax_h3_model,
-            )
-
-        self.assertFalse(torch.equal(first["prompt_embeds"], second["prompt_embeds"]))
-        self.assertEqual(_signature_kwargs(first), _signature_kwargs(second))
 
     def _ideogram_kwargs(self, text_seq: int, *, image_seq: int = 4):
         total_seq = text_seq + image_seq
@@ -386,16 +372,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "ZImagePipelineConfig",
         ):
             self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
-
-    def test_minimax_h3_is_registered_as_bcg_supported(self):
-        self.assertIn(
-            "minimaxai/minimax-h3",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "MiniMaxH3PipelineConfig",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
-        )
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()

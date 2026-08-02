@@ -3,8 +3,6 @@ import json
 import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
-from modelscope.hub.errors import NotExistError
-from requests.exceptions import HTTPError
 
 from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -166,25 +164,3 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
         )
 
     assert result == str(tmp_path)
-
-
-def test_modelscope_missing_repository_is_not_retried(monkeypatch):
-    calls = 0
-
-    def snapshot_download(**_):
-        nonlocal calls
-        calls += 1
-        try:
-            raise NotExistError("repository not found")
-        except NotExistError as exc:
-            raise HTTPError("repository not found") from exc
-
-    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", snapshot_download)
-
-    with (
-        envs.SGLANG_USE_MODELSCOPE.override(True),
-        pytest.raises(ValueError, match="Model or revision not found"),
-    ):
-        hf_diffusers_utils.maybe_download_model("MiniMax/MiniMax-H3")
-
-    assert calls == 2

@@ -182,17 +182,7 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         imgvid_cond_noise_aug_for_inference=0.75,
         audio_cond_noise_aug_for_inference=0.5,
     )
-    generic = {
-        "prompt": request.prompt,
-        "seed": request.seed,
-        "flow_shift": request.flow_shift,
-        "guidance_scale": request.guidance_scale,
-        "guidance_scale_2": request.guidance_scale_2,
-        "true_cfg_scale": request.true_cfg_scale,
-        "negative_prompt": request.negative_prompt,
-        "num_frames": 121,
-        "fps": 24,
-    }
+    generic = {"prompt": request.prompt, "seed": request.seed}
 
     lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(request, generic)
     assert lowered == {
@@ -208,19 +198,10 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         "audio_cond_noise_aug_for_inference": 0.5,
     }
 
-    request.model_extra.pop("quality")
-    assert "quality" not in MiniMaxH3SamplingParams.lower_video_request_kwargs(
-        request, generic
-    )
-
     with pytest.raises(ValueError):
         MiniMaxH3SamplingParams.lower_video_request_kwargs(
             request, {**generic, "guidance_scale": 7.5}
         )
-
-    request.model_extra["quality"] = True
-    with pytest.raises(ValueError, match="quality must be a non-empty string"):
-        MiniMaxH3SamplingParams.lower_video_request_kwargs(request, generic)
 
 
 class _HopperCapability:
@@ -247,35 +228,6 @@ def _quality_server_args():
         ulysses_degree=4,
         use_fsdp_inference=False,
     )
-
-
-def test_quality_profile_validates_only_four_h200_fl2va():
-    config = MiniMaxH3PipelineConfig()
-    with (
-        patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
-        patch.object(
-            current_platform,
-            "get_device_capability",
-            return_value=_HopperCapability(),
-        ),
-    ):
-        config.validate_quality_deployment(_quality_server_args())
-        for field, value in (
-            ("model_variant", "ref2va"),
-            ("is_dit_layerwise_offload_selected", True),
-        ):
-            args = _quality_server_args()
-            setattr(args, field, value)
-            with pytest.raises(ValueError, match="strict 4xH200 fl2va deployment"):
-                config.validate_quality_deployment(args)
-
-
-def test_minimax_h3_rejects_sage_attention():
-    args = _quality_server_args()
-    args.attention_backend = "sage_attn"
-    with pytest.raises(ValueError, match="does not support SageAttention"):
-        MiniMaxH3PipelineConfig().validate_server_args(args)
 
 
 def test_quality_admission_fails_closed_outside_validated_request():

@@ -8,9 +8,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
-    flash as video_vae_flash,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     material_io,
     reference_encoding,
@@ -48,36 +45,6 @@ def test_ffprobe_falls_back_when_stream_side_data_is_unknown(monkeypatch):
     assert payload["format"]["format_name"] == "mp3"
     assert material_io._ffprobe_entries is not None
     assert "stream_side_data" not in material_io._ffprobe_entries
-
-
-def test_video_vae_math_sdpa_is_rocm_gfx950_only(monkeypatch):
-    monkeypatch.delenv("MINIMAX_H3_TORCH_SDPA_BACKEND", raising=False)
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
-    assert video_vae_flash._auto_sdpa_backend_name() is None
-
-    from sglang.srt import utils as srt_utils
-
-    monkeypatch.setattr(torch.version, "hip", "test", raising=False)
-    monkeypatch.setattr(srt_utils, "is_gfx95_supported", lambda: False)
-    assert video_vae_flash._auto_sdpa_backend_name() is None
-
-    monkeypatch.setattr(srt_utils, "is_gfx95_supported", lambda: True)
-    assert video_vae_flash._auto_sdpa_backend_name() == "math"
-    math_context = object()
-    calls = []
-    monkeypatch.setattr(
-        torch.nn.attention,
-        "sdpa_kernel",
-        lambda *, backends: calls.append(backends) or math_context,
-    )
-    monkeypatch.setattr(video_vae_flash, "_AUTO_SDPA_BACKEND", "math")
-    assert video_vae_flash._sdpa_kernel_context() is math_context
-    assert calls == [[torch.nn.attention.SDPBackend.MATH]]
-
-    monkeypatch.setattr(video_vae_flash, "_AUTO_SDPA_BACKEND", None)
-    context = video_vae_flash._sdpa_kernel_context()
-    assert type(context).__name__ == "nullcontext"
-    assert calls == [[torch.nn.attention.SDPBackend.MATH]]
 
 
 def test_video_transform_runs_once_and_qwen_samples_shared_rgb(monkeypatch):

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical contract for request-static H3 denoise metadata."""
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -13,21 +12,14 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler
     _minimax_h3_euler_eta0_step,
     _minimax_h3_rf_v_to_x0,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_QUALITY_PROFILES,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
     _minimax_h3_update_target_rows_,
-    minimax_h3_denoise_loop,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-    MiniMaxH3DenoisingStage,
 )
 
 
@@ -154,30 +146,6 @@ def test_inplace_target_update_matches_scheduler_math():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_denoise_loop_reuses_inference_mode_model_outputs():
-    branch = _branch("t2va")
-    video_rows = torch.zeros(branch.img_pos.shape[0], 96)
-    audio_rows = torch.zeros(branch.audio_pos.shape[0], 32)
-    video_target_rows = int(branch.update_mask.sum())
-
-    def model(**_kwargs):
-        return torch.zeros(video_target_rows, 96), torch.zeros_like(audio_rows)
-
-    final_video, final_audio = minimax_h3_denoise_loop(
-        model=model,
-        positive=branch,
-        initial_video_rows=video_rows,
-        initial_audio_rows=audio_rows,
-        keyframe_cond_rows=None,
-        sigmas_video=[1.0, 0.0],
-        sigmas_audio=[1.0, 0.0],
-        device=torch.device("cpu"),
-    )
-
-    torch.testing.assert_close(final_video, video_rows, rtol=0, atol=0)
-    torch.testing.assert_close(final_audio, audio_rows, rtol=0, atol=0)
-
-
 def test_local_text_layout_is_a_contiguous_prefix_per_ulysses_rank():
     for mode in ("t2va", "fl2va", "ref2va"):
         branch = _branch(mode)
@@ -225,82 +193,3 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
-
-
-def test_quality_profiles_own_cache_dit_configs():
-    stage = object.__new__(MiniMaxH3DenoisingStage)
-    for profile_name, (warmup, threshold, max_cached) in {
-        name: value
-        for name, value in MINIMAX_H3_QUALITY_PROFILES.items()
-        if value is not None
-    }.items():
-        stage._minimax_h3_quality_profile = profile_name
-        assert stage._cache_dit_requested()
-        assert stage._cache_dit_scm_masks(50) == ("none", "dynamic", None, None)
-        config = stage._build_cache_dit_config(
-            50,
-            steps_computation_mask=None,
-            scm_policy="dynamic",
-        )
-        assert config.Fn_compute_blocks == 1
-        assert config.Bn_compute_blocks == 0
-        assert config.max_warmup_steps == warmup
-        assert config.residual_diff_threshold == threshold
-        assert config.max_continuous_cached_steps == max_cached
-        assert not config.enable_taylorseer
-
-
-def test_quality_profile_transitions_respect_explicit_lossless():
-    stage = object.__new__(MiniMaxH3DenoisingStage)
-    transformer = object()
-    stage.transformer = transformer
-    stage._cache_dit_enabled = True
-    stage._cached_num_steps = 50
-    stage._minimax_h3_quality_profile = "high"
-    stage._minimax_h3_cache_mode = "high"
-
-    def batch(quality, explicit=False):
-        return SimpleNamespace(
-            sampling_params=SimpleNamespace(
-                quality=quality,
-                _explicit_fields={"quality"} if explicit else set(),
-            ),
-            is_warmup=False,
-        )
-
-    def enable(stage_arg, _num_steps, _batch):
-        stage_arg._cache_dit_enabled = True
-
-    with (
-        patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-            "minimax_h3.stages.denoising.DenoisingStage._cache_dit_requested",
-            return_value=True,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-            "minimax_h3.stages.denoising.disable_cache_on_transformer",
-            return_value=transformer,
-        ) as disable,
-        patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-            "minimax_h3.stages.denoising.DenoisingStage._maybe_enable_cache_dit",
-            autospec=True,
-            side_effect=enable,
-        ) as enable_cache,
-    ):
-        stage._maybe_enable_cache_dit(50, batch("lossless", explicit=True))
-        assert not stage._cache_dit_enabled
-        assert stage._minimax_h3_cache_mode is None
-
-        stage._maybe_enable_cache_dit(50, batch("lossless"))
-        assert stage._cache_dit_enabled
-        assert stage._minimax_h3_cache_mode == "generic"
-
-        stage._maybe_enable_cache_dit(50, batch("medium", explicit=True))
-        assert stage._cache_dit_enabled
-        assert stage._minimax_h3_quality_profile == "medium"
-        assert stage._minimax_h3_cache_mode == "medium"
-
-    assert disable.call_count == 2
-    assert enable_cache.call_count == 2

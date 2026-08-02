@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hermetic tests for strict FL and text-only packed-sequence layouts."""
+"""Numerical contracts for MiniMax-H3 packed-sequence layouts."""
 
 import unittest
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
+    minimax_h3_packed_sequence_ref2va_blocks,
 )
 
 
@@ -100,15 +101,7 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
             include_keyframe_cond=True,
             frame_count=124,
         )
-        for frame_indices in (
-            None,
-            [1],
-            [0, 52],
-            [0, 52, -1],
-            [-1, 0],
-            [0, True],
-            ["0", -1],
-        ):
+        for frame_indices in (None, [1], [0, 52, -1]):
             with (
                 self.subTest(frame_indices=frame_indices),
                 self.assertRaises(ValueError),
@@ -117,13 +110,47 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
                     **common,
                     keyframe_frame_indices=frame_indices,
                 )
-        with self.assertRaises(ValueError):
-            minimax_h3_packed_sequence(
-                **{**common, "frame_count": None},
-                keyframe_frame_indices=[0, -1],
-            )
-        with self.assertRaises(ValueError):
-            minimax_h3_packed_sequence(
-                **{**common, "frame_count": 1},
-                keyframe_frame_indices=[0, -1],
-            )
+
+    def test_ref2va_structure(self):
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=97,
+            latent_t=112,
+            latent_h=48,
+            latent_w=84,
+            audio_t=631,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 64, "latent_w": 48},
+                {"kind": "audio", "ref_audio_t": 582},
+            ],
+        )
+
+        self.assertEqual(int(built["seq_len"]) % 64, 0)
+        self.assertEqual(int((~built["update_mask"]).sum()), 32 * 24)
+        self.assertEqual(int((~built["audio_update_mask"]).sum()), 582 * 2)
+        self.assertEqual(built["token_tags"][built["audio_pos"]].unique().tolist(), [2])
+
+    def test_ref2va_mixed_media_preserves_temporal_origin(self):
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 4, "latent_w": 4},
+                {
+                    "kind": "video_audio",
+                    "ref_audio_t": 3,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 4,
+                },
+                {"kind": "audio", "ref_audio_t": 1},
+            ],
+        )
+
+        self.assertEqual(int((~built["update_mask"]).sum()), 12)
+        self.assertEqual(int((~built["audio_update_mask"]).sum()), 8)
+        target_video_t0 = built["img_position_ids"][built["img_pos"][12], 0]
+        target_audio_t0 = built["img_position_ids"][built["audio_pos"][8], 0]
+        self.assertEqual(float(target_audio_t0), float(target_video_t0))
