@@ -46,9 +46,9 @@ logger = logging.getLogger(__name__)
 class NativeMmHost:
     """Builds and validates the native Rust MM pipeline for one model.
 
-    Construction loads the same model-specific ``mm_processor`` stack the
-    Python TokenizerManager would build — not to process requests (the Rust
-    worker pool does that natively, GIL-free), but as the source of truth
+    Construction registers the same model-specific ``mm_processor`` mapping
+    the Python TokenizerManager would build — not to process requests (the
+    Rust worker pool does that natively, GIL-free), but as the source of truth
     :meth:`resolve_native_spec` validates and resolves the pipeline parameters
     from. At drain time :meth:`build_native_mm` wraps the Rust-produced
     buffers into the scheduler's ``MultimodalProcessorOutput``.
@@ -78,37 +78,22 @@ class NativeMmHost:
     ):
         # Lazy imports: this class is only instantiated for multimodal models
         # under SGLANG_RUST_SERVER.
-        from sglang.srt.managers.multimodal_processor import (
-            get_mm_processor,
-            import_processors,
-        )
-        from sglang.srt.managers.tokenizer_manager import (
-            determine_tensor_transport_mode,
-            get_processor_wrapper,
-        )
+        from sglang.srt.managers.multimodal_processor import import_processors
+        from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
 
         self.server_args = server_args
         self.model_config = model_config
         # Rust mm-worker threads == max concurrently-processed mm requests.
         self.mm_workers = server_args.mm_processor_worker_num or self.AUTO_MM_WORKERS
 
-        # Same processor stack the Python TokenizerManager builds
+        # Same processor mapping the Python TokenizerManager builds
         # (init_tokenizer_and_processor, multimodal branch). The HF
         # AutoProcessor is reused from the caller's init_tokenizer (already
         # loaded, identical construction args) when available.
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        _processor = processor or get_processor_wrapper(self.server_args)
-        transport_mode = determine_tensor_transport_mode(self.server_args)
-        self.mm_processor = get_mm_processor(
-            self.model_config.hf_config,
-            self.server_args,
-            _processor,
-            transport_mode,
-            model_config=self.model_config,
-        )
-        self._processor = _processor
+        self._processor = processor or get_processor_wrapper(self.server_args)
         # Set by resolve_native_spec() when the model family has a pure-Rust
         # pipeline; consumed by build_native_mm (the drain-time adapter).
         self._native: Optional[Dict[str, Any]] = None
@@ -122,11 +107,15 @@ class NativeMmHost:
         approximating it."""
         import json
 
+        from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
         from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
         hf_config = self.model_config.hf_config
         if (
-            type(self.mm_processor) is not QwenVLImageProcessor
+            get_mm_processor_cls(
+                hf_config, self.server_args, model_config=self.model_config
+            )
+            is not QwenVLImageProcessor
             or getattr(hf_config, "model_type", None)
             not in self.NATIVE_QWEN_MODEL_TYPES
         ):

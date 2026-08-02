@@ -54,6 +54,7 @@ def make_processor(config):
     )
     hf_config = SimpleNamespace(
         model_type="qwen2_5_vl",
+        architectures=["Qwen2_5_VLForConditionalGeneration"],
         vision_start_token_id=1,
         image_token_id=2,
         vision_end_token_id=3,
@@ -61,6 +62,9 @@ def make_processor(config):
         vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=2),
     )
     server_args = SimpleNamespace(
+        # Non-auto, so the native-MM gate never calls
+        # get_resolved_model_impl on this SimpleNamespace.
+        model_impl="sglang",
         keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
         disable_fast_image_processor=True,

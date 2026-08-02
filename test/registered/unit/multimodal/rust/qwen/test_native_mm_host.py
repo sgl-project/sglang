@@ -49,9 +49,12 @@ class TestQwenNativeMmHost(CustomTestCase):
     def make_host(self):
         """A drain-adapter host whose spec comes from ``resolve_native_spec()`` — the
         production extraction path — rather than a hand-built dict."""
+        # Populate the processor mapping the gate resolves from, as __init__ does.
+        from sglang.srt.managers.multimodal_processor import import_processors
+
+        import_processors("sglang.srt.multimodal.processors")
         host = NativeMmHost.__new__(NativeMmHost)
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
-        host.mm_processor = self.processor
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
         host._native = None
