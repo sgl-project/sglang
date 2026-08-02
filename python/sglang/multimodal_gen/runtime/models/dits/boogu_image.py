@@ -39,6 +39,23 @@ ADALN_EMBED_DIM = 1024
 TIMESTEP_FREQ_DIM = 256
 NUM_ADALN_MODULATION_PARAMS = 4
 
+# Head sizes FA's tuned kernels are compiled for -- must stay in sync with
+# FlashAttentionBackend.get_supported_head_sizes(). Boogu's head_dim=120 is
+# outside this set, so we zero-pad Q/K/V in the head_dim direction up to the
+# next-larger bucket (128) before dispatching to attention: Q_pad K_pad^T =
+# Q K^T + 0, so with softmax_scale pinned at 1/sqrt(head_dim) the logits are
+# unchanged and the padded output tail is 0 (sliced off). Same pattern as
+# sana_wm's _sana_wm_sdpa (head_dim=112), minus that model's baked-in
+# 1/sqrt(pad) training convention -- Boogu was trained with 1/sqrt(120).
+_FA_HEAD_DIM_BUCKETS = (32, 64, 96, 128, 160, 192, 224, 256)
+
+
+def _pad_to_fa_bucket(head_dim: int) -> int:
+    for bucket in _FA_HEAD_DIM_BUCKETS:
+        if head_dim <= bucket:
+            return bucket
+    return head_dim  # > 256: FA won't help either, leave caller on SDPA
+
 
 class BooguRMSNorm(nn.Module):
 
@@ -245,12 +262,16 @@ class BooguAttention(nn.Module):
             ]
         )
 
+        # Route through FA by lying to the backend selector about head_size --
+        # softmax_scale must stay pinned to the model's native head_dim, since
+        # USPAttention's None-default would derive 1/sqrt(padded) which is wrong.
+        self._padded_head_dim = _pad_to_fa_bucket(self.head_dim)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
@@ -297,7 +318,14 @@ class BooguAttention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self._qkv(hidden_states)
         q, k = self._norm_and_rope(q, k, freqs_cis)
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            q = nn.functional.pad(q, (0, pad))
+            k = nn.functional.pad(k, (0, pad))
+            v = nn.functional.pad(v, (0, pad))
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
+        if pad:
+            out = out[..., : self.head_dim]
         out, _ = self.to_out[0](out.flatten(2))
         return out
 
@@ -403,12 +431,14 @@ class BooguJointAttention(nn.Module):
             ]
         )
 
+        # See _pad_to_fa_bucket / BooguAttention.__init__ for the rationale.
+        self._padded_head_dim = _pad_to_fa_bucket(self.head_dim)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
@@ -463,7 +493,14 @@ class BooguJointAttention(nn.Module):
             )
         query, key = apply_rope_per_sample(query, key, freqs_cis)
 
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            query = nn.functional.pad(query, (0, pad))
+            key = nn.functional.pad(key, (0, pad))
+            value = nn.functional.pad(value, (0, pad))
         joint = self.attn(query, key, value, attn_mask_meta=attn_mask_meta)
+        if pad:
+            joint = joint[..., : self.head_dim]
         joint = joint.flatten(2)
 
         instruct_out, img_out = split_instruct_image(
