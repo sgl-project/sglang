@@ -15,6 +15,7 @@ read of that slot.
 
 import logging
 import os
+import socket
 from collections import OrderedDict
 
 import torch
@@ -136,11 +137,32 @@ class IpcA2AState:
         from torch.utils.cpp_extension import load_inline
 
         self.rank = dist.get_rank(group=group)
+        if dist.get_world_size(group=group) != 2:
+            raise _Unsupported("only 2-rank groups are supported")
         dev = torch.cuda.current_device()
-        if not torch.cuda.can_device_access_peer(dev, 1 - dev):
-            raise _Unsupported("no peer-to-peer access between the two devices")
+        device_locations: list[tuple[str, int] | None] = [None, None]
+        my_location = (socket.gethostname(), dev)
+        dist.all_gather_object(device_locations, my_location, group=group)
+        peer_location = device_locations[1 - self.rank]
+        assert peer_location is not None
+        peer_host, peer_dev = peer_location
+
+        can_access_peer = False
+        if peer_host == my_location[0] and peer_dev != dev:
+            try:
+                can_access_peer = torch.cuda.can_device_access_peer(dev, peer_dev)
+            except (RuntimeError, ValueError):
+                pass
+        # Every rank must make the same transport decision. Otherwise one rank
+        # can enter the IPC exchange while its peer falls back to NCCL.
+        supported = torch.tensor(
+            [can_access_peer], dtype=torch.int32, device=torch.device("cuda", dev)
+        )
+        dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=group)
+        if supported.item() == 0:
+            raise _Unsupported("no peer-to-peer access within the 2-rank group")
         # kernel-level dereference of peer mappings needs explicit peer access
-        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(1 - dev, 0)
+        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
         build_dir = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, f"ipc_a2a_sync_r{dev}"
         )
@@ -257,7 +279,11 @@ IPC_A2A = IpcA2AState()
 def ipc_a2a_ready(group) -> bool:
     """True when the IPC transport is enabled and initialized (initializes
     lazily on the first eager call; never inside a graph capture)."""
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
     if not envs.SGLANG_DIFFUSION_IPC_A2A or IPC_A2A.failed:
+        return False
+    if not current_platform.is_cuda():
         return False
     if IPC_A2A.inited:
         return True
