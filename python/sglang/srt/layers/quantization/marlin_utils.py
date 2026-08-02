@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -26,7 +27,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
-from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils import get_device_capability, is_cuda, round_up
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -224,6 +225,85 @@ def check_marlin_supports_shape(
     except ValueError as e:
         return False, e.__str__()
     return True, None
+
+
+def marlin_padded_nk(size_n: int, size_k: int, group_size: int = -1) -> tuple[int, int]:
+    """Return a minimally padded Marlin GEMM shape.
+
+    Marlin supports two thread-tile families: (N % 64, K % 128) or
+    (N % 128, K % 64). Padding keeps K divisible by the quant group size so
+    grouped scales remain whole.
+    """
+    group = group_size if group_size > 0 else 1
+    candidates = (
+        (round_up(size_n, 64), round_up(size_k, math.lcm(128, group))),
+        (round_up(size_n, 128), round_up(size_k, math.lcm(64, group))),
+    )
+    padded_nk = min(candidates, key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]))
+    if padded_nk != (size_n, size_k):
+        logger.warning_once(
+            "Marlin requires thread-tile padding for some weight shapes in "
+            "this model. Activations and/or outputs of the padded layers are "
+            "padded/sliced on every forward; performance may be degraded."
+        )
+    return padded_nk
+
+
+def marlin_repacked_nk(qweight: torch.Tensor, num_bits: int) -> tuple[int, int]:
+    """Recover the padded (N, K) used to repack a Marlin weight."""
+    pack_factor = 32 // num_bits
+    size_k = qweight.size(0) * GPTQ_MARLIN_TILE
+    size_n = qweight.size(1) * pack_factor // GPTQ_MARLIN_TILE
+    return size_n, size_k
+
+
+def marlin_pad_qweight(
+    qweight: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+) -> torch.Tensor:
+    """Zero-pad a GPTQ-layout packed weight before Marlin repack."""
+    if (padded_n, padded_k) == (size_n, size_k):
+        return qweight
+    pack_factor = size_k // qweight.size(0)
+    return torch.nn.functional.pad(
+        qweight,
+        (0, padded_n - size_n, 0, (padded_k - size_k) // pack_factor),
+    )
+
+
+def marlin_pad_scales(
+    scales: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Zero-pad weight scales shaped as [num_groups, N]."""
+    if (padded_n, padded_k) == (size_n, size_k):
+        return scales
+    pad_rows = padded_k // group_size - scales.size(0) if group_size > 0 else 0
+    assert pad_rows >= 0
+    return torch.nn.functional.pad(scales, (0, padded_n - size_n, 0, pad_rows))
+
+
+def marlin_pad_dim(x: torch.Tensor, size: int, padded: int) -> torch.Tensor:
+    """Zero-pad the last dimension from the logical size to the padded size."""
+    if padded == size:
+        return x
+    return torch.nn.functional.pad(x, (0, padded - size))
+
+
+def marlin_unpad_output(
+    output: torch.Tensor, size_n: int, padded_n: int
+) -> torch.Tensor:
+    """Slice a padded Marlin output back to the logical output width."""
+    if padded_n == size_n:
+        return output
+    return output[..., :size_n].contiguous()
 
 
 def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
