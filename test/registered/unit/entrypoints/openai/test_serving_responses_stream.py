@@ -18,6 +18,20 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_reasoning_parser_uses_processed_reasoning_state(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_stream_chunk.return_value = (None, "done")
+            fixture = StreamFixture(serving, request, require_reasoning=True)
+            fixture.run([engine_chunk("done", 1, finish=True)])
+
+        self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
+
     def test_emits_typed_sse_events_in_order(self):
         serving = make_serving()
         serving.reasoning_parser = None

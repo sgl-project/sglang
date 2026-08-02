@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -210,6 +211,105 @@ class ChatToolForwardingTestCase(CustomTestCase):
         result = asyncio.run(serving.create_responses(request, raw_request=None))
         self.assertEqual(getattr(result, "status_code", None), 400)
 
+    def test_kimi_k3_request_uses_chat_encoder_fields(self):
+        serving = make_serving()
+        serving.chat_encoding_spec = "kimi_k3"
+        serving.default_chat_template_kwargs = {}
+        serving.template_manager.chat_template_name = None
+        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
+        request = ResponsesRequest(
+            model="x",
+            input="Explain <|kimi_image_placeholder|>",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            tool_choice="required",
+            reasoning={"effort": "high"},
+            store=False,
+        )
+
+        _, request_prompts, engine_prompts, _ = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            call.args[0][0]["content"], "Explain <| kimi_image_placeholder |>"
+        )
+        self.assertEqual(call.kwargs["thinking_effort"], "high")
+        self.assertEqual(call.kwargs["tool_choice"], "required")
+        self.assertEqual(call.kwargs["tools"][0]["function"]["name"], "lookup")
+        self.assertEqual(request_prompts, [[4, 5, 6]])
+        self.assertEqual(engine_prompts, [[4, 5, 6]])
+
+
+class ReasoningRequestForwardingTestCase(unittest.TestCase):
+    def test_create_responses_uses_processed_reasoning_state(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.default_chat_template_kwargs = {"thinking": False}
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="answer",
+            request_id="resp_reasoning",
+            store=False,
+        )
+
+        with (
+            patch.object(
+                serving, "_apply_conversation_template", return_value=rendered
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+            ) as parser_cls,
+        ):
+            parser_cls.return_value.parse_non_stream.return_value = (None, "done")
+            response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status, "completed")
+        self.assertFalse(captured["adapted_request"].require_reasoning)
+        self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
+
 
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
@@ -298,6 +398,7 @@ class FullResponseUsageTestCase(CustomTestCase):
                 tokenizer=serving.tokenizer_manager.tokenizer,
                 request_metadata=metadata,
                 created_time=123,
+                require_reasoning=False,
             )
         )
 
@@ -442,6 +543,7 @@ class OutputItemsTestCase(CustomTestCase):
                 self._function_tool_request(),
                 "raw model output with <tool_call>",
                 tokenizer=Mock(),
+                require_reasoning=False,
             )
 
         tool_calls = [
@@ -473,7 +575,10 @@ class OutputItemsTestCase(CustomTestCase):
                 [fake_call],
             )
             output_items = serving._make_response_output_items(
-                self._function_tool_request(), "raw model output", tokenizer=Mock()
+                self._function_tool_request(),
+                "raw model output",
+                tokenizer=Mock(),
+                require_reasoning=False,
             )
 
         types = [type(item).__name__ for item in output_items]
@@ -498,7 +603,7 @@ class OutputItemsTestCase(CustomTestCase):
         raw = '[{"name": "get_weather", "parameters": {"city": "Beijing"}}]'
 
         output_items = serving._make_response_output_items(
-            request, raw, tokenizer=Mock()
+            request, raw, tokenizer=Mock(), require_reasoning=False
         )
 
         tool_calls = [
@@ -532,7 +637,10 @@ class OutputItemsTestCase(CustomTestCase):
             "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
         ) as parser_cls:
             output_items = serving._make_response_output_items(
-                request, "just a plain answer", tokenizer=Mock()
+                request,
+                "just a plain answer",
+                tokenizer=Mock(),
+                require_reasoning=False,
             )
             parser_cls.assert_not_called()
 
@@ -663,13 +771,35 @@ class EnginePassthroughTestCase(CustomTestCase):
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
-        serving.template_manager.force_reasoning = True
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=True
+        )
 
         captured = self._capture(
             serving, ResponsesRequest(model="x", input="hi", store=False)
         )
 
         self.assertTrue(captured["adapted_request"].require_reasoning)
+
+    def test_prefilled_think_template_opens_the_parser(self):
+        """``force_reasoning`` is a template property, not a request one, so it
+        drives the parser but never the engine flag -- as on the chat path."""
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-r1"
+        serving.template_manager.force_reasoning = True
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_non_stream.return_value = (None, "hi")
+            serving._make_response_output_items(
+                ResponsesRequest(model="x", input="hi", store=False),
+                "hi",
+                tokenizer=Mock(),
+                require_reasoning=False,
+            )
+
+        self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
 
     def test_require_reasoning_false_without_reasoning_parser(self):
         serving = make_serving()

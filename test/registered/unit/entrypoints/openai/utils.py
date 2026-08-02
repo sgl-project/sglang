@@ -128,9 +128,10 @@ def engine_chunk(text, completion_tokens=1, *, finish=False):
 class StreamFixture:
     """Drives ``responses_stream_generator_non_harmony`` over a chunk list."""
 
-    def __init__(self, serving, request):
+    def __init__(self, serving, request, *, require_reasoning=False):
         self.serving = serving
         self.request = request
+        self.require_reasoning = require_reasoning
         self.request_metadata = RequestResponseMetadata(request_id=request.request_id)
 
     def run(self, chunks) -> list[str]:
@@ -147,6 +148,7 @@ class StreamFixture:
                     model_name="x",
                     tokenizer=Mock(),
                     request_metadata=self.request_metadata,
+                    require_reasoning=self.require_reasoning,
                 )
             )
 

@@ -302,6 +302,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages, request_prompts, engine_prompts = (
                     self._make_request_with_harmony(request, prev_response)
                 )
+                require_reasoning = self._is_thinking_enabled_for_request(request)
             else:
                 (
                     messages,
@@ -309,6 +310,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     engine_prompts,
                     processed_messages,
                 ) = await self._make_request(request, prev_response, tokenizer)
+                require_reasoning = processed_messages.require_reasoning
 
         except _MediaInputValidationError as e:
             return self.create_error_response(str(e))
@@ -456,11 +458,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         extra_key=self._compute_extra_key(request),
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
-                        # defers any grammar past </think> so reasoning and
-                        # structured output can coexist (same flag the chat path sets).
-                        require_reasoning=self._is_thinking_enabled_for_request(
-                            request
-                        ),
+                        require_reasoning=require_reasoning,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -509,6 +507,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        require_reasoning=require_reasoning,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -530,6 +529,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        require_reasoning=require_reasoning,
                     )
                 return self.responses_stream_generator_non_harmony(
                     request,
@@ -538,6 +538,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     model_name,
                     tokenizer,
                     request_metadata,
+                    require_reasoning=require_reasoning,
                 )
             try:
                 result: Union[ORJSONResponse, ResponsesResponse] = (
@@ -549,6 +550,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        require_reasoning=require_reasoning,
                     )
                 )
                 return result
@@ -627,6 +629,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -673,6 +677,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 final_res["text"],
                 tokenizer,
                 output_logprobs=output_logprobs,
+                require_reasoning=require_reasoning,
             )
 
             if meta_info is not None:
@@ -757,7 +762,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         return "incomplete" if reason == "length" else "completed"
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
-        """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
         # an explicit toggle wins; the key differs by family (enable_thinking vs thinking).
@@ -803,14 +807,18 @@ class OpenAIServingResponses(OpenAIServingChat):
         final_output: Any,
         tokenizer: Any,
         output_logprobs: Optional[list] = None,
+        *,
+        require_reasoning: bool,
     ):
         if self.reasoning_parser:
-            # Templates that prefill ``<think>`` only emit the close tag, so
-            # start the detector in thinking mode.
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
-                force_reasoning=self._is_thinking_enabled_for_request(request),
+                # A template that prefills <think> forces the parser open even
+                # when the request itself did not ask for reasoning, same as chat.
+                force_reasoning=(
+                    self.template_manager.force_reasoning or require_reasoning
+                ),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
@@ -1344,8 +1352,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
-        *args,
-        **kwargs,
+        *,
+        require_reasoning: bool,
     ):
         try:
             # Update the status to "in_progress"
@@ -1363,8 +1371,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 request_metadata,
                 created_time,
-                *args,
-                **kwargs,
+                require_reasoning=require_reasoning,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1452,6 +1459,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
         # TODO:
         # 1. Handle disconnect
@@ -1857,6 +1866,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             tokenizer,
             request_metadata,
             created_time=created_time,
+            require_reasoning=require_reasoning,
         )
         response_dict = final_response.model_dump()
         # OpenAI SDK's Tool union may not know extended types; drop echo.
@@ -1879,6 +1889,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -1960,7 +1972,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_parser_obj = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
-                force_reasoning=self._is_thinking_enabled_for_request(request),
+                # A template that prefills <think> forces the parser open even
+                # when the request itself did not ask for reasoning, same as chat.
+                force_reasoning=(
+                    self.template_manager.force_reasoning or require_reasoning
+                ),
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
             )

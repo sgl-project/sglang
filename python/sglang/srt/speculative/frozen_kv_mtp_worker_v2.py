@@ -233,12 +233,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             return self.draft_model_runner.attn_backend
 
         backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+        if backend_type == "triton":
+            return self._init_triton_draft_attn_backend()
+        if backend_type == "trtllm_mha":
+            return self._init_trtllm_mha_draft_attn_backend()
+        raise ValueError(
+            "Frozen-KV MTP topk > 1 currently supports triton and trtllm_mha "
+            f"attention backends, got {backend_type}."
+        )
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -252,6 +254,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
+
+    def _init_trtllm_mha_draft_attn_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
 
     def _bind_kv_context(self) -> None:
         draft_model = self.draft_model_runner.model
