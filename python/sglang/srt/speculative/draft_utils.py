@@ -58,7 +58,7 @@ class DraftBackendFactory:
             draft_hf_config = self.draft_model_runner.model_config.hf_config
             if not is_deepseek_v4(draft_hf_config):
                 backend_type = self.server_args._get_default_attn_backend(
-                    use_mla_backend=False,
+                    use_mla_backend=self.draft_model_runner.use_mla_backend,
                     model_config=self.draft_model_runner.model_config,
                 )
 

@@ -186,17 +186,17 @@ def _resolve_attention_backend_strs(
 def _fallback_dsv4_backend_for_non_dsv4_draft(
     *, backend: str, server_args: ServerArgs, model_config
 ) -> str:
-    """Keep DSV4's fixed-shape attention backend away from MHA draft models."""
+    """Keep DSV4's fixed-shape attention backend away from other draft models."""
     if backend != "dsv4":
         return backend
 
-    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.configs.model_config import AttentionArch, is_deepseek_v4
 
     if is_deepseek_v4(model_config.hf_config):
         return backend
 
     fallback = server_args._get_default_attn_backend(
-        use_mla_backend=False,
+        use_mla_backend=model_config.attention_arch == AttentionArch.MLA,
         model_config=model_config,
     )
     logger.warning(
