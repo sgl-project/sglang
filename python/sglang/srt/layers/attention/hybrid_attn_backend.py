@@ -182,6 +182,12 @@ class HybridAttnBackend(AttentionBackend):
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
 
+    def supports_dsa_indexer_metadata(self) -> bool:
+        return (
+            self.prefill_backend.supports_dsa_indexer_metadata()
+            and self.decode_backend.supports_dsa_indexer_metadata()
+        )
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> Optional[BaseIndexerMetadata]:
