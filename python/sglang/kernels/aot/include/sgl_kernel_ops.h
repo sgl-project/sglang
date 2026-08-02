@@ -96,6 +96,21 @@ void register_graph_buffers(
  */
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
+void direct_dcp_a2a_lse_reduce(
+    const at::Tensor& partial_output,
+    const at::Tensor& partial_lse,
+    const at::Tensor& peer_output_ptrs,
+    const at::Tensor& peer_lse_ptrs,
+    const at::Tensor& peer_signal_ptrs,
+    at::Tensor& received_output,
+    at::Tensor& received_lse,
+    at::Tensor& received_signal,
+    at::Tensor& epoch,
+    at::Tensor& combined_output,
+    int64_t world_size,
+    int64_t rank,
+    int64_t max_num_tokens,
+    bool is_lse_base_on_e);
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,

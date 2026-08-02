@@ -1030,8 +1030,9 @@ class DeepseekMLAForwardMixin:
                 self.kv_lora_rank,
             )
             dcp_comm_backend = get_parallel().dcp_comm_backend
-            if dcp_comm_backend in ("a2a", "fi_a2a"):
-                # A2A exchange of head partials + LSE, then local Triton combine.
+            if dcp_comm_backend in ("a2a", "fi_a2a", "symm_a2a"):
+                # Exchange head partials + LSE and combine them. symm_a2a fuses
+                # the peer exchange and LSE combine in its CUDA kernel sequence.
                 # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
                 attn_output = dcp_a2a_lse_reduce(
                     attn_output.contiguous(),
@@ -1039,6 +1040,7 @@ class DeepseekMLAForwardMixin:
                     get_parallel().dcp_group,
                     is_lse_base_on_e=False,
                     comm_backend=dcp_comm_backend,
+                    ubatch_id=getattr(forward_batch, "ubatch_id", 0),
                 )
             else:
                 attn_output = cp_lse_ag_out_rs_mla(

@@ -44,6 +44,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
   m.def(
+      "direct_dcp_a2a_lse_reduce(Tensor partial_output, Tensor partial_lse, Tensor peer_output_ptrs, Tensor "
+      "peer_lse_ptrs, Tensor peer_signal_ptrs, Tensor! received_output, Tensor! received_lse, Tensor! received_signal, "
+      "Tensor! epoch, Tensor! combined_output, int world_size, int rank, int max_num_tokens, bool is_lse_base_on_e) "
+      "-> ()");
+  m.impl("direct_dcp_a2a_lse_reduce", torch::kCUDA, &direct_dcp_a2a_lse_reduce);
+  m.def(
       "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);

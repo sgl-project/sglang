@@ -3,6 +3,57 @@ from typing import Optional, Tuple
 import torch
 
 
+def direct_dcp_a2a_lse_reduce(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    peer_output_ptrs: torch.Tensor,
+    peer_lse_ptrs: torch.Tensor,
+    peer_signal_ptrs: torch.Tensor,
+    received_output: torch.Tensor,
+    received_lse: torch.Tensor,
+    received_signal: torch.Tensor,
+    epoch: torch.Tensor,
+    world_size: int,
+    rank: int,
+    max_num_tokens: int,
+    is_lse_base_on_e: bool,
+    combined_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if combined_output is None:
+        if world_size <= 1:
+            raise ValueError(
+                "world_size must be greater than 1 when allocating combined_output"
+            )
+        if partial_output.shape[1] % world_size != 0:
+            raise ValueError(
+                "attention heads must divide evenly across DCP ranks when allocating combined_output"
+            )
+        combined_output = partial_output.new_empty(
+            (
+                partial_output.shape[0],
+                partial_output.shape[1] // world_size,
+                partial_output.shape[2],
+            )
+        )
+    torch.ops.sgl_kernel.direct_dcp_a2a_lse_reduce.default(
+        partial_output,
+        partial_lse,
+        peer_output_ptrs,
+        peer_lse_ptrs,
+        peer_signal_ptrs,
+        received_output,
+        received_lse,
+        received_signal,
+        epoch,
+        combined_output,
+        world_size,
+        rank,
+        max_num_tokens,
+        is_lse_base_on_e,
+    )
+    return combined_output
+
+
 def merge_state_v2(
     v_a: torch.Tensor,
     s_a: torch.Tensor,

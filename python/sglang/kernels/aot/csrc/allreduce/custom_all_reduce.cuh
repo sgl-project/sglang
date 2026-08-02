@@ -175,6 +175,29 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
   return flag;
 }
 
+#ifndef USE_MUSA
+// 64-bit counterpart used by long-running protocols whose epoch must not be
+// truncated to FlagType. Keep this next to the hardened u32 primitives so
+// system-scope synchronization is implemented in one place.
+static DINLINE void st_flag_release_u64(uint64_t* flag_addr, uint64_t flag) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+  asm volatile("st.release.sys.global.u64 [%1], %0;" : : "l"(flag), "l"(flag_addr));
+#else
+  asm volatile("membar.sys; st.volatile.global.u64 [%1], %0;" : : "l"(flag), "l"(flag_addr));
+#endif
+}
+
+static DINLINE uint64_t ld_flag_acquire_u64(const uint64_t* flag_addr) {
+  uint64_t flag;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(flag) : "l"(flag_addr));
+#else
+  asm volatile("ld.volatile.global.u64 %0, [%1]; membar.gl;" : "=l"(flag) : "l"(flag_addr));
+#endif
+  return flag;
+}
+#endif
+
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 }
