@@ -2648,6 +2648,27 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # HBM-resident post-hoc KV-cache sparsity
+    # -------------------------------------------------------------------------
+    enable_kv_cache_sparsity: A[
+        bool,
+        "Enable visibility-only post-hoc KV-cache sparsity",
+        NS("memory"),
+    ] = False
+    kv_cache_sparsity_config: A[
+        Optional[str],
+        Arg(
+            help=(
+                "JSON configuration for HBM-resident KV-cache sparsity. Example: "
+                '\'{"policy":"streaming_llm","backend":"fa3",'
+                '"min_sparse_tokens":4096,"policy_config":{'
+                '"sink_pages":4,"recent_pages":2048}}\''
+            )
+        ),
+        NS("memory"),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
     enable_broadcast_mm_inputs_process: A[
@@ -4822,6 +4843,7 @@ class ServerArgs:
             and not self.prefill_only_disable_kv_cache
             and not self.enable_memory_saver
             and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+            and not self.enable_kv_cache_sparsity
             # Accurate sizing assumes graph-covered execution (graphs retain the
             # activation workspace, so it is measured post-capture). An eager
             # phase would pay activations outside the measurement: DP attention
@@ -8656,6 +8678,12 @@ class ServerArgs:
             raise ValueError(
                 "--retraction-policy priority requires --enable-priority-scheduling"
             )
+
+        from sglang.srt.arg_groups.kv_sparsity_hook import (
+            validate_kv_cache_sparsity,
+        )
+
+        validate_kv_cache_sparsity(self)
 
         # Check hisparse
         # Moved to the resolution pipeline (arg_groups/overrides.py:

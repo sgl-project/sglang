@@ -1775,6 +1775,8 @@ def _attention_backend_default(view: Any) -> dict:
         view.prefill_attention_backend == view.decode_attention_backend
     ):  # override the default attention backend
         return {"attention_backend": view.prefill_attention_backend}
+    if view.is_attention_backend_not_set() and view.enable_kv_cache_sparsity:
+        return {"attention_backend": "fa3"}
     if view.attention_backend is None:
         backend = view._get_default_attn_backend(
             view.use_mla_backend(), view.get_model_config()

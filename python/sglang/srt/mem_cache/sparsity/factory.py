@@ -11,12 +11,37 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     DSABackendAdaptor,
     FlashAttentionAdaptor,
 )
+from sglang.srt.mem_cache.sparsity.backend.visibility_adaptor import (
+    FlashAttentionVisibilityAdaptor,
+    HBMResidentPlacement,
+)
+from sglang.srt.mem_cache.sparsity.config import KVSparsityConfig
+from sglang.srt.mem_cache.sparsity.core.kv_sparsity_controller import (
+    KVSparsityController,
+)
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.mem_cache.sparsity.policies.streaming_llm import StreamingLLMPolicy
 
 logger = logging.getLogger(__name__)
+
+_KV_SPARSITY_POLICIES = {
+    "streaming_llm": StreamingLLMPolicy,
+}
+_KV_SPARSITY_BACKEND_ALIASES = {
+    "flashattention": "fa3",
+}
+_KV_SPARSITY_CONFIG_FIELDS = {
+    "policy",
+    "backend",
+    "page_size",
+    "min_sparse_tokens",
+    "start_layer",
+    "end_layer",
+    "policy_config",
+}
 
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
@@ -114,6 +139,91 @@ def _parse_sparse_config(server_args) -> SparseConfig:
 def parse_hisparse_config(server_args) -> SparseConfig:
     """Parse hisparse config from server_args, returning defaults if no config provided."""
     return _parse_sparse_config(server_args)
+
+
+def parse_kv_sparsity_config(server_args) -> KVSparsityConfig:
+    """Parse the independent HBM-resident sparse-attention configuration."""
+    raw_config = getattr(server_args, "kv_cache_sparsity_config", None)
+    if raw_config:
+        try:
+            values = json.loads(raw_config)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse kv_cache_sparsity_config: {exc}"
+            ) from exc
+        if not isinstance(values, dict):
+            raise ValueError("kv_cache_sparsity_config must be a JSON object")
+    else:
+        values = {}
+
+    unknown = sorted(set(values) - _KV_SPARSITY_CONFIG_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown KV sparsity config field(s): {unknown}")
+
+    runtime_page_size = getattr(server_args, "page_size", None)
+    configured_page_size = values.get("page_size", runtime_page_size)
+    if configured_page_size is None:
+        configured_page_size = 1
+    if runtime_page_size is not None and configured_page_size != runtime_page_size:
+        raise ValueError(
+            "KV sparsity page_size must match the runtime --page-size "
+            f"({runtime_page_size}), got {configured_page_size}"
+        )
+
+    policy = values.get("policy", "streaming_llm")
+    backend = values.get("backend", "fa3")
+    if not isinstance(policy, str) or not policy.strip():
+        raise ValueError("KV sparsity policy must be a non-empty string")
+    if not isinstance(backend, str) or not backend.strip():
+        raise ValueError("KV sparsity backend must be a non-empty string")
+    policy = policy.strip().lower()
+    backend = _KV_SPARSITY_BACKEND_ALIASES.get(
+        backend.strip().lower(), backend.strip().lower()
+    )
+
+    return KVSparsityConfig(
+        policy=policy,
+        backend=backend,
+        page_size=configured_page_size,
+        min_sparse_tokens=values.get("min_sparse_tokens", 2048),
+        start_layer=values.get("start_layer", 0),
+        end_layer=values.get("end_layer", -1),
+        policy_config=values.get("policy_config", {}),
+    )
+
+
+def create_kv_sparsity_controller(
+    *,
+    device: torch.device,
+    req_to_token_pool,
+    start_layer: int,
+    end_layer: int,
+    server_args,
+) -> KVSparsityController:
+    config = parse_kv_sparsity_config(server_args)
+    policy_class = _KV_SPARSITY_POLICIES.get(config.policy)
+    if policy_class is None:
+        raise ValueError(
+            f"Unknown KV sparsity policy {config.policy!r}; "
+            f"available policies: {sorted(_KV_SPARSITY_POLICIES)}"
+        )
+    if config.backend != "fa3":
+        raise ValueError("The initial KV sparsity runtime supports only FA3")
+
+    policy = policy_class(config, device)
+    placement = HBMResidentPlacement(
+        req_to_token=req_to_token_pool.req_to_token,
+        page_size=config.page_size,
+    )
+    adaptor = FlashAttentionVisibilityAdaptor(placement)
+    return KVSparsityController(
+        config=config,
+        policy=policy,
+        adaptor=adaptor,
+        req_to_token_pool=req_to_token_pool,
+        start_layer=start_layer,
+        end_layer=end_layer,
+    )
 
 
 def create_sparse_coordinator(

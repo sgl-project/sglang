@@ -24,7 +24,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -71,6 +74,7 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.mem_cache.sparsity.core import KVSparsityController
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -276,15 +280,58 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
-            return get_attn_backend().forward(
-                q,
-                k,
-                v,
+            attn_backend = get_attn_backend()
+            controller = get_forward_context().kv_sparsity_controller
+            if _should_run_kv_sparsity_hook(
                 self,
                 forward_batch,
+                k,
                 save_kv_cache,
-                **kwargs,
+                controller,
+            ):
+                metadata = getattr(attn_backend, "forward_metadata", None)
+                controller.before_attention(q, k, v, self, forward_batch, metadata)
+                output = attn_backend.forward(
+                    q,
+                    k,
+                    v,
+                    self,
+                    forward_batch,
+                    save_kv_cache,
+                    **kwargs,
+                )
+                controller.after_attention(
+                    q, k, v, output, self, forward_batch, metadata
+                )
+                return output
+            return attn_backend.forward(
+                q, k, v, self, forward_batch, save_kv_cache, **kwargs
             )
+
+
+def _should_run_kv_sparsity_hook(
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    key: Optional[torch.Tensor],
+    save_kv_cache: bool,
+    controller: Optional[KVSparsityController],
+) -> bool:
+    """Keep unsupported execution modes on the byte-identical dense path."""
+    return bool(
+        controller is not None
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+        )
+        and forward_batch.spec_info is None
+        and save_kv_cache
+        and key is not None
+        and not layer.is_cross_attention
+        and layer.attn_type == AttentionType.DECODER
+        and get_tc_piecewise_forward_context() is None
+        and forward_batch.req_pool_indices is not None
+        and forward_batch.seq_lens is not None
+    )
 
 
 def _unified_attention_with_output_impl(

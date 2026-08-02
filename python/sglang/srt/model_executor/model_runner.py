@@ -387,6 +387,7 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.kv_sparsity_controller = None
 
         # Load model weights and configure
         self.initialize()
@@ -785,6 +786,7 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
 
         self.maybe_init_hisparse_coordinator()
+        self.maybe_init_kv_sparsity_controller()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
@@ -814,6 +816,19 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+        )
+
+    def maybe_init_kv_sparsity_controller(self):
+        if not self.server_args.enable_kv_cache_sparsity:
+            return
+        from sglang.srt.mem_cache.sparsity import create_kv_sparsity_controller
+
+        self.kv_sparsity_controller = create_kv_sparsity_controller(
+            device=torch.device(self.device),
+            req_to_token_pool=self.req_to_token_pool,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            server_args=self.server_args,
         )
 
     def post_capture_resize_kv_pool(self):
@@ -876,6 +891,8 @@ class ModelRunner:
         self.decode_attn_backend_group = backends.decode_attn_backend_group
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
+        if self.kv_sparsity_controller is not None:
+            self.kv_sparsity_controller.bind_attention_backend(self.attn_backend)
 
         if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1474,7 +1491,12 @@ class ModelRunner:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(
+                    attn_backend=self.attn_backend,
+                    kv_sparsity_controller=self.kv_sparsity_controller,
+                )
+            )
         with ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
