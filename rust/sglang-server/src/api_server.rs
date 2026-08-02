@@ -19,16 +19,13 @@ use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
-/// Shared handler state: the submit machinery (`senders`, `egress_buf`)
-/// + shared tokenizer.
+/// Shared handler state: submission handles, immutable server configuration,
+/// and API-owned formatter/response-store state.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    /// The tokenizer loaded once at startup and shared with the encode/detok
-    /// workers. OpenAI also uses it for token-ID prompt echo.
-    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     chat_formatter: Option<openai::ChatFormatter>,
     response_store: openai::ResponseStore,
     /// Egress heartbeat (bumped per drained ring frame).
@@ -40,7 +37,6 @@ pub async fn serve(
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
-    tokenizer: Option<dynamo_tokenizers::Tokenizer>,
     egress_activity: ActivityCounter,
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
@@ -52,7 +48,6 @@ pub async fn serve(
         senders,
         egress_buf,
         server_args: server_args.clone(),
-        tokenizer,
         chat_formatter,
         response_store: openai::new_response_store(),
         egress_activity,

@@ -91,6 +91,21 @@ impl DetokenizerBackend {
         }
     }
 
+    /// Decode one complete sequence without creating request-scoped streaming
+    /// state. This runs on a pinned detokenizer worker, never on an API runtime
+    /// thread.
+    fn decode_once(&self, token_ids: &[u32]) -> Result<String, Error> {
+        match self {
+            DetokenizerBackend::Dynamo(tokenizer) => tokenizer
+                .decode(token_ids, true)
+                .map(String::from)
+                .map_err(|error| Error::Detokenize(error.to_string())),
+            DetokenizerBackend::Skip => Err(Error::Validation(
+                "echo for token-ID prompts is unavailable when skip_tokenizer_init=True".into(),
+            )),
+        }
+    }
+
     /// Decode each logprob token id to its own text (one id at a time, matching
     /// Python's `batch_decode([[id] for id in ids])`). Runs on this CPU-bound
     /// shard, not the api-server I/O threads. `Skip` mode (no tokenizer) yields
@@ -193,6 +208,9 @@ impl Runnable for DetokenizerWorker {
                     for ev in evs {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
+                }
+                DetokMsg::Decode { token_ids, reply } => {
+                    let _ = reply.send(self.backend.decode_once(&token_ids));
                 }
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
@@ -461,6 +479,13 @@ mod tests {
         let mut t = "a STOP b STOP".to_string();
         trim_stop_str(&mut t, "STOP", true);
         assert_eq!(t, "a STOP");
+    }
+
+    #[test]
+    fn decode_once_rejects_skip_mode() {
+        let error = DetokenizerBackend::Skip.decode_once(&[1]).unwrap_err();
+        assert!(matches!(error, Error::Validation(_)));
+        assert!(error.to_string().contains("skip_tokenizer_init=True"));
     }
 
     /// Two requests on the SAME shard keep separate entries. This is what a

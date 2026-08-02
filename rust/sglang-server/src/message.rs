@@ -27,7 +27,9 @@ pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
 use bytes::Bytes;
+use tokio::sync::oneshot;
 
+use crate::error::Error;
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 
@@ -74,6 +76,13 @@ pub enum DetokMsg {
     /// One decode step's chunks for *this shard*. Batched because `tm-egress` blocks
     /// per send, so one message per request cost ~1.3 µs × batch (5.1x at 4096).
     Chunks(Vec<ChunkEvent>),
+    /// Decode a complete token-id sequence outside the incremental request
+    /// lifecycle. Used for protocol features such as completion prompt echo;
+    /// the reply keeps CPU-bound decoding on the detokenizer worker.
+    Decode {
+        token_ids: Vec<u32>,
+        reply: oneshot::Sender<Result<String, Error>>,
+    },
     /// Control result: one already-serialized payload delivered to the sink verbatim.
     Result { rid: Rid, payload: bytes::Bytes },
     /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).

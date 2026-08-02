@@ -248,7 +248,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let api_activity = egress_activity.clone();
-        let api_tokenizer = dyn_tokenizer.clone();
         let shutdown_rx = shutdown_rx.clone();
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
@@ -272,7 +271,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
-                    api_tokenizer,
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
                     shutdown_rx,

@@ -28,17 +28,17 @@ use super::{
 use crate::ids::Rid;
 use crate::message::{
     ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, SamplingParams,
+    TokenIds,
 };
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/completions", post(completions))
 }
 
-#[derive(Debug)]
-struct PromptSpec {
-    text: Option<String>,
-    input_ids: Option<Vec<i32>>,
-    echo: String,
+#[derive(Debug, PartialEq, Eq)]
+enum PromptSpec {
+    Text(String),
+    TokenIds(TokenIds),
 }
 
 pub(super) struct SubmittedChoice {
@@ -67,6 +67,7 @@ async fn completions(
         }
     };
     let stream = request.stream.unwrap_or(false);
+    let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
     if model != state.server_args.served_model_name {
         return openai_error(
@@ -99,11 +100,7 @@ async fn completions(
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1");
     }
-    let prompts = match completion_prompt_specs(
-        &request.prompt,
-        request.echo.unwrap_or(false),
-        state.tokenizer.as_ref(),
-    ) {
+    let prompts = match completion_prompt_specs(&request.prompt) {
         Ok(prompts) => prompts,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
@@ -138,17 +135,33 @@ async fn completions(
     let mut submitted = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
+        let (text, input_ids, mut prompt_echo) = match prompt {
+            PromptSpec::Text(text) => {
+                let prompt_echo = if echo { text.clone() } else { String::new() };
+                (Some(text), None, prompt_echo)
+            }
+            PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
+        };
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
+            if echo
+                && sample_index == 0
+                && let Some(token_ids) = &input_ids
+            {
+                prompt_echo = match decode_prompt_echo(&state, &rid, token_ids.clone()).await {
+                    Ok(echo) => echo,
+                    Err(response) => return response,
+                };
+            }
             let native = GenerateRequest {
                 rid: rid.clone(),
-                text: prompt.text.clone(),
-                input_ids: prompt.input_ids.clone(),
+                text: text.clone(),
+                input_ids: input_ids.clone(),
                 sampling_params: sampling.clone(),
                 stream,
                 return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if request.echo.unwrap_or(false) && request.logprobs.is_some() {
+                logprob_start_len: if echo && request.logprobs.is_some() {
                     0
                 } else {
                     -1
@@ -165,7 +178,7 @@ async fn completions(
                 index,
                 prompt_index,
                 rid,
-                echo: prompt.echo.clone(),
+                echo: prompt_echo.clone(),
                 rx,
             });
         }
@@ -182,7 +195,6 @@ async fn completions(
             .map(|o| o.continuous_usage_stats)
             .unwrap_or(false);
         let want_logprobs = request.logprobs.is_some();
-        let echo = request.echo.unwrap_or(false);
         let s = completion_event_stream(
             submitted,
             guard,
@@ -203,60 +215,59 @@ async fn completions(
             response_id,
             model,
             created,
-            request.echo.unwrap_or(false),
+            echo,
             request.logprobs.is_some(),
         )
         .await
     }
 }
 
-fn completion_prompt_specs(
-    prompt: &Prompt,
-    echo: bool,
-    tokenizer: Option<&dynamo_tokenizers::Tokenizer>,
-) -> Result<Vec<PromptSpec>, String> {
+async fn decode_prompt_echo(
+    state: &AppState,
+    rid: &Rid,
+    token_ids: TokenIds,
+) -> Result<String, Response> {
+    match state.senders.decode_once(rid, token_ids).await {
+        Ok(text) => Ok(text),
+        Err(crate::error::Error::Validation(message)) => {
+            Err(openai_error(StatusCode::BAD_REQUEST, message))
+        }
+        Err(error) => {
+            let status = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Err(openai_error(
+                status,
+                format!("failed to decode prompt for echo: {error}"),
+            ))
+        }
+    }
+}
+
+fn completion_prompt_specs(prompt: &Prompt) -> Result<Vec<PromptSpec>, String> {
     match prompt {
         Prompt::String(text) => {
             if text.is_empty() {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(vec![PromptSpec {
-                text: Some(text.clone()),
-                input_ids: None,
-                echo: if echo { text.clone() } else { String::new() },
-            }])
+            Ok(vec![PromptSpec::Text(text.clone())])
         }
         Prompt::StringArray(texts) => {
             if texts.is_empty() || texts.iter().any(String::is_empty) {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(texts
-                .iter()
-                .map(|text| PromptSpec {
-                    text: Some(text.clone()),
-                    input_ids: None,
-                    echo: if echo { text.clone() } else { String::new() },
-                })
-                .collect())
+            Ok(texts.iter().cloned().map(PromptSpec::Text).collect())
         }
-        Prompt::IntegerArray(ids) => Ok(vec![token_prompt_spec(ids, echo, tokenizer)?]),
+        Prompt::IntegerArray(ids) => Ok(vec![token_prompt_spec(ids)?]),
         Prompt::ArrayOfIntegerArray(prompts) => {
             if prompts.is_empty() {
                 return Err("Prompt cannot be empty".into());
             }
-            prompts
-                .iter()
-                .map(|ids| token_prompt_spec(ids, echo, tokenizer))
-                .collect()
+            prompts.iter().map(|ids| token_prompt_spec(ids)).collect()
         }
     }
 }
 
-fn token_prompt_spec(
-    ids: &[u32],
-    echo: bool,
-    tokenizer: Option<&dynamo_tokenizers::Tokenizer>,
-) -> Result<PromptSpec, String> {
+fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
@@ -264,23 +275,7 @@ fn token_prompt_spec(
         .iter()
         .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
         .collect::<Result<Vec<_>, _>>()?;
-    let echo = if echo {
-        tokenizer
-            .ok_or_else(|| {
-                "echo for token-ID prompts is unavailable when skip_tokenizer_init=True".to_string()
-            })?
-            .decode(ids, true)
-            .map_err(|e| format!("failed to decode prompt for echo: {e}"))?
-            .as_str()
-            .to_owned()
-    } else {
-        String::new()
-    };
-    Ok(PromptSpec {
-        text: None,
-        input_ids: Some(input_ids),
-        echo,
-    })
+    Ok(PromptSpec::TokenIds(input_ids))
 }
 
 fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
@@ -702,8 +697,8 @@ fn append_top_logprobs(
 mod tests {
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
-        ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
-        unary_completion,
+        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
+        completion_prompt_specs, completion_response_value, unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
@@ -740,6 +735,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.max_tokens, Some(0));
+    }
+
+    #[test]
+    fn token_prompt_is_normalized_without_echo_state() {
+        let specs = completion_prompt_specs(&Prompt::IntegerArray(vec![1, 2])).unwrap();
+        assert_eq!(specs, [PromptSpec::TokenIds(vec![1, 2])]);
     }
 
     #[test]

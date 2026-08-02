@@ -16,8 +16,9 @@ mod ingress;
 pub use egress::{ActivityCounter, Egress};
 pub use ingress::{Ingress, Limits};
 
+use crate::error::Error;
 use crate::ids::Rid;
-use crate::message::{DetokMsg, Request};
+use crate::message::{DetokMsg, Request, TokenIds};
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.
@@ -89,5 +90,110 @@ impl Senders {
     #[inline]
     pub fn detok_for(&self, rid: &Rid) -> &flume::Sender<DetokMsg> {
         &self.detok[rid.shard(self.detok.len())]
+    }
+
+    /// Decode one complete token-id sequence on a detokenizer worker.
+    ///
+    /// Unlike request streaming decode, this has no request registration or
+    /// incremental state. The oneshot carries only the reply; callers depend on
+    /// this service method rather than owning a concrete tokenizer.
+    pub async fn decode_once(&self, rid: &Rid, token_ids: TokenIds) -> Result<String, Error> {
+        if self.detok.is_empty() {
+            return Err(Error::Internal(
+                "no detokenizer worker is configured".into(),
+            ));
+        }
+        let detok = self.detok_for(rid);
+        let token_ids = token_ids
+            .into_iter()
+            .map(|id| {
+                u32::try_from(id)
+                    .map_err(|_| Error::Validation(format!("Token ID {id} is out of range")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        detok
+            .send_async(DetokMsg::Decode { token_ids, reply })
+            .await
+            .map_err(|_| Error::Internal("detokenizer worker is unavailable".into()))?;
+        response
+            .await
+            .map_err(|_| Error::Internal("detokenizer worker dropped the decode reply".into()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn senders(detok: Vec<flume::Sender<DetokMsg>>) -> Senders {
+        Senders {
+            tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
+            tok: flume::unbounded().0,
+            detok,
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_once_round_trips_the_worker_reply() {
+        let (detok_tx, detok_rx) = flume::bounded(1);
+        let task = tokio::spawn(async move {
+            senders(vec![detok_tx])
+                .decode_once(&Rid::from("decode"), vec![1, 2])
+                .await
+        });
+
+        let DetokMsg::Decode { token_ids, reply } = detok_rx.recv_async().await.unwrap() else {
+            panic!("expected a one-shot decode request");
+        };
+        assert_eq!(token_ids, [1, 2]);
+        reply.send(Ok("decoded".into())).unwrap();
+
+        assert_eq!(task.await.unwrap().unwrap(), "decoded");
+    }
+
+    #[tokio::test]
+    async fn decode_once_rejects_missing_workers_and_negative_ids() {
+        let rid = Rid::from("decode");
+        let error = senders(vec![])
+            .decode_once(&rid, vec![1])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Internal(_)));
+
+        let (detok_tx, _detok_rx) = flume::bounded(1);
+        let error = senders(vec![detok_tx])
+            .decode_once(&rid, vec![-1])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn decode_once_uses_the_request_shard() {
+        let (detok0_tx, detok0_rx) = flume::bounded(1);
+        let (detok1_tx, detok1_rx) = flume::bounded(1);
+        let rid = Rid::from("same-routing-key");
+        let expected_shard = rid.shard(2);
+        let task_rid = rid.clone();
+        let task = tokio::spawn(async move {
+            senders(vec![detok0_tx, detok1_tx])
+                .decode_once(&task_rid, vec![7])
+                .await
+        });
+
+        let (expected_rx, other_rx) = if expected_shard == 0 {
+            (&detok0_rx, &detok1_rx)
+        } else {
+            (&detok1_rx, &detok0_rx)
+        };
+        let DetokMsg::Decode { token_ids, reply } = expected_rx.recv_async().await.unwrap() else {
+            panic!("expected a one-shot decode request");
+        };
+        assert_eq!(token_ids, [7]);
+        assert!(other_rx.try_recv().is_err());
+        reply.send(Ok("seven".into())).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), "seven");
     }
 }
