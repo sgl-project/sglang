@@ -74,6 +74,15 @@ def _patched_deep_ep(*, with_buffer: bool, with_elastic_buffer: bool):
         sys.modules["deep_ep"] = _make_stub_deep_ep(
             with_buffer=with_buffer, with_elastic_buffer=with_elastic_buffer
         )
+    else:
+        # Simulate `deep_ep` being *entirely absent* even on hosts where it is
+        # genuinely installed (e.g. a GPU serving pod). Merely popping it from
+        # sys.modules is not enough there: the probe's `import deep_ep` would
+        # simply re-import the real package from site-packages and the flags
+        # would come back True. A sentinel `None` entry forces `import deep_ep`
+        # to raise ImportError (documented CPython behavior), so the probe's
+        # try/except sets `use_deepep=False` deterministically on any host.
+        sys.modules["deep_ep"] = None
     try:
         yield
     finally:
