@@ -21,7 +21,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(
     est_time=480,
     suite="stage-c-test-large-8-gpu-amd-mi35x",
-    disabled="move to nightly for saving time",
+    nightly=True,
 )
 
 HIDDEN_DIMS = [2880, 4096, 5120, 6144, 7168, 8192]

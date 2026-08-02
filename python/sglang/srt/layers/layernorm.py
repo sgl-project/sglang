@@ -95,7 +95,6 @@ if _is_cuda or _is_xpu or _is_musa:
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
-_aiter_per_1x128_quant = None
 _aiter_per_token_quant = None
 _aiter_fp8_dtype = None
 if _use_aiter:
@@ -104,9 +103,8 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
-    # Cache HIP quant functors and the FP8 dtype so fallback paths don't
+    # Cache the HIP quant functor and the FP8 dtype so fallback paths don't
     # re-import aiter on every forward.
-    _aiter_per_1x128_quant = _aiter.get_hip_quant(_aiter.QuantType.per_1x128)
     _aiter_per_token_quant = _aiter.get_hip_quant(_aiter.QuantType.per_Token)
     _aiter_fp8_dtype = _aiter.dtypes.fp8
 
