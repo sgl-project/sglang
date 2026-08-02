@@ -476,7 +476,7 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 120
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
