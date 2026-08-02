@@ -21,7 +21,7 @@
 //!
 //! The tests cover parser-name canonicalization, every `tool_choice` branch of
 //! [`apply_tool_constraint`], Dynamo's streaming jail integration, unary
-//! parsing, and finish-reason mapping.
+//! parsing, finish-reason mapping, and the Responses function-call lifecycle.
 
 use dynamo_parsers::parsers::get_tool_parser_map;
 use dynamo_parsers::{

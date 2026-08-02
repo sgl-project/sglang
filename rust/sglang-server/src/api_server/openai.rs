@@ -4,18 +4,25 @@
 //! request and response primitives. Native [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use dynamo_protocols::types::ChatCompletionRequestMessage;
+use dynamo_protocols::types::responses::Response as OpenAIResponse;
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 mod chat;
 mod completions;
 mod models;
 mod reasoning;
+mod response_stream;
+mod responses;
 mod template;
 mod tools;
 
@@ -31,16 +38,30 @@ use crate::runtime::ServerArgs;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
+#[derive(Clone)]
+pub(super) struct StoredResponse {
+    response: OpenAIResponse,
+    messages: Vec<ChatCompletionRequestMessage>,
+    rid: Option<Rid>,
+}
+
+pub(super) type ResponseStore = Arc<RwLock<HashMap<String, StoredResponse>>>;
+
+pub(super) fn new_response_store() -> ResponseStore {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(responses::routes())
 }
 
-/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
-/// endpoint. Tokenization is the tokenizer pool's job (the api server never
+/// Resolve the chat formatter, or `None` to disable the OpenAI chat/responses
+/// endpoints. Tokenization is the tokenizer pool's job (the api server never
 /// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
 /// `--chat-template` name or a model-path-inferred legacy template resolve
 /// without it, so its absence must not disable chat.
