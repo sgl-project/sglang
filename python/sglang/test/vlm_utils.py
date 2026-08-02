@@ -8,12 +8,12 @@ import pybase64
 import requests
 from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # image
@@ -60,7 +60,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def get_vision_request_kwargs(self):
         return self.get_request_kwargs()

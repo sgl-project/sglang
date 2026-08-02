@@ -1002,6 +1002,8 @@ def run_benchmark_internal(
                 "token_capacity", 1000000000
             )
 
+        # Router /get_server_info responses carry "router_manager"; worker
+        # responses never do, so its presence confirms a router by design.
         if not internal_states and server_info.get("router_manager"):
             print(
                 "WARNING: base_url points at a PD router; worker internal "
