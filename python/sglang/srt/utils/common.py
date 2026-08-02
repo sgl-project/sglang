@@ -2390,40 +2390,69 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
+# Collectors created by add_prometheus_track_response_middleware, keyed by the
+# extra label names they were created with. Prometheus collectors live in a
+# process wide registry and registering the same name twice raises an error,
+# so a process that builds more than one app with metrics enabled (see
+# build_app in http_server.py) must reuse the collectors of the first call.
+_track_response_collectors: Dict[Tuple[str, ...], Tuple[Any, ...]] = {}
+
+
+def _get_or_create_track_response_collectors(extra_label_names: List[str]):
+    """Create the HTTP tracking collectors once per process and reuse them."""
+    from prometheus_client import Counter, Gauge
+
+    key = tuple(extra_label_names)
+    if key not in _track_response_collectors:
+        http_request_counter = Counter(
+            name="sglang:http_requests_total",
+            documentation="Total number of HTTP requests by endpoint and method",
+            labelnames=extra_label_names + ["endpoint", "method"],
+        )
+
+        http_response_counter = Counter(
+            name="sglang:http_responses_total",
+            documentation="Total number of HTTP responses by endpoint and status code",
+            labelnames=extra_label_names + ["endpoint", "status_code", "method"],
+        )
+
+        http_requests_active = Gauge(
+            name="sglang:http_requests_active",
+            documentation="Number of currently active HTTP requests",
+            labelnames=extra_label_names + ["endpoint", "method"],
+            multiprocess_mode="livesum",
+        )
+
+        routing_keys_active = RefCountedGauge(
+            Gauge(
+                name="sglang:routing_keys_active",
+                documentation="Number of unique routing keys with active requests",
+                multiprocess_mode="livesum",
+            )
+        )
+
+        _track_response_collectors[key] = (
+            http_request_counter,
+            http_response_counter,
+            http_requests_active,
+            routing_keys_active,
+        )
+
+    return _track_response_collectors[key]
+
+
 def add_prometheus_track_response_middleware(
     app, extra_labels: Optional[Dict[str, str]] = None
 ):
-    from prometheus_client import Counter, Gauge
-
     extra_labels = extra_labels or {}
     extra_label_names = list(extra_labels.keys())
 
-    http_request_counter = Counter(
-        name="sglang:http_requests_total",
-        documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=extra_label_names + ["endpoint", "method"],
-    )
-
-    http_response_counter = Counter(
-        name="sglang:http_responses_total",
-        documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
-    )
-
-    http_requests_active = Gauge(
-        name="sglang:http_requests_active",
-        documentation="Number of currently active HTTP requests",
-        labelnames=extra_label_names + ["endpoint", "method"],
-        multiprocess_mode="livesum",
-    )
-
-    routing_keys_active = RefCountedGauge(
-        Gauge(
-            name="sglang:routing_keys_active",
-            documentation="Number of unique routing keys with active requests",
-            multiprocess_mode="livesum",
-        )
-    )
+    (
+        http_request_counter,
+        http_response_counter,
+        http_requests_active,
+        routing_keys_active,
+    ) = _get_or_create_track_response_collectors(extra_label_names)
 
     # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
     # that passes `receive` through, so request.is_disconnected() keeps working.

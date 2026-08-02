@@ -60,6 +60,8 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from starlette.datastructures import State
+from starlette.routing import Route as StarletteRoute
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -271,16 +273,47 @@ async def lifespan(fast_api_app: FastAPI):
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
+        # External hosts that embed the module-level app configure it by
+        # setting the three attributes above by hand, so they do not set the
+        # warmup target, which this module started reading only recently.
+        # Falling back to the standalone warmup keeps those hosts working
+        # exactly as they did before.
+        warmup_thread_target = getattr(
+            fast_api_app, "warmup_thread_target", _wait_and_warmup
+        )
         thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
         warmup_thread_kwargs = dict(server_args=server_args)
+        warmup_thread_target = _wait_and_warmup
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+
+    # Apps built by `build_app` carry their own engine binding on
+    # `app.state.global_state` (set by `init_app_state`); the module-level app
+    # relies on the process-global state set by `set_global_state`. Both
+    # attributes are read with a default because this lifespan can also be
+    # attached to an app that neither `build_app` nor this module created, and
+    # a Starlette `State` raises AttributeError for names that were never set.
+    global_state = getattr(fast_api_app.state, "global_state", None)
+    if global_state is None:
+        if getattr(fast_api_app.state, "built_by_build_app", False):
+            raise RuntimeError(
+                "This app was created by build_app but no engine was bound to "
+                "it. Call init_app_state(engine, app.state) before serving "
+                "the app."
+            )
+        global_state = _global_state
+    if global_state is None:
+        raise RuntimeError(
+            "SGLang global state is not initialized. When embedding the app in "
+            "an external ASGI host, call init_app_state(engine, app.state) "
+            "before serving it."
+        )
 
     # Add prometheus middleware
     if server_args.enable_metrics:
-        add_prometheus_middleware(app)
+        add_prometheus_middleware(fast_api_app)
         enable_func_timer()
 
     # Init tracing
@@ -298,37 +331,37 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_chat = (
-        _global_state.tokenizer_manager.serving_chat_class(
-            _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager.serving_chat_class(
+            global_state.tokenizer_manager, global_state.template_manager
         )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
 
     # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+    fast_api_app.state.ollama_serving = OllamaServing(global_state.tokenizer_manager)
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
@@ -357,8 +390,8 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
         fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
-            _global_state.tokenizer_manager,
-            _global_state.template_manager,
+            global_state.tokenizer_manager,
+            global_state.template_manager,
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
         )
@@ -379,7 +412,7 @@ async def lifespan(fast_api_app: FastAPI):
         await execute_warmups(
             server_args.disaggregation_mode,
             server_args.warmups.split(","),
-            _global_state.tokenizer_manager,
+            global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
 
@@ -395,9 +428,9 @@ async def lifespan(fast_api_app: FastAPI):
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
+                tokenizer_manager=global_state.tokenizer_manager,
+                template_manager=global_state.template_manager,
+                scheduler_info=global_state.scheduler_info,
             )
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
@@ -406,7 +439,7 @@ async def lifespan(fast_api_app: FastAPI):
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
+            target=warmup_thread_target,
             kwargs=warmup_thread_kwargs,
         )
         warmup_thread.start()
@@ -426,25 +459,52 @@ async def lifespan(fast_api_app: FastAPI):
             warmup_thread.join()
 
 
-# Fast API
-app = FastAPI(
-    lifespan=lifespan,
-    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _new_fastapi_app(*, built_by_build_app: bool) -> FastAPI:
+    """Create an empty FastAPI app with the middleware every SGLang app needs.
 
-if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
-    from sglang.srt.entrypoints.http_request_decompression import (
-        RequestDecompressionMiddleware,
+    Shared by the module-level ``app`` below and by ``build_app`` so the
+    standalone server and embedded apps cannot drift apart. Only the
+    ``built_by_build_app`` marker differs between the two.
+
+    Routes, exception handlers and the middleware that depends on
+    ``server_args`` are added afterwards; see ``build_app`` and
+    ``_configure_single_tokenizer_app``.
+    """
+    fast_api_app = FastAPI(
+        lifespan=lifespan,
+        openapi_url=(
+            None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json"
+        ),
+    )
+    # The module-level app is bound to an engine through the process-global
+    # state (`set_global_state`); apps built by `build_app` get a per-app
+    # binding via `init_app_state`. `None` means "fall back to the
+    # process-global state".
+    fast_api_app.state.global_state = None
+    # Apps created by `build_app` set this to True so the lifespan can refuse
+    # to start them when no engine was bound, instead of silently falling back
+    # to the process-global state.
+    fast_api_app.state.built_by_build_app = built_by_build_app
+    fast_api_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    app.add_middleware(RequestDecompressionMiddleware)
+    if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+        from sglang.srt.entrypoints.http_request_decompression import (
+            RequestDecompressionMiddleware,
+        )
+
+        fast_api_app.add_middleware(RequestDecompressionMiddleware)
+
+    return fast_api_app
+
+
+# Fast API
+app = _new_fastapi_app(built_by_build_app=False)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -2122,7 +2182,10 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _execute_server_warmup(server_args: ServerArgs):
+def _execute_server_warmup(
+    server_args: ServerArgs,
+    kill_process_on_failure: bool = True,
+):
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -2147,7 +2210,8 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     if not success:
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        if kill_process_on_failure:
+            kill_process_tree(os.getpid())
         return success
 
     model_info = res.json()
@@ -2284,7 +2348,8 @@ def _execute_server_warmup(server_args: ServerArgs):
     except Exception:
         last_traceback = get_exception_traceback()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
+        if kill_process_on_failure:
+            kill_process_tree(os.getpid())
         return False
 
     return success
@@ -2420,6 +2485,216 @@ def _run_granian_server(
         server.serve()
 
 
+def _configure_single_tokenizer_app(
+    fast_api_app: FastAPI,
+    *,
+    server_args: ServerArgs,
+    warmup_thread_kwargs: Dict,
+    warmup_thread_target: Callable = _wait_and_warmup,
+) -> None:
+    """Bind ``server_args`` to the app and add server-args-dependent middleware.
+
+    Shared by ``launch_server`` (via ``_setup_and_run_http_server``) and
+    ``build_app`` so the standalone server and embedded apps are configured
+    through one code path.
+    """
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    fast_api_app.is_single_tokenizer_mode = True
+    fast_api_app.server_args = server_args
+    fast_api_app.warmup_thread_kwargs = warmup_thread_kwargs
+    fast_api_app.warmup_thread_target = warmup_thread_target
+
+    # Add api key authorization
+    # This is only supported in single tokenizer mode.
+    #
+    # Backward compatibility:
+    # - api_key only: behavior matches legacy (all endpoints require api_key)
+    # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+    #   admin_api_key is not configured.
+    if (
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(fast_api_app)
+    ):
+        from sglang.srt.utils.auth import add_api_key_middleware
+
+        add_api_key_middleware(
+            fast_api_app,
+            api_key=server_args.api_key,
+            admin_api_key=server_args.admin_api_key,
+        )
+
+
+def _embedded_app_warmup(server_args: ServerArgs, run_http_warmup: bool) -> None:
+    """Warmup thread body for apps built by ``build_app``.
+
+    Runs the same startup steps as the standalone server (``_wait_and_warmup``)
+    and only replaces the step that sends the warmup HTTP requests:
+
+    * When ``run_http_warmup`` is False (the default for embedded apps), no
+      HTTP request is sent and the engine is simply marked ready, exactly as if
+      ``skip_server_warmup`` were set. An embedded app is usually not served at
+      ``server_args.host`` and ``server_args.port``, so requests to that
+      address would not reach it.
+    * When ``run_http_warmup`` is True, the regular HTTP warmup runs against
+      ``server_args.host`` and ``server_args.port``, except that a failure
+      never kills the process, because the process belongs to the external
+      host that embeds the app. The failure is logged and the engine stays not
+      ready.
+
+    Everything else stays as on the standalone path: waiting for the weights
+    of a checkpoint engine, skipping warmup for an elastic EP joiner, deleting
+    the checkpoint after loading, and ending the process after a tensor dump
+    run. The only step of ``_wait_and_warmup`` an embedded app never uses is
+    the launch callback, which the standalone path uses to report readiness
+    back to ``launch_server``. An embedded app has no such caller to report
+    to; its host starts the app and sees the ASGI lifespan finish.
+    """
+
+    def execute_warmup(server_args: ServerArgs) -> bool:
+        if not run_http_warmup:
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            return True
+        if _execute_server_warmup(server_args, kill_process_on_failure=False):
+            return True
+        logger.error(
+            "Warmup of the embedded SGLang app failed. The engine was not "
+            "marked ready. The host process keeps running."
+        )
+        return False
+
+    _wait_and_warmup(server_args, execute_warmup_func=execute_warmup)
+
+
+def build_app(server_args: ServerArgs, warmup: bool = False) -> FastAPI:
+    """Build a fresh FastAPI app serving the SGLang HTTP API for an in-process engine.
+
+    Use this to embed SGLang's OpenAI compatible server in an external ASGI
+    host (e.g. Ray Serve) without touching the module level ``app``:
+
+    .. code-block:: python
+
+        import sglang
+        import uvicorn
+        from sglang.srt.entrypoints.http_server import build_app, init_app_state
+
+        engine = sglang.Engine(**engine_kwargs)
+        app = build_app(engine.server_args)
+        init_app_state(engine, app.state)
+        uvicorn.run(app, host="0.0.0.0", port=30000)
+
+    The returned app carries the same routes, exception handlers, and
+    middleware configuration as the app served by ``launch_server`` (both are
+    configured through ``_configure_single_tokenizer_app``). Notes:
+
+    1. The host must run the ASGI lifespan: the serving handlers on
+       ``app.state`` are created at startup by ``lifespan``, and the lifespan
+       refuses to start when ``init_app_state`` was never called.
+    2. By default no warmup HTTP requests are sent; the engine is marked
+       ready as soon as the app starts. Passing ``warmup=True`` enables the
+       built in warmup, which sends HTTP requests carrying
+       ``server_args.api_key`` to ``server_args.host`` and
+       ``server_args.port``. Only enable it when the app is actually served
+       at that address.
+    3. Apart from those requests, startup runs the same steps as the
+       standalone server; see ``_embedded_app_warmup``. Two of those steps are
+       worth calling out for a host process. Setting
+       ``server_args.debug_tensor_dump_input_file`` still ends the process
+       once the dump is written, and that process is now the host's, so use
+       the flag only in a debug run. And there is no "the engine is ready"
+       callback, because the host starts the app itself and sees the ASGI
+       lifespan finish.
+    4. The app installs a CORS policy that allows every origin with
+       credentials, the same as ``launch_server``. When the app is mounted
+       inside a host application, that policy applies to the mounted subtree.
+    5. Only single tokenizer mode is supported; multi tokenizer mode requires
+       the shared memory bootstrap in ``launch_server``.
+    """
+    if server_args.tokenizer_worker_num != 1:
+        raise ValueError(
+            "build_app only supports single-tokenizer mode "
+            f"(tokenizer_worker_num=1, got {server_args.tokenizer_worker_num}). "
+            "Multi-tokenizer mode requires the shared-memory bootstrap in "
+            "launch_server."
+        )
+
+    fast_api_app = _new_fastapi_app(built_by_build_app=True)
+
+    # Every endpoint in this module is registered on the module-level ``app``;
+    # snapshot those route objects onto the fresh app. Plain starlette
+    # ``Route`` entries are FastAPI's own doc routes (/openapi.json, /docs,
+    # ...), which the fresh app already has. Sharing the (immutable) route
+    # objects keeps the route lists independent: routes added to one app later
+    # do not appear on the other.
+    fast_api_app.router.routes.extend(
+        route for route in app.router.routes if type(route) is not StarletteRoute
+    )
+    fast_api_app.exception_handlers.update(app.exception_handlers)
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(fast_api_app)
+
+    _configure_single_tokenizer_app(
+        fast_api_app,
+        server_args=server_args,
+        warmup_thread_kwargs=dict(
+            server_args=server_args,
+            run_http_warmup=warmup,
+        ),
+        warmup_thread_target=_embedded_app_warmup,
+    )
+    return fast_api_app
+
+
+def init_app_state(
+    engine: Engine,
+    state: State,
+    server_args: Optional[ServerArgs] = None,
+) -> None:
+    """Bind an in-process ``Engine`` to an app built by ``build_app``.
+
+    Stores the engine's tokenizer manager, template manager, and scheduler info
+    on ``state`` (consumed by ``lifespan`` at startup to create the serving
+    handlers) and publishes the same objects as the process-global state used
+    by the native endpoints (``/generate``, ``/health``, ...).
+
+    ``server_args`` is optional and exists only for symmetry with similar
+    factory APIs. When given, it must equal ``engine.server_args``; the engine
+    is always bound with the arguments it was created with.
+
+    Known limitation: because the native endpoints still read the
+    process-global state, only one engine per process can be bound. Binding a
+    different engine raises instead of silently repointing the native
+    endpoints of already running apps.
+    """
+    if server_args is not None and server_args != engine.server_args:
+        raise ValueError(
+            "server_args does not match engine.server_args. init_app_state "
+            "always binds the engine with the arguments the engine was "
+            "created with, so pass engine.server_args or omit the parameter."
+        )
+    if server_args is None:
+        server_args = engine.server_args
+    if (
+        _global_state is not None
+        and _global_state.tokenizer_manager is not engine.tokenizer_manager
+    ):
+        raise RuntimeError(
+            "A different engine is already bound in this process. The native "
+            "endpoints read one process wide engine binding, so only one "
+            "engine per process can serve SGLang apps."
+        )
+    global_state = _GlobalState(
+        tokenizer_manager=engine.tokenizer_manager,
+        template_manager=engine.template_manager,
+        scheduler_info=engine._scheduler_init_result.scheduler_infos[0],
+    )
+    set_global_state(global_state)
+    state.global_state = global_state
+    state.server_args = server_args
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -2450,37 +2725,17 @@ def _setup_and_run_http_server(
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
     if server_args.tokenizer_worker_num == 1:
         # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_kwargs = dict(
+        _configure_single_tokenizer_app(
+            app,
             server_args=server_args,
-            launch_callback=launch_callback,
-            execute_warmup_func=execute_warmup_func,
+            warmup_thread_kwargs=dict(
+                server_args=server_args,
+                launch_callback=launch_callback,
+                execute_warmup_func=execute_warmup_func,
+            ),
         )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            server_args.api_key
-            or server_args.admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
-            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.

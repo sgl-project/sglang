@@ -156,6 +156,7 @@ def add_api_key_middleware(
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
     from starlette.requests import Request
+    from starlette.routing import get_route_path
 
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
@@ -172,7 +173,12 @@ def add_api_key_middleware(
                 return
 
             request = Request(scope, receive=receive)
-            path = request.url.path
+            # Use the path relative to where this app is mounted, so the
+            # exemption for /health and /metrics in decide_request_auth keeps
+            # working when the app is served under a path prefix inside a
+            # larger application. For an app served at the root, this is the
+            # full request path, so standalone behavior is unchanged.
+            path = get_route_path(scope)
             authz = request.headers.get("Authorization")
             level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
             decision = decide_request_auth(

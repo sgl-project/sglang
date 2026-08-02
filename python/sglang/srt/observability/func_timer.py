@@ -32,6 +32,12 @@ def enable_func_timer():
     global enable_metrics, FUNC_LATENCY
     enable_metrics = True
 
+    if FUNC_LATENCY is not None:
+        # Already enabled earlier in this process (for example when a second
+        # app with metrics starts). Creating the histogram again would fail
+        # because its name is already registered with prometheus.
+        return
+
     FUNC_LATENCY = Histogram(
         "sglang:func_latency_seconds",
         "Function latency in seconds",
