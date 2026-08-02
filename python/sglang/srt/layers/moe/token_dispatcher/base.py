@@ -29,6 +29,8 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        MoonEPCombineInput,
+        MoonEPDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -165,12 +167,19 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_moonep(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MoonEPDispatchOutput]:
+        return dispatch_output.format.is_moonep()
+
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    MOONEP = "moonep"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
 
@@ -194,6 +203,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_moonep(self) -> bool:
+        return self == DispatchOutputFormat.MOONEP
 
 
 @runtime_checkable
@@ -249,11 +261,18 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_moonep(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MoonEPCombineInput]:
+        return combine_input.format == CombineInputFormat.MOONEP
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    MOONEP = "moonep"
     FLASHINFER = "flashinfer"
     ASCEND_TP = "ascend_tp"
 
