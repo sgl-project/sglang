@@ -98,6 +98,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     """Create a TokenizerManager with mocked dependencies, bypassing __init__."""
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
+    tm._config_updates = []
     tm.server_args.enable_trace = False
     tm.server_args.enable_metrics = False
     tm.server_args.enable_lora = False

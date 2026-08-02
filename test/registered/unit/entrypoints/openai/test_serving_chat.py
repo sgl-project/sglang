@@ -48,6 +48,9 @@ class _MockTokenizerManager:
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
         )
+        # The manager tracks the served name itself; a weight update rewrites it.
+        self.served_model_name = "test-model"
+
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]

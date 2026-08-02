@@ -912,17 +912,23 @@ class RuntimeContext:
         """Serialize the *resolved* config: the pristine ``server_args`` fields
         with every post-publish ``override`` overlaid.
 
-        Reporting endpoints (``/server_info``, ``get_internal_state``) surface
-        the config the process is *currently* running, not the startup record,
-        so they read this rather than serializing ``server_args`` directly —
-        otherwise runtime updates (weight version, model path, tunables set via
-        ``/set_internal_state``) never show up in the readback.
+        ``get_internal_state`` reports this, and ``/server_info`` carries it in
+        the ``internal_states`` block, so scheduler-side runtime changes show up
+        in a readback: HiCache attach/detach, the generated forward-pass-metrics
+        endpoint, tunables set via ``/set_internal_state``.
 
         ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
         ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first (``/server_info``). Override
-        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
-        top level of either base is exact.
+        dataclass fields must be expanded first. Override leaves are flat
+        ``ServerArgs`` field names, so overlaying them onto the top level of
+        either base is exact.
+
+        This covers the process-global bags only. Per-engine control-plane
+        changes (weight version, model path, the tokenizer's HiCache mirror)
+        live on the tokenizer manager — several ``Engine``s can share one
+        process — and ``TokenizerManager.resolved_config_dict`` overlays those
+        for the top-level ``/server_info`` body. The two are separate logs, not
+        one merged dict.
         """
         d = dict(vars(self.server_args)) if base is None else dict(base)
         for _source, fields in self._overrides_log:

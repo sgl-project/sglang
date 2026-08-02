@@ -710,12 +710,13 @@ async def model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "weight_version": _global_state.tokenizer_manager.config_value(
+            "weight_version"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
     embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
@@ -761,7 +762,9 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **_global_state.tokenizer_manager.resolved_config_dict(
+                dataclasses.asdict(server_args)
+            ),
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
@@ -1091,10 +1094,13 @@ async def hicache_storage_backend_status():
         return _admin_api_key_missing_response()
 
     return {
-        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
-        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
-        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
-        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+        name: _global_state.tokenizer_manager.config_value(name)
+        for name in (
+            "hicache_storage_backend",
+            "hicache_storage_backend_extra_config",
+            "hicache_storage_prefetch_policy",
+            "hicache_write_policy",
+        )
     }
 
 
@@ -1385,8 +1391,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.override(
+        _global_state.tokenizer_manager.record_config_updates(
             "http.update_weight_version", weight_version=obj.new_version
         )
 

@@ -343,7 +343,7 @@ class TokenizerControlMixin:
                 )
             if hicache_write_policy is not None:
                 hicache_fields["hicache_write_policy"] = hicache_write_policy
-            self.server_args.override("tokenizer.attach_hicache", **hicache_fields)
+            self.record_config_updates("tokenizer.attach_hicache", **hicache_fields)
         return out
 
     async def detach_hicache_storage(
@@ -359,7 +359,7 @@ class TokenizerControlMixin:
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
-            self.server_args.override(
+            self.record_config_updates(
                 "tokenizer.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
@@ -920,6 +920,6 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            self.server_args.override(
+            self.record_config_updates(
                 "tokenizer.weight_version", weight_version=weight_version
             )
