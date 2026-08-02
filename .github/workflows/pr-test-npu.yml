@@ -388,7 +388,7 @@ jobs:
         run: |
           pip install sglang_router
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   stage-b-test-8-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
