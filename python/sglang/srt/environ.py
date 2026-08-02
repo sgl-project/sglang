@@ -232,6 +232,14 @@ class Envs:
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
 
+    # Per-role config-namespace bookkeeping: off / record / enforce (value is
+    # validated fail-loud in runtime_context, which resolves it once at import
+    # so the read stays dynamo-prunable).
+    SGLANG_ROLE_NAMESPACES = EnvStr("off")
+    # record mode: append each newly observed (role, namespace) pair to this
+    # file so the audit survives signal-killed workers.
+    SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
@@ -1087,6 +1095,9 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Copy rank-local MoE slices into independent CPU storage before H2D when
+    # they reference a larger mmap-backed checkpoint storage.
+    SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

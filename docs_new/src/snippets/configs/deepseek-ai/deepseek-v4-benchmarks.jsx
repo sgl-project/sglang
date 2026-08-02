@@ -7,6 +7,36 @@ export const benchmarks = [
   // B200 + FP4
   // ====================================================================
   {
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 218.90, tpot_ms: 1.28, tokens_per_sec_per_gpu: 481 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 189.89, tpot_ms: 3.38, tokens_per_sec_per_gpu: 3383 },
+    ],
+  },
+  {
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 1629.45, tpot_ms: 34.13, tokens_per_sec_per_gpu: 1595 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 2568.55, tpot_ms: 57.15, tokens_per_sec_per_gpu: 4326 },
+    ],
+  },
+  {
+    match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 74853.51, tpot_ms: 51.72, tokens_per_sec_per_gpu: 5464 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 216241.01, tpot_ms: 51.80, tokens_per_sec_per_gpu: 5301 },
+    ],
+  },
+  {
     match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
@@ -395,6 +425,36 @@ export const benchmarks = [
   // ====================================================================
   // H200 + FP4
   // ====================================================================
+  {
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 308.29, tpot_ms: 1.72, tokens_per_sec_per_gpu: 606 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 661.70, tpot_ms: 8.39, tokens_per_sec_per_gpu: 2538 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 1617.91, tpot_ms: 38.05, tokens_per_sec_per_gpu: 2994 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 1931.94, tpot_ms: 104.53, tokens_per_sec_per_gpu: 4872 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 195108.42, tpot_ms: 123.81, tokens_per_sec_per_gpu: 4573 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 505508.73, tpot_ms: 123.97, tokens_per_sec_per_gpu: 4542 },
+    ],
+  },
   {
     match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",

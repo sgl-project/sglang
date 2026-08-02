@@ -103,7 +103,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -277,16 +277,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
-        needs_full_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash_family()
-        )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or needs_full_hidden_states:
+        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
-            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
@@ -335,7 +331,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
 
@@ -403,8 +399,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend
-            and not model_runner.server_args.disable_chunked_prefix_cache
+            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -1056,7 +1051,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if (
             capture_hidden_mode is not None
-            and capture_hidden_mode != self.capture_hidden_mode
+            and self.capture_hidden_mode < capture_hidden_mode
         ):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
@@ -1652,9 +1647,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
         )
 
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
