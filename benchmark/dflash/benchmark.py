@@ -28,9 +28,23 @@ DEFAULT_TARGET_MODEL = "moonshotai/Kimi-K3"
 DEFAULT_TARGET_MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
 DEFAULT_DFLASH_DRAFT_MODEL = "/tmp/dflash/draft-epoch-10"
 DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND = "trtllm_mha"
+DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE = "bf16"
 DEFAULT_LINEAR_ATTN_PREFILL_BACKEND = "ptx_kda"
 DEFAULT_LINEAR_ATTN_DECODE_BACKEND = "triton"
 DEFAULT_LINEAR_ATTN_VERIFY_BACKEND = "nv_cutedsl"
+DEFAULT_CUDA_GRAPH_BACKEND_PREFILL = "breakable"
+DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL = 4096
+DEFAULT_CUDA_GRAPH_BS_PREFILL = (
+    128,
+    256,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+    3072,
+    4096,
+)
 LINEAR_ATTN_PREFILL_BACKEND_CHOICES = (
     "triton",
     "cutedsl",
@@ -48,6 +62,7 @@ LINEAR_ATTN_VERIFY_BACKEND_CHOICES = (
     "nv_cutedsl",
     "flashinfer",
 )
+CUDA_GRAPH_BACKEND_PREFILL_CHOICES = ("breakable", "disabled")
 DEFAULT_TRTLLM_GEN_MOE_CUBIN_POOL = os.environ.get(
     "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL",
     "/home/modal/trtllm_gen_moe_cubin_pool_20260617_v0613rc1",
@@ -80,6 +95,9 @@ class SharedServerConfig:
     linear_attn_prefill_backend: str = DEFAULT_LINEAR_ATTN_PREFILL_BACKEND
     linear_attn_decode_backend: str = DEFAULT_LINEAR_ATTN_DECODE_BACKEND
     linear_attn_verify_backend: str = DEFAULT_LINEAR_ATTN_VERIFY_BACKEND
+    cuda_graph_backend_prefill: str = DEFAULT_CUDA_GRAPH_BACKEND_PREFILL
+    cuda_graph_max_bs_prefill: int = DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL
+    cuda_graph_bs_prefill: tuple[int, ...] = DEFAULT_CUDA_GRAPH_BS_PREFILL
 
     def to_args(self) -> list[str]:
         args = [
@@ -106,6 +124,12 @@ class SharedServerConfig:
             str(self.max_running_requests),
             "--cuda-graph-max-bs-decode",
             str(self.cuda_graph_max_bs_decode),
+            "--cuda-graph-backend-prefill",
+            self.cuda_graph_backend_prefill,
+            "--cuda-graph-max-bs-prefill",
+            str(self.cuda_graph_max_bs_prefill),
+            "--cuda-graph-bs-prefill",
+            *(str(size) for size in self.cuda_graph_bs_prefill),
             "--skip-server-warmup",
             "--enable-metrics",
         ]
@@ -132,7 +156,11 @@ class SharedServerConfig:
             f"random_seed:{self.random_seed},"
             f"linear_attn_prefill_backend:{self.linear_attn_prefill_backend},"
             f"linear_attn_decode_backend:{self.linear_attn_decode_backend},"
-            f"linear_attn_verify_backend:{self.linear_attn_verify_backend}"
+            f"linear_attn_verify_backend:{self.linear_attn_verify_backend},"
+            f"cuda_graph_backend_prefill:{self.cuda_graph_backend_prefill},"
+            f"cuda_graph_max_bs_prefill:{self.cuda_graph_max_bs_prefill},"
+            "cuda_graph_bs_prefill:"
+            f"{' '.join(str(size) for size in self.cuda_graph_bs_prefill)}"
         )
 
 
@@ -144,6 +172,7 @@ class DFlashConfig:
     draft_model: str
     block_size: Optional[int] = None
     draft_attention_backend: str = DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND
+    draft_kv_cache_dtype: str = DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE
     # Replace per-token SSM snapshots with ReplaySSM raw-input rings.
     enable_replayssm: bool = True
 
@@ -178,6 +207,8 @@ class DFlashConfig:
             self.draft_model,
             "--speculative-draft-attention-backend",
             self.draft_attention_backend,
+            "--speculative-draft-kv-cache-dtype",
+            self.draft_kv_cache_dtype,
         ]
         if self.block_size is not None:
             args.extend(["--speculative-dflash-block-size", str(int(self.block_size))])
@@ -237,6 +268,12 @@ class ServerDeployment:
             return self.mode_config.block_size
         return None
 
+    @property
+    def dflash_draft_kv_cache_dtype(self) -> Optional[str]:
+        if isinstance(self.mode_config, DFlashConfig):
+            return self.mode_config.draft_kv_cache_dtype
+        return None
+
 
 @dataclass(frozen=True)
 class DeploymentSweep:
@@ -244,6 +281,7 @@ class DeploymentSweep:
     dflash_draft_model: str
     dflash_block_sizes: tuple[Optional[int], ...]
     dflash_draft_attention_backend: str = DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND
+    dflash_draft_kv_cache_dtype: str = DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE
     dflash_enable_replayssm: bool = True
 
     @property
@@ -287,6 +325,9 @@ class SweepConfig:
     linear_attn_prefill_backend: str
     linear_attn_decode_backend: str
     linear_attn_verify_backend: str
+    cuda_graph_backend_prefill: str
+    cuda_graph_max_bs_prefill: int
+    cuda_graph_bs_prefill: tuple[int, ...]
     workloads: tuple[str, ...]
     concurrencies: tuple[int, ...]
     sampling: SamplingConfig
@@ -408,6 +449,9 @@ def _shared_server_config_to_payload(config: SharedServerConfig) -> dict[str, An
         "linear_attn_prefill_backend": config.linear_attn_prefill_backend,
         "linear_attn_decode_backend": config.linear_attn_decode_backend,
         "linear_attn_verify_backend": config.linear_attn_verify_backend,
+        "cuda_graph_backend_prefill": config.cuda_graph_backend_prefill,
+        "cuda_graph_max_bs_prefill": config.cuda_graph_max_bs_prefill,
+        "cuda_graph_bs_prefill": list(config.cuda_graph_bs_prefill),
     }
 
 
@@ -435,6 +479,19 @@ def _shared_server_config_from_payload(payload: dict[str, Any]) -> SharedServerC
             payload.get("linear_attn_verify_backend")
             or DEFAULT_LINEAR_ATTN_VERIFY_BACKEND
         ),
+        cuda_graph_backend_prefill=str(
+            payload.get("cuda_graph_backend_prefill")
+            or DEFAULT_CUDA_GRAPH_BACKEND_PREFILL
+        ),
+        cuda_graph_max_bs_prefill=int(
+            payload.get("cuda_graph_max_bs_prefill", DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL)
+        ),
+        cuda_graph_bs_prefill=tuple(
+            int(size)
+            for size in payload.get(
+                "cuda_graph_bs_prefill", DEFAULT_CUDA_GRAPH_BS_PREFILL
+            )
+        ),
     )
 
 
@@ -449,6 +506,7 @@ def _mode_config_to_payload(
             "draft_model": config.draft_model,
             "block_size": config.block_size,
             "draft_attention_backend": config.draft_attention_backend,
+            "draft_kv_cache_dtype": config.draft_kv_cache_dtype,
             "enable_replayssm": config.enable_replayssm,
         }
     raise TypeError(f"Unsupported mode config type: {type(config).__name__}")
@@ -466,6 +524,12 @@ def _mode_config_from_payload(
             block_size=payload.get("block_size"),
             draft_attention_backend=str(
                 payload.get("draft_attention_backend", "trtllm_mha")
+            ),
+            draft_kv_cache_dtype=str(
+                payload.get(
+                    "draft_kv_cache_dtype",
+                    DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE,
+                )
             ),
             enable_replayssm=bool(payload.get("enable_replayssm", True)),
         )
@@ -1403,6 +1467,9 @@ def _build_shared_server_configs(
     linear_attn_prefill_backend: str = DEFAULT_LINEAR_ATTN_PREFILL_BACKEND,
     linear_attn_decode_backend: str = DEFAULT_LINEAR_ATTN_DECODE_BACKEND,
     linear_attn_verify_backend: str = DEFAULT_LINEAR_ATTN_VERIFY_BACKEND,
+    cuda_graph_backend_prefill: str = DEFAULT_CUDA_GRAPH_BACKEND_PREFILL,
+    cuda_graph_max_bs_prefill: int = DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL,
+    cuda_graph_bs_prefill: tuple[int, ...] = DEFAULT_CUDA_GRAPH_BS_PREFILL,
 ) -> list[SharedServerConfig]:
     if device_sm != 103:
         raise RuntimeError(
@@ -1416,6 +1483,9 @@ def _build_shared_server_configs(
             linear_attn_prefill_backend=linear_attn_prefill_backend,
             linear_attn_decode_backend=linear_attn_decode_backend,
             linear_attn_verify_backend=linear_attn_verify_backend,
+            cuda_graph_backend_prefill=cuda_graph_backend_prefill,
+            cuda_graph_max_bs_prefill=cuda_graph_max_bs_prefill,
+            cuda_graph_bs_prefill=cuda_graph_bs_prefill,
             max_running_requests=max(
                 BASE_SHARED_SERVER_CONFIG.max_running_requests,
                 int(max_concurrency),
@@ -1453,6 +1523,7 @@ def _build_deployments(
                     draft_model=sweep.dflash_draft_model,
                     block_size=block_size,
                     draft_attention_backend=sweep.dflash_draft_attention_backend,
+                    draft_kv_cache_dtype=sweep.dflash_draft_kv_cache_dtype,
                     enable_replayssm=sweep.dflash_enable_replayssm,
                 ),
             )
@@ -1796,12 +1867,28 @@ def _print_summary(
                 config.linear_attn_verify_backend,
             ),
             (
+                "cuda_graph_backend_prefill",
+                config.cuda_graph_backend_prefill,
+            ),
+            (
+                "cuda_graph_max_bs_prefill",
+                config.cuda_graph_max_bs_prefill,
+            ),
+            (
+                "cuda_graph_bs_prefill",
+                " ".join(str(size) for size in config.cuda_graph_bs_prefill),
+            ),
+            (
                 "dflash_draft_model",
                 config.deployment_sweep.dflash_draft_model,
             ),
             (
                 "speculative_draft_attention_backend",
                 config.deployment_sweep.dflash_draft_attention_backend,
+            ),
+            (
+                "speculative_draft_kv_cache_dtype",
+                config.deployment_sweep.dflash_draft_kv_cache_dtype,
             ),
             (
                 "trtllm_gen_moe_cubin_pool",
@@ -2011,9 +2098,13 @@ CSV_FIELDS = [
     "linear_attn_prefill_backend",
     "linear_attn_decode_backend",
     "linear_attn_verify_backend",
+    "cuda_graph_backend_prefill",
+    "cuda_graph_max_bs_prefill",
+    "cuda_graph_bs_prefill",
     "tp",
     "mode",
     "dflash_block_size",
+    "speculative_draft_kv_cache_dtype",
     "concurrency",
     "source_sample_count",
     "source_generation_turn_count",
@@ -2292,9 +2383,18 @@ def _build_csv_rows(
                 "linear_attn_prefill_backend": result.deployment.shared_config.linear_attn_prefill_backend,
                 "linear_attn_decode_backend": result.deployment.shared_config.linear_attn_decode_backend,
                 "linear_attn_verify_backend": result.deployment.shared_config.linear_attn_verify_backend,
+                "cuda_graph_backend_prefill": result.deployment.shared_config.cuda_graph_backend_prefill,
+                "cuda_graph_max_bs_prefill": result.deployment.shared_config.cuda_graph_max_bs_prefill,
+                "cuda_graph_bs_prefill": " ".join(
+                    str(size)
+                    for size in result.deployment.shared_config.cuda_graph_bs_prefill
+                ),
                 "tp": key.tp,
                 "mode": key.mode,
                 "dflash_block_size": result.deployment.dflash_block_size or "",
+                "speculative_draft_kv_cache_dtype": (
+                    result.deployment.dflash_draft_kv_cache_dtype or ""
+                ),
                 "concurrency": key.concurrency,
                 "source_sample_count": _fmt_optional_int(result.source_sample_count),
                 "source_generation_turn_count": _fmt_optional_int(
@@ -2461,6 +2561,35 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cuda-graph-backend-prefill",
+        type=str.lower,
+        choices=CUDA_GRAPH_BACKEND_PREFILL_CHOICES,
+        default=DEFAULT_CUDA_GRAPH_BACKEND_PREFILL,
+        help=(
+            "Target prefill CUDA graph backend "
+            f"(benchmark default: {DEFAULT_CUDA_GRAPH_BACKEND_PREFILL})."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-max-bs-prefill",
+        type=int,
+        default=DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL,
+        help=(
+            "Maximum captured prefill token bucket "
+            f"(benchmark default: {DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL})."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-bs-prefill",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_CUDA_GRAPH_BS_PREFILL),
+        help=(
+            "Captured prefill token buckets "
+            f"(benchmark default: {' '.join(str(size) for size in DEFAULT_CUDA_GRAPH_BS_PREFILL)})."
+        ),
+    )
+    parser.add_argument(
         "--random-seed",
         type=int,
         default=DEFAULT_RANDOM_SEED,
@@ -2485,6 +2614,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Attention backend for the DFlash draft worker "
             f"(default: {DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND})."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-draft-kv-cache-dtype",
+        type=str.lower,
+        default=DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE,
+        help=(
+            "KV cache dtype for the DFlash draft worker's separate pool "
+            f"(benchmark default: {DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE})."
         ),
     )
     parser.add_argument(
@@ -2601,11 +2739,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         parser.error(
             "--dflash-block-sizes values must be > 0, " f"got {args.dflash_block_sizes}"
         )
+    if args.cuda_graph_max_bs_prefill <= 0:
+        parser.error("--cuda-graph-max-bs-prefill must be > 0")
+    if (
+        not args.cuda_graph_bs_prefill
+        or any(size <= 0 for size in args.cuda_graph_bs_prefill)
+        or args.cuda_graph_bs_prefill != sorted(set(args.cuda_graph_bs_prefill))
+    ):
+        parser.error("--cuda-graph-bs-prefill must be unique, positive, and increasing")
+    if args.cuda_graph_bs_prefill[-1] > args.cuda_graph_max_bs_prefill:
+        parser.error(
+            "--cuda-graph-bs-prefill values must not exceed "
+            "--cuda-graph-max-bs-prefill"
+        )
     mode_keys = DeploymentSweep(
         include_baseline=not args.skip_baseline,
         dflash_draft_model=args.dflash_draft_model,
         dflash_block_sizes=tuple(dflash_block_sizes),
         dflash_draft_attention_backend=args.speculative_draft_attention_backend,
+        dflash_draft_kv_cache_dtype=args.speculative_draft_kv_cache_dtype,
         dflash_enable_replayssm=not args.disable_replayssm,
     ).mode_keys
     duplicate_mode_keys = _duplicate_values(mode_keys)
@@ -2638,6 +2790,7 @@ def build_sweep_config_from_args(args: argparse.Namespace) -> SweepConfig:
         dflash_draft_model=args.dflash_draft_model,
         dflash_block_sizes=tuple(args.dflash_block_sizes),
         dflash_draft_attention_backend=args.speculative_draft_attention_backend,
+        dflash_draft_kv_cache_dtype=args.speculative_draft_kv_cache_dtype,
         dflash_enable_replayssm=not args.disable_replayssm,
     )
 
@@ -2690,6 +2843,9 @@ def build_sweep_config_from_args(args: argparse.Namespace) -> SweepConfig:
         linear_attn_prefill_backend=args.linear_attn_prefill_backend,
         linear_attn_decode_backend=args.linear_attn_decode_backend,
         linear_attn_verify_backend=args.linear_attn_verify_backend,
+        cuda_graph_backend_prefill=args.cuda_graph_backend_prefill,
+        cuda_graph_max_bs_prefill=int(args.cuda_graph_max_bs_prefill),
+        cuda_graph_bs_prefill=tuple(args.cuda_graph_bs_prefill),
         random_seed=int(args.random_seed),
         workloads=tuple(args.workloads),
         concurrencies=tuple(concurrencies),
@@ -2723,6 +2879,9 @@ def build_shared_configs_for_runtime(
         linear_attn_prefill_backend=sweep_config.linear_attn_prefill_backend,
         linear_attn_decode_backend=sweep_config.linear_attn_decode_backend,
         linear_attn_verify_backend=sweep_config.linear_attn_verify_backend,
+        cuda_graph_backend_prefill=sweep_config.cuda_graph_backend_prefill,
+        cuda_graph_max_bs_prefill=sweep_config.cuda_graph_max_bs_prefill,
+        cuda_graph_bs_prefill=sweep_config.cuda_graph_bs_prefill,
     )
     return shared_configs, device_sm
 
@@ -2742,6 +2901,9 @@ def build_shared_configs_for_modal(
         linear_attn_prefill_backend=sweep_config.linear_attn_prefill_backend,
         linear_attn_decode_backend=sweep_config.linear_attn_decode_backend,
         linear_attn_verify_backend=sweep_config.linear_attn_verify_backend,
+        cuda_graph_backend_prefill=sweep_config.cuda_graph_backend_prefill,
+        cuda_graph_max_bs_prefill=sweep_config.cuda_graph_max_bs_prefill,
+        cuda_graph_bs_prefill=sweep_config.cuda_graph_bs_prefill,
     )
 
 
