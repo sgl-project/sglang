@@ -193,7 +193,7 @@ def test_release_session_threads_mamba_skip_ids():
     dec_lock_ref. The first req's last_node may be full-only-locked (mamba
     skipped at inc), so without the skip set the release would drop a mamba
     lock the session never took -- another request's, on a shared node."""
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
