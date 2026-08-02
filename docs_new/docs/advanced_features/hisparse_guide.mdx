@@ -46,6 +46,28 @@ Prefill GPU  ──RDMA──▶  Decode Host Pool (CPU pinned memory)
 
 For DeepSeek V4, the direct-to-host path writes only C4 KV into the decode host pool. The c4_indexer and C128 KV remain device-to-device transfers.
 
+### Decode-side Radix prefix reuse (experimental)
+
+For ordinary DSA models, HiSparse can expose its canonical cache to the decode-side RadixCache. This allows a later request to reuse a prefix already present on the decode worker instead of receiving the same KV and indexer state from the prefill worker again.
+
+The Radix-visible logical cache owns two rows per token for the same lifetime:
+
+- complete attention KV in CPU pinned memory; and
+- indexer history (`K^I`) on GPU.
+
+HiSparse continues to own only the bounded GPU full-KV hot buffer and its existing LRU/swap-in policy. The hot buffer is an execution cache, not the owner of a reusable prefix.
+
+```text
+Radix logical token ──▶ CPU full KV       (canonical)
+                    └─▶ GPU indexer K^I  (canonical)
+
+CPU full KV ──top-k swap-in──▶ GPU HiSparse hot buffer (transient)
+```
+
+The decode worker matches and pins a reusable prefix before allocating slots for the missing suffix. Prefill then transfers only that suffix. KV produced during decode is copied from the hot buffer back to its canonical CPU slot, and the copy completes before the token is published to RadixCache.
+
+This mode currently supports PD decode with ordinary DSA HiSparse. It rejects speculative decoding, pipeline parallelism, HiCache/decode KV offload, hybrid SWA or Mamba/SSM models, and DeepSeek V4's mixed cache layout.
+
 ## Server Arguments
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -71,6 +93,11 @@ For DeepSeek V4, the direct-to-host path writes only C4 KV into the decode host 
       <td><code>--hisparse-config</code></td>
       <td>JSON string</td>
       <td>Configuration for HiSparse (see below)</td>
+    </tr>
+    <tr>
+      <td><code>--disaggregation-decode-enable-radix-cache</code></td>
+      <td>flag; default: disabled</td>
+      <td>Reuse decode-side CPU KV and GPU indexer prefixes through RadixCache (ordinary DSA only)</td>
     </tr>
   </tbody>
 </table>
@@ -157,6 +184,12 @@ python3 -m sglang.launch_server \
     --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'
 ```
 
+The command above selects legacy request-local HiSparse with `--disable-radix-cache`. To retain completed prefixes on the decode worker for ordinary DSA models, remove `--disable-radix-cache` and add:
+
+```bash Command
+--disaggregation-decode-enable-radix-cache
+```
+
 > **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`). DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
 
 ### Benchmark
@@ -182,6 +215,7 @@ python3 -m sglang.bench_serving \
 
 - The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
 - On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
+- Decode-side Radix reuse is opt-in. It uses HiSparse's CPU full-KV pool and GPU indexer pool as one canonical logical allocation; it does not enable HiCache or create a duplicate full-KV cache.
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
 - For DeepSeek V4, DSA backend flags are not applicable. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
 - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
