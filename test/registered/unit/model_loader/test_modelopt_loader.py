@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -767,9 +768,12 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
     def test_mixed_precision_mxfp8_linear_loads_modelopt_scale(self):
         prefix = "model.layers.0.mlp.down_proj"
         selected_backend = object()
-        with patch(
-            "sglang.srt.layers.quantization.fp8.dispatch_w8a8_mxfp8_linear",
-            return_value=selected_backend,
+        with (
+            get_parallel().override(tp_size=1),
+            patch(
+                "sglang.srt.layers.quantization.fp8.dispatch_w8a8_mxfp8_linear",
+                return_value=selected_backend,
+            ),
         ):
             layer = ReplicatedLinear(
                 input_size=64,
