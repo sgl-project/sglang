@@ -170,6 +170,140 @@ def _aiter_fp8_paged_mqa_logits(
     return logits
 
 
+# The C4 indexer's head dimension can be folded out before the GEMM:
+#
+#   Σ_h w[i,h] · (Σ_d q[i,h,d]·k[j,d])  =  Σ_d (Σ_h w[i,h]·q[i,h,d]) · k[j,d]
+#
+# Two premises, both load-bearing. `weights` is indexed by (row, head) only, and
+# `k[j,d]` carries no head index because this indexer is MQA -- one shared KV.
+# With per-head K the step is simply false, so this must not be reused on MHA.
+#
+# The quadratic term loses the head factor: n²·H·D becomes n²·D. With
+# index_n_heads = 64 that is the difference between a fallback that is merely
+# present and one that is usable.
+#
+# Why upstream would not want this on Hopper: folding produces an fp32 q_eff,
+# forfeiting the fp8 tensor cores that fp8_paged_mqa_logits exists to use. SM80
+# has no fp8 tensor cores to forfeit -- this path is already bf16/fp32 -- so the
+# trade is one-sided in Ampere's favour and against it on SM90/SM100.
+import triton as _tri
+import triton.language as _tl
+
+
+@_tri.jit
+def _folded_paged_logits(
+    QE,
+    KV,
+    PT,
+    SL,
+    OUT,
+    B,
+    MAXP,
+    MAXK,
+    BLOCK: _tl.constexpr,
+    s_qe,
+    s_kvp,
+    s_kvs,
+    s_pt,
+    s_out,
+    D: _tl.constexpr,
+    BS: _tl.constexpr,
+    BK: _tl.constexpr,
+):
+    pid_b = _tl.program_id(0)
+    pid_k = _tl.program_id(1)
+    offs_b = pid_b * BS + _tl.arange(0, BS)
+    offs_k = pid_k * BK + _tl.arange(0, BK)
+    bm = offs_b < B
+    sl = _tl.load(SL + offs_b, mask=bm, other=0)
+
+    o_ptr = OUT + offs_b[:, None] * s_out + offs_k[None, :]
+    o_mask = bm[:, None] & (offs_k[None, :] < MAXK)
+    # Whole-tile skip: if this tile lies past every row's causal end, only -inf
+    if _tl.max(sl) <= pid_k * BK:
+        _tl.store(o_ptr, _tl.full((BS, BK), float("-inf"), _tl.float32), mask=o_mask)
+        return
+
+    offs_d = _tl.arange(0, D)
+    q = _tl.load(
+        QE + offs_b[:, None] * s_qe + offs_d[None, :], mask=bm[:, None], other=0.0
+    )
+
+    # Paged addressing: KV j lives at slot j%BLOCK of page page_table[b, j//BLOCK]
+    pg_idx = offs_k // BLOCK
+    slot = offs_k % BLOCK
+    pg = _tl.load(
+        PT + offs_b[:, None] * s_pt + pg_idx[None, :],
+        mask=bm[:, None] & (pg_idx[None, :] < MAXP),
+        other=0,
+    )
+    # Rows in a tile share the KV columns, so row 0's page numbers suffice --
+    # guarded by the uniformity check in the caller.
+    pg0 = _tl.load(PT + pid_b * BS * s_pt + pg_idx, mask=pg_idx < MAXP, other=0)
+    base = pg0 * s_kvp + slot * s_kvs
+    k = _tl.load(
+        KV + base[:, None] + offs_d[None, :], mask=(offs_k < MAXK)[:, None], other=0.0
+    )
+    # Scales sit right after the 128 dims (4-byte float32); already folded into
+    # the bf16 view by the wrapper.
+    acc = _tl.dot(q, _tl.trans(k))
+    acc = _tl.where(offs_k[None, :] < sl[:, None], acc, float("-inf"))
+    _tl.store(o_ptr, acc, mask=o_mask)
+
+
+def _triton_folded_paged_mqa_logits(
+    q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len
+):
+    import torch as _t
+
+    B, _, H, D = q_fp8.shape
+    blk = kvcache_fp8.shape[1]
+    # (1) fold -- cheap at B·H·D; computed in fp32, then bf16 for the tensor cores
+    qe = _t.einsum(
+        "bhd,bh->bd", q_fp8.reshape(B, H, D).to(_t.float32), weight.float()
+    ).to(_t.bfloat16)
+    # (2) pre-scale the KV and flatten to a [num_pages*blk, D] bf16 view
+    kb = kvcache_fp8.view(_t.uint8)
+    npg = kb.shape[0]
+    kdat = kb[..., :D].view(_t.float8_e4m3fn).reshape(npg * blk, D).to(_t.float32)
+    ksc = (
+        kb[..., D : D + 4]
+        .reshape(npg * blk, 4)
+        .contiguous()
+        .view(_t.float32)
+        .reshape(-1)
+    )
+    kk = (kdat * ksc[:, None]).to(_t.bfloat16)
+    out = _t.empty((B, max_seq_len), device=q_fp8.device, dtype=_t.float32)
+    BS, BK = 32, 128
+    grid = (_tri.cdiv(B, BS), _tri.cdiv(max_seq_len, BK))
+    _folded_paged_logits[grid](
+        qe,
+        kk,
+        page_table,
+        seq_lens,
+        out,
+        B,
+        page_table.shape[1],
+        max_seq_len,
+        blk,
+        qe.stride(0),
+        blk * D,
+        D,
+        page_table.stride(0),
+        out.stride(0),
+        D=D,
+        BS=BS,
+        BK=BK,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -182,6 +316,44 @@ def fp8_paged_mqa_logits_torch_sm120(
 ) -> torch.Tensor:
     """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
     _ = deep_gemm_metadata
+    import os as _os
+
+    import torch as _t2
+
+    # Never take this path during CUDA graph capture. The page-table uniformity
+    # check below is a device-to-host sync, and this function's contract is
+    # "no .item()" -- syncing mid-capture invalidates the whole graph
+    # (cudaErrorStreamCaptureInvalidated, observed). Capture happens on decode;
+    # the path this accelerates is prefill, so nothing is lost.
+    # Enabled where the deep_gemm indexer kernels cannot run at all: they assert
+    # arch_major in {9, 10}, so Ampere reaches this torch fallback with no faster
+    # option. Override with SGLANG_DSV4_TRITON_FOLDED_INDEXER=0.
+    _use_folded = (
+        _os.environ.get(
+            "SGLANG_DSV4_TRITON_FOLDED_INDEXER",
+            (
+                "1"
+                if (
+                    _t2.cuda.is_available() and _t2.cuda.get_device_capability()[0] == 8
+                )
+                else "0"
+            ),
+        )
+        == "1"
+    )
+    if _use_folded and not _t2.cuda.is_current_stream_capturing():
+        _sl = seq_lens.reshape(-1) if seq_lens.dim() > 1 else seq_lens
+        # Premise guard: to save registers the kernel reuses row 0's page table
+        # for the whole tile. That holds for single-sequence chunked prefill,
+        # where every query token belongs to one request, but not for a batch of
+        # different requests -- there it would read the wrong KV. Fall back
+        # rather than assume.
+        if page_table.shape[0] > 1 and not bool((page_table == page_table[0:1]).all()):
+            pass  # fall through to the torch implementation below
+        else:
+            return _triton_folded_paged_mqa_logits(
+                q_fp8, kvcache_fp8, weight, _sl, page_table, max_seq_len
+            )
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
