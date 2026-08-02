@@ -25,6 +25,7 @@ from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_scale_shift_bf16_,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT,
@@ -46,6 +47,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -1018,6 +1020,15 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
+    def _can_batch_block_adaln(self) -> bool:
+        return (
+            get_tp_world_size() > 1
+            and not torch.compiler.is_compiling()
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and not is_layerwise_offloaded_module(self)
+            and all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+        )
+
     def _validate_tp_config(
         self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int
     ) -> None:
@@ -1600,7 +1611,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_adaln_params = None
-        if get_tp_world_size() > 1:
+        if self._can_batch_block_adaln():
             local_adaln = torch.stack(
                 [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
             )
