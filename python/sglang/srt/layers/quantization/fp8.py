@@ -294,6 +294,7 @@ class Fp8Config(QuantizationConfig):
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             if _is_cuda:
+                # Converted MXFP8 is enabled for Hopper+ only. SM80 stays unsupported.
                 return 89
             return 94
 

@@ -4128,7 +4128,7 @@ def mxfp8_block_convert_required():
     checkpoints there are converted to block-fp8 [128,128] at load and run
     through the native block-fp8 kernels. gfx95 keeps its native MX path (this
     returns False there). CUDA SM90 uses the same conversion because native
-    MXFP8 dense kernels require Blackwell.
+    MXFP8 dense kernels require Blackwell; CUDA SM80 remains unsupported.
     """
     if torch.version.hip:
         return is_gfx942_supported() and not is_gfx95_supported()

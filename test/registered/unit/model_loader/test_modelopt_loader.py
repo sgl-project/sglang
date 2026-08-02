@@ -17,8 +17,9 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import LinearBase, ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization import fp8_utils
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -765,6 +766,15 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "MXFP8",
         )
+
+    def test_cuda_mxfp8_block_conversion_keeps_sm80_unsupported(self):
+        with (
+            patch.object(fp8_module, "_is_musa", False),
+            patch.object(fp8_module, "_is_hip", False),
+            patch.object(fp8_module, "_is_cuda", True),
+            patch.object(fp8_module, "_mxfp8_to_block_fp8_required", True),
+        ):
+            self.assertEqual(Fp8Config(use_mxfp8=True).get_min_capability(), 89)
 
     def test_modelopt_mixed_auto_fp8_backend_uses_flashinfer_cutlass_on_sm100(self):
         server_args = MagicMock()
