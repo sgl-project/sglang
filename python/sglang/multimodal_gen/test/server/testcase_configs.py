@@ -577,6 +577,14 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+SANA_VIDEO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt="A curious raccoon walks through a sunlit forest. motion score: 30.",
+    output_size="832x480",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 8, "guidance_scale": 6.0, "seed": 42},
+)
+
 JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
