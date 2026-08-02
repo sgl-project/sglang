@@ -307,6 +307,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.chunk_tree_verify_active
             and gdn_fused_tree_verify_enabled(model_runner.server_args)
         )
+        self.tree_verify_max_depth = None
+        if self.fused_tree_verify_active:
+            block_size = model_runner.server_args.speculative_dflash_block_size
+            assert block_size is not None
+            self.tree_verify_max_depth = int(block_size) - 1
         if (
             model_runner.server_args.speculative_gdn_verify_kernel == "chunk"
             and not model_runner.is_draft_worker
@@ -663,14 +668,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.fused_tree_verify_active:
             from sglang.srt.layers.attention.fla.gdn_tree_fused import (
                 alloc_tree_structure_buffers,
-                build_tree_structure_into,
+                build_tree_structure_into_fast,
             )
 
             if getattr(self, "_fused_tree_struct", None) is None:
+                assert self.tree_verify_max_depth is not None
                 self._fused_tree_struct = alloc_tree_structure_buffers(
-                    batch_size, draft_token_num, retrieve_parent_token.device
+                    batch_size,
+                    draft_token_num,
+                    min(self.tree_verify_max_depth, draft_token_num - 1),
+                    retrieve_parent_token.device,
                 )
-            build_tree_structure_into(
+            build_tree_structure_into_fast(
                 retrieve_parent_token[:batch_size].view(batch_size, draft_token_num),
                 self._fused_tree_struct,
             )

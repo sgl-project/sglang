@@ -155,9 +155,11 @@ def build_tree_structure_into(parent_src: torch.Tensor, buf: "TreeStructure") ->
     return buf
 
 
-def alloc_tree_structure_buffers(N: int, T: int, device) -> "TreeStructure":
+def alloc_tree_structure_buffers(
+    N: int, T: int, max_depth: int, device
+) -> "TreeStructure":
     """Persistent zeroed TreeStructure for in-place per-step rebuilds."""
-    max_depth = T - 1
+    assert 0 <= max_depth < T
     return TreeStructure(
         parent=torch.zeros(N, T, dtype=torch.long, device=device),
         anc_mask=torch.zeros(N, T, T, dtype=torch.bool, device=device),

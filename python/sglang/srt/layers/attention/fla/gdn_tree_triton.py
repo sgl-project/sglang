@@ -148,7 +148,7 @@ def _k1_gram_kernel(
     stride_inv_nh, stride_inv_b,
     USE_L2NORM: tl.constexpr,
     NBT: tl.constexpr, BK: tl.constexpr, K: tl.constexpr, BT: tl.constexpr,
-    PREC: tl.constexpr, G: tl.constexpr,
+    PREC: tl.constexpr, G: tl.constexpr, MAX_DEPTH: tl.constexpr,
     tile_ptr=None,
 ):
     # lower-triangular tile grid: upper tiles (j > i) are identically zero
@@ -219,13 +219,16 @@ def _k1_gram_kernel(
             x = eye + n1
             m2 = tl.dot(n1, n1, input_precision=PREC)
             x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            m2 = tl.dot(m2, m2, input_precision=PREC)
-            x = x + tl.dot(x, m2, input_precision=PREC)
-            if BT > 32:  # one more squaring level covers j < 64
+            if MAX_DEPTH > 3:
+                m2 = tl.dot(m2, m2, input_precision=PREC)
+                x = x + tl.dot(x, m2, input_precision=PREC)
+            if MAX_DEPTH > 7:
+                m2 = tl.dot(m2, m2, input_precision=PREC)
+                x = x + tl.dot(x, m2, input_precision=PREC)
+            if MAX_DEPTH > 15:
+                m2 = tl.dot(m2, m2, input_precision=PREC)
+                x = x + tl.dot(x, m2, input_precision=PREC)
+            if MAX_DEPTH > 31:
                 m2 = tl.dot(m2, m2, input_precision=PREC)
                 x = x + tl.dot(x, m2, input_precision=PREC)
             inv_base = i_nh * stride_inv_nh + i_t * stride_inv_b
@@ -430,6 +433,7 @@ def tree_gdn_triton_verify(
         Ainv.stride(0), Ainv.stride(1),
         USE_L2NORM=use_qk_l2norm_in_kernel,
         NBT=NBT, BK=BK, K=K, BT=BT, PREC=precision, G=G,
+        MAX_DEPTH=tree.max_depth,
         tile_ptr=tile_t,
         num_warps=4,
     )
@@ -460,7 +464,7 @@ def tree_gdn_triton_verify(
         USE_L2NORM=use_qk_l2norm_in_kernel,
         USE_H0=initial_state_source is not None,
         NB=NB, BK=BK, K=K, BV=BV, V=V, BT=BT, PREC=precision,
-        num_warps=8,
+        num_warps=4,
     )
 
     if return_lazy_state:
