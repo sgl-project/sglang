@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):
@@ -65,9 +65,11 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
     def test_native_scalar_a_static_prequant_and_dynamic_scale_shapes(self):
         import sglang.srt.layers.quantization.fp8_utils as fp8_utils
 
-        server_args = SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(tc_compiler="none")
+        exec_config = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(tc_compiler="none")
+                )
             )
         )
         for capability in (
@@ -97,7 +99,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 capabilities[capability] = True
                 with patch.multiple(fp8_utils, **capabilities), patch.object(
                     fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-                ), patch.object(fp8_utils, "get_server_args", return_value=server_args):
+                ), patch.object(fp8_utils, "get_exec", return_value=exec_config):
                     fp8_utils.apply_fp8_linear(
                         input,
                         weight,
