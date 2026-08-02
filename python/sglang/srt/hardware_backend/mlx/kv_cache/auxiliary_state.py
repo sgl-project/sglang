@@ -15,12 +15,18 @@ from typing import Any, Iterable, Optional
 import mlx.core as mx
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.tree_component import TreeComponent
+from sglang.srt.runtime_context import get_server_args
 
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()
@@ -107,6 +113,18 @@ class MlxAuxiliaryStatePool:
 
     def available_size(self) -> int:
         return int(self.free_slots.numel())
+
+    def schedulable_available_size(self) -> int:
+        return self.available_size()
+
+    def alloc_group_begin(self, num_reqs: int) -> None:
+        # MambaSlotAllocator pre-allocates a slot batch in its group window to
+        # amortize per-request alloc cost; slots here are plain tensor slices,
+        # so the window is a no-op and alloc() keeps the per-call path.
+        pass
+
+    def alloc_group_end(self) -> None:
+        pass
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
@@ -231,25 +249,42 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        # Scheduler paths (waiting-queue group alloc, retract release, session
+        # cleanup, stats) and inherited MambaComponent paths (match CoW alloc,
+        # eviction frees) address the slot allocator as ``mamba_allocator``.
+        # This pool is its own allocator, so expose it under that name too.
+        self.mamba_allocator = self.mamba_pool
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
         )
 
     def alloc(self, reqs):
-        select_index = super().alloc(reqs)
+        # Reserve all newly needed auxiliary slots before mutating request-row
+        # ownership. This makes the two-resource allocation atomic when the
+        # scheduler's admission budget cannot recover enough radix states.
+        reqs_needing_auxiliary_state = [
+            req for req in reqs if getattr(req, "mamba_pool_idx", None) is None
+        ]
+        allocated = self.auxiliary_state_pool.alloc(len(reqs_needing_auxiliary_state))
+        if allocated is None:
+            raise RuntimeError("Not enough MLX auxiliary state slots")
+
+        try:
+            select_index = super().alloc(reqs)
+        except Exception:
+            self.auxiliary_state_pool.free(allocated)
+            raise
         if select_index is None:
+            self.auxiliary_state_pool.free(allocated)
             return None
+
+        for req, mid in zip(reqs_needing_auxiliary_state, allocated):
+            req.mamba_pool_idx = mid
 
         auxiliary_state_indices = []
         for req in reqs:
-            if getattr(req, "mamba_pool_idx", None) is not None:
-                mid = req.mamba_pool_idx
-            else:
-                allocated = self.auxiliary_state_pool.alloc(1)
-                assert allocated is not None, "Not enough MLX auxiliary state slots"
-                mid = allocated[0]
-                req.mamba_pool_idx = mid
+            mid = req.mamba_pool_idx
             auxiliary_state_indices.append(mid.to(dtype=torch.int32))
         self.req_index_to_auxiliary_state_index_mapping[select_index] = torch.stack(
             auxiliary_state_indices
@@ -314,6 +349,12 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 f"got {type(pool)}"
             )
         TreeComponent.__init__(self, cache, params)
+        # MambaComponent.__init__ is skipped on purpose (its
+        # HybridReqToTokenPool assert cannot hold here), so mirror the base
+        # fields its inherited match/insert helpers read.
+        server_args = get_server_args()
+        self.mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        self.mamba_max_states_per_path = server_args.mamba_max_states_per_path
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
@@ -326,6 +367,24 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         if getattr(req, "mamba_pool_idx", None) is None:
             return None, False
         return req.mamba_pool_idx.unsqueeze(-1).clone(), False
+
+    def finalize_match_result_in_cache(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        result = super().finalize_match_result_in_cache(params, result)
+        req = params.req
+        if params.cow_mamba and req is not None and req.mamba_cow_src_index is not None:
+            # The CUDA runner applies the CoW staged by the base method as a
+            # deferred batch copy (forward_batch.mamba_cow_src_indices); the
+            # MLX runner has no such pass and restores straight from the
+            # request's own slot, so copy the snapshot now and clear the
+            # deferred marker. If scheduler admission later rejects the
+            # request, this copy is discarded and repeated on the next match.
+            self.cache.req_to_token_pool.auxiliary_state_pool.copy_from(
+                req.mamba_cow_src_index, req.mamba_pool_idx.unsqueeze(0)
+            )
+            req.mamba_cow_src_index = None
+        return result
 
     def prepare_for_caching_req(
         self,
