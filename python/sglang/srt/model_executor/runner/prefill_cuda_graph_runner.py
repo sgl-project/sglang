@@ -536,10 +536,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
+        spec_algorithm = self.model_runner.spec_algorithm
+        # DFlash-family target prefill owns the recurrent checkpoint state.
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and not self.model_runner.server_args.disable_radix_cache
-            and self.model_runner.spec_algorithm.is_none()
+            and (
+                spec_algorithm.is_none()
+                or (
+                    spec_algorithm.is_dflash_family()
+                    and not self.model_runner.is_draft_worker
+                )
+            )
         )
 
     def _cache_loc_dtype(self):

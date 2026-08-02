@@ -167,6 +167,10 @@ class PtxKDAKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[1]
+        # Breakable prefill graphs narrow q/k/v to the live token count,
+        # while g/beta retain their capture-bucket token dimension.
+        g = g[:, :num_tokens]
+        beta = beta[:, :num_tokens]
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         track_h_src = kwargs.get("track_ssm_h_src")
         supported_shape = (
