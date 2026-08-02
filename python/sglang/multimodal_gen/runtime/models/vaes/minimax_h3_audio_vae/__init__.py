@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .dac_audio_vae import DacAudioVAE
+from .audio_vae import DacAudioVAE
 
 __all__ = ["DacAudioVAE"]

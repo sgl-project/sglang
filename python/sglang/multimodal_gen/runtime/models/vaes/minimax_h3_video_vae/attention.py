@@ -8,8 +8,7 @@ import torch.nn as nn
 from diffusers.utils import logging
 
 from .flash import flash_attn
-from .func import apply_rotary_pos_emb_qk
-from .utils import _env_flag
+from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

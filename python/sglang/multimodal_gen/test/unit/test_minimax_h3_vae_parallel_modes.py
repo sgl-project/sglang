@@ -9,7 +9,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
-from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
 

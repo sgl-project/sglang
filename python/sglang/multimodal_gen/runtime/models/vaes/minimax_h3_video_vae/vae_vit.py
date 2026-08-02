@@ -9,7 +9,7 @@ from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
 from .flash import make_block_causal_mask_mod
-from .func import create_token_ids, prepare_rotary_pos_emb
+from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 

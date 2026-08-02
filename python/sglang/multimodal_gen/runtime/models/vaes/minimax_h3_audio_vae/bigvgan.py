@@ -6,12 +6,53 @@
 
 import torch
 import torch.nn as nn
-from torch.nn import Conv1d, ConvTranspose1d
+from torch.nn import Conv1d, ConvTranspose1d, Parameter
 from torch.nn.utils.parametrizations import weight_norm
 
-from .dac_activations import SnakeBeta
-from .dac_alias_free_act import Activation1d
-from .dac_utils import get_padding
+from .alias_free import Activation1d
+
+
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size * dilation - dilation) / 2)
+
+
+# Adapted from https://github.com/EdwardDixon/snake under the MIT license.
+@torch.jit.script
+def snakebeta(x, alpha, beta):
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1)
+    x = x + (beta + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
+    x = x.reshape(shape)
+    return x
+
+
+class SnakeBeta(nn.Module):
+    def __init__(
+        self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False
+    ):
+        super(SnakeBeta, self).__init__()
+        self.in_features = in_features
+
+        self.alpha_logscale = alpha_logscale
+        if self.alpha_logscale:
+            self.alpha = Parameter(torch.zeros(in_features) * alpha)
+            self.beta = Parameter(torch.zeros(in_features) * alpha)
+        else:
+            self.alpha = Parameter(torch.ones(in_features) * alpha)
+            self.beta = Parameter(torch.ones(in_features) * alpha)
+
+        self.alpha.requires_grad = alpha_trainable
+        self.beta.requires_grad = alpha_trainable
+        self.no_div_by_zero = 0.000000001
+
+    def forward(self, x):
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
+        beta = self.beta.unsqueeze(0).unsqueeze(-1)
+        if self.alpha_logscale:
+            alpha = torch.exp(alpha)
+            beta = torch.exp(beta)
+        x = snakebeta(x, alpha, beta)
+        return x
 
 
 class AttrDict(dict):

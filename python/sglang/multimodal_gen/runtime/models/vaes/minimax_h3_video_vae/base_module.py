@@ -16,7 +16,7 @@ from sglang.kernels.ops.diffusion.triton.scale_shift import (
 )
 
 from .attention import Attention
-from .utils import _env_flag, _vit_torch_compile_kwargs
+from .vit_utils import _env_flag, _vit_torch_compile_kwargs
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
