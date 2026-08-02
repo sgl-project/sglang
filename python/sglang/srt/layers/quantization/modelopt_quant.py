@@ -2257,26 +2257,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def _set_dispatcher_quant_config(self, layer: torch.nn.Module) -> None:
-        """Hand the token dispatcher this layer's input global scale.
-
-        Shared by process_weights_after_loading and ipc_rebind_after_import: the
-        scale is a tensor reference, so a weight cache client -- which maps the
-        daemon's tensors but not its Python objects -- has to redo exactly this
-        wiring against its own copy.
-        """
-        # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        layer.dispatcher.set_quant_config(
-            {
-                "input_global_scale": (
-                    layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else None
-                )
-            }
-        )
-
     def ipc_transferable_attrs(self) -> frozenset[str]:
         # intermediate_size_per_partition: padded MoE size, set by
         #   align_fp4_moe_weights_for_flashinfer_trtllm and read by the runners.
@@ -2290,7 +2270,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         return True
 
     def ipc_rebind_after_import(self, layer: torch.nn.Module) -> None:
-        self._set_dispatcher_quant_config(layer)
+        layer.dispatcher.set_quant_config(
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
+                )
+            }
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""

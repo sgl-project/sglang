@@ -42,16 +42,6 @@ class QuantizeMethodBase(ABC):
         """
         return
 
-    # ------------------------------------------------------------------
-    # CUDA IPC weight sharing (sglang/srt/weight_cache)
-    # ------------------------------------------------------------------
-    # The weight cache daemon runs process_weights_after_loading once and
-    # exports the resulting tensors to engines over CUDA IPC; a client maps
-    # those tensors and never runs post-processing itself. Whatever that pass
-    # leaves *outside* the tensors is therefore invisible to a client unless the
-    # quant method declares it below. The defaults describe a method whose
-    # post-processing is fully captured by the exported tensors.
-
     def ipc_transferable_attrs(self) -> frozenset[str]:
         """Plain layer attributes post-processing stamps and apply() reads.
 
