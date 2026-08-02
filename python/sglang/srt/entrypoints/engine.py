@@ -1678,7 +1678,10 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if "flashinfer" in cfg.get_attention_backends():
+        if (
+            "flashinfer" in cfg.get_attention_backends()
+            or cfg.dsa_topk_backend == "flashinfer"
+        ):
             assert_pkg_version(
                 "flashinfer_python",
                 "0.6.17",
