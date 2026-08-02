@@ -1,3 +1,4 @@
+import logging
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from sglang.srt.models.deepseek_v4 import (
     _WQKV_A_SHARD_ORDER,
     DeepseekV4ForCausalLM,
     _classify_fused_shard,
+    _fused_module_prefixes,
     _is_dense_linear,
     _pop_fused_weight,
     _reject_unfusable_leaf,
@@ -26,6 +28,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ATTN_PREFIX = "model.layers.3.self_attn"
 COMPRESSOR_PREFIX = "model.layers.3.self_attn.compressor"
+DENSE_LAYER = "model.layers.0.self_attn"
+PACKED_LAYER = "model.layers.1.self_attn"
 
 
 def run_load_weights(params, weights, fuse_wqa_wkv=True):
@@ -333,6 +337,114 @@ class TestPackedLayerFallback(unittest.TestCase):
         )
 
         torch.testing.assert_close(params[f"{ATTN_PREFIX}.wq_a.qweight"].data, qweight)
+
+
+class TestMixedPrecisionCheckpoint(unittest.TestCase):
+    """Per-layer quantization: some layers dense and fused, others packed.
+
+    A checkpoint that excludes individual attention blocks from quantization
+    (`quantization_config.extra_config` with `bits: 16` entries) builds a model
+    in which layer 0 keeps `wqkv_a` and layer 1 does not. The fusion decision
+    has to follow the layer under load, not the model as a whole.
+    """
+
+    def mixed_params(self):
+        return {
+            # Layer 0 stayed dense, so MqaAttentionBase kept the fusion.
+            f"{DENSE_LAYER}.wqkv_a.weight": torch.nn.Parameter(torch.zeros(10, 4)),
+            # Layer 1 is packed, so MqaAttentionBase dropped wqkv_a and built
+            # the separate projections.
+            f"{PACKED_LAYER}.wq_a.qweight": torch.nn.Parameter(torch.zeros(4, 8)),
+            f"{PACKED_LAYER}.wq_a.scales": torch.nn.Parameter(torch.zeros(1, 8)),
+            f"{PACKED_LAYER}.wkv.qweight": torch.nn.Parameter(torch.zeros(4, 2)),
+            f"{PACKED_LAYER}.wkv.scales": torch.nn.Parameter(torch.zeros(1, 2)),
+        }
+
+    def test_prefixes_report_the_layers_that_kept_the_fusion(self):
+        prefixes = _fused_module_prefixes(self.mixed_params(), "wqkv_a")
+
+        self.assertEqual(prefixes, {DENSE_LAYER})
+
+    def test_prefixes_cover_the_mtp_naming_space(self):
+        # load_weights rewrites the MTP layer prefix to "model.decoder", which
+        # carries no layer index.
+        params = {
+            "model.decoder.self_attn.wqkv_a.weight": torch.nn.Parameter(
+                torch.zeros(2, 2)
+            )
+        }
+
+        self.assertEqual(
+            _fused_module_prefixes(params, "wqkv_a"), {"model.decoder.self_attn"}
+        )
+
+    def test_mixed_checkpoint_loads_every_layer(self):
+        wq_a = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+        wkv = torch.arange(2 * 4, dtype=torch.float32).reshape(2, 4) + 100
+        packed = {
+            f"{PACKED_LAYER}.wq_a.qweight": torch.ones(4, 8),
+            f"{PACKED_LAYER}.wq_a.scales": torch.full((1, 8), 2.0),
+            f"{PACKED_LAYER}.wkv.qweight": torch.full((4, 2), 3.0),
+            f"{PACKED_LAYER}.wkv.scales": torch.full((1, 2), 4.0),
+        }
+        params = self.mixed_params()
+
+        run_load_weights(
+            params,
+            [
+                (f"{DENSE_LAYER}.wq_a.weight", wq_a),
+                (f"{DENSE_LAYER}.wkv.weight", wkv),
+                *packed.items(),
+            ],
+        )
+
+        # The dense layer is fused exactly as on a uniform dense checkpoint.
+        torch.testing.assert_close(
+            params[f"{DENSE_LAYER}.wqkv_a.weight"].data, torch.cat([wq_a, wkv], dim=0)
+        )
+        # The packed layer loads through its own separate projections.
+        for name, weight in packed.items():
+            torch.testing.assert_close(params[name].data, weight)
+
+    def test_mixed_checkpoint_emits_no_unplaced_summary(self):
+        params = self.mixed_params()
+
+        with self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING") as logs:
+            logging.getLogger("sglang.srt.models.deepseek_v4").warning("probe")
+            run_load_weights(
+                params,
+                [
+                    (f"{DENSE_LAYER}.wq_a.weight", torch.zeros(8, 4)),
+                    (f"{DENSE_LAYER}.wkv.weight", torch.zeros(2, 4)),
+                    (f"{PACKED_LAYER}.wq_a.qweight", torch.zeros(4, 8)),
+                    (f"{PACKED_LAYER}.wq_a.scales", torch.zeros(1, 8)),
+                    (f"{PACKED_LAYER}.wkv.qweight", torch.zeros(4, 2)),
+                    (f"{PACKED_LAYER}.wkv.scales", torch.zeros(1, 2)),
+                ],
+            )
+
+        self.assertEqual(
+            [record for record in logs.output if "not placed" in record], []
+        )
+        self.assertEqual(
+            [record for record in logs.output if "not found in params_dict" in record],
+            [],
+        )
+
+    def test_packed_tensor_for_a_fused_layer_is_still_refused(self):
+        # The layer kept wqkv_a, so a packed checkpoint tensor for it is a real
+        # disagreement between model and checkpoint and must not be joined.
+        params = self.mixed_params()
+
+        with self.assertRaises(ValueError) as ctx:
+            run_load_weights(
+                params,
+                [(f"{DENSE_LAYER}.wq_a.qweight", torch.zeros(4, 8))],
+            )
+
+        message = str(ctx.exception)
+        self.assertIn(f"{DENSE_LAYER}.wq_a.qweight", message)
+        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
 
 
 class TestUnplacedWeightSummary(unittest.TestCase):

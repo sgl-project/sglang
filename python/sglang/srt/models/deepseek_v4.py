@@ -2860,12 +2860,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        # The built model is authoritative: MqaAttentionBase falls back to
-        # separate wq_a/wkv projections when the quantization method builds a
-        # packed layer, in which case there is no wqkv_a to load into.
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get() and any(
-            ".wqkv_a." in param_name for param_name in params_dict
-        )
+        # The built model is authoritative, and it is authoritative per layer:
+        # MqaAttentionBase drops wqkv_a and builds separate wq_a/wkv
+        # projections for each layer whose quantization method produced a
+        # packed layer. A checkpoint that quantizes only some attention blocks
+        # (per-layer entries in quantization_config) therefore keeps wqkv_a on
+        # some layers and not on others, so the decision is taken per attention
+        # module -- the one the tensor under load belongs to -- and never for
+        # the model as a whole. The env variable stays a global kill switch.
+        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fused_wqkv_a_prefixes = _fused_module_prefixes(params_dict, "wqkv_a")
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         unplaced_weight_names: List[str] = []
 
@@ -3084,10 +3088,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                            elif fuse_wqa_wkv and (
-                                classified := _classify_fused_shard(
-                                    name, _WQKV_A_SHARD_IDS
+                            elif (
+                                fuse_wqa_wkv
+                                and (
+                                    classified := _classify_fused_shard(
+                                        name, _WQKV_A_SHARD_IDS
+                                    )
                                 )
+                                # Only this tensor's own layer decides: if that
+                                # layer kept wqkv_a, fuse into it; if it built
+                                # the separate projections, the generic path
+                                # below loads the tensor into wq_a / wkv.
+                                and classified[1] in fused_wqkv_a_prefixes
                             ):
                                 shard_id, parent, leaf = classified
                                 if leaf not in _WQKV_A_FUSABLE_LEAVES:
@@ -3260,6 +3272,24 @@ def _is_dense_linear(layer: nn.Module) -> bool:
     two dense checkpoint tensors.
     """
     return hasattr(layer, "weight")
+
+
+def _fused_module_prefixes(
+    params_dict: dict[str, nn.Parameter], module_name: str
+) -> Set[str]:
+    """Parent prefixes of the built ``<prefix>.<module_name>.<leaf>`` parameters.
+
+    The prefix, not a parsed layer index, is the key: it is exactly what
+    ``_classify_fused_shard`` returns for a checkpoint tensor, and it also
+    covers the names that carry no layer index at all -- the MTP layer is
+    rewritten to ``model.decoder`` before it reaches the dispatch.
+    """
+    segment = f".{module_name}."
+    return {
+        param_name.rsplit(segment, 1)[0]
+        for param_name in params_dict
+        if segment in param_name
+    }
 
 
 def _classify_fused_shard(
