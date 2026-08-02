@@ -207,6 +207,15 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+if _sm120_default_backend == "flashinfer" and (
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0)
+):
+    # The FlashInfer path is CUTLASS compiled for SM120 only. Every other
+    # architecture arrives here precisely because it has no CUDA sparse-decode
+    # kernel, so defaulting it into one that does not exist just trades one
+    # crash for another. Pick the portable Triton implementation instead; the
+    # env var above still forces `torch` when debugging.
+    _sm120_default_backend = "triton"
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):

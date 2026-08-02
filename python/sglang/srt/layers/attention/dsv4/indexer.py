@@ -772,7 +772,13 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+        ):
+            # The second disjunct routes Ampere here by default: deep_gemm's
+            # indexer kernels gate themselves to arch_major in {9, 10}, so the
+            # default branch below cannot serve SM8x at all -- requiring an env
+            # var to avoid a guaranteed crash would just be a trap.
             if is_sm120_supported() or (
                 torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
             ):
