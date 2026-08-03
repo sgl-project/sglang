@@ -845,6 +845,31 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    @staticmethod
+    def _remap_mtp_rest(rest: str) -> str:
+        """Rename an ``mtp.<stage>.``-relative checkpoint path to the module tree.
+
+        The ``.scale`` rename is anchored at the suffix: packed checkpoints
+        (gptq / awq / auto_round) store their scales as ``.scales``, and a
+        substring replace turns that into ``.weight_scale_invs`` — which
+        matches no parameter and is dropped with only a warning, so the draft
+        "loads" with uninitialised weights and the speculative accept rate
+        silently pins to zero. The target model's loader anchors this same
+        rename at the suffix already.
+        """
+        rest = rest.replace("attn.", "self_attn.", 1)
+        rest = rest.replace("ffn.", "mlp.", 1)
+        rest = rest.replace("attn_norm.", "input_layernorm.", 1)
+        rest = rest.replace("ffn_norm.", "post_attention_layernorm.", 1)
+        rest = rest.replace(".w1.", ".gate_proj.")
+        rest = rest.replace(".w2.", ".down_proj.")
+        rest = rest.replace(".w3.", ".up_proj.")
+        rest = rest.replace(".gate.tid2eid", ".topk.tid2eid")
+        rest = rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+        if rest.endswith(".scale"):
+            rest = rest[: -len(".scale")] + ".weight_scale_inv"
+        return rest
+
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
@@ -866,18 +891,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 return None
             return f"confidence_head.{rest[len('confidence_head.'):]}"
 
-        mapped_rest = rest
-        mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
-        mapped_rest = mapped_rest.replace("ffn.", "mlp.", 1)
-        mapped_rest = mapped_rest.replace("attn_norm.", "input_layernorm.", 1)
-        mapped_rest = mapped_rest.replace("ffn_norm.", "post_attention_layernorm.", 1)
-        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
-        return f"stages.{stage_id}.{mapped_rest}"
+        return f"stages.{stage_id}.{self._remap_mtp_rest(rest)}"
 
 
 EntryClass = [DeepseekV4ForCausalLMDSpark]
