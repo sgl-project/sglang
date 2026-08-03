@@ -337,6 +337,10 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def set_hash(self, hash_value: int) -> None:
+        self.hash = hash_value
+        self.pad_value = _compute_pad_value(hash_value)
+
     @staticmethod
     def is_empty_list(l):
         if l is None:

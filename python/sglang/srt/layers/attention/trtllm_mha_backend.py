@@ -75,6 +75,9 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # CP-v2 zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
+    zigzag_page_table: torch.Tensor = None
+    zigzag_swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
@@ -338,6 +341,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if is_swa:
                 return swa_pt
         return self.forward_metadata.page_table
+
+    def _maybe_build_cp_zigzag_page_tables(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Duplicate request rows once for the combined prev-then-next CP launch."""
+        if not is_cp_v2_active(forward_batch):
+            return
+
+        # TODO: Avoid materializing duplicated page tables to reduce zigzag CP
+        # page-table memory usage.
+        metadata.zigzag_page_table = torch.cat(
+            (metadata.page_table, metadata.page_table), dim=0
+        )
+        if metadata.swa_page_table is not None:
+            metadata.zigzag_swa_page_table = torch.cat(
+                (metadata.swa_page_table, metadata.swa_page_table), dim=0
+            )
 
     @staticmethod
     def _get_scalar_scale(
@@ -962,6 +984,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._fill_page_table_device(
             metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
         )
+        self._maybe_build_cp_zigzag_page_tables(metadata, forward_batch)
 
         if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
             row_map = (
@@ -1276,13 +1299,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cu_seqlens_q,
                 cache_seqlens,
                 max_seqlen_q,
+                *,
                 cu_seqlens_kv,
+                use_zigzag_page_table=False,
             ):
+                block_tables = page_table
+                if use_zigzag_page_table:
+                    block_tables = self.forward_metadata.zigzag_page_table
+                    zigzag_swa_pt = self.forward_metadata.zigzag_swa_page_table
+                    if zigzag_swa_pt is not None:
+                        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+                        if is_swa:
+                            block_tables = zigzag_swa_pt
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
                     workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
+                    block_tables=block_tables,
                     seq_lens=cache_seqlens,
                     max_q_len=max_seqlen_q,
                     max_kv_len=self.max_context_len,

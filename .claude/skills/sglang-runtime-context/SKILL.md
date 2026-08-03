@@ -69,10 +69,10 @@ resolved configuration lives in the namespace bags.**
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read
   `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. (The mm-processor boundary is not yet
-  airtight: `BaseMultimodalProcessor.process_mm_data` still reads `base_gpu_id` /
-  `rl_on_policy_target` through `get_server_args()` — a known last-publish-wins gap,
-  not a pattern to copy.)
+  bags are last-publish-wins across engines. `base_gpu_id` also differs per worker
+  (the encode-server DP workers each specialize their own copy), so no process-global
+  value can stand in for it — `BaseMultimodalProcessor._fast_image_processor_device`
+  is the shape to copy.
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
@@ -237,10 +237,13 @@ Never module-skip a test "until the migration settles" — seed the context inst
 ## Hard-won pitfalls (check these before/while refactoring)
 
 - **Moving code drops first-line guards**: early returns (`if self.is_draft_worker: return`)
-  are the easiest thing to lose when relocating a method body. Only drafts built through
-  `build_draft_tp_worker()` get private bags (a preserved publish of the rewritten copy);
-  drafts constructed directly with `is_draft_worker=True` skip publish and **share the
-  target's bags** — a draft-side write there poisons the target.
+  are the easiest thing to lose when relocating a method body. Every draft is built
+  under a preserved publish of its own config: the scheduler makes the copy with
+  `draft_server_args_copy()` (seeded from the resolved config, so load-time overrides
+  carry) and publishes it around the worker factory, and `build_draft_tp_worker()`
+  nests the same shape for dflash / dspark. The publish ends when construction does —
+  anything the draft reads later (`alloc_memory_pool`, `init_attention_backends`,
+  cuda-graph capture) is back on the target's bags.
 - **Registry-completeness timing**: a gate that consults an extensible list is only correct
   after the registrars ran (platform `init_backend()` at module import). See "load-time vs
   resolution-time".
