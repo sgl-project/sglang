@@ -50,10 +50,7 @@ class IntelAMXAttnBackend(AttentionBackend):
                 0
             ]
         v_buffer = model_runner.token_to_kv_pool.get_value_buffer(layer_id)
-        if isinstance(v_buffer, tuple):
-            self.v_head_dim = v_buffer[0].shape[-1]
-        else:
-            self.v_head_dim = v_buffer.shape[-1]
+        self.v_head_dim = v_buffer.shape[-1]
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
@@ -221,25 +218,18 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        key_buf1, value_buf1 = (
-            (key_buffer[1], value_buffer[1])
-            if isinstance(key_buffer, tuple)
-            else (None, None)
-        )
-        key_buf0, value_buf0 = (
-            (key_buffer[0], value_buffer[0])
-            if isinstance(key_buffer, tuple)
-            else (key_buffer, value_buffer)
+        key_scale, value_scale = self.token_to_kv_pool.get_kv_scale_buffer(
+            layer.layer_id
         )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
             v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            key_buf0,
-            value_buf0,
-            key_buf1,
-            value_buf1,
+            key_buffer,
+            value_buffer,
+            key_scale,
+            value_scale,
             self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             seq_lens,
@@ -286,15 +276,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
         key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        key_buf1, value_buf1 = (
-            (key_buffer[1], value_buffer[1])
-            if isinstance(key_buffer, tuple)
-            else (None, None)
-        )
-        key_buf0, value_buf0 = (
-            (key_buffer[0], value_buffer[0])
-            if isinstance(key_buffer, tuple)
-            else (key_buffer, value_buffer)
+        key_scale, value_scale = self.token_to_kv_pool.get_kv_scale_buffer(
+            layer.layer_id
         )
         cache_loc = (
             forward_batch.out_cache_loc
@@ -303,10 +286,10 @@ class IntelAMXAttnBackend(AttentionBackend):
         )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            key_buf0,
-            value_buf0,
-            key_buf1,
-            value_buf1,
+            key_buffer,
+            value_buffer,
+            key_scale,
+            value_scale,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,

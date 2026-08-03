@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -48,6 +47,20 @@ def _import_mha_pool():
             pytest.skip("local xgrammar is too old for workspace sglang imports")
         raise
     return MHATokenToKVPool
+
+
+def _import_mla_pool():
+    pytest.importorskip(
+        "xgrammar.structural_tag",
+        reason="local xgrammar is too old for workspace sglang imports",
+    )
+    try:
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    except ImportError as exc:
+        if "AnyTokensFormat" in str(exc):
+            pytest.skip("local xgrammar is too old for workspace sglang imports")
+        raise
+    return MLATokenToKVPool
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
@@ -125,48 +138,71 @@ def test_mha_fp8_e4m3_kv_pool_updates_scales():
     assert pool.v_scale_buffer is not None
     assert torch.all(pool.k_scale_buffer[0][loc] > 0)
     assert torch.all(pool.v_scale_buffer[0][loc] > 0)
+    assert isinstance(pool.get_key_buffer(0), torch.Tensor)
+    assert isinstance(pool.get_value_buffer(0), torch.Tensor)
+    k_scale, v_scale = pool.get_kv_scale_buffer(0)
+    assert k_scale is pool.k_scale_buffer[0]
+    assert v_scale is pool.v_scale_buffer[0]
+
+    k_ref = pool.k_buffer[0][loc].clone()
+    v_ref = pool.v_buffer[0][loc].clone()
+    k_scale_ref = pool.k_scale_buffer[0][loc].clone()
+    v_scale_ref = pool.v_scale_buffer[0][loc].clone()
+    kv_cpu = pool.get_cpu_copy(loc)
+
+    pool.k_buffer[0][loc].zero_()
+    pool.v_buffer[0][loc].zero_()
+    pool.k_scale_buffer[0][loc].zero_()
+    pool.v_scale_buffer[0][loc].zero_()
+    pool.load_cpu_copy(kv_cpu, loc)
+
+    assert torch.equal(pool.k_buffer[0][loc], k_ref)
+    assert torch.equal(pool.v_buffer[0][loc], v_ref)
+    assert torch.equal(pool.k_scale_buffer[0][loc], k_scale_ref)
+    assert torch.equal(pool.v_scale_buffer[0][loc], v_scale_ref)
 
 
 @pytest.mark.skipif(not _cpu_has_amx(), reason="FP8 E4M3 KV cache requires AMX")
-def test_mha_fp8_e4m3_kv_pool_rejects_hnd(monkeypatch):
-    MHATokenToKVPool = _import_mha_pool()
+def test_mla_fp8_e4m3_kv_pool_preserves_scales():
+    MLATokenToKVPool = _import_mla_pool()
 
-    monkeypatch.setattr(envs.SGLANG_USE_HND_KVCACHE, "get", lambda: True)
-    with pytest.raises(NotImplementedError, match="SGLANG_USE_HND_KVCACHE"):
-        MHATokenToKVPool(
-            size=32,
-            page_size=1,
-            dtype=torch.float8_e4m3fn,
-            head_num=2,
-            head_dim=32,
-            layer_num=1,
-            device=DEVICE,
-            enable_memory_saver=False,
-        )
-
-
-@pytest.mark.skipif(not _cpu_has_amx(), reason="FP8 E4M3 KV cache requires AMX")
-def test_mha_fp8_e4m3_kv_pool_rejects_dcp_mask():
-    MHATokenToKVPool = _import_mha_pool()
-
-    pool = MHATokenToKVPool(
+    pool = MLATokenToKVPool(
         size=32,
         page_size=1,
         dtype=torch.float8_e4m3fn,
-        head_num=2,
-        head_dim=32,
+        kv_lora_rank=16,
+        qk_rope_head_dim=16,
         layer_num=1,
         device=DEVICE,
         enable_memory_saver=False,
     )
     loc = torch.tensor([3, 7], dtype=torch.int64, device=DEVICE)
+    target_loc = torch.tensor([11, 13], dtype=torch.int64, device=DEVICE)
     layer = SimpleNamespace(layer_id=0)
-    cache_k = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
-    cache_v = torch.randn((2, 2, 32), dtype=torch.bfloat16, device=DEVICE)
-    dcp_kv_mask = torch.ones((2,), dtype=torch.bool, device=DEVICE)
+    cache_k = torch.randn((2, 1, 32), dtype=torch.bfloat16, device=DEVICE)
+    cache_v = torch.empty((2, 1, 16), dtype=torch.bfloat16, device=DEVICE)
 
-    with pytest.raises(NotImplementedError, match="DCP KV masks"):
-        pool.set_kv_buffer(layer, loc, cache_k, cache_v, dcp_kv_mask=dcp_kv_mask)
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+
+    assert hasattr(pool, "kv_scale_buffer")
+    expected_bytes = sum(t.numel() * t.element_size() for t in pool.kv_buffer)
+    expected_bytes += sum(t.numel() * t.element_size() for t in pool.kv_scale_buffer)
+    assert pool.get_kv_size_bytes() == expected_bytes
+
+    kv_ref = pool.kv_buffer[0][loc].clone()
+    scale_ref = pool.kv_scale_buffer[0][loc].clone()
+    pool.move_kv_cache(target_loc, loc)
+
+    assert torch.equal(pool.kv_buffer[0][target_loc], kv_ref)
+    assert torch.equal(pool.kv_scale_buffer[0][target_loc], scale_ref)
+
+    kv_cpu = pool.get_cpu_copy(target_loc)
+    pool.kv_buffer[0][target_loc].zero_()
+    pool.kv_scale_buffer[0][target_loc].zero_()
+    pool.load_cpu_copy(kv_cpu, target_loc)
+
+    assert torch.equal(pool.kv_buffer[0][target_loc], kv_ref)
+    assert torch.equal(pool.kv_scale_buffer[0][target_loc], scale_ref)
 
 
 if __name__ == "__main__":
