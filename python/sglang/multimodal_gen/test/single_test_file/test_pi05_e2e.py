@@ -138,7 +138,7 @@ def test_pi05_python_action_e2e(pi05_generator):
     _assert_action_output(output)
 
 
-def test_pi05_python_action_consistency(pi05_generator):
+def test_pi05_python_action_repeatability_and_cache(pi05_generator):
     first = pi05_generator.generate_action(_action_request_kwargs("consistency"))
     second = pi05_generator.generate_action(_action_request_kwargs("consistency"))
     _assert_action_output(first, expect_cache_hit=False)
