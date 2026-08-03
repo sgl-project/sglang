@@ -602,12 +602,23 @@ cat > "$WORKDIR/drive.sh" <<'DRIVE'
 #!/bin/bash
 set -x
 WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+resolve_ip() {
+  local node="$1" addr field ip
+  for field in $(scontrol show node "$node" -o); do
+    case "$field" in
+      NodeAddr=*) addr="${field#NodeAddr=}"; break ;;
+    esac
+  done
+  [[ -n "$addr" ]] || addr="$node"
+  read -r ip _ < <(getent ahostsv4 "$addr")
+  printf '%s\n' "$ip"
+}
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 PNODES=("${NODES[@]:0:PW}")
 DNODES=("${NODES[@]:PW:DW}")
 PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
-PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
-DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+PIP=$(resolve_ip "$PNODE")
+DIP=$(resolve_ip "$DNODE")
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
 if (( PW > 1 || DW > 1 )); then
