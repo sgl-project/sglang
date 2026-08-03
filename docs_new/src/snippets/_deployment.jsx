@@ -9,7 +9,10 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd
+//                      vendor picks the selector group: blackwell | hopper | amd.
+//                      `multiNodeDockerFlags: string[]` (either source) adds
+//                      `docker run` flags the platform's fabric needs
+//   groupHardware      optional — set false to show one flat hardware row
 //   variants/quantizations/strategies/nodesOptions  LEGACY 4-dim option lists,
 //                      used when `matchDims` is absent (nodesOptions id is
 //                      `single` or `multi-N` → --nnodes N)
@@ -23,7 +26,8 @@
 //                      `flags` / `env` / `hints` (each a literal array or a function
 //                      of the whole selection), and a row-level `default` / `showWhen`.
 //                      `hints` render as `# ...` lines above the command.
-//   cells              {match, verified?, nnodes?, warn?, redirect?, env, flags}[] — one per
+//   cells              {match, verified?, verificationStatus?, nnodes?, warn?, redirect?,
+//                      env, flags}[] — one per
 //                      (hw × match dims); env/flags are flat literals, only
 //                      {{PLACEHOLDER}} subst applied. `nnodes` supplies the node
 //                      count for configs with no `nodes` dim (default 1). `warn`
@@ -31,9 +35,15 @@
 //                      embed [label](#anchor) links. `redirect: true` renders the
 //                      banner ALONE — no command, header, or copy buttons — for
 //                      cells that only point somewhere else.
+//                      `verified` is the boolean badge baseline.
+//                      `verificationStatus` overrides it with a third state —
+//                      "verified" | "in-progress" | "unverified" — for a recipe
+//                      whose verification round is open rather than absent.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
-//   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
+//   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
+//                      `(selection, cell) => template` when the request payload
+//                      depends on a custom match/overlay dimension
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
 //                      per-eval accuracy templates)
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
@@ -46,10 +56,17 @@
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
-//                      then `hw`; falls back to `lmsysorg/sglang:dev`
+//   dockerImages       optional — `docker run` image, keyed by
+//                      `hw|quant|strategy` then `hw|quant` then `hw`;
+//                      falls back to `lmsysorg/sglang:dev`
+//   dockerMounts       optional — additional `-v` mount specs
+//   dockerRunCommand   optional — command placed after the image and before
+//                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
-//                      `docker`); defaults to both, in that order
+//                      `docker`), as an array or `(selection) => array`;
+//                      defaults to both, in that order
+//   showPlaygroundLink optional — false hides the "Open the Playground" footer
+//                      for cookbooks that only expose the deployment matrix
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -73,6 +90,12 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "gb300", label: "GB300", vram: "288GB" },
       { id: "b200",  label: "B200",  vram: "192GB" },
       { id: "gb200", label: "GB200", vram: "192GB" },
+      // GB10 Grace Blackwell — 128 GB coherent unified system memory (not discrete VRAM).
+      // Multi-node runs over ConnectX-7 RDMA (pinned memory + IB passthrough).
+      { id: "dgx-spark", label: "DGX Spark", vram: "128GB",
+        multiNodeDockerFlags: [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ] },
     ],
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
@@ -157,8 +180,8 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
     },
-    // Amber callout under the command when speculative decoding (MTP) is on
-    // but --max-running-requests isn't set (SGLang then caps it at 48).
+    // Amber callout under the command when speculative decoding (MTP, DSpark, ...)
+    // is on but --max-running-requests isn't set (SGLang then caps it at 48).
     mtpWarn: {
       margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
       fontSize: "12px", lineHeight: "1.45",
@@ -166,18 +189,30 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#fde68a" : "#92400e",
       border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
-    badge: (verified) => ({
+    // Takes either a boolean (legacy `cell.verified`) or a status id — see
+    // VERIFY_LABEL / verifyStatusOf in section 3.
+    badge: (status) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px",
-      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
-                           : (isDark ? "#78350f" : "#fef3c7"),
-      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
-                           : (isDark ? "#fde68a" : "#92400e"),
-      fontSize: "11px", fontWeight: 600,
+      background: {
+        verified:      isDark ? "#064e3b" : "#d1fae5",
+        "in-progress": isDark ? "#1e3a8a" : "#dbeafe",
+        unverified:    isDark ? "#78350f" : "#fef3c7",
+      }[verifyStatusOf(status)],
+      color: {
+        verified:      isDark ? "#a7f3d0" : "#065f46",
+        "in-progress": isDark ? "#bfdbfe" : "#1e40af",
+        unverified:    isDark ? "#fde68a" : "#92400e",
+      }[verifyStatusOf(status)],
+      // The in-progress label is long; keep the pill on one line and let the
+      // header row wrap around it instead of breaking the text mid-badge.
+      fontSize: "11px", fontWeight: 600, whiteSpace: "nowrap",
     }),
-    badgeDot: (verified) => ({
+    badgeDot: (status) => ({
       width: "8px", height: "8px", borderRadius: "50%",
-      background: verified ? "#10b981" : "#f59e0b",
+      background: { verified: "#10b981", "in-progress": "#3b82f6", unverified: "#f59e0b" }[
+        verifyStatusOf(status)
+      ],
     }),
     iconButton: {
       padding: "4px 10px",
@@ -388,6 +423,25 @@ export const Deployment = ({ config, benchmarks }) => {
   });
 
   // ==== 3. Pure helpers (no React state) ====
+  // Verification badge state. A cell's boolean `verified` is the baseline;
+  // `cell.verificationStatus` overrides it, which is how a recipe whose
+  // verification round is open reports that instead of collapsing into the flat
+  // Verified / Not Verified pair.
+  const VERIFY_LABEL = {
+    verified: "Verified",
+    "in-progress": "Final Verification In Progress",
+    unverified: "Not Verified",
+  };
+  // Booleans keep their historical meaning; an unrecognized status id falls
+  // back to "unverified" rather than to truthiness (a typo must never read as
+  // a green Verified badge).
+  const verifyStatusOf = (v) =>
+    typeof v === "string"
+      ? (VERIFY_LABEL[v] ? v : "unverified")
+      : (v ? "verified" : "unverified");
+  const cellVerifyStatus = (c) =>
+    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
+
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
   //   overlay dims  never touch cell lookup; the picked option contributes flags
@@ -638,9 +692,15 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`,
+      // then `hw`; `:dev` if unmapped. The strategy key covers a tier that
+      // needs its own build (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
@@ -649,6 +709,16 @@ export const Deployment = ({ config, benchmarks }) => {
         }
         const extra = (config.hardware || []).find((h) => h.id === hwId);
         return (extra && extra.vendor) || "nvidia";
+      };
+      // `config.hardware` overrides by id, as in buildHardwareGroups.
+      const fabricFlagsOf = (hwId) => {
+        const extra = (config.hardware || []).find((h) => h.id === hwId);
+        if (extra) return extra.multiNodeDockerFlags || [];
+        for (const list of Object.values(HARDWARE_CATALOG)) {
+          const hit = list.find((h) => h.id === hwId);
+          if (hit) return hit.multiNodeDockerFlags || [];
+        }
+        return [];
       };
       const gpuAccessLines = vendorOf(sel.hw) === "amd"
         ? [
@@ -668,14 +738,16 @@ export const Deployment = ({ config, benchmarks }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...flags.map((f) => "    " + f),
       ];
       cmd = dockerLines.join(" \\\n");
@@ -971,6 +1043,9 @@ export const Deployment = ({ config, benchmarks }) => {
         .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
       if (items.length) groups.push({ label: vendor.toUpperCase(), items });
     }
+    if (config.groupHardware === false) {
+      return [{ label: null, items: groups.flatMap((group) => group.items) }];
+    }
     return groups;
   };
 
@@ -1102,8 +1177,17 @@ export const Deployment = ({ config, benchmarks }) => {
   const [benchConc, setBenchConc] = useState(null);
   const [benchAcc, setBenchAcc] = useState(null);
   const [benchCopied, setBenchCopied] = useState(null);
-  const runModes = config.runModes || ["python", "docker"];
+  const configuredRunModes = typeof config.runModes === "function"
+    ? config.runModes(sel)
+    : config.runModes;
+  const runModes = configuredRunModes || ["python", "docker"];
   const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
+  const hasRunMode = runModes.includes(runMode);
+  const fallbackRunMode = runModes[0];
+  const activeRunMode = hasRunMode ? runMode : fallbackRunMode;
+  useEffect(() => {
+    if (!hasRunMode) setRunMode(fallbackRunMode);
+  }, [hasRunMode, fallbackRunMode]);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // Live --mamba-full-memory-ratio from the ratio calculator (K3 pages):
@@ -1122,6 +1206,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
+  const verifyStatus = cellVerifyStatus(cell);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
@@ -1134,14 +1219,38 @@ export const Deployment = ({ config, benchmarks }) => {
     else flags.push(line);
     return { ...cell, flags };
   })();
-  const command = renderCommand(cellWithRatio, sel, env, runMode);
-  // MTP hint on the EFFECTIVE flags — speculation arrives via the Spec Decode
-  // overlay, never the cell. SGLang resets --max-running-requests to 48 when
-  // spec is on and it's unset.
+  const command = renderCommand(cellWithRatio, sel, env, activeRunMode);
+  // Speculative-decoding hint on the EFFECTIVE flags — speculation can arrive via
+  // the Spec Decode overlay as well as the cell. SGLang resets
+  // --max-running-requests to 48 when spec is on and it's unset; verified for both
+  // EAGLE/MTP and DSPARK (server_args reports max_running_requests=48 either way).
   const effFlags = cell ? [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)] : [];
-  const mtpHint =
-    effFlags.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
-    !effFlags.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  const specAlgoFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  const specMrrFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  // Two cases, both worth surfacing when speculation is on:
+  //   mtpHint       — the flag is MISSING, so SGLang silently caps at 48 (a hazard)
+  //   specPinnedHint— the recipe PINS it, which is safe but is a fixed number the
+  //                   reader still has to match to their own concurrency
+  const mtpHint = !!specAlgoFlag && !specMrrFlag;
+  const specPinnedHint = !!specAlgoFlag && !!specMrrFlag;
+  const specMrrValue = specMrrFlag
+    ? (specMrrFlag.split(/[\s=]/).filter(Boolean)[1] || "")
+    : "";
+  // Name the algorithm in the banner rather than hardcoding "MTP" — the same reset
+  // applies to DSpark and friends, and a DSpark user reading "(MTP)" would be
+  // misled. The cookbook calls the EAGLE-based path MTP, so keep that mapping.
+  const SPEC_ALGO_LABEL = {
+    EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
+    DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
+    STANDALONE: "standalone draft",
+  };
+  const specAlgoName = (() => {
+    if (!specAlgoFlag) return "MTP";
+    const v = specAlgoFlag.split(/[\s=]/).filter(Boolean)[1] || "";
+    return SPEC_ALGO_LABEL[v.toUpperCase()] || v || "MTP";
+  })();
   // cell.warn may embed [label](#anchor) links — rendered as scrollIntoView
   // buttons, not hrefs, so the hash (which carries the selection) isn't overwritten.
   const renderWarn = (text) => {
@@ -1179,7 +1288,9 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
   const modelName = resolveModelName(sel);
-  const curlText = interpolate(config.curl || "", env, modelName);
+  const curlTemplate =
+    typeof config.curl === "function" ? config.curl(sel, cell) : config.curl;
+  const curlText = interpolate(curlTemplate || "", env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
@@ -1301,8 +1412,8 @@ export const Deployment = ({ config, benchmarks }) => {
       <div style={s.cardColumn}>
         <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
         {hwGroups.map((g) => (
-          <div key={g.label} style={s.vendorRow}>
-            <div style={s.vendorLabel}>{g.label}</div>
+          <div key={g.label || "hardware"} style={s.vendorRow}>
+            {g.label && <div style={s.vendorLabel}>{g.label}</div>}
             <div style={s.itemsGrid(maxHwCols)}>
               {g.items.map((item) => renderButton(item, "hw", sel.hw))}
               {Array.from({ length: maxHwCols - g.items.length }).map((_, i) => (
@@ -1337,9 +1448,9 @@ export const Deployment = ({ config, benchmarks }) => {
           ) : (<>
             <div style={s.commandHeader}>
               <div style={s.headerLeft}>
-                <div style={s.badge(Boolean(cell && cell.verified))}>
-                  <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-                  {cell && cell.verified ? "Verified" : "Not Verified"}
+                <div style={s.badge(verifyStatus)}>
+                  <span style={s.badgeDot(verifyStatus)} />
+                  {VERIFY_LABEL[verifyStatus]}
                 </div>
                 <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                   {runModes.map((mode, index) => (
@@ -1347,13 +1458,13 @@ export const Deployment = ({ config, benchmarks }) => {
                       key={mode}
                       style={{
                         ...(index === runModes.length - 1
-                          ? s.runModeChipLast(runMode === mode)
-                          : s.runModeChip(runMode === mode)),
+                          ? s.runModeChipLast(activeRunMode === mode)
+                          : s.runModeChip(activeRunMode === mode)),
                         ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
                       }}
                       onClick={() => setRunMode(mode)}
                       role="tab"
-                      aria-selected={runMode === mode}
+                      aria-selected={activeRunMode === mode}
                     >
                       {mode === "docker" ? "Docker" : "Python"}
                     </span>
@@ -1372,7 +1483,12 @@ export const Deployment = ({ config, benchmarks }) => {
             {cell && cell.warn && <div style={s.mtpWarn}>⚠️ {renderWarn(cell.warn)}</div>}
             {mtpHint && (
               <div style={s.mtpWarn}>
-                ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+                ⚠️ Speculative decoding ({specAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              </div>
+            )}
+            {specPinnedHint && (
+              <div style={s.mtpWarn}>
+                ℹ️ Speculative decoding ({specAlgoName}) is on and this recipe pins <code>--max-running-requests</code> to <strong>{specMrrValue}</strong>. Adjust it to match your target concurrency — if you remove the flag, SGLang falls back to <strong>48</strong>.
               </div>
             )}
           </>)}
@@ -1384,38 +1500,40 @@ export const Deployment = ({ config, benchmarks }) => {
 
       {/* Playground link — scrollIntoView, not an href, so the hash (which
           carries the selection) isn't overwritten. */}
-      <div
-        style={{
-          padding: "6px 12px",
-          fontSize: "12px",
-          color: isDark ? "#9ca3af" : "#6b7280",
-          display: "flex",
-          alignItems: "center",
-          gap: "6px",
-        }}
-      >
-        <span>Need to go beyond the verified matrix?</span>
-        <button
-          type="button"
-          onClick={() => {
-            const el = document.getElementById("playground");
-            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-          }}
+      {config.showPlaygroundLink !== false && (
+        <div
           style={{
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            color: isDark ? "#FDBA74" : "#C2410C",
-            cursor: "pointer",
+            padding: "6px 12px",
             fontSize: "12px",
-            fontWeight: 600,
-            textDecoration: "underline",
-            textUnderlineOffset: "2px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
           }}
         >
-          Open the Playground →
-        </button>
-      </div>
+          <span>Need to go beyond the verified matrix?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById("playground");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+            }}
+          >
+            Open the Playground →
+          </button>
+        </div>
+      )}
 
       {/* cURL modal */}
       {modal === "curl" && (

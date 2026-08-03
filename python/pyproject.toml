@@ -199,6 +199,12 @@ killall_sglang = "sglang.cli.killall:main"
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
 
+[tool.setuptools.exclude-package-data]
+"sglang" = [
+  "kernels/aot/*",
+  "kernels/aot/**/*",
+]
+
 [tool.setuptools.packages.find]
 exclude = [
   "assets*",
@@ -207,6 +213,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang.kernels.aot*",
   "tests*",
 ]
 
@@ -218,6 +225,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang/kernels/aot*",
   "tests*",
 ]
 
