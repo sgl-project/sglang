@@ -42,6 +42,7 @@ if is_cuda():
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_xpu():
     from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+    from sgl_kernel import gdn_attention as sgl_kernel_gdn_attention
 
     causal_conv1d_fn = causal_conv1d_fn_xpu
     causal_conv1d_update = causal_conv1d_update_xpu
@@ -350,18 +351,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
-        # Persistent, grow-only scratch buffers shared by every GDN layer's
-        # fused-SYCL-kernel call (see forward_fused_gdn / _get_gdn_ws below).
-        # Passing these into torch.ops.sgl_kernel.gdn_attention lets the C++
-        # side reuse one fixed-capacity allocation (viewed/narrowed per call)
-        # instead of doing its own torch::empty/torch::zeros of a shape that
-        # varies every call (different token counts across prefill/decode
-        # steps and across layers). Without this, the XPU caching allocator
-        # accumulates many differently-sized cached blocks that are never
-        # freed back to the OS, inflating torch.xpu.memory_reserved() far
-        # beyond torch.xpu.memory_allocated() and causing OOM under TP with
-        # large prefill batches.
-        self._gdn_ws: dict[str, torch.Tensor] = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -709,27 +698,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return False
         return True
 
-    def _get_gdn_ws(
-        self, name: str, numel: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        """Return a flat 1-D scratch buffer with >= `numel` elements of `dtype`,
-        shared across all GDN layers and forward calls. Grows (reallocates,
-        with a 25% headroom margin) the first time a call needs more capacity
-        than previously seen, then stays fixed-size thereafter -- so the XPU
-        caching allocator sees one stable-size allocation instead of many
-        differently-shaped ones across layers/steps."""
-        cur = self._gdn_ws.get(name)
-        if (
-            cur is None
-            or cur.numel() < numel
-            or cur.dtype != dtype
-            or cur.device != device
-        ):
-            new_numel = max(numel, int(numel * 1.25))
-            cur = torch.empty(new_numel, dtype=dtype, device=device)
-            self._gdn_ws[name] = cur
-        return cur
-
     def forward_fused_gdn(
         self,
         layer: RadixLinearAttention,
@@ -779,32 +747,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         z = torch.empty_like(core_attn_out)
 
-        # Fused-GDN-kernel chunk size (Xe2 chunk-scan algorithm); must match
-        # `gdn::chunk_size_xe2` in sgl-kernel-xpu's gdn_attn_utils.h.
-        GDN_XE2_CHUNK_SIZE = 64
-        padding_size = bs * (GDN_XE2_CHUNK_SIZE - 1) if num_prefills > 0 else 0
-        padded_tokens = num_actual_tokens + padding_size
-        ws_q = self._get_gdn_ws(
-            "q", padded_tokens * layer.num_k_heads * layer.head_k_dim, dtype, device
-        )
-        ws_k = self._get_gdn_ws(
-            "k", padded_tokens * layer.num_k_heads * layer.head_k_dim, dtype, device
-        )
-        ws_v = self._get_gdn_ws(
-            "v", padded_tokens * layer.num_v_heads * layer.head_v_dim, dtype, device
-        )
-        ws_b = self._get_gdn_ws("b", padded_tokens * layer.num_v_heads, dtype, device)
-        ws_a = self._get_gdn_ws("a", padded_tokens * layer.num_v_heads, dtype, device)
-        ws_b_prefill = self._get_gdn_ws(
-            "b_prefill", padded_tokens * layer.num_v_heads, torch.float32, device
-        )
-        ws_a_prefill = self._get_gdn_ws(
-            "a_prefill", padded_tokens * layer.num_v_heads, torch.float32, device
-        )
-        # workspace: [q, k, v, b, a, b_prefill, a_prefill].
-        gdn_workspace = [ws_q, ws_k, ws_v, ws_b, ws_a, ws_b_prefill, ws_a_prefill]
-
-        torch.ops.sgl_kernel.gdn_attention(
+        sgl_kernel_gdn_attention(
             core_attn_out,
             z,
             projected_states_qkvz,
@@ -834,7 +777,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             num_actual_tokens,
             1,
             True,
-            gdn_workspace,
         )
 
         # conv/ssm states were updated in place via the pool views.
