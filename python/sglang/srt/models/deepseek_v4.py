@@ -225,6 +225,44 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
+def _apply_wo_a_bf16_matmul(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+    """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
+
+    ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
+    ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
+
+    The plain ``torch.einsum("tgd,grd->tgr", ...)`` dispatches to a
+    rocBLAS/Tensile ``Cijk_*`` batched GEMM on ROCm, which is the single
+    largest decode attention-region kernel. On gfx95 aiter ships a tuned
+    ``batched_gemm_bf16`` for exactly this shape (``Y[i] = X[i] @ W[i]^T``),
+    which is the kernel the reference ATOM stack uses. Routing to it is
+    numerically bf16-equivalent (validated max rel-err <=5e-4). Opt-in via
+    ``SGLANG_OPT_WO_A_AITER_BATCHED_GEMM`` (default off); any failure falls
+    back to the einsum.
+    """
+    if (
+        envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.get()
+        and _is_hip
+        and _is_gfx95_supported
+    ):
+        try:
+            from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+                batched_gemm_bf16,
+            )
+
+            # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
+            # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
+            # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
+            xq = o.transpose(0, 1).contiguous()
+            y = batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
+            return y.transpose(0, 1).contiguous()
+        except Exception as err:
+            logger.warning(
+                "aiter wo_a batched_gemm_bf16 failed, einsum fallback: %s", err
+            )
+    return torch.einsum("tgd,grd->tgr", o, wo_a)
+
+
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
     x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
         hidden_states,
@@ -1264,7 +1302,7 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
         if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
