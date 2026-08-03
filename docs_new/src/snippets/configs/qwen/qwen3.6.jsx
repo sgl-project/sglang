@@ -233,12 +233,15 @@ export const config = {
       ],
     },
     {
+      // mem-fraction-static 0.92 (vs generator default 0.8): +13% throughput on this
+      // KV-bound MoE cell (A/B screened at conc 1024). Benchmark pending — re-bench at
+      // 0.92 (conc 1024+4096) before marking verified.
       match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.92",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -441,13 +444,17 @@ export const config = {
       ],
     },
     {
+      // 0.5.16 target config: NVFP4-MoE needs --moe-runner-backend flashinfer_cutlass
+      // (default crashes). Benchmark pending — measured b200 numbers were on 0.5.15
+      // (plain path); re-bench on 0.5.16 with this flag to unify the Blackwell backend.
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 1",
         "--attention-backend trtllm_mha",
+        "--moe-runner-backend flashinfer_cutlass",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -458,13 +465,15 @@ export const config = {
       ],
     },
     {
+      // 0.5.16 target config (see LL note): flashinfer_cutlass moe runner; benchmark pending.
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 1",
         "--attention-backend trtllm_mha",
+        "--moe-runner-backend flashinfer_cutlass",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

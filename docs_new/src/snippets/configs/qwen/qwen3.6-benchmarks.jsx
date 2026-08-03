@@ -4,28 +4,21 @@
 // --warmup-requests 64, --flush-cache), run1 landed. tokens_per_sec_per_gpu =
 // output_throughput / tp * (isl+osl)/osl (tp=1). LL @ conc 1+16, HT @ conc 1024+4096.
 //
-// Coverage: B200 (12) @ 0.5.15, H200 (8) + B300 (12) @ 0.5.16. Pending: H100 (all, GPU
-// capacity) and Xeon (4, no CPU box). Cells without an entry render "pending".
+// Coverage: 29/44 measured — B200 (10) @ 0.5.15, H200 (7) + B300 (12) @ 0.5.16. Pending:
+// H100 (8, GPU capacity), Xeon (4, no CPU box), and 2 cells whose config was updated past
+// their last measurement (below). Cells without an entry render "pending".
 //
-// 35B-A3B NVFP4 (MoE) note: on sglang 0.5.16 the plain generator command crashes at
-// CUDA-graph capture (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM moe runner), so the
-// B300 cells (0.5.16) add --moe-runner-backend flashinfer_cutlass and were measured WITH
-// it. The B200 cells stay on 0.5.15, where the default FLASHINFER_TRTLLM path works — they
-// keep the plain generator command (no flag) and were measured that way. So each cell
-// matches exactly what was benched. Follow-up: re-bench B200 on 0.5.16 + the flag to unify
-// the backend across Blackwell. 27B NVFP4 is dense (no MoE) and unaffected.
+// 35B-A3B NVFP4 (MoE): on 0.5.16 the plain generator command crashes at CUDA-graph capture
+// (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM runner), so the config carries the fix
+// --moe-runner-backend flashinfer_cutlass on Blackwell 35B-A3B NVFP4. B300 was measured
+// WITH it (0.5.16). B200 35B-A3B NVFP4 is PENDING: config shows the 0.5.16 target (with the
+// flag), but our only numbers are 0.5.15 on the plain path — dropped until re-benched on
+// 0.5.16 with the flag. (27B NVFP4 is dense, unaffected.)
+//
+// h200 35B-A3B bf16 high-throughput is PENDING: config updated to --mem-fraction-static
+// 0.92 (+13% A/B at conc 1024); re-bench conc 1024+4096 at 0.92 before marking verified.
 
 export const benchmarks = [
-  {
-    match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.16",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 460510, tpot_ms: 27.79, tokens_per_sec_per_gpu: 18708 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 1970028, tpot_ms: 28.08, tokens_per_sec_per_gpu: 18642 },
-    ],
-  },
   {
     match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
@@ -134,26 +127,6 @@ export const benchmarks = [
         ttft_ms: 116, tpot_ms: 1.81, tokens_per_sec_per_gpu: 4755 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 221, tpot_ms: 4.62, tokens_per_sec_per_gpu: 27810 },
-    ],
-  },
-  {
-    match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 154224, tpot_ms: 26.07, tokens_per_sec_per_gpu: 47846 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 737740, tpot_ms: 26.64, tokens_per_sec_per_gpu: 47654 },
-    ],
-  },
-  {
-    match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.5.15",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 110, tpot_ms: 2.42, tokens_per_sec_per_gpu: 3549 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 206, tpot_ms: 5.44, tokens_per_sec_per_gpu: 23694 },
     ],
   },
   {
