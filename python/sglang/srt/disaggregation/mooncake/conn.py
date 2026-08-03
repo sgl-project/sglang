@@ -1858,24 +1858,14 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def start_prefill_thread(self):
-        # Poll with a timeout so the worker can observe _stopped and exit
-        # promptly (recv_multipart() would block forever and make teardown,
-        # i.e. runtime P<->D role switch, hang).
-        poller = zmq.Poller()
-        poller.register(self.server_socket, zmq.POLLIN)
+        recv = self._make_worker_recv(self.server_socket)
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while not self._stopped:
-                try:
-                    if not poller.poll(timeout=500):
-                        continue
-                    waiting_req_bytes = self.server_socket.recv_multipart()
-                except Exception:
-                    if self._stopped:
-                        break
-                    logger.exception("Bootstrap thread failed")
+                waiting_req_bytes = recv()
+                if waiting_req_bytes is None:
                     continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
@@ -1983,22 +1973,12 @@ class MooncakeKVManager(CommonKVManager):
         self._worker_threads.append(t)
 
     def start_decode_thread(self):
-        # Poll with a timeout so the worker can observe _stopped and exit
-        # promptly (recv_multipart() would block forever and make teardown,
-        # i.e. runtime P<->D role switch, hang).
-        poller = zmq.Poller()
-        poller.register(self.server_socket, zmq.POLLIN)
+        recv = self._make_worker_recv(self.server_socket)
 
         def decode_thread():
             while not self._stopped:
-                try:
-                    if not poller.poll(timeout=500):
-                        continue
-                    msg = self.server_socket.recv_multipart()
-                except Exception:
-                    if self._stopped:
-                        break
-                    logger.exception("Decode thread failed")
+                msg = recv()
+                if msg is None:
                     continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)

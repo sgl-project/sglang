@@ -567,25 +567,6 @@ class MoriKVManager(CommonKVManager):
             return None
         return payload
 
-    def _make_worker_recv(self, socket, timeout_ms: int = 500):
-        """Build the blocking multipart recv used by a worker thread.
-
-        Plain blocking recv unless role switching is enabled: teardown flips a
-        stop flag that a blocked recv can never observe, so in that mode poll
-        with a timeout and return None when it expires. Deployments without
-        --enable-pd-role-switch keep the original blocking recv and pay nothing.
-        """
-        if not self.server_args.enable_pd_role_switch:
-            return socket.recv_multipart
-
-        poller = zmq.Poller()
-        poller.register(socket, zmq.POLLIN)
-
-        def recv():
-            return socket.recv_multipart() if poller.poll(timeout_ms) else None
-
-        return recv
-
     def _start_bootstrap_thread(self) -> None:
         recv = self._make_worker_recv(self.server_socket)
 

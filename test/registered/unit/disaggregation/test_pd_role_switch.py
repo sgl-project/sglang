@@ -245,6 +245,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             moe_a2a_backend="none",
             pp_size=1,
             dp_size=1,
+            dcp_size=1,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -403,11 +404,11 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
 class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
     """The prefill bootstrap loop moved from a blocking recv_multipart() to a
     500ms poll + _stopped check (so teardown, i.e. a runtime role switch, can
-    stop it) and now retries on recv errors instead of dying. That loop runs
-    on every mooncake PD instance, so pin the new contract with real ZMQ
-    traffic driven through the ABORT -> ABORT_ACK path: no message loss while
-    idle or bursting, survival of a transient recv error, and prompt exit
-    once _stopped is set.
+    stop it). That loop runs on every mooncake PD instance, so pin the
+    contract with real ZMQ traffic driven through the ABORT -> ABORT_ACK
+    path: no message loss while idle or bursting, and prompt exit once
+    _stopped is set. Unlike mori, the loop has no try/except around recv: a
+    recv error terminates the thread (see test_recv_error_kills_thread).
     """
 
     class _FlakySocket(zmq.Socket):
@@ -431,6 +432,9 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         m._stopped = False
         m._worker_threads = []
         m.server_socket = sock
+        # The receive path is gated on this flag: role switch must be on for
+        # the poll-with-timeout loop these tests exercise.
+        m.server_args = SimpleNamespace(enable_pd_role_switch=True)
         # ABORT for an unknown room takes the "ignoring" branch and still
         # ACKs, giving a side-effect-free probe of the receive loop.
         m.request_status = {}
@@ -484,15 +488,16 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         # Two-step poll+recv must consume every queued message exactly once.
         self._wait_acks(n)
 
-    def test_survives_transient_recv_error(self):
+    def test_recv_error_kills_thread(self):
+        # No try/except guards recv() in the mooncake loop (unlike mori): a
+        # recv error terminates the thread and the loop stops processing.
+        # Pin that contract so adding error handling stays a deliberate,
+        # reviewed change rather than a silent behavior shift.
         thread = self._start()
         self._FlakySocket.fail_next_recv = True
         self._send_abort(3)
-        # The first wakeup raises inside recv; the loop must log and retry so
-        # the message is still delivered and the thread stays alive (the old
-        # blocking loop died here, silently killing bootstrap for good).
-        self._wait_acks(1)
-        self.assertTrue(thread.is_alive())
+        thread.join(timeout=2.0)
+        self.assertFalse(thread.is_alive(), "bootstrap thread survived recv error")
         self.assertFalse(self._FlakySocket.fail_next_recv)  # fault consumed
 
     def test_exits_promptly_when_stopped_while_idle(self):
