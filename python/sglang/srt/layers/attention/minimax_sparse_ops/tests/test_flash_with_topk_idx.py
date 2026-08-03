@@ -476,5 +476,67 @@ def test_flash_decode_dense_page_table_trivial_rows_skip_score_writes():
             assert torch.equal(page_table_cpu[row, :valid_pages], expected)
 
 
+@pytest.mark.parametrize("score_type", ["max", "lse"])
+def test_flash_decode_score_one_page_per_block(score_type):
+    """The block-table score path must match token-table addressing."""
+    torch.manual_seed(43)
+    bs, nqh, nkh, hd, blk, tk = 2, 1, 1, 128, 128, 4
+    seq_lens_list = [513, 768]
+    q, _, k_cache, v_cache, _, seq_lens, _, slot_ids = build_inputs(
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens_list,
+        max_kv_len=max(seq_lens_list),
+    )
+
+    pages_per_req = max(seq_lens_list) // blk
+    page_table = torch.randperm(
+        bs * pages_per_req, device=DEVICE, dtype=torch.int32
+    ).view(bs, pages_per_req)
+    req_to_token = (
+        page_table[:, :, None] * blk
+        + torch.arange(blk, device=DEVICE, dtype=torch.int32)[None, None, :]
+    ).reshape(bs, -1)
+
+    _, topk_new, _ = flash_decode_with_topk_idx(
+        q,
+        None,
+        k_cache,
+        None,
+        page_table,
+        seq_lens,
+        max(seq_lens_list),
+        blk,
+        tk,
+        0,
+        1,
+        disable_index_value=True,
+        score_type=score_type,
+        page_size=blk,
+    )
+    _, topk_ref = pytorch_reference(
+        q,
+        None,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens,
+        slot_ids,
+        blk,
+        tk,
+        0,
+        1,
+        score_type=score_type,
+    )
+
+    for b, seq_len in enumerate(seq_lens_list):
+        actual_topk = min(tk, (seq_len + blk - 1) // blk)
+        assert set(topk_new[0, b, :actual_topk].tolist()) == set(
+            topk_ref[0, b, :actual_topk].tolist()
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
