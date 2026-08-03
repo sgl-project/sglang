@@ -19,7 +19,7 @@ mod config;
 mod runnable;
 mod threads;
 
-pub use config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+pub use config::{DefaultSamplingParams, RuntimeConfig, RustServerServerArgs, ServerArgs};
 
 use crate::message::DetokMsg;
 use crate::ring::{
