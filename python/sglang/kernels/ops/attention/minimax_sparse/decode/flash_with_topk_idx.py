@@ -214,6 +214,126 @@ def _decode_score_kernel(
             16, triton.next_power_of_2(args["gqa_group_size"])
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit
+def _decode_score_one_page_per_block_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    score_ptr,
+    seq_lens,
+    batch_size,
+    gqa_group_size,
+    head_dim,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    sm_scale,
+    k_scale,
+    init_blocks,
+    local_blocks,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_pt_b,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_KV_CHUNKS: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    """Decode index scores when one sparse block is one physical KV page."""
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+
+    pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
+    pid_b = pid_bc % batch_size
+    pid_c = pid_bc // batch_size
+    pid_h = pid_kh * gqa_group_size
+
+    seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
+    num_blocks = tl.cdiv(seq_len, block_size)
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
+
+    chunk_size_blocks = tl.cdiv(num_blocks, NUM_KV_CHUNKS)
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
+    if chunk_start_block >= chunk_end_block:
+        return
+
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        shape=(gqa_group_size, head_dim),
+        strides=(stride_q_h, stride_q_d),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_n = tl.arange(0, block_size)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    head_mask = off_h < gqa_group_size
+    dim_mask = off_d < head_dim
+    local_start = tl.maximum(0, num_blocks - local_blocks)
+    page_table_row = page_table_ptr + pid_b * stride_pt_b
+    sm_scale_log2e = sm_scale * 1.4426950409
+
+    for logical_block in range(chunk_start_block, chunk_end_block):
+        physical_page = tl.load(page_table_row + logical_block).to(tl.int64)
+        slots = physical_page * block_size + off_n
+        k = tl.load(
+            k_cache_ptr
+            + slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_d[:, None] * stride_k_d,
+            mask=dim_mask[:, None],
+            other=0.0,
+        )
+        if IS_FP8:
+            k = k.to(q.dtype)
+        qk = tl.dot(q, k) * (sm_scale_log2e * k_scale)
+        pos_mask = logical_block * block_size + off_n < seq_len
+        qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+        sub_max = tl.max(qk, axis=1)
+        if SCORE_TYPE == "max":
+            block_score = sub_max
+        else:
+            block_score = sub_max + tl.log2(
+                tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
+            )
+            block_score = tl.where(
+                block_score != block_score, float("-inf"), block_score
+            )
+
+        is_init = logical_block < init_blocks
+        is_local = (logical_block >= local_start) & (logical_block < num_blocks)
+        block_score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, block_score))
+        tl.store(
+            score_ptr
+            + (pid_h + off_h) * stride_s_h
+            + pid_b * stride_s_b
+            + logical_block * stride_s_n,
+            block_score.to(score_ptr.dtype.element_ty),
+            mask=head_mask,
+        )
+
+
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
     }
 )
@@ -872,7 +992,40 @@ def flash_decode_with_topk_idx(
     skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
     grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
-    if disable_index_value:
+    if disable_index_value and page_size == block_size:
+        _decode_score_one_page_per_block_kernel[grid](
+            q,
+            k_cache,
+            page_table,
+            score,
+            seq_lens,
+            batch_size,
+            gqa_group_size,
+            head_dim,
+            block_size,
+            topk,
+            sm_scale,
+            k_scale,
+            init_blocks,
+            local_blocks,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            page_table.stride(0),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            NUM_KV_CHUNKS=NUM_KV_CHUNKS,
+            SCORE_TYPE=score_type,
+            SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
+            num_warps=4,
+            num_stages=3,
+        )
+    elif disable_index_value:
         _decode_score_kernel[grid](
             q,
             k_cache,
