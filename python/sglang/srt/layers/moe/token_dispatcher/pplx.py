@@ -22,7 +22,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_output_dtype,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 
 # Block size used by pplx-kernels for FP8 block-wise scales, matching the
 # DeepSeek / DeepGEMM block quantization convention.
@@ -155,7 +155,7 @@ class PplxAllToAllManager:
         # pplx forces ep_size == world_size
         # with pp_size == 1 (enforced in _ensure_nvshmem), so the EP group spans
         # a single node iff the whole job runs on one node.
-        is_internode = get_server_args().nnodes > 1
+        is_internode = get_parallel().nnodes > 1
 
         if is_internode:
             cls._all_to_all = AllToAll.internode(

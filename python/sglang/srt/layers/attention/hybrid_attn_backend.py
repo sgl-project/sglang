@@ -42,6 +42,7 @@ class HybridAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = (
             prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
         )
+        self.max_context_len = model_runner.model_config.context_len
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
