@@ -321,5 +321,51 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         json.dumps(info)
 
 
+class TestServerInfoSecretsRedacted(CustomTestCase):
+    """`/server_info` must never leak secrets from ServerArgs.
+
+    Regression tests for the credential-exposure report: the handler
+    used to spread `dataclasses.asdict(server_args)` into the response,
+    which exposed `api_key`, `admin_api_key`, and
+    `ssl_keyfile_password` verbatim — e.g. an anonymous caller could
+    read `admin_api_key` when only `--admin-api-key` was set.
+    """
+
+    def test_secret_fields_are_masked_when_set(self):
+        args = ServerArgs(
+            model_path="dummy",
+            api_key="user-secret-key",
+            admin_api_key="admin-secret-key",
+            ssl_keyfile_password="ssl-secret",
+        )
+
+        info = _call_server_info_with(args)
+
+        for field in ServerArgs.SENSITIVE_FIELDS:
+            self.assertEqual(info[field], "****", f"{field} leaked to /server_info")
+        serialized = json.dumps(info)
+        self.assertNotIn("user-secret-key", serialized)
+        self.assertNotIn("admin-secret-key", serialized)
+        self.assertNotIn("ssl-secret", serialized)
+
+    def test_unset_secret_fields_stay_none(self):
+        # Consumers can still distinguish "not configured" (None) from
+        # "configured" ("****").
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        for field in ServerArgs.SENSITIVE_FIELDS:
+            self.assertIn(field, info)
+            self.assertIsNone(info[field])
+
+    def test_redacted_asdict_does_not_mutate_server_args(self):
+        args = ServerArgs(model_path="dummy", api_key="user-secret-key")
+
+        args.redacted_asdict()
+
+        self.assertEqual(args.api_key, "user-secret-key")
+
+
 if __name__ == "__main__":
     unittest.main()

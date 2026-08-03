@@ -9092,6 +9092,23 @@ class ServerArgs:
             "dp_size": self.dp_size,
         }
 
+    # Fields whose values are secrets and must never leave the process via
+    # introspection surfaces (/server_info, gRPC GetServerInfo, etc.).
+    SENSITIVE_FIELDS = ("api_key", "admin_api_key", "ssl_keyfile_password")
+
+    def redacted_asdict(self) -> Dict[str, Any]:
+        """Like ``dataclasses.asdict(self)`` but with secret fields masked.
+
+        Keys stay present (so consumers can still detect whether e.g. an
+        API key is configured), but any set value is replaced with
+        ``"****"``. Unset (``None``) values are left as ``None``.
+        """
+        d = dataclasses.asdict(self)
+        for key in self.SENSITIVE_FIELDS:
+            if d.get(key) is not None:
+                d[key] = "****"
+        return d
+
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
     """Whether MiniMax-M3 attention GEMMs run in fp8 (no opt-in flag; active
