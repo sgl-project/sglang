@@ -102,9 +102,16 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
 )
 
+# SHM-based AllReduce is not yet implemented for aarch64 or ppc64le.
+# VSX/MMA-optimized ppc64le implementation is planned for Phase 2.
+set(SGLANG_CPU_NO_SHM_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/shm.cpp
+)
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ppc64le|ppc64")
     add_compile_definitions(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
     list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
+    list(REMOVE_ITEM SOURCES ${SGLANG_CPU_NO_SHM_SOURCES})
 endif()
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})

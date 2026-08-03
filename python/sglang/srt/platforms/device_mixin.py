@@ -242,7 +242,12 @@ class DeviceMixin:
 
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
-        """Detect CPU architecture."""
+        """Detect CPU architecture.
+
+        Uses ``platform.machine()`` to classify the host CPU into X86, ARM,
+        or POWERPC (covers both ppc64le little-endian and ppc64 big-endian).
+        Returns UNSPECIFIED for anything else.
+        """
         import platform as _platform
 
         machine = _platform.machine().lower()
