@@ -1446,6 +1446,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
+    _startup_gauge_cls = None
+
     def __init__(
         self,
         server_args: Optional[ServerArgs] = None,
@@ -1460,7 +1462,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
+        Gauge = self._startup_gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}

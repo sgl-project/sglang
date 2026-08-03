@@ -372,6 +372,8 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    startup_time: Optional[Dict[str, Any]] = None
+
     @property
     def serving_chat_class(self):
         """Return the serving chat class for OpenAI API.

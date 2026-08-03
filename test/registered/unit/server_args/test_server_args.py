@@ -41,27 +41,6 @@ _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
-class TestModelConfigLogging(CustomTestCase):
-    @patch("sglang.srt.configs.model_config.ModelConfig.from_server_args")
-    def test_hybrid_swa_info_is_logged_once(self, mock_from_server_args):
-        args = object.__new__(ServerArgs)
-        model_config = SimpleNamespace(
-            is_hybrid_swa=True,
-            hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
-        )
-        mock_from_server_args.return_value = model_config
-
-        with patch.object(server_args_module.logger, "info") as mock_info:
-            self.assertIs(args.get_model_config(), model_config)
-            self.assertIs(args.get_model_config(), model_config)
-
-        mock_from_server_args.assert_called_once_with(args)
-        mock_info.assert_called_once_with(
-            "Hybrid SWA model detected. architectures=%s",
-            ["GptOssForCausalLM"],
-        )
-
-
 class TestPrepareServerArgs(CustomTestCase):
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")

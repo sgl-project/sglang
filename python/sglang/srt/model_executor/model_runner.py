@@ -116,7 +116,7 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
-    capture_prefill_graph,
+    capture_prefill_graph_with_usage,
 )
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
@@ -1225,7 +1225,7 @@ class ModelRunner:
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        capture = capture_prefill_graph(
+        capture = capture_prefill_graph_with_usage(
             model_runner=self,
             eager_runner=self.eager_runner,
             force_for_draft_worker=force_for_draft_worker,

@@ -128,7 +128,7 @@ def capture_cuda_graphs(
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
-    prefill = capture_prefill_graph(
+    prefill = capture_prefill_graph_with_usage(
         model_runner=model_runner, eager_runner=eager_runner
     )
 
@@ -181,8 +181,22 @@ def capture_prefill_graph(
     model_runner: ModelRunner,
     eager_runner: EagerRunner,
     force_for_draft_worker: bool = False,
+) -> Optional[BaseRunner]:
+    """Initialize and return the prefill CUDA graph runner."""
+    return capture_prefill_graph_with_usage(
+        model_runner=model_runner,
+        eager_runner=eager_runner,
+        force_for_draft_worker=force_for_draft_worker,
+    ).runner
+
+
+def capture_prefill_graph_with_usage(
+    *,
+    model_runner: ModelRunner,
+    eager_runner: EagerRunner,
+    force_for_draft_worker: bool = False,
 ) -> GraphCapture:
-    """Initialize prefill CUDA graph runner."""
+    """Initialize a prefill graph and return its startup resource usage."""
 
     memory_phase = "draft_prefill" if model_runner.is_draft_worker else "prefill"
 

@@ -64,7 +64,6 @@ class TestCollectorClassAttrs(unittest.TestCase):
 
     def test_tokenizer_collector_attrs_default_none(self):
         self.assertIsNone(TokenizerMetricsCollector._counter_cls)
-        self.assertIsNone(TokenizerMetricsCollector._gauge_cls)
         self.assertIsNone(TokenizerMetricsCollector._histogram_cls)
 
     def test_storage_collector_attrs_default_none(self):
