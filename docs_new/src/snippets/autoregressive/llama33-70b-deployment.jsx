@@ -81,7 +81,6 @@ export const Llama33Deployment = () => {
     cmd += `  --model-path ${modelPath}`;
 
     if (isArcB) {
-        cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
         cmd += ' \\\n  --device xpu';
         cmd += ' \\\n  --tp 8';
     } else {

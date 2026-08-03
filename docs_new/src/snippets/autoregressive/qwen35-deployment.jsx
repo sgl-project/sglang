@@ -375,7 +375,6 @@ export const Qwen35Deployment = () => {
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (isArcB) {
-        cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
         cmd += ` \\\n  --device xpu`;
     }
     if ((!isArcB && tpValue > 1) || isArcB) {

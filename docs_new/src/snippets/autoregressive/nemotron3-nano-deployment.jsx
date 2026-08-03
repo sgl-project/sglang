@@ -79,7 +79,6 @@ export const Nemotron3NanoDeployment = () => {
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelName}`;
     if (isArcB) {
-      cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
       cmd += ' \\\n  --device xpu';
     }
     cmd += ` \\\n  --tp ${tp}`;

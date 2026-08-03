@@ -144,7 +144,6 @@ export const Gemma4Deployment = () => {
 
     let cmd = `sglang serve --model-path ${modelPath}`;
     if (hardware === 'Arc B') {
-      cmd = 'SGLANG_USE_SGL_XPU=1 ' + cmd;
       cmd += ` \\\n  --device xpu`;
     }
     if (tp > 1) {
