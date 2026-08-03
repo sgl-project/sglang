@@ -1702,9 +1702,8 @@ class DeepseekOCRForCausalLM(nn.Module):
                 .type(target_dtype)
                 .to(device=pixel_values.device)
             )
-            images_spatial_crop = (
-                item.images_spatial_crop.type(torch.long)
-                .to(device=pixel_values.device)
+            images_spatial_crop = item.images_spatial_crop.type(torch.long).to(
+                device=pixel_values.device
             )
             if images_spatial_crop.dim() == 2:
                 images_spatial_crop = images_spatial_crop.unsqueeze(0)

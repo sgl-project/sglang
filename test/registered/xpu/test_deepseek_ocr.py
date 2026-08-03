@@ -6,9 +6,13 @@ import json
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import requests
+import torch
 
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -107,6 +111,77 @@ class TestDeepSeekOCR(CustomTestCase):
 
     def test_moe(self):
         self.run_decode()
+
+
+@unittest.skipUnless(
+    hasattr(torch, "xpu") and torch.xpu.is_available(),
+    "requires an available XPU device",
+)
+class TestDeepSeekOCRProcessImageInputBatchedUnequalCrops(CustomTestCase):
+    """Regression: `_process_image_input` used to `torch.stack` `images_crop`
+    across `mm_items`, which crashed when two OCR requests in the same batch
+    had different `num_patches` (e.g. 6 vs 4). Guards against reintroducing
+    the stack. Runs on XPU to match the intended deployment target."""
+
+    def _make_item(self, num_patches, tiles_w, tiles_h):
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.feature = torch.zeros(3, 640, 640, dtype=torch.float32, device=self.device)
+        item.images_crop = torch.zeros(
+            1, num_patches, 3, 640, 640, dtype=torch.float32, device=self.device
+        )
+        item.images_spatial_crop = torch.tensor(
+            [[[tiles_w, tiles_h]]], dtype=torch.long, device=self.device
+        )
+        item.has_local_crops = True
+        return item
+
+    def test_batched_unequal_num_patches_no_crash(self):
+        self.device = torch.device("xpu")
+
+        items = [
+            self._make_item(num_patches=6, tiles_w=3, tiles_h=2),
+            self._make_item(num_patches=4, tiles_w=2, tiles_h=2),
+        ]
+
+        def fake_pixel_values_to_embedding(
+            pixel_values, images_crop, images_spatial_crop, has_local_crops
+        ):
+            self.assertEqual(pixel_values.shape[0], 1)
+            self.assertEqual(images_crop.dim(), 6)
+            self.assertEqual(images_spatial_crop.dim(), 3)
+            self.assertEqual(pixel_values.device.type, "xpu")
+            self.assertEqual(images_crop.device.type, "xpu")
+            self.assertEqual(images_spatial_crop.device.type, "xpu")
+            n_patches = images_crop.shape[2]
+            return [torch.zeros(n_patches, 8, dtype=torch.float32, device=self.device)]
+
+        instance = DeepseekOCRForCausalLM.__new__(DeepseekOCRForCausalLM)
+        instance.is_ocr2 = False
+
+        stub_param = torch.zeros(1, dtype=torch.float32, device=self.device)
+
+        class _Stub:
+            dtype = torch.float32
+
+            @staticmethod
+            def parameters():
+                return iter([stub_param])
+
+        instance.sam_model = _Stub()
+        instance.vision_model = _Stub()
+
+        with patch.object(
+            DeepseekOCRForCausalLM,
+            "_pixel_values_to_embedding",
+            side_effect=fake_pixel_values_to_embedding,
+            autospec=False,
+        ):
+            out = DeepseekOCRForCausalLM._process_image_input(instance, items)
+
+        # Feature sequences from both items must be concatenated in order.
+        # 6 rows for item A + 4 rows for item B = 10 rows.
+        self.assertEqual(out.shape, (10, 8))
+        self.assertEqual(out.device.type, "xpu")
 
 
 if __name__ == "__main__":
