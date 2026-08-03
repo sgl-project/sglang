@@ -53,16 +53,10 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.bcg import (
-    PrefillCPBCGInput,
-)
-from sglang.srt.layers.cp.bcg import (
-    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
-)
-from sglang.srt.layers.cp.bcg import (
-    execute_prefill_cp_bcg,
-    filter_prefill_cp_bcg_capture_num_tokens,
-)
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -460,10 +454,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
+        # bcg 与本模块互相引用:bcg 顶层要 runner.shape_key(触发包 __init__,
+        # 而 __init__ 顶层 import 本模块),本模块又要 bcg 的这两个名字。顶层互指
+        # 使先被导入的一方必炸;把 runner->bcg 这条边推迟到首次使用,环即断开。
+        from sglang.srt.layers.cp.bcg import (
+            PrefillCPBCGInput,
+        )
+        from sglang.srt.layers.cp.bcg import (
+            enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+        )
+
         self.enable_cp_v2_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
         ) and should_enable_cp_v2_bcg_capture(server_args)
         if self.enable_cp_v2_bcg_capture:
+            from sglang.srt.layers.cp.bcg import (
+                filter_prefill_cp_bcg_capture_num_tokens,
+            )
+
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -1709,6 +1717,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
             if self.enable_cp_v2_bcg_capture:
+                from sglang.srt.layers.cp.bcg import execute_prefill_cp_bcg
+
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
