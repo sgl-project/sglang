@@ -375,8 +375,7 @@ class WeightCacheDaemon:
 
         # Log approximate serialized metadata size (not payload-backed bytes)
         total_bytes = sum(
-            len(str(entry).encode("utf-8"))
-            for entry in self.state_entries.values()
+            len(str(entry).encode("utf-8")) for entry in self.state_entries.values()
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
