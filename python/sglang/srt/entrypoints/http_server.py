@@ -2251,10 +2251,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            # TODO: @rainj-me fix this when Rust server supports disaggregation
-            assert (
-                not envs.SGLANG_RUST_SERVER.get()
-            ), "Rust server is not supported for disaggregation warmup for now"
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
@@ -2272,14 +2268,20 @@ def _execute_server_warmup(server_args: ServerArgs):
                     server_args.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
-                _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
                     "Disaggregation warmup failed (mode=%s), status codes: %s",
                     server_args.disaggregation_mode,
                     failed_status_codes,
                 )
-                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            # In rust-server mode there is no TokenizerManager (readiness is
+            # the Rust server's own /health), so skip the status update.
+            if not envs.SGLANG_RUST_SERVER.get():
+                _global_state.tokenizer_manager.server_status = (
+                    ServerStatus.Up
+                    if not failed_status_codes
+                    else ServerStatus.UnHealthy
+                )
 
     except Exception:
         last_traceback = get_exception_traceback()
