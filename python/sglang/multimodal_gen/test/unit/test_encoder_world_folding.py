@@ -1,14 +1,9 @@
-"""Unit test for the encoder parallel-folding decision (two stages).
+"""Unit test for the encoder_parallel decision.
 
-Stage 1 - ServerArgs.adjust_pipeline_config proposes a fold group from the
-parallelism alone (mode = "world"/"sp"/None), the same for every encoder.
-
-Stage 2 - encoder_folding_worthwhile (applied by the loader once real dims are
-known) keeps the fold only for encoders wide enough to benefit and whose heads
-and MLP divide the group. Being size-based (not per-architecture) it handles the
-same encoder family at different parameter counts.
-
-Pure logic, no GPU / distributed init.
+adjust_pipeline_config proposes a fold group from the parallelism alone;
+finalize_encoder_folding resolves fold-vs-replicate per policy on real dims;
+encoder_dp_worthwhile gates the runtime batch data-parallel. Pure logic, no
+GPU / distributed init (the fold group is monkeypatched).
 """
 
 from types import SimpleNamespace
@@ -19,20 +14,39 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.runtime.models.encoders import base as _base_mod
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     FOLD_MIN_HIDDEN_SIZE,
+    _encoder_dims_divide,
+    encoder_dp_worthwhile,
     encoder_folding_worthwhile,
+    finalize_encoder_folding,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
+def _run(
+    encoders,
+    tp,
+    sp,
+    cfg,
+    dp=1,
+    disagg=False,
+    num_gpus=None,
+    image=(),
+    policy="auto",
+    batching_max_size=1,
+    explicit=(),
+):
     self = SimpleNamespace(
         tp_size=tp,
         sp_degree=sp,
         cfg_parallel_degree=cfg,
         dp_size=dp,
         disagg_mode=disagg,
+        encoder_parallel=policy,
+        batching_max_size=batching_max_size,
+        is_arg_explicitly_set=lambda name: name in explicit,
         num_gpus=num_gpus if num_gpus is not None else tp * sp * cfg * dp,
         pipeline_config=SimpleNamespace(
             text_encoder_configs=tuple(encoders),
@@ -40,12 +54,13 @@ def _run(encoders, tp, sp, cfg, dp=1, disagg=False, num_gpus=None, image=()):
         ),
     )
     ServerArgs.adjust_pipeline_config(self)
+    return self
 
 
-def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None):
+def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"):
     enc = T5Config()
     enc.parallel_folding_mode = None
-    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_gpus=num_gpus)
+    _run([enc], tp, sp, cfg, dp=dp, disagg=disagg, num_gpus=num_gpus, policy=policy)
     return enc.parallel_folding_mode
 
 
@@ -106,6 +121,26 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
+def test_adjust_proposes_regardless_of_policy():
+    # adjust reads the parallelism only; finalize owns the policy decision.
+    for policy in ("auto", "fold", "dp", "replicate"):
+        assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
+
+
+def test_no_policy_touches_batching_max_size():
+    # An encoder flag must not switch DiT batching on: that changes the denoise
+    # batch shape, and with it the output, for every serve deployment. dp simply
+    # stays inactive until the operator raises the ceiling themselves.
+    for policy in ("auto", "fold", "dp", "replicate"):
+        sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy=policy)
+        assert sa.batching_max_size == 1, policy
+
+
+def test_explicit_batching_max_size_is_preserved():
+    sa = _run([T5Config()], tp=1, sp=2, cfg=1, policy="dp", batching_max_size=8)
+    assert sa.batching_max_size == 8
+
+
 # --- stage 2: size + divisibility gate (loader, on real dims) ----------------
 
 
@@ -154,6 +189,91 @@ def test_threshold_is_the_boundary():
         encoder_folding_worthwhile(_enc(FOLD_MIN_HIDDEN_SIZE - 128, 8, 8192), 2)
         is False
     )
+
+
+def test_dims_divide():
+    # divisibility only (size-agnostic): the hard constraint to shard at all.
+    assert _encoder_dims_divide(_enc(2560, 32, 9728), 2) is True
+    assert _encoder_dims_divide(_enc(4096, 6, 10240), 4) is False  # heads
+    assert _encoder_dims_divide(_enc(4096, 64, 10250), 4) is False  # intermediate
+    assert _encoder_dims_divide(_enc(4096, 64, 10240), 1) is False  # group of 1
+
+
+def test_dp_worthwhile():
+    # dp pays above the latency-bound width, with a batch, on a measured topology
+    wide = _enc(4096, 64, 10240)
+    assert encoder_dp_worthwhile(wide, 2, True) is True
+    assert encoder_dp_worthwhile(_enc(2560, 32, 9728), 4, True) is True
+    assert encoder_dp_worthwhile(_enc(768, 12, 3072), 8, True) is False  # CLIP-L
+    assert encoder_dp_worthwhile(wide, 1, True) is False  # unbatched
+    assert encoder_dp_worthwhile(wide, 4, False) is False  # no peer-to-peer
+    assert encoder_dp_worthwhile(TextEncoderConfig(), 4, True) is False
+
+
+# --- stage 3: finalize dispatches on the encoder_parallel policy --------------
+
+
+def _finalize(
+    monkeypatch,
+    hidden,
+    heads,
+    inter,
+    policy,
+    mode="world",
+    group_size=2,
+    prefer_dp=False,
+    measured=True,
+):
+    monkeypatch.setattr(
+        _base_mod,
+        "get_folding_tp_group",
+        lambda config: SimpleNamespace(world_size=group_size),
+    )
+    monkeypatch.setattr(
+        _base_mod, "group_has_measured_topology", lambda group: measured
+    )
+    enc = _enc(hidden, heads, inter)
+    enc.parallel_folding_mode = mode
+    finalize_encoder_folding(enc, policy, prefer_dp=prefer_dp)
+    return enc.parallel_folding_mode
+
+
+def test_finalize_dp_replicate_never_fold(monkeypatch):
+    # policy alone clears the proposed fold, even for a huge encoder.
+    assert _finalize(monkeypatch, 5120, 32, 32768, "dp") is None
+    assert _finalize(monkeypatch, 5120, 32, 32768, "replicate") is None
+
+
+def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
+    assert _finalize(monkeypatch, 2560, 32, 9728, "auto") is None  # below threshold
+
+
+def test_finalize_auto_leaves_dp_capable_unsharded_when_dp_preferred(monkeypatch):
+    # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", prefer_dp=True) is None
+    # TP or DiT-DP makes encoder DP ineligible, so keep the useful fold
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
+    # CLIP-L cannot dp either, so folding remains the only question
+    assert _finalize(monkeypatch, 768, 12, 3072, "auto", prefer_dp=True) is None
+
+
+def test_finalize_auto_needs_a_measured_topology(monkeypatch):
+    assert _finalize(monkeypatch, 4096, 64, 10240, "auto", measured=False) is None
+    # explicit fold is the operator's call, topology included
+    assert _finalize(monkeypatch, 4096, 64, 10240, "fold", measured=False) == "world"
+
+
+def test_finalize_fold_ignores_size_but_needs_divisible(monkeypatch):
+    # "fold" folds a narrow encoder that "auto" would reject...
+    assert _finalize(monkeypatch, 2560, 32, 9728, "fold") == "world"
+    # ...but it still must divide the group.
+    assert _finalize(monkeypatch, 2560, 6, 9728, "fold", group_size=4) is None
+
+
+def test_finalize_mode_none_is_noop(monkeypatch):
+    # nothing proposed -> stays replicated regardless of policy.
+    assert _finalize(monkeypatch, 5120, 32, 32768, "auto", mode=None) is None
 
 
 # --- config defaults ---------------------------------------------------------

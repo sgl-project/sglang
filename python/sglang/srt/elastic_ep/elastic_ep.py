@@ -11,6 +11,7 @@ from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
@@ -308,13 +309,10 @@ def elastic_expanded_world_enabled() -> bool:
 
     Launch-time TP groups exclude ranks admitted during scale-up.
     """
-    from sglang.srt.runtime_context import get_server_args
-
     inst = ElasticEPStateManager.instance()
     if inst is None:
         return False
-    sa = get_server_args()
-    if sa.max_ep_size is None:
+    if get_parallel().max_ep_size is None:
         return False
     active_target_size = inst.effective_ep_size
     if inst.pending_ep_size is not None and inst.scale_phase in (

@@ -2,7 +2,7 @@ import dataclasses
 import glob
 import os
 import re
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import nullcontext
 from typing import cast
 
@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
     finalize_encoder_folding,
     get_folding_tp_group,
 )
@@ -184,6 +185,7 @@ class TextEncoderLoader(ComponentLoader):
         model_name_or_path: str,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -216,7 +218,10 @@ class TextEncoderLoader(ComponentLoader):
 
         if use_safetensors:
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                key_filter=key_filter,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -237,20 +242,39 @@ class TextEncoderLoader(ComponentLoader):
         self,
         source: "Source",
         to_cpu: bool,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
+        source_key_filter: Callable[[str], bool] | None
+        if key_filter is None:
+            source_key_filter = None
+        else:
+
+            def include_source_weight(name: str) -> bool:
+                return key_filter(source.prefix + name)
+
+            source_key_filter = include_source_weight
+
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            key_filter=source_key_filter,
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 to_cpu=to_cpu,
+                key_filter=source_key_filter,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
+            if source_key_filter is not None:
+                weights_iterator = (
+                    (name, tensor)
+                    for name, tensor in weights_iterator
+                    if source_key_filter(name)
+                )
 
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -261,6 +285,10 @@ class TextEncoderLoader(ComponentLoader):
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        key_filter = cast(
+            Callable[[str], bool] | None,
+            getattr(model, "should_materialize_checkpoint_weight", None),
+        )
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
@@ -270,6 +298,7 @@ class TextEncoderLoader(ComponentLoader):
         yield from self._get_weights_iterator(
             primary_weights,
             to_cpu,
+            key_filter,
         )
 
         secondary_weights = cast(
@@ -280,6 +309,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(
                 source,
                 to_cpu,
+                key_filter,
             )
 
     def load_customized(
@@ -314,9 +344,21 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
-        # Real dims are populated now; keep the proposed fold group only if this
-        # encoder is actually wide enough to benefit at its real size.
-        finalize_encoder_folding(encoder_config)
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            getattr(encoder_config, "architectures", [])
+        )
+        # real dims are populated now; resolve fold vs replicate
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            prefer_dp=(
+                server_args.batching_max_size > 1
+                and (server_args.tp_size or 1) == 1
+                and (server_args.dp_size or 1) == 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            ),
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]

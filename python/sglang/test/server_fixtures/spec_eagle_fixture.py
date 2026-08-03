@@ -17,7 +17,6 @@ import time
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -28,6 +27,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # Chat-style prompts shared by send_request / send_requests_abort.
@@ -146,7 +146,7 @@ class SpecEagleServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     @property
     def tokenizer(self):
