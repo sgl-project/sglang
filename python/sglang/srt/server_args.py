@@ -6591,14 +6591,6 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
-    def _supports_flashinfer_a2a_parallelism(self) -> bool:
-        from sglang.srt.arg_groups.overrides import resolved_view
-
-        resolved = resolved_view(self)
-        return (resolved.enable_dp_attention and self.dp_size == self.tp_size) or (
-            self.enable_prefill_cp and resolved.attn_cp_size == self.tp_size
-        )
-
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -6679,8 +6671,8 @@ class ServerArgs:
             )
         if self.moe_a2a_backend == "flashinfer":
             assert (
-                self._supports_flashinfer_a2a_parallelism()
-            ), "Flashinfer MoE A2A is only supported with either dp_size == tp_size and --enable-dp-attention, or full prefill context parallelism with attn_cp_size == tp_size"
+                resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
+            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

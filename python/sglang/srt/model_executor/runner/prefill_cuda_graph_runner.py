@@ -55,14 +55,13 @@ from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
-    execute_prefill_cp_bcg,
-    filter_prefill_cp_bcg_capture_num_tokens,
 )
-from sglang.srt.layers.cp.utils import (
+from sglang.srt.layers.cp.bcg import (
     enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
 )
-from sglang.srt.layers.cp.utils import (
-    is_cp_v2_active,
+from sglang.srt.layers.cp.bcg import (
+    execute_prefill_cp_bcg,
+    filter_prefill_cp_bcg_capture_num_tokens,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1091,9 +1090,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self.enable_cp_v2_bcg_capture and not is_cp_v2_active(forward_batch):
-            return False
-
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
