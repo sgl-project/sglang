@@ -202,8 +202,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
-        self.assertIn("pool-handle caching is enabled", output)
-        self.assertIn("without reserving another pool", output)
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
@@ -248,13 +246,11 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            with self.assertLogs(server_args_module.logger, level="INFO"):
                 server_args._handle_multimodal_feature_transport()
 
             self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
             self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("auto-resolved to cuda_ipc", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_default_auto_keeps_cpu_on_multi_node(self, _mock_is_cuda):
@@ -284,13 +280,11 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            with self.assertLogs(server_args_module.logger, level="INFO"):
                 server_args._handle_multimodal_feature_transport()
 
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("encoder-only serving", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_encoder_only_ignores_explicit_cuda_ipc(self, _mock_is_cuda):

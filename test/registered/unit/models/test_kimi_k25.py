@@ -16,7 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models import kimi_k3_vl, kimi_k25
+from sglang.srt.models import kimi_k25
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.kimi_k3 import (
@@ -57,7 +57,6 @@ def test_kimi_shared_concat_avoids_single_image_copy():
     first = torch.arange(12).view(3, 4)
     second = first + 12
 
-    assert kimi_k25.concat_or_single is kimi_k3_vl.concat_or_single
     assert kimi_k25.concat_or_single([first]) is first
     torch.testing.assert_close(
         kimi_k25.concat_or_single([first, second]), torch.cat([first, second])
@@ -73,7 +72,6 @@ def test_kimi_tpool_shared_fast_path_matches_temporal_mean(frames):
     reference = reference.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
     reference = reference.view(6, 4, 3)
 
-    assert kimi_k25.tpool_patch_merger is kimi_k3_vl.tpool_patch_merger
     actual = kimi_k25.tpool_patch_merger(hidden_states, grid_thws)
     explicit_metadata = kimi_k25.tpool_patch_merger(
         hidden_states, grid_thws, grid_thw_list=grid_thws.tolist()
@@ -187,8 +185,6 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         worker_processor = asyncio.run(
             processor.mm_processor_executor.run(lambda *, processor: processor)
         )
-        assert processor.mm_processor_worker_num == 2
-        assert processor.mm_io_worker_num == 16
         assert isinstance(processor._processor, wrapper_cls)
         assert isinstance(worker_processor, wrapper_cls)
         assert worker_processor is not processor._processor

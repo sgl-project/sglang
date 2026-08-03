@@ -1,11 +1,10 @@
-"""Unit tests for the MNNVL auto-inference gates.
+"""Unit tests for the MNNVL auto-inference gate.
 
 The TP8 best-throughput launch used to require exporting
-``SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1`` and
-``SGLANG_K3_AR_FUSION=1`` by hand. Both are now capability-inferred; these
-cases pin the negative-branch contracts so a refactor cannot silently turn
-either predicate into always-true (engaging fabric paths on non-fabric
-clusters) or drop the explicit-off override.
+``SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1`` by hand. It is now
+capability-inferred; these cases pin the negative-branch contracts so a
+refactor cannot silently turn the predicate into always-true (engaging fabric
+paths on non-fabric clusters) or drop the explicit-off override.
 """
 
 import unittest
@@ -84,62 +83,6 @@ class TestCaV2MultinodeAuto(CustomTestCase):
         ), patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True):
             _HANDLE(SimpleNamespace(nnodes=2, tp_size=16))
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set())
-
-
-class TestK3ArFusionGate(CustomTestCase):
-    def _reset(self):
-        import sglang.srt.layers.k3_ar_fusion as mod
-
-        mod._STATE = None
-        mod._INITIALIZED = False
-        return mod
-
-    def test_explicit_off_wins(self):
-        """SGLANG_K3_AR_FUSION=0 disables the fusion before any capability
-        probe (no distributed state is touched)."""
-        mod = self._reset()
-        with envs.SGLANG_K3_AR_FUSION.override("0"):
-            self.assertFalse(mod.enabled())
-
-    def test_auto_requires_sm100(self):
-        """Unset env auto-probes only on SM100/SM103; other arches stay on
-        the regular all-reduce path."""
-        mod = self._reset()
-        with _cleared(envs.SGLANG_K3_AR_FUSION), patch(
-            "sglang.srt.utils.common.get_device_sm", return_value=90
-        ):
-            self.assertFalse(mod.enabled())
-
-    def test_auto_skips_symm_mem(self):
-        """Bug regression: the auto-probe engaged the fusion under
-        --enable-symm-mem, where the pynccl allocator context misroutes
-        the o_proj/MoE outputs away from the k3 symm pool and the pull path's
-        symm-pool assertion kills the server at graph-capture warmup (hit on
-        both plain TP8 and DCP8 launches). Unset env + symm-mem must stay on
-        the regular all-reduce path regardless of dcp_size (explicit
-        SGLANG_K3_AR_FUSION=1 still force-attempts). DCP without symm-mem is
-        inside the validated envelope and is NOT gated off (DCP8 GB300:
-        GSM8K in-band, bs=1 +19%)."""
-        for symm, dcp, a2a in (
-            (True, 1, "none"),
-            (True, 8, "none"),
-            # Bug regression (EP): under EP a2a (megamoe/deepep) the model's
-            # symm-pool allocation contract does not hold on every AR
-            # call-site -> the same _find_mc_ptr assertion killed an EP8
-            # megamoe launch at warmup on head 480fe4e76.
-            (False, 1, "megamoe"),
-            (False, 1, "deepep"),
-        ):
-            mod = self._reset()
-            with _cleared(envs.SGLANG_K3_AR_FUSION), patch(
-                "sglang.srt.utils.common.get_device_sm", return_value=103
-            ), patch(
-                "sglang.srt.runtime_context.get_server_args",
-                return_value=SimpleNamespace(
-                    enable_symm_mem=symm, dcp_size=dcp, moe_a2a_backend=a2a
-                ),
-            ):
-                self.assertFalse(mod.enabled(), f"symm={symm} dcp={dcp} a2a={a2a}")
 
 
 if __name__ == "__main__":
