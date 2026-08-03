@@ -184,9 +184,9 @@ configure_rust_build_store() {
     # package. Preserve reusable compiler output outside the checkout because
     # the checkout is scrubbed between CI jobs.
     #
-    # Each slot represents a compatible compiler, interpreter, architecture,
-    # and dependency graph. Cargo remains responsible for detecting ordinary
-    # source changes inside a slot.
+    # Each slot represents an exact set of local Rust/proto contents together
+    # with a compatible compiler, interpreter, and architecture. Checkouts that
+    # differ only in file timestamps can safely select the same slot.
     local source_identity interpreter_signature compiler_signature slot_id
     source_identity=$(
         python3 "${SCRIPT_DIR}/rust_build_inputs.py" --repo-root "${REPO_ROOT}"

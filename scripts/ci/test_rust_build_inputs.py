@@ -50,3 +50,23 @@ def test_digest_includes_generated_code_inputs(tmp_path: Path) -> None:
         'syntax = "proto3"; message Changed {}\n'
     )
     assert compute_build_input_digest(checkout) != before
+
+
+def test_digest_framing_cannot_be_injected_through_file_content(
+    tmp_path: Path,
+) -> None:
+    checkout_a = tmp_path / "checkout-a"
+    checkout_b = tmp_path / "checkout-b"
+    for checkout in (checkout_a, checkout_b):
+        (checkout / "rust").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+
+    (checkout_a / "rust/a").write_bytes(b"X\0rust/b\0file\0Y")
+    (checkout_b / "rust/a").write_bytes(b"X")
+    (checkout_b / "rust/b").write_bytes(b"Y")
+    subprocess.run(["git", "-C", str(checkout_a), "add", "rust"], check=True)
+    subprocess.run(["git", "-C", str(checkout_b), "add", "rust"], check=True)
+
+    assert compute_build_input_digest(checkout_a) != compute_build_input_digest(
+        checkout_b
+    )
