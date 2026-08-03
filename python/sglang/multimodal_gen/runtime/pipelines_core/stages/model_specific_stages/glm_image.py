@@ -488,8 +488,7 @@ class GlmImageAR(PipelineStage):
             len(batches) > 1
             and server_args.srt_encoder_url is not None
             and all(
-                isinstance(batch.prompt, str)
-                and batch.image_path is None
+                isinstance(batch.prompt, str) and batch.image_path is None
                 for batch in batches
             )
         )
