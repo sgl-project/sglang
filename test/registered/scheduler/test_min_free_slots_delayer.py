@@ -35,7 +35,7 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         # max_running_requests < 8 disables, matching DFlash.
         self.assertIsNone(resolve_min_free_slots(4, 7))
 
-    def test_explicit_value_overrides_dflash_formula(self):
+    def test_non_dflash_uses_explicit_value(self):
         self.assertEqual(resolve_min_free_slots(8, 512), 8)
         self.assertEqual(resolve_min_free_slots(16, 512), 16)
 
@@ -47,9 +47,9 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertEqual(resolve_min_free_slots(3, 512), 3)
         self.assertEqual(resolve_min_free_slots(2, 8), 2)
 
-    def test_user_value_overrides_dflash_default(self):
-        # An explicit user value wins over the DFlash auto-default.
-        self.assertEqual(resolve_min_free_slots(3, 512, is_dflash_family=True), 3)
+    def test_dflash_formula_takes_precedence_over_user_value(self):
+        self.assertEqual(resolve_min_free_slots(16, 512, is_dflash_family=True), 4)
+        self.assertEqual(resolve_min_free_slots(16, 8, is_dflash_family=True), 2)
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):

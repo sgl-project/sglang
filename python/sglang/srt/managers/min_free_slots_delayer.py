@@ -8,17 +8,16 @@ def resolve_min_free_slots(
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
-    An explicit user value (>1) overrides the DFlash formula. When unset,
-    DFlash workloads fall back to the formula (preserving the always-on
-    behavior); other workloads stay disabled. Also disabled when
-    max_running_requests < 8.
+    DFlash workloads use the legacy formula (preserving the always-on
+    behavior). Other workloads use an explicit user value when provided.
+    Also disabled when max_running_requests < 8.
     """
     max_running_requests = max(0, int(max_running_requests))
     formula = min(4, max(2, (max_running_requests + 5) // 6))
-    if user_value is not None:
-        min_free_slots = min(user_value, max_running_requests)
-    elif is_dflash_family:
+    if is_dflash_family:
         min_free_slots = formula
+    elif user_value is not None:
+        min_free_slots = min(user_value, max_running_requests)
     else:
         min_free_slots = None
 
