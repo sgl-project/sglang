@@ -20,17 +20,12 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 
 class DsparkDraftSampler:
-    """Graph-folded draft proposal head (base logits + markov chain sampling).
+    """Graph-folded draft proposal head, captured as a draft-graph tail hook.
 
-    Captured as a draft-graph tail hook. With folded_sampling it handles
-    greedy and sampling rows in one pass: the per-step fused kernel
-    (SampleStepTokens) argmaxes greedy rows and Gumbel-samples the rest with
-    in-graph philox noise (CUDAGraph advances the generator per replay).
-    Per-step sampling params live in static buffers refreshed by
-    stage_sampling_params before each replay; corrected block logits are
-    exported for the sampling accept path. Without folded_sampling the hook
-    argmaxes every row and allocates none of those buffers; sampling batches
-    then take the eager proposal path.
+    With folded_sampling, greedy rows argmax and sampling rows Gumbel-sample
+    in one in-graph pass (params staged into static buffers before each
+    replay; corrected block logits exported for the sampling accept path).
+    Without it, every row argmaxes and sampling batches propose eagerly.
     """
 
     def __init__(
@@ -141,14 +136,8 @@ class DsparkDraftSampler:
 
 
 def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
-    """Decide whether the folded sampler allocates its sampling buffers.
-
-    The exp-noise and corrected-logits buffers are captured into the draft
-    graph, so they must exist before capture and stay resident. AUTO takes
-    them only when they fit in the free memory left after target init,
-    keeping the same 1 GB floor the draft-graph capture requires (local
-    probe, mirroring init_cuda_graphs).
-    """
+    """The sampling buffers are baked into the captured draft graph, so AUTO
+    must decide before capture from a free-memory probe."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
     if mode == DsparkFoldedSampling.OFF:
         return False

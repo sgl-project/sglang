@@ -227,14 +227,9 @@ class InvariantCheckLevel(IntEnum):
 
 
 class DsparkFoldedSampling(IntEnum):
-    """Whether the graph-folded DSpark draft sampler supports sampling rows.
-
-    OFF: greedy-only folding; sampling batches take the eager proposal path.
-    AUTO: enable sampling support when the static noise/logits buffers fit in
-    the free GPU memory left after target init (leaving the same 1 GB floor
-    the draft-graph capture requires); otherwise fall back to greedy-only.
-    FORCE: always allocate the sampling buffers.
-    """
+    """Sampling support in the graph-folded DSpark draft proposal: OFF =
+    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
+    FORCE = always."""
 
     OFF = 0
     AUTO = 1
