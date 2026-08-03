@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_frame_indices,
     _minwm_layer_norm,
     _minwm_packed_attention_backend,
+    _minwm_project_output_in_reference_row_bucket,
     _minwm_qk_norm_op,
     _minwm_qk_norm_rope_op,
     _minwm_uniform_cu_seqlens,
@@ -1416,6 +1417,48 @@ def test_minwm_sequence_shard_rope_uses_flattened_token_positions():
     )
     torch.testing.assert_close(cos, expected_positions.float(), rtol=0, atol=0)
     torch.testing.assert_close(sin, -expected_positions.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", range(3))
+def test_minwm_output_projection_restores_reference_row_bucket(rank):
+    class CaptureProjection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input = None
+
+        def forward(self, value):
+            self.input = value
+            return value * 2
+
+    seq_splits = (3, 2, 2)
+    projection = CaptureProjection()
+    hidden_states = torch.arange(
+        seq_splits[rank] * 2,
+        dtype=torch.float32,
+    ).reshape(1, seq_splits[rank], 2)
+
+    output = _minwm_project_output_in_reference_row_bucket(
+        projection,
+        hidden_states,
+        seq_splits,
+        rank,
+    )
+
+    row_start = sum(seq_splits[:rank])
+    expected_input = torch.zeros(1, sum(seq_splits), 2)
+    expected_input[:, row_start : row_start + seq_splits[rank]] = hidden_states
+    torch.testing.assert_close(projection.input, expected_input, rtol=0, atol=0)
+    torch.testing.assert_close(output, hidden_states * 2, rtol=0, atol=0)
+
+
+def test_minwm_output_projection_rejects_mismatched_shard():
+    with pytest.raises(ValueError, match="does not match split"):
+        _minwm_project_output_in_reference_row_bucket(
+            torch.nn.Identity(),
+            torch.zeros(1, 2, 4),
+            (3, 2),
+            0,
+        )
 
 
 def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):

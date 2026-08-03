@@ -1245,7 +1245,13 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 cache_start=cache_start,
             )
 
-        hidden_states = self._apply_output_head(hidden_states, temb, timestep)
+        hidden_states = self._apply_output_head(
+            hidden_states,
+            temb,
+            timestep,
+            sequence_shard_splits=seq_splits,
+            sequence_shard_rank=sp_rank,
+        )
         hidden_states = gather_sequence_varlen(
             hidden_states,
             seq_splits,
@@ -1307,7 +1313,9 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 )
             dump(block_name, output)
 
-        for block_index, block in enumerate(self.blocks):
+        dump_all_blocks = os.environ.get("MINWM_PARITY_DUMP_ALL_BLOCKS", "0") == "1"
+        debug_blocks = self.blocks if dump_all_blocks else self.blocks[:1]
+        for block_index, block in enumerate(debug_blocks):
             block_name = f"block{block_index}"
             counters[block_name] = 0
             block.register_forward_hook(
@@ -1408,6 +1416,9 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         hidden_states: torch.Tensor,
         temb: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        sequence_shard_splits: list[int] | tuple[int, ...] | None = None,
+        sequence_shard_rank: int = 0,
     ) -> torch.Tensor:
         num_frames = timestep.shape[1]
         temb = temb.unflatten(dim=0, sizes=timestep.shape).to(hidden_states.dtype)
@@ -1422,7 +1433,55 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             timestep_value,
             self.norm_out.norm.eps,
         )
+        if (
+            sequence_shard_splits is not None
+            and len(sequence_shard_splits) == 8
+            and normalized.is_cuda
+            and normalized.dtype == torch.bfloat16
+            and torch.cuda.get_device_capability(normalized.device)[0] == 9
+        ):
+            return _minwm_project_output_in_reference_row_bucket(
+                self.proj_out,
+                normalized,
+                sequence_shard_splits,
+                sequence_shard_rank,
+            )
         return self.proj_out(normalized)
+
+
+def _minwm_project_output_in_reference_row_bucket(
+    projection: nn.Module,
+    hidden_states: torch.Tensor,
+    sequence_shard_splits: list[int] | tuple[int, ...],
+    sequence_shard_rank: int,
+) -> torch.Tensor:
+    """Run Hopper SP8 output projection with the reference SP1 row layout.
+
+    Hopper can select a different BF16 GEMM reduction for the short SP8 row
+    bucket. Padding each local shard back to its exact global row positions
+    keeps the projection bitwise aligned with SP1; the extra output-head work
+    is negligible relative to the transformer blocks.
+    """
+    if not 0 <= sequence_shard_rank < len(sequence_shard_splits):
+        raise ValueError(
+            f"sequence shard rank {sequence_shard_rank} is outside "
+            f"{len(sequence_shard_splits)} splits"
+        )
+    local_seq_len = sequence_shard_splits[sequence_shard_rank]
+    if hidden_states.shape[1] != local_seq_len:
+        raise ValueError(
+            f"local output-head sequence length {hidden_states.shape[1]} "
+            f"does not match split {local_seq_len}"
+        )
+    row_start = sum(sequence_shard_splits[:sequence_shard_rank])
+    row_end = row_start + local_seq_len
+    global_seq_len = sum(sequence_shard_splits)
+    padded = F.pad(
+        hidden_states,
+        (0, 0, row_start, global_seq_len - row_end),
+    )
+    projected = projection(padded)
+    return projected.narrow(1, row_start, local_seq_len)
 
 
 EntryClass = MinWMCausalTransformer3DModel
