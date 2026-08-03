@@ -17,6 +17,7 @@ from sglang.srt.sampling.sampling_params import (
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
+    raise_if_tokenizer_required,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -384,6 +385,62 @@ class TestSamplingParamsNormalize(CustomTestCase):
         tokenizer = self._mock_tokenizer()
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_max_len, 3)
+
+
+class TestRaiseIfTokenizerRequired(CustomTestCase):
+
+    def test_tokenizer_allows_tokenizer_dependent_features(self):
+        tokenizer = MagicMock()
+
+        raise_if_tokenizer_required(
+            tokenizer,
+            stop_strs=["done"],
+            stop_regex_strs=[r"end\d+"],
+            min_new_tokens=1,
+        )
+
+    def test_unused_features_do_not_require_tokenizer(self):
+        for stop_strs, stop_regex_strs in ((None, None), ([], [])):
+            with self.subTest(stop_strs=stop_strs, stop_regex_strs=stop_regex_strs):
+                raise_if_tokenizer_required(
+                    None,
+                    stop_strs=stop_strs,
+                    stop_regex_strs=stop_regex_strs,
+                    min_new_tokens=0,
+                )
+
+    def test_stop_strs_require_tokenizer(self):
+        with self.assertRaisesRegex(
+            ValueError, r"stop=\['done'\].*skip_tokenizer_init=True"
+        ):
+            raise_if_tokenizer_required(
+                None,
+                stop_strs=["done"],
+                stop_regex_strs=[],
+                min_new_tokens=0,
+            )
+
+    def test_stop_regex_strs_require_tokenizer(self):
+        with self.assertRaisesRegex(
+            ValueError, r"stop_regex=\['end\\\\d\+'\].*skip_tokenizer_init=True"
+        ):
+            raise_if_tokenizer_required(
+                None,
+                stop_strs=[],
+                stop_regex_strs=[r"end\d+"],
+                min_new_tokens=0,
+            )
+
+    def test_positive_min_new_tokens_requires_tokenizer(self):
+        with self.assertRaisesRegex(
+            ValueError, r"min_new_tokens=1.*skip_tokenizer_init=True"
+        ):
+            raise_if_tokenizer_required(
+                None,
+                stop_strs=[],
+                stop_regex_strs=[],
+                min_new_tokens=1,
+            )
 
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
