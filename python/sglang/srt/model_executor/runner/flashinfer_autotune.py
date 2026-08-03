@@ -30,6 +30,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+
+
+def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
+    skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
+    skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
+    return skip_ops
+
 
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
@@ -41,18 +50,23 @@ def should_run_flashinfer_autotune(
     if mr.server_args.disable_flashinfer_autotune:
         return False
 
-    # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
-    # be autotuned -- its _dummy_run would dispatch more tokens per rank than
-    # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
-    # Read server_args directly to avoid depending on initialize_moe_config()
-    # having already populated the MoE backend globals.
-    if (
-        mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
-        and mr.server_args.moe_a2a_backend == "deepep"
-    ):
-        return False
+    server_args = mr.server_args
+    if for_speculative_draft:
+        backend_str = (
+            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+        )
+        a2a_backend_str = (
+            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+        )
+    else:
+        backend_str = server_args.moe_runner_backend
+        a2a_backend_str = server_args.moe_a2a_backend
 
-    backend_str = mr.server_args.moe_runner_backend
+    # Autotune can run before the MoE backend globals are initialized, so read
+    # the target or draft backend from server_args. CuteDSL v1 bypasses
+    # MoeRunner, and its dummy dispatch can exceed DeepEP low-latency's token limit.
+    if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
+        return False
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
@@ -124,6 +138,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # A different skip policy must not reuse previously tuned tactics.
+    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
@@ -172,11 +189,11 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
             maybe_skip_logits = autotune_dummy_run_mode()
+        skip_ops = get_flashinfer_autotune_skip_ops(mr)
         with torch.inference_mode(), autotune(
-            # Autotuning mxfp8_gemm hits an IMA; skip it.
             True,
             cache=str(autotune_cache),
-            skip_ops={"mxfp8_gemm"},
+            skip_ops=skip_ops,
         ), maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)

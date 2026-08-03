@@ -423,7 +423,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            vocab_mask = None
+            grammar_mask = None
             if batch.has_grammar:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
@@ -431,9 +431,8 @@ class NGRAMWorker(BaseSpecWorker):
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                vocab_mask = build_grammar_vocab_mask(
+                grammar_mask = build_grammar_vocab_mask(
                     reqs=batch.reqs,
-                    verify_input=verify_input,
                     tree=GrammarTree.from_host(
                         retrieve_next_token_cpu,
                         retrieve_next_sibling_cpu,
@@ -441,6 +440,8 @@ class NGRAMWorker(BaseSpecWorker):
                     ),
                     sampling_info=batch.sampling_info,
                     device=verify_input.retrieve_next_token.device,
+                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
+                    barrier=None,
                 )
 
             # Sample
@@ -454,7 +455,7 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,

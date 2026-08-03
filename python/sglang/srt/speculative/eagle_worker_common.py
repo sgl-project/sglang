@@ -191,10 +191,10 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_cuda_graph:
+    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
@@ -204,7 +204,7 @@ def prepare_for_draft_extend(
         # On NPU with --disable-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
-        if not is_npu() or can_cuda_graph:
+        if not is_npu() or can_run_decode_cuda_graph:
             forward_batch.mark_forward_metadata_ready()
     return forward_batch
 
@@ -307,10 +307,10 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph
 
 
 def build_eagle_verify_input(
@@ -342,22 +342,26 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Build tree mask
-    # Directly write to cuda graph buffers for verify attn
-    tree_mask_buf, position_buf = (
-        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-    )
+    # Write straight into the backend's buffer when it owns one and this batch
+    # fits; an eager batch past the captured max_bs falls back to allocating.
+    bs = batch.seq_lens.shape[0]
+    target_attn_backend = target_worker.model_runner.attn_backend
+    verify_mask = target_attn_backend.verify_mask
+    if verify_mask is None:
+        tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+    else:
+        mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-    # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+    # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
     seq_lens_sum = batch.seq_lens_sum
     if seq_lens_sum is None:
-        if tree_mask_buf is None:
-            max_context_len = target_worker.model_runner.attn_backend.max_context_len
-            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-        else:
-            # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+        if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+            # Preallocated, or a QLEN_ONLY allocation sized off bs alone.
             seq_lens_sum = 0
+        else:
+            seq_lens_sum = bs * target_attn_backend.max_context_len
 
     (
         tree_mask,
@@ -376,9 +380,9 @@ def build_eagle_verify_input(
         topk,
         num_steps,
         num_draft_tokens,
-        tree_mask_mode,
+        mask_mode,
         tree_mask_buf,
-        position_buf,
+        fill_prefix_mask=fill_mask,
     )
 
     return EagleVerifyInput(
@@ -564,20 +568,14 @@ def run_eagle_verify(
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
-    vocab_mask = None
+    grammar_mask = None
     if batch.has_grammar:
-        # Grammar barrier: advance the previous batch's grammar FSM over its
-        # committed tokens before building this batch's bitmask. Runs after the
-        # target forward launch, so the FSM advance and the traversal below both
-        # overlap the target verify forward. No-op if there is nothing pending.
-        if grammar_barrier is not None:
-            grammar_barrier()
-        vocab_mask = build_grammar_vocab_mask(
+        grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
-            verify_input=verify_input,
             tree=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
 
     # Sample
@@ -587,7 +585,7 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
