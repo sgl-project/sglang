@@ -21,6 +21,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_parallel_rank,
+    get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -76,7 +77,7 @@ def _parity_dump(name: str, value) -> None:
     path = (
         Path(dump_dir)
         / "sglang"
-        / f"sp_rank_{get_sp_parallel_rank():02d}"
+        / f"sp_{get_sp_world_size():02d}_rank_{get_sp_parallel_rank():02d}"
         / name
     )
     path.parent.mkdir(parents=True, exist_ok=True)

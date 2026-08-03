@@ -1271,7 +1271,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         dump_dir = (
             Path(dump_root)
             / "sglang"
-            / f"sp_rank_{get_sp_parallel_rank():02d}"
+            / f"sp_{get_sp_world_size():02d}_rank_{get_sp_parallel_rank():02d}"
         )
         dump_dir.mkdir(parents=True, exist_ok=True)
         counters = {"patch": 0, "block0": 0}
