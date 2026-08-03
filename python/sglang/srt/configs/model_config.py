@@ -1439,19 +1439,19 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
+                and quant_method == "modelopt_fp4"
+            )
             # An explicit online-requantization request (e.g. quark_mxfp4 on top
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
             # source format
             if self.quantization not in REQUANTIZATION_METHODS:
-                # ModelOpt FP4 checkpoints quantize only the target model; an
-                # embedded MTP draft may stay unquantized, so an explicit
-                # nvfp4_online opt-in for the draft wins over checkpoint detection.
-                # The online loader rejects already-packed weights at load time.
-                preserve_online_draft_quantization = (
-                    self.is_draft_model
-                    and self.quantization == "nvfp4_online"
-                    and quant_method == "modelopt_fp4"
-                )
 
                 # Detect which checkpoint is it
                 if not preserve_online_draft_quantization:
