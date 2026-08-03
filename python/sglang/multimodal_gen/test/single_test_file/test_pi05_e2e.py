@@ -58,7 +58,7 @@ def _action_request_kwargs(tag: str) -> dict:
         "state": np.linspace(
             -0.5,
             0.5,
-            _env_int("SGLANG_PI05_E2E_STATE_DIM", 32),
+            _env_int("SGLANG_PI05_E2E_STATE_DIM", 14),
             dtype=np.float32,
         ),
         "noise": rng.standard_normal((action_horizon, action_dim)).astype(np.float32),
