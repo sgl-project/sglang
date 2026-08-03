@@ -42,6 +42,15 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def repack_weights_after_hot_update(self, layer: nn.Module) -> None:
+        """Re-derive kernel weight layouts a weight loader had to undo.
+
+        Called by the update paths that do not re-run
+        `process_weights_after_loading`. Overrides re-derive only their own
+        layout and must no-op when nothing was undone.
+        """
+        return
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
