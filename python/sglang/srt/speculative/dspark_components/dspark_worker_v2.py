@@ -33,6 +33,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
