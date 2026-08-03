@@ -14,6 +14,31 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLocalAttentionMetadata(unittest.TestCase):
+    def test_default_preserves_short_prompt_chunk_normalization(self):
+        query_start_loc = np.array([0, 1000], dtype=np.int32)
+        seq_lens = np.array([1000], dtype=np.int32)
+        block_table = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+
+        (
+            query_lens,
+            query_start_loc_local,
+            key_lens,
+            block_table_local,
+        ) = make_local_attention_virtual_batches(
+            attn_chunk_size=8192,
+            query_start_loc_np=query_start_loc,
+            seq_lens_np=seq_lens,
+            block_table=block_table,
+            page_size=16,
+        )
+
+        np.testing.assert_array_equal(query_lens, np.array([992, 8]))
+        np.testing.assert_array_equal(
+            query_start_loc_local, np.array([0, 992, 1000], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(key_lens, np.array([992, 8], dtype=np.int32))
+        self.assertEqual(block_table_local.shape, (2, 62))
+
     def test_short_prompt_does_not_change_attention_chunk_boundary(self):
         query_start_loc = np.array([0, 1000], dtype=np.int32)
         seq_lens = np.array([1000], dtype=np.int32)
@@ -30,6 +55,7 @@ class TestLocalAttentionMetadata(unittest.TestCase):
             seq_lens_np=seq_lens,
             block_table=block_table,
             page_size=16,
+            preserve_attn_chunk_size=True,
         )
 
         np.testing.assert_array_equal(query_lens, np.array([1000]))
