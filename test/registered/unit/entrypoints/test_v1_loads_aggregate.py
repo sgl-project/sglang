@@ -5,9 +5,11 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import msgspec.msgpack
 
+from sglang.srt.entrypoints import v1_loads
 from sglang.srt.entrypoints.v1_loads import get_loads
 from sglang.srt.managers.load_snapshot import (
     HEADER_STRUCT,
@@ -89,6 +91,19 @@ class TestLoadsResponse(CustomTestCase):
         self.assertNotIn("num_total_reqs", response["loads"][0])
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
+
+
+class TestLoadsAcceleratorField(CustomTestCase):
+    def test_accelerator_reported_in_json(self):
+        """Guards the response contract: the JSON envelope carries an
+        "accelerator" field with the detected device name."""
+        manager = _FakeHttpTokenizerManager([LoadSnapshot(dp_rank=0)])
+
+        with mock.patch.object(
+            v1_loads, "_accelerator_name", return_value="NVIDIA GB300"
+        ):
+            response = asyncio.run(get_loads(tokenizer_manager=manager))
+            self.assertEqual(response["accelerator"], "NVIDIA GB300")
 
 
 class TestGetLoads(CustomTestCase):

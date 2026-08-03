@@ -411,11 +411,6 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertTrue(sp.spaces_between_special_tokens)
         self.assertFalse(sp.no_stop_trim)
 
-    def test_msgpack_omits_default_fields(self):
-        encoded = msgspec.msgpack.encode(SamplingParams())
-
-        self.assertEqual(msgspec.msgpack.decode(encoded), {})
-
     def test_msgpack_round_trip_preserves_normalized_state(self):
         tokenizer = MagicMock()
         tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {

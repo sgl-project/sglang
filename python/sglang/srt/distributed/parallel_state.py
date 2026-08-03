@@ -429,6 +429,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
@@ -631,7 +632,10 @@ class GroupCoordinator:
 
         In addition, PyTorch custom ops do not support mutation or returning
         a new tensor in the same op. So we need to figure out if the op is
-        in-place or out-of-place ahead of time.
+        in-place or out-of-place ahead of time — except under Dynamo tracing,
+        where the method selection would guard on the symbolic shape; there we
+        always emit the out-of-place op with method "auto" and resolve the
+        method at runtime inside the op.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -661,6 +665,32 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        if torch.compiler.is_compiling():
+            # Byte-size thresholds in method selection (e.g. `_pick_algo` or
+            # `should_mscclpp_allreduce`) would guard on the symbolic token dim
+            # and recompile per shape; defer the selection to runtime inside
+            # the opaque custom op. Groups without any accelerated
+            # communicator keep the inplace split op so their collective
+            # stays outside captured graphs. The symmetric-memory in-place
+            # path below is deliberately bypassed under compile: its raw
+            # pynccl call is untraceable (hard error with fullgraph, graph
+            # break otherwise) and its in-place contract does not fit the
+            # outplace custom op.
+            if (
+                self.ca_comm is None
+                and self.qr_comm is None
+                and self.pymscclpp_comm is None
+                and self.torch_symm_mem_comm is None
+                and self.pynccl_comm is None
+            ):
+                inplace_all_reduce(input_, group_name=self.unique_name)
+                return input_
+            return outplace_all_reduce(
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method="auto",
+            )
+
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
@@ -675,31 +705,10 @@ class GroupCoordinator:
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
-        outplace_all_reduce_method = None
-        if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and not should_use_pymscclpp_allreduce
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
-        elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
-            outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
-            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            outplace_all_reduce_method = "pynccl"
+        outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+            input_=input_,
+            should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+        )
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -856,9 +865,63 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _resolve_outplace_all_reduce_method(
+        self,
+        input_: torch.Tensor,
+        should_use_pymscclpp_allreduce: Optional[bool] = None,
+    ) -> Optional[str]:
+        if should_use_pymscclpp_allreduce is None:
+            should_use_pymscclpp_allreduce = (
+                self.pymscclpp_comm is not None
+                and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            )
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            return "ca"
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
+        if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
+            return "pymscclpp"
+        if (
+            self.torch_symm_mem_comm is not None
+            and not self.torch_symm_mem_comm.disabled
+            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            return "torch_symm_mem"
+        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            return "pynccl"
+        return None
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        if outplace_all_reduce_method == "auto":
+            outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+                input_
+            )
+            if outplace_all_reduce_method == "pymscclpp":
+                # pymscclpp reduces in place and returns its input; feed it a
+                # clone to honor the op's no-mutation contract.
+                input_ = input_.clone()
+            elif outplace_all_reduce_method is None:
+                # Force pynccl over the in-place fallback: it is graph-capture
+                # safe and NCCL is natively out-of-place, avoiding the clone
+                # the in-place fallback needs.
+                if self.pynccl_comm is not None:
+                    outplace_all_reduce_method = "pynccl"
+                else:
+                    out = input_.clone()
+                    self._all_reduce_in_place(out)
+                    return out
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
@@ -1010,7 +1073,12 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
@@ -1904,7 +1972,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2337,7 +2405,6 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

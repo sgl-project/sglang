@@ -621,6 +621,6 @@ Before submitting, verify:
 After the model produces non-noise output, read
 [references/testing-and-accuracy.md](references/testing-and-accuracy.md) before
 adding GPU cases, component-accuracy skips/hooks, suite entries, or benchmark
-claims. That reference tracks the current `gpu_cases.py` / `testcase_configs.py`
-/ `accuracy_testcase_configs.py` / `run_suite.py` split and the component-accuracy
-decision rules.
+claims. That reference tracks the current `gpu_cases.py`,
+`DiffusionTestCase.run_component_accuracy_check`,
+`single_test_file/component_accuracy/`, and `run_suite.py` split.

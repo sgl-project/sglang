@@ -77,8 +77,9 @@ NIGHTLY_PRESET_ORDER = (
     "zimage",
     "wan-t2v",
     "wan-ti2v",
-    "ltx2",
     "ltx23-ti2v-two-stage",
+    "ideogram4-fp8",
+    "cosmos3-super-t2v",
     "wan-i2v",
 )
 
@@ -184,21 +185,7 @@ MODELS = {
             "--num-frames=81",
         ],
     },
-    # 8. Nightly: ltx2_twostage_t2v
-    "ltx2": {
-        "nightly_case_id": "ltx2_twostage_t2v",
-        "path": "Lightricks/LTX-2",
-        "prompt": "A cat and a dog baking a cake together in a kitchen.",
-        "extra_args": [
-            "--pipeline-class-name=LTX2TwoStagePipeline",
-            "--width=768",
-            "--height=512",
-            "--num-frames=121",
-            "--num-gpus=2",
-            "--enable-cfg-parallel",
-        ],
-    },
-    # 9. Nightly: ltx2.3_twostage_ti2v_2gpus
+    # 8. Nightly: ltx2.3_twostage_ti2v_2gpus
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "ltx23-ti2v-two-stage": {
         "nightly_case_id": "ltx2.3_twostage_ti2v_2gpus",
@@ -214,7 +201,36 @@ MODELS = {
             "--cfg-parallel-size=2",
         ],
     },
-    # 10. Nightly: wan22_i2v_a14b_720p
+    # 9. Nightly: ideogram4_fp8_t2i_2gpu
+    "ideogram4-fp8": {
+        "nightly_case_id": "ideogram4_fp8_t2i_2gpu",
+        "path": "ideogram-ai/ideogram-4-fp8",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
+            "--attention-backend=fa",
+        ],
+    },
+    # 10. Nightly: cosmos3_super_t2v_2gpu
+    "cosmos3-super-t2v": {
+        "nightly_case_id": "cosmos3_super_t2v_2gpu",
+        "path": "nvidia/Cosmos3-Super",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "env": {
+            "SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1",
+        },
+        "extra_args": [
+            "--width=1280",
+            "--height=720",
+            "--num-frames=81",
+            "--num-gpus=2",
+            "--tp-size=2",
+        ],
+    },
+    # 11. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
         "nightly_case_id": "wan22_i2v_a14b_720p",
@@ -233,6 +249,18 @@ MODELS = {
         ],
     },
     # Source-tracked extras from current registry / GPU test coverage.
+    "ltx2": {
+        "path": "Lightricks/LTX-2",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+        ],
+    },
     "qwen-image": {
         "path": "Qwen/Qwen-Image",
         "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
@@ -303,14 +331,6 @@ MODELS = {
             "--height=480",
             "--num-frames=9",
             "--num-inference-steps=4",
-        ],
-    },
-    "ideogram4-fp8": {
-        "path": "ideogram-ai/ideogram-4-fp8",
-        "prompt": "A clean product poster for a new open-source inference engine",
-        "extra_args": [
-            "--width=1024",
-            "--height=1024",
         ],
     },
     "ernie-image-turbo": {
@@ -657,6 +677,8 @@ def validate_nightly_alignment() -> int:
             errors.append(f"{model_key}: reference image presence differs")
         if preset.get("seed", 42) != case.get("seed"):
             errors.append(f"{model_key}: seed differs")
+        if preset.get("env", {}) != case["frameworks"]["sglang"].get("extra_env", {}):
+            errors.append(f"{model_key}: environment differs")
 
         actual_args = {
             key: _normalize_cli_value(value)

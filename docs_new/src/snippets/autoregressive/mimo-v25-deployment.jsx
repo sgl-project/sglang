@@ -321,9 +321,9 @@ export const MiMoV25Deployment = () => {
 
     if (multinode) flags.push(...multiNodeFlags(nnodes));
 
-    // MoE backend: Blackwell uses flashinfer_trtllm (hardware-driven); Hopper
+    // MoE backend: Blackwell uses flashinfer_trtllm (both variants); Hopper
     // optionally uses DeepEP (toggle).
-    if (isPro && blackwell) {
+    if (blackwell) {
       flags.push("  --moe-runner-backend flashinfer_trtllm");
     } else if (useDeepep) {
       flags.push("  --moe-a2a-backend deepep");
@@ -349,7 +349,11 @@ export const MiMoV25Deployment = () => {
         flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       }
     } else {
-      if (blackwell) flags.push("  --mm-attention-backend fa4");
+      if (blackwell) {
+        // fa4 is required, not tuning: trtllm_mha rejects MiMoV2's 192/128 KV.
+        flags.push("  --attention-backend fa4");
+        flags.push("  --mm-attention-backend fa4");
+      }
       flags.push("  --mem-fraction-static 0.65");
       flags.push("  --chunked-prefill-size 16384");
     }
