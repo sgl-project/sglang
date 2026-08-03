@@ -252,17 +252,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        self._dsv4_reasoning_effort_profile_resolver = (
-            chat_encoding.Dsv4ReasoningEffortProfileResolver(
-                model_path=self.tokenizer_manager.model_path,
-                revision=self.tokenizer_manager.server_args.revision,
-                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
-                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
-                ),
-            )
-            if self.chat_encoding_spec == "dsv4"
-            else None
-        )
+        # DeepSeek-V4 reasoning-effort profile resolver. Built lazily on first dsv4
+        # request: ``chat_encoding_spec`` may be assigned after construction (tests,
+        # subclasses), so the resolver is not gated on its value here.
+        self._dsv4_reasoning_effort_profile_resolver: Optional[
+            chat_encoding.Dsv4ReasoningEffortProfileResolver
+        ] = None
 
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
@@ -353,6 +348,26 @@ class OpenAIServingChat(OpenAIServingBase):
             hf_config=self.tokenizer_manager.model_config.hf_config,
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
+        )
+
+    def _resolve_dsv4_reasoning_effort_profile(self) -> str:
+        """Resolve the DeepSeek-V4 reasoning-effort profile, cached per model path.
+
+        The resolver is built lazily because ``chat_encoding_spec`` may be
+        assigned after construction; it caches the resolved profile keyed on
+        ``model_path`` so a weight update that changes the path re-detects.
+        """
+        if self._dsv4_reasoning_effort_profile_resolver is None:
+            self._dsv4_reasoning_effort_profile_resolver = chat_encoding.Dsv4ReasoningEffortProfileResolver(
+                model_path=self.tokenizer_manager.model_path,
+                revision=self.tokenizer_manager.server_args.revision,
+                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+                ),
+            )
+        return self._dsv4_reasoning_effort_profile_resolver.resolve(
+            model_path=self.tokenizer_manager.model_path,
+            revision=self.tokenizer_manager.server_args.revision,
         )
 
     def _request_id_prefix(self) -> str:
@@ -1220,12 +1235,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
-                reasoning_effort_profile = (
-                    self._dsv4_reasoning_effort_profile_resolver.resolve(
-                        model_path=self.tokenizer_manager.model_path,
-                        revision=self.tokenizer_manager.server_args.revision,
-                    )
-                )
+                reasoning_effort_profile = self._resolve_dsv4_reasoning_effort_profile()
                 accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
                     reasoning_effort_profile
                 ]
