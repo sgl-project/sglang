@@ -5,6 +5,21 @@
 })(typeof globalThis !== "undefined" ? globalThis : window, function traceTopologyFactory() {
   const DEFAULT_MAX_EVENTS = 160;
   const DEFAULT_TRANSFER_MS = 10;
+  const STICKY_CHUNK_FIELDS = [
+    "requestPrepareMs",
+    "schedulerForwardMs",
+    "denoiseMs",
+    "vaeEncodeMs",
+    "vaeDecodeMs",
+    "postDecodeMs",
+    "rawPayloadBuildMs",
+    "wsWriteMs",
+    "chunkTotalMs",
+    "clientDecodeMs",
+    "displayLagMs",
+    "numFrames",
+    "payloadBytes",
+  ];
 
   const STAGES = [
     { id: "browser", title: "Browser", subtitle: "input + render" },
@@ -69,7 +84,10 @@
         (left, right) => Number(left.chunkIndex) - Number(right.chunkIndex),
       );
       const latestObservedChunk = sortedChunks[sortedChunks.length - 1] || null;
-      const latestChunk = latestTimedChunk(sortedChunks) || latestObservedChunk;
+      const latestChunk = latestKnownMetricChunk(
+        sortedChunks,
+        latestTimedChunk(sortedChunks) || latestObservedChunk,
+      );
       const nodes = buildNodes(latestChunk, events);
       const edges = buildEdges(latestChunk, events);
       return {
@@ -337,6 +355,37 @@
       if (hasChunkTiming(sortedChunks[i])) return sortedChunks[i];
     }
     return null;
+  }
+
+  function latestKnownMetricChunk(sortedChunks, baseChunk) {
+    if (!baseChunk) return null;
+    const snapshot = {
+      ...baseChunk,
+      events: Array.isArray(baseChunk.events) ? [...baseChunk.events] : [],
+    };
+    for (const field of STICKY_CHUNK_FIELDS) {
+      const value = latestFiniteChunkField(sortedChunks, field);
+      if (isFiniteNumber(value)) snapshot[field] = Number(value);
+    }
+    const contentType = latestStringChunkField(sortedChunks, "contentType");
+    if (contentType) snapshot.contentType = contentType;
+    return snapshot;
+  }
+
+  function latestFiniteChunkField(sortedChunks, field) {
+    for (let i = sortedChunks.length - 1; i >= 0; i -= 1) {
+      const value = sortedChunks[i]?.[field];
+      if (isFiniteNumber(value)) return value;
+    }
+    return null;
+  }
+
+  function latestStringChunkField(sortedChunks, field) {
+    for (let i = sortedChunks.length - 1; i >= 0; i -= 1) {
+      const value = sortedChunks[i]?.[field];
+      if (value) return String(value);
+    }
+    return "";
   }
 
   function hasChunkTiming(chunk) {

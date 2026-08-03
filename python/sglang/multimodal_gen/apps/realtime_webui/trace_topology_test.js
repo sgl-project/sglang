@@ -126,6 +126,51 @@ function usesLatestCompletedChunkWhenNextChunkIsInFlight() {
   assert.ok(summary.nodes.find((node) => node.id === "scheduler").metric.includes("491ms"));
 }
 
+function retainsLastKnownStageMetricsForPartiallyReportedChunks() {
+  const topology = createRealtimeTraceTopology({ maxEvents: 32 });
+  topology.reset("trace-sticky");
+
+  topology.addEvent({
+    event: "server.chunk_complete",
+    trace_id: "trace-sticky",
+    chunk_index: 16,
+    request_prepare_ms: 6,
+    scheduler_forward_ms: 450,
+    raw_payload_build_ms: 40,
+    ws_write_ms: 4,
+    chunk_total_ms: 520,
+  });
+  topology.addEvent({
+    event: "server.model_denoise_complete",
+    trace_id: "trace-sticky",
+    chunk_index: 16,
+    duration_ms: 390,
+  });
+  topology.addEvent({
+    event: "server.vae_decode_complete",
+    trace_id: "trace-sticky",
+    chunk_index: 16,
+    duration_ms: 88,
+  });
+
+  topology.addEvent({
+    event: "client.decode_batch_done",
+    trace_id: "trace-sticky",
+    chunk_index: 17,
+    decode_ms: 4,
+  });
+
+  const summary = topology.summary();
+  assert.equal(summary.latestObservedChunk.chunkIndex, 17);
+  assert.equal(summary.latestChunk.chunkIndex, 17);
+  assert.equal(summary.latestChunk.denoiseMs, 390);
+  assert.equal(summary.latestChunk.vaeDecodeMs, 88);
+  assert.equal(summary.latestChunk.clientDecodeMs, 4);
+  assert.equal(summary.nodes.find((node) => node.id === "denoise").metric, "390ms");
+  assert.equal(summary.nodes.find((node) => node.id === "vae_decode").metric, "88ms");
+  assert.equal(summary.nodes.find((node) => node.id === "frontend").metric, "4ms");
+}
+
 function mapsGenericPipelineStageEventsToChunkMetrics() {
   const topology = createRealtimeTraceTopology({ maxEvents: 16 });
   topology.reset("trace-d");
@@ -212,6 +257,7 @@ function formatsReadableDurations() {
 recordsChunkCriticalPathAndAsyncEstimate();
 keepsOnlyCurrentTraceAndRecentEvents();
 usesLatestCompletedChunkWhenNextChunkIsInFlight();
+retainsLastKnownStageMetricsForPartiallyReportedChunks();
 mapsGenericPipelineStageEventsToChunkMetrics();
 separatesVaeEncodeAndDecodeInTopologyOrder();
 formatsReadableDurations();
