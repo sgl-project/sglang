@@ -1,5 +1,4 @@
 import unittest
-from itertools import accumulate
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,7 +7,6 @@ import torch
 
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
-    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -223,9 +221,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             actual_seq_q_prev_list.append(block_sizes[rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - rank - 1])
 
-        actual_seq_q_combined_list = actual_seq_q_prev_list + actual_seq_q_next_list
-        kv_len_combined_list = kv_len_prev_list + kv_len_next_list
-
         return {
             "bs": bs,
             "total_seq_lens": sum(extend_seq_lens),
@@ -239,10 +234,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             "kv_len_next_list": kv_len_next_list,
             "actual_seq_q_prev_list": actual_seq_q_prev_list,
             "actual_seq_q_next_list": actual_seq_q_next_list,
-            "actual_seq_q_combined_list": actual_seq_q_combined_list,
-            "kv_len_combined_list": kv_len_combined_list,
-            "cu_seqlens_q_combined": [0] + list(accumulate(actual_seq_q_combined_list)),
-            "cu_seqlens_kv_combined": [0] + list(accumulate(kv_len_combined_list)),
         }
 
     def _assert_metadata_matches(self, metadata, expected):
@@ -277,45 +268,6 @@ class TestCPZigzagStrategy(CustomTestCase):
             + list(
                 torch.tensor(expected["actual_seq_q_next_list"]).cumsum(dim=0).tolist()
             ),
-        )
-        self.assertEqual(
-            metadata.actual_seq_q_combined_tensor.cpu().tolist(),
-            expected["actual_seq_q_combined_list"],
-        )
-        self.assertEqual(
-            metadata.kv_len_combined_tensor.cpu().tolist(),
-            expected["kv_len_combined_list"],
-        )
-        self.assertEqual(
-            metadata.cu_seqlens_q_combined_tensor.cpu().tolist(),
-            expected["cu_seqlens_q_combined"],
-        )
-        self.assertEqual(
-            metadata.cu_seqlens_kv_combined_tensor.cpu().tolist(),
-            expected["cu_seqlens_kv_combined"],
-        )
-        for tensor in (
-            metadata.actual_seq_q_combined_tensor,
-            metadata.kv_len_combined_tensor,
-            metadata.cu_seqlens_q_combined_tensor,
-            metadata.cu_seqlens_kv_combined_tensor,
-        ):
-            self.assertEqual(tensor.dtype, torch.int32)
-        self.assertEqual(metadata.actual_seq_q_combined_tensor.numel(), 2 * metadata.bs)
-        self.assertEqual(metadata.kv_len_combined_tensor.numel(), 2 * metadata.bs)
-        self.assertEqual(
-            metadata.cu_seqlens_q_combined_tensor.numel(), 2 * metadata.bs + 1
-        )
-        self.assertEqual(
-            metadata.cu_seqlens_kv_combined_tensor.numel(), 2 * metadata.bs + 1
-        )
-        self.assertEqual(
-            metadata.cu_seqlens_q_combined_tensor[-1].item(),
-            metadata.total_q_prev_tokens + metadata.total_q_next_tokens,
-        )
-        self.assertEqual(
-            metadata.max_seqlen_q_combined,
-            max(expected["actual_seq_q_combined_list"]),
         )
 
     def _padded_rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
@@ -369,35 +321,6 @@ class TestCPZigzagStrategy(CustomTestCase):
                         extend_seq_lens=extend_seq_lens,
                     )
                     self._assert_metadata_matches(metadata, expected)
-
-    def test_zigzag_combined_metadata_preserves_nonzero_prefix_order(self):
-        cp_size = 4
-        seq_lens = [19, 27]
-        extend_seq_lens = [11, 13]
-
-        for rank in range(cp_size):
-            with self.subTest(rank=rank):
-                metadata = self._metadata_for_rank(
-                    rank,
-                    cp_size=cp_size,
-                    seq_lens=seq_lens,
-                    extend_seq_lens=extend_seq_lens,
-                )
-                expected = self._expected_metadata(
-                    rank=rank,
-                    cp_size=cp_size,
-                    seq_lens=seq_lens,
-                    extend_seq_lens=extend_seq_lens,
-                )
-                self._assert_metadata_matches(metadata, expected)
-                self.assertEqual(
-                    metadata.kv_len_combined_tensor[: metadata.bs].tolist(),
-                    expected["kv_len_prev_list"],
-                )
-                self.assertEqual(
-                    metadata.kv_len_combined_tensor[metadata.bs :].tolist(),
-                    expected["kv_len_next_list"],
-                )
 
     def test_zigzag_shards_hidden_states_and_position_ids(self):
         cp_size = 4
@@ -590,7 +513,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(written_value, value))
         self.assertEqual((k_scale, v_scale), ("key-scale", "value-scale"))
 
-    def test_zigzag_flashattention_dispatch_runs_prev_then_next(self):
+    def test_zigzag_attention_dispatch_runs_prev_then_next(self):
         cp_size = 2
         seq_lens = [8]
         extend_seq_lens = [8]
@@ -623,95 +546,6 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
-
-    def test_zigzag_trtllm_dispatch_uses_one_combined_call(self):
-        cp_size = 2
-        metadata = self._metadata_for_rank(
-            0,
-            cp_size=cp_size,
-            seq_lens=[8],
-            extend_seq_lens=[8],
-        )
-        fb = SimpleNamespace(attn_cp_metadata=metadata)
-        q = torch.arange(4 * 2).view(4, 2)
-        calls = []
-
-        def attn_fn(
-            q_chunk,
-            cu_seqlens_q,
-            cache_seqlens,
-            max_seqlen_q,
-            *,
-            cu_seqlens_kv,
-            use_zigzag_page_table=False,
-        ):
-            calls.append(
-                (
-                    q_chunk.clone(),
-                    cu_seqlens_q.clone(),
-                    cache_seqlens.clone(),
-                    max_seqlen_q,
-                    cu_seqlens_kv.clone(),
-                    use_zigzag_page_table,
-                )
-            )
-            return q_chunk + 100
-
-        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
-            q,
-            fb,
-            device=torch.device("cpu"),
-            attn_fn=attn_fn,
-            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
-        )
-
-        self.assertEqual(len(calls), 1)
-        call = calls[0]
-        self.assertTrue(torch.equal(call[0], q))
-        self.assertTrue(torch.equal(call[1], metadata.cu_seqlens_q_combined_tensor))
-        self.assertTrue(torch.equal(call[2], metadata.kv_len_combined_tensor))
-        self.assertEqual(call[3], metadata.max_seqlen_q_combined)
-        self.assertTrue(torch.equal(call[4], metadata.cu_seqlens_kv_combined_tensor))
-        self.assertTrue(call[5])
-        self.assertTrue(torch.equal(out, q + 100))
-
-    def test_zigzag_trtllm_single_call_zeroes_physical_padding(self):
-        cp_size = 2
-        metadata = self._metadata_for_rank(
-            0,
-            cp_size=cp_size,
-            seq_lens=[8],
-            extend_seq_lens=[8],
-        )
-        fb = SimpleNamespace(attn_cp_metadata=metadata)
-        logical_q = torch.arange(4 * 2).view(4, 2)
-        q = torch.cat([logical_q, torch.full((2, 2), -1)], dim=0)
-        calls = []
-
-        def attn_fn(
-            q_chunk,
-            cu_seqlens_q,
-            cache_seqlens,
-            max_seqlen_q,
-            *,
-            cu_seqlens_kv,
-            use_zigzag_page_table=False,
-        ):
-            calls.append(q_chunk.clone())
-            return q_chunk + 100
-
-        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
-            q,
-            fb,
-            device=torch.device("cpu"),
-            attn_fn=attn_fn,
-            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
-        )
-
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(torch.equal(calls[0], logical_q))
-        self.assertTrue(torch.equal(out[:4], logical_q + 100))
-        self.assertTrue(torch.equal(out[4:], torch.zeros_like(out[4:])))
 
     def test_zigzag_combined_attention_matches_two_half_reference(self):
         def reference_attention(

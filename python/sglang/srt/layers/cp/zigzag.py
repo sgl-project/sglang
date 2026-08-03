@@ -353,7 +353,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         ), f"{self.name} CP does not support {attention_backend=}"
 
         meta = forward_batch.attn_cp_metadata
+        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
+        q_next = q[meta.total_q_prev_tokens : logical_tokens]
+
+        prev_kwargs = {}
+        next_kwargs = {}
         if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
             result = attn_fn(
                 q[:logical_tokens],
@@ -364,19 +369,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
-            q_prev = q[: meta.total_q_prev_tokens]
-            q_next = q[meta.total_q_prev_tokens : logical_tokens]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
                 meta.kv_len_prev_tensor,
                 meta.max_seqlen_q_prev,
+                **prev_kwargs,
             )
             result_next = attn_fn(
                 q_next,
                 meta.cu_seqlens_q_next_tensor,
                 meta.kv_len_next_tensor,
                 meta.max_seqlen_q_next,
+                **next_kwargs,
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
