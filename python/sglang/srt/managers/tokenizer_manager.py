@@ -182,6 +182,18 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # A request may be observed as terminal by more than one path (normal
+    # output, an abort echo, an error finish reason, or dispatch cleanup).
+    # The LoRA registry reference must nevertheless be handed back once.
+    lora_released: bool = False
+
+    # Usually a state owns the single reference in ``obj.lora_id``. When an
+    # explicit rid list is used with parallel sampling, however, normalization
+    # keeps one parent rid per prompt while LoRARegistry.acquire has already
+    # acquired ``parallel_sample_num`` references per prompt. Keep that bundle
+    # on the parent until ownership is transferred to regenerated child states.
+    lora_ids_to_release: Optional[Union[str, List[Optional[str]]]] = None
+
     # An abort matched this rid while the request was still tokenizer-held
     # (parked at the pause gate / model-update lock / tokenization). The
     # scheduler never saw the rid, so the dispatch path must resolve the
@@ -453,6 +465,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        # asyncio only keeps weak references to tasks. Keep release tasks alive
+        # until their registry decrement has completed.
+        self._lora_release_tasks: set[asyncio.Task] = set()
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -1490,7 +1505,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             finish_reason.get("type") == "abort"
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
-            self._release_req_state(state.obj.rid)
+            self.rid_to_state.pop(state.obj.rid, None)
+            release_task = self._release_lora_once(state)
+            if release_task is not None:
+                await release_task
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1503,7 +1521,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            self._release_req_state(state.obj.rid)
+            self.rid_to_state.pop(state.obj.rid, None)
+
+            release_task = self._release_lora_once(state)
+            if release_task is not None:
+                await release_task
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -1512,6 +1534,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return out
 
         return None
+
+    def _release_lora_once(self, state: ReqState) -> Optional[asyncio.Task]:
+        """Release a request's LoRA registry reference at most once.
+
+        A scheduler output, an abort echo, an error finish reason, and failed
+        dispatch cleanup may all observe the same terminal request. The
+        per-state guard makes those paths idempotent, while the task set keeps
+        the asynchronous registry decrement alive until it completes.
+
+        ``lora_id`` is the ownership signal. A request can carry ``lora_path``
+        before registry acquisition succeeds, so checking the path alone can
+        incorrectly schedule ``release(None)`` on validation failures.
+        """
+        if state.lora_released:
+            return None
+
+        lora_ids = state.lora_ids_to_release
+        if lora_ids is None:
+            lora_ids = getattr(state.obj, "lora_id", None)
+        if not getattr(self, "enable_lora", False) or lora_ids is None:
+            return None
+
+        if isinstance(lora_ids, list):
+            lora_ids = [lora_id for lora_id in lora_ids if lora_id is not None]
+            if not lora_ids:
+                return None
+
+        state.lora_released = True
+        task = asyncio.create_task(self.lora_registry.release(lora_ids))
+        self._lora_release_tasks.add(task)
+        task.add_done_callback(self._lora_release_tasks.discard)
+        return task
 
     async def _wait_one_response(
         self,
@@ -1676,9 +1730,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
+            # Every real sample below is sent under a regenerated rid. The
+            # original states are bookkeeping parents, not additional LoRA
+            # users: the acquire count belongs to the regenerated children.
+            # Remove all parents (including the otherwise orphaned expanded
+            # entries) and mark their accounting as transferred.
+            parent_states = {}
+            for parent_rid in obj.rid if isinstance(obj.rid, list) else [obj.rid]:
+                parent_state = self.rid_to_state.pop(parent_rid, None)
+                if parent_state is not None:
+                    parent_state.lora_released = True
+                    parent_states[parent_rid] = parent_state
+
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
+                # This warm-up is an extra request beyond the n references
+                # acquired for the real samples. Keep LoRA on tokenized_obj so
+                # the scheduler caches the prefix under the right adapter, but
+                # make its tokenizer-side state a non-owner.
+                tmp_obj.lora_path = None
+                tmp_obj.lora_id = None
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -1715,8 +1787,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                if objs[i].rid in parent_states:
+                    parent_states[objs[i].rid].time_stats.set_finished_time()
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2213,7 +2285,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                self._release_req_state(rid)
+                del self.rid_to_state[rid]
+                self._release_lora_once(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -2871,7 +2944,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        self._release_req_state(recv_obj.rid)
+        del self.rid_to_state[recv_obj.rid]
+        self._release_lora_once(state)
 
         state.out_list.append(out)
         state.event.set()
@@ -3027,6 +3101,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+        missing_rids, orphaned_lora_ids = self._assign_lora_release_ownership(obj)
+        if missing_rids:
+            # An abort ack can remove a tokenizer-held state while acquire() is
+            # awaiting the registry. In that race the abort cannot release yet
+            # (lora_id is still None), so return the newly acquired references
+            # here instead of leaking them.
+            if orphaned_lora_ids:
+                await self.lora_registry.release(orphaned_lora_ids)
+            raise ValueError(
+                "Request was aborted while resolving its LoRA adapter: "
+                + ", ".join(missing_rids)
+            )
+
+    def _assign_lora_release_ownership(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> Tuple[List[str], List[str]]:
+        """Assign every acquired LoRA reference to an initial request state.
+
+        Returns missing rids and the references that belonged to them. A rid
+        can disappear while ``LoRARegistry.acquire`` awaits; its references
+        must be released directly because no state remains to own them.
+        """
+        if not isinstance(obj.lora_id, list):
+            ownership = [(obj.rid, obj.lora_id)]
+        else:
+            rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+            if len(rids) == len(obj.lora_id):
+                ownership = list(zip(rids, obj.lora_id))
+            else:
+                # Batch fields are expanded by repeating the whole batch, so
+                # prompt i owns i, i + batch_size, ... until fan-out. Using
+                # this partition for malformed input too keeps every acquired
+                # reference owned until later validation rejects the request.
+                ownership = [
+                    (rid, obj.lora_id[i :: len(rids)]) for i, rid in enumerate(rids)
+                ]
+
+        missing_rids = []
+        orphaned_lora_ids = []
+        for rid, lora_ids in ownership:
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                missing_rids.append(rid)
+                if isinstance(lora_ids, list):
+                    orphaned_lora_ids.extend(
+                        lora_id for lora_id in lora_ids if lora_id is not None
+                    )
+                elif lora_ids is not None:
+                    orphaned_lora_ids.append(lora_ids)
+                continue
+            state.lora_ids_to_release = lora_ids
+
+        return missing_rids, orphaned_lora_ids
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -3072,20 +3200,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _release_req_state(self, rid: str) -> None:
-        """Drop the request's rid_to_state entry and release its LoRA reference.
-
-        Removal and release belong together: popping first keeps the release at
-        exactly one per request when several cleanup paths race for the same
-        rid, and a reference that is never handed back leaves
-        ``/unload_lora_adapter`` waiting on the registry counter forever.
-        """
-        state = self.rid_to_state.pop(rid, None)
-        if state is None:
-            return
-        if self.enable_lora and state.obj.lora_path:
-            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
-
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
@@ -3098,7 +3212,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self._release_req_state(rid)
+            state = self.rid_to_state.pop(rid, None)
+            if state is not None:
+                self._release_lora_once(state)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
