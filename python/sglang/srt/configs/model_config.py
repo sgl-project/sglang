@@ -691,7 +691,7 @@ class ModelConfig:
         )
 
         if self.is_hybrid_swa:
-            logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+            logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(
                 arch
@@ -1502,20 +1502,6 @@ class ModelConfig:
                         f"method specified in the `quantization` argument "
                         f"({self.quantization})."
                     )
-
-            # Warn if DeepGemm is enabled for a non-ue8m0 checkpoint on Blackwell.
-            # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
-            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if (
-                not self.use_scale_ue8m0
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and self.quantization != "mxfp8"
-            ):
-                logger.warning(
-                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
-                )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
