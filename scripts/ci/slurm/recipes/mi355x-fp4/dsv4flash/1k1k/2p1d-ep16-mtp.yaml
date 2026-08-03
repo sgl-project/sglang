@@ -74,10 +74,13 @@ runtime:
       MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
       MORI_MAX_DISPATCH_TOKENS_DECODE: 256
       SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 16384
+    # MTP decode capture drives the MoE dispatch to cuda_graph_bs * draft_tokens
+    # tokens/rank, so the decode buffers must clear that; 512/2048/1024 validated
+    # on mi355x (undersized values abort during decode cuda-graph capture).
     decode_extra_env:
-      MORI_MAX_DISPATCH_TOKENS_DECODE: 64
-      MORI_MOE_MAX_INPUT_TOKENS_DECODE: 332
-      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 512
+      MORI_MOE_MAX_INPUT_TOKENS_DECODE: 2048
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 1024
 
 # MTP / EAGLE speculative decoding (NextN head from the base model). Applied to
 # both prefill and decode.
