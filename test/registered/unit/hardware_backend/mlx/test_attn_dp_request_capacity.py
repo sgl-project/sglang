@@ -13,6 +13,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,6 +41,7 @@ def _arch(*, hybrid: bool):
 
 
 def _stub_for_initialize(
+    test,
     *,
     dp_size: int,
     attn_dp_size: int,
@@ -47,16 +49,22 @@ def _stub_for_initialize(
     max_mamba_cache_size: int | None = None,
     pool_size: int = 64,
 ):
-    stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
-    stub._mlx_pool_size = pool_size
-    stub.device = "cpu"
-    stub.ps = ParallelState.trivial(dp_size=dp_size, attn_dp_size=attn_dp_size)
-    stub.server_args = SimpleNamespace(
+    # ``initialize`` reads the config namespaces, so the config has to be
+    # published rather than stubbed onto the runner.
+    override = get_context().override_server_args(
         enable_memory_saver=False,
         max_running_requests=max_running_requests,
         max_mamba_cache_size=max_mamba_cache_size,
         disable_radix_cache=False,
     )
+    server_args = override.install()
+    test.addCleanup(override.restore)
+
+    stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
+    stub._mlx_pool_size = pool_size
+    stub.device = "cpu"
+    stub.ps = ParallelState.trivial(dp_size=dp_size, attn_dp_size=attn_dp_size)
+    stub.server_args = server_args
     stub.model_config = SimpleNamespace(
         is_hybrid_swa=False,
         sliding_window_size=None,
@@ -80,14 +88,14 @@ def _initialize_stub(stub, *, hybrid: bool = False):
 class TestAttentionDpRequestCapacity(CustomTestCase):
     def test_pure_dp_replica_retains_full_request_limit(self):
         stub = _initialize_stub(
-            _stub_for_initialize(dp_size=4, attn_dp_size=1),
+            _stub_for_initialize(self, dp_size=4, attn_dp_size=1),
         )
         self.assertEqual(stub.max_running_requests, 8)
         self.assertEqual(stub.req_to_token_pool.size, 8)
 
     def test_attention_dp_partitions_request_limit(self):
         stub = _initialize_stub(
-            _stub_for_initialize(dp_size=4, attn_dp_size=4),
+            _stub_for_initialize(self, dp_size=4, attn_dp_size=4),
         )
         self.assertEqual(stub.max_running_requests, 2)
         self.assertEqual(stub.req_to_token_pool.size, 2)
@@ -95,6 +103,7 @@ class TestAttentionDpRequestCapacity(CustomTestCase):
     def test_attention_dp_partitions_explicit_auxiliary_state_limit(self):
         stub = _initialize_stub(
             _stub_for_initialize(
+                self,
                 dp_size=4,
                 attn_dp_size=4,
                 max_running_requests=8,
@@ -109,6 +118,7 @@ class TestAttentionDpRequestCapacity(CustomTestCase):
 
     def test_attention_dp_auxiliary_error_reports_global_cli_units(self):
         stub = _stub_for_initialize(
+            self,
             dp_size=4,
             attn_dp_size=4,
             max_running_requests=8,
