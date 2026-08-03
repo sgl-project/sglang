@@ -12,10 +12,10 @@ _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.dsa.dsa_indexer import (
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
-    Indexer,
-    rotate_activation,
+    DSAIndexerMetadata,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
@@ -23,7 +23,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 )
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
-    DSAIndexerMetadata,
     DSAMetadata,
 )
 from sglang.srt.layers.layernorm import LayerNorm
