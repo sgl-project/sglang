@@ -1,102 +1,167 @@
-# 第 8 章 内存与 KV Cache：RadixAttention 与层级化缓存
+# 第 8 章 KV Cache 与 RadixAttention 代码走读
 
-## 8.1 显存去哪儿了
+> 代码来自 `python/sglang/srt/mem_cache/`：`memory_pool.py`（池子）与 `radix_cache.py`（前缀树）。
 
-推理时显存主要被三样东西占据：
+## 8.1 两级池子：逻辑位置 → 物理位置
 
-1. **模型权重**；
-2. **KV Cache**：每个 token 每层都要保存 key/value，随请求总长度线性增长，通常占显存大头；
-3. **中间激活**（激活值、CUDA graph 缓冲等）。
+KV 管理分两层（都在 `memory_pool.py`）：
 
-`server_args.py` 的 `mem_fraction_static`（默认约 0.9）决定了把多少显存留给 KV Cache，启动日志会打印"KV Cache is allocated ..."。本章聚焦 KV Cache 的组织方式。
-
-## 8.2 两级池子
-
-SGLang 把 KV 管理拆成两个池（都在 `mem_cache/memory_pool.py`）：
-
-| 池 | 类 | 作用 |
-| --- | --- | --- |
-| `req_to_token_pool` | `ReqToTokenPool`（第 256 行） | 记录"每个请求的每个 token 对应哪个 KV 位置"，形状 `(max_reqs, max_len)` |
-| `token_to_kv_pool` | `KVCache` 子类（MHA/MLA/...） | 实际的 K/V 张量，按 token 位置组织 |
-
-`ReqToTokenPool.req_to_token[req_idx, seq_pos] = kv_loc` 这行映射就是 paged KV 的核心：**逻辑 token 位置 → 物理 KV 位置**。
-
-## 8.3 不同模型架构的 KV 池
-
-`memory_pool.py` 里 `KVCache` 的抽象基类（第 1581 行）声明了 `get_key_buffer/get_value_buffer/set_kv_buffer` 等接口，具体实现按注意力类型分：
-
-| 实现 | 适用 |
-| --- | --- |
-| `MHATokenToKVPool`（第 1702 行） | 标准 MHA/GQA 模型 |
-| `MLATokenToKVPool`（第 3866 行） | DeepSeek 等 MLA 模型（只存压缩后的 latent KV） |
-| `DSATokenToKVPool`（第 4276 行） | DeepSeek Sparse Attention |
-| `MHATokenToKVPoolFP4` / `MXFP8` | 量化 KV cache |
-| `HybridLinearKVPool` | 线性注意力/混合架构 |
-
-MLA 是理解 DeepSeek 系列的关键：它不存每层的完整 K/V，而是存低秩压缩向量，`set_kv_buffer` 时现场展开。`layers/radix_attention.py` 里对应 `RadixAttention` 层会按模型类型分发到不同内核。
-
-## 8.4 分配器：分页的思想
-
-`mem_cache/allocator/` 提供分配策略：
-
-- `paged.py`：页对齐分配（`BaseTokenToKVPoolAllocator`），按 `page_size` 分配连续页；
-- `token.py`：token 粒度分配（可跨页，适合 HiCache 等场景）；
-- `base.py`：接口与原子计数器。
-
-调度器组批时问 allocator"还能分配多少页"，运行中每次 extend/decode 都要 `alloc`/`free`。这也是 `enable_memory_saver`（TorchMemorySaverAdapter）等显存复用技巧的挂载点。
-
-## 8.5 RadixAttention：让公共前缀共享
-
-`mem_cache/radix_cache.py` 的 `RadixCache`（第 279 行）把 KV 页组织成 **radix 树（前缀树）**：
-
-- 树的每个节点存一段连续 token 的 KV 页引用；
-- 两个请求有公共前缀时，前缀段的 KV 页被共享，各自只分配差异部分；
-- 请求结束后，其 KV 段 `insert` 回树中（`cache_finished_req`，第 434 行），供后续请求复用。
-
-```python
-def match_prefix(self, params) -> MatchResult:
-    """Find the longest cached prefix of key in the radix tree."""
-    value, last_node = self._match_prefix_helper(self.root_node, key)
-    ...
-
-def insert(self, params) -> InsertResult:
-    ...
-    prefix_len, last_node = self._insert_helper(self.root_node, key, value, ...)
+```text
+req_to_token_pool   # 逻辑层：req_to_token[req][seq_pos] = kv_loc
+token_to_kv_pool    # 物理层：实际的 K/V 张量，按 kv_loc 索引
 ```
 
-多轮对话、few-shot、共享 system prompt、Agent 场景里，这种复用能把 prefill 时间砍掉大半——这就是 README 里 "RadixAttention 5x 加速" 的来源。
+`ReqToTokenPool`（第 256 行）的真相就是一张二维表：
 
-## 8.6 树上的精细操作
+```python
+class ReqToTokenPool:
+    """A memory pool that maps a request to its token locations."""
 
-`RadixKey`（第 59 行）是"可哈希、可分页"的 token 序列；`TreeNode`（第 220 行）带优先级、访问时间等元数据。树上操作包括：
+    def __init__(self, size, max_context_len, device, enable_memory_saver):
+        ...
+        self._alloc_size = size + 1   # +1 是给 CUDA graph padding 的 dummy 行
+        self.req_to_token = torch.zeros(
+            (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+        )
+```
 
-- **match_prefix**：匹配时若命中的是节点内部某一段，会**分裂节点**（split），让边界精确，便于后续共享；
-- **insert**：把新段插入，必要时合并相邻节点；
-- **cache_finished_req**：请求结束时把 token→KV 映射写回树，同时**释放请求独占的页**（`free_segment`）；
-- **eviction**：容量超限时按策略（`evict_policy.py`）淘汰叶子节点，如 LRU/LFU；
-- **extra_key 命名空间**：`RadixKey` 支持 `extra_key`，不同 LoRA/会话可强制不共享前缀，避免 KV 污染。
+`req_to_token[req_idx, pos]` 存的是"这个请求的第 pos 个 token 的 KV 在物理池的哪个位置"。这一层映射是 paged attention 的基础：**逻辑序列连续，物理存储可以乱序**。
 
-## 8.7 缓存命中怎么回报给用户
+## 8.2 物理池：按模型架构分化
 
-调度器的 `load_snapshot`、`cache_report` 机制会把命中 token 数统计进 metrics；HTTP 响应里 `cached_tokens` 字段（OpenAI usage 中）就来自这里。`/flush_cache` 端点则整体清空这棵树。
+`KVCache` 抽象基类（第 1581 行）定义接口：
 
-## 8.8 更复杂的缓存形态（进阶预览）
+```python
+class KVCache(abc.ABC):
+    @abc.abstractmethod
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor: ...
+    @abc.abstractmethod
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor: ...
+    @abc.abstractmethod
+    def set_kv_buffer(self, layer: RadixAttention, loc, cache_k, cache_v): ...
+```
 
-`mem_cache/` 里还躺着不少高级缓存：
+具体实现按注意力架构分化：
 
-- `unified_cache/`、`hybrid_cache/`：统一/混合缓存（HiCache 生态，支持更大容量、异构存储）；
-- `swa_radix_cache.py`、`pure_swa_radix_cache.py`：滑动窗口注意力模型的缓存；
-- `mamba_radix_cache.py`、`hi_mamba_radix_cache.py`：Mamba/状态空间模型的缓存；
-- `chunk_cache.py`、`multimodal_cache.py`：按块缓存、多模态特征缓存；
-- `deepseek_v4_memory_pool.py` / `compress_state`：DeepSeek-V4 的压缩状态缓存；
-- `cpp_radix_tree/`：C++ 实现的 radix 树（`tree_v2.cpp`），供大规模场景用。
+| 实现 | 位置 | 存什么 |
+| --- | --- | --- |
+| `MHATokenToKVPool` | 第 1702 行 | 每层完整 K/V（标准 MHA/GQA） |
+| `MLATokenToKVPool` | 第 3866 行 | 只存 MLA 压缩后的 latent KV，用时现场展开 |
+| `DSATokenToKVPool` | 第 4276 行 | DeepSeek Sparse Attention 专用 |
+| `MHATokenToKVPoolFP4` / `MXFP8` | — | 量化 KV |
 
-这些是理解 SGLang 演进脉络的富矿：从"一棵树"到"一套缓存生态"。
+MLA 池是最值得读的实现：DeepSeek 系列不存每层的完整 K/V，而是存低秩投影后的压缩向量，`set_kv_buffer` 时用共享矩阵展开成实际注意力要用的 K/V。**省显存，但算力换显存**——这也是为什么 MLA 模型需要专门的 attention kernel。
+
+## 8.3 分配器：谁来给"页"
+
+`mem_cache/allocator/` 提供两种粒度：
+
+- `paged.py`：页对齐分配，`BaseTokenToKVPoolAllocator` 维护 free 页列表与原子计数；
+- `token.py`：token 粒度（HiCache 等场景）。
+
+调度器组批时问 `allocator.get_available_size()`，运行中每次 extend/decode 都 `alloc`/`free`。`PrefillAdder` 的显存预算就来自这里——第 7 章的"①显存检查"最终就是问它。
+
+## 8.4 RadixKey：能匹配、能分页、能哈希的 token 序列
+
+`radix_cache.py` 第 59 行：
+
+```python
+class RadixKey:
+    def __init__(self, token_ids, extra_key=None, is_bigram=False):
+        ...
+    def page_aligned(self, page_size: int) -> RadixKey:   # 截断到页边界
+    def match(self, other, page_size=1) -> int:           # 返回公共前缀长度
+    def hash_page(self, start, end, prior_hash) -> str:   # 分页哈希
+```
+
+三个设计点：
+
+1. `extra_key`：额外命名空间。LoRA、会话、采样盐不同时，即使 token 相同也**不共享缓存**——隔离正确性，防止缓存污染。
+2. `page_aligned`：匹配只在页边界对齐的位置发生，保证共享的 KV 是整页的，内存池才能安全引用。
+3. `hash_page`：分页哈希用于快速比较（大模型下逐 token 比较太慢）。
+
+## 8.5 匹配：match_prefix 与节点分裂
+
+`match_prefix`（第 352 行）找"最长的缓存前缀"，核心是 `_match_prefix_helper`（第 648 行）：
+
+```python
+def _match_prefix_helper(self, node, key):
+    child_key = key.child_key(self.page_size)
+    value = []
+    while len(key) > 0 and child_key in node.children.keys():
+        child = node.children[child_key]
+        prefix_len = child.key.match(key, page_size=self.page_size)
+        if prefix_len < len(child.key):
+            # 命中的地方在一个节点的“中间”→ 必须分裂
+            new_node = self._split_node(child.key, child, prefix_len)
+            value.append(new_node.value)
+            node = new_node
+            break
+        else:
+            value.append(child.value)      # 整段命中，继续往下
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+    return value, node
+```
+
+分裂 `_split_node`（第 674 行）是理解前缀树的关键：
+
+```python
+def _split_node(self, key, child, split_len):
+    # new_node 继承 child 的优先级（它代表被共享的前缀）
+    new_node = TreeNode(priority=child.priority)
+    new_node.children = {key[split_len:].child_key(self.page_size): child}
+    new_node.key = child.key[:split_len]
+    new_node.value = child.value[:split_len].clone()
+    child.parent = new_node
+    child.key = child.key[split_len:]
+    child.value = child.value[split_len:].clone()
+    new_node.parent.children[key.child_key(self.page_size)] = new_node
+    return new_node
+```
+
+场景：缓存里存了 100 个 token 的节点，新请求只命中前 30 个。如果不分裂，共享粒度是"整个 100"，后续 31~100 的缓存全部浪费。分裂后：30 个 token 的公共段成为新节点，两个分支各自持有剩余部分，**公共段从此可以被任意请求共享**。
+
+## 8.6 插入与请求结束落缓存
+
+`insert`（第 412 行）把一段 token → KV 映射写进树，`_insert_helper` 沿树找公共前缀，只写入差异部分。
+
+请求结束时走 `cache_finished_req`（第 434 行）：
+
+```python
+def cache_finished_req(self, req, is_insert=True, *, kv_len_to_handle):
+    token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+    kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :len(token_ids)]
+    radix_key = RadixKey(token_ids, req.extra_key, ...).page_aligned(self.page_size)
+    ...
+    result = self.insert(InsertParams(key=radix_key, value=kv_indices, priority=...))
+    # 从 result.prefix_len 之后的部分释放请求独占的 KV 页
+    self.token_to_kv_pool_allocator.free_segment(...)
+```
+
+两件事：把 KV 引用写进树（共享），同时**释放请求独占的那部分页**（不浪费）。树里的引用会阻止这些页被释放，直到节点被淘汰。
+
+## 8.7 淘汰：缓存满了怎么办
+
+`evict_policy.py` 提供策略（LRU/LFU 等），`RadixCache` 用 `get_eviction_strategy` 选择。淘汰的是**叶子节点**（没有子节点的节点）：因为只有叶子不影响其他共享者。
+
+> **不变量：只有叶子节点可以被淘汰。** 淘汰中间节点会破坏还在使用它的请求。
+
+## 8.8 自己动手的实验
+
+1. `--enable-cache-report` 启动，连续发两次**完全相同的** prompt，看第二次响应的 `cached_tokens` 是否等于 prompt 长度。
+2. 发三条 prompt：`A+B`、`A+C`、`A+B+D`（A/B/C/D 是明显的分隔段落），观察第二次 `A+B` 的命中数。理解"任意公共前缀共享"。
+3. `--disable-radix-cache` 开关，对比同一批 20 个共享前缀请求的总耗时。
+4. 用 `/flush_cache` 清缓存，再发同样请求，观察命中数归零。
 
 ## 8.9 本章小结
 
-- KV Cache 由 `req_to_token_pool`（逻辑映射）与 `token_to_kv_pool`（物理存储）两级池子管理。
-- 按架构分池：MHA/MLA/DSA/量化/线性注意力各有实现。
-- RadixCache 用前缀树让公共前缀共享 KV 页，是 SGLang 最具标志性的设计。
-- 缓存不是"一次性写入"，而是一个有匹配、插入、分裂、淘汰的活结构。
-- 下一章看 GPU 执行侧：这些 KV 怎么被注意力层消费，以及 CUDA graph 如何加速。
+- 两级池子（req_to_token / token_to_kv）实现"逻辑连续、物理乱序"。
+- 物理池按架构分化：MHA / MLA / DSA / 量化各有实现。
+- RadixKey 是匹配单元，extra_key 是隔离命名空间，page_aligned 保证整页共享。
+- 匹配时节点分裂让共享粒度精确到 token。
+- 请求结束落缓存并释放独占页；淘汰只动叶子。
+
+> 下一章看 GPU 侧：这些 KV 怎么被注意力层消费，CUDA graph 又怎么把 decode 提速。

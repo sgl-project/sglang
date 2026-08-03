@@ -1,19 +1,29 @@
-# 第 20 章 RL 与后训练：SGLang 作为 Rollout 引擎
+# 第 20 章 RL 与后训练：推理引擎的第二战场
 
-## 20.1 为什么训练框架需要推理引擎
+## 20.1 RL 需要推理引擎干什么
 
-强化学习（如 RLHF、GRPO、RLVR）每轮要：
+强化学习（RLHF / GRPO / RLVR）的每一轮：
 
-1. 让当前策略模型对大量 prompt 生成 rollout（推理）；
-2. 用 reward 模型打分或规则校验；
-3. 把结果喂回训练器更新权重；
-4. 循环。
+```text
+训练器更新权重 → 用新权重对一批 prompt 生成 rollout → 打分/规则校验
+→ 结果喂回训练器 → 更新权重 → 循环
+```
 
-这个"生成 rollout"的环节就是推理引擎的舞台。verl、AReaL、Miles、slime、Tunix 等框架都接 SGLang，正是因为它的**离线引擎（Engine）**形态和**在线权重更新**能力。
+"用新权重批量生成"就是推理引擎的活。verl、AReaL、Miles 等都接 SGLang，不是因为它能"聊天"，而是因为它能**高吞吐地批量生成 + 随时换权重 + 返回训练需要的中间量**。
 
-## 20.2 离线 Engine：进程内推理
+## 20.2 与在线服务的三个本质差异
 
-训练框架最常用的是进程内 `sgl.Engine`（`examples/runtime/engine/launch_engine.py`）：
+| | 在线服务 | RL rollout |
+| --- | --- | --- |
+| 请求形态 | 单条、交互 | 万级 prompt 一次灌入 |
+| 权重 | 固定 | **每轮都变** |
+| 需要的输出 | 文本 | 文本 + logprobs + hidden states |
+
+这三个差异决定了 SGLang 为 RL 专门做的设计。
+
+## 20.3 形态：进程内 Engine
+
+RL 框架用的是 `sgl.Engine`（`examples/runtime/engine/launch_engine.py`）：
 
 ```python
 import sglang as sgl
@@ -23,48 +33,76 @@ llm.generate("What is the capital of France?")
 llm.shutdown()
 ```
 
-Engine 不监听 HTTP，直接在调用方进程里起 Scheduler/ModelRunner 子进程。对应实现：`python/sglang/srt/entrypoints/engine.py` 的 `Engine` 类与 `EngineBase.py` 的接口。典型 RL 用法是"一个训练步骤内批量 generate + 批量拿 logprobs/hidden states"。
+Engine 不开 HTTP 端口，直接在调用方进程里起 Scheduler/ModelRunner 子进程。对训练框架的价值：**少一层 HTTP 序列化，且能拿到 logprobs/hidden states 等训练输入**。
 
-## 20.3 权重更新：训练和推理共享参数
+## 20.4 换权重：训练与推理共享参数
 
-RL 每轮都要把新权重灌进推理引擎。`entrypoints/http_server.py` 提供 `/update_weights_from_disk`、`/update_weights_from_distributed` 等端点，`managers/tokenizer_manager.py` 里有对应的 mixin；`srt/weight_sync/` 与 `model_executor/model_runner_components/weight_updater.py` 实现分布式权重同步。
+每轮权重更新是 RL 最刚性的需求。SGLang 提供多条路径：
 
-同时，Engine 也直接暴露 `update_weights_from_tensor` / `update_weights_from_distributed` 等 API（`io_struct.py` 中的 `UpdateWeightsFromTensorReqInput` 等），训练框架可以不经 HTTP 直接更新。
+```text
+HTTP：POST /update_weights_from_disk（或 _from_distributed / _from_tensor）
+Engine API：update_weights_from_tensor / update_weights_from_distributed
+```
 
-## 20.4 打分与奖励
+实现要点（`srt/weight_sync/` + `model_runner_components/weight_updater.py`）：
 
-- reward 模型：`examples/runtime/reward_model.py` 演示；服务端 `/v1/score` 端点（`entrypoints/openai/serving_score.py`）+ `EngineScoreMixin`（`engine_score_mixin.py`）支持批量打分；
-- hidden states：`return_hidden_states` 让 rollout 拿到每 token 表示（`ReturnHiddenStatesMode`），供 KL 项或 value head 使用；
-- logprobs：`return_logprob` 返回各 token 概率，RL 损失的必要输入。
+- 新权重先到 rank 0，再广播到 TP 各组（避免每张卡各自拉文件）；
+- 更新前要**暂停调度**（`model_update_lock`），更新后恢复——不能让"半新半旧"的权重跑请求；
+- 与 CUDA graph 的耦合：graph 里引用的是权重 buffer 的地址，更新必须"原地写"或重录 graph。
 
-`tokenizer_manager_score_mixin.py` 里的 `score_prompts` 展示了一次批量打分请求的完整形态（`scores: List[List[float]]` + 可选 pooled hidden states）。
+## 20.5 训练要的中间量
 
-## 20.5 针对 RL 的工程特性
+| 中间量 | 参数 | 用途 |
+| --- | --- | --- |
+| logprobs | `return_logprob` | PPO/GRPO 的损失项 |
+| hidden states | `return_hidden_states` | value head、KL 项 |
+| 批量打分 | `/v1/score`、`EngineScoreMixin` | reward model |
 
-`docs_new/docs/advanced_features/sglang_for_rl.mdx` 总结了 SGLang 为 RL 做的专门设计：
+`tokenizer_manager_score_mixin.py` 的 `score_prompts` 展示了打分请求的形态：返回 `scores: List[List[float]]`（每个 prompt 一组分数），可附带 pooled hidden states。
 
-- **细粒度 Engine 睡眠/唤醒**：`/release_memory_occupation`、`/resume_memory_occupation` 释放并恢复显存，避免每轮重启；配合 `--enable-memory-saver`（TorchMemorySaver 保持 CUDA graph 地址）让"训练/推理共享 GPU"成为可能；
-- **Refit 功能**：多样化的训练/推理共址或分离方案（`srt/multiplex/`、`session/` 相关代码）；
-- **生成暂停/控制**：让训练器能控制 rollout 的推进节奏（`EngineBase` 的 pause/resume）；
-- **确定性推理**：`--deterministic-inference`（`srt/configs/` 有对应配置）保证训练与推理行为一致，避免"训练时和 rollout 时结果不同"；
-- **KV-aware 路由**：大规模 rollout 时用 router 把相同 prompt 路由到缓存实例（第 17 章）。
+## 20.6 显存共址：sleep/wake 机制
 
-## 20.6 与训练框架的集成点速查
+RL 训练和 rollout 常常共享 GPU：训练器要用显存时，推理引擎先"睡"，训练完再"醒"。SGLang 提供：
 
-| 需求 | SGLang 能力 |
-| --- | --- |
-| 批量生成 | `Engine.generate` / `/generate`（批请求） |
-| 拿 logprob | `return_logprob` / `logprob_start_len` |
-| 拿 hidden states | `return_hidden_states` |
-| 打分 | `/v1/score`、reward model |
-| 换权重 | `/update_weights_from_*`、Engine tensor 接口 |
-| 暂停/恢复 | pause/resume、memory saver |
-| 确定性 | `--deterministic-inference` |
-| 长时间运行 | 健康检查、watchdog（`utils/watchdog.py`） |
+```text
+POST /release_memory_occupation   # 释放 KV 与权重显存（保留进程）
+POST /resume_memory_occupation    # 恢复
+```
 
-## 20.7 本章小结
+配合 `--enable-memory-saver`（TorchMemorySaver）：释放显存时**保持虚拟内存地址不变**，恢复后 CUDA graph 还能直接回放，不用重录。这是"训练/推理共址"可行性的关键，也是 docs 里明确标注的 RL 专属特性。
 
-- RL 场景的推理需求 = 高吞吐 batch 生成 + logprob/hidden states + 快速换权重 + 显存共址。
-- 离线 Engine 与在线权重更新接口是 SGLang 被训练框架广泛选用的关键。
-- 睡眠/唤醒、确定性推理等特性体现了"为 RL 专门设计"的深度。
-- 下一章回到工程本身：如何参与这个项目。
+## 20.7 确定性：训练与推理必须一致
+
+RL 训练最大的坑之一：训练时前向和 rollout 时前向结果不一致（比如 dropout、非确定性 kernel），导致策略估计失真。SGLang 提供 `--deterministic-inference`：
+
+- 固定采样种子（`sampling_seed`，按位置派生）；
+- 使用确定性 kernel；
+- 禁用有损优化路径。
+
+代价是性能下降，**只在需要严格一致性时开**。
+
+## 20.8 集成架构速查
+
+```text
+训练框架（verl/AReaL/...）
+  ├─ 拉起 N 个 sgl.Engine（进程内）
+  ├─ engine.generate(prompts, return_logprob=True, return_hidden_states=...)
+  ├─ 训练器算损失、更新权重
+  ├─ engine.update_weights_from_distributed(...)
+  └─ 下一轮
+```
+
+长跑生产的注意点：
+
+- watchdog（`utils/watchdog.py`）守护子进程，崩了自动重启；
+- 权重更新期间的请求排队/暂停要有策略，别让 rollout 和更新互相饿死；
+- 大规模 rollout 用 router 做缓存亲和（同 prompt 重复采样的场景收益明显）。
+
+## 20.9 本章小结
+
+- RL 推理需求 = 万级批量 + 快速换权重 + logprobs/hidden states + 显存共址。
+- Engine 形态与在线权重更新 API 是训练框架选它的关键。
+- memory-saver 的"释放但保地址"让共址成为可能。
+- 确定性推理是训练正确性的最后一道闸。
+
+> 最后一章：如果你想参与这个项目，从哪下手、怎么保证质量。

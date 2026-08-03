@@ -1,61 +1,91 @@
-# 第 14 章 投机解码：EAGLE、MTP 与 DFlash
+# 第 14 章 投机解码：原理、收益、工程代价
 
-## 14.1 为什么 decode 慢
+## 14.1 先算一笔账：为什么 decode 的 GPU 用不满
 
-自回归解码每步只生成一个 token，但整张模型都要过一遍。GPU 每步的算力利用率很低，时间主要花在"把权重搬一遍"上。**投机解码（Speculative Decoding）**的思路：先用一个小而快的 draft 模型一次猜出 k 个 token，再用大模型一次前向**验证**这 k 个 token——猜对的部分白赚，猜错则回退。期望上每步产出 >1 个 token，decode 吞吐显著提升。
+decode 阶段每步只处理 1 个新 token，但必须把整个模型的所有权重读一遍（访存）。假设模型权重 16GB、GPU 带宽 2TB/s，理论上一遍权重要 8ms——而真正算一个 token 的 FLOPs 可能只需要不到 1ms。**GPU 在等权重搬运，算力闲着。**
 
-## 14.2 SGLang 里的算法家族
+投机解码的思路：让一个小模型（draft）先快速猜 k 个 token，大模型（target）一次前向**同时验证**这 k 个位置。验证时：
 
-`--speculative-algorithm` 参数（`server_args.py` 第 1996 行）接受的内置算法：
+- 每个位置都和 draft 的猜测一致 → 白赚，一次前向产出 k+1 个 token；
+- 第一个不一致的位置 → 从那里回退，这个位置用 target 自己的输出。
 
-| 算法 | 实现目录 | 说明 |
+每步期望产出：
+
+```text
+E[tokens per step] = 1 + α + α² + ... + αᵏ   （α = 接受率，draft 每个位置被 target 认可的概率）
+```
+
+接受率 0.7、k=4 时，期望产出约 2.7 个 token/步，比不投机多 ~2.7 倍——这就是投机解码的收益上限。
+
+## 14.2 SGLang 支持的算法家族
+
+`--speculative-algorithm`（`server_args.py:1996`）：
+
+| 算法 | 草稿怎么来 | 特点 |
 | --- | --- | --- |
-| EAGLE / EAGLE3 | `speculative/eagle_worker_v2.py` 等 | 基于"特征层"的草稿模型，EAGLE-2 引入自适应 top-k |
-| NEXTN | `speculative/` 相关 worker | 原生多 token 预测头（如 Gemma 2 的 nextn） |
-| MTP | `speculative/mtp_*` | DeepSeek 的多 token 预测训练配套 |
-| NGRAM | `speculative/cpp_ngram` | 用 n-gram 匹配 prompt 做草稿，无需额外模型 |
-| STANDALONE | `speculative/base_spec_worker.py` | 无草稿，验证路径（调试用） |
-| DFlash / DSPARK | `dflash_*`、`dspark_components` | 新一代免训练投机方案（DFlash 是 2026 年 README 主打的 Spec V2） |
+| EAGLE / EAGLE3 | 用 target 倒数第二层特征做输入的小模型 | 质量高，接受率通常最好 |
+| MTP | 训练时一起训的多 token 预测头 | DeepSeek 系模型自带 |
+| NEXTN | 原生多 token 预测（如 Gemma） | 模型自带，无需额外训练 |
+| NGRAM | 从 prompt 里找 n-gram 片段做草稿 | 无需草稿模型，代码在 `speculative/cpp_ngram` |
+| DFlash / DSPARK | 免训练方法（2026 年的 Spec V2） | 无需额外模型，成本低 |
 
-算法可通过 `SpeculativeAlgorithm.register` 扩展，说明这是一个开放注册表。
+选型核心看三点：**有没有现成草稿模型、接受率多高、草稿前向多贵**。草稿太贵会把省下的时间吃回去。
 
-## 14.3 架构：草稿与验证 worker
+## 14.3 工程结构：双 worker
 
-投机解码在 SGLang 里是**双 worker**结构：
+投机解码在代码里是**两个 worker**：
 
 ```text
 Scheduler
-├── target worker（大模型，ModelRunner）
-└── draft worker（草稿模型，独立 ModelRunner / CUDA graph）
-    └── 与 target 共享 KV 池或独立池（按算法而定）
+├── target worker（大模型，正常 ModelRunner）
+└── draft worker（草稿模型，独立 ModelRunner / 独立 CUDA graph）
 ```
 
-- `scheduler.py` 的 `maybe_init_draft_worker` 负责拉起草稿 worker；
-- `speculative/draft_worker_common.py`、`eagle_worker_common.py` 提供公共逻辑；
-- 验证逻辑在 `speculative/` 下的 `draft_utils.py` 与各算法 worker 中：一次前向同时算草稿序列的所有位置，逐个对比 target logits 的 argmax。
+`scheduler.py` 的 `maybe_init_draft_worker` 拉起草稿 worker；`speculative/draft_worker_common.py` 提供公共逻辑。验证发生在 target 一次前向里：draft 序列的所有位置一起算，逐个和 target logits 的 argmax 比较。
 
-## 14.4 与 CUDA graph / KV cache 的耦合
+## 14.4 耦合点：为什么它是"进阶中的进阶"
 
-投机解码是 SGLang 里耦合最深的特性之一：
+投机解码不是独立模块，它和三大系统深度耦合：
 
-- 草稿序列的 KV 也走 radix cache（EAGLE 的 draft KV 有专门缓存）；
-- `eagle_draft_cuda_graph_runner.py` / `eagle_draft_extend_cuda_graph_runner.py`：草稿模型也有 CUDA graph；
-- `adaptive_spec_params.py` / `adaptive_runtime_state.py`：EAGLE-2 的自适应 top-k，根据接受率动态调整草稿长度；
-- 与 PD 分离配合时，prefill 侧不产生草稿 KV，decode 侧用无效 sentinel 标记（`disaggregation` 代码注释中有说明）。
+1. **CUDA graph**：draft 有自己的 graph（`eagle_draft_cuda_graph_runner.py`），target 验证步的 graph 也要按"接受/拒绝"动态调整；
+2. **KV cache**：draft 序列的 KV 也走 radix cache（否则每次重新算 draft 前向就白费了）；
+3. **PD 分离**：P 实例不产生 draft KV，D 实例用 sentinel 标记"这里是投机起始"——注释里明确写了这个耦合。
 
-## 14.5 什么时候收益最大
+任何一处没对齐，投机要么不生效，要么**生成结果与 target 单独跑不一致**（这是正确性事故）。
 
-- 草稿模型够小、够快（接受率 0.6~0.9 时收益明显）；
-- decode 阶段访存受限严重（长上下文、小 batch 尤为明显）；
-- 多 LoRA 场景需谨慎：草稿模型不认识 LoRA 适配器时接受率会掉。
+## 14.5 自适应：EAGLE-2 的动态 top-k
 
-## 14.6 基准测试
+接受率不是固定的：prompt 难，接受率就低。EAGLE-2 的做法（`speculative/adaptive_spec_params.py`）：
 
-`benchmark/bench_adaptive_speculative.py` 是自适应投机解码的专用 benchmark，`examples/` 下也有 EAGLE 相关示例（`examples/runtime/speculative/`）。README 里 2026 年的 DFlash / Spec V2 博客是了解最新进展的入口。
+```text
+接受率高 → 下次多猜几个（k 调大）
+接受率低 → 下次少猜几个（k 调小）
+```
+
+运行时根据最近几轮的接受率自适应，避免"猜了 4 个只对 1 个，反而比不猜更慢"。
+
+## 14.6 实测与调参
+
+启动后怎么看收益：
+
+1. 日志里的 accept rate / 每步产出 token 数（`--log-level info` 或 metrics）；
+2. `--speculative-eagle-topk` 控制 EAGLE 的草稿长度上限；
+3. 换模型/换 prompt 分布后，接受率会明显变化，**不要拿一个 benchmark 的结果当所有场景的结论**。
+
+失效模式速查：
+
+| 现象 | 可能原因 |
+| --- | --- |
+| 接受率极低（<0.3） | 草稿模型与 target 不匹配 / prompt 太难 / 量化降低了 target 与 draft 的一致性 |
+| 吞吐反而下降 | draft 前向太慢，k 太大；调小 k 或换算法 |
+| 与不加投机结果不一致 | draft/target 的采样参数不同步；版本耦合处出错 |
+| 多 LoRA 场景退化 | draft 不认识 LoRA 适配器，接受率暴跌 |
 
 ## 14.7 本章小结
 
-- 投机解码 = 小模型猜 + 大模型验证，白赚正确猜测。
-- SGLang 支持 EAGLE/MTP/NEXTN/NGRAM/DFlash 等多种算法，双 worker 架构统一承载。
-- 与 CUDA graph、KV cache、PD 分离的耦合使它成为"进阶中的进阶"话题。
-- 收益取决于接受率与草稿速度，部署前务必用 benchmark 实测。
+- 收益上限由接受率决定：α=0.7、k=4 时约 2.7x。
+- 选算法看"草稿质量 vs 草稿成本"，EAGLE 质量高但需要草稿模型，NGRAM/DFlash 免训练但接受率看场景。
+- 双 worker + CUDA graph + KV cache + PD 的耦合，让它成为正确性风险最高的特性。
+- 上线前必须实测接受率，且按 prompt 分布单独评估。
+
+> 下一章：多 LoRA 的显存账和动态管理。

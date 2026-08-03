@@ -1,71 +1,100 @@
-# 第 21 章 参与贡献：测试、开发流程与学习路线
+# 第 21 章 二次开发与贡献：从改文档到改内核
 
-## 21.1 为什么值得参与
+## 21.1 先建立正确的预期
 
-SGLang 是 AI Infra 领域少见的"全栈"项目：从 Triton kernel 到 Python 调度器再到 Rust 服务，从单卡优化到千卡集群。参与它的过程，等于把系统能力、性能工程、分布式知识各练一遍。
+SGLang 是"读起来有意思、改起来有门槛"的项目：
 
-## 21.2 代码规范与工具链
+- 门槛最低：文档、示例、测试、benchmark 脚本；
+- 门槛中等：新增模型、新增 processor、修 bug；
+- 门槛最高：调度器、内存池、注意力 kernel、分布式通信——每一处改动都可能影响正确性（KV 缓存）或全集群性能。
 
-仓库根目录的 `.pre-commit-config.yaml` 定义了强制规范：
+从低到高走，每个层级都在用前面章节的知识。
 
-```bash
-pre-commit install
-pre-commit run --all-files
+## 21.2 新增一个模型：完整的代码路径
+
+这是最经典的入门任务，对应第 9、12 章的知识：
+
+```text
+1. 写模型实现      python/sglang/srt/models/xxx.py
+   - forward() 复用 layers/ 的 RadixAttention、Linear、RotaryEmbedding
+   - 依赖 hf_config 判断架构，不要写死
+2. 注册 config     python/sglang/srt/configs/ 或 model_config.py
+   - 让 --model-path 能识别新架构
+3. 验证            --load-format dummy 先跑通链路（假权重）
+4. 加测试          test/srt/ 下补 smoke test（用 mock model）
+5. 多模态模型？    多一步：srt/multimodal/processors/ 加 processor
 ```
 
-包括 ruff（lint）、black/isort（格式）、codespell（拼写，`.codespellrc`）、mypy 等。Python 包在 `python/` 下，新增依赖需要同步 `python/pyproject.toml`。
+质量红线：
 
-## 21.3 测试体系
+- 前向结果必须和 HuggingFace 参考实现一致（有专门的对比测试）；
+- 复用 `layers/` 而不是复制粘贴别的模型的代码；
+- 显存/耗时不能明显劣于同类模型（贡献指南要求附 benchmark）。
 
-`test/` 目录：
+## 21.3 新增一个 kernel 或 attention backend
+
+第 9 章讲过 attention 是插件化的。新增 backend 的路径：
+
+```text
+1. 继承 AttentionBackend（layers/attention/base_attn_backend.py）
+2. 实现 init_forward_metadata / 前向内核调用
+3. 在 attention_registry.py 注册
+4. --attention-backend xxx 显式指定测试
+5. 覆盖正确性（kv_canary）+ 性能对比
+```
+
+Triton kernel 的开发流程见 `docs_new/docs/developer_guide/development_jit_kernel_guide.mdx`，仓库里 `python/sglang/kernels/` 有大量现成算子可以模仿。
+
+## 21.4 测试体系：改动质量的守护
 
 ```text
 test/
-├── srt/          # 运行时测试（按模块：test_radix_cache、test_scheduler 等）
+├── srt/          # 运行时测试（按模块：radix、scheduler、sampler...）
 ├── registered/   # 注册式测试
-├── manual/       # 手动/大模型测试
-├── run_suite.py  # 测试套件入口
-└── pytest.ini
+├── manual/       # 大模型手动测试
+└── run_suite.py  # 套件入口
 ```
 
-`python/sglang/test/` 下还有 CI 用的脚本与 mock 模型（`mock_model` 用于不下载真实权重跑通链路）。提交前建议：
+提交前的最低标准：
 
-1. `pre-commit` 全绿；
-2. 改动的模块相关 pytest 通过（如 `pytest test/srt/ -k radix`）；
-3. 涉及正确性的改动跑 kv_canary 与确定性测试。
+1. `pre-commit run --all-files`（ruff/black/isort/mypy/codespell，配置在 `.pre-commit-config.yaml`）；
+2. 改动的模块相关 pytest 通过；
+3. 涉及缓存/注意力的改动跑 kv_canary；
+4. 涉及行为变化的改动附 benchmark 数据。
 
-## 21.4 如何新增一个模型（经典任务）
+仓库有大量 CI 工作流（`.github/workflows/`）：`pr-test.yml`、`lint.yml`、各硬件的 `pr-test-*`。PR 标题/描述会被机器人读取，规范很重要。
 
-这是入门贡献最合适的路径，步骤对应代码：
+## 21.5 读代码的顺序建议（重新出发版）
 
-1. **写模型实现**：`python/sglang/srt/models/xxx.py`，实现 `forward`，复用 `layers/` 的 attention/linear/rotary；
-2. **注册 config**：`python/sglang/srt/configs/` 加配置类（或在 `model_config.py` 注册架构名）；
-3. **验证**：用 `--load-format dummy` 先加载假权重跑通链路（`examples/` 里有相关用法）；
-4. **加测试**：`test/srt/` 下补 smoke test。
+如果你认真读完了本册，建议按这个顺序做"代码考古"：
 
-新增多模态模型则多一步：`srt/multimodal/processors/` 下加 processor（第 12 章）。
+```text
+1. 通读 managers/scheduler.py 的 __init__（看一个 Scheduler 世界需要哪些零件）
+2. 通读 mem_cache/radix_cache.py 全部（前缀树的每个方法都读一遍）
+3. 通读 model_executor/forward_batch_info.py（ForwardBatch 每个字段追到使用处）
+4. 选一个模型文件（models/llama.py），把 forward 追到 layers/ 的实现
+5. 选一个高级特性（投机/PD/LoRA），把它的 mixin 追到调度器里的挂载点
+```
 
-## 21.5 贡献流程
+做完这五步，你已经能看懂 80% 的日常 PR 在改什么。
 
-1. 先到 GitHub Issues / Slack 确认设计（大改动建议先写 RFC/讨论）；
-2. 遵循 `docs_new/CONTRIBUTING.md` 与仓库根 `CONTRIBUTING.md`；
-3. PR 描述包含动机、测试结果、性能影响（若有）；
-4. 保持 PR 小而聚焦，方便 review；
-5. 涉及行为/性能变化时附 benchmark 数据。
+## 21.6 贡献流程速查
 
-## 21.6 学习路线总结
+1. 大改动先去 GitHub Issues / Slack 讨论（调度和缓存改动尤其要先说方案）；
+2. 小改动直接 PR，描述写清楚：动机、改动点、测试、性能影响；
+3. 保持 PR 小且聚焦，方便 review；
+4. 参考 `docs_new/CONTRIBUTING.md` 与仓库根 `CONTRIBUTING.md`；
+5. 社区活跃：官方 docs、roadmap.sglang.io、每周 dev meeting。
 
-从这份文档出发的推荐路径：
+## 21.7 学习路线的终点
 
-1. **跑起来**（第 3 章）→ 理解请求链路（第 6 章）；
-2. **读调度器**（第 7 章）+ KV Cache（第 8 章），这是 SGLang 的灵魂；
-3. **理解执行层**（第 9 章）：attention backend、CUDA graph；
-4. **分布式**（第 10 章）+ PD 分离（第 13 章）+ 投机解码（第 14 章）；
-5. **动手贡献**：先改文档/加测试/加小模型，再碰内核与调度；
-6. **持续跟进**：README News、官方 blog、roadmap.sglang.io、每周 dev meeting。
+本册的结构本身就是一条学习路线：
 
-## 21.7 本章小结
+```text
+第一部分：建立心智模型（餐厅图）→ 会用（启动/调用/API）
+第二部分：读懂实现（调度器/缓存/执行/并行/采样/多模态的代码）
+第三部分：理解权衡（PD/投机/LoRA/Rust/路由/调优/排障/RL）
+再之后：动手改（先模型/测试，再调度/内核）
+```
 
-- 贡献入口 = 规范（pre-commit）+ 测试（test/srt）+ 小步 PR。
-- 新增模型是入门贡献的最佳起点，链路是 models/ + configs/ + test/。
-- 学习路线按"跑通 → 调度 → 执行 → 分布式 → 前沿特性"推进，动手是最好的老师。
+当你能把第 18 章的三个案例讲给同事听、能对着 `scheduler.py` 指出"这里改了会影响什么"时，你就是一名合格的 AI Infra 推理工程师了。

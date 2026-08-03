@@ -1,90 +1,101 @@
-# 第 18 章 性能调优：从 server_args 到工程实践
+# 第 18 章 性能调优实战：从指标到案例
 
-## 18.1 调优的目标与指标
+> 本章不列参数表（那是 `server_args.py` 和官方文档的事），而是讲"怎么系统地找到瓶颈并验证修复"。
 
-先定义目标：
+## 18.1 先定义指标
 
-- **TTFT**（Time To First Token）：用户体验首 token 延迟，主要被 prefill 影响；
-- **TPOT / ITL**（Time Per Output Token / Inter-Token Latency）：连贯性感知，主要被 decode 影响；
-- **Throughput**（tokens/s）：系统吞吐，batch 越大越高，但与延迟有 trade-off；
-- **显存占用**：决定能同时跑多少请求。
-
-任何调优都要先明确"优化哪个指标"，因为多数参数是权衡。仓库 benchmark（第 19 章）输出这些指标，先测基线再动手。
-
-## 18.2 server_args 关键参数地图
-
-`python/sglang/srt/server_args.py` 是参数的唯一真相（约 9000 行，含参数组 `NS(...)` 命名空间）。按维度分组：
-
-### 显存与批大小
-
-| 参数 | 作用 | 常见调整方向 |
+| 指标 | 定义 | 谁在乎 |
 | --- | --- | --- |
-| `--mem-fraction-static` | KV 可占显存比例 | 小值保权重/激活，大值提并发 |
-| `--max-running-requests` | 运行请求上限 | 调大提升吞吐，调小保延迟 |
-| `--max-prefill-tokens` | 单批 prefill token 上限 | 防止长 prefill 卡住 batch |
-| `--chunked-prefill-size` | 长请求分块大小 | 小→延迟稳，大→吞吐高 |
+| TTFT | 首 token 延迟 | 交互体验 |
+| TPOT / ITL | 相邻输出 token 间隔 | 流式体验 |
+| Throughput | tokens/s（prefill + decode 分开看） | 成本 |
+| 显存占用 | KV 预算、激活峰值 | 能开多大并发 |
+| 缓存命中率 | 命中 token / 总 token | 前缀复用效率 |
 
-### 调度
+**调优第一步永远是测基线**：`python -m sglang.benchmark.serving`（OpenAI 协议、可配请求速率）或 `benchmark/bench_serving.py`（更完整）。没有基线，所有"优化"都无从谈起。
 
-| 参数 | 作用 |
-| --- | --- |
-| `--schedule-policy` | lpm / fcfs / lof 等（第 7 章） |
-| `--enable-priority-scheduling` | 请求带 `priority` 字段时按优先级 |
-| `--enable-mixed-chunk` | prefill/decode 混合进同一 batch |
-| `--enable-overlap-schedule` | CPU 调度与 GPU 前向重叠 |
+## 18.2 瓶颈定位三张表
 
-### 执行加速
+### 症状 → 瓶颈 → 对策
 
-| 参数 | 作用 |
-| --- | --- |
-| `--attention-backend` / `--decode-attention-backend` / `--prefill-attention-backend` | 指定注意力内核 |
-| `--cuda-graph-bs` / `--cuda-graph-max-bs` | CUDA graph 覆盖的 batch 序列 |
-| `--cuda-graph-backend-decode` | full / breakable / tc_piecewise |
-| `--disable-cuda-graph` | 诊断用 |
-| `--torch-compile-*` 系列 | torch.compile 开关与后端 |
+| 症状 | 瓶颈 | 对策 |
+| --- | --- | --- |
+| GPU 利用率低 + batch 小 | CPU 调度跟不上 | `--enable-overlap-schedule`；检查 CUDA graph 覆盖；CPU 核数/主频 |
+| GPU 利用率高 + TTFT 高 | prefill 计算量大 | chunked prefill；加 prefill 实例（PD）；检查缓存命中率 |
+| GPU 利用率高 + TPOT 高 | decode 访存受限 | 投机解码；量化 KV/权重；减小 batch 波动 |
+| GPU 利用率高 + 请求完成慢 | 队列排队 | 加大并发/实例；调 `max_running_requests`；检查抢占是否频繁 |
+| 显存 OOM | 预算分配不当 | 降 `mem_fraction_static`；量化；开 memory saver |
 
-### 高级特性开关
+### 缓存维度
 
-`--enable-dp-attention`、`--enable-speculative-*`、`--enable-lora-*`、`--disaggregation-*`、`--quantization`、`--kv-cache-dtype`（fp8/int4 量化 KV）等，均在对应章节讲过。
+| 现象 | 原因 | 对策 |
+| --- | --- | --- |
+| `cached_tokens` 一直是 0 | 请求间无公共前缀 / radix 被禁用 | 检查 prompt 分布；`--schedule-policy lpm` |
+| 命中率波动大 | 路由不亲和 / 缓存被淘汰 | router cache-aware；加大 KV 预算 |
+| 命中但速度没提升 | 命中段不在页边界 | 检查 `page_size` 与共享粒度 |
 
-## 18.3 调优方法论（对照代码）
+### 显存维度
 
-### 第一步：定位瓶颈
+| 手段 | 收益 | 代价 |
+| --- | --- | --- |
+| `--kv-cache-dtype fp8_e5m2` 等 | KV 减半 | 精度下降，需验证 |
+| 权重量化（fp8/awq/gptq） | 权重减半 + 访存减半 | 精度/兼容性 |
+| 降低 `mem_fraction_static` | 更稳 | 并发上限下降 |
+| LoRA buffer 管理 | 多租户容量 | 动态加载复杂度 |
 
-- 用 `--log-level info` + metrics 看 batch 大小、pool 使用率（`mem_cache/allocator` 的统计）；
-- GPU 利用率低但 batch 大：看 CPU 调度是否成为瓶颈 → 开 `--enable-overlap-schedule`；
-- GPU 利用率高但单请求慢：看 batch 是否过大、是否有长 prefill 混入 → 调 chunked prefill；
-- TTFT 高：检查 `schedule_policy` 与 prefill 并发限制；
-- 显存 OOM：看 `mem_fraction_static`、量化 KV、LoRA 缓存。
+## 18.3 案例一：在线服务 TTFT 突然劣化
 
-### 第二步：缓存效率
+现象：压测时 TTFT 从 200ms 涨到 2s，TPOT 正常。
 
-前缀缓存命中率是 SGLang 调优的独有维度：
+排查顺序（对照代码）：
 
-- 多轮/共享 prompt 场景确保 `--schedule-policy lpm`；
-- 用 `--enable-cache-report` 观察每个请求命中 token 数；
-- `/flush_cache` 在测试不同 prompt 分布时用于隔离；
-- 会话场景用 `session_id` + session radix cache（`srt/session/`）跨请求复用。
+1. **看等待队列**：`/metrics` 的 waiting queue 长度是否增长 → 如果是，调度器来不及消化（CPU 瓶颈），开 overlap；
+2. **看 prefill batch**：是否出现超大 prefill 把 GPU 占住 → chunked prefill 参数是否生效；
+3. **看缓存命中率**：压测用的 prompt 是否随机导致命中率近 0 → 换有前缀分布的负载测试，或确认 LPM；
+4. **看抢占**：`mem_fraction_static` 是否过低导致频繁抢占 → 抢占会让请求"先算一半再等"，TTFT 剧增。
 
-### 第三步：显存效率
+结论通常是 2+4 的组合：长 prefill 挤占 + 抢占回退。对策：chunked prefill + 调大 KV 预算。
 
-- 量化 KV：`--kv-cache-dtype fp8_e5m2` 等（`mem_cache/kv_cache_dtype.py`）；
-- 权重量化：`--quantization fp8` / awq / gptq 等（`srt/layers/quantization/`、`model_loader/`）；
-- 内存 saver：`--enable-memory-saver`（TorchMemorySaverAdapter）。
+## 18.4 案例二：离线批处理吞吐上不去
 
-## 18.4 实战案例：从参数反推场景
+现象：GPU 利用率 60%，batch 上不去，显存还有富余。
 
-| 场景 | 推荐组合 |
-| --- | --- |
-| 在线低延迟（小并发） | 小 batch、禁用 chunk、优先 decode 延迟、CUDA graph 全覆盖 |
-| 离线高吞吐（批处理） | 大 batch、`max-running-requests` 拉满、混合 chunk |
-| 长上下文 | chunked prefill、PD 分离、注意力后端选长序列优化版本 |
-| 多租户 | Multi-LoRA + `enable-lora-overlap-loading` + 优先级调度 |
-| DeepSeek 级 MoE | TP+EP 组合、MLA 后端、speculative（MTP/DFlash） |
+排查：
 
-## 18.5 本章小结
+1. `max_running_requests` 是否卡住 batch 上限 → 调大；
+2. CUDA graph 是否覆盖目标 batch → `--cuda-graph-bs` 补上；
+3. CPU 侧是否成为瓶颈 → 开 overlap，检查 `schedule_policy` 的排序开销（LPM 在大队列会退化 FCFS）；
+4. 显存其实够，但 allocator 的页碎片/保留导致可用量低 → 调 `page_size` 或看 pool 统计。
 
-- 调优 = 明确指标 → 测基线 → 定位瓶颈 → 改参数 → 复测。
-- 参数集中在 `server_args.py`，分为显存、调度、执行加速三大类。
-- SGLang 特有的调优维度是前缀缓存命中率与 CUDA graph 覆盖。
-- 下一章讲怎么观察：metrics、trace、profiling 与 benchmark。
+## 18.5 案例三：长上下文（100k+）
+
+长上下文会把三类资源同时逼到极限：
+
+1. **KV 显存**：线性增长，100k token × 多层 × 多请求很快爆掉 → 量化 KV、PD 分离（P 侧专门吃长 prompt）、HiCache 存储级缓存；
+2. **prefill 计算**：首 token 延迟和 prompt 长度成正比 → chunked prefill 让其他请求能插队；
+3. **attention 复杂度**：全量 attention 是平方级 → 稀疏注意力模型（DSA 等）+ 对应 backend。
+
+这也是为什么官方把 GB300 长上下文单独写 blog：**长上下文不是一个参数能解决的，需要架构级组合**。
+
+## 18.6 一个被低估的参数：new_token_ratio
+
+调度器里有个"新 token 比例"的估算（`new_token_ratio_tracker`），它影响 decode 请求预留多少 KV 空间。如果你的负载是"输出特别长"（如 Agent 写长文），这个比例会被持续低估/高估，导致 prefill 挤占 decode 的显存预算。观察 pool 使用率与预估值是否偏差大，是调优时容易漏的一环。
+
+## 18.7 调优方法论总结
+
+```text
+1. 明确优化指标（TTFT / TPOT / 吞吐 / 成本）
+2. 测基线，记录指标与 GPU/CPU/显存利用率
+3. 用 18.2 的表定位瓶颈（先看利用率，再看队列，再看缓存）
+4. 一次只改一个参数，复测
+5. 回归验证：精度（量化）、正确性（投机/PD）不能牺牲
+```
+
+## 18.8 本章小结
+
+- 调优是"定位瓶颈"的游戏，不是"堆参数"。
+- 三张表：利用率表（CPU/GPU/显存）、缓存表、显存表。
+- 三个案例覆盖在线、离线、长上下文三类典型负载。
+- 每次只改一个变量，用指标验证，别信感觉。
+
+> 下一章：怎么观察和排查——metrics、trace、benchmark 与故障流程。

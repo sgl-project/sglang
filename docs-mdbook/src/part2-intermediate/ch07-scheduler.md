@@ -1,141 +1,182 @@
-# 第 7 章 调度器 Scheduler：连续批处理与事件循环
+# 第 7 章 调度器代码走读：下一批跑什么、为什么
 
-## 7.1 为什么调度器是灵魂
+> 前置要求：先读第 3 章的心智模型，或至少知道 waiting queue / running batch / prefill / decode 是什么。
+> 本章代码全部来自 `python/sglang/srt/managers/scheduler.py` 与 `schedule_policy.py`。
 
-GPU 做一次前向，代价与 batch 大小几乎无关（小 batch 时），因此**能塞多少请求进一个 batch，吞吐就有多大**。但请求到达是随机的：有刚来的长 prompt（prefill）、有进行到一半的短尾巴（decode）、有要中止的、有带不同采样约束的。调度器就是回答三件事的引擎：
+## 7.1 先找到主角
 
-1. **现在跑谁**（等待队列 → running batch）；
-2. **跑成什么样**（prefill batch 还是 decode batch，还是混合）；
-3. **显存不够怎么办**（谁被抢占、谁被淘汰）。
+`Scheduler` 类在 `scheduler.py` 第 359 行，类的文档注释只有一句：*"A scheduler that manages a tensor parallel GPU worker."*——它管理着一个 TP 组的 GPU worker。
 
-SGLang 的调度器位于 `python/sglang/srt/managers/scheduler.py`，核心类是 `Scheduler`（第 359 行），注释写着："A scheduler that manages a tensor parallel GPU worker."
+调度器是**独立进程**（由 `entrypoints/engine.py` 用 `run_scheduler_process` 拉起），与 HTTP 层通过 ZMQ 通信。它内部持有：
 
-## 7.2 Scheduler 的初始化：一个进程就是一套世界
+- `waiting_queue`：等待中的请求列表；
+- `running_batch`：正在跑的 `ScheduleBatch`；
+- `tree_cache`：前缀缓存（第 8 章的主角）；
+- `token_to_kv_pool_allocator`：KV 显存分配器。
 
-`Scheduler.__init__` 要做的事极多，重要的一批：
+## 7.2 事件循环：调度器的"心跳"
 
-- `init_ipc_channels`：建立与 TokenizerManager/Detokenizer 的 ZMQ 通道；
-- `init_model_config` / `init_tp_model_worker`：解析模型配置、初始化 GPU worker（ModelRunner）；
-- `init_memory_pools`：创建 req_to_token 池与 KV 池（`mem_cache/memory_pool.py`）；
-- `init_all_attention_backends` / `init_all_cuda_graphs`：准备注意力内核与 CUDA graph 缓存；
-- `init_chunked_prefill`：决定长 prefill 是否分块；
-- `init_schedule_policy`：选择调度策略；
-- `init_disaggregation`：PD 分离模式下注册传输队列；
-- `init_overlap`：CPU 调度与 GPU 执行重叠模式。
-
-读代码时建议从 `run_event_loop` 倒着往上读：先看"循环里做什么"，再回头理解每个初始化步骤为什么存在。
-
-## 7.3 事件循环：两种形态
-
-### event_loop_normal（第 1632 行）
-
-最简单的形态，循环体只有四步：
+最基础的模式是 `event_loop_normal`（第 1632 行），完整循环只有四步：
 
 ```python
-while True:
-    recv_reqs = self.request_receiver.recv_requests()   # 从 ZMQ 收新请求
-    self.process_input_requests(recv_reqs)              # 解析并放入 waiting queue
-    plan = self.get_next_batch_to_run(running_batch, last_batch)
-    self.running_batch = plan.running_batch
-    batch = plan.batch_to_run
-    if batch:
-        result = self.run_batch(batch)                  # 同步执行 GPU 前向
-        self.process_batch_result(batch, result)
-    else:
-        self.on_idle()                                  # 空闲自检
-    self.last_batch = batch
+def event_loop_normal(self):
+    """A normal scheduler loop."""
+    while True:
+        if self.gracefully_exit:
+            break
+
+        # Receive requests
+        recv_reqs = self.request_receiver.recv_requests()   # ① 从 ZMQ 收请求
+        self.process_input_requests(recv_reqs)              # ② 解析并放入 waiting_queue
+        if self._engine_paused:
+            continue
+
+        # Get the next batch to run
+        plan = self.get_next_batch_to_run(
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )                                                   # ③ 决策：下一批跑什么
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+
+        # Launch the current batch
+        if batch:
+            result = self.run_batch(batch)                  # ④ GPU 前向（同步阻塞）
+            self.process_batch_result(batch, result)        # ⑤ 处理结果
+        else:
+            self.on_idle()                                  # 空闲自检
+
+        self.last_batch = batch
 ```
 
-这个循环是**单线程阻塞式**的：调度决策和 GPU 前向交替进行。简单但浪费——GPU 在跑的时候 CPU 在等。
+读这段代码要注意一个反直觉的点：**循环里的"每一轮"不一定对应一个请求，而是对应一次 GPU 前向**。`batch` 可能是 prefill 批、decode 批，也可能为空（什么都不做）。
 
-### event_loop_overlap（第 1666 行）
+⑤ 处理结果时会发生什么？看 `process_batch_result`（第 3756 行）的职责：
 
-重叠模式把"上一批的结果处理"与"下一批的 GPU 执行"并行：
+1. 把新 token 追加到每个请求的 `output_ids`，判断是否 EOS / 达到 `max_new_tokens`；
+2. 完成的请求把 KV 写回前缀缓存（`tree_cache.cache_finished_req`）；
+3. 组一个"结果消息"发给 Detokenizer 进程；
+4. 更新指标（pool 用量、token 统计）。
+
+## 7.3 快照：事件循环的"状态机"本质
+
+把 ③④⑤ 连起来看，调度器其实在反复执行：
+
+```text
+读请求 → 更新队列状态 → 决策下一批 → 执行 → 根据结果更新状态 → 循环
+```
+
+`get_next_batch_to_run`（第 2872 行）开头还会做几件容易被忽略的事：
+
+- `_abort_on_waiting_timeout` / `_abort_on_running_timeout`：请求等待/运行超时直接中止；
+- chunked 请求的特殊处理：未完成的 chunk 请求要"插队"继续跑；
+- PD 分离模式下，prefill 批可能要先发缓存前缀的 KV。
+
+这说明调度循环不只是"组批"，还是一个**生命周期管理器**：请求的中止、超时、续跑都发生在这里。
+
+## 7.4 决策是怎么做出来的：组批的三层检查
+
+`get_new_batch_prefill`（第 3014 行）→ `_get_new_batch_prefill_raw` → `PrefillAdder`（`schedule_policy.py` 第 444 行）。
+
+`PrefillAdder` 构造时先算好"这轮还有多少预算"：
 
 ```python
-while True:
-    # 处理上一批结果
-    tmp_batch, tmp_result = self.result_queue.popleft()
-    self.process_batch_result(tmp_batch, tmp_result)
-
-    # 收请求、组批、启动这一批（异步）
-    ...
-    self.run_batch_async(batch)   # GPU 前向交给 stream，不阻塞
-    self.result_queue.append((batch, result_future))
+class PrefillAdder:
+    def __init__(self, page_size, tree_cache, token_to_kv_pool_allocator,
+                 running_batch, new_token_ratio, rem_input_tokens, rem_chunk_tokens,
+                 num_mixed_decode_tokens=0, ...):
+        self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        self.rem_chunk_tokens = rem_chunk_tokens
+        ...
 ```
 
-实现细节依赖 CUDA stream 的并发：调度器在 `schedule_stream` 上做 CPU 工作，模型在 `forward_stream` 上做 GPU 工作，中间用 WAR barrier（写后读屏障）保证共享内存池不冲突。这个机制是"零开销调度器"卖点的来源，也是 `scheduler.py` 里最微妙的部分之一。
+然后主循环遍历 `waiting_queue`，对每个请求做三类检查（见 `_get_new_batch_prefill_raw` 中的循环）：
 
-## 7.4 队列与请求对象
+```text
+对每个请求：
+  ① 显存检查：allocator 还能分配足够的 KV 页吗？
+     → 不够：要么抢占 running batch 里优先级低的请求，要么停手
+  ② token 预算检查：加上这个请求，prefill 总 token 数超 max_prefill_tokens 吗？
+     → 超了：把它切成 chunk（chunked prefill），下一轮继续
+  ③ 请求数检查：batch 人数达到 max_running_requests 吗？
+     → 到了：标记 batch full，后面的等下轮
+```
 
-- **waiting_queue**：`List[Req]`，新请求先在这里排队；
-- **running_batch**：`ScheduleBatch`（`managers/schedule_batch.py` 第 1923 行），当前正在执行的请求集合；
-- **Req**（`schedule_batch.py` 第 771 行）：调度器内部的请求表示，字段包括 `rid`、`origin_input_ids`、`output_ids`、`sampling_params`、`kv_committed_len`、`lora_id`、`priority`、`session` 等。
+顺序很重要：**显存检查在最前**，因为显存是硬约束，token 数是软约束。
 
-`Req` 与 HTTP 层的 `GenerateReqInput` 是两套对象：前者是"调度器的视图"，后者是"网络的视图"。
-
-## 7.5 组批：PrefillAdder 与 DecodeAdder
-
-调度策略定义在 `managers/schedule_policy.py`：
-
-- `SchedulePolicy.calc_priority()` 给 waiting queue 排序。策略包括：
-  - **LPM**（Longest Prefix Match）：优先跑能命中前缀缓存最多的请求（cache-aware）；
-  - **FCFS**（先来先服务）；
-  - **LOF**（Longest Output First）、**RANDOM**、**DFS_WEIGHT** 等。
-  - 一个工程细节：LPM 在队列超过 128 时会自动降级为 FCFS，避免排序开销过大（`_determine_active_policy`）。
-
-- `PrefillAdder`（`schedule_policy.py` 第 444 行）把 waiting queue 的请求装进 prefill batch，受以下约束：
-  - `max_running_requests`：batch 上限；
-  - `max_prefill_tokens`：单批 prefill 总 token 上限；
-  - `chunked_prefill_size`：单个超长请求被切成多少 token 一块；
-  - 显存预算：由 `token_to_kv_pool_allocator` 决定还能分配多少页。
+`calc_priority`（`schedule_policy.py` 第 186 行）决定遍历顺序。策略枚举：
 
 ```python
-adder = PrefillAdder(
-    self.page_size,
-    self.tree_cache,
-    self.token_to_kv_pool_allocator,
-    running_batch,
+class SchedulePolicy:
+    Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
+```
+
+- **LPM**（Longest Prefix Match，缓存感知）：先算每个请求能命中多少缓存前缀（`_compute_prefix_matches`），按命中量从大到小排。命中越多，这轮要算的越少，GPU 越省。
+- **FCFS**：先来先服务，不看缓存。
+- **LOF**：输出越长的越优先（避免短请求把长请求饿死，用于 decode 混合场景）。
+- 工程细节：LPM 在等待队列超过 128 个请求时会自动退化成 FCFS（`_determine_active_policy`）——因为对 128+ 个请求逐个做前缀匹配的 CPU 开销，可能比省下的 GPU 时间还多。
+
+## 7.5 Chunked prefill 的循环细节
+
+`_get_new_batch_prefill_raw` 里有这样一段：
+
+```python
+if self.chunked_req is not None:
+    self.chunked_req.init_next_round_input()
+    self.chunked_req = adder.add_chunked_req(self.chunked_req)
+```
+
+含义：上一个 chunk 跑完后，调度器记得"这个请求还有一半没算"（`chunked_req` 非空），下一轮**先**把它接着算完，再处理新请求。`init_next_round_input` 把剩余段变成这一轮的输入。
+
+这样长请求（比如 100k token）就不会独占 GPU：它每次只算一小块，中间可以穿插其他请求的 decode。
+
+## 7.6 抢占：显存不够时的不变量
+
+当 allocator 说"没页了"，调度器有两种选择：这轮不加新请求，或者**把 running batch 里的请求移出去**（CPU preemption）。
+
+被抢占的请求不是从头再来——它的 KV 已经按 token 提交到前缀缓存里了，之后可以**从断点续跑**。这个能力依赖第 8 章的缓存设计，先记住不变量：
+
+> **不变量：任何时刻，一个请求的 KV 都是"从开头到某个位置"的连续前缀。** 有了这个不变量，抢占 = 摘下来，续跑 = 接着算，永远不需要重算。
+
+## 7.7 重叠模式：让 CPU 调度和 GPU 计算并行
+
+`event_loop_normal` 是"算完再调度"，GPU 干活时 CPU 闲着。`event_loop_overlap`（第 1666 行）把两步叠起来：
+
+```python
+def event_loop_overlap(self):
     ...
-)
-for req in self.waiting_queue:
-    # 判断能否加入、要不要抢占、是否截断为 chunk
+    while True:
+        def pop_and_process():
+            # 处理上一批的结果（CPU 活）
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        ...
+        # 把这一批的 GPU 前向丢到另一个 CUDA stream 上异步执行
+        # 不阻塞，立刻回到循环继续做下一批的调度准备
+```
+
+实现细节依赖 CUDA stream：调度器在 `schedule_stream` 上做 CPU 准备，模型在 `forward_stream` 上做 GPU 前向，中间用"写后读屏障"（WAR barrier）保证两者不踩到同一块显存缓冲。`run_batch` 里能看到：
+
+```python
+with self.forward_stream_ctx:
+    self.forward_stream.wait_stream(self.schedule_stream)
     ...
 ```
 
-`scheduler.py` 的 `get_new_batch_prefill`（第 3014 行）与 decode 分支共同构成 `get_next_batch_to_run`（第 2872 行）的核心。
+这就是 SGLang "零开销调度器"的来源：GPU 算这一批的时候，CPU 已经把下一批准备好了。
 
-## 7.6 Chunked Prefill：长请求不被饿死
+## 7.8 自己动手的实验
 
-一个 100k token 的请求如果整段 prefill，会独占 GPU 很久，导致后续请求 TTFT 爆炸。SGLang 的 chunked prefill 把它切成 `chunked_prefill_size` 的小块（`--chunked-prefill-size` 可指定，`-1` 表示禁用；默认值按显存自动确定，T4 为 2k、H100 为 8k、B200 为 16k，见 `server_args.py` 的 `_validate_cuda_graph_config` 中按 `gpu_mem` 分档的逻辑），块之间可以插入 decode 或别的 prefill。实现上，`Req` 有 `chunked_prefill_size` 与 `chunked_req` 状态，调度器在 `_get_new_batch_prefill_raw` 里用 `add_chunked_req` 把未完成块重新放回调度。
+1. **观察两种策略的差别**：同一批 50 个请求（其中 10 个共享前缀），分别用 `--schedule-policy lpm` 和 `fcfs` 跑，对比总耗时与 TTFT 分布。
+2. **看 chunked prefill**：发一个 10k token 的请求，`--log-level debug`，观察日志里它是被切成了多少块跑的。
+3. **看抢占**：小显存（`--mem-fraction-static 0.3`）+ 高并发，观察日志里的 preempt 相关输出。
+4. **开 overlap 对比**：`--enable-overlap-schedule` 开关前后，对比同负载下的吞吐。
 
-## 7.7 抢占与显存不足
+## 7.9 本章小结
 
-当显存不足（allocator 返回可分配页数为 0）时：
+- 调度器 = 无限循环：收请求 → 组批 → 执行 → 处理结果。
+- 组批是三层预算检查（显存 / token / 请求数），顺序体现硬软约束。
+- LPM 策略让"缓存命中多的请求"优先，是 SGLang 吞吐的独门武器。
+- Chunked prefill 与抢占依赖同一个不变量：请求 KV 永远是连续前缀。
+- 重叠模式用 CUDA stream 让 CPU 调度和 GPU 计算并行。
 
-1. **CPU 抢占**：把某些请求从 running batch 里移出，释放其 KV 页（`mem_cache` 的 free 操作）；
-2. 被抢占请求的进度保留在前缀缓存中，等空间恢复后可从断点继续（因为 KV 是按 token 提交的，天然支持续跑）；
-3. `min_free_slots_delayer`、`prefill_delayer` 等机制则反过来：宁可让 prefill 等一等，也要保住 decode 的延迟。
-
-这种"运行中请求可被摘除并续跑"的能力，依赖第 8 章的 Radix Cache 设计。
-
-## 7.8 结果处理：process_batch_result
-
-`process_batch_result`（第 3756 行）做四类事：
-
-- **更新 Req 状态**：把新生成的 token 追加到 `output_ids`，判断是否 EOS/达 max_tokens；
-- **KV 落缓存**：`tree_cache.cache_finished_req`（或 `insert`）把完成的请求写进 radix 树；
-- **产出响应**：组装 `GenerationBatchResult` 发给 detokenizer（走 `output_sender`/ZMQ）；
-- **维护指标**：更新 pool 用量、token 统计等（`metrics_reporter`、`new_token_ratio_tracker`）。
-
-## 7.9 与 DP Controller 的关系
-
-`managers/data_parallel_controller.py` 运行一个调度器之上的"调度器"：当 `--dp-size > 1` 时，请求先在 DP Controller 上按负载/缓存感知策略分发给某个 Scheduler（数据并行副本），每个副本各有自己的 `running_batch`。这是第 17 章路由话题的前奏。
-
-## 7.10 本章小结
-
-- Scheduler 是独立进程 + 无限事件循环，核心是"收请求 → 组批 → 执行 → 处理结果"。
-- 重叠模式下 CPU 调度与 GPU 前向并发，是 SGLang 吞吐优势的关键。
-- 组批由 SchedulePolicy 排序 + PrefillAdder/DecodeAdder 装填，受显存、token 预算、请求上限约束。
-- Chunked prefill 与抢占机制共同保证长请求和短请求公平共存。
-- 下一章看调度器依赖的地基：KV Cache 与 RadixAttention。
+> 下一章深入那个"被反复使用的缓存"：KV Cache 与 RadixAttention 的代码实现。
