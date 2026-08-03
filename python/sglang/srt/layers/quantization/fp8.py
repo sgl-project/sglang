@@ -1242,7 +1242,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
-                fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+                fp4_scale_dtype = (
+                    torch.float8_e8m0fnu
+                    if _use_aiter or use_intel_xpu_backend()
+                    else torch.float32
+                )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -1636,6 +1640,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 fp4_weight_dtype = _require_fp4_dtype() if _use_aiter else torch.int8
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+
+                if use_intel_xpu_backend():
+                    layer.w13_weight_scale_inv.data = (
+                        layer.w13_weight_scale_inv.data.view(torch.uint8)
+                    )
+                    layer.w2_weight_scale_inv.data = (
+                        layer.w2_weight_scale_inv.data.view(torch.uint8)
+                    )
 
                 if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
