@@ -29,9 +29,9 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
-    DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
+    _resolve_num_fused_shared_experts,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -564,7 +564,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        DeepseekV4ForCausalLM.determine_num_fused_shared_experts(self)
+        self.num_fused_shared_experts = _resolve_num_fused_shared_experts(config)
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -772,13 +772,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
+            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:

@@ -2469,6 +2469,32 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _resolve_num_fused_shared_experts(config: DeepSeekV4Config) -> int:
+    if get_exec().moe.disable_shared_experts_fusion:
+        return 0
+
+    if get_exec().moe.enforce_shared_experts_fusion:
+        if config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={config.n_shared_experts}."
+            )
+        return config.n_shared_experts
+
+    from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+    declare_load_time_override(
+        "deepseek_v4._resolve_num_fused_shared_experts",
+        {"disable_shared_experts_fusion": True},
+    )
+    log_info_on_rank0(
+        logger,
+        "Config does not support fused shared expert(s). "
+        "Shared experts fusion optimization is disabled.",
+    )
+    return 0
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     def __init__(
         self,
@@ -2489,7 +2515,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        self.num_fused_shared_experts = _resolve_num_fused_shared_experts(config)
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -2551,36 +2577,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
-
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_exec().moe.disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if get_exec().moe.enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-        else:
-            disable_reason = "Config does not support fused shared expert(s)."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
