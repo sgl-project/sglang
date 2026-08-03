@@ -120,6 +120,7 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
+    tp_redundant: bool = False,
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -127,6 +128,7 @@ def build_pool_entry(
         device_pool=device_pool,
         layer_mapper=_make_layer_mapper(layer_mapping, transfer_layer_num),
         is_primary_index_anchor=is_anchor,
+        tp_redundant=tp_redundant,
         host_evict_fn=host_evict_fn,
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
@@ -588,6 +590,7 @@ def build_hybrid_mamba_stack(
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
+            tp_redundant=use_mla,
         ),
         build_pool_entry(
             name=PoolName.MAMBA,
@@ -768,6 +771,7 @@ def build_anchor_sidecar_stack(
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
+            tp_redundant=use_mla,
         ),
         build_pool_entry(
             name=sidecar_pool_name,
@@ -775,6 +779,7 @@ def build_anchor_sidecar_stack(
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num,
+            tp_redundant=use_mla,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
