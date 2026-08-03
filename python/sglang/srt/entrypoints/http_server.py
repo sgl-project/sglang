@@ -430,13 +430,9 @@ async def lifespan(fast_api_app: FastAPI):
 
 # Fast API
 class ORJSONRequest(Request):
-    """Request whose ``json()`` uses orjson.
-
-    Large multimodal chat bodies (data-URL images are tens of MB) otherwise
-    pay stdlib ``json.loads`` inside FastAPI's dependency resolution; orjson
-    parses the same bytes several times faster. It is stricter on two RFC
-    8259 violations stdlib accepts: bare NaN/Infinity, and integers wider
-    than 64 bits -- both now reject with 400 instead of being parsed.
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
     """
 
     async def json(self) -> Any:

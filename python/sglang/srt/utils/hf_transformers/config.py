@@ -254,11 +254,9 @@ def get_config(
     )
 
     if model_override_args:
-        # Deep-merge dict-valued overrides into existing sub-configs, e.g.
-        # --json-model-override-args '{"text_config": {"num_hidden_layers": 5}}'
-        # on a VLM. A plain update() would setattr the whole sub-config to a
-        # dict, dropping every other field and breaking attribute access
-        # downstream.
+        # A plain update() setattrs a dict-valued override straight onto the
+        # config, so '{"text_config": {...}}' on a VLM would replace the whole
+        # sub-config with a dict and break attribute access downstream.
         for key, value in model_override_args.items():
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
