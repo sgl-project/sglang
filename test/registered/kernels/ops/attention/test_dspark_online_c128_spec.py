@@ -26,7 +26,9 @@ def _layout(bs: int, ragged: bool, device: str):
             [MAX_VERIFY_TOKENS] * bs,
         )
     verify_lens = torch.tensor([1, 3, 5, 8][:bs], dtype=torch.int32, device=device)
-    starts = torch.nn.functional.pad(torch.cumsum(verify_lens, 0)[:-1], (1, 0))
+    starts = torch.nn.functional.pad(
+        torch.cumsum(verify_lens, 0, dtype=torch.int32)[:-1], (1, 0)
+    )
     return verify_lens, starts, verify_lens.cpu().tolist()
 
 

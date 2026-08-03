@@ -109,7 +109,7 @@ def make_case(batch_size: int, num_verify_tokens: int, layout: str) -> Benchmark
             + 1
         )
         extend_start_loc = torch.nn.functional.pad(
-            torch.cumsum(verify_lens, dim=0)[:-1], (1, 0)
+            torch.cumsum(verify_lens, dim=0, dtype=torch.int32)[:-1], (1, 0)
         )
         num_input_tokens = int(verify_lens.sum().item())
     else:
