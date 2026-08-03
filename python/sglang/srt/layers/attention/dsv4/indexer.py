@@ -188,22 +188,30 @@ def fp8_paged_mqa_logits_torch_sm120(
 
     _QUERY_CHUNK = 1024
     if batch_size > _QUERY_CHUNK:
-        return torch.cat(
-            [
-                fp8_paged_mqa_logits_torch_sm120(
-                    q_fp8[start : start + _QUERY_CHUNK],
-                    kvcache_fp8,
-                    weight[start : start + _QUERY_CHUNK],
-                    seq_lens[start : start + _QUERY_CHUNK],
-                    page_table[start : start + _QUERY_CHUNK],
-                    deep_gemm_metadata,
-                    max_seq_len,
-                    clean_logits=clean_logits,
-                )
-                for start in range(0, batch_size, _QUERY_CHUNK)
-            ],
-            dim=0,
+        # Write each query chunk straight into one preallocated output. The
+        # previous torch.cat kept every sub-call's [chunk, max_seq_len] fp32
+        # output alive simultaneously, plus the concatenation -- at 1M context
+        # with B=8192 that is twice ~8.6 GB before any scoring work, and it is
+        # what OOMed after the chunk-size budget was fixed. The loop caps the
+        # transient at a single sub-output.
+        out = torch.full(
+            (batch_size, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
         )
+        for start in range(0, batch_size, _QUERY_CHUNK):
+            out[start : start + _QUERY_CHUNK] = fp8_paged_mqa_logits_torch_sm120(
+                q_fp8[start : start + _QUERY_CHUNK],
+                kvcache_fp8,
+                weight[start : start + _QUERY_CHUNK],
+                seq_lens[start : start + _QUERY_CHUNK],
+                page_table[start : start + _QUERY_CHUNK],
+                deep_gemm_metadata,
+                max_seq_len,
+                clean_logits=clean_logits,
+            )
+        return out
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
     assert (
