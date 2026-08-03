@@ -683,8 +683,16 @@ def pre_permute_standard_to_deep_gemm(
     # forwards the contiguous grouped GEMM is the intended interface: tokens
     # are compacted per expert, so no [E, m_max, ...] capacity buffers and
     # far fewer kernels. Small batches (decode eager / graph warmup+capture)
-    # stay on the masked path.
-    if hidden_states.shape[0] >= 512 and not torch.cuda.is_current_stream_capturing():
+    # stay on the masked path, as do quant configs the contiguous pre-permute
+    # cannot express (it re-quantizes activations at fp8 group 128).
+    if (
+        quant_info.use_fp8
+        and not quant_info.use_mxfp8
+        and not quant_info.is_fp4_experts
+        and quant_info.block_shape == [128, 128]
+        and hidden_states.shape[0] >= 512
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         return _pre_permute_standard_contiguous(
             hidden_states, topk_ids, topk_weights, runner_config, running_state
         )
@@ -831,9 +839,14 @@ def post_permute_deep_gemm_to_standard(
     topk_weights = running_state["topk_weights"]
 
     if running_state.get("contiguous", False):
-        gather_out = torch.zeros(
-            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-        )
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            gather_out = torch.zeros(
+                hidden_states_shape,
+                dtype=hidden_states_dtype,
+                device=hidden_states_device,
+            )
         ep_gather(
             runner_output.hidden_states,
             topk_ids,
