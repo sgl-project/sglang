@@ -10,11 +10,122 @@
 export const config = {
   modelName: "Kimi-K3",
 
-  // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8 TP16, or TP8/PP2 for
-  // Long-Context), GB200 (4×4 TP16 MNNVL), H200 (2×8 TP16/EP16, or 4×8 TP32/EP32
-  // for High-Throughput), H100 (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have
-  // serving recipes.
+  // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8: NOSPEC is PP2 × TP8 on
+  // Low-Latency, PP2 × DCPEP8 on Balanced and High-Throughput, while DSPARK
+  // re-lays the same 16 as flat TP16 / DCPEP16), GB200 (4×4 TP16 MNNVL),
+  // H200 (2×8 TP16/EP16, or 4×8 TP32/EP32 for High-Throughput), H100
+  // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
   supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"],
+
+  // ---- Cell introspection (config-internal; the engines ignore these keys) ----
+  //
+  // The overlay callbacks below are handed only the SELECTION, never the resolved
+  // cell, so anything they need to know about the recipe has to be looked up.
+  // Doing that lookup here — instead of restating it as per-hardware tables —
+  // keeps one source of truth: the cell's own flags. A recipe that gains DCP, or
+  // drops a pipeline stage, or a whole new platform, then needs no edit to the
+  // overlay logic. The tables it replaces had to be revised by hand for every
+  // such change, and a missed revision is invisible (the panel just quietly
+  // emits a shape the server rejects).
+  //
+  // Mintlify strips module-level statements from snippets, so these live as
+  // properties on the exported object and are called as `config.cellFor(s)`.
+  cellFor(s) {
+    return (config.cells || []).find(
+      (c) => c.match.hw === s.hw &&
+             c.match.pdMode === s.pdMode &&
+             c.match.strategy === s.strategy);
+  },
+  // Flags are authored as "--name value" / "--name=value" strings, matching how
+  // _deployment.jsx splits them for stripPrefixes.
+  flagOf(cell, name) {
+    return ((cell || {}).flags || []).find((f) => f.split(/[\s=]/)[0] === name);
+  },
+  // Absent parallelism flags mean 1 (SGLang's own default), so callers can do
+  // arithmetic without null checks.
+  sizeOf(cell, name) {
+    const f = config.flagOf(cell, name);
+    return f ? Number(f.split(/[\s=]/)[1]) || 1 : 1;
+  },
+  // Does this recipe shard the TP-replicated MLA KV? Replaces the per-platform
+  // "which cells carry DCP" tables the HiCache tiers used to hardcode.
+  hasDcp(s) {
+    return !!config.flagOf(config.cellFor(s), "--dcp-size");
+  },
+  // A pp_size == 1 speculative algorithm cannot run a pipelined recipe. Cells
+  // that would rather be re-laid flat than blocked opt in with
+  // `specCollapsePp: true`; the rest are simply unavailable under speculation.
+  isPipelined(s) {
+    return config.sizeOf(config.cellFor(s), "--pp-size") > 1;
+  },
+  specCollapses(s) {
+    return config.isPipelined(s) && !!(config.cellFor(s) || {}).specCollapsePp;
+  },
+  // The playground's chip `disable` is declarative only (no predicates), so the
+  // DCP-carrying recipes are enumerated — but generated from the cells here
+  // rather than typed out per platform, so it is the same single source of truth
+  // as hasDcp() above. One rule per (hardware, PD role): which strategies carry
+  // DCP varies along both axes — B200 reaches DCP only at High-Throughput when
+  // unified, but carries it on Balanced too in the decode role — and keying on
+  // hw+strategy alone (as the hand-written rules did) cannot express that without
+  // over-matching one role or under-matching the other.
+  get dcpStorageDisableRules() {
+    const groups = new Map();
+    for (const c of (config.cells || [])) {
+      if (!config.flagOf(c, "--dcp-size")) continue;
+      const k = `${c.match.hw}|${c.match.pdMode}`;
+      if (!groups.has(k)) groups.set(k, new Set());
+      groups.get(k).add(c.match.strategy);
+    }
+    return [...groups].map(([k, strategies]) => {
+      const [hw, pdMode] = k.split("|");
+      return {
+        when: { hw: [hw], pdMode: [pdMode], strategy: [...strategies],
+                hicache: ["l2"], spec: ["none"] },
+        reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2.",
+      };
+    });
+  },
+  // Companion to the hand-written TP/DP-Attention rules below, which enumerate
+  // the platforms whose recipes are too small for a 16-rank knob. Those cover the
+  // flat recipes; this covers the other reason a knob cannot widen — the recipe
+  // spends its ranks on pipeline stages instead. Only cells that never collapse
+  // the pipeline are listed (a specCollapsePp cell becomes flat under DSPARK and
+  // is handled by its own spec-keyed rule), so no `spec` key is needed here.
+  get pipelinedKnobDisableRules() {
+    const groups = new Map();
+    for (const c of (config.cells || [])) {
+      if (config.sizeOf(c, "--pp-size") <= 1 || c.specCollapsePp) continue;
+      const k = `${c.match.hw}|${c.match.pdMode}`;
+      if (!groups.has(k)) groups.set(k, new Set());
+      groups.get(k).add(c.match.strategy);
+    }
+    return [...groups].map(([k, strategies]) => {
+      const [hw, pdMode] = k.split("|");
+      return {
+        when: { hw: [hw], pdMode: [pdMode], strategy: [...strategies] },
+        reason: "This recipe spends its ranks on pipeline stages (--pp-size > 1 with a small --tp-size), so widening the attention parallelism would need more GPUs than the deployment has. Pick a flat recipe to change TP or DP-Attention.",
+      };
+    });
+  },
+  // Fold the pipeline back into the other axes at constant world size:
+  // TP8 × PP2 -> TP16, and DCP8/EP8 scale with it -> DCP16/EP16. Derived from
+  // the cell rather than written out, so it stays right if a cell is re-shaped.
+  specCollapsedFlags(s) {
+    const cell = config.cellFor(s);
+    const pp = config.sizeOf(cell, "--pp-size");
+    const out = [`--tp-size ${config.sizeOf(cell, "--tp-size") * pp}`];
+    // HiCache under DCP rejects speculative decoding, so when a host tier is on
+    // the DCP half is dropped instead of scaled (the HiCache options' own
+    // stripPrefixes reach cell flags only, never these overlay flags).
+    if (config.flagOf(cell, "--dcp-size") && s.hicache !== "l2" && s.hicache !== "l3") {
+      out.push(`--dcp-size ${config.sizeOf(cell, "--dcp-size") * pp}`);
+    }
+    if (config.flagOf(cell, "--ep-size")) {
+      out.push(`--ep-size ${config.sizeOf(cell, "--ep-size") * pp}`);
+    }
+    return out;
+  },
 
   // Single checkpoint and a single shipped quantization (MXFP4), so neither is a
   // reader-facing axis. Node count is fixed by the hardware recipe (B200 2x8,
@@ -41,13 +152,7 @@ export const config = {
         { id: "balanced",        label: "Balanced",        showWhen: (s) => s.pdMode !== "prefill" },
         { id: "high-throughput", label: "High-Throughput", showWhen: (s) => s.pdMode !== "prefill" },
         { id: "default",         label: "Default",         showWhen: (s) => s.pdMode === "prefill" },
-        {
-          id: "long-context",
-          label: "Long-Context",
-          showWhen: (s) =>
-            s.pdMode === "prefill" ||
-            (s.pdMode === "unified" && s.hw === "b200"),
-        },
+        { id: "long-context",    label: "Long-Context",    showWhen: (s) => s.pdMode === "prefill" },
       ],
     },
   ],
@@ -64,15 +169,32 @@ export const config = {
         {
           id: "dspark",
           label: "DSPARK",
-          disabled: (s) => s.strategy === "long-context",
+          // DSPARK requires pp_size == 1, so a pipelined recipe is either re-laid
+          // flat (cells opting in with `specCollapsePp`) or unavailable. Both
+          // branches read --pp-size off the cell, so no platform is named here:
+          // whichever recipes happen to be pipelined are the ones affected.
+          // Combinations with no published cell are left alone here — they render
+          // an empty command panel either way, and gating on cell existence would
+          // change this button on every such combination across every platform,
+          // which is a separate decision from how speculation reads a recipe.
+          disabled: (s) => config.isPipelined(s) && !config.specCollapses(s),
           disableReason:
-            "The Long-Context recipes use pipeline parallelism (--pp-size 2 on B200 Unified, --pp-size 8 on Prefill), while DSPARK currently requires pp_size == 1.",
+            "This recipe is pipelined (--pp-size > 1) and DSPARK requires pp_size == 1. Pick a recipe that runs a single pipeline stage, or run this one NOSPEC.",
+          // Where a cell does opt in, DSPARK rewrites its parallelism instead of
+          // layering on top: the pipeline is stripped and folded into the other
+          // axes at constant world size (see specCollapsedFlags). Cells that are
+          // already flat are untouched.
+          stripPrefixes: (s) =>
+            config.specCollapses(s)
+              ? ["--tp-size", "--pp-size", "--dcp-size", "--ep-size"]
+              : [],
           // Every DSPARK recipe layers ReplaySSM on: it moves the per-draft
           // intermediate SSM states onto a fixed ring, lifting the concurrency
           // the state pool admits (needs the Triton decode kernel, the K3
           // default). Only the PD prefill role opts out — it never runs verify
           // and rejects the flag at startup.
           flags: (s) => [
+            ...(config.specCollapses(s) ? config.specCollapsedFlags(s) : []),
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Kimi-K3-DSpark",
             "--speculative-dspark-block-size 7",
@@ -118,19 +240,19 @@ export const config = {
           // point is dropped instead of blocking the option, same as L3 does. The
           // ratio calculator reads --dcp-size off this command, so dropping it also
           // re-solves --mamba-full-memory-ratio for the plain-TP shape.
+          //
+          // Which cells carry DCP is read off the cells themselves, so adding or
+          // reshaping a DCP recipe needs no edit here.
           stripPrefixes: (s) =>
-            ["b300", "gb300", "b200", "gb200"].includes(s.hw) &&
-            ["balanced", "high-throughput"].includes(s.strategy) &&
-            s.spec !== "none"
+            s.spec !== "none" && config.hasDcp(s)
               ? ["--dcp-size", "--dcp-comm-backend"]
               : [],
           hints: (s) =>
-            ["b300", "gb300", "b200", "gb200"].includes(s.hw) &&
-            ["balanced", "high-throughput"].includes(s.strategy) &&
-            s.spec !== "none"
+            s.spec !== "none" && config.hasDcp(s)
               ? [
                   "HiCache under DCP rejects speculative decoding, so this recipe drops DCP",
-                  "and runs plain TP. Per-request context is far shorter than the DCP",
+                  "and serves the MLA KV TP-replicated (any PP/EP in the cell stays).",
+                  "Per-request context is far shorter than the DCP",
                   "version — DCP is what buys KV capacity. Run the cell NOSPEC to keep DCP.",
                 ]
               : [],
@@ -145,23 +267,24 @@ export const config = {
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
           // L3 under DCP is rejected at startup (the rank-0 replicated-MLA backup
           // and the storage keys are not dcp_rank-aware), so on the DCP recipes L3
-          // drops the DCP operating point and runs plain TP instead. The ratio
+          // drops the DCP operating point instead (only DCP — any PP/EP in the
+          // cell stays, so on B200 the result is not plain TP). The ratio
           // calculator reads --dcp-size off this command, so dropping it also
           // re-solves --mamba-full-memory-ratio for the plain-TP shape.
+          //
+          // Same cell-derived DCP test as the L1+L2 option above, except this one
+          // fires NOSPEC too rather than only under speculation.
           stripPrefixes: (s) =>
-            ["b300", "gb300", "b200", "gb200"].includes(s.hw) &&
-            ["balanced", "high-throughput"].includes(s.strategy)
-              ? ["--dcp-size", "--dcp-comm-backend"]
-              : [],
+            config.hasDcp(s) ? ["--dcp-size", "--dcp-comm-backend"] : [],
           hints: (s) =>
             [
               "L3 also needs a mooncake_master process on rank 0 and the config file",
               "above present on every rank — the launch command alone is not enough.",
-              ...(["b300", "gb300", "b200", "gb200"].includes(s.hw) &&
-              ["balanced", "high-throughput"].includes(s.strategy)
+              ...(config.hasDcp(s)
                 ? [
                     "L3 storage keys are not dcp_rank-aware yet, so this recipe drops DCP",
-                    "and runs plain TP. Concurrency lands on a similar target, but",
+                    "and serves the MLA KV TP-replicated (any PP/EP in the cell stays).",
+                    "Concurrency lands on a similar target, but",
                     "per-request context is far shorter than the DCP version — DCP is",
                     "what buys KV capacity.",
                   ]
@@ -239,35 +362,49 @@ export const config = {
           null, 8,
           {
             value: 16,
-            disable: [
+            get disable() { return [
               {
                 when: { hw: ["b300", "gb300"] },
                 reason: "TP=16 needs 16 ranks; the B300 and GB300 recipes have 8 ranks.",
               },
               {
-                when: { hw: ["b200"], strategy: ["long-context"] },
-                reason: "The B200 Long-Context recipe already uses all 16 GPUs as TP8 × PP2; changing TP to 16 would require 32 ranks.",
+                when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
+                reason: "With Spec Decode off, the B200 Unified recipes already use all 16 GPUs as TP8 × PP2, so changing TP to 16 would require 32 ranks. Switch Spec Decode to DSPARK — it drops the pipeline and re-lays the same GPUs as flat TP16.",
               },
-            ],
+              ...config.pipelinedKnobDisableRules,
+            ]; },
           },
         ]},
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null, false, 2, 4,
-            { value: 8, disable: { hw: ["b300", "gb300"] },
-              disableReason: "On an 8-rank deployment (B300 1×8, GB300 2×4) dp=8 leaves attn_tp=1, so each rank holds the full unsharded MLA KV and OOMs — prefer dp=2/attn_tp=4." },
+            {
+              value: 8,
+              get disable() { return [
+                {
+                  when: { hw: ["b300", "gb300"] },
+                  reason: "On an 8-rank deployment (B300 1×8, GB300 2×4) dp=8 leaves attn_tp=1, so each rank holds the full unsharded MLA KV and OOMs — prefer dp=2/attn_tp=4.",
+                },
+                {
+                  when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
+                  reason: "With Spec Decode off, the B200 Unified recipes run TP8 within each PP2 stage, so dp=8 leaves attn_tp=1 and each rank holds the full unsharded MLA KV — prefer dp=2/attn_tp=4, or switch Spec Decode to DSPARK for the flat TP16 shape.",
+                },
+                ...config.pipelinedKnobDisableRules,
+              ]; },
+            },
             {
               value: 16,
-              disable: [
+              get disable() { return [
                 {
                   when: { hw: ["b300", "gb300"] },
                   reason: "DP-Attention=16 needs 16 TP ranks; the B300 and GB300 recipes have 8.",
                 },
                 {
-                  when: { hw: ["b200"], strategy: ["long-context"] },
-                  reason: "The B200 Long-Context recipe uses TP8 within each PP stage, so DP-Attention cannot exceed 8.",
+                  when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
+                  reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so DP-Attention cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
                 },
-              ],
+                ...config.pipelinedKnobDisableRules,
+              ]; },
             },
           ],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -311,16 +448,17 @@ export const config = {
         null, 1, 2, 4, 8,
         {
           value: 16,
-          disable: [
+          get disable() { return [
             {
               when: { hw: ["b300", "gb300"] },
               reason: "EP=16 needs 16 TP ranks; the B300 and GB300 recipes have 8.",
             },
             {
-              when: { hw: ["b200"], strategy: ["long-context"] },
-              reason: "The B200 Long-Context recipe uses TP8 within each PP stage, so EP cannot exceed 8.",
+              when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
+              reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so EP cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
             },
-          ],
+            ...config.pipelinedKnobDisableRules,
+          ]; },
         },
       ]},
     },
@@ -373,17 +511,13 @@ export const config = {
       backends: [
         { id: null,       label: "Auto" },
         { id: "file",     label: "File",
-          disable: [{ when: { hw: ["b300", "gb300", "b200", "gb200"], strategy: ["balanced", "high-throughput"], hicache: ["l2"], spec: ["none"] },
-                      reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2." }] },
+          get disable() { return config.dcpStorageDisableRules; } },
         { id: "mooncake", label: "Mooncake",
-          disable: [{ when: { hw: ["b300", "gb300", "b200", "gb200"], strategy: ["balanced", "high-throughput"], hicache: ["l2"], spec: ["none"] },
-                      reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2." }] },
+          get disable() { return config.dcpStorageDisableRules; } },
         { id: "hf3fs",    label: "HF3FS",
-          disable: [{ when: { hw: ["b300", "gb300", "b200", "gb200"], strategy: ["balanced", "high-throughput"], hicache: ["l2"], spec: ["none"] },
-                      reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2." }] },
+          get disable() { return config.dcpStorageDisableRules; } },
         { id: "nixl",     label: "NiXL",
-          disable: [{ when: { hw: ["b300", "gb300", "b200", "gb200"], strategy: ["balanced", "high-throughput"], hicache: ["l2"], spec: ["none"] },
-                      reason: "This recipe runs DCP, and a storage backend (L3) under DCP is rejected at startup. Switch HiCache to L3 in the Deploy panel (that drops DCP), or stay on L1+L2." }] },
+          get disable() { return config.dcpStorageDisableRules; } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
@@ -575,7 +709,7 @@ export const config = {
           "--ep-size", "--ep", "--expert-parallel-size",
           "--enable-dp-attention", "--dp-size", "--enable-dp-lm-head",
           "--dcp-size", "--dcp-comm-backend",
-          // The B200 Long-Context cell carries --pp-size 2; left standing it
+          // Every B200 Unified cell carries --pp-size 2; left standing it
           // multiplies against the preset's --tp-size for a world size the
           // preset's own --nnodes cannot satisfy.
           "--pp-size", "--pipeline-parallel-size",
@@ -713,16 +847,24 @@ export const config = {
       ],
     },
     {
-      // Plain TP16 avoids pipeline bubbles at the shallow 16-request point.
+      // NOSPEC shape. PP2 × TP8 keeps every TP collective inside one node and
+      // halves the layer-local KV/state bill per GPU; the cross-node hop is a
+      // pipeline P2P the next microbatch hides, not an all-reduce to wait on.
+      // With DSPARK the Spec Decode overlay rewrites this to flat TP16 —
+      // speculation requires pp_size == 1.
       match: { hw: "b200", pdMode: "unified", strategy: "low-latency" },
       nnodes: 2,
+      // Under a pp_size == 1 speculative algorithm, re-lay this recipe flat at
+      // constant world size instead of making speculation unavailable.
+      specCollapsePp: true,
       verified: false,
       verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
+        "--tp-size 8",
+        "--pp-size 2",
         "--mem-fraction-static 0.85",
         "--disable-flashinfer-autotune",
         "--watchdog-timeout 3600",
@@ -734,18 +876,34 @@ export const config = {
       ],
     },
     {
-      // TP16 + DCP16 on two B200 nodes.
+      // PP2 × DCPEP8: DCP8 deduplicates the TP-replicated MLA KV within each
+      // pipeline stage, EP8 shards the 896 experts across the same 8 ranks.
+      // EP here is plain expert sharding (a2a backend stays `none`), so unlike
+      // DeepEP/MegaMoE it allocates no dispatch buffers to reclaim the KV DCP
+      // just bought. DSPARK rewrites the pair to TP16 + DCP16 + EP16.
       match: { hw: "b200", pdMode: "unified", strategy: "balanced" },
       nnodes: 2,
+      // Under a pp_size == 1 speculative algorithm, re-lay this recipe flat at
+      // constant world size instead of making speculation unavailable.
+      specCollapsePp: true,
       verified: false,
       verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
-        "--dcp-size 16",
+        "--tp-size 8",
+        "--pp-size 2",
+        "--dcp-size 8",
+        "--ep-size 8",
+        // Both pinned to the brought-up shape rather than left to the auto
+        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
+        // cubin pool the published image ships; drop it to get the Marlin
+        // fallback on an install without one.
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--watchdog-timeout 3600",
         "--reasoning-parser kimi_k3",
@@ -757,8 +915,12 @@ export const config = {
     },
     {
       // Balanced baseline; High-Throughput routes to the large-scale presets.
+      // Still redirects: the 16-GPU cell is the floor of the large-scale lane.
       match: { hw: "b200", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 2,
+      // Under a pp_size == 1 speculative algorithm, re-lay this recipe flat at
+      // constant world size instead of making speculation unavailable.
+      specCollapsePp: true,
       verified: false,
       verificationStatus: "in-progress",
       redirect: true,
@@ -767,35 +929,14 @@ export const config = {
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
-        "--dcp-size 16",
-        "--mem-fraction-static 0.85",
-        "--disable-flashinfer-autotune",
-        "--watchdog-timeout 3600",
-        "--reasoning-parser kimi_k3",
-        "--tool-call-parser kimi_k3",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      // Reference long-context launch: PP2 halves the layer-local KV/state
-      // footprint per GPU while TP8 spans each 8-GPU pipeline stage.
-      match: { hw: "b200", pdMode: "unified", strategy: "long-context" },
-      nnodes: 2,
-      verified: false,
-      verificationStatus: "in-progress",
-      env: [],
-      flags: [
-        "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--pp-size 2",
+        "--dcp-size 8",
+        "--ep-size 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
-        "--context-length 131072",
         "--chunked-prefill-size 8192",
-        "--mamba-radix-cache-strategy extra_buffer",
         "--disable-flashinfer-autotune",
         "--watchdog-timeout 3600",
         "--reasoning-parser kimi_k3",
@@ -1171,11 +1312,14 @@ export const config = {
       ],
     },
 
-    // ----- Prefill role: chunked, on the TP8 platforms. The prefill role keeps
-    // radix caching, so the Unified 5-slots-per-request state cost still holds
-    // (pool split rides the calculator-driven ratio). Default is TP8;
-    // Long-Context is one pipeline stage per GPU, which turns the parallelism
-    // comm from something you wait for into something the next microbatch hides.
+    // ----- Prefill role: chunked. The prefill role keeps radix caching, so the
+    // Unified 5-slots-per-request state cost still holds (pool split rides the
+    // calculator-driven ratio). Two shapes, split by cell width: the 8-GPU
+    // platforms (B300 1×8, GB300 2×4) run Default as TP8 and reserve deep PP for
+    // Long-Context, while the 16-GPU platforms (B200 2×8, GB200 4×4) run PP16 ×
+    // TP1 on both and differ only in --mem-fraction-static. Deep PP is one
+    // pipeline stage per GPU, which turns the parallelism comm from something you
+    // wait for into something the next microbatch hides.
     // Both roles must agree on --page-size and --kv-cache-dtype (the transfer
     // sanity-checks them at connect), so neither is pinned here. -----
     {
@@ -1346,6 +1490,81 @@ export const config = {
         "--weight-loader-prefetch-checkpoints",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend nixl",
+        "--disaggregation-bootstrap-port 8998",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      // B200 2×8 has the same 16 ranks as GB200 4×4, so the prefill role takes
+      // the same PP16 × TP1 shape — one pipeline stage per GPU. The pipeline is
+      // what makes this portable off MNNVL: the only cross-node traffic is a
+      // pipeline P2P handoff at the node boundary (one stage boundary out of 15,
+      // activations not weights), which the next microbatch hides, where a
+      // TP16 or TEP16 prefill would put an all-reduce on the same link and wait
+      // on it. Same caveat as GB200: below concurrency ~8 the pipeline cannot
+      // fill and `--tp-size 16 --ep-size 16` leads instead. No --enable-symm-mem
+      // and no DCP — at TP1 there is no TP collective to accelerate and no
+      // TP-replicated KV to shard. Pairs with all three B200 decode cells: SGLang
+      // requires `decode pp_size == prefill pp_size or 1`, and every B200 decode
+      // cell is flat TP16 (pp=1), so none of them carry the GB200 Low-Latency
+      // cell's PP2 constraint that forces a PP2 × TP8 prefill instead.
+      match: { hw: "b200", pdMode: "prefill", strategy: "default" },
+      nnodes: 2,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--pp-size 16",
+        "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--disable-flashinfer-autotune",
+        "--weight-loader-prefetch-checkpoints",
+        "--watchdog-timeout 3600",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        // Explicit multithread_load is also what keeps it on: prefetch otherwise
+        // forces the single-threaded loader to avoid I/O oversubscription.
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend nixl",
+        "--disaggregation-bootstrap-port 8998",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Same PP16 × TP1 shape as the Default cell with mem-fraction raised to
+      // 0.90 for KV headroom, exactly the GB200 pair's trade. TP1 is what buys
+      // the context length: with TP > 1 the MLA KV is replicated across the TP
+      // ranks, so TP2 × PP8 would hold roughly half the tokens for the same
+      // memory. Not yet benchmarked on long-context workloads.
+      match: { hw: "b200", pdMode: "prefill", strategy: "long-context" },
+      nnodes: 2,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--pp-size 16",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--disable-flashinfer-autotune",
+        "--weight-loader-prefetch-checkpoints",
+        "--watchdog-timeout 3600",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
         "--disaggregation-mode prefill",
         "--disaggregation-transfer-backend nixl",
         "--disaggregation-bootstrap-port 8998",
@@ -1903,7 +2122,10 @@ export const config = {
   // Cross-node fabric env (substitute the NIC used by every rank).
   multiNodeHints: {
     b200: [
-      "Low-Latency, Balanced, and High-Throughput use TP16 across both nodes; Long-Context uses TP8 within each PP2 stage.",
+      // One hint list per hw, shared by every cell, so it has to name the shape
+      // per role rather than assume the Unified one.
+      "Unified with Spec Decode off runs TP8 within a node and PP2 across the two (+DCP8/EP8 on Balanced and High-Throughput); with DSPARK (pp_size == 1) it runs TP16 across both nodes instead.",
+      "Prefill is TP1 × PP16 — one pipeline stage per GPU, non-speculative only. Decode is flat TP16 (+DCP16 on Balanced and High-Throughput).",
       "Multi-node K3 needs the cross-node NIC pinned on BOTH ranks:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
       "  NCCL_SOCKET_IFNAME=<your-nic>   # force NCCL off kube-ipvs0",
