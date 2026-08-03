@@ -354,7 +354,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                     # Skip loading mm/language parameters
                     if (
-                        self.config.encoder_only or self.config.language_only
+                        self.config.encoder_only
+                        or self.config.language_only
+                        or getattr(self.config, "language_model_only", False)
                     ) and name not in params_dict:
                         continue
 
