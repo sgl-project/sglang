@@ -35,7 +35,7 @@ _L2_NORM_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_L2_NORM_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -115,7 +115,7 @@ def _activate_gate(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_GATE_FIXED_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -254,7 +254,7 @@ def _gate_cumsum_operands_fixed(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_GATE_VARLEN_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -483,7 +483,7 @@ _INTRA_MATRIX_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_INTRA_MATRIX_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -783,7 +783,7 @@ _SOLVE_RECOMPUTE_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_SOLVE_RECOMPUTE_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -1110,7 +1110,7 @@ _STATE_VARLEN_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_STATE_FIXED_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -1238,7 +1238,7 @@ def _chunk_state(
 
 
 _chunk_state_varlen = helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_STATE_VARLEN_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_chunk_state.fn)
@@ -1254,7 +1254,7 @@ _OUTPUT_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=True,
+    static_shapes=False,
     config=_OUTPUT_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )

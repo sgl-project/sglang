@@ -160,13 +160,13 @@ def _helion_fused_recurrent_kda_packed_decode_body(
 
 _helion_fused_recurrent_kda_packed_decode = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
-    static_shapes=True,
+    static_shapes=False,
     config=_KDA_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
 _helion_fused_recurrent_kda_packed_decode_bf16 = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
-    static_shapes=True,
+    static_shapes=False,
     config=_KDA_BF16_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
