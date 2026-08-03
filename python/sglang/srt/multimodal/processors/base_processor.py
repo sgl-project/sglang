@@ -1610,7 +1610,8 @@ class BaseMultimodalProcessor(ABC):
 
         self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
-        # Wrap GPU features in the bounded IPC pool; pool misses fall back to CPU.
+        # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
+        # plain CPU tensor. The scheduler copies out and releases each slice.
         if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
