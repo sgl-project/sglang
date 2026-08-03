@@ -4,12 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, info};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::{
-        steps::workflow_data::WorkerUpdateWorkflowData, BasicWorkerBuilder, HealthConfig, Worker,
-    },
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+use crate::core::{
+    steps::workflow_data::WorkerUpdateWorkflowData, BasicWorkerBuilder, HealthConfig, Worker,
 };
 
 /// Step to update worker properties.
@@ -80,6 +78,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 success_threshold: request
                     .health_success_threshold
                     .unwrap_or(existing_health.success_threshold),
+                disable_health_check: request
+                    .disable_health_check
+                    .unwrap_or(existing_health.disable_health_check),
             };
 
             // Determine API key: use new one if provided, otherwise keep existing

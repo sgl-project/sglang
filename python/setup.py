@@ -1,125 +1,199 @@
-"""
-Custom setup.py for SGLang that compiles protobuf files during build.
+"""sglang build hooks.
 
-This file works alongside pyproject.toml. It hooks into the build process
-to automatically generate gRPC/protobuf Python files from .proto sources
-when building the wheel or doing editable installs.
+Rust extensions are auto-discovered from the cargo workspace in ../rust: every
+crate whose Cargo.toml declares
+
+    [package.metadata.sglang]
+    python-module = "sglang.srt.<pkg>._core"   # import path inside the wheel
+    debug = false                              # optional RustExtension knob
+
+is built as a PyO3 extension module at that import path. Adding a new extension
+crate therefore needs no pyproject changes — declare the metadata in the crate.
+
+Two filters can narrow the discovered set:
+
+- [tool.sglang] rust-extensions in the active pyproject.toml: a list of
+  case-insensitive substrings of the target module. Platform pyprojects use
+  this to build a subset (e.g. pyproject_other.toml builds only "multimodal";
+  grpc needs proto/tonic and is intentionally CUDA-only).
+- SGLANG_BUILD_RUST_EXTS env var, applied at build time on top of the above:
+  unset or "all" builds everything, "none" builds nothing, and a
+  comma-separated list matches substrings, e.g. "grpc" matches
+  "sglang.srt.grpc._core". It is read directly from os.environ instead of
+  sglang.srt.environ, which is not importable until the package is built.
 """
 
+import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
 from setuptools import setup
-from setuptools.command.build_py import build_py
-from setuptools.command.develop import develop
-from setuptools.command.egg_info import egg_info
-from setuptools.errors import SetupError
 
-PROTO_SOURCE = "sglang/srt/grpc/sglang_scheduler.proto"
+try:
+    from setuptools_rust import Binding, RustExtension, build_rust
+except ModuleNotFoundError as exc:
+    if exc.name != "setuptools_rust":
+        raise
+    # Alternate platform pyprojects that build no Rust extensions do not
+    # install setuptools-rust.
+    build_rust = None
+
+_BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
+_PYTHON_DIR = Path(__file__).resolve().parent
+_RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
 
 
-def compile_proto():
-    """Compile the protobuf file to Python using grpc_tools.protoc."""
-    proto_path = Path(__file__).parent / PROTO_SOURCE
-
-    if not proto_path.exists():
-        print(f"Warning: Proto file not found at {proto_path}, skipping generation")
-        return
-
-    print(f"Generating gRPC files from {PROTO_SOURCE}")
-
-    output_dir = proto_path.parent
-    proto_dir = proto_path.parent
-
-    # Import grpc_tools.protoc directly instead of running as subprocess.
-    # This ensures we use the grpcio-tools installed in the build environment,
-    # since sys.executable may point to the main Python interpreter in
-    # pip's isolated build environments.
-    try:
-        import grpc_tools
-        from grpc_tools import protoc
-    except ImportError as e:
-        raise SetupError(
-            f"Failed to import grpc_tools: {e}. "
-            "Ensure grpcio-tools is listed in build-system.requires in pyproject.toml"
+def _cargo_workspace_metadata():
+    """The rust/ cargo workspace as JSON, straight from cargo's own parser."""
+    manifest_path = _RUST_WORKSPACE_DIR / "Cargo.toml"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"no cargo workspace at {manifest_path} (building outside a repo "
+            f"checkout?); set {_BUILD_RUST_EXTS_ENV}=none to build without "
+            "Rust extensions"
         )
-
-    # Get the path to well-known proto files bundled with grpcio-tools
-    # (e.g., google/protobuf/timestamp.proto, google/protobuf/struct.proto)
-    grpc_tools_proto_path = Path(grpc_tools.__file__).parent / "_proto"
-
-    # Build the protoc arguments (protoc.main expects argv-style list)
-    args = [
-        "protoc",  # argv[0] is the program name
-        f"-I{proto_dir}",
-        f"-I{grpc_tools_proto_path}",  # Include path for well-known protos
-        f"--python_out={output_dir}",
-        f"--grpc_python_out={output_dir}",
-        f"--pyi_out={output_dir}",
-        str(proto_dir / proto_path.name),
-    ]
-
-    print(f"Running protoc with args: {args[1:]}")
-
-    # Save and restore cwd since protoc may change it
-    original_cwd = os.getcwd()
     try:
-        result = protoc.main(args)
-        if result != 0:
-            raise SetupError(f"protoc failed with exit code {result}")
-    finally:
-        os.chdir(original_cwd)
-
-    # Fix imports in generated grpc file (change absolute to relative imports)
-    _fix_imports(output_dir, proto_path.stem)
-
-    print(f"Successfully generated gRPC files in {output_dir}")
-
-
-def _fix_imports(output_dir: Path, proto_stem: str):
-    """Fix imports in generated files to use relative imports."""
-    grpc_file = output_dir / f"{proto_stem}_pb2_grpc.py"
-
-    if grpc_file.exists():
-        content = grpc_file.read_text()
-        # Change absolute import to relative import
-        old_import = f"import {proto_stem}_pb2"
-        new_import = f"from . import {proto_stem}_pb2"
-
-        if old_import in content:
-            content = content.replace(old_import, new_import)
-            grpc_file.write_text(content)
-            print("Fixed imports in generated gRPC file")
+        out = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--manifest-path",
+                str(manifest_path),
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "cargo is required to discover the Rust extension modules in "
+            f"{_RUST_WORKSPACE_DIR} (and to build them); install a Rust "
+            f"toolchain, or set {_BUILD_RUST_EXTS_ENV}=none to build without "
+            "Rust extensions"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"cargo metadata failed:\n{exc.stderr}") from exc
+    return json.loads(out.stdout)
 
 
-class BuildPyWithProto(build_py):
-    """Build Python modules, generating gRPC files from .proto sources first."""
-
-    def run(self):
-        compile_proto()
-        super().run()
-
-
-class DevelopWithProto(develop):
-    """Editable install with gRPC file generation."""
-
-    def run(self):
-        compile_proto()
-        super().run()
-
-
-class EggInfoWithProto(egg_info):
-    """Egg info generation with gRPC file generation."""
-
-    def run(self):
-        compile_proto()
-        super().run()
+def _match_by_substring(declared, tokens, source):
+    """Match tokens as case-insensitive substrings of extension names."""
+    matched = set()
+    unmatched = []
+    for token in tokens:
+        hits = {ext.name for ext in declared if token in ext.name.lower()}
+        if hits:
+            matched |= hits
+        else:
+            unmatched.append(token)
+    if unmatched:
+        declared_names = sorted(ext.name for ext in declared)
+        raise ValueError(
+            f"{source} matched no discovered Rust extension for: {unmatched}; "
+            f"discovered extensions are {declared_names}"
+        )
+    return [ext for ext in declared if ext.name in matched]
 
 
-setup(
-    cmdclass={
-        "build_py": BuildPyWithProto,
-        "develop": DevelopWithProto,
-        "egg_info": EggInfoWithProto,
-    },
-)
+def _discovered_rust_extensions():
+    """One RustExtension per workspace crate declaring a python-module."""
+    extensions = []
+    for package in sorted(
+        _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
+    ):
+        sglang_meta = (package["metadata"] or {}).get("sglang", {})
+        if "python-module" not in sglang_meta:
+            continue
+        extensions.append(
+            RustExtension(
+                target=sglang_meta["python-module"],
+                path=package["manifest_path"],
+                binding=Binding.PyO3,
+                debug=sglang_meta.get("debug"),
+            )
+        )
+    if not extensions:
+        raise RuntimeError(
+            f"no crate under {_RUST_WORKSPACE_DIR} declares "
+            "[package.metadata.sglang] python-module; set "
+            f"{_BUILD_RUST_EXTS_ENV}=none to build without Rust extensions"
+        )
+    return extensions
+
+
+# Deliberately not a TOML parser (keeps setup.py stdlib-only): the allowlist
+# must be written as a single line, e.g. rust-extensions = ["multimodal"].
+_ALLOWLIST_RE = re.compile(r"^rust-extensions\s*=\s*\[([^\]]*)\]", re.MULTILINE)
+
+
+def _pyproject_rust_extensions(declared):
+    """Apply the active pyproject's [tool.sglang] rust-extensions allowlist."""
+    pyproject_text = (_PYTHON_DIR / "pyproject.toml").read_text(encoding="utf-8")
+    match = _ALLOWLIST_RE.search(pyproject_text)
+    if match is None:
+        return declared
+    tokens = re.findall(r'"([^"]*)"', match.group(1))
+    return _match_by_substring(
+        declared=declared,
+        tokens=[token.lower() for token in tokens],
+        source="[tool.sglang] rust-extensions",
+    )
+
+
+def _selected_rust_extensions(declared):
+    """Apply the SGLANG_BUILD_RUST_EXTS build-time filter."""
+    declared = list(declared)
+    raw = os.environ.get(_BUILD_RUST_EXTS_ENV)
+    if raw is None:
+        return declared
+
+    spec = raw.strip().lower()
+    # An empty or whitespace-only value is treated as unset (build everything).
+    if not spec or spec == "all":
+        return declared
+    if spec == "none":
+        return []
+
+    tokens = [token.strip() for token in spec.split(",")]
+    if not all(tokens):
+        raise ValueError(
+            f"{_BUILD_RUST_EXTS_ENV}={raw!r} has an empty item; unset it or use "
+            "'all', 'none', or a comma-separated list of extension names"
+        )
+    return _match_by_substring(
+        declared=declared, tokens=tokens, source=_BUILD_RUST_EXTS_ENV
+    )
+
+
+def _declared_rust_extensions():
+    # "none" short-circuits discovery so builds without a ../rust checkout
+    # (e.g. from an sdist) still work.
+    if (os.environ.get(_BUILD_RUST_EXTS_ENV) or "").strip().lower() == "none":
+        return []
+    return _pyproject_rust_extensions(_discovered_rust_extensions())
+
+
+if build_rust is not None:
+
+    class BuildRust(build_rust):
+        """Build only the Rust extensions selected by SGLANG_BUILD_RUST_EXTS."""
+
+        def run(self) -> None:
+            rust_extensions = _selected_rust_extensions(self.extensions or [])
+            self.extensions = rust_extensions
+            self.distribution.rust_extensions = rust_extensions
+            if not rust_extensions:
+                return
+            super().run()
+
+    setup(
+        cmdclass={"build_rust": BuildRust},
+        rust_extensions=_declared_rust_extensions(),
+    )
+else:
+    setup()

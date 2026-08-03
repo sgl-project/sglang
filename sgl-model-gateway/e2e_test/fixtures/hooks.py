@@ -88,13 +88,14 @@ def pytest_collection_modifyitems(
 
     from infra import (
         DEFAULT_MODEL,
-        LOG_SEPARATOR_WIDTH,
         MODEL_SPECS,
         PARAM_MODEL,
         PARAM_SETUP_BACKEND,
         ConnectionMode,
         WorkerType,
     )
+
+    available_gpus = _count_gpus_without_cuda()
 
     def track_worker(
         model_id: str, mode: ConnectionMode, worker_type: WorkerType, count: int
@@ -214,6 +215,27 @@ def pytest_collection_modifyitems(
             _max_test_gpu_requirement = test_gpus
             _max_test_name = item.nodeid
 
+        # Mark over-capacity tests as skipped (including when available_gpus
+        # is 0) so pytest_collection_finish can detect the all-skipped case
+        # and fail loudly instead of passing green with zero tests run.
+        if test_gpus > available_gpus:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=(
+                        f"requires {test_gpus} GPUs (model={model_id}, "
+                        f"tp={MODEL_SPECS.get(model_id, {}).get('tp', 1)}); "
+                        f"only {available_gpus} available on this runner"
+                    )
+                )
+            )
+
+    # Prune workers that can never launch on this runner.
+    for key in list(_worker_counts.keys()):
+        spec = MODEL_SPECS.get(key[0], {})
+        if spec.get("tp", 1) > available_gpus:
+            del _worker_counts[key]
+    _first_seen_order[:] = [k for k in _first_seen_order if k in _worker_counts]
+
     # Log results
     if _worker_counts:
         summary = []
@@ -285,9 +307,22 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
 def _count_gpus_without_cuda() -> int:
     """Count available GPUs without initializing CUDA.
 
-    Uses nvidia-smi to avoid CUDA initialization, which is critical for
-    pytest-parallel compatibility. CUDA cannot be re-initialized after a fork.
+    Must avoid CUDA initialization because pytest_collection_modifyitems
+    runs before pytest-parallel forks workers, and CUDA cannot be
+    re-initialized after fork.
+
+    Honors CUDA_VISIBLE_DEVICES first — container runners commonly expose
+    all host GPUs to the container (e.g. NVIDIA_VISIBLE_DEVICES=all) and
+    gate per-process visibility via CUDA_VISIBLE_DEVICES, so nvidia-smi
+    would over-report. Falls back to nvidia-smi only when the env var is
+    unset, and logs (rather than swallows) any nvidia-smi failure so a
+    misconfigured runner is debuggable from CI logs.
     """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        # CUDA treats "-1" as "no devices"; don't count it as one.
+        return len([d for d in cvd.split(",") if d.strip() and d.strip() != "-1"])
+
     import subprocess
 
     try:
@@ -297,11 +332,29 @@ def _count_gpus_without_cuda() -> int:
             text=True,
             timeout=10,
         )
-        if result.returncode == 0:
-            return len([line for line in result.stdout.strip().split("\n") if line])
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        pass
-    return 0
+    except FileNotFoundError:
+        logger.error(
+            "nvidia-smi not found and CUDA_VISIBLE_DEVICES is unset; "
+            "cannot determine GPU count, treating as 0"
+        )
+        return 0
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.error(
+            "nvidia-smi failed (%s); cannot determine GPU count, treating as 0",
+            e,
+            exc_info=True,
+        )
+        return 0
+
+    if result.returncode != 0:
+        logger.error(
+            "nvidia-smi exited with code %d; treating as 0 GPUs. stderr=%r stdout=%r",
+            result.returncode,
+            result.stderr,
+            result.stdout,
+        )
+        return 0
+    return len([line for line in result.stdout.strip().split("\n") if line])
 
 
 def validate_gpu_requirements() -> tuple[int, int]:
@@ -319,9 +372,11 @@ def validate_gpu_requirements() -> tuple[int, int]:
 
 def pytest_collection_finish(session: pytest.Session) -> None:
     """Validate GPU requirements after test collection."""
-    from infra import ENV_SKIP_MODEL_POOL, LOG_SEPARATOR_WIDTH
+    from infra import ENV_SKIP_MODEL_POOL
 
-    if not _worker_counts:
+    # _max_test_gpu_requirement survives pruning; _worker_counts may be
+    # emptied above when no test fits, and we still want the loud-fail.
+    if _max_test_gpu_requirement == 0:
         return
 
     if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
@@ -330,19 +385,31 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     max_required, available_gpus = validate_gpu_requirements()
 
     if max_required > available_gpus:
-        sep = "=" * LOG_SEPARATOR_WIDTH
-        raise pytest.UsageError(
-            f"\n{sep}\n"
-            f"GPU REQUIREMENTS EXCEEDED\n"
-            f"{sep}\n"
-            f"Test '{_max_test_name}' requires {max_required} GPUs\n"
-            f"Available: {available_gpus} GPUs\n"
-            f"\nOptions:\n"
-            f"  1. Run tests that fit: pytest -k 'not {_max_test_name.split('::')[0]}'\n"
-            f"  2. Reduce workers: @pytest.mark.workers(prefill=1, decode=1)\n"
-            f"  3. Skip GPU tests: SKIP_MODEL_POOL=1 pytest\n"
-            f"{sep}"
+        # Tests whose individual GPU need exceeds capacity are already skipped
+        # in pytest_collection_modifyitems. If literally every collected test
+        # was skipped this way, refuse to pass green — that's the runner-
+        # mismatch case that should fail loud (e.g. wrong matrix entry,
+        # nvidia-smi returning 0 on a healthy host).
+        non_skipped = [
+            it
+            for it in session.items
+            if not any(m.name == "skip" for m in it.iter_markers())
+        ]
+        if not non_skipped:
+            raise pytest.UsageError(
+                f"Runner has {available_gpus} GPU(s); every collected test "
+                f"requires more (largest: {_max_test_name} needs {max_required}). "
+                f"Zero tests would run — refusing to pass silently."
+            )
+        # Otherwise: surface the gap so it's obvious in logs that this runner
+        # only ran the fitting subset.
+        logger.warning(
+            "Runner has %d GPU(s); skipped tests requiring up to %d (largest: %s)",
+            available_gpus,
+            max_required,
+            _max_test_name,
         )
+        return
 
     logger.info(
         "GPU validation passed: max %d required (by %s), %d available",

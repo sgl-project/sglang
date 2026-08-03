@@ -1,9 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu-5090")
-register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,15 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.runtime_context import get_context
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 
 class LMHeadStub(nn.Module):
-    def __init__(self, vocab, hidden, dtype, device="cuda"):
+    def __init__(self, vocab, hidden, dtype, device=get_device()):
         super().__init__()
         self.weight = nn.Parameter(
             torch.randn(vocab, hidden, dtype=dtype, device=device)
@@ -38,13 +33,17 @@ class DummyMeta:
 class TestLMHeadFP32(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("needs CUDA GPU")
+        if not torch.cuda.is_available() and not (
+            hasattr(torch, "xpu") and torch.xpu.is_available()
+        ):
+            raise unittest.SkipTest("needs CUDA GPU or XPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        get_global_server_args().enable_dp_lm_head = False
-        get_global_server_args().enable_fp32_lm_head = enable_fp32
+        # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
+        # from the published config.
+        override = get_context().override_server_args(enable_fp32_lm_head=enable_fp32)
+        override.install()
+        self.addCleanup(override.restore)
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
@@ -56,7 +55,7 @@ class TestLMHeadFP32(unittest.TestCase):
         expected_a_dtype,
         expected_b_dtype,
     ):
-        device = "cuda"
+        device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
         hidden_state = torch.randn(
             BATCH_SIZE, HIDDEN_SIZE, dtype=hidden_state_dtype, device=device
@@ -85,8 +84,9 @@ class TestLMHeadFP32(unittest.TestCase):
                 state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
             return original_linear(x, w, bias)
 
-        with patch("torch.matmul", new=probe_matmul), patch(
-            "torch.nn.functional.linear", new=probe_linear
+        with (
+            patch("torch.matmul", new=probe_matmul),
+            patch("torch.nn.functional.linear", new=probe_linear),
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)

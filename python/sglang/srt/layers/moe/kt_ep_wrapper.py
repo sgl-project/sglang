@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -128,7 +128,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
     Example:
         # Wrap any GPU method with AMX/AVX CPU expert support
-        gpu_method = CompressedTensorsWNA16MoEMethod(quant_config, prefix)
+        gpu_method = CompressedTensorsWNA16MoE(quant_config, prefix)
         kt_config = KTConfig(layer_idx=0, num_gpu_experts=4, ...)
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
@@ -154,7 +154,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None

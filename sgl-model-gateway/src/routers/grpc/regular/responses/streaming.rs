@@ -17,6 +17,7 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
+use data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -32,7 +33,6 @@ use super::{
     conversions,
 };
 use crate::{
-    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         chat::{

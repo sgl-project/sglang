@@ -1,252 +1,303 @@
-"""DeepSeek V3.2 NSA (Native Sparse Attention) mixin classes."""
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
-import logging
-from typing import TYPE_CHECKING, Optional
+"""DeepSeek V3.2/DSA model helpers shared by the target and NextN models."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
 
 import torch
-from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_dsa_index_head_dim,
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
 )
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
+from sglang.srt.layers.communicator import LayerCommunicator, get_attn_tp_context
+from sglang.srt.layers.communicator_dsa_cp import (
+    DSACPLayerCommunicator,
+    maybe_prefetch_next_full_attention_kv,
+)
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    mla_use_prefill_cp,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import add_prefix
-
-logger = logging.getLogger(__name__)
-
-_NSA_AVAILABLE = False
-
-try:
-    from sglang.srt.configs.model_config import (
-        get_nsa_index_head_dim,
-        get_nsa_index_n_heads,
-        get_nsa_index_topk,
-        is_deepseek_nsa,
-    )
-    from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
-    from sglang.srt.layers.attention.nsa.utils import (
-        can_cp_split,
-        is_nsa_enable_prefill_cp,
-        nsa_use_prefill_cp,
-        prepare_input_dp_with_cp_dsa,
-    )
-    from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
-
-    _NSA_AVAILABLE = True
-except ImportError:
-    Indexer = None
-    NSACPLayerCommunicator = None
-
-    def is_deepseek_nsa(_config):
-        return False
-
-    def is_nsa_enable_prefill_cp():
-        return False
-
-    def nsa_use_prefill_cp(_forward_batch):
-        return False
-
-    def can_cp_split(_input_len, _cp_size, _use_nsa, _forward_batch):
-        return False
-
-    def prepare_input_dp_with_cp_dsa(_input_len, _cp_rank, _cp_size, _seq_lens):
-        return None
-
-    def get_nsa_index_n_heads(_config):
-        return 0
-
-    def get_nsa_index_head_dim(_config):
-        return 0
-
-    def get_nsa_index_topk(_config):
-        return 0
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.runtime_context import get_parallel
 
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
+class DeepseekV32Mixin:
+    """Encapsulate V3.2/DSA setup without owning the model's forward methods."""
 
-
-def is_nsa_available() -> bool:
-    return _NSA_AVAILABLE
-
-
-class DeepseekV32AttentionMixin:
-    """NSA-specific logic for the attention layer."""
-
-    def init_nsa_attention(
+    def init_v32_attention(
         self,
+        *,
         config: PretrainedConfig,
         hidden_size: int,
         qk_rope_head_dim: int,
         q_lora_rank: Optional[int],
         max_position_embeddings: int,
         rope_theta: float,
-        rope_scaling: Optional[dict],
+        rope_scaling: Optional[Dict[str, Any]],
         quant_config: Optional[QuantizationConfig],
         layer_id: int,
-        prefix: str,
         alt_stream: Optional[torch.cuda.Stream],
-    ) -> tuple:
-        """Initialize NSA components. Returns (use_nsa, nsa_enable_prefill_cp, attn_tp_rank, attn_tp_size, cp_size, indexer)."""
-        use_nsa = is_deepseek_nsa(config)
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-
-        if nsa_enable_prefill_cp:
-            assert use_nsa, "CP currently only supports deepseek v3.2 model"
-
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        cp_size = None
-
-        # CP reuses attn_tp comm group but duplicates weights
-        if nsa_enable_prefill_cp and use_nsa:
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            cp_size = get_attention_tp_size()
-
-        indexer = None
-        if use_nsa and _NSA_AVAILABLE:
-            indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_nsa_index_n_heads(config),
-                index_head_dim=get_nsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_nsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-            )
-
-        return use_nsa, nsa_enable_prefill_cp, attn_tp_rank, attn_tp_size, cp_size, indexer
-
-    def forward_nsa_indexer_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        indexer: "Indexer",
+        prefix: str,
+        is_nextn: bool,
+        dsa_enable_prefill_cp: bool,
+        mla_enable_prefill_cp: bool,
     ) -> None:
-        """Cache quantized keys during prefill."""
-        if indexer is None:
+        self.use_dsa = is_deepseek_dsa(config)
+        self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp
+        if self.dsa_enable_prefill_cp:
+            assert self.use_dsa, "CP currently only supports deepseek v3.2 model"
+
+        # Both CP flavors reuse the attention TP group and duplicate weights.
+        self.cp_size = (
+            get_parallel().attn_cp_size
+            if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp
+            else None
+        )
+
+        self.skip_topk = None
+        self.next_skip_topk = None
+        if not self.use_dsa:
             return
-        indexer(
-            x=hidden_states,
-            q_lora=q_lora,
-            positions=positions,
-            forward_batch=forward_batch,
+
+        self.indexer = Indexer(
+            hidden_size=hidden_size,
+            index_n_heads=get_dsa_index_n_heads(config),
+            index_head_dim=get_dsa_index_head_dim(config),
+            rope_head_dim=qk_rope_head_dim,
+            index_topk=get_dsa_index_topk(config),
+            q_lora_rank=q_lora_rank,
+            max_position_embeddings=max_position_embeddings,
+            rope_theta=rope_theta,
+            scale_fmt="ue8m0",
+            block_size=128,
+            rope_scaling=rope_scaling,
+            is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+            prefix=prefix,
+            quant_config=quant_config,
             layer_id=layer_id,
-            return_indices=False,
+            alt_stream=alt_stream,
+            config=config,
         )
 
-    def forward_nsa_indexer_decode(
+        # Refer to https://arxiv.org/abs/2603.12201 for the cross-layer
+        # index reuse policy used by DSA and the NextN layer.
+        if is_nextn:
+            self.skip_topk = True
+            self.next_skip_topk = True
+        else:
+            index_cli_factor = getattr(config, "cli_factor", 1)
+            if index_cli_factor > 1:
+                self.skip_topk = layer_id % index_cli_factor != 0
+                self.next_skip_topk = (layer_id + 1) % index_cli_factor != 0
+            else:
+                self.skip_topk = dsa_layer_skips_topk(config, layer_id)
+                self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
+
+    def create_layer_communicator(
         self,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        indexer: "Indexer",
-    ) -> Optional[torch.Tensor]:
-        """Get top-k indices during decode."""
-        if indexer is None:
-            return None
-        return indexer(
-            x=hidden_states,
-            q_lora=q_lora,
-            positions=positions,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
+        *,
+        layer_scatter_modes,
+        input_layernorm,
+        post_attention_layernorm,
+        is_last_layer: bool,
+        qkv_latent_func,
+    ):
+        # DSACPLayerCommunicator is flavor-agnostic: its internal gates handle
+        # both DSA and dense MLA prefill CP.
+        communicator_cls = (
+            DSACPLayerCommunicator
+            if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp
+            else LayerCommunicator
+        )
+        return communicator_cls(
+            layer_scatter_modes=layer_scatter_modes,
+            input_layernorm=input_layernorm,
+            post_attention_layernorm=post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=is_last_layer,
+            qkv_latent_func=qkv_latent_func,
         )
 
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
 
-class DeepseekV32DecoderLayerMixin:
-    """NSA-specific logic for the decoder layer."""
-
-    def init_nsa_layer_communicator(
+    def init_v32_model_cp(
         self,
         config: PretrainedConfig,
-        layer_id: int,
-        is_nextn: bool,
-        layer_scatter_modes: LayerScatterModes,
-        input_layernorm: nn.Module,
-        post_attention_layernorm: nn.Module,
-        qkv_latent_func: callable,
-    ) -> tuple:
-        """Initialize layer communicator. Returns (nsa_enable_prefill_cp, layer_communicator)."""
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        is_last_layer = is_nextn or (layer_id == config.num_hidden_layers - 1)
-
-        if nsa_enable_prefill_cp and _NSA_AVAILABLE:
-            layer_communicator = NSACPLayerCommunicator(
-                layer_scatter_modes=layer_scatter_modes,
-                input_layernorm=input_layernorm,
-                post_attention_layernorm=post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=is_last_layer,
-                qkv_latent_func=qkv_latent_func,
-            )
-        else:
-            layer_communicator = LayerCommunicator(
-                layer_scatter_modes=layer_scatter_modes,
-                input_layernorm=input_layernorm,
-                post_attention_layernorm=post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=is_last_layer,
-                qkv_latent_func=qkv_latent_func,
-            )
-
-        return nsa_enable_prefill_cp, layer_communicator
-
-
-class DeepseekV32ModelMixin:
-    """NSA-specific logic at the model level."""
-
-    def init_nsa_model(self, config: PretrainedConfig) -> tuple:
-        """Initialize NSA model components. Returns (use_nsa, nsa_enable_prefill_cp, cp_rank, cp_size)."""
-        use_nsa = is_deepseek_nsa(config)
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-
-        if nsa_enable_prefill_cp:
-            cp_rank = get_attention_tp_rank()
-            cp_size = get_attention_tp_size()
-        else:
-            cp_rank = None
-            cp_size = None
-
-        return use_nsa, nsa_enable_prefill_cp, cp_rank, cp_size
-
-    def prepare_nsa_forward(
-        self,
-        input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
-        use_nsa: bool,
-        nsa_enable_prefill_cp: bool,
-        cp_rank: Optional[int],
-        cp_size: Optional[int],
+        *,
+        mla_enable_prefill_cp: bool,
     ) -> None:
-        """Prepare NSA metadata before forward pass."""
-        if nsa_enable_prefill_cp and _NSA_AVAILABLE:
-            if can_cp_split(len(input_ids), cp_size, use_nsa, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    cp_rank,
-                    cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                )
+        self.use_dsa = is_deepseek_dsa(config)
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp and not self.use_dsa
+        self.cp_size = (
+            get_parallel().attn_cp_size
+            if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp
+            else None
+        )
+
+    def dsa_forward_uses_topk(self) -> bool:
+        if not self.use_dsa:
+            return False
+        backend = get_attn_backend()
+        backend = getattr(backend, "primary", backend)
+        return not getattr(backend, "use_mha", False)
+
+    def dsa_layer_skips_topk(self, layer_id: int) -> bool:
+        return dsa_layer_skips_topk(self.config, layer_id)
+
+    def empty_dsa_topk_indices(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states.new_empty(
+            (0, get_dsa_index_topk(self.config)), dtype=torch.int32
+        )
+
+    def use_prefill_cp_v1(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+        ) and not is_cp_v2_active(forward_batch)
+
+    def maybe_split_model_inputs_for_cp(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        is_first_pp_rank: bool,
+        use_cp_v1: bool,
+    ):
+        if use_cp_v1:
+            if is_first_pp_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+        return hidden_states, positions
+
+    def maybe_gather_model_outputs_for_cp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        use_cp_v1: bool,
+    ) -> torch.Tensor:
+        if not use_cp_v1:
+            return hidden_states
+        return cp_all_gather_rerange_output(
+            hidden_states,
+            self.cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+
+    def init_v32_for_causal_lm(
+        self,
+        config: PretrainedConfig,
+        *,
+        mla_enable_prefill_cp: bool,
+    ) -> None:
+        self.use_dsa = is_deepseek_dsa(config)
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp and not self.use_dsa
+        if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
+
+    def init_v32_attn_tp_context(self, config: PretrainedConfig) -> None:
+        q_lora_rank = getattr(config, "q_lora_rank", None)
+        get_attn_tp_context().init_context(q_lora_rank, self.use_dsa)
+
+    def maybe_prepare_cp_metadata(
+        self,
+        input_length: int,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if is_cp_v2_active(forward_batch):
+            return
+
+        if self.dsa_enable_prefill_cp:
+            can_split = can_dsa_cp_split(
+                input_length, self.cp_size, self.use_dsa, forward_batch
+            )
+        elif self.mla_enable_prefill_cp:
+            can_split = can_cp_split(input_length, self.cp_size, forward_batch)
+        else:
+            return
+
+        if can_split:
+            forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                input_length,
+                self.cp_rank,
+                self.cp_size,
+                forward_batch.seq_lens_cpu.tolist(),
+                extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+            )
 
     @staticmethod
-    def should_use_nsa_prefill_cp(forward_batch: ForwardBatch) -> bool:
-        return nsa_use_prefill_cp(forward_batch)
+    def gather_dsa_topk_indices_for_cp(
+        topk_indices: torch.Tensor,
+        local_num_tokens: int,
+        cp_size: int,
+        forward_batch: ForwardBatch,
+        stream,
+    ) -> torch.Tensor:
+        if (
+            is_dsa_prefill_cp_round_robin_split()
+            and topk_indices.shape[0] < local_num_tokens
+        ):
+            pad_rows = local_num_tokens - topk_indices.shape[0]
+            topk_indices = torch.cat(
+                [
+                    topk_indices,
+                    topk_indices.new_full((pad_rows, topk_indices.shape[1]), -1),
+                ],
+                dim=0,
+            )
+        return cp_all_gather_rerange_output(
+            topk_indices,
+            cp_size,
+            forward_batch,
+            stream,
+        )

@@ -55,34 +55,6 @@ pub enum RetryError {
 pub struct RetryExecutor;
 
 impl RetryExecutor {
-    /// Execute an async operation with retries and backoff.
-    /// The `operation` closure is invoked each attempt with the attempt index.
-    pub async fn execute_with_retry<F, Fut, T>(
-        config: &RetryConfig,
-        mut operation: F,
-    ) -> Result<T, RetryError>
-    where
-        F: FnMut(u32) -> Fut,
-        Fut: std::future::Future<Output = Result<T, ()>>,
-    {
-        let max = config.max_retries.max(1);
-        let mut attempt: u32 = 0;
-        loop {
-            match operation(attempt).await {
-                Ok(val) => return Ok(val),
-                Err(_) => {
-                    let is_last = attempt + 1 >= max;
-                    if is_last {
-                        return Err(RetryError::MaxRetriesExceeded);
-                    }
-                    let delay = BackoffCalculator::calculate_delay(config, attempt);
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-    }
-
     /// Execute an operation that returns an HTTP Response with retries and backoff.
     ///
     /// Usage pattern:
@@ -218,54 +190,6 @@ mod tests {
             let d = BackoffCalculator::calculate_delay(&cfg, 2).as_millis() as f32;
             assert!(d >= base * 0.5 - 1.0 && d <= base * 1.5 + 1.0);
         }
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_retry_success_after_failures() {
-        let cfg = base_retry_config();
-        let remaining = Arc::new(AtomicU32::new(2));
-        let calls = Arc::new(AtomicU32::new(0));
-
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let remaining = remaining.clone();
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                let remaining = remaining.clone();
-                async move {
-                    if remaining
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
-                        .is_ok()
-                    {
-                        Err(())
-                    } else {
-                        Ok(42u32)
-                    }
-                }
-            }
-        })
-        .await;
-
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), 42);
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_retry_exhausted() {
-        let cfg = base_retry_config();
-        let calls = Arc::new(AtomicU32::new(0));
-        let res: Result<u32, RetryError> = RetryExecutor::execute_with_retry(&cfg, {
-            let calls = calls.clone();
-            move |_attempt| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                async move { Err(()) }
-            }
-        })
-        .await;
-
-        assert!(matches!(res, Err(RetryError::MaxRetriesExceeded)));
-        assert_eq!(calls.load(Ordering::Relaxed), cfg.max_retries);
     }
 
     #[tokio::test]

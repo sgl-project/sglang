@@ -120,6 +120,13 @@ class MultiModalStaticCache(MultimodalCache):
         self.current_size += data_size
         return True
 
+    def get_single(self, mm_hash: int) -> Optional[EmbeddingResult]:
+        """Get a single cached embedding by its hash (no combine_hashes)."""
+        embedding = self.mm_cache.get(mm_hash)
+        if embedding is not None:
+            self.mm_cache.move_to_end(mm_hash)
+        return embedding
+
     def has(self, mm_hash: int) -> bool:
         return mm_hash in self.mm_cache
 

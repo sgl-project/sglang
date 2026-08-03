@@ -73,6 +73,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             "model.mm_projector.3": "multi_modal_projector.linear_2",
             "model.mm_projector.4": "multi_modal_projector.ln_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
+            # transformers 5.6.0 flattened CLIPVisionModel/SiglipVisionModel,
+            # dropping the `vision_model` intermediate wrapper.
+            "vision_tower.vision_model.": "vision_tower.",
         }
         params_dict = dict(self.named_parameters())
         weights = list(weights)

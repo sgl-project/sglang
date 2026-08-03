@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 
 
 @dataclass
@@ -26,6 +27,8 @@ class ZImageArchConfig(DiTArchConfig):
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
 
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_zimage_layer])
+
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             # (param_name, shard_name, shard_id)
@@ -36,8 +39,51 @@ class ZImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"(.*)\.attention\.to_q\.weight$": (r"\1.attention.to_qkv.weight", 0, 3),
+            r"(.*)\.attention\.to_k\.weight$": (r"\1.attention.to_qkv.weight", 1, 3),
+            r"(.*)\.attention\.to_v\.weight$": (r"\1.attention.to_qkv.weight", 2, 3),
+            r"(.*)\.attention\.to_q\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                0,
+                3,
+            ),
+            r"(.*)\.attention\.to_k\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                1,
+                3,
+            ),
+            r"(.*)\.attention\.to_v\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                2,
+                3,
+            ),
+            r"(.*)\.attention\.to_q\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"(.*)\.attention\.to_k\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"(.*)\.attention\.to_v\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                2,
+                3,
+            ),
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
+            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                0,
+                2,
+            ),
+            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                1,
+                2,
+            ),
         }
     )
 

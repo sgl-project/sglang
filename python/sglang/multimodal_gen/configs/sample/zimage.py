@@ -8,16 +8,18 @@ from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 
 @dataclass
-class ZImageSamplingParams(SamplingParams):
+class ZImageTurboSamplingParams(SamplingParams):
     num_inference_steps: int = 9
 
     num_frames: int = 1
     negative_prompt: str = None
-    # height: int = 720
-    # width: int = 1280
+    # Z-Image officially recommends starting at 1024x1024
+    height: int = 1024
+    width: int = 1024
     # fps: int = 24
 
     guidance_scale: float = 0.0
+    cfg_normalization: float | bool = False
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
@@ -31,3 +33,13 @@ class ZImageSamplingParams(SamplingParams):
             ],
         )
     )
+
+
+@dataclass
+class ZImageSamplingParams(SamplingParams):
+    num_inference_steps: int = 50
+
+    num_frames: int = 1
+    negative_prompt: str = " "
+    guidance_scale: float = 5.0
+    cfg_normalization: float | bool = True

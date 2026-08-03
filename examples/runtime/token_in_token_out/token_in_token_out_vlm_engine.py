@@ -67,8 +67,8 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     args = [
         "--model-path=Qwen/Qwen2-VL-2B",
+        "--skip-tokenizer-init",
     ]
     args = parser.parse_args(args=args)
     server_args = ServerArgs.from_cli_args(args)
-    server_args.skip_tokenizer_init = True
     token_in_out_example(server_args)

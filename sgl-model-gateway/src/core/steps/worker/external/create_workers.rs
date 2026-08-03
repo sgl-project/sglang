@@ -4,15 +4,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::{
-        circuit_breaker::CircuitBreakerConfig,
-        steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
-        worker::{HealthConfig, RuntimeType, WorkerType},
-        BasicWorkerBuilder, ConnectionMode, Worker,
-    },
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+use crate::core::{
+    circuit_breaker::CircuitBreakerConfig,
+    steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
+    worker::{HealthConfig, RuntimeType, WorkerType},
+    BasicWorkerBuilder, ConnectionMode, Worker,
 };
 
 /// Normalize URL for external APIs (ensure https://).
@@ -60,6 +58,7 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
                 endpoint: cfg.endpoint.clone(),
                 failure_threshold: cfg.failure_threshold,
                 success_threshold: cfg.success_threshold,
+                disable_health_check: cfg.disable_health_check || config.disable_health_check,
             }
         };
 
@@ -98,7 +97,11 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
             }
 
             let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-            worker.set_healthy(false);
+            if health_config.disable_health_check {
+                worker.set_healthy(true);
+            } else {
+                worker.set_healthy(false);
+            }
 
             info!(
                 "Created wildcard worker at {} (accepts any model, user auth forwarded)",
@@ -132,7 +135,11 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
                 }
 
                 let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-                worker.set_healthy(false);
+                if health_config.disable_health_check {
+                    worker.set_healthy(true);
+                } else {
+                    worker.set_healthy(false);
+                }
 
                 debug!(
                     "Created external worker for model {} at {}",

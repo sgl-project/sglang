@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
 import logging
@@ -7,6 +9,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
 
@@ -33,6 +36,7 @@ def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
+        torch.float8_e8m0fnu,
     ):
         return 0
     if dtype in (torch.float16, torch.bfloat16):
@@ -65,10 +69,12 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Unsupported copy between dtypes: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if target_rank < loaded_rank:
+    if target_rank < loaded_rank and not envs.SGLANG_QUANT_ALLOW_DOWNCASTING.get():
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
+    if loaded_rank == torch.float8_e8m0fnu:
+        assert target_rank in {torch.float8_e8m0fnu, torch.float32}
 
     target.copy_(loaded_weight)
 
@@ -584,8 +590,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

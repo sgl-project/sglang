@@ -67,7 +67,7 @@ class RuntimeEndpoint(BaseBackend):
 
     def get_server_info(self):
         res = http_request(
-            self.base_url + "/get_server_info",
+            self.base_url + "/server_info",
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -382,7 +382,7 @@ class Runtime:
         # client code without installing SRT server and its dependency if they want.
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
-        from sglang.srt.utils import is_port_available
+        from sglang.srt.utils.network import is_port_available
 
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
@@ -390,7 +390,7 @@ class Runtime:
         for port in range(self.server_args.port, 40000):
             if is_port_available(port):
                 break
-        self.server_args.port = port
+        self.server_args.override("runtime_endpoint.port_alloc", port=port)
 
         self.url = self.server_args.url()
         self.generate_url = self.url + "/generate"
@@ -463,18 +463,21 @@ class Runtime:
         self,
         prompt: str,
         sampling_params: Optional[Dict] = None,
+        session_id: Optional[str] = None,
     ):
         if self.server_args.skip_tokenizer_init:
             json_data = {
                 "input_ids": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         else:
             json_data = {
                 "text": prompt,
                 "sampling_params": sampling_params,
                 "stream": True,
+                "session_id": session_id,
             }
         pos = 0
 
@@ -505,6 +508,7 @@ class Runtime:
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
+        session_id: Optional[str] = None,
     ):
         json_data = {
             "text": prompt,
@@ -513,6 +517,7 @@ class Runtime:
             "logprob_start_len": logprob_start_len,
             "top_logprobs_num": top_logprobs_num,
             "lora_path": lora_path,
+            "session_id": session_id,
         }
         assert not isinstance(lora_path, list) or len(lora_path) == len(prompt)
         response = requests.post(
@@ -531,7 +536,7 @@ class Runtime:
 
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.url}/get_server_info") as response:
+            async with session.get(f"{self.url}/server_info") as response:
                 if response.status == 200:
                     return await response.json()
                 else:

@@ -4,11 +4,11 @@ use std::{sync::Arc, time::Instant};
 
 use axum::response::Response;
 use serde_json::{from_str, json, to_string, to_value, Value};
+use smg_mcp::{self as mcp, McpManager};
 use tracing::{debug, error, warn};
 
 use super::common::McpCallTracking;
 use crate::{
-    mcp::{self, McpManager},
     observability::metrics::{metrics_labels, Metrics},
     protocols::{
         common::{Function, ToolCall},

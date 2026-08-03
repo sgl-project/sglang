@@ -1,7 +1,7 @@
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     BackendAdaptor,
+    DSABackendAdaptor,
     FlashAttentionAdaptor,
-    NSABackendAdaptor,
 )
 
-__all__ = ["BackendAdaptor", "FlashAttentionAdaptor", "NSABackendAdaptor"]
+__all__ = ["BackendAdaptor", "FlashAttentionAdaptor", "DSABackendAdaptor"]

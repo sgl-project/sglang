@@ -12,12 +12,12 @@ class AttnForwardMethod(IntEnum):
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
 
-    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
+    # Use multi-head attention, execute the MHA for prefix and extended kv in a single kernel
     # when the sequence lengths are below the threshold.
     MHA_ONE_SHOT = auto()
 
     # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
+    MLA_FUSED_ROPE_ROCM = auto()
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()

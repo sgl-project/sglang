@@ -1,6 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
+use data_connector::{
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+};
 use reqwest::Client;
 use smg::{
     app_context::AppContext,
@@ -8,16 +11,13 @@ use smg::{
     core::{
         BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
-    data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-    },
-    mcp::{McpConfig, McpManager},
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
     tokenizer::registry::TokenizerRegistry,
 };
+use smg_mcp::{McpConfig, McpManager};
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
@@ -89,6 +89,8 @@ pub fn create_test_app(
         context: app_context,
         concurrency_queue_tx: None,
         router_manager: None,
+        mesh_handler: None,
+        mesh_sync_manager: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -129,6 +131,8 @@ pub fn create_test_app_with_context(
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        mesh_handler: None,
+        mesh_sync_manager: None,
     });
 
     // Get config from the context

@@ -17,6 +17,23 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.config = config
         self.loras = []
 
+    @staticmethod
+    def should_suppress_logs(timestep):
+        """Determine if logs should be suppressed based on timestep value."""
+        if torch.is_tensor(timestep):
+            return bool((timestep < 1.0).item())
+        return bool(timestep < 1.0)
+
+    def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
+        """Set LoRA adapter using SGLang Diffusion API."""
+        if len(lora_nickname) > 0:
+            self.generator.set_lora(
+                lora_nickname=lora_nickname,
+                lora_path=lora_path,
+                strength=strength,
+                target=target,
+            )
+
     def _unpack_latents(self, latents, height, width, channels):
         """Unpack latents from packed format to standard format."""
         batch_size = latents.shape[0]

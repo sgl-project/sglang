@@ -78,12 +78,10 @@ impl PipelineStage for WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(
-                    ctx.input.model_id.as_deref(),
-                    text,
-                    tokens,
-                    headers,
-                ) {
+                match self
+                    .select_single_worker(ctx.input.model_id.as_deref(), text, tokens, headers)
+                    .await
+                {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -101,7 +99,10 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers) {
+                match self
+                    .select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers)
+                    .await
+                {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -130,7 +131,7 @@ impl PipelineStage for WorkerSelectionStage {
 }
 
 impl WorkerSelectionStage {
-    fn select_single_worker(
+    async fn select_single_worker(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -166,29 +167,31 @@ impl WorkerSelectionStage {
             .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         // Select worker using the policy
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await?;
         let selected = available[idx].clone();
 
         // Record worker selection metric
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_GRPC,
-            model_id.unwrap_or("default"),
+            model_id.unwrap_or(UNKNOWN_MODEL_ID),
             policy.name(),
         );
 
         Some(selected)
     }
 
-    fn select_pd_pair(
+    async fn select_pd_pair(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -244,10 +247,10 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
-        let decode_idx = policy.select_worker(&available_decode, &info)?;
+        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
+        let decode_idx = policy.select_worker(&available_decode, &info).await?;
 
-        let model = model_id.unwrap_or("default");
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode

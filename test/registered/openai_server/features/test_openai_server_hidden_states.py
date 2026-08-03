@@ -16,11 +16,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=186, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=134, suite="stage-b-test-small-1-gpu-5090")
+register_cuda_ci(est_time=222, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(
     est_time=186,
-    suite="stage-b-test-small-1-gpu-amd",
+    suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 
@@ -101,7 +100,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         )
 
         for choice in response.choices:
-            assert hasattr(choice, "hidden_states") == return_hidden_states
+            assert hasattr(choice, "hidden_states") == bool(return_hidden_states)
             if return_hidden_states:
                 assert choice.hidden_states is not None, "hidden_states was None"
 
@@ -140,7 +139,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
             usage = response.usage
             for choice in response.choices:
                 if hasattr(choice, "hidden_states"):
-                    assert return_hidden_states
+                    assert bool(return_hidden_states)
                     assert choice.hidden_states is not None
                     hidden_states_list.append(choice.hidden_states)
 
@@ -170,7 +169,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         )
 
         for choice in response.choices:
-            assert hasattr(choice, "hidden_states") == return_hidden_states
+            assert hasattr(choice, "hidden_states") == bool(return_hidden_states)
             if return_hidden_states:
                 assert choice.hidden_states is not None, "hidden_states was None"
 
@@ -197,7 +196,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
         for response in generator:
             for choice in response.choices:
                 if hasattr(choice.delta, "hidden_states"):
-                    assert return_hidden_states
+                    assert bool(return_hidden_states)
                     assert choice.delta.hidden_states is not None
                     hidden_states_list.append(choice.delta.hidden_states)
 
@@ -228,7 +227,7 @@ class TestOpenAIServerWithHiddenStatesEnabled(
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-        cls.return_hidden_states = [False, True]
+        cls.return_hidden_states = [False, True, "last"]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1, 2]
 
@@ -254,7 +253,7 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-        cls.return_hidden_states = [False, True]
+        cls.return_hidden_states = [False, True, "last"]
         cls.use_list_input = [True, False]
         cls.parallel_sample_nums = [1]
 

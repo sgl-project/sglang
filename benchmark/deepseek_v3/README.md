@@ -4,7 +4,7 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek.html).
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek V3/V3.1/R1 Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek_v3.html#optimizations).
 
 ## Installation & Launch
 
@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install "sglang[all]>=0.5.6.post2"
+pip install sglang
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -177,19 +177,19 @@ There is one B200 node with 4 (for FP4) GPUs or 8 (for FP4 or FP8) GPUs.  Both F
 If using 4 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 If using 8 GPUs:
 
 ```bash
-python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
 ```
 
 #### FP8
 
 ```bash
-SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
+SGLANG_ENABLE_JIT_DEEPGEMM=false python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs-decode 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30 --fp8-gemm-backend flashinfer_trtllm
 ```
 
 ### Example: Serving with two H200\*8 nodes and docker
@@ -271,7 +271,7 @@ Then we can benchmark the accuracy and latency by accessing the first node's exp
 
 ```bash
 # bench accuracy
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host http://10.0.0.1 --port 30000
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --host 10.0.0.1 --port 30000
 
 # bench latency
 python3 -m sglang.bench_one_batch_server --model None --base-url http://10.0.0.1:30000 --batch-size 1 --input-len 128 --output-len 128
