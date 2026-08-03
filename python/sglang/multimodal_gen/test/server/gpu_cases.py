@@ -659,6 +659,61 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
+        "minimax_h3_t2va_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp, brick storefronts, muted teal "
+                "and amber colors, subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "flux2_modelopt_fp8_tp2_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
