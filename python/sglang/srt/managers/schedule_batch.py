@@ -1117,6 +1117,9 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        # Also set outside disaggregation whenever this request's KV must never
+        # be shared: a fake bootstrap host here, or content known to be bad
+        # (tokens sampled from NaN logits, see _abort_full_nan_logits_reqs).
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -189,6 +190,46 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _abort_full_nan_logits_reqs(
+        self,
+        batch: ScheduleBatch,
+        logits_output: Optional[LogitsProcessorOutput],
+    ) -> None:
+        """Abort requests whose whole logits row came back NaN.
+
+        Sanitization turns such a row into a uniform distribution, so its
+        sampled token is vocabulary noise that the client would receive as a
+        healthy 200. Fail the request with a retriable 503 instead, and keep
+        its KV out of the radix tree so prefix matching cannot hand the
+        corrupted prefix to unrelated requests.
+
+        Populated by Sampler.forward only (SGLANG_ABORT_ON_NAN_LOGITS), which
+        is reached from ModelRunner.sample — one logits row per request, so the
+        mask indexes batch.reqs directly. Speculative workers verify through
+        their own sampling path and leave the mask unset.
+        """
+        if logits_output is None or logits_output.full_nan_rows is None:
+            return
+        full_nan_rows = logits_output.full_nan_rows
+        assert len(full_nan_rows) == len(batch.reqs), (
+            f"full_nan_rows has {len(full_nan_rows)} rows for "
+            f"{len(batch.reqs)} requests; expected one row per request."
+        )
+        for i in full_nan_rows.nonzero().flatten().tolist():
+            req = batch.reqs[i]
+            if req.finished() or req.is_retracted:
+                continue
+            req.skip_radix_cache_insert = True
+            req.to_finish = FINISH_ABORT(
+                "Transient numerical error (NaN logits); please retry.",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            logger.error(
+                "Aborting req %s: the model produced an all-NaN logits row, so "
+                "the next token would have been sampled uniformly at random.",
+                req.rid,
+            )
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -223,6 +264,9 @@ class SchedulerBatchResultProcessor:
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
+
+            # Before update_finish_state below consumes req.to_finish.
+            self._abort_full_nan_logits_reqs(batch, logits_output)
 
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
@@ -840,6 +884,9 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+
+        # Before update_finish_state below consumes req.to_finish.
+        self._abort_full_nan_logits_reqs(batch, logits_output)
 
         for i, req in enumerate(batch.reqs):
             req: Req

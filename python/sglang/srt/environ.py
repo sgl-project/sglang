@@ -895,6 +895,10 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
+    # Abort the affected request (retriable 503) when its whole logits row is
+    # NaN, instead of sampling the uniform distribution sanitization leaves
+    # behind. Partial-row NaN still falls through to sanitization.
+    SGLANG_ABORT_ON_NAN_LOGITS = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
