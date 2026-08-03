@@ -1,7 +1,12 @@
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
+from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_groups import PROCESS_GROUP
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     initialize_parallel_runtime,
 )
@@ -77,3 +82,34 @@ def test_reuses_matching_sp_decomposition():
 
     destroy.assert_not_called()
     initialize.assert_not_called()
+
+
+def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
+    ulysses_group = object()
+    ring_group = object()
+
+    with ExitStack() as stack:
+        for name in (
+            "_TP",
+            "_SP",
+            "_DP",
+            "_CFG",
+            "_PP",
+            "_VAE_DECODE",
+            "_DIT",
+            "_VAE",
+        ):
+            stack.enter_context(patch.object(parallel_state, name, None))
+        stack.enter_context(patch.object(PROCESS_GROUP, "ULYSSES_PG", ulysses_group))
+        stack.enter_context(patch.object(PROCESS_GROUP, "RING_PG", ring_group))
+        reset_ipc = stack.enter_context(patch.object(IPC_A2A, "reset"))
+        destroy_group = stack.enter_context(
+            patch.object(parallel_state.torch.distributed, "destroy_process_group")
+        )
+
+        parallel_state.destroy_model_parallel()
+
+        reset_ipc.assert_called_once_with()
+        assert destroy_group.call_args_list == [call(ulysses_group), call(ring_group)]
+        assert PROCESS_GROUP.ULYSSES_PG is None
+        assert PROCESS_GROUP.RING_PG is None
