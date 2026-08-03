@@ -356,3 +356,76 @@ kimik26-fp8-mi355x-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation for Kimi-K2.6 (MXFP4) over MORI. MXFP4
+# experts run the aiter MoE path (SGLANG_DSV4_FP4_EXPERTS, driven by precision).
+# Four variants mirroring the DeepSeek-V4 / GLM-5.2 basic tier:
+#   * (base)      : TP8, no MTP
+#   * -mtp        : TP8 + EAGLE3 external-draft MTP
+#   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
+#   * -dp8ep8-mtp : DP8 + narrow EP8 + EAGLE3 MTP
+# Weights: amd/Kimi-K2.6-MXFP4. Split attention backends (aiter prefill / triton
+# decode); Kimi model env + parsers live in each recipe's model block.
+kimik26-fp4-mi355x-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/kimik26/1k1k/1p1d.yaml
+
+kimik26-fp4-mi355x-mtp-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/kimik26/1k1k/1p1d-mtp.yaml
+
+kimik26-fp4-mi355x-dp8ep8-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/kimik26/1k1k/1p1d-dp8ep8.yaml
+
+kimik26-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/kimik26/1k1k/1p1d-dp8ep8-mtp.yaml
