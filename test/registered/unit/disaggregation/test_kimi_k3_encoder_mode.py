@@ -28,6 +28,7 @@ from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -320,33 +321,35 @@ def test_epd_encoder_reuses_scheduler_zmq_peer():
         receiver = context.socket(zmq.PULL)
         port = receiver.bind_to_random_port("tcp://127.0.0.1")
         encoder = MMEncoder.__new__(MMEncoder)
-        encoder.server_args = SimpleNamespace(
+        config_override = get_context().override_server_args(
             encoder_transfer_backend="zmq_to_scheduler"
         )
-        encoder.send_timeout = 3
-        encoder.context = context
-        encoder.scheduler_send_sockets = {}
-        encoder.scheduler_send_locks = {}
-        mm_data = EmbeddingData(
-            req_id="test-rid_local_part_0",
-            num_parts=1,
-            part_idx=0,
-            grid_dim=None,
-            modality=Modality.IMAGE,
-            error_msg="probe",
-            error_code=599,
-        )
-        try:
-            for _ in range(2):
-                await encoder._send(None, mm_data, url=f"127.0.0.1:{port}")
-                parts = await asyncio.wait_for(receiver.recv_multipart(), timeout=1)
-                assert pickle.loads(parts[0]).req_id == mm_data.req_id
-            assert len(encoder.scheduler_send_sockets) == 1
-        finally:
-            for socket in encoder.scheduler_send_sockets.values():
-                socket.close(linger=0)
-            receiver.close(linger=0)
-            context.term()
+        with config_override as server_args:
+            encoder.server_args = server_args
+            encoder.send_timeout = 3
+            encoder.context = context
+            encoder.scheduler_send_sockets = {}
+            encoder.scheduler_send_locks = {}
+            mm_data = EmbeddingData(
+                req_id="test-rid_local_part_0",
+                num_parts=1,
+                part_idx=0,
+                grid_dim=None,
+                modality=Modality.IMAGE,
+                error_msg="probe",
+                error_code=599,
+            )
+            try:
+                for _ in range(2):
+                    await encoder._send(None, mm_data, url=f"127.0.0.1:{port}")
+                    parts = await asyncio.wait_for(receiver.recv_multipart(), timeout=1)
+                    assert pickle.loads(parts[0]).req_id == mm_data.req_id
+                assert len(encoder.scheduler_send_sockets) == 1
+            finally:
+                for socket in encoder.scheduler_send_sockets.values():
+                    socket.close(linger=0)
+                receiver.close(linger=0)
+                context.term()
 
     asyncio.run(send_twice())
 
@@ -392,36 +395,40 @@ def test_epd_encoder_pipelines_zero_copy_sends_per_peer():
         second_queued = asyncio.Event()
         socket = FakeSocket(release, second_queued)
         encoder = MMEncoder.__new__(MMEncoder)
-        encoder.server_args = SimpleNamespace(
+        config_override = get_context().override_server_args(
             encoder_transfer_backend="zmq_to_scheduler"
         )
-        encoder.send_timeout = 1
-        encoder.context = FakeContext(socket)
-        encoder.scheduler_send_sockets = {}
-        encoder.scheduler_send_locks = {}
-        mm_data = EmbeddingData(
-            req_id="test-rid_local_part_0",
-            num_parts=1,
-            part_idx=0,
-            grid_dim=None,
-            modality=Modality.IMAGE,
-            error_msg="probe",
-            error_code=599,
-        )
+        with config_override as server_args:
+            encoder.server_args = server_args
+            encoder.send_timeout = 1
+            encoder.context = FakeContext(socket)
+            encoder.scheduler_send_sockets = {}
+            encoder.scheduler_send_locks = {}
+            mm_data = EmbeddingData(
+                req_id="test-rid_local_part_0",
+                num_parts=1,
+                part_idx=0,
+                grid_dim=None,
+                modality=Modality.IMAGE,
+                error_msg="probe",
+                error_code=599,
+            )
 
-        first = asyncio.create_task(encoder._send(None, mm_data, url="127.0.0.1:12345"))
-        while socket.send_count < 1:
-            await asyncio.sleep(0)
-        second = asyncio.create_task(
-            encoder._send(None, mm_data, url="127.0.0.1:12345")
-        )
-        try:
-            await asyncio.wait_for(second_queued.wait(), timeout=0.5)
-        finally:
-            release.set()
-        await asyncio.gather(first, second)
+            first = asyncio.create_task(
+                encoder._send(None, mm_data, url="127.0.0.1:12345")
+            )
+            while socket.send_count < 1:
+                await asyncio.sleep(0)
+            second = asyncio.create_task(
+                encoder._send(None, mm_data, url="127.0.0.1:12345")
+            )
+            try:
+                await asyncio.wait_for(second_queued.wait(), timeout=0.5)
+            finally:
+                release.set()
+            await asyncio.gather(first, second)
 
-        assert socket.send_count == 2
+            assert socket.send_count == 2
 
     asyncio.run(run_test())
 
