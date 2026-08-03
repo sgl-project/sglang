@@ -289,6 +289,9 @@ class TinyMamba2ModelConfig:
         self.hf_text_config = self.hf_config
         self.linear_attn_registry_result = None
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
         return self.num_key_value_heads // tp_size
@@ -311,6 +314,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
         self.gpu_id = 0
         self.ps = ParallelState.trivial()
         self.canary_manager = None
@@ -389,7 +393,7 @@ class MockMamba2ModelRunner(ModelRunner):
         # `MambaMixer2.forward_decode` requires. In production the
         # scheduler calls this during initialization; the fixture must
         # mirror that or DECODE crashes with a missing-backend error.
-        from sglang.srt.layers.attention.mamba.ops import (
+        from sglang.kernels.ops.mamba.triton_ops import (
             initialize_mamba_selective_state_update_backend,
         )
 

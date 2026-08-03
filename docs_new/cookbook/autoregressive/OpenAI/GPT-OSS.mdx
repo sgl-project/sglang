@@ -25,6 +25,8 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3.Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -47,6 +49,7 @@ import { GPTOSSDeployment } from "/src/snippets/autoregressive/gpt-oss-deploymen
 - **MCP tool servers:** For production, point SGLang at external MCP SSE servers with `--tool-server ip-1:port-1,ip-2:port-2`.
 - **Responses API:** GPT-OSS supports OpenAI's Responses API (`client.responses.create`) in addition to the standard Chat Completions API (see section 4.2.4).
 - **Use Python 3.12** when running the demo Python tool.
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4.Model Invocation
 

@@ -327,6 +327,10 @@ def _configure_runner_for_eagle_draft(
         "use_mla_backend": runner.use_mla_backend,
     }
     server_args.override(source="attention-unittest-eagle-draft", **updates)
+    # Re-publish so the bags pick up the overrides.
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(server_args)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -390,6 +394,9 @@ def _build_frozen_kv_mtp_fixture(
     fixture.runner.server_args.override(
         "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
     )
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(fixture.runner.server_args)
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
@@ -1484,6 +1491,7 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
     vocab_size: int = 64,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ):
     settings = EagleDraftRunnerSettings(
         topk=topk,
@@ -1498,12 +1506,20 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
         atol=DSV4_ATOL,
         rtol=DSV4_RTOL,
     )
+
+    def _make_forward_batch(case, draft_inputs, settings):
+        batch = _make_dsv4_eagle_draft_forward_batch(case, draft_inputs, settings)
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+        return batch
+
     adapter = EagleDraftCudaGraphRunnerAdapter(
         build_fixture=build_dsv4_attention_fixture,
         make_model_forward=_make_dsv4_model_forward,
         make_draft_inputs=_make_dsv4_draft_inputs,
         prepare_replay_state=_prepare_dsv4_draft_replay_state,
-        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
+        make_forward_batch=_make_forward_batch,
         check_case=_check_dsv4_draft_cache_layout,
         init_eager_metadata=_init_dsv4_eager_metadata,
     )

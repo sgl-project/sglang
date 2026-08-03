@@ -19,6 +19,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -39,6 +43,24 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+# Measured immediately before prefill graph construction, after model weights,
+# KV cache, and the eager runner's static buffers have been allocated.  Below
+# this budget, compiling/capturing a multi-bucket prefill graph is likely to
+# OOM or make no forward progress for large models.  Keep an explicitly chosen
+# backend untouched: an operator may intentionally trade KV capacity for it.
+_MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB = 4.0
+
+
+def should_skip_auto_prefill_cuda_graph_for_memory(
+    available_memory_gb: float,
+    cuda_graph_config_locked: set[tuple[str, str]],
+) -> bool:
+    """Return whether an auto-selected prefill graph lacks capture headroom."""
+    return (
+        (Phase.PREFILL, "backend") not in cuda_graph_config_locked
+        and available_memory_gb < _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB
+    )
 
 
 class DecodeGraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -144,21 +166,33 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return None
 
-    # Skip prefill CG for EAGLE target on tc_piecewise: that backend
-    # captures CaptureHiddenMode.NULL while runtime requests FULL, so
-    # the captured graph is dead, and capturing it perturbs FP4 /
-    # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
-    # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
-    # (restored from #25795), so it does NOT need this skip.
+    # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
+    # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
+    # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
+    # state and corrupt decode replay (see #28386 and #28870). BCG captures
+    # FULL for EAGLE target in PrefillCudaGraphRunner.__init__, so it does not
+    # need this skip.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and not model_runner.server_args.enable_return_hidden_states
+        and get_server_return_hidden_states_mode(model_runner.server_args)
+        < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
             "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
             "to avoid FP4/MoE decode-replay corruption (#28386)."
+        )
+        return eager_runner
+
+    if (
+        model_runner.server_args.enable_lora
+        and not model_runner.lora_manager.supports_prefill_cuda_graph
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because the current LoRA "
+            "configuration does not support it (unsupported LoRA backend, "
+            "MoE LoRA, or DP attention)."
         )
         return eager_runner
 
@@ -204,6 +238,7 @@ def capture_prefill_graph(
         model_runner.moe_layers,
         model_runner.moe_fusions,
         model_runner.dsa_indexers,
+        model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
     if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
@@ -217,6 +252,20 @@ def capture_prefill_graph(
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
+    if should_skip_auto_prefill_cuda_graph_for_memory(
+        before_mem,
+        getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
+    ):
+        logger.warning(
+            "Disabling auto-selected prefill CUDA graph: only %.2f GiB is free "
+            "after model/KV/eager-buffer allocation; at least %.2f GiB is "
+            "required for capture. Set an explicit prefill CUDA graph backend "
+            "to override this safety gate.",
+            before_mem,
+            _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB,
+        )
+        return eager_runner
+
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
     capture_num_tokens = sorted(model_runner.server_args.cuda_graph_config.prefill.bs)
@@ -269,12 +318,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
     role = "draft" if model_runner.is_draft_worker else "target"
     if model_runner.spec_algorithm.is_speculative():
         capture_name = f"{role} verify"
-        num_tokens_per_req = (
-            model_runner.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                model_runner.server_args.speculative_num_draft_tokens,
-                model_runner.is_draft_worker,
-            )
-        )
+        num_tokens_per_req = model_runner.decode_num_tokens_per_req()
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1

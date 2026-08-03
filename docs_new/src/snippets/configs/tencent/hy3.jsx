@@ -109,6 +109,10 @@ sgl-eval run aime26 \\
   playgroundFeatures: {
 
     // ----- Card 1: "Attention Parallelism" -----
+    // No CP knob: prefill Context Parallel needs model-side integration in
+    // SGLang (DeepSeek-family / Qwen-MoE / Mellum have it) and HYV3ForCausalLM
+    // has none — the engine's CP knob would emit --enable-prefill-cp flags
+    // that don't work on this model.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -120,7 +124,6 @@ sgl-eval run aime26 \\
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,

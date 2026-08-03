@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
@@ -197,12 +198,16 @@ class BaseRunner(ABC):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        # elastic-EP scale-up rewrites dp_size on the published config
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
-        self.enable_return_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
+        self.return_hidden_states_mode = (
+            CaptureHiddenMode.NULL
+            if model_runner.is_draft_worker
+            else get_server_return_hidden_states_mode(model_runner.server_args)
         )
+        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -218,6 +223,7 @@ class BaseRunner(ABC):
             return
 
         self._pre_initialize_flashinfer_allreduce_workspace()
+        self._pre_initialize_fi_a2a_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -255,6 +261,19 @@ class BaseRunner(ABC):
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
         )
+
+    def _pre_initialize_fi_a2a_workspace(self):
+        """Allocate the FlashInfer MNNVL all-to-all workspace for the fi_a2a DCP
+        comm backend; must run before CG capture (it syncs the stream + barriers
+        cross-rank, uncapturable) and raises early on non-MNNVL platforms.
+        """
+        mr = self.model_runner
+        if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "fi_a2a":
+            return
+
+        from sglang.srt.layers.dcp import init_fi_a2a_workspace
+
+        init_fi_a2a_workspace(get_parallel().dcp_group)
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
@@ -299,7 +318,7 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
-            dp_size=mr.server_args.dp_size,
+            dp_size=get_parallel().dp_size,
             pp_size=mr.server_args.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
@@ -353,21 +372,19 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.DECODE
         else:
             capture_forward_mode = ForwardMode.EXTEND
-        capture_hidden_mode = CaptureHiddenMode.NULL
+        capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+            if mr.is_draft_worker
+            else get_server_return_hidden_states_mode(mr.server_args)
+        )
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             if mr.is_draft_worker:
-                if not mr.spec_algorithm.supports_target_verify_for_draft():
-                    raise RuntimeError("This should not happen")
+                assert (
+                    mr.spec_algorithm.supports_target_verify_for_draft()
+                ), "This should not happen"
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_req = (
-                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
-
-        if mr.server_args.enable_return_hidden_states:
-            capture_hidden_mode = CaptureHiddenMode.FULL
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
 
         num_tokens = batch_size * num_tokens_per_req
 
@@ -388,8 +405,6 @@ class BaseRunner(ABC):
             )
         )
 
-        seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
-
         if get_flags().capture.enable_torch_compile:
             set_torch_compile_config()
             should_disable_torch_compile = not getattr(
@@ -406,33 +421,34 @@ class BaseRunner(ABC):
         # NOTE: aux hidden state capture (eagle3/dflash) is already
         # configured by init_aux_hidden_state_capture() in initialize().
 
-        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
-        if require_gathered_buffer(mr.server_args):
-            assert require_mlp_tp_gather_ or require_attn_tp_gather(mr.server_args)
-
+        # Token-axis buffer views and counters.
         input_ids = buffers.input_ids[:num_tokens]
         positions = buffers.positions[:num_tokens]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        buffers.num_token_non_padded[...] = num_tokens
+
+        # Batch-axis buffer views.
+        req_pool_indices = buffers.req_pool_indices[:batch_size]
+        seq_lens = buffers.seq_lens[:batch_size]
+        seq_lens_cpu = buffers.seq_lens_cpu[:batch_size]
+
+        # Optional buffer views.
         # Eager-reuse drops the logits buffer; only buffer sets that carry one slice it.
         next_token_logits_buffer = (
             buffers.next_token_logits_buffer[:num_tokens]
             if buffers.next_token_logits_buffer is not None
             else None
         )
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        req_pool_indices = buffers.req_pool_indices[:batch_size]
-        seq_lens = buffers.seq_lens[:batch_size]
-        seq_lens_cpu = buffers.seq_lens_cpu[:batch_size]
         encoder_lens = (
             buffers.encoder_lens[:batch_size]
             if buffers.encoder_lens is not None
             else None
         )
 
-        buffers.num_token_non_padded[...] = num_tokens
-
         # For extend mode
         if capture_forward_mode == ForwardMode.EXTEND:
+            seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
             extend_prefix_lens_cpu = [0] * batch_size
             extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
@@ -466,9 +482,15 @@ class BaseRunner(ABC):
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        # TP-gather requirements for global token metadata.
+        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
+        require_attn_tp_gather_ = require_attn_tp_gather(mr.server_args)
+        if require_gathered_buffer(mr.server_args):
+            assert require_mlp_tp_gather_ or require_attn_tp_gather_
+
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * mr.server_args.dp_size
-        elif require_attn_tp_gather(mr.server_args):
+            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
+        elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
             global_num_tokens_cpu = None
@@ -484,6 +506,7 @@ class BaseRunner(ABC):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
+        # Speculative metadata and hidden-state capture mode.
         spec_info = create_dummy_verify_input(
             mr.spec_algorithm,
             mr.server_args,
@@ -506,6 +529,7 @@ class BaseRunner(ABC):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        # Optional LoRA metadata.
         if mr.server_args.enable_lora:
             lora_ids = [None] * batch_size
         else:
@@ -544,17 +568,21 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
                 batch_size
             )
-
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
+        forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
+            # Reused dummy batches may carry DP-local lazy caches from a prior
+            # forward. Clear them, then refresh the process-wide DP buffer and
+            # MoE mode metadata read by model code during this standalone run.
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
