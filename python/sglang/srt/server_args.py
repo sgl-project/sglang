@@ -4456,6 +4456,7 @@ class ServerArgs:
             is_deepseek_v4,
             is_nemotron_h,
         )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4482,7 +4483,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4494,10 +4496,10 @@ class ServerArgs:
                 "two-batch overlap",
                 lambda: self.enable_two_batch_overlap,
             ),
-            # Only DeepEP's a2a is validated under BCG.
             (
-                "non-DeepEP a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
+                "unvalidated a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -9332,6 +9334,10 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+            elif is_rust_server:
+                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
+                # DataParallelController allocating worker ports.
+                scheduler_input_port = port_base + 6 + dp_rank
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
