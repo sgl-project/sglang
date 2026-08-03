@@ -50,6 +50,10 @@ class RemoteDecodeResult:
     decode_ms: float
     encode_ms: float
     transfer_ms: float
+    serialize_ms: float
+    latent_send_ms: float
+    credit_wait_ms: float
+    first_frame_ms: float | None
 
 
 FrameBatchHandler = Callable[[RemoteFrameBatch], Awaitable[None]]
@@ -62,6 +66,10 @@ class _PendingDecode:
     result: asyncio.Future[RemoteDecodeResult]
     on_frame_batch: FrameBatchHandler
     sent_at: float
+    serialize_ms: float
+    latent_send_ms: float = 0.0
+    credit_wait_ms: float = 0.0
+    first_frame_ms: float | None = None
     callback_tail: asyncio.Task | None = None
 
 
@@ -69,6 +77,9 @@ class _PendingDecode:
 class RemoteDecodeHandle:
     _future: asyncio.Future[RemoteDecodeResult]
     timeout_s: float
+    serialize_ms: float
+    latent_send_ms: float
+    credit_wait_ms: float
 
     async def wait(self) -> RemoteDecodeResult:
         return await asyncio.wait_for(asyncio.shield(self._future), self.timeout_s)
@@ -154,10 +165,12 @@ class RealtimeVAEClient:
     ) -> RemoteDecodeHandle:
         if self._ws is None or self._closed:
             raise RemoteVAEError("VAE client is not open")
+        serialize_started = time.perf_counter()
         cpu_latents = latents.detach().to(device="cpu").contiguous()
         if cpu_latents.dtype not in {torch.bfloat16, torch.float16, torch.float32}:
             raise ProtocolViolation(f"unsupported latent dtype: {cpu_latents.dtype}")
         payload = cpu_latents.view(torch.uint8).numpy().tobytes()
+        serialize_ms = (time.perf_counter() - serialize_started) * 1000.0
         header = LatentChunkHeader(
             session_id=str(handoff["session_id"]),
             generation_id=str(handoff["generation_id"]),
@@ -185,15 +198,22 @@ class RealtimeVAEClient:
             result=loop.create_future(),
             on_frame_batch=on_frame_batch,
             sent_at=time.perf_counter(),
+            serialize_ms=serialize_ms,
         )
         self._pending[header.request_id] = pending
         try:
             wire = encode_message("latent_chunk", header=header, payload=payload)
             if len(wire) > self.max_message_bytes:
                 raise ProtocolViolation("encoded latent exceeds VAE message limit")
+            send_started = time.perf_counter()
             async with self._send_lock:
                 await self._ws.send(wire)
+            pending.latent_send_ms = (time.perf_counter() - send_started) * 1000.0
+            credit_started = time.perf_counter()
             await asyncio.wait_for(pending.accepted.wait(), self.timeout_s)
+            pending.credit_wait_ms = (
+                time.perf_counter() - credit_started
+            ) * 1000.0
             if pending.result.done():
                 pending.result.result()
         except Exception:
@@ -201,7 +221,13 @@ class RealtimeVAEClient:
             if not pending.result.done():
                 pending.result.cancel()
             raise
-        return RemoteDecodeHandle(pending.result, self.timeout_s)
+        return RemoteDecodeHandle(
+            pending.result,
+            self.timeout_s,
+            pending.serialize_ms,
+            pending.latent_send_ms,
+            pending.credit_wait_ms,
+        )
 
     async def _read_loop(self) -> None:
         try:
@@ -223,6 +249,10 @@ class RealtimeVAEClient:
                     if pending is None:
                         raise ProtocolViolation("frames for unknown VAE request")
                     self._validate_message_identity(message, pending.header)
+                    if pending.first_frame_ms is None:
+                        pending.first_frame_ms = (
+                            time.perf_counter() - pending.sent_at
+                        ) * 1000.0
                     frame_batch = self._decode_frame_batch(message, pending.header)
                     previous = pending.callback_tail
 
@@ -317,6 +347,10 @@ class RealtimeVAEClient:
                 decode_ms=float(message.get("decode_ms") or 0.0),
                 encode_ms=float(message.get("encode_ms") or 0.0),
                 transfer_ms=(time.perf_counter() - pending.sent_at) * 1000.0,
+                serialize_ms=pending.serialize_ms,
+                latent_send_ms=pending.latent_send_ms,
+                credit_wait_ms=pending.credit_wait_ms,
+                first_frame_ms=pending.first_frame_ms,
             )
         )
 

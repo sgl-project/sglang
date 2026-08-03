@@ -50,6 +50,8 @@ class GenerateSession:
         self.client_activity_version = 0
         self.action_version = 0
         self.prompt_version = 0
+        self.denoise_intervals: dict[int, tuple[float, float]] = {}
+        self.vae_intervals: dict[int, tuple[float, float]] = {}
         self.client_trace: dict[str, Any] | None = None
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
@@ -92,6 +94,8 @@ class GenerateSession:
         self.output_pace_next_send_at = None
         self.output_pace_last_event_id = None
         self.vae_client = None
+        self.denoise_intervals.clear()
+        self.vae_intervals.clear()
         self.realtime_session.dispose()
 
     def mark_client_activity(self) -> None:

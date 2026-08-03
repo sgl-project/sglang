@@ -247,6 +247,38 @@ function separatesVaeEncodeAndDecodeInTopologyOrder() {
   assert.ok(summary.edges.find((edge) => edge.from === "denoise" && edge.to === "vae_decode"));
 }
 
+function keepsLatestCompleteRemoteVaeMetricsDuringNextChunk() {
+  const topology = createRealtimeTraceTopology({ maxEvents: 32 });
+  topology.reset("trace-remote");
+  topology.addEvent({
+    event: "server.remote_vae_complete",
+    trace_id: "trace-remote",
+    chunk_index: 7,
+    vae_queue_wait_ms: 4,
+    vae_decode_ms: 82,
+    frame_encode_ms: 13,
+    latent_serialize_ms: 2,
+    latent_send_ms: 5,
+    vae_credit_wait_ms: 3,
+    latent_to_gateway_complete_ms: 111,
+    overlap_with_next_denoise_ms: 70,
+    overlap_ratio: 0.72,
+  });
+  topology.addEvent({
+    event: "server.scheduler_forward_start",
+    trace_id: "trace-remote",
+    chunk_index: 8,
+  });
+
+  const summary = topology.summary();
+  assert.equal(summary.latestChunk.vaeQueueWaitMs, 4);
+  assert.equal(summary.latestChunk.vaeDecodeMs, 82);
+  assert.equal(summary.latestChunk.frameEncodeMs, 13);
+  assert.equal(summary.latestChunk.latentTransferMs, 8);
+  assert.equal(summary.latestChunk.overlapMs, 70);
+  assert.equal(summary.nodes.find((node) => node.id === "vae_decode").metric, "86ms");
+}
+
 function formatsReadableDurations() {
   assert.equal(formatTraceDuration(0), "0ms");
   assert.equal(formatTraceDuration(12.4), "12ms");
@@ -260,6 +292,7 @@ usesLatestCompletedChunkWhenNextChunkIsInFlight();
 retainsLastKnownStageMetricsForPartiallyReportedChunks();
 mapsGenericPipelineStageEventsToChunkMetrics();
 separatesVaeEncodeAndDecodeInTopologyOrder();
+keepsLatestCompleteRemoteVaeMetricsDuringNextChunk();
 formatsReadableDurations();
 
 console.log("trace topology tests ok");

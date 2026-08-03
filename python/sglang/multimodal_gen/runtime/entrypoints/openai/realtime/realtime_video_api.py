@@ -26,6 +26,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
 )
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     CLIENT_TRACE_EVENT_KIND,
+    calculate_overlap_ms,
+    calculate_overlap_ratio,
     compact_client_trace_event,
     log_realtime_trace,
     normalize_trace_id,
@@ -581,9 +583,61 @@ async def _complete_remote_chunk(
     request_prepare_ms: float,
     scheduler_forward_ms: float,
     chunk_started: float,
+    vae_started: float,
 ) -> None:
     remote_result = await handle.wait()
+    vae_completed = time.perf_counter()
+    session.vae_intervals[chunk.index] = (vae_started, vae_completed)
+    next_denoise = session.denoise_intervals.get(chunk.index + 1)
+    overlap_ms = 0.0
+    overlap_ratio = 0.0
+    if next_denoise is not None:
+        overlap_ms = calculate_overlap_ms(
+            session.vae_intervals[chunk.index], next_denoise
+        )
+        overlap_ratio = calculate_overlap_ratio(
+            session.vae_intervals[chunk.index], next_denoise
+        )
     chunk_total_ms = (time.perf_counter() - chunk_started) * 1000.0
+    common = {
+        "request_id": chunk.request_id,
+        "chunk_index": chunk.index,
+        "event_id": getattr(batch, "realtime_event_id", None),
+    }
+    log_realtime_trace(
+        logger,
+        session,
+        "server.vae_queue_wait_complete",
+        **common,
+        duration_ms=round(remote_result.queue_wait_ms, 3),
+    )
+    log_realtime_trace(
+        logger,
+        session,
+        "server.vae_decode_complete",
+        **common,
+        duration_ms=round(remote_result.decode_ms, 3),
+        source="remote_taehv",
+    )
+    log_realtime_trace(
+        logger,
+        session,
+        "server.frame_encode_complete",
+        **common,
+        duration_ms=round(remote_result.encode_ms, 3),
+    )
+    log_realtime_trace(
+        logger,
+        session,
+        "server.frame_transfer_complete",
+        **common,
+        duration_ms=round(remote_result.transfer_ms, 3),
+        first_frame_ms=(
+            round(remote_result.first_frame_ms, 3)
+            if remote_result.first_frame_ms is not None
+            else None
+        ),
+    )
     log_realtime_trace(
         logger,
         session,
@@ -595,6 +649,16 @@ async def _complete_remote_chunk(
         vae_decode_ms=round(remote_result.decode_ms, 3),
         frame_encode_ms=round(remote_result.encode_ms, 3),
         latent_to_gateway_complete_ms=round(remote_result.transfer_ms, 3),
+        latent_serialize_ms=round(remote_result.serialize_ms, 3),
+        latent_send_ms=round(remote_result.latent_send_ms, 3),
+        vae_credit_wait_ms=round(remote_result.credit_wait_ms, 3),
+        first_frame_ms=(
+            round(remote_result.first_frame_ms, 3)
+            if remote_result.first_frame_ms is not None
+            else None
+        ),
+        overlap_with_next_denoise_ms=round(overlap_ms, 3),
+        overlap_ratio=round(overlap_ratio, 4),
         num_frames=remote_result.num_frames,
     )
     _log_realtime_chunk_timing(
@@ -672,13 +736,20 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 request_prepare_ms=round(request_prepare_ms, 3),
                 event_id=getattr(batch, "realtime_event_id", None),
             )
+            denoise_started = time.perf_counter()
             _, result = await process_generation_batch(async_scheduler_client, batch)
+            denoise_completed = time.perf_counter()
+            session.denoise_intervals[chunk.index] = (
+                denoise_started,
+                denoise_completed,
+            )
             scheduler_forward_ms = timer.mark_ms()
             _emit_realtime_result_stage_traces(session, chunk, batch, result)
             if result.realtime_latents is None or result.realtime_handoff is None:
                 raise RuntimeError("remote VAE path received no latent handoff")
 
             send_stats = empty_frame_send_stats()
+            first_remote_batch = True
 
             async def on_frame_batch(
                 frame_batch: RemoteFrameBatch,
@@ -686,6 +757,18 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 batch=batch,
                 send_stats=send_stats,
             ) -> None:
+                nonlocal first_remote_batch
+                if first_remote_batch:
+                    first_remote_batch = False
+                    log_realtime_trace(
+                        logger,
+                        session,
+                        "server.remote_first_frame_received",
+                        request_id=chunk.request_id,
+                        chunk_index=chunk.index,
+                        event_id=getattr(batch, "realtime_event_id", None),
+                        frame_batch_index=frame_batch.frame_batch_index,
+                    )
                 await _send_remote_frame_batch(
                     ws,
                     session,
@@ -694,17 +777,30 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                     send_stats,
                 )
 
+            vae_started = time.perf_counter()
             handle = await client.submit(
                 result.realtime_latents,
                 result.realtime_handoff,
                 on_frame_batch=on_frame_batch,
+            )
+            log_realtime_trace(
+                logger,
+                session,
+                "server.latent_transfer_accepted",
+                request_id=chunk.request_id,
+                chunk_index=chunk.index,
+                event_id=getattr(batch, "realtime_event_id", None),
+                latent_serialize_ms=round(handle.serialize_ms, 3),
+                latent_send_ms=round(handle.latent_send_ms, 3),
+                vae_credit_wait_ms=round(handle.credit_wait_ms, 3),
             )
             result.realtime_latents = None
             await coordinator.submit(
                 lambda chunk=chunk, batch=batch, handle=handle, send_stats=send_stats,
                 request_prepare_ms=request_prepare_ms,
                 scheduler_forward_ms=scheduler_forward_ms,
-                chunk_started=chunk_started: _complete_remote_chunk(
+                chunk_started=chunk_started,
+                vae_started=vae_started: _complete_remote_chunk(
                     ws,
                     session,
                     chunk,
@@ -714,6 +810,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                     request_prepare_ms,
                     scheduler_forward_ms,
                     chunk_started,
+                    vae_started,
                 )
             )
         await coordinator.finish()

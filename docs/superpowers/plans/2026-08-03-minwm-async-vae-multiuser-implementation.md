@@ -417,7 +417,7 @@ Commit: `git commit -am "feat(realtime): enable quota-bound multi-user sessions"
 - Modify: `python/sglang/multimodal_gen/apps/realtime_webui/app.js`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_trace.py`
 
-- [ ] **Step 1: Write failing trace completeness and redaction tests**
+- [x] **Step 1: Write failing trace completeness and redaction tests**
 
 ```python
 def test_async_chunk_trace_has_correlated_stage_timings_without_media():
@@ -432,17 +432,17 @@ def test_overlap_ratio_uses_union_not_sum():
     assert calculate_overlap_ratio(denoise=(100, 600), vae=(400, 700)) == pytest.approx(0.4)
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_trace.py -q`
 
 Expected: FAIL because remote stages are absent.
 
-- [ ] **Step 3: Add spans and low-cardinality metrics**
+- [x] **Step 3: Add spans and low-cardinality metrics**
 
 Emit `denoiser.queue_wait`, `denoiser.compute`, `latent.serialize`, `latent.transfer`, `vae.queue_wait`, `vae.decode`, `frame.encode`, `frame.transfer`, `gateway.ws_write`, `browser.render`; each carries trace/session/generation/chunk/request IDs in Trace only, worker role/SKU in metric labels, prompt SHA-256 and length but no prompt text. Add histograms for stage latency, action-to-visible, queue depth, backpressure, active/free slots and an overlap gauge. WebUI keeps last complete timing when a partial update arrives.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_trace.py python/sglang/multimodal_gen/test/unit/realtime/test_perf_logger.py -q`
 

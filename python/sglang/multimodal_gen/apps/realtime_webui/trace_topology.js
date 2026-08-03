@@ -11,6 +11,13 @@
     "denoiseMs",
     "vaeEncodeMs",
     "vaeDecodeMs",
+    "vaeQueueWaitMs",
+    "latentSerializeMs",
+    "latentTransferMs",
+    "frameEncodeMs",
+    "frameTransferMs",
+    "overlapMs",
+    "overlapRatio",
     "postDecodeMs",
     "rawPayloadBuildMs",
     "wsWriteMs",
@@ -145,6 +152,13 @@
         denoiseMs: null,
         vaeEncodeMs: null,
         vaeDecodeMs: null,
+        vaeQueueWaitMs: null,
+        latentSerializeMs: null,
+        latentTransferMs: null,
+        frameEncodeMs: null,
+        frameTransferMs: null,
+        overlapMs: null,
+        overlapRatio: null,
         postDecodeMs: null,
         rawPayloadBuildMs: null,
         wsWriteMs: null,
@@ -175,6 +189,24 @@
       assignNumber(chunk, "vaeEncodeMs", preferredDuration(event));
     } else if (event.event === "server.vae_decode_complete") {
       assignNumber(chunk, "vaeDecodeMs", preferredDuration(event));
+    } else if (event.event === "server.vae_queue_wait_complete") {
+      assignNumber(chunk, "vaeQueueWaitMs", preferredDuration(event));
+    } else if (event.event === "server.latent_transfer_accepted") {
+      assignNumber(chunk, "latentSerializeMs", event.latent_serialize_ms);
+      assignNumber(chunk, "latentTransferMs", sumNumbers(event.latent_send_ms, event.vae_credit_wait_ms));
+    } else if (event.event === "server.frame_encode_complete") {
+      assignNumber(chunk, "frameEncodeMs", preferredDuration(event));
+    } else if (event.event === "server.frame_transfer_complete") {
+      assignNumber(chunk, "frameTransferMs", preferredDuration(event));
+    } else if (event.event === "server.remote_vae_complete") {
+      assignNumber(chunk, "vaeQueueWaitMs", event.vae_queue_wait_ms);
+      assignNumber(chunk, "vaeDecodeMs", event.vae_decode_ms);
+      assignNumber(chunk, "latentSerializeMs", event.latent_serialize_ms);
+      assignNumber(chunk, "latentTransferMs", sumNumbers(event.latent_send_ms, event.vae_credit_wait_ms));
+      assignNumber(chunk, "frameEncodeMs", event.frame_encode_ms);
+      assignNumber(chunk, "frameTransferMs", event.latent_to_gateway_complete_ms);
+      assignNumber(chunk, "overlapMs", event.overlap_with_next_denoise_ms);
+      assignNumber(chunk, "overlapRatio", event.overlap_ratio);
     } else if (event.event === "server.post_decode_complete") {
       assignNumber(chunk, "postDecodeMs", preferredDuration(event));
     } else if (event.event === "server.pipeline_stage_complete") {
@@ -250,10 +282,15 @@
     if (eventName === "server.model_denoise_complete") return "denoise";
     if (
       eventName === "server.vae_decode_complete" ||
+      eventName === "server.vae_queue_wait_complete" ||
+      eventName === "server.frame_encode_complete" ||
       eventName === "server.post_decode_complete"
     ) return "vae_decode";
     if (
       eventName === "server.output_send_start" ||
+      eventName === "server.latent_transfer_accepted" ||
+      eventName === "server.frame_transfer_complete" ||
+      eventName === "server.remote_vae_complete" ||
       eventName === "server.chunk_complete" ||
       eventName === "server.chunk_stats_sent"
     ) return "transport";
@@ -267,7 +304,7 @@
     if (stageId === "scheduler") return formatTraceDuration(chunk.schedulerForwardMs);
     if (stageId === "vae_encode") return formatTraceDuration(chunk.vaeEncodeMs);
     if (stageId === "denoise") return formatTraceDuration(chunk.denoiseMs);
-    if (stageId === "vae_decode") return formatTraceDuration(sumNumbers(chunk.vaeDecodeMs, chunk.postDecodeMs));
+    if (stageId === "vae_decode") return formatTraceDuration(sumNumbers(chunk.vaeQueueWaitMs, chunk.vaeDecodeMs, chunk.postDecodeMs));
     if (stageId === "transport") {
       return formatTraceDuration(sumNumbers(chunk.rawPayloadBuildMs, chunk.wsWriteMs));
     }

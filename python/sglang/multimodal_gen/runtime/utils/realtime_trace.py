@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import socket
@@ -25,9 +26,18 @@ _RESERVED_PAYLOAD_KEYS = {
     "event",
     "trace_id",
     "session_id",
+    "generation_id",
     "server_epoch_ms",
     "server_elapsed_ms",
     "host",
+}
+_SENSITIVE_TRACE_FIELDS = {
+    "prompt",
+    "image",
+    "first_frame",
+    "latent_payload",
+    "payload",
+    "video",
 }
 
 
@@ -127,6 +137,7 @@ def log_realtime_trace_for_batch(
         return
     session = SimpleNamespace(
         id=getattr(batch, "realtime_session_id", None),
+        generation_id=getattr(batch, "realtime_generation_id", None),
         trace_id=trace_id,
         trace_started_at=getattr(batch, "realtime_trace_started_at", None),
     )
@@ -236,14 +247,43 @@ def realtime_trace_payload(session, event: str, **fields: Any) -> dict[str, Any]
         "event": event,
         "trace_id": getattr(session, "trace_id", getattr(session, "id", "")),
         "session_id": getattr(session, "id", None),
+        "generation_id": getattr(session, "generation_id", None),
         "server_epoch_ms": int(time.time() * 1000),
         "server_elapsed_ms": round((now - started_at) * 1000.0, 3),
         "host": _HOSTNAME,
     }
     for key, value in fields.items():
-        if value is not None and key not in _RESERVED_PAYLOAD_KEYS:
-            payload[key] = _json_safe(value)
+        if value is None or key in _RESERVED_PAYLOAD_KEYS:
+            continue
+        if key in _SENSITIVE_TRACE_FIELDS:
+            if isinstance(value, str):
+                payload[f"{key}_length"] = len(value)
+                payload[f"{key}_sha256"] = hashlib.sha256(
+                    value.encode("utf-8")
+                ).hexdigest()
+            else:
+                payload[f"{key}_redacted"] = True
+            continue
+        payload[key] = _json_safe(value)
     return payload
+
+
+def calculate_overlap_ratio(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> float:
+    left_start, left_end = left
+    right_start, right_end = right
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    longest_stage = max(0.0, left_end - left_start, right_end - right_start)
+    return overlap / longest_stage if longest_stage else 0.0
+
+
+def calculate_overlap_ms(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> float:
+    return max(0.0, min(left[1], right[1]) - max(left[0], right[0])) * 1000.0
 
 
 def _notify_realtime_trace_sinks(payload: dict[str, Any]) -> None:

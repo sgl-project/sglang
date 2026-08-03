@@ -23,6 +23,11 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     LatentChunkHeader,
     ProtocolViolation,
 )
+from sglang.multimodal_gen.runtime.realtime.async_vae_metrics import (
+    observe_stage,
+    record_backpressure,
+    update_capacity,
+)
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
@@ -141,6 +146,7 @@ class AsyncVAEWorker:
                 self._run_session(identity, state),
                 name=f"realtime-vae-{request.session_id[:8]}",
             )
+            self._update_capacity_metrics()
 
     async def submit(
         self,
@@ -154,6 +160,7 @@ class AsyncVAEWorker:
         if state is None:
             raise ProtocolViolation("unknown VAE session generation")
         if state.queue.full():
+            record_backpressure()
             raise VAEBackpressureError("VAE session decode queue is full")
 
         disposition = state.tracker.accept(header)
@@ -193,8 +200,10 @@ class AsyncVAEWorker:
         try:
             state.queue.put_nowait(job)
         except asyncio.QueueFull as exc:
+            record_backpressure()
             raise VAEBackpressureError("VAE session decode queue is full") from exc
         state.last_activity_at = time.monotonic()
+        self._update_capacity_metrics()
         return future
 
     async def decode(
@@ -234,6 +243,7 @@ class AsyncVAEWorker:
                 finally:
                     state.queue.task_done()
                     state.last_activity_at = time.monotonic()
+                    self._update_capacity_metrics()
         finally:
             current = self._sessions.get(identity)
             if current is state:
@@ -301,6 +311,9 @@ class AsyncVAEWorker:
         )
         encoded = tuple(batch for group in encoded_groups for batch in group)
         encode_ms = sum(batch.encode_ms for batch in encoded)
+        observe_stage("queue_wait", queue_wait_ms)
+        observe_stage("decode", decode_ms)
+        observe_stage("frame_encode", encode_ms)
 
         return DecodeResult(
             disposition=AcceptDisposition.ACCEPT,
@@ -481,6 +494,7 @@ class AsyncVAEWorker:
         reset = getattr(state.decoder, "reset", None)
         if callable(reset):
             reset()
+        self._update_capacity_metrics()
 
     async def close_all(self) -> None:
         for session_id, generation_id in list(self._sessions):
@@ -489,6 +503,13 @@ class AsyncVAEWorker:
     @property
     def active_sessions(self) -> int:
         return len(self._sessions)
+
+    def _update_capacity_metrics(self) -> None:
+        update_capacity(
+            active=len(self._sessions),
+            queued=sum(state.queue.qsize() for state in self._sessions.values()),
+            maximum=self.max_sessions,
+        )
 
 
 class TAEHVEngine:

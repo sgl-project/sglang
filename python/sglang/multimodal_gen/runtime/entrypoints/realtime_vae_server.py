@@ -10,6 +10,8 @@ import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from starlette.responses import Response
 
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     ProtocolViolation,
@@ -51,6 +53,10 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                 "max_sessions": worker.max_sessions,
             }
         )
+
+    @app.get("/metrics")
+    async def metrics():
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.websocket("/v1/realtime_vae/decode")
     async def decode_socket(ws: WebSocket):
