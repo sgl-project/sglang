@@ -239,8 +239,13 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
     )
     monkeypatch.setattr(
         realtime_vae.CausalVaeDecodingStage,
-        "_load_streaming_taehv_decoder",
-        lambda self, checkpoint_path, vae_dtype: streaming,
+        "_load_taehv_model",
+        lambda self, checkpoint_path, vae_dtype: object(),
+    )
+    monkeypatch.setattr(
+        realtime_vae.CausalVaeDecodingStage,
+        "_create_streaming_taehv_decoder",
+        lambda self, taehv_model: streaming,
     )
 
     native_vae = _NativeVAE()
@@ -265,6 +270,102 @@ def test_causal_vae_decoding_stage_uses_streaming_taehv_decoder(monkeypatch):
     assert torch.equal(streaming.inputs[0], torch.full((1, 1, 48, 4, 4), 2.0))
     assert tuple(frames.shape) == (1, 3, 1, 16, 16)
     assert torch.equal(frames, torch.full((1, 3, 1, 16, 16), 0.25))
+
+
+def test_causal_vae_decoding_stage_preloads_taehv_model(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+        vae as realtime_vae,
+    )
+
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_precision="fp32",
+            vae_config=SimpleNamespace(
+                taehv_checkpoint_path="/opt/taehv/taew2_2.pth",
+            ),
+        )
+    )
+    load_calls = []
+    taehv_model = object()
+
+    def fake_decoding_stage_init(self, vae, pipeline=None, component_name="vae"):
+        self.vae = vae
+        self.pipeline = pipeline
+        self.component_name = component_name
+        self.server_args = server_args
+
+    monkeypatch.setattr(
+        realtime_vae.DecodingStage,
+        "__init__",
+        fake_decoding_stage_init,
+    )
+    monkeypatch.setattr(
+        realtime_vae.CausalVaeDecodingStage,
+        "_load_taehv_model",
+        lambda self, checkpoint_path, vae_dtype: (
+            load_calls.append((checkpoint_path, vae_dtype)) or taehv_model
+        ),
+        raising=False,
+    )
+
+    stage = realtime_vae.CausalVaeDecodingStage(vae=object())
+
+    assert load_calls == [("/opt/taehv/taew2_2.pth", torch.float32)]
+    assert stage._taehv_models == {
+        ("/opt/taehv/taew2_2.pth", torch.float32): taehv_model,
+    }
+
+
+def test_causal_vae_decoding_stage_shares_taehv_weights_between_sessions(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+        vae as realtime_vae,
+    )
+
+    class _StreamingDecoder:
+        def __init__(self, model):
+            self.taehv = model
+
+        def reset(self):
+            pass
+
+    stage = realtime_vae.CausalVaeDecodingStage.__new__(
+        realtime_vae.CausalVaeDecodingStage
+    )
+    stage._taehv_models = {}
+    load_calls = []
+    taehv_model = object()
+    monkeypatch.setattr(
+        stage,
+        "_load_taehv_model",
+        lambda checkpoint_path, vae_dtype: (
+            load_calls.append((checkpoint_path, vae_dtype)) or taehv_model
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        stage,
+        "_create_streaming_taehv_decoder",
+        lambda model: _StreamingDecoder(model),
+        raising=False,
+    )
+
+    first_state = RealtimeVAEDecodeState()
+    second_state = RealtimeVAEDecodeState()
+    first = stage._get_or_create_streaming_taehv_decoder(
+        first_state,
+        "/opt/taehv/taew2_2.pth",
+        torch.float32,
+    )
+    second = stage._get_or_create_streaming_taehv_decoder(
+        second_state,
+        "/opt/taehv/taew2_2.pth",
+        torch.float32,
+    )
+
+    assert load_calls == [("/opt/taehv/taew2_2.pth", torch.float32)]
+    assert first is not second
+    assert first.taehv is taehv_model
+    assert second.taehv is taehv_model
 
 
 def test_causal_vae_decoding_stage_reads_parallel_decode_from_vae_config():
@@ -292,9 +393,7 @@ def test_causal_vae_decoding_stage_reads_parallel_decode_from_vae_config():
     stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
     stage.load_model = lambda: None
     stage._get_causal_decode_reset_fn = lambda: None
-    stage.decode_causal = (
-        lambda latents, server_args, *, first_chunk=False: latents + 1
-    )
+    stage.decode_causal = lambda latents, server_args, **kwargs: latents + 1
     batch = SimpleNamespace(
         block_idx=0,
         latents=torch.zeros(1, 1, 1, 1, 1),

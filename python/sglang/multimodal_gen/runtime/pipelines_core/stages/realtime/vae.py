@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -130,6 +132,18 @@ class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
 class CausalVaeDecodingStage(DecodingStage):
     """Decode realtime chunks with a persistent causal VAE cache when available."""
 
+    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
+        super().__init__(vae=vae, pipeline=pipeline, component_name=component_name)
+        self._taehv_models = {}
+
+        vae_config = getattr(self.server_args.pipeline_config, "vae_config", None)
+        checkpoint_path = self._taehv_checkpoint_path(vae_config)
+        if checkpoint_path is not None:
+            vae_dtype = PRECISION_TO_TYPE[
+                self.server_args.pipeline_config.vae_precision
+            ]
+            self._get_or_load_taehv_model(checkpoint_path, vae_dtype)
+
     @staticmethod
     def _taehv_checkpoint_path(vae_config) -> str | None:
         path = getattr(vae_config, "taehv_checkpoint_path", None)
@@ -137,13 +151,13 @@ class CausalVaeDecodingStage(DecodingStage):
             path = path.strip()
         return path or None
 
-    def _load_streaming_taehv_decoder(
+    def _load_taehv_model(
         self,
         checkpoint_path: str,
         vae_dtype: torch.dtype,
     ):
         try:
-            from taehv import StreamingTAEHV, TAEHV
+            from taehv import TAEHV
         except ImportError as exc:
             raise RuntimeError(
                 "TAEHV realtime decoder was requested, but the `taehv` package "
@@ -153,7 +167,42 @@ class CausalVaeDecodingStage(DecodingStage):
 
         taehv = TAEHV(checkpoint_path=checkpoint_path).eval()
         taehv = taehv.to(device=get_local_torch_device(), dtype=vae_dtype)
-        return StreamingTAEHV(taehv).eval()
+        return taehv.requires_grad_(False)
+
+    def _get_or_load_taehv_model(
+        self,
+        checkpoint_path: str,
+        vae_dtype: torch.dtype,
+    ):
+        models = getattr(self, "_taehv_models", None)
+        if models is None:
+            models = {}
+            self._taehv_models = models
+
+        key = (checkpoint_path, vae_dtype)
+        model = models.get(key)
+        if model is None:
+            started_at = time.perf_counter()
+            logger.info(
+                "Preloading TAEHV decoder weights: checkpoint=%s device=%s dtype=%s",
+                checkpoint_path,
+                get_local_torch_device(),
+                vae_dtype,
+            )
+            model = self._load_taehv_model(checkpoint_path, vae_dtype)
+            models[key] = model
+            logger.info(
+                "TAEHV decoder weights ready in %.3fs: checkpoint=%s",
+                time.perf_counter() - started_at,
+                checkpoint_path,
+            )
+        return model
+
+    @staticmethod
+    def _create_streaming_taehv_decoder(taehv_model):
+        from taehv import StreamingTAEHV
+
+        return StreamingTAEHV(taehv_model).eval()
 
     def _get_or_create_streaming_taehv_decoder(
         self,
@@ -168,7 +217,9 @@ class CausalVaeDecodingStage(DecodingStage):
         ):
             return decode_state.taehv_streaming_decoder
 
-        decoder = self._load_streaming_taehv_decoder(checkpoint_path, vae_dtype)
+        decode_state.reset_taehv_decoder()
+        taehv_model = self._get_or_load_taehv_model(checkpoint_path, vae_dtype)
+        decoder = self._create_streaming_taehv_decoder(taehv_model)
         decode_state.taehv_streaming_decoder = decoder
         decode_state.taehv_checkpoint_path = checkpoint_path
         decode_state.taehv_dtype = vae_dtype
