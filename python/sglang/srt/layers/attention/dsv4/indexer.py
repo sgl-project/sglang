@@ -150,7 +150,19 @@ def fold_paged_mqa_logits_approx(
     logits = torch.full(
         (batch_size, max_seq_len), float("-inf"), dtype=torch.float32, device=device
     )
-    logits[:, :n_eff] = (q_eff @ kv[:n_eff].t()) * sc[:n_eff].unsqueeze(0)
+    # Chunk the folded GEMM along the sequence axis. Computing it whole
+    # materialises a [B, n] fp32 product -- the size of the output -- and then a
+    # second one for the scale, so the approximation would cost 2x the output on
+    # top of the output itself: measured at +1.66 GB (128K) and +3.42 GB (256K)
+    # over the exact kernel at B=8192, which is enough to OOM a pool sized for a
+    # 1M context. One chunk at a time keeps the transient at ~256 MB.
+    step = max(64, (256 << 20) // max(1, batch_size * 4))
+    for start in range(0, n_eff, step):
+        stop = min(n_eff, start + step)
+        block = q_eff @ kv[start:stop].t()
+        block *= sc[start:stop].unsqueeze(0)
+        logits[:, start:stop] = block
+        del block
 
     positions = torch.arange(max_seq_len, device=device)
     invalid = positions[None, :] >= seq_lens.reshape(batch_size)[:, None]
