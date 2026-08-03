@@ -8,6 +8,10 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.eagle_echo import (
+    apply_eagle_retrieval_layout,
+    scatter_eagle_verify_output,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -20,8 +24,10 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
+    eagle_ragged_graph_tier_eligible,
     eagle_sample,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, round_up_grid
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -53,6 +59,31 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+
+def _select_eagle_ragged_graph_num_tokens(
+    *,
+    total_verify_tokens: int,
+    batch_size: int,
+    graph_runner,
+) -> int:
+    """Select a captured token tier, or retain the exact eager token count."""
+    if (
+        graph_runner is None
+        or not graph_runner.ragged_verify_mode
+        or not graph_runner.capture_num_tokens
+        or total_verify_tokens > graph_runner.capture_num_tokens[-1]
+    ):
+        return total_verify_tokens
+
+    graph_tier = round_up_grid(total_verify_tokens, graph_runner.capture_num_tokens)
+    if not eagle_ragged_graph_tier_eligible(
+        graph_num_tokens=graph_tier,
+        batch_size=batch_size,
+        graph_runner=graph_runner,
+    ):
+        return total_verify_tokens
+    return graph_tier
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -320,6 +351,7 @@ def build_eagle_verify_input(
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
     draft_probs: Optional[torch.Tensor],
+    verify_lens: Optional[torch.Tensor],
     *,
     target_worker: TpModelWorker,
     topk: int,
@@ -385,6 +417,40 @@ def build_eagle_verify_input(
         fill_prefix_mask=fill_mask,
     )
 
+    ragged_verify_layout = None
+    if verify_lens is not None:
+        verify_lens = verify_lens.to(device=draft_tokens.device, dtype=torch.int32)
+        if verify_lens.numel() == 0:
+            raise ValueError("ECHO layout is empty")
+        torch._assert_async(
+            (verify_lens >= 1).all(),
+            "ECHO layout values must be at least 1",
+        )
+        torch._assert_async(
+            (verify_lens <= num_draft_tokens).all(),
+            "ECHO layout values exceed the configured range",
+        )
+
+        # CUDA graph selection is a host decision. Synchronize one scalar total,
+        # not the complete per-request vector; all row geometry remains on device.
+        total_verify_tokens = int(verify_lens.sum().item())
+        graph_num_tokens = _select_eagle_ragged_graph_num_tokens(
+            total_verify_tokens=total_verify_tokens,
+            batch_size=verify_lens.numel(),
+            graph_runner=target_worker.model_runner.decode_cuda_graph_runner,
+        )
+
+        ragged_verify_layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=verify_lens,
+            graph_num_tokens=graph_num_tokens,
+        )
+        apply_eagle_retrieval_layout(
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            verify_lens=verify_lens,
+        )
+
     return EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
@@ -400,6 +466,7 @@ def build_eagle_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         draft_probs=draft_probs,
+        ragged_verify_layout=ragged_verify_layout,
     )
 
 
@@ -566,6 +633,21 @@ def run_eagle_verify(
         is_verify=True,
     )
     logits_output = forward_batch_output.logits_output
+    ragged_layout = verify_input.ragged_verify_layout
+    if ragged_layout is not None and not batch.forward_mode.is_idle():
+        logits_output.next_token_logits = scatter_eagle_verify_output(
+            compact=logits_output.next_token_logits,
+            layout=ragged_layout,
+            query_layout=verify_input.ragged_query_layout,
+            draft_token_num=num_draft_tokens,
+        )
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = scatter_eagle_verify_output(
+                compact=logits_output.hidden_states,
+                layout=ragged_layout,
+                query_layout=verify_input.ragged_query_layout,
+                draft_token_num=num_draft_tokens,
+            )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
@@ -654,6 +736,11 @@ def run_eagle_verify(
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
+        cap_lens=(
+            ragged_layout.verify_lens.to(torch.int32)
+            if ragged_layout is not None and not batch.forward_mode.is_idle()
+            else None
+        ),
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,

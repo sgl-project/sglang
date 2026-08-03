@@ -70,6 +70,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
+    compute_echo_verify_lens,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
@@ -146,6 +147,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.echo_threshold = getattr(server_args, "speculative_echo_threshold", None)
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -492,9 +494,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
-                )
+                (
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    draft_probs,
+                    verify_lens,
+                ) = self.cuda_graph_runner.execute(forward_batch)
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -504,9 +510,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+                (
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    draft_probs,
+                    verify_lens,
+                ) = self.draft_forward(forward_batch)
 
         return build_eagle_verify_input(
             batch,
@@ -515,6 +525,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             draft_probs,
+            verify_lens,
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
@@ -684,20 +695,41 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             bs = draft_tokens_topk1.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
+            return (
+                parent_list,
+                top_scores_index,
+                draft_tokens_topk1,
+                draft_probs,
+                None,
+            )
 
         if topk1_chain_fits:
             bs = token_list[0].shape[0]
             draft_tokens = torch.cat(token_list, dim=1)
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
-            return parent_list, top_scores_index, draft_tokens, draft_probs
+            return parent_list, top_scores_index, draft_tokens, draft_probs, None
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
+        verify_lens = (
+            compute_echo_verify_lens(
+                score_list,
+                top_scores_index,
+                self.echo_threshold,
+            )
+            if self.echo_threshold is not None
+            else None
+        )
 
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            draft_probs,
+            verify_lens,
+        )
 
     def draft_extend(self):
         pass

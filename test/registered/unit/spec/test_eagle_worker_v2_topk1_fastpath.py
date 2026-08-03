@@ -154,6 +154,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
             torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
             None,
+            None,
         )
         tree_result = (
             torch.empty((0,), dtype=torch.bool, device=DEVICE),

@@ -1152,6 +1152,118 @@ class TestDecoupledSpecArgs(CustomTestCase):
             )
 
 
+class TestEagleEchoArgs(CustomTestCase):
+    def _make_args(self, *, model_overrides=None, **overrides):
+        model_fields = {
+            "hf_config": SimpleNamespace(
+                architectures=["Qwen3ForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            ),
+            "linear_attn_registry_result": None,
+            "model_is_mrope": False,
+            "sliding_window_size": None,
+        }
+        model_fields.update(model_overrides or {})
+        model_config = SimpleNamespace(**model_fields)
+
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE3"
+        args.speculative_num_steps = 3
+        args.speculative_eagle_topk = 3
+        args.speculative_num_draft_tokens = 6
+        args.speculative_echo_threshold = 0.5
+        args.attention_backend = "fa3"
+        args.decode_attention_backend = None
+        args.disable_overlap_schedule = True
+        args.page_size = 1
+        args.get_model_config = lambda: model_config
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_valid_args_and_tp_pass_validation(self):
+        args = self._make_args(
+            speculative_echo_threshold="0.25",
+            tp_size=2,
+        )
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_echo_threshold, 0.25)
+
+    def test_threshold_range(self):
+        for threshold in (-0.1, 1.1, float("inf"), float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(speculative_echo_threshold=threshold)
+                with self.assertRaisesRegex(ValueError, "finite value in"):
+                    handle_speculative_decoding(args)
+
+        for threshold in (0.0, 1.0):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(speculative_echo_threshold=threshold)
+                handle_speculative_decoding(args)
+                self.assertEqual(args.speculative_echo_threshold, threshold)
+
+    def test_rejects_incompatible_target_architectures(self):
+        args = self._make_args(model_overrides={"model_is_mrope": True})
+        with self.assertRaisesRegex(ValueError, "MRoPE"):
+            handle_speculative_decoding(args)
+
+        args = self._make_args()
+        with patch(
+            "sglang.srt.configs.hybrid_arch.mambaish_config",
+            return_value=object(),
+        ):
+            with self.assertRaisesRegex(ValueError, "Mamba/GDN"):
+                handle_speculative_decoding(args)
+
+    def test_rejects_unsupported_execution_modes(self):
+        cases = (
+            ({"speculative_algorithm": "EAGLE"}, "EAGLE3"),
+            ({"attention_backend": "triton"}, "fa3"),
+            ({"disable_overlap_schedule": False}, "disable-overlap-schedule"),
+            ({"enable_two_batch_overlap": True}, "two-batch overlap disabled"),
+            ({"speculative_eagle_topk": 1}, "topk > 1"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**overrides)
+                with self.assertRaisesRegex(ValueError, expected):
+                    handle_speculative_decoding(args)
+
+    def test_rejects_incompatible_parallel_topologies(self):
+        cases = (
+            ({"pp_size": 2}, "--pp-size 1"),
+            ({"attn_cp_size": 2}, "--attn-cp-size 1"),
+            ({"dcp_size": 2}, "--dcp-size 1"),
+            ({"moe_a2a_backend": "deepep"}, "gathered token buffers"),
+            ({"moe_dense_tp_size": 2}, "gathered token buffers"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**overrides)
+                with self.assertRaisesRegex(ValueError, expected):
+                    handle_speculative_decoding(args)
+
+        args = self._make_args(
+            moe_a2a_backend="deepep",
+            disable_attn_tp_gather=True,
+        )
+        handle_speculative_decoding(args)
+
+    def test_cli_parses_threshold(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-echo-threshold",
+                "0.4",
+            ]
+        )
+
+        self.assertEqual(args.speculative_echo_threshold, 0.4)
+
+
 class TestAdaptiveSpecArgs(CustomTestCase):
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

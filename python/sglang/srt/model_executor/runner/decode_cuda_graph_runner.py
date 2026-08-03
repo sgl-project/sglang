@@ -117,7 +117,11 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
+def ragged_verify_compact_graphs_enabled(
+    spec_algorithm: SpeculativeAlgorithm, server_args
+) -> bool:
+    if spec_algorithm.is_eagle3():
+        return server_args.speculative_echo_threshold is not None
     if not spec_algorithm.supports_ragged_verify():
         return False
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
@@ -283,7 +287,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         self.ragged_verify_mode = (
-            ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
+            ragged_verify_compact_graphs_enabled(
+                self.model_runner.spec_algorithm, model_runner.server_args
+            )
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
@@ -579,9 +585,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        if self.model_runner.spec_algorithm.is_eagle3():
+            token_tier_supported = admission_tokens in self.capture_num_tokens
+        else:
+            # Preserve the existing admission rule for other ragged-verify
+            # algorithms; their planners own the final token-tier selection.
+            token_tier_supported = admission_tokens <= self.capture_num_tokens[-1]
+        is_tokens_supported = (
+            token_tier_supported
+            and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        )
 
         is_dp_supported = (
             forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
@@ -1265,6 +1278,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                    ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
                 )
                 # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(

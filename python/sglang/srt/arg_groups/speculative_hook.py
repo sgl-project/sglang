@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -101,6 +102,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         trust_remote_code=server_args.trust_remote_code,
         kwargs=kwargs,
     )
+
+    if (
+        getattr(server_args, "speculative_echo_threshold", None) is not None
+        and server_args.speculative_algorithm != "EAGLE3"
+    ):
+        raise ValueError(
+            "--speculative-echo-threshold requires " "--speculative-algorithm EAGLE3."
+        )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
@@ -558,7 +567,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "eagle speculative decoding."
         )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_config = server_args.get_model_config()
+    model_arch = model_config.hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
@@ -599,6 +609,82 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             server_args.speculative_eagle_topk,
             server_args.speculative_num_draft_tokens,
         ) = _auto_choose_speculative_params(server_args, model_arch)
+
+    echo_threshold = server_args.speculative_echo_threshold
+    if echo_threshold is not None:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        echo_threshold = float(echo_threshold)
+        if not math.isfinite(echo_threshold) or not (0.0 <= echo_threshold <= 1.0):
+            raise ValueError(
+                "--speculative-echo-threshold must be a finite "
+                f"value in [0, 1], got {echo_threshold!r}."
+            )
+        server_args.speculative_echo_threshold = echo_threshold
+
+        view = resolved_view(server_args)
+        _, decode_backend = attention_backends_of(view)
+        unsupported = []
+        if server_args.speculative_algorithm != "EAGLE3":
+            unsupported.append("--speculative-algorithm EAGLE3")
+        if decode_backend != "fa3":
+            unsupported.append("--decode-attention-backend fa3")
+        if not view.disable_overlap_schedule:
+            unsupported.append("--disable-overlap-schedule")
+        if server_args.enable_two_batch_overlap:
+            unsupported.append("two-batch overlap disabled")
+        if (
+            server_args.speculative_eagle_topk is None
+            or server_args.speculative_eagle_topk <= 1
+        ):
+            unsupported.append("--speculative-eagle-topk > 1")
+        if server_args.speculative_adaptive:
+            unsupported.append("fixed speculative parameters")
+        if view.enable_multi_layer_eagle:
+            unsupported.append("single-layer EAGLE3")
+        if server_args.speculative_use_rejection_sampling:
+            unsupported.append("target-only speculative sampling")
+        if view.enable_dp_attention:
+            unsupported.append("DP attention disabled")
+        if server_args.enable_lora:
+            unsupported.append("LoRA disabled")
+        if server_args.disable_cuda_graph_padding:
+            unsupported.append("CUDA graph padding enabled")
+        if getattr(model_config, "model_is_mrope", False):
+            unsupported.append("a target model without MRoPE")
+        if mambaish_config(model_config) is not None:
+            unsupported.append(
+                "a target model without hybrid Mamba/GDN/linear-attention layers"
+            )
+        if (
+            model_config.sliding_window_size is not None
+            and model_config.sliding_window_size > -1
+        ):
+            unsupported.append("a target model without sliding-window attention")
+        if server_args.pp_size != 1:
+            unsupported.append("--pp-size 1")
+        if view.attn_cp_size != 1:
+            unsupported.append("--attn-cp-size 1")
+        if server_args.dcp_size != 1:
+            unsupported.append("--dcp-size 1")
+        requires_gathered_buffer = (
+            not view.enable_dp_attention
+            and not server_args.disable_attn_tp_gather
+            and (
+                view.moe_a2a_backend != "none"
+                or server_args.moe_dense_tp_size is not None
+            )
+        )
+        if requires_gathered_buffer:
+            unsupported.append(
+                "a topology that does not require gathered token buffers"
+            )
+        if unsupported:
+            raise ValueError(
+                "--speculative-echo-threshold currently requires "
+                + ", ".join(unsupported)
+                + "."
+            )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:

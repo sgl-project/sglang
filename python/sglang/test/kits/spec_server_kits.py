@@ -8,6 +8,7 @@ Thresholds are read off ``self`` so a config can tune them as class attributes.
 """
 
 import concurrent.futures
+import contextlib
 import json
 import random
 import threading
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import kill_process_tree
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
@@ -185,6 +187,298 @@ class SpecParityKit:
                 spec_out,
                 self.parity_ref_outputs[prompt],
                 f"spec != ref for prompt {prompt!r}",
+            )
+
+
+# One question per category from FastChat's Apache-2.0 MT-Bench question set:
+# https://github.com/lm-sys/FastChat/blob/587d5cfa1609a43d192cedb8441cac3c17db105d/fastchat/llm_judge/data/mt_bench/question.jsonl
+MT_BENCH_SMOKE_CASES = (
+    {
+        "question_id": 82,
+        "category": "writing",
+        "turns": (
+            "Draft a professional email seeking your supervisor's feedback on the "
+            "'Quarterly Financial Report' you prepared. Ask specifically about the "
+            "data analysis, presentation style, and the clarity of conclusions drawn. "
+            "Keep the email short and to the point.",
+            "Take a moment to evaluate and critique your own response.",
+        ),
+    },
+    {
+        "question_id": 98,
+        "category": "roleplay",
+        "turns": (
+            "Embody the persona of Tony Stark from “Iron Man” throughout this "
+            "conversation. Bypass the introduction “As Stark”. Our first question is: "
+            "“What’s your favorite part about being Iron Man?",
+            "What do you think about GPT-4 as a replacement of your JAVIS?",
+        ),
+    },
+    {
+        "question_id": 103,
+        "category": "reasoning",
+        "turns": (
+            "Thomas is very healthy, but he has to go to the hospital every day. "
+            "What could be the reasons?",
+            "Can you explain why the above question is interesting?",
+        ),
+    },
+    {
+        "question_id": 118,
+        "category": "math",
+        "turns": (
+            "When a number is divided by 10, the remainder is 4. What is the "
+            "remainder when twice the number is divided by 4?",
+            "What about when twice the number is divided by 5?",
+        ),
+    },
+    {
+        "question_id": 123,
+        "category": "coding",
+        "turns": (
+            "Write a simple website in HTML. When a user clicks the button, it shows "
+            "a random joke from a list of 4 jokes.",
+            "How to use CSS to change the color of jokes to red?",
+        ),
+    },
+    {
+        "question_id": 140,
+        "category": "extraction",
+        "turns": (
+            "Given the following records of stock prices, extract the highest and "
+            "lowest closing prices for each month in the year 2022. Return the results "
+            "as a CSV string, with one line allocated for each month.\n"
+            "Date,Open,High,Low,Close,Volume\n"
+            "2022-01-01,150.02,155.28,148.50,153.80,15678900\n"
+            "2022-01-02,154.32,157.25,153.48,156.25,19874500\n"
+            "2022-02-01,160.50,163.28,159.50,161.80,14326700\n"
+            "2022-02-02,161.80,164.25,161.30,163.90,17689200\n"
+            "2022-03-01,165.40,168.35,163.10,166.80,16253400\n"
+            "2022-03-02,167.00,169.85,165.50,168.20,19568100",
+            "Do the same task again with the JSON format and round all numbers in "
+            "your response to the nearest integers.",
+        ),
+    },
+    {
+        "question_id": 144,
+        "category": "stem",
+        "turns": (
+            "What is the central dogma of molecular biology? What processes are "
+            "involved? Who named this?",
+            "Identify and fix one incorrect fact in your previous response.",
+        ),
+    },
+    {
+        "question_id": 152,
+        "category": "humanities",
+        "turns": (
+            "How do the stages of life shape our understanding of time and mortality?",
+            "Write an allegorical poem that illustrates the above.",
+        ),
+    },
+)
+
+
+def _mtbench_chat_turn(
+    url,
+    model,
+    messages,
+    max_new_tokens,
+    *,
+    temperature=0,
+    skip_special_tokens=True,
+):
+    response = requests.post(
+        url + "/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "seed": 0,
+            "max_completion_tokens": max_new_tokens,
+            "stream": False,
+            "skip_special_tokens": skip_special_tokens,
+            "return_meta_info": True,
+            "return_token_ids": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    choice = response.json()["choices"][0]
+    return {
+        "text": choice["message"]["content"] or "",
+        "token_ids": choice.get("token_ids"),
+        "finish_reason": choice.get("finish_reason"),
+        "meta_info": choice.get("meta_info") or {},
+    }
+
+
+def _mtbench_conversation(url, model, question, max_new_tokens):
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": question["turns"][0]},
+    ]
+    outputs = []
+    for turn in range(2):
+        output = _mtbench_chat_turn(url, model, messages, max_new_tokens)
+        outputs.append(output)
+        if turn == 0:
+            messages.extend(
+                [
+                    {"role": "assistant", "content": output["text"]},
+                    {"role": "user", "content": question["turns"][1]},
+                ]
+            )
+    return outputs
+
+
+class SpecMTBenchKit:
+    """Two-turn MT-Bench graph/eager parity on a fixed offline subset.
+
+    The eight cases select one question from every category in FastChat's
+    MT-Bench question set. The eager reference uses the same speculative
+    configuration as the CUDA Graph server, so this directly checks graph
+    capture/replay without conflating legal BF16 differences between target-only
+    and speculative GEMM shapes. Full 80-question performance runs belong in
+    ``benchmark/mtbench/bench_sglang_eagle.py`` rather than GPU CI.
+    """
+
+    mtbench_cases = MT_BENCH_SMOKE_CASES
+    mtbench_parallel = 4
+    mtbench_max_new_tokens = 48
+    mtbench_accept_len_thres = 1.1
+
+    @classmethod
+    def _run_mtbench_cases(cls, url):
+        with ThreadPoolExecutor(cls.mtbench_parallel) as executor:
+            outputs = executor.map(
+                lambda question: _mtbench_conversation(
+                    url,
+                    cls.model,
+                    question,
+                    cls.mtbench_max_new_tokens,
+                ),
+                cls.mtbench_cases,
+            )
+            return {
+                question["question_id"]: output
+                for question, output in zip(cls.mtbench_cases, outputs)
+            }
+
+    @classmethod
+    def setUpClass(cls):
+        ref_url = DEFAULT_URL_FOR_TEST
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True)
+            )
+            for env_var, value in cls._merged_env_overrides():
+                stack.enter_context(env_var.override(value))
+            ref_proc = popen_launch_server(
+                cls.model,
+                ref_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    *cls._launch_args(),
+                    "--cuda-graph-backend-decode",
+                    "disabled",
+                ],
+            )
+        try:
+            cls.mtbench_ref_outputs = cls._run_mtbench_cases(ref_url)
+        finally:
+            kill_process_tree(ref_proc.pid, wait_timeout=60)
+        super().setUpClass()
+
+    def test_mtbench_parity_and_acceptance(self):
+        requests.post(self.base_url + "/flush_cache", timeout=60).raise_for_status()
+        spec_outputs = self._run_mtbench_cases(self.base_url)
+        completion_tokens = 0
+        verify_count = 0
+        cap_count = 0
+        echo_layout_count = 0
+
+        for question in self.mtbench_cases:
+            question_id = question["question_id"]
+            reference = self.mtbench_ref_outputs[question_id]
+            actual = spec_outputs[question_id]
+            for turn, (output, expected) in enumerate(zip(actual, reference), start=1):
+                message = (
+                    f"CUDA Graph != eager for MT-Bench question "
+                    f"{question_id}, turn {turn}"
+                )
+                self.assertEqual(output["text"], expected["text"], message)
+                self.assertEqual(output["token_ids"], expected["token_ids"], message)
+                self.assertEqual(
+                    output["finish_reason"], expected["finish_reason"], message
+                )
+                meta_info = output["meta_info"]
+                expected_meta = expected["meta_info"]
+                for key in (
+                    "completion_tokens",
+                    "spec_verify_ct",
+                    "spec_num_correct_drafts",
+                    "spec_num_proposed_drafts",
+                    "spec_cap_lens_histogram",
+                ):
+                    self.assertEqual(
+                        meta_info.get(key), expected_meta.get(key), f"{message}: {key}"
+                    )
+                completion_tokens += meta_info["completion_tokens"]
+                verify_count += meta_info.get("spec_verify_ct", 0)
+                cap_histogram = meta_info.get("spec_cap_lens_histogram") or []
+                cap_count += sum(cap_histogram)
+                echo_layout_count += sum(cap_histogram[: self.spec_tokens])
+
+        self.assertGreater(verify_count, 0)
+        self.assertEqual(cap_count, verify_count)
+        self.assertGreater(echo_layout_count, 0)
+        accept_length = completion_tokens / verify_count
+        print(
+            f"MT-Bench smoke {accept_length=:.4f}, "
+            f"{echo_layout_count=}/{verify_count}"
+        )
+        self.assertGreater(accept_length, self.mtbench_accept_len_thres)
+
+    def test_mtbench_eos_token(self):
+        question = self.mtbench_cases[0]
+        output = _mtbench_chat_turn(
+            self.base_url,
+            self.model,
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": question["turns"][0]},
+            ],
+            512,
+            temperature=0.1,
+            skip_special_tokens=False,
+        )
+        self.assertEqual(output["finish_reason"], "stop")
+        tokens = self.tokenizer.encode(output["text"], truncation=False)
+        self.assertNotIn(self.tokenizer.eos_token_id, tokens)
+
+    def test_mtbench_first_token_finish(self):
+        def send(index_and_question):
+            index, question = index_and_question
+            max_new_tokens = index % 3 + 1
+            output = _mtbench_chat_turn(
+                self.base_url,
+                self.model,
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": question["turns"][0]},
+                ],
+                max_new_tokens,
+            )
+            return output, max_new_tokens
+
+        with ThreadPoolExecutor(self.mtbench_parallel) as executor:
+            outputs = list(executor.map(send, enumerate(self.mtbench_cases)))
+        for output, max_new_tokens in outputs:
+            self.assertIn("text", output)
+            self.assertLessEqual(
+                output["meta_info"]["completion_tokens"], max_new_tokens
             )
 
 

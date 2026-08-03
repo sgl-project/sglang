@@ -426,6 +426,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             draft_input.draft_probs,
+            None,
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
