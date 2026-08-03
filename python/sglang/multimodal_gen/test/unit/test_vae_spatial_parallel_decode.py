@@ -200,6 +200,23 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertFalse(config.use_parallel_decode)
         self.assertEqual(config.parallel_decode_mode, "patch")
 
+    def test_vae_nested_cli_accepts_taehv_checkpoint_path(self):
+        parser = FlexibleArgumentParser()
+        VAEConfig.add_cli_args(parser)
+        parsed = vars(
+            parser.parse_args(
+                [
+                    "--vae-config.taehv-checkpoint-path",
+                    "/opt/taehv/taew2_2.pth",
+                ]
+            )
+        )
+        config = MinWMWan22VAEConfig()
+
+        update_config_from_args(config, parsed, "vae_config")
+
+        self.assertEqual(config.taehv_checkpoint_path, "/opt/taehv/taew2_2.pth")
+
     def test_base_decode_prefers_spatial_parallel_dispatch(self):
         config = VAEConfig()
         config.arch_config.temporal_compression_ratio = 1
