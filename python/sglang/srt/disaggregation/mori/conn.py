@@ -567,19 +567,34 @@ class MoriKVManager(CommonKVManager):
             return None
         return payload
 
-    def _start_bootstrap_thread(self) -> None:
-        # Poll with a timeout so the worker can observe _stopped and exit
-        # promptly (recv_multipart() would block forever and make teardown,
-        # i.e. runtime P<->D role switch, hang).
+    def _make_worker_recv(self, socket, timeout_ms: int = 500):
+        """Build the blocking multipart recv used by a worker thread.
+
+        Plain blocking recv unless role switching is enabled: teardown flips a
+        stop flag that a blocked recv can never observe, so in that mode poll
+        with a timeout and return None when it expires. Deployments without
+        --enable-pd-role-switch keep the original blocking recv and pay nothing.
+        """
+        if not self.server_args.enable_pd_role_switch:
+            return socket.recv_multipart
+
         poller = zmq.Poller()
-        poller.register(self.server_socket, zmq.POLLIN)
+        poller.register(socket, zmq.POLLIN)
+
+        def recv():
+            return socket.recv_multipart() if poller.poll(timeout_ms) else None
+
+        return recv
+
+    def _start_bootstrap_thread(self) -> None:
+        recv = self._make_worker_recv(self.server_socket)
 
         def bootstrap_worker():
             while not self._stopped:
                 try:
-                    if not poller.poll(timeout=500):
+                    msg = recv()
+                    if msg is None:
                         continue
-                    msg = self.server_socket.recv_multipart()
                     payload = self._validate_message(msg)
                     if payload is None:
                         continue
@@ -608,15 +623,14 @@ class MoriKVManager(CommonKVManager):
                     self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
 
     def _start_decode_thread(self) -> None:
-        poller = zmq.Poller()
-        poller.register(self.server_socket, zmq.POLLIN)
+        recv = self._make_worker_recv(self.server_socket)
 
         def decode_worker():
             while not self._stopped:
                 try:
-                    if not poller.poll(timeout=500):
+                    msg = recv()
+                    if msg is None:
                         continue
-                    msg = self.server_socket.recv_multipart()
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
                         continue
