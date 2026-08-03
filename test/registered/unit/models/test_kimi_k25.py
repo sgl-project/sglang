@@ -3,10 +3,12 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -14,9 +16,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+from sglang.srt.models.kimi_k25 import (
+    KimiK25ForConditionalGeneration,
+    mm_projection_auto,
+)
+from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    _expand_image_token_ids,
+    _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -63,14 +72,12 @@ def _image_item(feature, grid_thw):
 def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     torch.manual_seed(0)
     indexed_images = [
-        (0, torch.randn(3, 32, 24)),
-        (1, torch.randn(3, 32, 24)),
-        (2, torch.randn(3, 28, 20)),
+        (0, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
+        (1, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
+        (2, torch.randint(0, 256, (3, 28, 20), dtype=torch.uint8)),
     ]
     expected = [
-        F.interpolate(
-            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
-        )
+        _resize_bicubic_if_needed(image.unsqueeze(0), 16, 12)
         for _, image in indexed_images
     ]
     real_interpolate = F.interpolate
@@ -90,6 +97,128 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
+    # The GPU path must reproduce PIL.Image.resize(..., BICUBIC), which is what
+    # Kimi's HF media processor uses. Plain F.interpolate skips PIL's implicit
+    # antialiasing on downscale and drifts far outside 8-bit rounding.
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:512, 0:512].astype(np.float32)
+    plane = np.clip(
+        128
+        + 90 * np.sin(xx / 40) * np.cos(yy / 55)
+        + 40 * ((xx // 37 + yy // 41) % 2)
+        + rng.normal(0, 6, (512, 512)),
+        0,
+        255,
+    )
+    array = np.stack([plane, np.roll(plane, 7, 0), np.roll(plane, 13, 1)], -1).astype(
+        np.uint8
+    )
+    pil = torch.from_numpy(
+        np.asarray(Image.fromarray(array).resize((252, 252), Image.BICUBIC)).astype(
+            np.float32
+        )
+    ).permute(2, 0, 1)
+    source = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+
+    resized = _resize_bicubic_if_needed(source, 252, 252)
+
+    assert resized.shape == (1, 3, 252, 252)
+    torch.testing.assert_close(resized, resized.round())
+    assert resized.min() >= 0.0 and resized.max() <= 255.0
+    # Within a couple of 8-bit levels of PIL; the non-antialiased resize is off
+    # by an order of magnitude more, which is the regression this guards.
+    assert (resized[0] - pil).abs().max() <= 4.0
+    naive = F.interpolate(
+        source.float(), size=(252, 252), mode="bicubic", align_corners=False
+    )
+    assert (naive[0] - pil).abs().max() > 20.0
+
+
+def test_kimi_resize_is_a_dtype_only_cast_when_already_at_target():
+    image = torch.randint(0, 256, (1, 3, 16, 12), dtype=torch.uint8)
+
+    resized = _resize_bicubic_if_needed(image, 16, 12)
+
+    assert resized.dtype == torch.float32
+    torch.testing.assert_close(resized, image.float())
+
+
+def test_kimi_expands_one_placeholder_per_image_from_existing_ids():
+    # 7 is the placeholder; the two images claim 3 and 2 tokens.
+    input_ids = [1, 7, 2, 7, 3]
+
+    expanded = _expand_image_token_ids(
+        input_ids, image_token_id=7, image_token_counts=[3, 2]
+    )
+
+    assert expanded.tolist() == [[1, 7, 7, 7, 2, 7, 7, 3]]
+
+
+def test_kimi_expansion_rejects_a_placeholder_count_mismatch():
+    with pytest.raises(ValueError, match="placeholder"):
+        _expand_image_token_ids([1, 7, 2], image_token_id=7, image_token_counts=[3, 2])
+
+
+def test_kimi_placeholder_validation_only_claims_real_token_ids():
+    validate = KimiGridMMDataMixin.validate_tokenized_image_placeholders
+
+    assert validate([1, 7, 2, 7], 7, 2) is True
+    assert validate(torch.tensor([[1, 7, 2]]), 7, 1) is True
+    # A prompt string carries no token IDs, so the caller must not take the
+    # tokenized fast path.
+    assert validate("<|media_pad|>", 7, 1) is False
+    with pytest.raises(ValueError, match="one-to-one"):
+        validate([1, 7, 2], 7, 2)
+
+
+def test_kimi_single_frame_pool_matches_the_temporal_mean():
+    torch.manual_seed(0)
+    x = torch.randn(1 * 4 * 4, 8)
+    grid_thws = torch.tensor([[1, 4, 4]])
+
+    (merged,) = tpool_patch_merger(x, grid_thws)
+
+    # t == 1 skips the mean; it must stay bit-identical to averaging one frame.
+    reference = (
+        x.view(1, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+    )
+    assert torch.equal(merged, reference.view(4, 4, 8))
+
+
+def test_kimi_multi_frame_pool_still_averages_across_frames():
+    torch.manual_seed(0)
+    x = torch.randn(3 * 4 * 4, 8)
+    grid_thws = torch.tensor([[3, 4, 4]])
+
+    (merged,) = tpool_patch_merger(x, grid_thws)
+
+    reference = (
+        x.view(3, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+    )
+    assert merged.shape == (4, 4, 8)
+    torch.testing.assert_close(merged, reference.view(4, 4, 8))
+
+
+def test_kimi_projection_returns_one_flattened_feature_tensor():
+    torch.manual_seed(0)
+    per_image = [torch.randn(4, 2, 8), torch.randn(6, 2, 8)]
+
+    packed = mm_projection_auto(None, per_image)
+
+    assert packed.shape == (20, 8)
+    torch.testing.assert_close(packed, torch.cat(per_image, dim=0).reshape(-1, 8))
+
+
+def test_kimi_projection_does_not_copy_a_single_image():
+    single = torch.randn(4, 2, 8)
+
+    packed = mm_projection_auto(None, [single])
+
+    # reshape keeps the storage; a torch.cat of one tensor would not.
+    assert packed.data_ptr() == single.data_ptr()
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
