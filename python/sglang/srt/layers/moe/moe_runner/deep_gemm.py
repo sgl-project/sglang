@@ -679,18 +679,19 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids, _ = topk_output
 
     # The masked grouped GEMM is a capacity-style interface designed for
-    # CUDA-graph decode (fixed shapes, unknown m). For prefill-sized eager
-    # forwards the contiguous grouped GEMM is the intended interface: tokens
-    # are compacted per expert, so no [E, m_max, ...] capacity buffers and
-    # far fewer kernels. Small batches (decode eager / graph warmup+capture)
-    # stay on the masked path, as do quant configs the contiguous pre-permute
-    # cannot express (it re-quantizes activations at fp8 group 128).
+    # CUDA-graph decode (fixed shapes, unknown m). For long eager prefills the
+    # contiguous grouped GEMM is the intended interface: tokens are compacted
+    # per expert, so no [E, m_max, ...] capacity buffers and far fewer kernels.
+    # It only pays off once the real rows (tokens * topk) dwarf the per-expert
+    # padding (num_local_experts * BLOCK_E) the compaction adds, hence the
+    # token floor. Quant configs whose activation recipe is not fp8 group 128
+    # stay on the masked path too -- that is the only recipe this pre-permute
+    # can produce (bf16 weights leave block_shape unset; mxfp8 pins [1, 32]).
     if (
         quant_info.use_fp8
-        and not quant_info.use_mxfp8
-        and not quant_info.is_fp4_experts
         and quant_info.block_shape == [128, 128]
-        and hidden_states.shape[0] >= 512
+        and hidden_states.shape[0]
+        >= envs.SGLANG_DEEPGEMM_CONTIGUOUS_PREFILL_MIN_TOKENS.get()
         and not torch.cuda.is_current_stream_capturing()
     ):
         return _pre_permute_standard_contiguous(
