@@ -95,6 +95,14 @@ class DllmConfig:
                 f"and no smaller than it: {prefill_block_size=}, {block_size=}"
             )
         prefill_attention_backend, _ = attention_backends_of(cfg)
+        # Each dLLM step needs one complete block; reject smaller budgets
+        # to avoid unschedulable requests and scheduler livelock.
+        max_prefill_tokens = getattr(cfg, "max_prefill_tokens", None)
+        if max_prefill_tokens is not None and max_prefill_tokens < block_size:
+            raise ValueError(
+                "max_prefill_tokens must be at least the dLLM block_size: "
+                f"{max_prefill_tokens=}, {block_size=}"
+            )
         _validate_multi_block_prefill_backend(
             block_size=block_size,
             prefill_block_size=prefill_block_size,

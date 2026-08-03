@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -376,6 +377,17 @@ class SchedulerDllmMixin:
         for req in reqs:
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
+                # Without a runnable batch, this request would be retried
+                # without a state change. Abort it; otherwise keep it queued.
+                running_batch = getattr(adder, "running_batch", None)
+                no_batch = running_batch is None or running_batch.is_empty()
+                if not adder.can_run_list and no_batch:
+                    logger.error(
+                        "Aborting dLLM staging request %s: insufficient KV "
+                        "capacity for an aligned extend",
+                        req.rid,
+                    )
+                    self.abort_request(AbortReq(rid=req.rid))
                 return res
 
         return AddReqResult.CONTINUE

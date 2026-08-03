@@ -933,17 +933,18 @@ class PrefillAdder:
             if req.is_dllm_prefill()
             else self.dllm_block_size
         )
-        # _update_prefill_budget also reserves a page per request. Never use the
-        # old fallback to rem_dllm_tokens here: it could bypass a depleted KV or
-        # max-prefill budget for a large prefill chunk.
+        # Reuse the prefix page tail and do not reserve an extra page here.
+        # The aligned extend may exactly fill the remaining pages.
+        prefix_page_slack = (-len(req.prefix_indices)) % self.page_size
+        kv_budget = min(int(self.rem_total_tokens), int(self.cur_rem_tokens))
+        kv_budget += prefix_page_slack
         return max(
             0,
             min(
                 self.rem_dllm_tokens,
                 per_req_cap,
                 self.rem_input_tokens,
-                int(self.rem_total_tokens) - self.page_size,
-                int(self.cur_rem_tokens) - self.page_size,
+                kv_budget,
             ),
         )
 

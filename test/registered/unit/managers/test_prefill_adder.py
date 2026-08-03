@@ -152,8 +152,14 @@ class TestPrefillAdder(CustomTestCase):
         )
         return req
 
-    def create_dllm_adder(self, *, is_prefill: bool, rem_input_tokens: int = 10000):
-        self.mock_token_allocator.available_size.return_value = 10000
+    def create_dllm_adder(
+        self,
+        *,
+        is_prefill: bool,
+        rem_input_tokens: int = 10000,
+        available_size: int = 10000,
+    ):
+        self.mock_token_allocator.available_size.return_value = available_size
         dllm_config = SimpleNamespace(
             block_size=32,
             prefill_block_size=128,
@@ -192,6 +198,7 @@ class TestPrefillAdder(CustomTestCase):
             model_path="dummy",
             revision=None,
             max_running_requests=2,
+            max_prefill_tokens=16384,
             dllm_algorithm_config=None,
             dllm_prefill_block_size=128,
             dllm_fdfo=True,
@@ -210,6 +217,33 @@ class TestPrefillAdder(CustomTestCase):
             config = DllmConfig.from_server_args(server_args)
 
         self.assertEqual(config.prefill_block_size, 128)
+
+    def test_dllm_max_prefill_tokens_must_fit_one_block(self):
+        server_args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            model_path="dummy",
+            revision=None,
+            max_running_requests=2,
+            max_prefill_tokens=16,
+            dllm_algorithm_config=None,
+            dllm_prefill_block_size=None,
+            dllm_fdfo=True,
+            attention_backend="flashinfer",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LLaDA2MoeModelLM"])
+        )
+
+        with patch(
+            "sglang.srt.dllm.config.ModelConfig.from_server_args",
+            return_value=model_config,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "max_prefill_tokens must be at least"
+            ):
+                DllmConfig.from_server_args(server_args)
 
     def test_dllm_prefill_block_size_uses_unmaterialized_backend(self):
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -375,6 +409,28 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_dllm_tokens, 64)
         self.assertTrue(adder._add_dllm_req(req, 0))
         self.assertEqual(req.extend_range, Range(0, 32))
+
+    def test_dllm_staging_accepts_exactly_one_available_page(self):
+        # One page is enough for this aligned block.
+        adder = self.create_dllm_adder(is_prefill=False, available_size=32)
+        req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
+
+        self.assertEqual(adder._get_dllm_remain_tokens(req), 32)
+        # The request is admitted; NO_TOKEN stops further admissions.
+        self.assertEqual(adder.add_dllm_staging_req(req), AddReqResult.NO_TOKEN)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(req.extend_range, Range(0, 32))
+
+    def test_dllm_staging_aborts_when_no_batch_can_make_progress(self):
+        adder = self.create_dllm_adder(is_prefill=False, available_size=0)
+        req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
+        scheduler = SimpleNamespace(abort_request=MagicMock())
+
+        result = SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, [req])
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        scheduler.abort_request.assert_called_once()
+        self.assertEqual(scheduler.abort_request.call_args.args[0].rid, req.rid)
 
     def test_dllm_scheduler_uses_normal_extend_only_for_prefill(self):
         scheduler = SimpleNamespace(
