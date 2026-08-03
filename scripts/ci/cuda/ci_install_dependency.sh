@@ -326,6 +326,31 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+require_prebuilt_rust_exts() {
+    # Stages whose download succeeded set this to none; fail loudly if the modules
+    # are missing anyway, since building without them leaves is_rust_server_built()
+    # false and silently skips the Rust-server tests. Placed before
+    # setup_pip_toolchain uninstalls sglang so bailing out leaves no half-removed
+    # site-packages skeleton.
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" != "none" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    local missing=()
+    local pkg
+    for pkg in server grpc multimodal; do
+        compgen -G "python/sglang/srt/${pkg}/_core*.so" >/dev/null || missing+=("${pkg}")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "::error::SGLANG_BUILD_RUST_EXTS=none but no prebuilt extension module found for: ${missing[*]}"
+        exit 1
+    fi
+    echo "Using prebuilt Rust extension modules; skipping the cargo build."
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_sglang() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
@@ -654,6 +679,7 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_cargo_cache
+    require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
