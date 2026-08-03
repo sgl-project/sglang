@@ -178,7 +178,7 @@ Commit: `git commit -am "feat(realtime): enforce bounded multi-user admission"`
 - Modify: `python/sglang/multimodal_gen/runtime/pipelines/minwm_causal_dmd_pipeline.py`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_handoff.py`
 
-- [ ] **Step 1: Write failing handoff tests**
+- [x] **Step 1: Write failing handoff tests**
 
 ```python
 def test_handoff_returns_contiguous_bf16_latents_without_decoding():
@@ -193,13 +193,13 @@ def test_minwm_pipeline_keeps_local_decoder_without_remote_url():
     assert pipeline_stage_names(realtime_vae_worker_url="ws://vae:18081/decode")[-1] == "RealtimeLatentHandoffStage"
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_handoff.py -q`
 
 Expected: FAIL because handoff output fields and stage do not exist.
 
-- [ ] **Step 3: Implement feature-flagged handoff**
+- [x] **Step 3: Implement feature-flagged handoff**
 
 ```python
 class RealtimeLatentHandoffStage(PipelineStage):
@@ -225,7 +225,7 @@ class RealtimeLatentHandoffStage(PipelineStage):
 
 `OutputBatch.drop_payload_for_warmup()` 清理新字段；`process_generation_batch()` 把 `realtime_latents` 视为有效输出但不调用 `save_outputs()`。MinWM DMD/UniPC pipeline 仅在 URL 非空时用 handoff stage 替代本地 decoder。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_handoff.py python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py -q`
 

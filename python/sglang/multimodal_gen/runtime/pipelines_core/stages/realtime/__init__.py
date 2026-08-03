@@ -9,6 +9,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.input_validation import (
     RealtimeInputValidationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.latent_handoff import (
+    RealtimeLatentHandoffStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.latent_preparation import (
     RealtimeChunkLatentPreparationStage,
 )
@@ -26,6 +29,7 @@ __all__ = [
     "RealtimeDiffusionStage",
     "RealtimeImageVAEEncodingStage",
     "RealtimeInputValidationStage",
+    "RealtimeLatentHandoffStage",
     "RealtimeStageComponent",
     "RealtimeTextEncodingStage",
 ]

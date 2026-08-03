@@ -490,6 +490,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if self.rank != 0:
             return
+        if isinstance(output_batch.realtime_latents, torch.Tensor):
+            output_batch.realtime_latents = (
+                output_batch.realtime_latents.detach().contiguous().cpu()
+            )
         if output_batch.output is not None:
             output_batch.raw_frame_content_type = RAW_RGB_CONTENT_TYPE
             (

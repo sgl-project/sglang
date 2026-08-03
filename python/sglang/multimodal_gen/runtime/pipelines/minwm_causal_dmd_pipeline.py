@@ -24,9 +24,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
     RealtimeImageVAEEncodingStage,
     RealtimeInputValidationStage,
+    RealtimeLatentHandoffStage,
     RealtimeTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+def _use_remote_realtime_vae(server_args: ServerArgs) -> bool:
+    value = getattr(server_args, "realtime_vae_worker_url", None)
+    return isinstance(value, str) and bool(value.strip())
 
 
 class MinWMCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
@@ -108,6 +114,12 @@ class MinWMCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
             )
         )
+        self._add_realtime_output_stage(server_args)
+
+    def _add_realtime_output_stage(self, server_args: ServerArgs) -> None:
+        if _use_remote_realtime_vae(server_args):
+            self.add_stage(RealtimeLatentHandoffStage())
+            return
         self.add_stage(
             MinWMCausalVaeDecodingStage(
                 vae=self.get_module("vae"),
@@ -158,12 +170,7 @@ class MinWMCausalUniPCPipeline(MinWMCausalDMDPipeline):
                 scheduler=self.get_module("scheduler"),
             )
         )
-        self.add_stage(
-            MinWMCausalVaeDecodingStage(
-                vae=self.get_module("vae"),
-                pipeline=self,
-            )
-        )
+        self._add_realtime_output_stage(server_args)
 
 
 EntryClass = [MinWMCausalDMDPipeline, MinWMCausalUniPCPipeline]

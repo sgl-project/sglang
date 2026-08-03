@@ -418,6 +418,8 @@ class OutputBatch:
     raw_frame_batches: list[list[bytes]] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None
+    realtime_latents: torch.Tensor | None = None
+    realtime_handoff: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
@@ -444,4 +446,6 @@ class OutputBatch:
         self.trajectory_decoded = None
         self.output_file_paths = None
         self.raw_frame_batches = None
+        self.realtime_latents = None
+        self.realtime_handoff = None
         self.noise_pred = None

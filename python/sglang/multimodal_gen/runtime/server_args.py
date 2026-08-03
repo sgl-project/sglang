@@ -287,6 +287,9 @@ class ServerArgs(DisaggServerArgsMixin):
     realtime_session_max_lifetime_s: float = 600.0
     realtime_admission_wait_s: float = 10.0
     realtime_session_lease_table: str | None = None
+    realtime_vae_worker_url: str | None = None
+    realtime_vae_timeout_s: float = 10.0
+    realtime_vae_max_message_mb: int = 64
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -1616,6 +1619,24 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Optional DynamoDB lease table for multiple Gateway replicas.",
         )
         parser.add_argument(
+            "--realtime-vae-worker-url",
+            type=str,
+            default=ServerArgs.realtime_vae_worker_url,
+            help="Persistent WebSocket endpoint for remote realtime VAE decoding.",
+        )
+        parser.add_argument(
+            "--realtime-vae-timeout-s",
+            type=float,
+            default=ServerArgs.realtime_vae_timeout_s,
+            help="Per-chunk remote VAE timeout in seconds.",
+        )
+        parser.add_argument(
+            "--realtime-vae-max-message-mb",
+            type=int,
+            default=ServerArgs.realtime_vae_max_message_mb,
+            help="Maximum encoded remote VAE protocol message size in MiB.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -2211,6 +2232,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("realtime_session_max_lifetime_s must be > 0")
         if self.realtime_admission_wait_s < 0:
             raise ValueError("realtime_admission_wait_s must be >= 0")
+        if self.realtime_vae_timeout_s <= 0:
+            raise ValueError("realtime_vae_timeout_s must be > 0")
+        if self.realtime_vae_max_message_mb < 1:
+            raise ValueError("realtime_vae_max_message_mb must be >= 1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
