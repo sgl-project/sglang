@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -106,6 +107,41 @@ def _is_mnnvl_fabric_supported() -> bool:
     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
+
+
+_V2_TIMING = get_bool_env_var("SGLANG_DEEPEP_V2_TIMING", default="false")
+_v2_timing_state = {"n": 0, "dispatch_s": 0.0, "combine_s": 0.0}
+
+
+class _V2Timer:
+    """Env-gated (SGLANG_DEEPEP_V2_TIMING=1) wall-clock timer for the V2
+    dispatch/combine call sites. Synchronizes CUDA around the timed region —
+    measurement-only, never enabled in a perf run."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+    def __enter__(self):
+        if _V2_TIMING:
+            torch.cuda.synchronize()
+            self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if _V2_TIMING:
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - self.t0
+            st = _v2_timing_state
+            st[f"{self.kind}_s"] += dt
+            if self.kind == "combine":
+                st["n"] += 1
+                logger.info(
+                    "[V2-TIMING] call=%d %s=%.1fms cum(dispatch=%.2fs combine=%.2fs)",
+                    st["n"], self.kind, dt * 1e3, st["dispatch_s"], st["combine_s"],
+                )
+            else:
+                logger.info("[V2-TIMING] %s=%.1fms", self.kind, dt * 1e3)
+        return False
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -237,14 +273,20 @@ class DeepEPBuffer:
         # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
         # the default code path is byte-identical to V1.
         if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
-            cls._buffer = cls._build_v2_buffer(
+            # Cache on `state.buffer` — the SAME slot the guard at the top of
+            # this function checks. An earlier revision wrote `cls._buffer`
+            # here, which the guard never reads, so every `_get_buffer()`
+            # (2x per MoE layer per token) constructed a fresh ElasticBuffer:
+            # measured ~0.35s/ctor => ~34s/token on a 2-node EP16 serve while
+            # the dispatch/combine kernels themselves were 7ms p50.
+            state.buffer = cls._build_v2_buffer(
                 group,
                 hidden_size,
                 deepep_mode,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
             )
-            return cls._buffer
+            return state.buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -692,28 +734,29 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     _prev_evt = None
             previous_event = _prev_evt
             _deepep_precompile_tp_barrier()
-            (
-                recv_x,
-                recv_topk_ids,
-                recv_topk_weights,
-                self.handle,
-                event,
-            ) = buffer.dispatch(
+            with _V2Timer("dispatch"), torch.no_grad():
+                (
+                    recv_x,
+                    recv_topk_ids,
+                    recv_topk_weights,
+                    self.handle,
+                    event,
+                ) = buffer.dispatch(
                 x,
-                topk_idx=topk_ids,
-                topk_weights=topk_weights,
-                num_experts=self.num_experts,
-                num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-                expert_alignment=(
+                    topk_idx=topk_ids,
+                    topk_weights=topk_weights,
+                    num_experts=self.num_experts,
+                    num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                    expert_alignment=(
                     128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
                 ),
-                num_sms=0,
-                num_qps=0,
-                previous_event=previous_event,
-                async_with_compute_stream=self.async_finish,
-                allocate_on_comm_stream=_alloc_on_comm,
-                do_expand=False,
-            )
+                    num_sms=0,
+                    num_qps=0,
+                    previous_event=previous_event,
+                    async_with_compute_stream=self.async_finish,
+                    allocate_on_comm_stream=_alloc_on_comm,
+                    do_expand=False,
+                )
             num_recv_tokens_per_expert = getattr(
                 self.handle, "num_recv_tokens_per_expert_list", None
             )
@@ -828,15 +871,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     _alloc_on_comm = True
                 except Exception:
                     _prev_evt = None
-            combined_x, _, event = buffer.combine(
-                x,
-                self.handle,
-                num_sms=0,
-                num_qps=0,
-                previous_event=_prev_evt,
-                async_with_compute_stream=self.async_finish,
-                allocate_on_comm_stream=_alloc_on_comm,
-            )
+            with _V2Timer("combine"):
+                combined_x, _, event = buffer.combine(
+                    x,
+                    self.handle,
+                    num_sms=0,
+                    num_qps=0,
+                    previous_event=_prev_evt,
+                    async_with_compute_stream=self.async_finish,
+                    allocate_on_comm_stream=_alloc_on_comm,
+                )
             return combined_x, event
         combined_x, _, event = buffer.combine(
             x,
