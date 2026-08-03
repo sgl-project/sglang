@@ -35,29 +35,48 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
-# defaults instead of est_time. max_parallel = size (no throttle).
+# Single-shard sanity gate on the critical path; pinned rather than sized
+# from est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
-    "base-a-test-cpu": 8,
     "base-a-test-1-gpu-small": 1,
 }
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
+# Inlined in pr-test.yml rather than dispatched through the reusable stage,
+# so there is no `run_timeout_minutes` input to read the budget from.
+_INLINE_SUITE_JOBS = {"base-a-test-cpu"}
+
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline base-a-test-cpu is skipped (uses `_BASE_A_OVERRIDES`)."""
+    Inline suites (`_INLINE_SUITE_JOBS`) contribute their `Run test` step
+    timeout so they size off the same budget as dispatched stages."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
+    jobs = wf.get("jobs") or {}
     timeouts = {}
-    for job_id, job in (wf.get("jobs") or {}).items():
+    for job_id, job in jobs.items():
         if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
             continue
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
         timeouts[suite] = int(with_["run_timeout_minutes"])
+    for suite in _INLINE_SUITE_JOBS:
+        budgets = [
+            s["timeout-minutes"]
+            for s in ((jobs.get(suite) or {}).get("steps") or [])
+            if isinstance(s, dict)
+            and s.get("name") == "Run test"
+            and "timeout-minutes" in s
+        ]
+        if len(budgets) != 1:
+            raise RuntimeError(
+                f"load_run_timeouts: inline suite {suite!r} needs exactly one "
+                f"`Run test` step with `timeout-minutes` in {pr_test_yml_path}."
+            )
+        timeouts[suite] = int(budgets[0])
     if not timeouts:
         raise RuntimeError(
             f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
@@ -176,7 +195,13 @@ def compute_partitions(
                     f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
                 )
             size = max(1, ideal_size)
-            max_parallel = size if full_parallel else compute_max_parallel(size)
+            # The throttle rations scarce self-hosted GPU runners; hosted
+            # ubuntu-latest is elastic, so capping CPU shards only serializes
+            # them.
+            unthrottled = full_parallel or all(
+                t.backend == HWBackend.CPU for t in group
+            )
+            max_parallel = size if unthrottled else compute_max_parallel(size)
         result[suite] = {
             "size": size,
             "arr": list(range(size)),
