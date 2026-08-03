@@ -1064,8 +1064,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._record_batch_dispatch_metrics(
             request_count=batch_len,
             output_count=sum(
-                max(1, int(req.num_outputs_per_prompt or 1))
-                for req in compatible_reqs
+                max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
             ),
             queue_wait_ms=oldest_wait_s * 1000.0,
             effective_max_output_count=self._batch_admission.max_admissible_batch_size(
