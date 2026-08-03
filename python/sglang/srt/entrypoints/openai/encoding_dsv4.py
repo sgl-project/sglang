@@ -311,16 +311,19 @@ def render_message(
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    assert (
-        reasoning_effort_profile in REASONING_EFFORT_PROFILES
-    ), f"Invalid reasoning effort profile: {reasoning_effort_profile}"
+    if reasoning_effort_profile not in REASONING_EFFORT_PROFILES:
+        raise ValueError(
+            f"Invalid reasoning effort profile: {reasoning_effort_profile!r}; "
+            f"expected one of {list(REASONING_EFFORT_PROFILES)}"
+        )
     effort_prompts = REASONING_EFFORT_PROFILES[reasoning_effort_profile]
     if reasoning_effort is None:
         reasoning_effort = "low" if reasoning_effort_profile == "0731" else "high"
-    assert reasoning_effort in effort_prompts, (
-        f"Invalid reasoning effort {reasoning_effort!r} for profile "
-        f"{reasoning_effort_profile!r}; expected one of {list(effort_prompts)}"
-    )
+    if reasoning_effort not in effort_prompts:
+        raise ValueError(
+            f"Invalid reasoning effort {reasoning_effort!r} for profile "
+            f"{reasoning_effort_profile!r}; expected one of {list(effort_prompts)}"
+        )
     if index == 0 and thinking_mode == "thinking":
         prompt += effort_prompts[reasoning_effort]
 

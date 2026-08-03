@@ -11,9 +11,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import tempfile
 import unittest
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -41,16 +43,19 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
-            model_path="test/model",
+            model_path="deepseek-ai/DeepSeek-V4-Flash",
+            revision=None,
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
         )
+        self.model_path = self.server_args.model_path
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
+        mock_hf_config.dsv4_reasoning_effort_profile = None
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -719,9 +724,6 @@ class ServingChatTestCase(unittest.TestCase):
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
                 self.chat.chat_encoding_spec = chat_encoding_spec
-                self.chat._dsv4_reasoning_effort_profile = (
-                    "legacy" if chat_encoding_spec == "dsv4" else None
-                )
                 req = ChatCompletionRequest(
                     model="x",
                     messages=[
@@ -759,9 +761,6 @@ class ServingChatTestCase(unittest.TestCase):
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
                 self.chat.chat_encoding_spec = chat_encoding_spec
-                self.chat._dsv4_reasoning_effort_profile = (
-                    "legacy" if chat_encoding_spec == "dsv4" else None
-                )
                 req = ChatCompletionRequest(
                     model="x",
                     messages=[
@@ -1415,7 +1414,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("<｜Assistant｜>", out)
 
     def test_dsv4_reasoning_effort_profiles(self):
-        """Pin legacy and 0731 effort prefixes and their None defaults."""
         from sglang.srt.entrypoints.openai import encoding_dsv4
 
         messages = [
@@ -1462,17 +1460,75 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(encode("0731", None), release_low)
         self.assertEqual(len({release_low, release_high, release_max}), 3)
 
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             encode("legacy", "low")
 
     def test_dsv4_reasoning_effort_profile_resolution(self):
-        """Select the 0731 mapping without changing legacy V4 behavior."""
         resolve = OpenAIServingChat._resolve_dsv4_reasoning_effort_profile
         self.assertEqual(
             resolve("deepseek-ai/DeepSeek-V4-Flash"),
             "legacy",
         )
+        self.assertEqual(
+            resolve("deepseek-ai/DeepSeek-V4-Flash-DSpark"),
+            "legacy",
+        )
         self.assertEqual(resolve("deepseek-ai/DeepSeek-V4-Flash-0731"), "0731")
+
+        with tempfile.TemporaryDirectory() as model_path:
+            encoder_path = Path(model_path) / "encoding" / "encoding_dsv4.py"
+            encoder_path.parent.mkdir()
+            encoder_path.write_text(
+                'REASONING_EFFORT_PROMPTS = {"low": "", "high": "h", "max": "m"}\n'
+                'DEFAULT_REASONING_EFFORT = "low"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(resolve(model_path), "0731")
+
+        with tempfile.TemporaryDirectory(suffix="DeepSeek-V4-Flash-0731") as model_path:
+            encoder_path = Path(model_path) / "encoding" / "encoding_dsv4.py"
+            encoder_path.parent.mkdir()
+            encoder_path.write_text(
+                'REASONING_EFFORT_MAX = "legacy"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(resolve(model_path), "legacy")
+
+        self.assertEqual(resolve("renamed/model", override="0731"), "0731")
+        self.assertEqual(resolve("renamed/model", override="legacy"), "legacy")
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            resolve("renamed/model", override="auto")
+
+    def test_dsv4_reasoning_effort_profile_refreshes_after_weight_update(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.dspark_block_size = 5
+        tm.model_config.hf_config.dspark_markov_rank = 256
+        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+        tm.server_args.model_path = tm.model_path
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        legacy_prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Absolute maximum", legacy_prompt)
+        self.assertNotIn("Reasoning Effort: Beyond maximum", legacy_prompt)
+
+        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        tm.server_args.model_path = tm.model_path
+        serving_chat._process_messages(request, is_multimodal=False)
+        release_prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", release_prompt)
+
+        request.reasoning_effort = "low"
+        serving_chat._process_messages(request, is_multimodal=False)
+        self.assertNotIn("Reasoning Effort:", tm.tokenizer.encode.call_args.args[0])
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
