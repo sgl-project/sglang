@@ -87,12 +87,12 @@ def should_use_dsa_fused_topk(
 ) -> bool:
     """Select fused TopK for PD IndexShare.
 
-    Prefill worker:
-    - Target prefill: enabled.
-    - Draft extend: disabled.
+    PD Prefill worker:
+    - Target prefill: fused TopK enabled.
+    - Draft extend: fused TopK disabled.
 
-    Draft worker:
-    - Draft extend, target verify, and draft decode: enabled.
+    PD Decode worker:
+    - Draft decode / target verify / draft extend: fused TopK enabled.
     """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
