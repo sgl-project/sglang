@@ -171,6 +171,17 @@ clean_site_packages() {
         set -x
     fi
 
+    # An orphaned sglang/ shadows the checkout: `uv pip uninstall` deletes only
+    # what RECORD lists, so __pycache__ keeps the directory alive without
+    # __init__.py, PathFinder claims it as a namespace portion, and the editable
+    # install's _EditableFinder sits at the END of sys.meta_path - submodule
+    # imports fail. No install leaves this directory without __init__.py.
+    if [ -d "$SITE_PACKAGES/sglang" ] && [ ! -f "$SITE_PACKAGES/sglang/__init__.py" ]; then
+        echo "Removing orphaned sglang skeleton that would shadow the checkout: $SITE_PACKAGES/sglang"
+        find "$SITE_PACKAGES/sglang" -maxdepth 2 | head -20
+        rm -rf "$SITE_PACKAGES/sglang"
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -609,6 +620,24 @@ verify_imports() {
     $PIP_CMD list
     python3 -c "import torch; print(torch.version.cuda)"
     python3 -c "import cutlass; import cutlass.cute;"
+
+    # A shadowed sglang still imports, so without this the failure only surfaces
+    # as a missing submodule during the test step. find_spec, not import: the
+    # finders alone answer this and importing would pull in torch for nothing.
+    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import importlib.util, os
+want = os.environ["SGLANG_EXPECTED_INIT"]
+spec = importlib.util.find_spec("sglang")
+if spec is None:
+    raise SystemExit("sglang is not importable at all after install")
+if spec.origin != want:
+    raise SystemExit(
+        f"sglang resolves to origin={spec.origin} "
+        f"(search={list(spec.submodule_search_locations or [])}), expected {want}; "
+        "something in site-packages is shadowing the checkout"
+    )
+print(f"sglang resolves to {spec.origin}")
+'
 
     mark_step_done "${FUNCNAME[0]}"
 }
