@@ -70,6 +70,7 @@ autocast_enabled = precision.autocast_enabled
 get_module_dtype = precision.get_module_dtype
 precision_to_dtype = precision.precision_to_dtype
 resolve_component_precision = precision.resolve_component_precision
+resolve_decode_precision = precision.resolve_decode_precision
 resolve_precision = precision.resolve_precision
 temporary_module_dtype = precision.temporary_module_dtype
 
@@ -104,6 +105,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
     def _server_args(self, **overrides):
         config = {
             "vae_precision": "fp16",
+            "vae_decode_precision": None,
             "audio_vae_precision": "bf16",
             "dit_precision": "fp32",
             "image_encoder_precision": "fp16",
@@ -127,6 +129,18 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             resolve_precision(self._server_args(vae_precision="fp8"), "vae_precision")
         with self.assertRaisesRegex(ValueError, "Unsupported custom_precision"):
             precision_to_dtype("fp8", "custom_precision")
+
+    def test_decode_precision_override_and_fallback(self):
+        self.assertEqual(
+            resolve_decode_precision(self._server_args()),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_decode_precision(self._server_args(vae_decode_precision="bf16")),
+            torch.bfloat16,
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported vae_decode_precision"):
+            resolve_decode_precision(self._server_args(vae_decode_precision="fp8"))
 
     def test_component_precision_mapping(self):
         server_args = self._server_args()

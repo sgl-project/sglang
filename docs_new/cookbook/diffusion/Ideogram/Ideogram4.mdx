@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Ideogram 4 with SGLang Diffusion for high-aesthetic text-to-image generation."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "typography", "NF4/FP8/NVFP4"]} />
+
 ## 1. Model introduction
 
 [Ideogram 4](https://huggingface.co/ideogram-ai/ideogram-4-nf4) is Ideogram's text-to-image diffusion model. SGLang Diffusion supports the official NF4 and FP8 checkpoints, the Comfy-Org NVFP4 transformer checkpoint, and fal's single-branch Fast and Instant variants.

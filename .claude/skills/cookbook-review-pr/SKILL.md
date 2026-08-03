@@ -45,7 +45,10 @@ than restating.
 - No `!(x in y)` anywhere (Mintlify AST walker crashes) — use `obj.key === undefined`.
 - `supportedHardware` ⊆ `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. A
   model-specific GPU the shared catalog lacks must be declared in `config.hardware`
-  (`{id,label,vram,vendor}`), **not** added to the engine catalog.
+  (`{id,label,vram,vendor}`), **not** added to the engine catalog — unless the platform is
+  genuinely shared, which is an engine change the PR body has to argue (and the
+  `cookbook-add-model` hardware table moves with it). A new catalog entry is inert for
+  other pages: each filters the catalog by its own `supportedHardware`.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
@@ -66,6 +69,9 @@ than restating.
   a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
+  Hints render above BOTH run modes, so flag one that reads as docker-only ("add these
+  docker run flags") — `docker run` flags belong in the hardware entry's
+  `multiNodeDockerFlags`, which the engine emits into the Docker command itself.
 - `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
   template's `model` field is a free-form input prefilled from this value; if the config
   omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the

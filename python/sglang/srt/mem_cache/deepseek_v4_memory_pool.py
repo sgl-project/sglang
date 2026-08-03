@@ -22,7 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
 from sglang.srt.utils import ceil_div, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -278,7 +278,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
@@ -579,8 +579,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.c128_kv_pool = None
             server_args = get_server_args()
             spec_extra = (
-                (server_args.speculative_num_draft_tokens - 1)
-                if server_args.speculative_algorithm is not None
+                (get_spec().speculative_num_draft_tokens - 1)
+                if get_spec().speculative_algorithm is not None
                 else 0
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
@@ -648,10 +648,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if _is_hip:
-            self._init_paged_compress_states(False)
-        else:
-            self._init_paged_compress_states(enable_memory_saver)
+        self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
@@ -664,7 +661,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = get_spec().speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
