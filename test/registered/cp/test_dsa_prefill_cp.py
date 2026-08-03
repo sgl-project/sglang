@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=320, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=480, stage="extra-b", runner_config="deepep-8-gpu-h200")
 GLM52_MODEL_PATH = "zai-org/GLM-5.2-FP8"
 SERVER_LAUNCH_TIMEOUT = max(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, 1800)
 

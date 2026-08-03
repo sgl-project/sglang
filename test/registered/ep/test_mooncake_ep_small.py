@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=189, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=223, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 

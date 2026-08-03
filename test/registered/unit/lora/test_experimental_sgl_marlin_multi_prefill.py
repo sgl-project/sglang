@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 # The fused MoE LoRA-add kernel's shared-memory footprint exceeds the opt-in
 # ceiling of the small-GPU CI runner (~99 KiB on L4) at rank=128, so the

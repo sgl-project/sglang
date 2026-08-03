@@ -5,7 +5,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA piecewise backend requires CUDA", allow_module_level=True)
