@@ -130,7 +130,13 @@ class RelLogitsProj(nn.Module):
         # territory. Rounding moves with the fold (r*tau rounds to bf16 before
         # the GEMM instead of after); flag-off keeps the exact legacy post-scale.
         self._prescale_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
-        self._proj_dispatch = envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
+        # The dispatch picks its implementation from the token count, so the same
+        # row is projected by a different kernel depending on how many tokens
+        # share the forward pass. Deterministic inference needs one fixed path.
+        self._proj_dispatch = (
+            envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
+            and not get_server_args().enable_deterministic_inference
+        )
 
     def _project(self, r: torch.Tensor) -> torch.Tensor:
         """``einsum("thd,de->the", r, proj)`` -- but dispatched: in production
