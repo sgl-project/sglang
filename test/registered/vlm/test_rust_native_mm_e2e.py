@@ -98,13 +98,18 @@ class TestRustServerNativeMm(CustomTestCase):
         self.assertIn("red", text)
 
     def test_unsupported_format_is_rejected(self):
-        # GIF is not decodable natively and there is no Python fallback: the
-        # request must be rejected (4xx/500), not crash the server.
+        # A real image in a format the native pipeline cannot decode must be
+        # rejected (4xx/500) — never silently answered — and must not crash
+        # the server. PCX is the probe: sglang-mm enables only
+        # jpeg/png/webp/gif/bmp, and in the server binary feature unification
+        # (dynamo-parsers → openai-harmony → image default features) widens
+        # that to every image-crate default format, so the probe has to be a
+        # format the image crate does not know at all.
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
                 "text": chat_prompt("What color is this image?"),
-                "image_data": [solid_image_data_url("GIF")],
+                "image_data": [solid_image_data_url("PCX")],
                 "sampling_params": {"max_new_tokens": 8},
             },
         )
