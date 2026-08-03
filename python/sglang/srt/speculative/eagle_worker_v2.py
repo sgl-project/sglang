@@ -881,6 +881,36 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
+        runner = self.cuda_graph_runner_for_draft_extend
+        if (
+            runner is not None
+            and getattr(runner, "replayssm_commit_in_graph", False)
+            and not can_run_decode_cuda_graph
+            and not batch.forward_mode.is_idle()
+            and len(batch.seq_lens) > 0
+        ):
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_replayssm_fold_chain,
+            )
+
+            bs = len(batch.seq_lens)
+            device = batch.seq_lens.device
+            commit_replayssm_fold_chain(
+                spec_state=runner._commit_spec_state,
+                accept_lens=batch_result.accept_lens,
+                seq_lens=batch.seq_lens,
+                req_pool_indices=batch.req_pool_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_map=runner._commit_mamba_map,
+                raw_bs_tensor=torch.full((1,), bs, dtype=torch.int32, device=device),
+                seq_lens_offset=0,
+                track_interval=runner._commit_track_interval,
+                out_slots=torch.empty(bs, dtype=torch.int64, device=device),
+                out_last_correct=torch.empty(bs, dtype=torch.int64, device=device),
+                out_track_indices=torch.empty(bs, dtype=torch.int64, device=device),
+                out_track_steps=torch.empty(bs, dtype=torch.int64, device=device),
+            )
+
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:

@@ -492,6 +492,7 @@ class MambaPool:
         # no cursors. The shared g allocation gates on `_replayssm_on`.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
+        self.replayssm_commit_deferred = False
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
 
         # for disagg with nvlink

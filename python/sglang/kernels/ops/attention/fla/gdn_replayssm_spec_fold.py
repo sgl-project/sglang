@@ -211,6 +211,91 @@ def fused_verify_commit_indices(
     return state_batch_indices, last_correct, track_steps
 
 
+@triton.jit
+def _fused_chain_commit_indices_kernel(
+    accept_lens,
+    seq_lens,
+    req_pool_indices,
+    mamba_track_indices_in,
+    mamba_map,
+    raw_bs_ptr,
+    state_batch_indices_out,
+    last_correct_out,
+    track_indices_out,
+    track_steps_out,
+    seq_lens_offset,
+    track_interval,
+):
+    i = tl.program_id(0)
+    raw_bs = tl.load(raw_bs_ptr)
+    valid = i < raw_bs
+    n = tl.load(accept_lens + i).to(tl.int64)
+    req = tl.load(req_pool_indices + i).to(tl.int64)
+    slot = tl.load(mamba_map + req).to(tl.int64)
+    tl.store(state_batch_indices_out + i, tl.where(valid, slot, -1))
+    tl.store(last_correct_out + i, tl.where(valid, n - 1, 0))
+    tin = tl.load(mamba_track_indices_in + i).to(tl.int64)
+    tl.store(track_indices_out + i, tl.where(valid, tin, -1))
+
+    pre = tl.load(seq_lens + i).to(tl.int64) - seq_lens_offset
+    post = pre + n
+    crossed = (pre // track_interval) != (post // track_interval)
+    point = (post // track_interval) * track_interval
+    ith = tl.maximum(point - pre - 1, 0)
+    tl.store(track_steps_out + i, tl.where(crossed & valid, ith, -1))
+
+
+def commit_replayssm_fold_chain(
+    *,
+    spec_state,
+    accept_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_map: torch.Tensor,
+    raw_bs_tensor: torch.Tensor,
+    seq_lens_offset: int,
+    track_interval: int,
+    out_slots: torch.Tensor,
+    out_last_correct: torch.Tensor,
+    out_track_indices: torch.Tensor,
+    out_track_steps: torch.Tensor,
+) -> None:
+    """Linear-chain fold commit (topk <= 1): accepted steps are the row
+    prefix, so no accept_index table is needed -- last accepted step is
+    ``accept_lens - 1`` and the track candidate is the crossing offset
+    itself. All outputs land in caller-owned buffers, so the whole body is
+    allocation-free and CUDA-graph capturable. Rows >= raw_bs (graph
+    padding) resolve to slot/track -1, which every consumer skips."""
+    bs = accept_lens.shape[0]
+    if mamba_track_indices is None:
+        mamba_track_indices = out_track_indices
+        out_track_indices.fill_(-1)
+    _fused_chain_commit_indices_kernel[(bs,)](
+        accept_lens,
+        seq_lens,
+        req_pool_indices,
+        mamba_track_indices,
+        mamba_map,
+        raw_bs_tensor,
+        out_slots,
+        out_last_correct,
+        out_track_indices,
+        out_track_steps,
+        seq_lens_offset,
+        track_interval,
+    )
+    commit_gdn_replayssm_fold_after_verify(
+        spec_state=spec_state,
+        state_batch_indices=out_slots,
+        accept_lens=accept_lens,
+        last_correct_step_indices=out_last_correct,
+        mamba_track_indices=out_track_indices,
+        mamba_steps_to_track=out_track_steps,
+        null_block_id=-1,
+    )
+
+
 def commit_gdn_replayssm_fold_all_layers(
     checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, K, V], in place
     rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, RL, V]

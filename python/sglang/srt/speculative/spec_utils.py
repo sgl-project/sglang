@@ -829,6 +829,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    force: bool = False,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -864,6 +865,10 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
+        if getattr(mamba_pool, "replayssm_commit_deferred", False) and not force:
+            # The draft-extend CUDA graph owns the fold commit (captured after
+            # the draft forward); the eager fallback re-enters with force=True.
+            return
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (

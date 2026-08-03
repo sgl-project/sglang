@@ -64,6 +64,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -188,6 +189,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
+            self._init_replayssm_commit(eagle_worker)
+            mamba_track_indices = (
+                torch.full((self.max_bs,), -1, dtype=torch.int64)
+                if self.replayssm_commit_in_graph
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -256,6 +263,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens=extend_seq_lens,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            mamba_track_indices=mamba_track_indices,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -272,6 +280,56 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _init_replayssm_commit(self, eagle_worker) -> None:
+        """The fold commit rides this graph: its inputs (accept_lens,
+        seq_lens, req_pool_indices) are already static buffers here, so
+        capturing [chain-indices kernel + fold + conv scatters] after the
+        draft forward removes the whole eager commit from the host seam.
+        Rows >= raw_bs resolve to slot -1 and are skipped by every kernel."""
+        req_pool = getattr(eagle_worker, "req_to_token_pool", None)
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        self.replayssm_commit_in_graph = bool(
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+            and getattr(eagle_worker, "speculative_num_steps", 0) > 0
+        )
+        if not self.replayssm_commit_in_graph:
+            return
+        from sglang.srt.runtime_context import get_server_args
+
+        mamba_pool.replayssm_commit_deferred = True
+        self._commit_spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        self._commit_mamba_map = req_pool.req_index_to_mamba_index_mapping
+        self._commit_track_interval = get_server_args().mamba_track_interval
+        self._commit_raw_bs = torch.zeros((1,), dtype=torch.int32)
+        self._commit_out_slots = torch.full((self.max_bs,), -1, dtype=torch.int64)
+        self._commit_out_last = torch.zeros((self.max_bs,), dtype=torch.int64)
+        self._commit_out_track_idx = torch.full((self.max_bs,), -1, dtype=torch.int64)
+        self._commit_out_track_steps = torch.full((self.max_bs,), -1, dtype=torch.int64)
+
+    def _run_replayssm_commit(self, bs: int) -> None:
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+            commit_replayssm_fold_chain,
+        )
+
+        buffers = self.buffers
+        commit_replayssm_fold_chain(
+            spec_state=self._commit_spec_state,
+            accept_lens=buffers.num_accept_tokens[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            mamba_track_indices=buffers.mamba_track_indices[:bs],
+            mamba_map=self._commit_mamba_map,
+            raw_bs_tensor=self._commit_raw_bs,
+            seq_lens_offset=self.captured_req_width,
+            track_interval=self._commit_track_interval,
+            out_slots=self._commit_out_slots[:bs],
+            out_last_correct=self._commit_out_last[:bs],
+            out_track_indices=self._commit_out_track_idx[:bs],
+            out_track_steps=self._commit_out_track_steps[:bs],
+        )
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -431,6 +489,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            if self.replayssm_commit_in_graph:
+                self._run_replayssm_commit(bs)
             return ret
 
         with forward_context(
@@ -522,6 +582,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
             copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
+        if self.replayssm_commit_in_graph:
+            self._commit_raw_bs.fill_(raw_bs)
+            if forward_batch.mamba_track_indices is not None:
+                copy_dsts.append(self.buffers.mamba_track_indices[:raw_bs])
+                copy_srcs.append(forward_batch.mamba_track_indices)
+            else:
+                self.buffers.mamba_track_indices[:raw_bs].fill_(-1)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
