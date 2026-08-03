@@ -45,6 +45,7 @@ if is_musa():
         top_p_renorm_prob,
     )
 
+_is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
@@ -119,7 +120,7 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
-        if logits.shape[0] == 0:
+        if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
 
         # Preprocess logits (custom processors and NaN handling)
