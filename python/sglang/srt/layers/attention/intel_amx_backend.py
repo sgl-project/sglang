@@ -68,7 +68,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_extend_len = None
         else:
-            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+            # Pass -1 to let C++ kernel compute max_len_extend dynamically on C++ side.
+            # Avoids calling Python .item() which triggers torch.compile recompile guards.
+            max_extend_len = -1
         self.forward_metadata = (attn_logits, max_extend_len)
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -103,7 +105,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        max_extend_len = None
+        # Pass -1 to let C++ kernel compute max_len_extend dynamically on C++ side.
+        max_extend_len = -1
         self.forward_metadata = (attn_logits, max_extend_len)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):

@@ -2579,6 +2579,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             batch_size=forward_batch.batch_size,
         )
 
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
+
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
         self.decode_cuda_graph_runner = None
@@ -2596,7 +2603,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
+        if self.device == "cpu" and (
+            not get_flags().capture.enable_torch_compile
+            or not self._uses_cpu_graph_attention_backend()
+        ):
             return
 
         tic = time.perf_counter()
@@ -2669,26 +2679,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
 
-        # CPU has no literal CUDA graph capture and none of the FX-split /
-        # attention-layer-collection machinery below applies to it. CPUGraphRunner
-        # handles both decode and prefill in one object (see its module
-        # docstring); prefill is initialized first, so just construct it here --
-        # init_decode_cuda_graph's CPU branch reuses this same instance. Unlike
-        # decode, prefill is meaningful for non-generation (embedding / reward /
-        # classification) models too -- they only ever run EXTEND -- so this
-        # branch deliberately does *not* gate on `self.is_generation` the way
-        # init_decode_cuda_graph does; CPUGraphRunner itself skips building
-        # decode-only state when the model isn't a generation model.
+        # CPU graph is currently supported only by the Intel AMX attention
+        # backend. Other CPU attention backends use the eager runner.
         if self.device == "cpu":
             if not get_flags().capture.enable_torch_compile:
                 return
             if self.is_draft_worker and not force_for_draft_worker:
                 return
-            # CPUGraphRunner decides internally whether prefill.bs / the
-            # 'disabled' backend leaves it with no prefill buckets to build
-            # (can_run_graph then rejects EXTEND batches and callers fall back
-            # to eager). Always construct it here -- init_decode_cuda_graph's
-            # CPU branch reuses this same instance for decode.
+            if not self._uses_cpu_graph_attention_backend():
+                return
+            # CPUGraphRunner handles both prefill and decode; the decode path
+            # reuses this instance after prefill initialization.
             self.prefill_cuda_graph_runner = CPUGraphRunner(self)
             return
 

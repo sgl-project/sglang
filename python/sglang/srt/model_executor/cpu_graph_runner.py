@@ -18,12 +18,14 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import psutil
 import torch
+import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -137,6 +139,7 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.assume_static_by_default = False
     register_inductor_fallback_ops()
     monkey_patch_torch_compile()
 
@@ -579,7 +582,7 @@ class CPUGraphRunner:
     differ.
 
     Prefill design summary (full discussion in
-    /root/ecao/cpu_graph_runner_prefill_design_notes.md, sections 6-9):
+    cpu_graph_runner_prefill_design_notes.md, sections 6-9):
       - CPU has no literal CUDAGraph capture -- torch.compile produces *code* that
         is re-executed every call, not a frozen recording of kernel launches.
         Attention is an opaque registered custom op that Inductor never
@@ -793,9 +796,12 @@ class CPUGraphRunner:
             # bs values used to warm up every bucket / the dynamic fallback so
             # the request axis is established as a symbolic range before
             # serving starts (design notes doc, section 9.4). Two
-            # well-separated values are enough to force torch.compile off
-            # single-value specialization.
-            self.prefill_warmup_bs_values = sorted({1, min(4, self.prefill_max_bs)})
+            # well-separated values (>=2) force torch.compile to generate a
+            # symbolic shape graph immediately without specializing on size 1.
+            start_bs = 2 if self.prefill_max_bs >= 2 else 1
+            self.prefill_warmup_bs_values = sorted(
+                {start_bs, min(4, self.prefill_max_bs)}
+            )
             if self.enable_torch_compile:
                 # Stop-gap for IntelAMXAttnBackend's
                 # `max_extend_len = torch.max(...).item()` -- see class
@@ -833,7 +839,7 @@ class CPUGraphRunner:
         return bool(forward_batch.encoder_lens.max() == 0)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if forward_batch.forward_mode.is_extend():
             return self._can_run_prefill_graph(forward_batch)
 
         is_bs_supported = (
@@ -1110,7 +1116,7 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if forward_batch.forward_mode.is_extend():
             return self._execute_prefill_graph(forward_batch, pp_proxy_tensors)
 
         assert (
@@ -1201,10 +1207,12 @@ class CPUGraphRunner:
 
         with torch.device(self.device):
             req_pool_indices = torch.arange(bs, dtype=torch.int64)
-            extend_seq_lens = torch.tensor(lens_cpu, dtype=torch.int64)
+            extend_seq_lens = torch.tensor(lens_cpu, dtype=torch.int32)
             extend_prefix_lens = torch.zeros((bs,), dtype=torch.int64)
-            extend_start_loc = torch.tensor(start_loc_cpu, dtype=torch.int64)
-            seq_lens = extend_seq_lens.clone()  # no cached prefix in the dummy batch
+            extend_start_loc = torch.tensor(start_loc_cpu, dtype=torch.int32)
+            seq_lens = torch.tensor(
+                lens_cpu, dtype=torch.int64
+            )  # no cached prefix in the dummy batch
             input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int64)
             positions = torch.cat(
@@ -1341,11 +1349,13 @@ class CPUGraphRunner:
     def _can_run_prefill_graph(self, forward_batch: ForwardBatch) -> bool:
         if not self.capture_num_tokens:
             return False
+        if forward_batch.return_logprob:
+            return False
         if forward_batch.input_embeds is not None:
             return False
         if getattr(forward_batch, "replace_embeds", None) is not None:
             return False
-        if forward_batch.mm_inputs:
+        if forward_batch.contains_mm_inputs():
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False
@@ -1360,11 +1370,47 @@ class CPUGraphRunner:
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner's prefill path yet."
 
-        num_tokens = forward_batch.input_ids.shape[0]
-        compiled_fn = self.prefill_graphs.get(num_tokens)
-        using_dynamic_fallback = compiled_fn is None
-        if using_dynamic_fallback:
-            compiled_fn = self.prefill_dynamic_graph
+        raw_num_tokens = forward_batch.input_ids.shape[0]
+        compiled_fn = self.prefill_graphs.get(raw_num_tokens)
+        using_dynamic_fallback = False
+
+        if compiled_fn is None:
+            padded_num_tokens = None
+            if (
+                not self.disable_padding
+                and self.capture_num_tokens
+                and raw_num_tokens <= self.prefill_max_num_tokens
+            ):
+                idx = bisect.bisect_left(self.capture_num_tokens, raw_num_tokens)
+                if idx < len(self.capture_num_tokens):
+                    cand_tokens = self.capture_num_tokens[idx]
+                    diff = cand_tokens - raw_num_tokens
+                    ratio = diff / float(raw_num_tokens)
+                    # Heuristic: pad if waste ratio <= 20% or token diff <= 64 tokens
+                    if ratio <= 0.20 or diff <= 64:
+                        padded_num_tokens = cand_tokens
+
+            if (
+                padded_num_tokens is not None
+                and padded_num_tokens in self.prefill_graphs
+            ):
+                compiled_fn = self.prefill_graphs[padded_num_tokens]
+                pad_len = padded_num_tokens - raw_num_tokens
+                padded_fb = copy.copy(forward_batch)
+                padded_fb.input_ids = F.pad(
+                    forward_batch.input_ids, (0, pad_len), value=0
+                )
+                padded_fb.positions = F.pad(
+                    forward_batch.positions, (0, pad_len), value=0
+                )
+                if forward_batch.out_cache_loc is not None:
+                    padded_fb.out_cache_loc = F.pad(
+                        forward_batch.out_cache_loc, (0, pad_len), value=0
+                    )
+                forward_batch = padded_fb
+            else:
+                using_dynamic_fallback = True
+                compiled_fn = self.prefill_dynamic_graph
 
         if self.enable_torch_compile:
             self._mark_dynamic_request_axis(forward_batch)

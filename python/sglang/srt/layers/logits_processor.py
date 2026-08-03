@@ -264,6 +264,13 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        needs_extend_logprob_metadata = (
+            extend_return_logprob
+            or extend_return_top_logprob
+            or extend_token_ids_logprob
+            or forward_batch.multi_item_delimiter_indices is not None
+        )
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -272,11 +279,31 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
-            extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=forward_batch.top_logprobs_nums,
-            token_ids_logprobs=forward_batch.token_ids_logprobs,
+            extend_seq_lens_cpu=(
+                forward_batch.extend_seq_lens_cpu
+                if needs_extend_logprob_metadata
+                else None
+            ),
+            extend_logprob_start_lens_cpu=(
+                forward_batch.extend_logprob_start_lens_cpu
+                if extend_return_logprob
+                else None
+            ),
+            extend_logprob_pruned_lens_cpu=(
+                extend_logprob_pruned_lens_cpu
+                if needs_extend_logprob_metadata
+                else None
+            ),
+            top_logprobs_nums=(
+                forward_batch.top_logprobs_nums
+                if needs_extend_logprob_metadata
+                else None
+            ),
+            token_ids_logprobs=(
+                forward_batch.token_ids_logprobs
+                if needs_extend_logprob_metadata
+                else None
+            ),
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
             is_prefill_only=forward_batch.is_prefill_only,
