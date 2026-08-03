@@ -1519,6 +1519,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        mock_hf_config.dsv4_reasoning_effort_profile = None
         tm.model_config.hf_config = mock_hf_config
 
         # Case 1: No chat template + DeepSeek V3.2 arch -> should use dsv32 encoding
@@ -1540,7 +1541,7 @@ class ServingChatTestCase(unittest.TestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
-        tm.server_args.model_path = "deepseek-ai/DeepSeek-V4-Flash"
+        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
