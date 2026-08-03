@@ -121,7 +121,8 @@ export const LagunaXS2Deployment = () => {
     const lines = [
       'sglang serve \\',
       `  --model-path ${modelId} \\`,
-      `  --tp ${tp}`
+      `  --tp ${tp} \\`,
+      '  --trust-remote-code'
     ];
 
     if (dpAttention === 'enabled') {

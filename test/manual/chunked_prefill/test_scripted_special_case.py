@@ -406,9 +406,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and chunked is not None
                 and chunked.rid == r.rid
-                and chunked.extend_input_len > 0
+                and chunked.extend_range.length > 0
             ):
-                deduct = chunked.extend_input_len
+                deduct = chunked.extend_range.length
                 base = s.load_inquirer._get_num_pending_tokens()
                 deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
                 assert deducted == base - deduct, (
@@ -473,17 +473,18 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and r.chunks_done >= 1
                 and req is not None
-                and req.extend_input_len is not None
+                and req.extend_range is not None
             ):
                 saw_mid_chunk = True
                 assert (
-                    len(req.fill_ids) == len(req.prefix_indices) + req.extend_input_len
+                    req.extend_range.end
+                    == len(req.prefix_indices) + req.extend_range.length
                 ), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
-                    f"fill_ids_len={len(req.fill_ids)}, "
+                    f"fill_ids_len={req.extend_range.end}, "
                     f"prefix_indices_len={len(req.prefix_indices)}, "
-                    f"extend_input_len={req.extend_input_len}, "
+                    f"extend_input_len={req.extend_range.length}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
@@ -777,11 +778,11 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         page_size = 16
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.req.extend_input_len is not None:
+            if r.is_chunking and r.req.extend_range is not None:
                 saw_chunking = True
-                assert r.req.extend_input_len % page_size == 0, (
+                assert r.req.extend_range.length % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
-                    f"got extend_input_len={r.req.extend_input_len}, page_size={page_size}"
+                    f"got extend_input_len={r.req.extend_range.length}, page_size={page_size}"
                 )
             if r.finished:
                 break

@@ -16,8 +16,6 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -26,8 +24,6 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -60,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -119,7 +116,7 @@ class Step3TextMoEMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
@@ -189,10 +186,10 @@ class Step3TextAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
-        self.all_tp_rank = get_tensor_model_parallel_rank()
+        self.all_tp_rank = get_parallel().tp_rank
         self.total_num_heads = num_heads
         self.attn_tp_rank = attn_tp_rank
         self.layer_id = layer_id
@@ -541,8 +538,8 @@ class Step3VisionMLP(nn.Module):
         # Since this is a dense model,
         # the MLP component likewise adopts a DP-MLP approach modeled after DP Attention.
         # This choice may not represent the optimal solution and remains open to further deliberation.
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
         self.fc1 = ColumnParallelLinear(
             dim,
             intermediate_size,

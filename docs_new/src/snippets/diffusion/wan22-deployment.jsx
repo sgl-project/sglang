@@ -6,10 +6,13 @@
           title: 'Hardware Platform',
           items: [
             { id: 'b200', label: 'B200', default: true },
+            { id: 'b300', label: 'B300', default: false },
             { id: 'h200', label: 'H200', default: false },
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
             { id: 'mi355x', label: 'MI355X', default: false },
+            { id: 'a2', label: 'A2', default: false },
+            { id: 'a3', label: 'A3', default: false }
           ],
         },
         task: {
@@ -31,10 +34,10 @@
         },
         bestPractice: {
           name: 'bestPractice',
-          title: 'Sequence Parallelism',
+          title: 'Optimization',
           items: [
             { id: 'off', label: 'Standard', default: true },
-            { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+            { id: 'on', label: 'Best Practice', default: false },
           ],
         },
       };
@@ -84,6 +87,22 @@
         return modelConfigs[configKey]?.supportedLoras || [];
       })();
 
+      useEffect(() => {
+        const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
+
+        const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+
+        const allTabs = document.querySelectorAll('button, [role="tab"]');
+
+        allTabs.forEach((tab) => {
+          const text = tab.textContent.trim();
+
+          if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+            tab.click();
+          }
+        });
+      }, [values.hardware]);
+
       const handleRadioChange = (optionName, itemId) => {
         setValues((prev) => {
           const next = { ...prev, [optionName]: itemId };
@@ -109,16 +128,70 @@
       };
 
       const generateCommand = () => {
-        const { task, modelsize, selectedLoraPath, bestPractice } = values;
+        const { hardware, task, modelsize, selectedLoraPath, bestPractice } = values;
         const configKey = `${task}-${modelsize}`;
         const config = modelConfigs[configKey];
         if (!config) {
           return '# Error: Invalid configuration';
         }
 
+
+        if (hardware === 'a2' || hardware === 'a3') {
+          const comment = hardware === 'a3'
+            ? '#One A3 card has 2 npu chips\n'
+            : '';
+          const isBestPractice = bestPractice === 'on';
+          let command;
+
+          if (task === 'ti2v') {
+            if (isBestPractice) {
+              command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --sp-degree 8 \\
+  --num-gpus 8`;
+            } else if (hardware === 'a2') {
+              command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 1`;
+            } else {
+              command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size 1 \\
+  --sp-degree 2 \\
+  --num-gpus 2`;
+            }
+          } else {
+            const spDegree = isBestPractice ? 4 : 1;
+            const numGpus = isBestPractice ? 8 : (hardware === 'a3' ? 2 : 4);
+
+            command = `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size 2 \\
+  --sp-degree ${spDegree} \\
+  --num-gpus ${numGpus}`;
+          }
+
+          if (isBestPractice) {
+            command += ` \\\n  --attention-backend laser_attn`;
+          }
+
+          if (
+            selectedLoraPath === 'lightx2v/Wan2.2-Distill-Loras' ||
+            selectedLoraPath === 'Cseti/wan2.2-14B-Arcane_Jinx-lora-v1'
+          ) {
+            command += ` \\\n  --lora-path ${selectedLoraPath}`;
+          }
+
+          return command;
+        }
+
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
-          command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          if (hardware === 'b300') {
+            command += ` \\\n  --tp-size 2 \\\n  --num-gpus 8 \\\n  --sp-degree 2 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          } else {
+            command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
+          }
         }
         if (selectedLoraPath && selectedLoraPath !== 'none') {
           command += ` \\\n  --lora-path ${selectedLoraPath}`;

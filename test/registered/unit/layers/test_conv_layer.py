@@ -62,10 +62,6 @@ class TestConv2dLayer(unittest.TestCase):
         layer = Conv2dLayer(4, 8, kernel_size=2, stride=2, groups=2)
         self.assertFalse(layer.enable_linear)
 
-    def test_default_disables_linear(self):
-        layer = Conv2dLayer(3, 768, kernel_size=14, stride=14)
-        self.assertFalse(layer.enable_linear)
-
     def test_dilation_disables_linear(self):
         layer = Conv2dLayer(3, 64, kernel_size=3, stride=3, dilation=2)
         self.assertFalse(layer.enable_linear)

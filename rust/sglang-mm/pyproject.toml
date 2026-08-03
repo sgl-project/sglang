@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sglang-mm"
+dynamic = ["version"]
+description = "Rust-accelerated multimodal preprocessing for SGLang"
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "_core"

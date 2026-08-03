@@ -556,8 +556,6 @@ def generate_dense_grid_points(
 
 def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
     """Extract near-surface voxels for hierarchical decoding."""
-    device = input_tensor.device
-
     val = input_tensor + alpha
     valid_mask = val > -9000
 
@@ -833,7 +831,6 @@ class FlashVDMVolumeDecoding:
         dtype = latents.dtype
 
         resolutions = []
-        orig_resolution = octree_resolution
         if octree_resolution < min_resolution:
             resolutions.append(octree_resolution)
         while octree_resolution >= min_resolution:

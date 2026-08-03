@@ -11,7 +11,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -32,6 +31,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
 
 
@@ -117,7 +117,7 @@ class Cohere2MoeAttention(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -232,7 +232,7 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
@@ -403,7 +403,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
 
         norm_eps = getattr(config, "layer_norm_eps", 1e-5)
         self.input_layernorm = Cohere2MoeLayerNorm(config.hidden_size, eps=norm_eps)
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
     def forward(
         self,

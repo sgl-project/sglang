@@ -99,6 +99,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -127,6 +128,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
@@ -225,18 +227,22 @@ jobs:
 
   call-jit-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
+    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
+    # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
       always() &&
-      !failure() && !cancelled() &&
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      # On scheduled/parallel-dispatch runs sgl-kernel-build-wheels is skipped, so the wheel
+      # artifact does not exist. Force sgl_kernel='false' there so the jit-kernel jobs skip the
+      # wheel download and run against the released/pinned sgl-kernel instead of a fresh build.
+      sgl_kernel: ${{ (github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) && 'false' || needs.check-changes.outputs.sgl_kernel }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
@@ -262,6 +268,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
+      needs.check-changes.result == 'success' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
@@ -302,10 +309,10 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      - name: Rust cache (sglang-grpc)
+      - name: Rust cache (rust/ workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/sglang-grpc
+          workspaces: rust
           shared-key: "sglang-grpc-cpu"
           save-if: ${{ matrix.partition == 0 }}
 
@@ -327,13 +334,26 @@ jobs:
           key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
           restore-keys: hf-cpu-${{ matrix.partition }}-
 
+      # Pinned SHA so every shard splits against the same snapshot; without
+      # the file run_suite falls back to the (drifting) in-source est_time.
+      - name: Fetch live partition model
+        if: needs.check-changes.outputs.partition_model_sha != ''
+        run: |
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ needs.check-changes.outputs.partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o /tmp/partition-model.json
+
+      # compute_partitions reads this back as the per-shard budget, so it
+      # drives the fanout rather than capping it -- shrinking it buys more
+      # shards, not shorter ones.
       - name: Run test
-        timeout-minutes: 10
+        timeout-minutes: 15
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:

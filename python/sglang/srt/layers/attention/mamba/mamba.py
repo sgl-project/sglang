@@ -4,24 +4,20 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.mamba.triton_ops import (
+    mamba_chunk_scan_combined,
+    selective_state_update,
+)
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
 )
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
-from sglang.srt.layers.attention.mamba.ops import (
-    mamba_chunk_scan_combined,
-    selective_state_update,
-)
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import (
@@ -36,6 +32,7 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -45,15 +42,15 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn,
         causal_conv1d_update,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update_triton,
     )
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -66,16 +63,16 @@ elif is_xpu():
     # XPU has no native causal_conv1d kernel yet; use the portable Triton
     # implementation for both the "native" and the "_triton" entry points so
     # `causal_conv1d_fn` / `causal_conv1d_fn_triton` are always bound on XPU.
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn_triton,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update_triton,
     )
 
@@ -232,11 +229,11 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         if is_dp_attention_enabled():
-            self.tp_size = get_attention_tp_size()
-            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
         else:
-            self.tp_size = get_tensor_model_parallel_world_size()
-            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_parallel().tp_size
+            self.tp_rank = get_parallel().tp_rank
 
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim

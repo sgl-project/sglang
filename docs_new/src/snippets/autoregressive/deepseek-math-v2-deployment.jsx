@@ -73,6 +73,13 @@ export const DeepSeekMathV2Deployment = () => {
     if (memFraction) {
       cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
     }
+    if (hardware === 'b300') {
+      cmd += ' \\\n  --attention-backend flashinfer';
+      if (values.dpattention !== 'enabled') {
+        cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+        cmd += ' \\\n  --cuda-graph-backend-prefill disabled';
+      }
+    }
 
     cmd += ' \\\n  --host 0.0.0.0 \\\n  --port 30000';
 
