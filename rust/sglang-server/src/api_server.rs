@@ -88,6 +88,14 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
+    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
+    // Nagle/delayed-ACK penalty on keep-alive connections.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|io| {
+        if let Err(e) = io.set_nodelay(true) {
+            tracing::debug!(error = %e, "set_nodelay failed");
+        }
+    });
     // `with_connect_info` exposes the peer address to the access-log middleware.
     let serve = axum::serve(
         listener,
