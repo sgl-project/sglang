@@ -103,7 +103,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla"}
+    return attention_backend in {"fa3", "flashmla", "cutedsl_mla"}
 
 
 if _is_cuda:

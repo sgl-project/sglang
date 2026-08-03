@@ -148,6 +148,12 @@ def handle_dcp_validation(server_args: Any):
             "authoritative fabric probe runs at model-runner init; use 'a2a' "
             "or 'ag_rs' on clusters without MNNVL."
         )
+    if cfg.tp_size % cfg.dcp_size != 0:
+        raise ValueError(
+            "Tensor parallel size (--tp-size) must be divisible by decode "
+            "context parallel size (--dcp-size), but got "
+            f"tp_size={cfg.tp_size}, dcp_size={cfg.dcp_size}."
+        )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
