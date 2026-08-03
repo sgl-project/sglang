@@ -215,6 +215,10 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"64",
             b"DRAM,DRAM",
             b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
+            pack_int_lists([[4], [4, 5]], "I"),
+            b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
+            b"4",
+            b"3",
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -236,6 +240,10 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
+        self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertIsNotNone(info.staging)
         self.assertEqual(info.staging.base_ptr, staging_ptr)
         self.assertEqual(info.staging.total_size, 1048576)
@@ -262,6 +270,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
         self.assertEqual(info.dst_kv_item_lens, [256])
+        self.assertEqual(info.dst_dcp_size, 1)
+        self.assertEqual(info.dst_dcp_rank, 0)
         self.assertIsNone(info.staging)
 
 
@@ -445,6 +455,12 @@ class TestNixlTransferWorker(CustomTestCase):
                 staging=None,
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
+                # Non-DCP peer. Without this the worker raises AttributeError
+                # and lands in the same Failed status the assertions expect,
+                # so the transfer path would go unexercised.
+                requires_dcp_relayout=False,
+                dcp_dst_region_indices=None,
+                dcp_token_item_lens=None,
             )
         }
         mgr.req_to_decode_prefix_len = {room: 4}
@@ -496,6 +512,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[-1], "21_aux_nokv_0_0")
 
     def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -1017,6 +1034,116 @@ class TestNixlStaging(CustomTestCase):
             )
 
         self.assertIsNone(handle)
+
+
+class DlistCaptureAgent:
+    """Records prep_xfer_dlist descriptor arrays so tests can inspect them."""
+
+    def __init__(self):
+        self.calls = []  # (peer_name, np.ndarray, mem_kind)
+
+    def prep_xfer_dlist(self, peer_name, array, mem_kind):
+        self.calls.append((peer_name, np.asarray(array), mem_kind))
+        return f"handle_{len(self.calls)}"
+
+
+class TestNixlHeteroTpReplicatedKV(CustomTestCase):
+    """Regression guard for #31295.
+
+    Prefill attention-TP1 -> decode TP4 on a model with only 2 KV heads forces
+    GQA replication: decode ranks 0,1 share KV head 0 and ranks 2,3 share KV
+    head 1. The shared source dlist must interleave one group per *unique*
+    source head-slice (2), and each peer's head_group_idx must map replicated
+    decode ranks via integer division (0,0,1,1). The pre-fix code used
+    ``num_groups = decode_tp // prefill_tp`` (=4) -- addressing 2x past the
+    registered source region, which NIXL rejects with NIXL_ERR_NOT_FOUND -- and
+    a modulo head map (0,1,0,1).
+    """
+
+    TOTAL_KV_HEADS = 2
+    DECODE_TP = 4
+    PAGE_SIZE = 1
+    BYTES_PER_HEAD = 128  # per token, per head slice
+    SRC_KV_ITEM_LEN = TOTAL_KV_HEADS * BYTES_PER_HEAD  # both heads on one prefill rank
+    DST_KV_ITEM_LEN = BYTES_PER_HEAD  # one replicated head per decode rank
+    NUM_SLOTS = 4
+    SRC_PTRS = [0x10000, 0x20000]  # K, V for the single local layer
+    REGION_LEN = NUM_SLOTS * SRC_KV_ITEM_LEN
+
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = DlistCaptureAgent()
+        mgr.attn_tp_size = 1  # prefill attention TP = 1 (DP attention)
+        mgr.prep_handle_slice_src = None
+        mgr.prep_handles_slice_dst = {}
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            engine_rank=0,
+            page_size=self.PAGE_SIZE,
+            prefill_start_layer=0,
+            total_kv_head_num=self.TOTAL_KV_HEADS,
+            kv_head_num=self.TOTAL_KV_HEADS,
+            kv_item_lens=[self.SRC_KV_ITEM_LEN, self.SRC_KV_ITEM_LEN],
+            kv_data_ptrs=list(self.SRC_PTRS),
+            kv_data_lens=[self.REGION_LEN, self.REGION_LEN],
+        )
+        return mgr
+
+    def _decode_args(self, decode_tp_rank):
+        return SimpleNamespace(
+            agent_name=f"decode_{decode_tp_rank}",
+            decode_tp_size=self.DECODE_TP,
+            decode_tp_rank=decode_tp_rank,
+            dst_kv_item_len=self.DST_KV_ITEM_LEN,
+            dst_kv_ptrs=[0x30000, 0x40000],
+            dst_num_slots=self.NUM_SLOTS,
+            gpu_id=0,
+        )
+
+    def test_src_dlist_stays_within_registered_region_and_num_groups(self):
+        # Src dlist is built once (shared across peers) on the first call.
+        mgr = self._make_manager()
+        mgr._init_hetero_tp_prep_handle(
+            peer_name="decode_0", decode_kv_args=self._decode_args(0)
+        )
+
+        # num_groups must be 2 (one per unique KV head), not decode_tp//prefill_tp=4.
+        src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
+        self.assertEqual(num_groups, 2)
+
+        # Every source descriptor [addr, addr+len) must lie inside a registered
+        # base region [ptr, ptr+REGION_LEN). Pre-fix, num_groups=4 pushed the
+        # top group's addresses past the region -> NIXL_ERR_NOT_FOUND.
+        src_call = next(c for c in mgr.agent.calls if c[0] == "")
+        src_array = src_call[1]
+        regions = [(p, p + self.REGION_LEN) for p in self.SRC_PTRS]
+        for addr, length, _dev in src_array:
+            addr = int(addr)
+            length = int(length)
+            self.assertTrue(
+                any(lo <= addr and addr + length <= hi for lo, hi in regions),
+                f"descriptor [{addr:#x}, {addr + length:#x}) escapes all "
+                f"registered source regions {[(hex(lo), hex(hi)) for lo, hi in regions]}",
+            )
+
+    def test_head_group_idx_maps_replicated_ranks_by_integer_division(self):
+        # Each decode rank's per-peer dst handle records its head_group_idx.
+        # Expected replicated-KV mapping: ranks 0,1 -> group 0; ranks 2,3 -> group 1.
+        expected = {0: 0, 1: 0, 2: 1, 3: 1}
+        for rank in range(self.DECODE_TP):
+            mgr = self._make_manager()
+            mgr._init_hetero_tp_prep_handle(
+                peer_name=f"decode_{rank}", decode_kv_args=self._decode_args(rank)
+            )
+            _dst_handle, _num_slots_dst, head_group_idx = mgr.prep_handles_slice_dst[
+                f"decode_{rank}"
+            ]
+            self.assertEqual(
+                head_group_idx,
+                expected[rank],
+                f"decode rank {rank} mapped to group {head_group_idx}, "
+                f"expected {expected[rank]} (modulo bug gives 0,1,0,1)",
+            )
 
 
 if __name__ == "__main__":

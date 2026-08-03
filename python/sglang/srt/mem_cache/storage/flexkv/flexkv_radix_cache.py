@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -393,7 +394,7 @@ class FlexKVRadixCache(RadixCache):
         from sglang.srt.runtime_context import get_server_args
 
         global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
+        topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len
