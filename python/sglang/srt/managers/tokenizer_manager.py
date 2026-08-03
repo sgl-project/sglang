@@ -1062,7 +1062,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, GenerateReqInput):
             self._validate_context_forward_fields(obj)
         if obj.input_embeds is not None:
-            # Context forwards skip radix insert; plain embeds still need cache off.
+            # Context forwards skip radix insert. Plain embeds still need cache off.
             if not self.server_args.disable_radix_cache and not is_context_forward:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "

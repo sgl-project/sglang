@@ -453,7 +453,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     input_embeds: Optional[torch.Tensor] = None
     # None (causal) or "bidirectional".
     query_attention: Optional[str] = None
-    # Multi-dim positions [dims, n]; `positions` stays 1D for the runtime.
+    # Multi-dim positions [dims, n]. `positions` stays 1D for the runtime.
     token_positions: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None

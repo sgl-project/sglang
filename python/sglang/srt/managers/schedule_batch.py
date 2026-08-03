@@ -2072,7 +2072,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
-    # None or "bidirectional"; shared by all reqs in the batch.
+    # None or "bidirectional". Shared by all reqs in the batch.
     query_attention: Optional[str] = None
 
     # Explicit positions [n] or [dims, n] from prepare_for_extend.
@@ -2404,7 +2404,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             if req.token_positions is not None:
-                # Same tail-coverage as input_embeds; [n] or [dims][n].
+                # Same tail-coverage as input_embeds. [n] or [dims][n].
                 dims = (
                     req.token_positions
                     if isinstance(req.token_positions[0], list)
@@ -2552,7 +2552,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         if input_embeds:
-            # np.asarray handles list/ndarray rows; pin after (numpy tensors).
+            # np.asarray handles list/ndarray rows. Pin after (numpy tensors).
             embeds_tensor = torch.from_numpy(np.asarray(input_embeds, dtype=np.float32))
             if _pin:
                 embeds_tensor = embeds_tensor.pin_memory()

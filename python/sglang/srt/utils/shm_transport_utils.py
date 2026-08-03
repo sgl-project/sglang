@@ -1,7 +1,7 @@
 """Shared-memory tensor transport: the shm rung of the TensorRef ladder.
 
 A ref is a plain msgpack-safe dict: {"transport": "shm", "name": str,
-"dtype": str, "shape": [int, ...]}. Readers copy out and close; the request
+"dtype": str, "shape": [int, ...]}. Readers copy out and close. The request
 side unlinks its own request segments once the response arrives and unlinks
 response segments after reading them. Segments are named through
 make_shm_name so cleanup_stale_shm can reclaim them if the owning client
@@ -24,7 +24,7 @@ def _untrack(segment: shared_memory.SharedMemory) -> None:
     """https://stackoverflow.com/q/62748654: SharedMemory registers every
     segment with the process-local resource tracker, which unlinks it again
     at process exit. Lifecycle here is cross-process (the peer unlinks), so
-    drop the registration on both create and attach; leaked segments are
+    drop the registration on both create and attach. Leaked segments are
     reclaimed by cleanup_stale_shm via the pid embedded in the name."""
     with suppress(Exception):
         resource_tracker.unregister(segment._name, "shared_memory")
