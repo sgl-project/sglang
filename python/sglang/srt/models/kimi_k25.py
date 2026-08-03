@@ -48,7 +48,7 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -440,7 +440,9 @@ class MoonViT3dEncoder(nn.Module):
         self.video_attn_type = video_attn_type
         qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
         self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
-        self.use_fused_rope = _is_cuda and get_server_args().rl_on_policy_target is None
+        self.use_fused_rope = (
+            _is_cuda and get_exec().deterministic.rl_on_policy_target is None
+        )
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
