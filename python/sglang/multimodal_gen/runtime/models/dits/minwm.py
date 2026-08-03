@@ -1274,7 +1274,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             / f"sp_{get_sp_world_size():02d}_rank_{get_sp_parallel_rank():02d}"
         )
         dump_dir.mkdir(parents=True, exist_ok=True)
-        counters = {"patch": 0, "block0": 0}
+        counters = {"patch": 0}
 
         def dump(name: str, output) -> None:
             index = counters[name]
@@ -1291,16 +1291,36 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             lambda _module, _args, output: dump("patch", output)
         )
 
-        def dump_first_block(_module, hook_args, output) -> None:
-            index = counters["block0"]
-            if index < 2:
+        def dump_block(
+            _module,
+            hook_args,
+            output,
+            *,
+            block_name: str,
+            include_input: bool,
+        ) -> None:
+            index = counters[block_name]
+            if include_input and index < 2:
                 torch.save(
                     hook_args[0].detach().cpu(),
-                    dump_dir / f"block0_input_{index:03d}.pt",
+                    dump_dir / f"{block_name}_input_{index:03d}.pt",
                 )
-            dump("block0", output)
+            dump(block_name, output)
 
-        self.blocks[0].register_forward_hook(dump_first_block)
+        for block_index, block in enumerate(self.blocks):
+            block_name = f"block{block_index}"
+            counters[block_name] = 0
+            block.register_forward_hook(
+                lambda module, args, output, name=block_name, include=block_index == 0: (
+                    dump_block(
+                        module,
+                        args,
+                        output,
+                        block_name=name,
+                        include_input=include,
+                    )
+                )
+            )
 
         def register_detail(name: str, module: nn.Module) -> None:
             counters[name] = 0
@@ -1312,6 +1332,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                     "self_out",
                     "cross_q",
                     "cross_out",
+                    "output_proj",
                 }:
                     torch.save(
                         hook_args[0].detach().cpu(),
@@ -1352,6 +1373,7 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             "cross_norm_k": block0.attn2.norm_k,
             "cross_out": block0.attn2.to_out,
             "ffn": block0.ffn,
+            "output_proj": self.proj_out,
         }
         for detail_name, module in detail_modules.items():
             register_detail(detail_name, module)
