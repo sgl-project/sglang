@@ -721,6 +721,38 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_dwdp_tensor_schema(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.dwdp.tensor_schema import (
+            DwdpTensorSchema,
+            existing_tensor_names,
+        )
+
+        partitioned = existing_tensor_names(
+            layer,
+            (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ),
+        )
+        replicated = existing_tensor_names(
+            layer,
+            (
+                "w13_weight_bias",
+                "w2_weight_bias",
+                "gemm1_alpha",
+                "gemm1_beta",
+                "gemm1_clamp_limit",
+            ),
+        )
+        schema = DwdpTensorSchema(
+            partitioned=partitioned,
+            replicated=replicated,
+        )
+        schema.validate(layer)
+        return schema
+
     def apply(
         self,
         layer: torch.nn.Module,

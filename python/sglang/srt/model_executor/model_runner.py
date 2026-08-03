@@ -1116,11 +1116,11 @@ class ModelRunner:
             return
         if get_parallel().dwdp_size <= 1:
             return
-        from sglang.srt.layers.moe.dwdp import DwdpManager
+        from sglang.srt.layers.moe.dwdp import create_dwdp_manager
 
-        manager = DwdpManager(self.server_args)
-        set_global_dwdp_manager(manager)
+        manager = create_dwdp_manager(self.server_args)
         manager.setup(self.model)
+        set_global_dwdp_manager(manager)
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

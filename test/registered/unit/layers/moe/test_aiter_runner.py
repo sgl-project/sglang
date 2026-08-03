@@ -45,6 +45,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
+    fake_fused_moe.fused_moe_multi_b = fused_moe
 
     fake_ops = ModuleType("aiter.ops")
     fake_ops.__path__ = []
@@ -86,6 +87,79 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
     assert captured["custom_fused_moe_kwarg"] == "enabled"
+
+
+def test_aiter_runner_injects_rocm_dwdp_partitions(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.runtime_context import set_global_dwdp_manager
+
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    weights1 = torch.empty((2, 8, 2))
+    weights2 = torch.empty((2, 4, 2))
+    scale1 = torch.empty((2, 8, 1), dtype=torch.uint8)
+    scale2 = torch.empty((2, 4, 1), dtype=torch.uint8)
+    refs = {
+        weights1.untyped_storage().data_ptr(): "w13_weight",
+        weights2.untyped_storage().data_ptr(): "w2_weight",
+        scale1.untyped_storage().data_ptr(): "w13_weight_scale",
+        scale2.untyped_storage().data_ptr(): "w2_weight_scale",
+    }
+
+    class FakeManager:
+        weight_backend = "ipc"
+
+        def find_partitioned_name(self, layer_idx, reference):
+            assert layer_idx == 3
+            return refs[reference.untyped_storage().data_ptr()]
+
+        def get_partition_view(self, layer_idx, name, reference=None):
+            assert layer_idx == 3
+            if reference is None:
+                reference = {
+                    "w13_weight_scale": scale1,
+                    "w2_weight_scale": scale2,
+                }[name]
+            return SimpleNamespace(tensors=(reference, reference.clone()))
+
+    set_global_dwdp_manager(FakeManager())
+    try:
+        runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", layer_id=3))
+        runner.run(
+            _runner_input(),
+            _quant_info(
+                w13_weight=weights1,
+                w2_weight=weights2,
+                w13_scale=scale1,
+                w2_scale=scale2,
+                expert_mask=torch.ones(3, dtype=torch.bool),
+            ),
+            running_state={},
+        )
+    finally:
+        set_global_dwdp_manager(None)
+
+    assert len(captured["w1_partitions"]) == 2
+    assert len(captured["w2_partitions"]) == 2
+    assert len(captured["w1_scale_partitions"]) == 2
+    assert len(captured["w2_scale_partitions"]) == 2
+    assert captured["w1_scale_partitions"][0].shape == (16, 1)
+    assert captured["w2_scale_partitions"][0].shape == (8, 1)
+    assert captured["expert_mask"] is None
+
+
+def test_aiter_runner_preserves_fp32_block_scale_layout():
+    fp8_scale = torch.empty((2, 4, 3), dtype=torch.float32)
+    normalized = aiter_runner._normalize_dwdp_scale_partition(fp8_scale)
+    assert normalized.shape == (2, 4, 3)
+    assert normalized.dtype == torch.float32
+    assert normalized.is_contiguous()
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(

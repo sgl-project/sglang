@@ -442,6 +442,7 @@ class FusedMoE(torch.nn.Module):
         self.meta_overlap_args: Optional[dict] = None
 
         self._dwdp_bound = False
+        self._dwdp_original_topology: Optional[dict] = None
 
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
@@ -458,6 +459,40 @@ class FusedMoE(torch.nn.Module):
         Callers are weight-replication schemes that materialize all expert
         weights locally after load time (e.g. DWDP's composite-VA prefetch).
         """
+        self._bind_dwdp_expert_topology()
+
+        for name, tensor in weights.items():
+            self.replace_expert_tensor(name, tensor)
+
+        self._dwdp_bound = True
+
+    def bind_dwdp_partitioned_weights(self) -> None:
+        """Collapse EP metadata while retaining backend-owned weight partitions.
+
+        ROCm's IPC backend keeps the local parameter shard installed on the
+        module and supplies rank-ordered remote partitions to the MoE runner at
+        call time. This method updates only routing/dispatcher topology.
+        """
+        self._bind_dwdp_expert_topology()
+        self._dwdp_bound = True
+
+    def _bind_dwdp_expert_topology(self) -> None:
+        if self._dwdp_original_topology is None:
+            self._dwdp_original_topology = {
+                "moe_ep_size": self.moe_ep_size,
+                "moe_ep_rank": self.moe_ep_rank,
+                "_num_local_routed": self._num_local_routed,
+                "num_local_experts": self.num_local_experts,
+                "runner_num_local_experts": self.moe_runner_config.num_local_experts,
+                "dispatcher_moe_ep_size": self.dispatcher.moe_ep_size,
+                "dispatcher_moe_ep_rank": self.dispatcher.moe_ep_rank,
+                "dispatcher_num_local_experts": self.dispatcher.num_local_experts,
+                "dispatcher_num_local_routed_experts": (
+                    self.dispatcher.num_local_routed_experts
+                ),
+                "dispatcher_local_expert_mapping": self.dispatcher.local_expert_mapping,
+                "dispatcher_expert_mask_gpu": self.dispatcher.expert_mask_gpu,
+            }
         self.moe_ep_size = 1
         self.moe_ep_rank = 0
         self._num_local_routed = self._num_global_routed
@@ -471,10 +506,29 @@ class FusedMoE(torch.nn.Module):
         self.dispatcher.local_expert_mapping = None
         self.dispatcher.expert_mask_gpu = None
 
-        for name, tensor in weights.items():
-            self.replace_expert_tensor(name, tensor)
-
-        self._dwdp_bound = True
+    def unbind_dwdp_weights(self) -> None:
+        if not self._dwdp_bound:
+            return
+        state = self._dwdp_original_topology
+        if state is None:
+            raise RuntimeError("DWDP topology state was not captured before binding")
+        self.moe_ep_size = state["moe_ep_size"]
+        self.moe_ep_rank = state["moe_ep_rank"]
+        self._num_local_routed = state["_num_local_routed"]
+        self.num_local_experts = state["num_local_experts"]
+        self.moe_runner_config.num_local_experts = state["runner_num_local_experts"]
+        self.dispatcher.moe_ep_size = state["dispatcher_moe_ep_size"]
+        self.dispatcher.moe_ep_rank = state["dispatcher_moe_ep_rank"]
+        self.dispatcher.num_local_experts = state["dispatcher_num_local_experts"]
+        self.dispatcher.num_local_routed_experts = state[
+            "dispatcher_num_local_routed_experts"
+        ]
+        self.dispatcher.local_expert_mapping = state[
+            "dispatcher_local_expert_mapping"
+        ]
+        self.dispatcher.expert_mask_gpu = state["dispatcher_expert_mask_gpu"]
+        self._dwdp_original_topology = None
+        self._dwdp_bound = False
 
     def named_per_expert_tensors(
         self, num_local_experts: int
@@ -1411,6 +1465,11 @@ class FusedMoE(torch.nn.Module):
 
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is None:
+                raise RuntimeError(
+                    "FusedMoE is still bound to DWDP weights, but the global "
+                    "DWDP manager has already been cleared"
+                )
             dwdp_mgr.wait_prefetch(self.layer_id)
 
         dispatch_output = self.dispatcher.dispatch(

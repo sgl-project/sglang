@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import functools
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -43,13 +43,20 @@ class AiterQuantType(str, Enum):
     PER_1X32 = "per_1x32"
 
 
+AiterWeightTensor = Union[
+    torch.Tensor,
+    List[torch.Tensor],
+    Tuple[torch.Tensor, ...],
+]
+
+
 @dataclass
 class AiterMoeQuantInfo(MoeQuantInfo):
-    w13_weight: torch.Tensor
-    w2_weight: torch.Tensor
+    w13_weight: AiterWeightTensor
+    w2_weight: AiterWeightTensor
     quant_type: AiterQuantType = AiterQuantType.NONE
-    w13_scale: Optional[torch.Tensor] = None
-    w2_scale: Optional[torch.Tensor] = None
+    w13_scale: Optional[AiterWeightTensor] = None
+    w2_scale: Optional[AiterWeightTensor] = None
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     b13: Optional[torch.Tensor] = None
@@ -119,6 +126,56 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+def _normalize_dwdp_scale_partition(scale: torch.Tensor) -> torch.Tensor:
+    # MXFP4/MXFP8 E8M0 scales use Aiter's flattened shuffled matrix layout.
+    # Conventional FP8 keeps its FP32 [experts, N/128, K/128] block layout.
+    if scale.ndim > 2 and scale.element_size() == 1:
+        return scale.reshape(-1, scale.shape[-1]).contiguous()
+    return scale.contiguous()
+
+
+def _resolve_dwdp_partitioned_quant_info(
+    config: MoeRunnerConfig,
+    quant_info: AiterMoeQuantInfo,
+) -> AiterMoeQuantInfo:
+    from sglang.srt.runtime_context import get_global_dwdp_manager
+
+    manager = get_global_dwdp_manager()
+    if manager is None or getattr(manager, "weight_backend", None) != "ipc":
+        return quant_info
+    if config.layer_id is None:
+        raise RuntimeError("Aiter DWDP IPC execution requires a layer_id")
+
+    layer_idx = int(config.layer_id)
+    w13 = manager.get_partition_view(
+        layer_idx, "w13_weight", quant_info.w13_weight
+    ).tensors
+    w2 = manager.get_partition_view(
+        layer_idx, "w2_weight", quant_info.w2_weight
+    ).tensors
+
+    w13_scale = quant_info.w13_scale
+    if isinstance(w13_scale, torch.Tensor):
+        name = manager.find_partitioned_name(layer_idx, w13_scale)
+        w13_scale = manager.get_partition_view(layer_idx, name).tensors
+        w13_scale = tuple(_normalize_dwdp_scale_partition(scale) for scale in w13_scale)
+
+    w2_scale = quant_info.w2_scale
+    if isinstance(w2_scale, torch.Tensor):
+        name = manager.find_partitioned_name(layer_idx, w2_scale)
+        w2_scale = manager.get_partition_view(layer_idx, name).tensors
+        w2_scale = tuple(_normalize_dwdp_scale_partition(scale) for scale in w2_scale)
+
+    return replace(
+        quant_info,
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+        expert_mask=None,
+    )
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,
@@ -127,13 +184,6 @@ class AiterRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> AiterRunnerOutput:
-        if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
-            raise NotImplementedError(
-                "no_combine=True requested but the installed aiter.fused_moe does "
-                "not accept a `no_combine` kwarg. Install an aiter build that "
-                "supports fused_moe no_combine output."
-            )
-
         if runner_input.hidden_states.shape[0] == 0:
             if self.config.no_combine:
                 topk = runner_input.topk_ids.shape[-1]
@@ -144,6 +194,21 @@ class AiterRunnerCore(MoeRunnerCore):
                     )
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+
+        quant_info = _resolve_dwdp_partitioned_quant_info(self.config, quant_info)
+        is_multi_b = isinstance(quant_info.w13_weight, (list, tuple))
+        if is_multi_b != isinstance(quant_info.w2_weight, (list, tuple)):
+            raise TypeError("Aiter W1 and W2 must both use multi-B partitions")
+        if (
+            self.config.no_combine
+            and not is_multi_b
+            and not _aiter_fused_moe_supports_no_combine()
+        ):
+            raise NotImplementedError(
+                "no_combine=True requested but the installed aiter.fused_moe does "
+                "not accept a `no_combine` kwarg. Install an aiter build that "
+                "supports fused_moe no_combine output."
+            )
 
         from aiter.fused_moe import fused_moe
 
@@ -183,16 +248,12 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
-        output = fused_moe(
+        common_kwargs = dict(
             hidden_states=runner_input.hidden_states,
-            w1=quant_info.w13_weight,
-            w2=quant_info.w2_weight,
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
             activation=_aiter_activation(self.config.activation),
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
             a2_scale=quant_info.a2_scale,
             bias1=quant_info.b13,
@@ -203,6 +264,24 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
+        if is_multi_b:
+            from aiter.fused_moe import fused_moe_multi_b
+
+            output = fused_moe_multi_b(
+                w1_partitions=quant_info.w13_weight,
+                w2_partitions=quant_info.w2_weight,
+                w1_scale_partitions=quant_info.w13_scale,
+                w2_scale_partitions=quant_info.w2_scale,
+                **common_kwargs,
+            )
+        else:
+            output = fused_moe(
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                **common_kwargs,
+            )
         return AiterRunnerOutput(hidden_states=output)
 
     @property

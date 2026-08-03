@@ -1,0 +1,113 @@
+---
+title: Distributed Weight Data Parallelism
+---
+
+Distributed Weight Data Parallelism (DWDP) keeps each data-parallel rank's
+tokens local and asynchronously prefetches remote MoE expert weights. Unlike
+expert parallelism, the steady-state MoE forward has no token all-to-all or
+cross-rank output reduction.
+
+DWDP is intended for long-prefill workloads where expert-weight transfers can
+overlap the preceding layer's compute. PD-disaggregated prefill is the
+recommended deployment; standalone decode must fetch remote weights every
+step and is usually slower than EP.
+
+## ROCm backends
+
+ROCm provides two selectable weight backends:
+
+- `vmm`: HIP virtual-memory allocations are exported as POSIX file
+  descriptors and mapped into one contiguous full-expert virtual tensor. This
+  reuses the normal single-tensor MoE kernels.
+- `ipc`: PyTorch HIP IPC opens peer allocations and Aiter consumes a
+  rank-ordered list of weight and scale partitions through its multi-B kernel.
+- `auto`: selects IPC on ROCm. HIP VMM remains an explicit experimental
+  backend while ROCm's production-size generic-allocation limits are being
+  resolved.
+
+Use `--dwdp-weight-backend auto|vmm|ipc` to select a backend explicitly.
+
+Both backends use two ping-pong staging slots. On supported ROCm builds, SGLang
+submits peer transfers through pair-specific HSA SDMA engines. Set
+`SGLANG_DWDP_DISABLE_HSA_COPY=1` to use the per-peer HIP stream `copy_()`
+fallback for debugging.
+
+## Requirements
+
+The initial ROCm implementation requires:
+
+- one XGMI-connected node;
+- AMD Instinct MI355X (`gfx950`);
+- 2, 4, or 8 ranks with `--dwdp-size` equal to `--tp-size`;
+- routed experts evenly divisible by the DWDP size;
+- eager execution;
+- balanced free VRAM across all participating GPUs;
+- unlimited locked memory for UCX/NIXL PD deployments;
+- an Aiter build with `fused_moe_multi_b` when using the IPC backend.
+
+Pipeline parallelism, EPLB, speculative decoding, two-batch overlap, CUDA/HIP
+graphs, cross-node DWDP, and overlapping expert ownership are not supported.
+The IPC backend supports MXFP4/MXFP8 one-byte scale partitions; use VMM for
+conventional FP8 scales.
+
+## Launch
+
+ROCm PD prefill:
+
+```bash
+export SGLANG_USE_AITER=1
+export GPU_ARCHS=gfx950
+
+python3 -m sglang.launch_server \
+  --model-path /models/DeepSeek-R1-0528-MXFP4-th \
+  --tp-size 4 \
+  --dwdp-size 4 \
+  --dwdp-weight-backend auto \
+  --disaggregation-mode prefill \
+  --chunked-prefill-size 131072 \
+  --attention-backend aiter
+```
+
+Standalone validation:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /models/DeepSeek-R1-0528-MXFP4-th \
+  --tp-size 4 \
+  --dwdp-size 4 \
+  --dwdp-weight-backend auto \
+  --attention-backend aiter
+```
+
+When DWDP is enabled, SGLang configures DP attention and DP LM head, uses dense
+TP size 1, disables MoE all-to-all, skips scheduler all-gathers and idle
+forwards, and disables graph capture.
+
+`--chunked-prefill-size` is a global DP budget and is divided by
+`--dwdp-size`. Weight prefetch has a mostly fixed cost per chunk, so ROCm DWDP
+needs a large per-rank chunk to amortize transfers. For example, use 131072
+with DWDP4 or 262144 with DWDP8 to target 32768 tokens per rank, subject to
+available KV-cache memory.
+
+On 8 MI355X GPUs with DeepSeek-R1 MXFP4, graph capture disabled, 64 prompts,
+and concurrency 32, a 32768 per-rank chunk measured 57,706.92 input tokens/s
+for IPC DWDP versus 35,258.01 for DEP (`1.637x`). A global chunk of 32768
+becomes only 4096 tokens per rank at DWDP8 and was substantially slower than
+DEP, so it is not a suitable long-prefill production setting. With the
+optimized chunk, IPC/DEP was `0.579x`, `0.529x`, `1.209x`, and `1.637x` at
+4K, 8K, 16K, and 32K input lengths respectively. Use DWDP for long-prefill
+traffic; DEP remains preferable for this model below the 8K-16K crossover.
+
+## Supported model paths
+
+- GPT-OSS MXFP4 uses its existing DWDP-local routing path.
+- MiMo-V2 uses the generic FusedMoE integration, but conventional FP8 requires
+  the experimental VMM backend until Aiter gains a separate FP32-scale
+  multi-B kernel.
+- DeepSeek-R1 MXFP4 supports the 256 routed experts plus one fused shared
+  expert. The shared expert is owned by the final logical partition, yielding
+  layouts such as `[64, 64, 64, 65]`.
+
+Always compare deterministic logits and task accuracy against the same model,
+quantization, GPU count, graph mode, and chunking under DEP/EP before using a
+new model or quantization scheme in production.

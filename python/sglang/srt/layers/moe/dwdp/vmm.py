@@ -17,17 +17,7 @@ from sglang.srt.distributed.device_communicators.vmm_utils import (
 
 logger = logging.getLogger(__name__)
 
-
-def align_up(value: int, alignment: int) -> int:
-    if alignment <= 0 or (alignment & (alignment - 1)) != 0:
-        raise ValueError(f"alignment must be a positive power of 2, got {alignment}")
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def align_down(value: int, alignment: int) -> int:
-    if alignment <= 0 or (alignment & (alignment - 1)) != 0:
-        raise ValueError(f"alignment must be a positive power of 2, got {alignment}")
-    return (value // alignment) * alignment
+ACCESS_IS_ALLOCATION_SCOPED = False
 
 
 def _make_prop(device_id: int, handle_types: int) -> cuda.CUmemAllocationProp:

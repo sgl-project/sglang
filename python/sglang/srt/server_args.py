@@ -1050,6 +1050,17 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    dwdp_weight_backend: A[
+        str,
+        Arg(
+            help="Expert-weight backend for DWDP. 'vmm' uses a composite "
+            "virtual address, 'ipc' uses ROCm HIP IPC with Aiter multi-B, "
+            "and 'auto' selects IPC on ROCm or VMM on CUDA.",
+            choices=["auto", "vmm", "ipc"],
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = "auto"
     dcp_comm_backend: A[
         str,
         Arg(
@@ -6337,6 +6348,16 @@ class ServerArgs:
         assert (
             not self.enable_two_batch_overlap
         ), "DWDP's prefetch event protocol does not support two-batch overlap"
+        assert is_cuda() or is_hip(), "DWDP is supported only on CUDA or ROCm"
+        if is_hip():
+            assert (
+                self.dwdp_size in (2, 4, 8)
+            ), "ROCm DWDP requires dwdp_size in {2, 4, 8}"
+            assert self.nnodes == 1, "ROCm DWDP currently requires a single node"
+        else:
+            assert (
+                self.dwdp_weight_backend != "ipc"
+            ), "DWDP IPC/multi-B backend is only supported on ROCm"
 
         if self.disaggregation_mode == "null":
             logger.warning(
@@ -6361,6 +6382,7 @@ class ServerArgs:
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, "
+            f"weight_backend={self.dwdp_weight_backend}, "
             f"auto-forced dp_size={self.dp_size}, moe_ep_size={self.moe_ep_size}, "
             f"moe_dense_tp_size=1, moe_a2a_backend=none, "
             f"dp_attention_local_control_broadcast=True, "

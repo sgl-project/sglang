@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import bisect
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -26,6 +26,8 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         transport=None,
+        copy_engine: Any = None,
+        peer_device_ids: Optional[Dict[int, int]] = None,
     ) -> None:
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views
@@ -37,9 +39,12 @@ class DWDPWeightManager:
         self._dwdp_size = dwdp_size
         # transport handles underpin the VA mappings; must outlive this manager
         self._transport = transport
+        self._copy_engine = copy_engine
+        self._peer_device_ids = dict(peer_device_ids or {})
 
         device = torch.device("cuda", weight_buffer.device_id)
         self._copy_stream = torch.cuda.Stream(device=device)
+        self._copy_tickets: List[List[int]] = [[], []]
 
         self._prefetch_events: List[torch.cuda.Event] = [
             torch.cuda.Event() for _ in range(2)
@@ -77,15 +82,27 @@ class DWDPWeightManager:
     def prefetch_layer(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
 
-        with torch.cuda.stream(self._copy_stream):
-            # WAR: wait for compute to finish reading this slot before overwriting
-            self._copy_stream.wait_event(self._consume_events[buf_idx])
+        if self._copy_engine is not None:
+            # HSA queues cannot consume a HIP event. Host-wait before reusing
+            # the slot; graph capture is disabled for DWDP.
+            self._consume_events[buf_idx].synchronize()
+            if self._copy_tickets[buf_idx]:
+                raise RuntimeError(
+                    f"DWDP copy slot {buf_idx} still has outstanding HSA tickets"
+                )
+            self._prefetch_layer_per_slice(layer_idx, buf_idx=buf_idx)
+        else:
+            with torch.cuda.stream(self._copy_stream):
+                # WAR: wait for compute to finish reading this slot before overwriting
+                self._copy_stream.wait_event(self._consume_events[buf_idx])
 
-            self._prefetch_layer_per_slice(layer_idx)
+                self._prefetch_layer_per_slice(layer_idx)
 
-            self._prefetch_events[buf_idx].record(self._copy_stream)
+                self._prefetch_events[buf_idx].record(self._copy_stream)
 
-    def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
+    def _prefetch_layer_per_slice(
+        self, layer_idx: int, buf_idx: Optional[int] = None
+    ) -> None:
         for name in self._weight_names:
             remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
             for dst_slice, expert_start, expert_end in remote_slices:
@@ -100,14 +117,63 @@ class DWDPWeightManager:
 
                     peer_key = (peer_rank, layer_idx, name)
                     src = self._peer_views[peer_key]
-                    dst_slice[dst_offset : dst_offset + n].copy_(
-                        src[local_offset : local_offset + n]
-                    )
+                    destination = dst_slice[dst_offset : dst_offset + n]
+                    source = src[local_offset : local_offset + n]
+                    if self._copy_engine is None:
+                        destination.copy_(source)
+                    else:
+                        assert buf_idx is not None
+                        self._copy_tickets[buf_idx].append(
+                            self._copy_engine.submit(
+                                destination,
+                                source,
+                                destination_device=self._weight_buffer.device_id,
+                                source_device=self._peer_device_ids.get(
+                                    peer_rank,
+                                    source.device.index,
+                                ),
+                            )
+                        )
                     dst_offset += n
                     cursor = chunk_end
 
+    def _disable_hsa_copy_engine(self, completed_slot: int) -> None:
+        engine = self._copy_engine
+        if engine is None:
+            return
+        self._copy_tickets[completed_slot].clear()
+        for slot_idx, tickets in enumerate(self._copy_tickets):
+            if slot_idx == completed_slot or not tickets:
+                continue
+            try:
+                engine.wait_all(tickets)
+            except Exception:
+                logger.exception(
+                    "Failed while draining HSA DWDP VMM slot %s during fallback",
+                    slot_idx,
+                )
+            finally:
+                tickets.clear()
+        self._copy_engine = None
+
     def wait_prefetch(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        if self._copy_engine is not None:
+            try:
+                self._copy_engine.wait_all(self._copy_tickets[buf_idx])
+            except Exception:
+                logger.exception(
+                    "HSA DWDP prefetch failed for layer %s; retrying with HIP copy_",
+                    layer_idx,
+                )
+                self._disable_hsa_copy_engine(buf_idx)
+                with torch.cuda.stream(self._copy_stream):
+                    self._prefetch_layer_per_slice(layer_idx)
+                    self._prefetch_events[buf_idx].record(self._copy_stream)
+            else:
+                return
+            finally:
+                self._copy_tickets[buf_idx].clear()
         device = torch.device("cuda", self._weight_buffer.device_id)
         compute_stream = torch.cuda.current_stream(device)
         compute_stream.wait_event(self._prefetch_events[buf_idx])
@@ -133,6 +199,14 @@ class DWDPWeightManager:
             self.prefetch_layer(self._moe_layer_indices[1])
 
     def release(self) -> None:
+        if self._copy_engine is not None:
+            for tickets in self._copy_tickets:
+                try:
+                    self._copy_engine.wait_all(tickets)
+                except Exception:
+                    logger.exception("Failed while draining HSA tickets during release")
+                finally:
+                    tickets.clear()
         if self._weight_buffer is not None:
             self._weight_buffer.release()
             self._weight_buffer = None

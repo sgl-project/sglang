@@ -362,6 +362,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def get_dwdp_tensor_schema(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.dwdp.tensor_schema import (
+            DwdpTensorSchema,
+            existing_tensor_names,
+        )
+
+        partitioned = existing_tensor_names(
+            layer,
+            (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            ),
+        )
+        replicated = existing_tensor_names(
+            layer,
+            (
+                "w13_weight_bias",
+                "w2_weight_bias",
+                "gemm1_alpha",
+                "gemm1_beta",
+                "gemm1_clamp_limit",
+            ),
+        )
+        schema = DwdpTensorSchema(
+            partitioned=partitioned,
+            replicated=replicated,
+        )
+        schema.validate(layer)
+        return schema
+
+    def get_dwdp_tensor(self, layer: torch.nn.Module, name: str) -> torch.Tensor:
+        tensor = super().get_dwdp_tensor(layer, name)
+        if name in ("w13_weight_scale", "w2_weight_scale") and tensor.ndim == 2:
+            if tensor.shape[0] % self.num_experts != 0:
+                raise RuntimeError(
+                    f"Cannot restore expert axis for {name} with shape "
+                    f"{tuple(tensor.shape)} and {self.num_experts} experts"
+                )
+            tensor = tensor.view(self.num_experts, -1, tensor.shape[-1])
+        return tensor
+
     def create_weights(
         self,
         layer: torch.nn.Module,

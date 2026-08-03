@@ -101,6 +101,24 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
+    def get_dwdp_tensor_schema(self, layer: torch.nn.Module):
+        """Return the explicit expert-tensor contract used by DWDP backends.
+
+        Quantization methods with partitioned scales or non-standard tensor
+        names must override this method. The default covers unquantized MoE.
+        """
+        from sglang.srt.layers.moe.dwdp.tensor_schema import DwdpTensorSchema
+
+        schema = DwdpTensorSchema()
+        schema.validate(layer)
+        return schema
+
+    def get_dwdp_tensor(self, layer: torch.nn.Module, name: str) -> torch.Tensor:
+        """Return an expert-major view used by DWDP backends."""
+
+        value = getattr(layer, name)
+        return value.data if isinstance(value, torch.nn.Parameter) else value
+
     @abstractmethod
     def apply(
         self,

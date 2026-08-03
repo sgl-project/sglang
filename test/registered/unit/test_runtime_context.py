@@ -18,10 +18,12 @@ from sglang.srt.runtime_context import (
     _FlagGroupBase,
     get_context,
     get_flags,
+    get_global_dwdp_manager,
     get_parallel,
     get_schedule,
     get_server_args,
     reset_context,
+    set_global_dwdp_manager,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +72,19 @@ class TestRuntimeContextSingletons(CustomTestCase):
         self.assertIsInstance(get_parallel(), ParallelContext)
         self.assertIsInstance(get_context(), RuntimeContext)
         self.assertIs(get_context().parallel, get_parallel())
+
+    def test_reset_context_cleans_up_dwdp_manager(self):
+        class FakeManager:
+            cleanup_calls = 0
+
+            def cleanup(self):
+                self.cleanup_calls += 1
+
+        manager = FakeManager()
+        set_global_dwdp_manager(manager)
+        reset_context()
+        self.assertEqual(manager.cleanup_calls, 1)
+        self.assertIsNone(get_global_dwdp_manager())
 
 
 class _IsolatedOverrides(CustomTestCase):

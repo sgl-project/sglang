@@ -85,8 +85,6 @@ def _copy_local_weights_to_handles(
         unmap_va(temp_va, phys_size)
         free_va(temp_va, phys_size)
 
-        param.untyped_storage().resize_(0)
-
         handles[(layer_idx, name)] = handle
         sizes[(layer_idx, name)] = phys_size
 
@@ -94,8 +92,6 @@ def _copy_local_weights_to_handles(
             f"Phase 1: layer={layer_idx}, name={name}, "
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
-
-    torch.cuda.empty_cache()
 
     return handles, sizes
 
@@ -236,3 +232,7 @@ class DWDPTransport:
         self._imported_handles.clear()
 
         self._peer_views.clear()
+        if self._handle_set is not None:
+            for handle in self._handle_set.handles.values():
+                release_handle(handle)
+            self._handle_set = None
