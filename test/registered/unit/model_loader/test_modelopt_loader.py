@@ -525,7 +525,9 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
-    def test_inherited_draft_modelopt_fp4_preserves_fp8_source(self):
+    def test_inherited_draft_modelopt_fp4_accepts_fp8_checkpoint(self):
+        # ServerArgs has already copied the target's modelopt_fp4 request to the
+        # draft. Compatible FP8 metadata must not replace it with plain fp8.
         self.model_config.quantization = "modelopt_fp4"
         self.model_config.is_draft_model = True
         self.model_config.is_draft_quantization_explicit = False
@@ -543,14 +545,20 @@ class TestParseQuantHfConfig(CustomTestCase):
         ):
             self.model_config._verify_quantization()
 
+        # Keeping modelopt_fp4 selects online FP8-to-NVFP4 conversion for
+        # eligible MoE experts; this test stops at quantization-method routing.
         self.assertEqual(self.model_config.quantization, "modelopt_fp4")
 
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
     def test_draft_modelopt_fp4_uses_checkpoint_exclusions(self):
         cases = (
+            # Excluded MTP experts are unpacked, so an explicit draft request
+            # replaces the serialized config with online weight quantization.
             ("explicit embedded draft", True, ["mtp.layers.0*"], False),
+            # MTP experts present in the serialized checkpoint stay serialized.
             ("explicit serialized draft", True, [], True),
+            # Inherited target quantization does not override draft exclusions.
             ("inherited embedded draft", False, ["mtp.layers.0*"], True),
         )
         for name, is_explicit, ignored_layers, is_serialized in cases:
@@ -580,10 +588,12 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
             _is_already_quantized=lambda: False,
         )
 
+        # Online conversion runs through the regular per-layer weight loaders.
         online_loader = get_model_loader(LoadConfig(), model_config)
         self.assertIsInstance(online_loader, DefaultModelLoader)
         self.assertNotIsInstance(online_loader, ModelOptModelLoader)
 
+        # Explicit ModelOpt checkpoint/export workflows still need its loader.
         for option in (
             "modelopt_checkpoint_restore_path",
             "modelopt_checkpoint_save_path",

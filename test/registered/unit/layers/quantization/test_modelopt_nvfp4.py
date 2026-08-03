@@ -108,11 +108,15 @@ class TestModelOptNvfp4(CustomTestCase):
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
         return_value=True,
     )
-    def test_activation_scheme_matches_quantization_interface(self, _):
+    def test_modelopt_fp4_per_token_activation_contract(self, _):
+        # Serialized ModelOpt FP4 retains the existing environment-controlled
+        # per-token activation path.
         serialized_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             group_size=16,
         )
+        # Online modelopt_fp4 always uses per-tensor activation scaling, even
+        # when the serialized-checkpoint environment switch is enabled.
         online_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=False,
             group_size=16,
@@ -120,6 +124,7 @@ class TestModelOptNvfp4(CustomTestCase):
 
         self.assertTrue(serialized_config.use_per_token_activation)
         self.assertFalse(online_config.use_per_token_activation)
+        # nvfp4_online is the public interface for online per-token scaling.
         with self.assertRaisesRegex(ValueError, "Use nvfp4_online"):
             ModelOptFp4Config(
                 is_checkpoint_nvfp4_serialized=False,
