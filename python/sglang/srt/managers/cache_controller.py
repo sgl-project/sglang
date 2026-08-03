@@ -1003,7 +1003,7 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
             transfer
-            for transfer in getattr(operation, "pool_transfers", [])
+            for transfer in getattr(operation, "pool_transfers", None) or []
             if transfer.indices_from_pool == PoolName.KV
         ]
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
