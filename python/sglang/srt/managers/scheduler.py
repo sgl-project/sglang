@@ -1141,7 +1141,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.max_prefill_bs: int = 0
+        self.max_prefill_bs: float = 0.0
         if get_schedule().enable_prefill_delayer:
             if get_disagg().disaggregation_mode == "decode":
                 logger.info(
@@ -3010,6 +3010,11 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
+            # Decay the max-prefill-bs high-watermark once per pass so one
+            # unusually large admission burst does not permanently raise the
+            # slot_condition bar in the delayer (0.998/pass ~= half-life of
+            # ~350 forward passes).
+            self.max_prefill_bs *= 0.998
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -3104,7 +3109,7 @@ class Scheduler(
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            max_prefill_bs=self.max_prefill_bs,
+            max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
