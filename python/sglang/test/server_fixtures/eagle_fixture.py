@@ -4,7 +4,6 @@ import time
 
 import requests
 
-from sglang.srt.utils.common import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -12,6 +11,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 PROMPTS = [
@@ -53,7 +53,7 @@ class EagleServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def send_request(self):
         time.sleep(random.uniform(0, 2))

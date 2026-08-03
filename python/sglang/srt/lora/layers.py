@@ -66,10 +66,13 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    # Weight slicing derives the shard rank from the wrapped base layer
+    # (base_layer.tp_rank): under DP attention, attention layers are built
+    # on the attn-TP group, so the outer/global TP rank would overshoot.
+    def slice_lora_a_weights(self, A: torch.Tensor):
         pass
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         pass
 
 
@@ -234,13 +237,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         return base_output
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         # LoRA A weights (rank, vocab_size) are kept unsharded.
         # Each rank does a full embedding lookup; the result is complete
         # on every rank and added to the already all-reduced base output.
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         # LoRA B weights (embedding_dim, rank) are kept unsharded.
         # The base embedding output is all-reduced (full embedding_dim),
         # so LoRA B must also produce full embedding_dim.
@@ -414,12 +417,12 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         """Reset the lm_head pass index after all passes are done."""
         self.lora_backend._lm_head_pass_idx = None
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         # LoRA A weights (rank, hidden_size) are kept unsharded.
         # Each rank receives full hidden_states, so A operates on full input.
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         # lm_head is column-parallel: each rank produces vocab_size/tp_size (shard_vocab_size)
         # logits.  LoRA B (vocab_size, rank) must be sliced along the vocab
         # dimension to match the sharded base output.
@@ -491,13 +494,14 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
+        local_tp_rank = self.base_layer.tp_rank
         shard_size = self.base_layer.output_partition_sizes[0]
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
+        start_idx = local_tp_rank * shard_size
+        end_idx = (local_tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
 
@@ -587,16 +591,17 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             )
         return lora_output
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
+        local_tp_rank = self.base_layer.tp_rank
         partition_sizes = self.base_layer.output_partition_sizes
         output_sizes = self.base_layer.output_sizes
         slices = []
         offset = 0
         for full_size, part_size in zip(output_sizes, partition_sizes):
-            start_idx = tp_rank * part_size
+            start_idx = local_tp_rank * part_size
             end_idx = start_idx + part_size
             slices.append(B[offset + start_idx : offset + end_idx, :])
             offset += full_size
@@ -613,8 +618,9 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
     are head-partitioned uniformly. LoRA-A stays unsharded (inherited).
     """
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         bl = self.base_layer
+        tp_rank = bl.tp_rank
         hd, nkv, nh, dr, tp = (
             bl.inkling_head_dim,
             bl.inkling_num_kv_heads,
@@ -692,19 +698,20 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
         return lora_output
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+    def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         base_layer = self.base_layer
         q_proj_shard_size = base_layer.q_proj_shard_size
         kv_proj_shard_size = base_layer.kv_proj_shard_size
         num_kv_head_replicas = base_layer.num_kv_head_replicas
+        local_tp_rank = base_layer.tp_rank
 
-        q_start_idx = q_proj_shard_size * tp_rank
+        q_start_idx = q_proj_shard_size * local_tp_rank
         q_end_idx = q_start_idx + q_proj_shard_size
 
-        kv_shard_id = tp_rank // num_kv_head_replicas
+        kv_shard_id = local_tp_rank // num_kv_head_replicas
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
@@ -787,13 +794,20 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             and not should_skip_mlp_all_reduce()
         )
 
+        # Match the base layer's reduce group: layers built with
+        # use_dp_attention_reduce are sharded over the attn-TP group, so
+        # reducing over the global TP group would mix tokens across DP groups.
+        if self.base_layer.use_dp_attention_reduce:
+            all_reduce = get_parallel().attn_tp_group.all_reduce
+        else:
+            all_reduce = tensor_model_parallel_all_reduce
         lora_active = self.lora_active
         if lora_active and should_reduce:
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
-            lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
+            output_ = all_reduce(output_parallel)
+            lora_a_output = all_reduce(lora_a_output)
             output_ = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
@@ -805,21 +819,22 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             if lora_active:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
-                output_ = tensor_model_parallel_all_reduce(output_parallel)
+                output_ = all_reduce(output_parallel)
             else:
                 output_ = output_parallel
 
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output_, output_bias
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
+        local_tp_rank = self.base_layer.tp_rank
         shard_size = self.base_layer.input_size_per_partition
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
+        start_idx = local_tp_rank * shard_size
+        end_idx = (local_tp_rank + 1) * shard_size
         A = A[:, start_idx:end_idx].contiguous()
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         return B
 
 
@@ -906,10 +921,10 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         return B
 
 
@@ -1166,10 +1181,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         return final_hidden_states
 
-    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+    def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 
-    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+    def slice_lora_b_weights(self, B: torch.Tensor):
         return B
 
     def slice_moe_lora_a_weights(

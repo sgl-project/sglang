@@ -2,25 +2,16 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_context, get_exec, reset_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
-    """The disable decision is a load-time resolution: it writes through to
-    the published config via declare_load_time_override."""
-
-    def setUp(self):
-        self._saved_server_args = get_context()._server_args
-
-    def tearDown(self):
-        if self._saved_server_args is None:
-            reset_context()
-        else:
-            get_context().set_server_args(self._saved_server_args)
+    """The disable decision is a load-time resolution: it lands on the
+    published config bag via declare_load_time_override (bag-only; the
+    ServerArgs instance stays pristine)."""
 
     def _make_model(self, n_shared_experts=1):
         return SimpleNamespace(
@@ -29,10 +20,11 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         )
 
     def _publish(self, enforce):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.enforce_shared_experts_fusion = enforce
-        get_context().set_server_args(server_args)
-        return server_args
+        override = get_context().override_server_args(
+            enforce_shared_experts_fusion=enforce
+        )
+        override.install()
+        self.addCleanup(override.restore)
 
     def test_disables_shared_fusion_without_enforce(self):
         self._publish(enforce=False)
@@ -41,9 +33,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
 
         self.assertEqual(model.num_fused_shared_experts, 0)
-        # The disable decision is published via declare_load_time_override, which
-        # writes to the runtime-config namespace bag (get_exec().moe), not to the
-        # ServerArgs record.
+        # post-init declaration lands on the published config bag
         self.assertTrue(get_exec().moe.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):

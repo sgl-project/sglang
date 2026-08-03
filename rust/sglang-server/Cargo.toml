@@ -24,6 +24,7 @@ futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -35,6 +36,12 @@ axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together.
 dynamo-tokenizers = "1.7.0"
+# Keep the HTTP adapter on Dynamo's public OpenAI types, renderer, and parsers.
+# `dynamo-llm` stays excluded because it pulls the full runtime just to reuse
+# small service helpers.
+dynamo-parsers = "7.0.1"
+dynamo-protocols = "5.1.0"
+dynamo-renderer = "5.0.0"
 flume = "0.12.0"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
@@ -44,3 +51,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
+
+[dev-dependencies]
+# `Router::oneshot` for handler-level router tests.
+tower = { version = "0.5", features = ["util"] }
