@@ -1417,7 +1417,7 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8"],
             "petit_nvfp4": ["modelopt"],
@@ -1459,15 +1459,8 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-            # modelopt_fp4 can requantize FP8 MoE weights while preserving FP8 elsewhere.
-            preserve_online_modelopt_fp4 = (
-                self.quantization == "modelopt_fp4"
-                and quant_method == "fp8"
-                and (not self.is_draft_model or self.is_draft_quantization_explicit)
-            )
-
             # Detect which checkpoint is it
-            if not (preserve_online_draft_quantization or preserve_online_modelopt_fp4):
+            if not preserve_online_draft_quantization:
                 for _, method in QUANTIZATION_METHODS.items():
                     quantization_override = method.override_quantization_method(
                         quant_cfg, self.quantization
@@ -1482,14 +1475,10 @@ class ModelConfig:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
-                    preserve_online_draft_quantization
-                    or preserve_online_modelopt_fp4
-                    or (
-                        self.quantization in compatible_quantization_methods
-                        and quant_method
-                        in compatible_quantization_methods[self.quantization]
-                    )
+                is_compatible = preserve_online_draft_quantization or (
+                    self.quantization in compatible_quantization_methods
+                    and quant_method
+                    in compatible_quantization_methods[self.quantization]
                 )
                 if is_compatible:
                     # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if

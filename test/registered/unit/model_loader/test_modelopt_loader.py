@@ -525,10 +525,10 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
-    def test_explicit_draft_modelopt_fp4_preserves_fp8_source(self):
+    def test_inherited_draft_modelopt_fp4_preserves_fp8_source(self):
         self.model_config.quantization = "modelopt_fp4"
         self.model_config.is_draft_model = True
-        self.model_config.is_draft_quantization_explicit = True
+        self.model_config.is_draft_quantization_explicit = False
         with (
             patch.object(
                 self.model_config,
