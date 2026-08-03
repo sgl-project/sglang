@@ -71,137 +71,6 @@ class DraftProposal(msgspec.Struct, frozen=True):
     folded: bool = False
 
 
-class DsparkDraftSampler:
-    """Graph-folded draft proposal head (base logits + markov chain sampling).
-
-    Captured as a draft-graph tail hook. Handles greedy and sampling rows in
-    one pass: the per-step fused kernel (SampleStepTokens) argmaxes greedy
-    rows and Gumbel-samples the rest with in-graph philox noise (CUDAGraph
-    advances the generator per replay). Per-step sampling params live in
-    static buffers refreshed by stage_sampling_params before each replay;
-    corrected block logits are exported for the sampling accept path.
-    """
-
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
-        self.model = model
-        self.markov_head = model.markov_head
-        self.gamma = int(gamma)
-        max_bs = int(max_bs)
-        if out is not None:
-            assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
-            self.out = out
-        else:
-            self.out = torch.empty(
-                (max_bs * self.gamma,), dtype=torch.int64, device=device
-            )
-        self.confidence_fn = confidence_fn
-        self.confidence_out = (
-            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
-            if confidence_fn is not None
-            else None
-        )
-        vocab = int(model.lm_head.org_vocab_size)
-        self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
-        self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
-        self.exp_noise = torch.empty(
-            (max_bs, vocab), dtype=torch.float32, device=device
-        )
-        self.corrected_out = torch.empty(
-            (max_bs * self.gamma, vocab),
-            dtype=model.lm_head.weight.dtype,
-            device=device,
-        )
-
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Host-side refresh of the static sampling params; must run before
-        the draft graph replay that consumes them."""
-        if sampling_info is None:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
-
-    def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
-        base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
-
-        def _step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-            del step_idx
-            noise = self.exp_noise[:bs].exponential_()
-            return SampleStepTokens.execute(
-                step_logits=step_logits,
-                temperatures=self.temperatures[:bs],
-                greedy_mask=self.greedy_mask[:bs],
-                exp_noise=noise,
-            )
-
-        draft_tokens, corrected_logits = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=_step_sampler,
-        )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        self.corrected_out[: bs * self.gamma].copy_(
-            corrected_logits.reshape(bs * self.gamma, -1)
-        )
-        if self.confidence_out is not None:
-            confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_tap=confidence_tap,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-
-
-def maybe_build_draft_sampler(
-    *,
-    draft_model,
-    gamma: int,
-    max_bs: int,
-    device,
-    tp_rank: int,
-    confidence_fn=None,
-    out=None,
-) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded draft sampler (greedy + sampling rows), or
-    return None (with the reason logged) when the draft model cannot support
-    folding and the proposal must stay eager."""
-
-    def _eager(reason):
-        if tp_rank == 0:
-            logger.info("DSpark draft proposal kept eager (reason=%s).", reason)
-        return None
-
-    if gamma <= 0:
-        return _eager("gamma<=0")
-    if not hasattr(draft_model, "compute_base_logits"):
-        return _eager("no compute_base_logits")
-    if getattr(draft_model, "markov_head", None) is None:
-        return _eager("no markov head")
-    if tp_rank == 0:
-        logger.info(
-            "DSpark draft proposal (greedy + sampling) folded into the draft "
-            "cuda graph."
-        )
-    return DsparkDraftSampler(
-        model=draft_model,
-        gamma=gamma,
-        max_bs=max_bs,
-        device=device,
-        confidence_fn=confidence_fn,
-        out=out,
-    )
-
-
 def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
@@ -341,21 +210,44 @@ class DraftBlockProposer:
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph:
+        if (
+            draft_sampler is not None
+            and fwd.can_run_graph
+            and (all_greedy or draft_sampler.folded_sampling)
+        ):
             folded = True
-            draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+            if draft_sampler.folded_sampling:
+                greedy_mask = draft_sampler.greedy_mask[:bs]
+                temperatures = draft_sampler.temperatures[:bs]
                 # The sampling accept path needs the markov-corrected block
                 # logits; greedy accept only compares tokens.
-                corrected_logits=(
+                corrected_logits = (
                     None
                     if all_greedy
                     else draft_sampler.corrected_out[: bs * self.gamma].view(
                         bs, self.gamma, -1
                     )
-                ),
-                greedy_mask=draft_sampler.greedy_mask[:bs],
-                temperatures=draft_sampler.temperatures[:bs],
+                )
+            else:
+                # Greedy-only folding: the hook argmaxed every row and kept no
+                # sampling buffers, so derive the params on the fly.
+                greedy_mask = resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
+                if sampling_info is None:
+                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+                else:
+                    temperatures = (
+                        sampling_info.temperatures.view(-1)
+                        .to(torch.float32)
+                        .clamp_min(1e-5)
+                    )
+                corrected_logits = None
+            draft_block = DraftBlockResult(
+                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+                corrected_logits=corrected_logits,
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
