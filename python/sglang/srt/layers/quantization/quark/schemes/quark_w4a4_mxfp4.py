@@ -192,11 +192,8 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
-<<<<<<< HEAD
         self.use_asm = False
-=======
         self.dequantization_config = dequantization_config
->>>>>>> main
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
