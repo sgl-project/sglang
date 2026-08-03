@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 
+from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.utils.event_publisher import (
     KVEventsConfig,
     NullEventPublisher,
@@ -58,8 +59,9 @@ class LoadStat(
     """Per-scheduler runtime load snapshot.
 
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
-    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank?]`` —
-    the router decoder reads the four counts and ignores the rest.
+    num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank]`` —
+    the router decoder reads the four counts and ignores the rest. The trailing
+    field is always emitted (null when unset); array_like structs do not trim it.
     `attn_dp_rank` exists so the snapshot can be published directly through
     `ZmqEventPublisher.publish` (which stamps it); the router keys load by
     the subscriber's socket rank, not this field.
@@ -80,7 +82,7 @@ class SchedulerLoadPublisher:
     best-effort `publish_load_stat` path.
 
     Enabled on the same condition as KV-event publishing (a `kv_events_config`
-    on the attn-TP/CP-rank-0 scheduler), and binds the load port range packed
+    on the PP/attn-TP/CP-rank-0 scheduler), and binds the load port range packed
     immediately after the KV-event range (`kv_base + dp_size`). Stays a no-op
     (a `NullEventPublisher`) when disabled or when the KV config has no usable
     ZMQ endpoint.
@@ -88,8 +90,8 @@ class SchedulerLoadPublisher:
 
     kv_events_config: Optional[str]
     ps: ParallelState
-    # Number of attention-DP ranks (= the KV port range width); the load port
-    # range starts at kv_base + dp_size.
+    # Width of the KV-event port range (`server_args.dp_size`, i.e. the number
+    # of independent KV caches); the load port range starts at kv_base + dp_size.
     dp_size: int
     enable: bool = False
     publisher: Any = None
@@ -97,10 +99,19 @@ class SchedulerLoadPublisher:
     # Consecutive publish failures, reset on success (drives the periodic warn).
     _fail_count: int = 0
 
+    def _disable(self) -> None:
+        """Stay a no-op. Clears `enable` so `publish_load_stat` skips the
+        (non-trivial) load snapshot instead of computing it for a null sink."""
+        self.enable = False
+
     def __post_init__(self) -> None:
         self.publisher = NullEventPublisher()
+        # Must match SchedulerKvEventsPublisher.init_kv_events: one publisher per
+        # independent KV cache. Without the pp_rank gate every PP stage would
+        # bind the same load port.
         self.enable = bool(
             self.kv_events_config
+            and self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
         )
@@ -111,18 +122,34 @@ class SchedulerLoadPublisher:
         except Exception:
             # Malformed config — the KV publisher init would have failed too;
             # stay a no-op rather than raising at scheduler startup.
-            return
+            return self._disable()
         if cfg.publisher == "null" or not cfg.endpoint:
-            return
+            return self._disable()
+        # Only tcp:// endpoints carry a port to offset. inproc:// and ipc:// are
+        # valid KV-event endpoints, but deriving a distinct load endpoint from
+        # them is not defined, and offset_endpoint_port raises on ipc:// — so
+        # decline rather than take down scheduler startup over a load socket.
+        if not cfg.endpoint.startswith("tcp://"):
+            logger.info(
+                "load-publisher disabled: --kv-events-config endpoint %r is not "
+                "tcp://, so no separate load port can be derived",
+                cfg.endpoint,
+            )
+            return self._disable()
         load_endpoint = ZmqEventPublisher.offset_endpoint_port(
             cfg.endpoint, self.dp_size
         )
         if load_endpoint is None:
-            return
+            return self._disable()
         # Dedicated load socket: own port, replay disabled, unbuffered (load is
-        # a gauge, not a replayable delta).
+        # a gauge, not a replayable delta). The rank must be selected the same
+        # way the KV publisher selects it: in pure DP every worker has
+        # attn_dp_rank == 0, so using it raw would collide every worker on one
+        # port (or silently merge their load onto rank 0).
         self.publisher = ZmqEventPublisher(
-            self.ps.attn_dp_rank,
+            select_kv_publisher_dp_rank(
+                self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+            ),
             endpoint=load_endpoint,
             replay_endpoint=None,
             buffer_steps=0,
