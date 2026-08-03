@@ -1667,6 +1667,56 @@ class TestHandleCrashDumpEnv(CustomTestCase):
             )
 
 
+class TestHandleModelSourcePaths(CustomTestCase):
+    def _run_handler(
+        self,
+        *,
+        model_path="local-model",
+        tokenizer_path=None,
+        speculative_draft_model_path=None,
+    ):
+        server_args = SimpleNamespace(
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
+            speculative_draft_model_path=speculative_draft_model_path,
+        )
+        with patch.object(
+            server_args_module.ObjectStorageModel,
+            "download_and_get_path",
+        ) as mock_download:
+            ServerArgs._handle_model_source_paths(server_args)
+        return mock_download
+
+    def test_downloads_explicit_draft_object_storage_metadata(self):
+        mock_download = self._run_handler(
+            speculative_draft_model_path="s3://bucket/draft-model"
+        )
+
+        mock_download.assert_called_once_with("s3://bucket/draft-model")
+
+    def test_does_not_redownload_draft_when_it_matches_main_model(self):
+        model_path = "s3://bucket/model"
+        mock_download = self._run_handler(
+            model_path=model_path,
+            speculative_draft_model_path=model_path,
+        )
+
+        mock_download.assert_called_once_with(model_path)
+
+    def test_does_not_download_local_draft_path(self):
+        mock_download = self._run_handler(speculative_draft_model_path="/models/draft")
+
+        mock_download.assert_not_called()
+
+    def test_preserves_tokenizer_object_storage_handling(self):
+        mock_download = self._run_handler(
+            tokenizer_path="s3://bucket/tokenizer",
+            speculative_draft_model_path="/models/draft",
+        )
+
+        mock_download.assert_called_once_with("s3://bucket/tokenizer")
+
+
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
     alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
