@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    BackupComponents,
     BackupKV,
     CacheAction,
     ComponentAction,
@@ -472,7 +471,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
-    ) -> Optional[BackupKV | BackupComponents]:
+    ) -> Optional[BackupKV]:
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
@@ -513,7 +512,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
-                        written = self._execute_backup_action(
+                        written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
                         if written > 0:
@@ -789,8 +788,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(indices)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
-        elif isinstance(action, BackupComponents):
-            self._execute_and_commit_component_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -820,25 +817,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
-    def _execute_backup_action(
-        self,
-        action: BackupKV | BackupComponents,
-        write_back: bool = False,
-    ) -> int:
-        if isinstance(action, BackupComponents):
-            return self._execute_and_commit_component_backup(action, write_back)
-        return self._execute_and_commit_kv_backup(action, write_back)
-
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
-            # Overlapping chain actions: skip already-backed nodes.
-            if self.tree_core.is_backuped(node_id):
+            # Incremental component backup is currently write-through only.
+            if write_back and self.tree_core.is_backuped(node_id):
                 continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            if device_value.numel() == 0 and not comp_xfers:
+                continue
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
@@ -851,46 +841,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
             written = len(host_indices)
+            if written == 0:
+                written = sum(
+                    len(xfer.host_indices)
+                    for xfers in comp_xfers.values()
+                    for xfer in xfers
+                    if xfer.host_indices is not None
+                )
         return written
-
-    def _execute_and_commit_component_backup(
-        self, action: BackupComponents, write_back: bool = False
-    ) -> int:
-        """Add missing auxiliary components to an existing Full host backup."""
-        if self.ongoing_write_through:
-            self.writing_check(write_back=True)
-
-        device_value, comp_xfers = self.tree_core.build_component_backup_spec(
-            action.node_id, action.component_types
-        )
-        if not comp_xfers:
-            return 1
-
-        empty_full_value = device_value[:0]
-        sidecar_xfers = self._build_backup_sidecar(empty_full_value, comp_xfers)
-        host_indices = self._execute_kv_backup(
-            action.node_id,
-            empty_full_value,
-            comp_xfers,
-            sidecar_xfers,
-        )
-        if host_indices is None:
-            return 0
-
-        cache_actions: list[CacheAction | ComponentAction] = []
-        self.tree_core.commit_hicache_transfers(
-            action.node_id,
-            CacheTransferPhase.BACKUP_HOST,
-            comp_xfers,
-            cache_actions=cache_actions,
-        )
-        assert not cache_actions
-
-        lock_params = None
-        if not write_back:
-            lock_params = self.inc_lock_ref(action.node_id).to_dec_params()
-        self._track_write_through_node(action.node_id, lock_params)
-        return 1
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
         """Gather sidecar transfer spec."""

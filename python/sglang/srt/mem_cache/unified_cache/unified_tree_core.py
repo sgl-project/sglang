@@ -43,7 +43,6 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    BackupComponents,
     BackupKV,
     CacheAction,
     ComponentAction,
@@ -885,24 +884,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
         state.result = InsertResult(prefix_len=state.total_prefix_length)
-        component_actions: list[CacheAction | ComponentAction] = []
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,
                 is_new_leaf=state.is_new_leaf,
                 params=state.params,
                 result=state.result,
-                cache_actions=component_actions,
+                cache_actions=state.pending_actions,
             )
-        if self.enable_hicache and not self.is_write_back:
-            action = self._build_incremental_component_backup_action(state.target_node)
-            if action is not None:
-                state.pending_actions.append(action)
-        state.pending_actions.extend(component_actions)
         state.phase = _InsertPhase.TAIL
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
-        """Refresh the LRUs and append the terminal new-leaf backup."""
+        """Refresh the LRUs and append terminal backup actions."""
         if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -911,12 +904,36 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if state.is_new_leaf and self._inc_hit_count_and_check(
-            state.target_node, state.params.chunked
-        ):
+        backup_due = (
+            self._inc_hit_count_and_check(
+                state.target_node, state.params.chunked
+            )
+            if state.is_new_leaf
+            else self._needs_incremental_backup(state)
+        )
+        if backup_due:
             state.pending_actions.append(
                 self._build_backup_kv_action(state.target_node)
             )
+
+    def _needs_incremental_backup(self, state: _InsertWalkState) -> bool:
+        """Whether a Host-backed node has an unbacked Device Mamba state."""
+        if (
+            not self.enable_hicache
+            or self.is_write_back
+            or state.params.chunked
+            or ComponentType.MAMBA not in self.components_by_type
+        ):
+            return False
+
+        node = state.target_node
+        mamba_data = node.component_data[ComponentType.MAMBA]
+        return (
+            node.backuped
+            and node.write_through_pending_id is None
+            and mamba_data.value is not None
+            and mamba_data.host_value is None
+        )
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
@@ -1069,10 +1086,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if node.backuped:
-            result.backup_kv = self._build_incremental_component_backup_action(node)
-            if result.backup_kv is not None:
-                return result
         if not node.backuped:
             if is_write_back:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
@@ -1530,27 +1543,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
 
-    def build_component_backup_spec(
-        self, node_id: NodeId, component_types: tuple[ComponentType, ...]
-    ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
-        node = self.node_by_id(node_id)
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
-        assert device_value is not None
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for component_type in component_types:
-            comp = self.components_by_type[component_type]
-            if not comp.needs_incremental_host_backup(node):
-                continue
-            transfers = comp.build_hicache_transfers(
-                node, CacheTransferPhase.BACKUP_HOST
-            )
-            if transfers:
-                comp_xfers[component_type] = transfers
-        return device_value, comp_xfers
-
     def _build_backup_spec(self, node: UnifiedTreeNode):
-        """Gather device value backup spec."""
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        """Build transfers for data not already available in Host."""
+        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if node.backuped:
+            device_value = (
+                full_value[:0]
+                if full_value is not None
+                else self._empty_match_result.device_indices
+            )
+        else:
+            assert full_value is not None
+            device_value = full_value
+
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1652,21 +1657,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             chain.reverse()
         return BackupKV([target.id for target in chain])
 
-    def _build_incremental_component_backup_action(
-        self, node: UnifiedTreeNode
-    ) -> Optional[BackupComponents]:
-        if not node.backuped:
-            return None
-        component_types = tuple(
-            comp.component_type
-            for comp in self.components
-            if comp.component_type != BASE_COMPONENT_TYPE
-            and comp.needs_incremental_host_backup(node)
-        )
-        if not component_types:
-            return None
-        return BackupComponents(node.id, component_types)
-
     def commit_hicache_transfers(
         self,
         node_id: NodeId,
@@ -1698,13 +1688,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Commit a successful backup to the node."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            node,
-            CacheTransferPhase.BACKUP_HOST,
-            transfers=[kv_xfer],
-            cache_actions=cache_actions,
-        )
+        if host_indices.numel() > 0:
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+            self.components_by_type[
+                BASE_COMPONENT_TYPE
+            ].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=[kv_xfer],
+                cache_actions=cache_actions,
+            )
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,

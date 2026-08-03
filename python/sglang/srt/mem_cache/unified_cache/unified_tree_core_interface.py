@@ -47,7 +47,7 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
-    backup_kv: Optional[BackupKV | BackupComponents] = None
+    backup_kv: Optional[BackupKV] = None
 
 
 class DemoteResult(BaseEvictionResult):
@@ -98,7 +98,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
-        BackupComponents,
         BackupKV,
         CacheAction,
         ComponentAction,
@@ -363,13 +362,6 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         """Read a node's device->host backup spec (device value + transfers) now."""
-        ...
-
-    @abstractmethod
-    def build_component_backup_spec(
-        self, node_id: NodeId, component_types: tuple[ComponentType, ...]
-    ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
-        """Build transfers for auxiliary components missing from the host tier."""
         ...
 
     @abstractmethod

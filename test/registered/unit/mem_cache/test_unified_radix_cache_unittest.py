@@ -3078,36 +3078,9 @@ class UnifiedRadixCacheSuite:
         self._assert_hicache_mamba_incremental_write_through("write_through")
 
     def test_hicache_mamba_incremental_write_through_selective(self):
-        self._assert_hicache_mamba_incremental_write_through("write_through_selective")
-
-    def test_hicache_mamba_incremental_write_back(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa:
-            self.skipTest("requires Full+Mamba")
-
-        (
-            cache,
-            allocator,
-            req_to_token_pool,
-            seq,
-            node,
-            full_host_value,
-        ) = self._prepare_full_only_host_backup("write_back")
-
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        self.assertIsNone(node.component_data[ComponentType.MAMBA].host_value)
-
-        result = cache.evict(EvictParams(num_tokens=len(seq)))
-        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
-        self.assertTrue(node.evicted)
-        self.assertTrue(
-            torch.equal(
-                node.component_data[ComponentType.FULL].host_value,
-                full_host_value,
-            )
+        self._assert_hicache_mamba_incremental_write_through(
+            "write_through_selective"
         )
-        self.assertIsNone(node.component_data[ComponentType.MAMBA].value)
-        self.assertIsNotNone(node.component_data[ComponentType.MAMBA].host_value)
-        cache.sanity_check()
 
     def test_hicache_shorter_prefix_mamba_incremental_backup(self):
         """A shorter shared prefix gains Mamba in both L1 and L2 after a split."""

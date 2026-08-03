@@ -64,13 +64,6 @@ class BackupKV(msgspec.Struct, frozen=True):
     node_ids: list[NodeId]
 
 
-class BackupComponents(msgspec.Struct, frozen=True):
-    """Back up selected auxiliary components without copying Full KV again."""
-
-    node_id: NodeId
-    component_types: tuple[ComponentType, ...]
-
-
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):
     """Per-path Mamba state-cap eviction from the tail's root path; applied at
     the insert's commit barrier, after the walk-time backups whose
@@ -107,6 +100,4 @@ class SWARebuild(ComponentAction, frozen=True):
 
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
-CacheAction = (
-    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV | BackupComponents
-)
+CacheAction = ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV

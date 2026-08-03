@@ -468,10 +468,6 @@ class TreeComponent(ABC):
         """Cache-level host pre-allocation before a prefetch builds its transfers."""
         return PreparePrefetchResult()
 
-    def needs_incremental_host_backup(self, node: UnifiedTreeNode) -> bool:
-        """Whether a device component must be added to an existing host backup."""
-        return False
-
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,

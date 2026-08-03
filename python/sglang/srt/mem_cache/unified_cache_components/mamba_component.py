@@ -580,10 +580,6 @@ class MambaComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
-    def needs_incremental_host_backup(self, node: UnifiedTreeNode) -> bool:
-        cd = node.component_data[self.component_type]
-        return cd.value is not None and cd.host_value is None
-
     def prepare_load_back(
         self,
         node_id: NodeId,
@@ -643,7 +639,7 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            if cd.value is None or cd.host_value is not None:
                 return None
             return [
                 PoolTransfer(

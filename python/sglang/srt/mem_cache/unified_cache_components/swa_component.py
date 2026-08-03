@@ -690,7 +690,7 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            if cd.value is None or cd.host_value is not None:
                 return None
             # cd.value already holds SWA-pool indices (translated at insert time).
             # Host pool indexing wants int64.
