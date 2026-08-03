@@ -70,7 +70,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `prefix_cache` / `fused_score` /
+/// `cache_aware_zmq` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -83,6 +84,15 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
+    /// Scores workers by prefix-cache depth.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+    /// Weighted sum of `--fuse` terms.
+    #[value(name = "fused_score")]
+    FusedScore,
+    /// Router-local in-flight eligibility filter.
+    #[value(name = "overloaded")]
+    Overloaded,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -95,6 +105,15 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+impl std::fmt::Display for PolicyKind {
+    /// The CLI spelling for this policy kind.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("PolicyKind skips no variants");
+        f.write_str(v.get_name())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +165,7 @@ pub struct ModelConfig {
     pub tokenizer_path: String,
     pub policy: PolicyKind,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
+    /// Tuning for the cache-aware ZMQ policy. Ignored unless
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -155,6 +174,10 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Terms for `policy = "fused_score"`.
+    pub fused: Option<Vec<FusedTerm>>,
+    /// Hard constraints applied before policy selection.
+    pub eligibility: Option<EligibilityConfig>,
 }
 
 /// External KV Indexer client settings.
@@ -163,6 +186,54 @@ pub struct KvIndexerEndpointConfig {
     pub url: String,
     pub query_timeout_ms: u64,
     pub query_max_inflight: usize,
+}
+
+/// Eligibility filter configuration.
+#[derive(Debug, Clone, Default)]
+pub struct EligibilityConfig {
+    /// Filters in priority order.
+    pub filters: Vec<PolicyKind>,
+    /// `overloaded`: in-flight count at which a worker stops being eligible.
+    pub max_in_flight: Option<usize>,
+    /// `prefix_cache` minimum cached prompt share.
+    pub min_prefix_share: Option<f32>,
+}
+
+/// Default `--policy fused_score` terms.
+pub const DEFAULT_FUSE: [PolicyKind; 2] = [PolicyKind::PrefixCache, PolicyKind::LoadBased];
+
+/// One `--fuse` policy and optional weight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusedTerm {
+    pub kind: PolicyKind,
+    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
+    pub weight: Option<f32>,
+}
+
+impl std::str::FromStr for FusedTerm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (name, weight) = match s.split_once('=') {
+            Some((n, w)) => (n, Some(parse_fuse_weight(n, w)?)),
+            None => (s, None),
+        };
+        let kind = <PolicyKind as clap::ValueEnum>::from_str(name, false)
+            .map_err(|_| format!("--fuse: `{name}` is not a policy name"))?;
+        Ok(FusedTerm { kind, weight })
+    }
+}
+
+/// Parses a finite, non-negative term weight.
+fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
+    let w: f32 = raw
+        .parse()
+        .map_err(|_| format!("--fuse: `{name}` weight `{raw}` is not a number"))?;
+    if !w.is_finite() || w < 0.0 {
+        return Err(format!(
+            "--fuse: `{name}` weight `{raw}` must be finite and >= 0"
+        ));
+    }
+    Ok(w)
 }
 
 /// Per-model cache-aware tuning.
@@ -182,8 +253,7 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. When configured, it
-    /// replaces the local ZMQ radix tree as the cache signal.
+    /// Optional external KV Indexer client configuration.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 

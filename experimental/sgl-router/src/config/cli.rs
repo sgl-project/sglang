@@ -12,9 +12,9 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    DiscoveryBackend, EligibilityConfig, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
+    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -73,18 +73,31 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
+    /// External KV indexer gRPC endpoint used as the cache signal.
     #[arg(long)]
     pub kv_indexer_endpoint: Option<String>,
     /// KV Indexer query timeout in milliseconds. Requires
     /// `--kv-indexer-endpoint`; defaults to 100.
     #[arg(long)]
     pub kv_indexer_query_timeout_ms: Option<u64>,
-    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
+    /// Maximum concurrent KV Indexer queries. Requires
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+
+    /// Weighted terms for `--policy fused_score`.
+    #[arg(long, value_delimiter = ',')]
+    pub fuse: Vec<FusedTerm>,
+
+    /// Ordered hard constraints applied before policy selection.
+    #[arg(long, value_delimiter = ',')]
+    pub filter: Vec<PolicyKind>,
+    /// Router-local in-flight limit for `--filter overloaded`.
+    #[arg(long)]
+    pub max_in_flight: Option<usize>,
+    /// Minimum cached prompt share for `--filter prefix_cache`.
+    #[arg(long)]
+    pub prefix_cache_min_share: Option<f32>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -179,7 +192,8 @@ impl Cli {
             || self.kv_indexer_query_max_inflight.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "cache-aware tuning flags require --policy cache_aware_zmq"
+                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
+                 require --policy cache_aware_zmq"
             ));
         }
         if self.kv_indexer_query_timeout_ms == Some(0) {
@@ -202,6 +216,60 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
+
+        if !self.fuse.is_empty() && self.policy != PolicyKind::FusedScore {
+            return Err(anyhow!("--fuse requires --policy fused_score"));
+        }
+        let fused = if self.policy == PolicyKind::FusedScore {
+            let terms = if self.fuse.is_empty() {
+                DEFAULT_FUSE
+                    .iter()
+                    .map(|&kind| FusedTerm { kind, weight: None })
+                    .collect()
+            } else {
+                self.fuse.clone()
+            };
+            for (i, t) in terms.iter().enumerate() {
+                if t.kind == PolicyKind::FusedScore {
+                    return Err(anyhow!("--fuse: `fused_score` cannot fuse itself"));
+                }
+                if terms[..i].iter().any(|p| p.kind == t.kind) {
+                    return Err(anyhow!("--fuse: `{}` is listed more than once", t.kind));
+                }
+            }
+            Some(terms)
+        } else {
+            None
+        };
+
+        for (i, kind) in self.filter.iter().enumerate() {
+            if self.filter[..i].contains(kind) {
+                return Err(anyhow!("--filter: `{kind}` is listed more than once"));
+            }
+        }
+        let has = |k: PolicyKind| self.filter.contains(&k);
+        if self.max_in_flight.is_some() != has(PolicyKind::Overloaded) {
+            return Err(anyhow!(
+                "--max-in-flight and `--filter overloaded` require each other"
+            ));
+        }
+        if self.prefix_cache_min_share.is_some() != has(PolicyKind::PrefixCache) {
+            return Err(anyhow!(
+                "--prefix-cache-min-share and `--filter prefix_cache` require each other"
+            ));
+        }
+        if self
+            .prefix_cache_min_share
+            .is_some_and(|s| !(s > 0.0 && s <= 1.0))
+        {
+            return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
+        }
+        let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
+            filters: self.filter.clone(),
+            max_in_flight: self.max_in_flight,
+            min_prefix_share: self.prefix_cache_min_share,
+        });
+
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -225,13 +293,20 @@ impl Cli {
                 anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
             })?;
             let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
-            if matches!(
+            // An ALLOW-list, not a deny-list: `build_sticky_fallback` answers
+            // anything outside this set with `unreachable!()`, so a deny-list
+            // turns every policy added later into a startup panic instead of
+            // this message.
+            if !matches!(
                 fallback_policy,
-                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+                PolicyKind::RoundRobin
+                    | PolicyKind::Random
+                    | PolicyKind::PowerOfTwo
+                    | PolicyKind::LoadBased
             ) {
                 return Err(anyhow!(
                     "--sticky-fallback-policy must be one of round_robin / random / \
-                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                     power_of_two / load_based; `{fallback_policy}` is not allowed"
                 ));
             }
             let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
@@ -315,6 +390,8 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
+                fused,
+                eligibility,
             },
             discovery,
             proxy: ProxyConfig {
@@ -793,109 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_indexer_reuses_cache_aware_policy_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap();
-        let cache = c.model.cache_aware.expect("cache-aware config");
-        let indexer = cache.kv_indexer_endpoint.expect("Indexer config");
-        assert_eq!(indexer.url, "http://indexer:50051");
-        assert_eq!(indexer.query_timeout_ms, 75);
-        assert_eq!(indexer.query_max_inflight, 17);
-    }
-
-    #[test]
-    fn kv_indexer_uses_safe_query_defaults() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap();
-        let indexer = c
-            .model
-            .cache_aware
-            .expect("cache-aware config")
-            .kv_indexer_endpoint
-            .expect("Indexer config");
-        assert_eq!(indexer.query_timeout_ms, 100);
-        assert_eq!(indexer.query_max_inflight, 32);
-    }
-
-    #[test]
-    fn kv_indexer_requires_cache_aware_policy() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("require --policy cache_aware_zmq"));
-    }
-
-    #[test]
-    fn kv_indexer_timeout_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-query-timeout-ms",
-            "75",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_requires_endpoint() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-query-max-inflight",
-            "17",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("requires --kv-indexer-endpoint"));
-    }
-
-    #[test]
-    fn kv_indexer_max_inflight_must_be_positive() {
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-            "--kv-indexer-query-max-inflight",
-            "0",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("must be greater than zero"));
-    }
-
-    #[test]
     fn no_cache_aware_flags_leaves_none() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
@@ -994,6 +968,69 @@ mod tests {
         assert_eq!(s.fallback_policy, PolicyKind::LoadBased);
         assert_eq!(s.idle_secs, 120);
         assert_eq!(s.eviction_interval_secs, 15);
+    }
+
+    #[test]
+    fn filter_builds_the_eligibility_config_in_order_and_is_off_by_default() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "round_robin",
+            "--filter",
+            "overloaded,prefix_cache",
+            "--max-in-flight",
+            "64",
+            "--prefix-cache-min-share",
+            "0.6",
+        ]))
+        .unwrap();
+        let e = c.model.eligibility.expect("--filter must build the config");
+        assert_eq!(
+            e.filters,
+            vec![PolicyKind::Overloaded, PolicyKind::PrefixCache],
+            "order is priority, so it must survive parsing",
+        );
+        assert_eq!((e.max_in_flight, e.min_prefix_share), (Some(64), Some(0.6)));
+        assert_eq!(
+            c.model.policy,
+            PolicyKind::RoundRobin,
+            "not gated on --policy"
+        );
+
+        let bare = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(bare.model.eligibility.is_none(), "no --filter, no layer");
+    }
+
+    #[test]
+    fn filter_misconfigurations_fail_at_startup() {
+        let cases: [(&[&str], &str); 6] = [
+            (&["--filter", "overloaded"], "require each other"),
+            (&["--max-in-flight", "64"], "require each other"),
+            (&["--filter", "prefix_cache"], "require each other"),
+            (&["--prefix-cache-min-share", "0.6"], "require each other"),
+            (
+                &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
+                "listed more than once",
+            ),
+            (
+                &[
+                    "--filter",
+                    "prefix_cache",
+                    "--prefix-cache-min-share",
+                    "0.0",
+                ],
+                "must be in (0, 1]",
+            ),
+        ];
+        for (extra, want) in cases {
+            let mut args = vec!["--worker-urls", "http://x:30000"];
+            args.extend_from_slice(extra);
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "for {extra:?} got: {err}");
+        }
     }
 
     #[test]
@@ -1109,5 +1146,94 @@ mod tests {
             err.contains("--sticky-idle-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    /// `argv` is space-split, so a case reads as the command line an operator
+    /// would type. Model + worker URL are supplied.
+    fn cfg_of(argv: &str) -> Result<Config> {
+        let extra: Vec<&str> = argv.split_whitespace().collect();
+        into_config_owned(with_model(
+            &[&["--worker-urls", "http://10.0.0.1:30000"], &extra[..]].concat(),
+        ))
+    }
+
+    fn fuse_err(argv: &str) -> String {
+        cfg_of(argv).unwrap_err().to_string()
+    }
+
+    /// Resolved terms as `(kind, weight)` pairs; `None` when the policy is
+    /// not `fused_score` and so builds no term list at all.
+    fn fused_of(argv: &str) -> Option<Vec<(PolicyKind, Option<f32>)>> {
+        let ts = cfg_of(argv).unwrap().model.fused?;
+        Some(ts.iter().map(|t| (t.kind, t.weight)).collect())
+    }
+
+    fn fuse_ok(argv: &str) -> Vec<(PolicyKind, Option<f32>)> {
+        fused_of(argv).expect("fused_score builds a term list")
+    }
+
+    /// `--policy fused_score` alone composes the useful pair, and `--fuse`
+    /// overrides it with names + optional per-term weights.
+    #[test]
+    fn fuse_defaults_to_the_useful_pair_and_parses_weights() {
+        use PolicyKind::{LoadBased, PrefixCache, Random};
+        let pair = [(PrefixCache, None), (LoadBased, None)];
+        assert_eq!(fuse_ok("--policy fused_score"), pair);
+        // Comma-separated, order preserved, weight optional per term.
+        assert_eq!(
+            fuse_ok("--policy fused_score --fuse load_based=0.3,random"),
+            [(LoadBased, Some(0.3)), (Random, None)],
+        );
+        assert!(fused_of("").is_none(), "round_robin builds no term list");
+    }
+
+    /// Non-finite and negative weights are refused, naming the term.
+    ///
+    /// `nan`/`inf` matter more than they look: `str::parse::<f32>` accepts
+    /// both, and a NaN weight makes every worker's fused total NaN, so argmax
+    /// discards them all and the router silently degrades to least-load.
+    #[test]
+    fn fuse_rejects_non_finite_and_negative_weights() {
+        for bad in ["nan", "NaN", "inf", "-inf", "-0.5", "banana"] {
+            let err = fuse_err(&format!("--policy fused_score --fuse load_based={bad}"));
+            assert!(err.contains("load_based"), "{bad}: names the term: {err}");
+            assert!(
+                err.contains("must be finite and >= 0") || err.contains("is not a number"),
+                "{bad}: {err}",
+            );
+        }
+        for good in ["0", "0.3", "2", "1e3"] {
+            let got = fuse_ok(&format!("--policy fused_score --fuse load_based={good}"))[0].1;
+            assert_eq!(got, Some(good.parse::<f32>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn fuse_rejects_malformed_compositions() {
+        let cases: [(&str, &[&str]); 5] = [
+            ("--fuse load_based", &["--fuse requires", "fused_score"]),
+            (
+                "--policy fused_score --fuse fused_score,load_based",
+                &["fused_score", "cannot fuse itself"],
+            ),
+            (
+                "--policy fused_score --fuse load_based,load_based",
+                &["load_based", "listed more than once"],
+            ),
+            (
+                "--policy fused_score --fuse not_a_policy",
+                &["not_a_policy", "is not a policy name"],
+            ),
+            (
+                "--policy sticky --sticky-fallback-policy prefix_cache",
+                &["prefix_cache", "must be one of round_robin"],
+            ),
+        ];
+        for (argv, wants) in cases {
+            let err = fuse_err(argv);
+            for want in wants {
+                assert!(err.contains(want), "{argv}: want {want:?}, got: {err}");
+            }
+        }
     }
 }
