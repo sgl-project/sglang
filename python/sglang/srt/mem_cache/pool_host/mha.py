@@ -124,26 +124,23 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-        self.packed_device_k_data_ptrs = (
-            self.device_pool.k_data_ptrs
-            if not self.mtp_draft_device_pools
-            else torch.cat([pool.k_data_ptrs for pool in device_pools])
-        )
-        self.packed_device_v_data_ptrs = (
-            self.device_pool.v_data_ptrs
-            if not self.mtp_draft_device_pools
-            else torch.cat([pool.v_data_ptrs for pool in device_pools])
-        )
-        self.packed_device_k_buffers = [
-            buffer for pool in device_pools for buffer in pool.k_buffer
-        ]
-        self.packed_device_v_buffers = [
-            buffer for pool in device_pools for buffer in pool.v_buffer
-        ]
-        self.packed_device_kv_buffers = (
-            self.packed_device_k_buffers + self.packed_device_v_buffers
-        )
+        if self.mtp_draft_device_pools:
+            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+            self.packed_device_k_data_ptrs = torch.cat(
+                [pool.k_data_ptrs for pool in device_pools]
+            )
+            self.packed_device_v_data_ptrs = torch.cat(
+                [pool.v_data_ptrs for pool in device_pools]
+            )
+            self.packed_device_k_buffers = [
+                buffer for pool in device_pools for buffer in pool.k_buffer
+            ]
+            self.packed_device_v_buffers = [
+                buffer for pool in device_pools for buffer in pool.v_buffer
+            ]
+            self.packed_device_kv_buffers = (
+                self.packed_device_k_buffers + self.packed_device_v_buffers
+            )
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers()
 
@@ -363,13 +360,31 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _resolve_device_transfer_buffers(self, device_pool):
+        if self.mtp_draft_device_pools:
+            return (
+                self.packed_device_k_data_ptrs,
+                self.packed_device_v_data_ptrs,
+                self.packed_device_k_buffers,
+                self.packed_device_v_buffers,
+            )
+        return (
+            device_pool.k_data_ptrs,
+            device_pool.v_data_ptrs,
+            device_pool.k_buffer,
+            device_pool.v_buffer,
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if self.device_pool is None:
-            self.packed_device_k_data_ptrs = device_pool.k_data_ptrs
-            self.packed_device_v_data_ptrs = device_pool.v_data_ptrs
-            self.packed_device_kv_buffers = device_pool.k_buffer + device_pool.v_buffer
+        (
+            device_k_data_ptrs,
+            device_v_data_ptrs,
+            device_k_buffers,
+            device_v_buffers,
+        ) = self._resolve_device_transfer_buffers(device_pool)
+        device_kv_buffers = device_k_buffers + device_v_buffers
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -377,8 +392,8 @@ class MHATokenToKVPoolHost(HostKVCache):
                         k_ptr_dst=self.k_data_ptrs,
                         v_ptr_dst=self.v_data_ptrs,
                         indices_dst=host_indices,
-                        k_ptr_src=self.packed_device_k_data_ptrs,
-                        v_ptr_src=self.packed_device_v_data_ptrs,
+                        k_ptr_src=device_k_data_ptrs,
+                        v_ptr_src=device_v_data_ptrs,
                         indices_src=device_indices,
                         kv_cache_dst_stride_bytes=self.token_stride_size,
                         kv_cache_src_stride_bytes=self.token_stride_size,
@@ -386,9 +401,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer(
-                        src_k_layers=self.packed_device_k_data_ptrs,
+                        src_k_layers=device_k_data_ptrs,
                         dst_k_layers=self.k_data_ptrs,
-                        src_v_layers=self.packed_device_v_data_ptrs,
+                        src_v_layers=device_v_data_ptrs,
                         dst_v_layers=self.v_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -398,8 +413,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_staged_lf_pf(
-                        k_ptr_src=self.packed_device_k_data_ptrs,
-                        v_ptr_src=self.packed_device_v_data_ptrs,
+                        k_ptr_src=device_k_data_ptrs,
+                        v_ptr_src=device_v_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         staging_k=self.staging_k_buffer,
@@ -410,9 +425,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
                 else:
                     transfer_kv_all_layer_lf_pf(
-                        src_k_layers=self.packed_device_k_data_ptrs,
+                        src_k_layers=device_k_data_ptrs,
                         dst_k=self.k_buffer,
-                        src_v_layers=self.packed_device_v_data_ptrs,
+                        src_v_layers=device_v_data_ptrs,
                         dst_v=self.v_buffer,
                         src_indices=device_indices,
                         dst_indices=host_indices,
@@ -422,9 +437,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
-                    src_k_layers=self.packed_device_k_data_ptrs,
+                    src_k_layers=device_k_data_ptrs,
                     dst_k=self.k_buffer,
-                    src_v_layers=self.packed_device_v_data_ptrs,
+                    src_v_layers=device_v_data_ptrs,
                     dst_v=self.v_buffer,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -439,7 +454,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=self.packed_device_kv_buffers,
+                    src_layers=device_kv_buffers,
                     dst_layers=self.host_kv_data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -447,7 +462,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=self.packed_device_kv_buffers,
+                    src_ptrs=device_kv_buffers,
                     dst_ptrs=[self.k_buffer, self.v_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -1183,11 +1198,12 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        if self.device_pool is None:
-            self.packed_device_k_data_ptrs = device_pool.k_data_ptrs
-            self.packed_device_v_data_ptrs = device_pool.v_data_ptrs
-            self.packed_device_k_buffers = device_pool.k_buffer
-            self.packed_device_v_buffers = device_pool.v_buffer
+        (
+            device_k_data_ptrs,
+            device_v_data_ptrs,
+            device_k_buffers,
+            device_v_buffers,
+        ) = self._resolve_device_transfer_buffers(device_pool)
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(
@@ -1196,7 +1212,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 )
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                    ptr_src=self.packed_device_k_data_ptrs,
+                    ptr_src=device_k_data_ptrs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     staging=self.staging_k_buffer,
@@ -1204,7 +1220,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     page_size=self.page_size,
                 )
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
-                    ptr_src=self.packed_device_v_data_ptrs,
+                    ptr_src=device_v_data_ptrs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     staging=self.staging_v_buffer,
@@ -1213,7 +1229,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 )
             else:
                 transfer_kv_all_layer_mla_lf_pf(
-                    src_layers=self.packed_device_k_data_ptrs,
+                    src_layers=device_k_data_ptrs,
                     dst=self.k_buffer,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -1222,7 +1238,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     num_layers=self.layer_num,
                 )
                 transfer_kv_all_layer_mla_lf_pf(
-                    src_layers=self.packed_device_v_data_ptrs,
+                    src_layers=device_v_data_ptrs,
                     dst=self.v_buffer,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -1238,14 +1254,14 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     "'page_first_direct'."
                 )
             transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=self.packed_device_k_buffers,
+                src_ptrs=device_k_buffers,
                 dst_ptrs=[self.k_buffer],
                 src_indices=device_indices,
                 dst_indices=host_indices,
                 page_size=self.page_size,
             )
             transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=self.packed_device_v_buffers,
+                src_ptrs=device_v_buffers,
                 dst_ptrs=[self.v_buffer],
                 src_indices=device_indices,
                 dst_indices=host_indices,

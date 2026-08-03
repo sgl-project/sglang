@@ -101,15 +101,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-        self.packed_device_data_ptrs = (
-            self.device_pool.data_ptrs
-            if not self.mtp_draft_device_pools
-            else torch.cat([pool.data_ptrs for pool in device_pools])
-        )
-        self.packed_device_kv_buffers = [
-            buffer for pool in device_pools for buffer in pool.kv_buffer
-        ]
+        if self.mtp_draft_device_pools:
+            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+            self.packed_device_data_ptrs = torch.cat(
+                [pool.data_ptrs for pool in device_pools]
+            )
+            self.packed_device_kv_buffers = [
+                buffer for pool in device_pools for buffer in pool.kv_buffer
+            ]
         self._init_write_back_staging_buffers()
 
     def get_contiguous_buf_infos(self):
@@ -390,6 +389,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
             )
 
+    def _resolve_device_transfer_buffers(self, device_pool):
+        if self.mtp_draft_device_pools:
+            return self.packed_device_data_ptrs, self.packed_device_kv_buffers
+        return device_pool.data_ptrs, device_pool.kv_buffer
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -412,15 +416,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             return
 
-        device_data_ptrs = (
-            self.packed_device_data_ptrs
-            if self.mtp_draft_device_pools
-            else device_pool.data_ptrs
-        )
-        device_kv_buffers = (
-            self.packed_device_kv_buffers
-            if self.mtp_draft_device_pools
-            else device_pool.kv_buffer
+        device_data_ptrs, device_kv_buffers = self._resolve_device_transfer_buffers(
+            device_pool
         )
 
         if io_backend == "kernel":
