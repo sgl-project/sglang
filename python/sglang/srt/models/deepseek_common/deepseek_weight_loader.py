@@ -458,7 +458,6 @@ class DeepseekV2WeightLoaderMixin:
         nextn_layer_id = (
             0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
         )
-
         return NextNEnabledConfig(
             num_nextn_layers=num_nextn_layers,
             nextn_layer_id=nextn_layer_id,
