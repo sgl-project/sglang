@@ -3,18 +3,19 @@
 use dynamo_parsers::ToolDefinition;
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_protocols::types::responses::{
-    AssistantRole, CreateResponse, IncompleteDetails, InputTokenDetails, Instructions,
+    AssistantRole, CreateResponse, IncompleteDetails, InputTokenDetails, Instructions, LogProb,
     OutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
     OutputTextContent, OutputTokenDetails, Response as OpenAIResponse, ResponseCompletedEvent,
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
     ResponseFunctionCallArgumentsDeltaEvent, ResponseFunctionCallArgumentsDoneEvent,
-    ResponseInProgressEvent, ResponseIncompleteEvent, ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent, ResponseReasoningTextDoneEvent,
-    ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseUsage, Status,
+    ResponseInProgressEvent, ResponseIncompleteEvent, ResponseLogProb,
+    ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ResponseStreamEvent, ResponseTextDeltaEvent,
+    ResponseTextDoneEvent, ResponseTopLobProb, ResponseUsage, Status, TopLogProb,
 };
 use dynamo_protocols::types::{
-    ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
-    ChatCompletionRequestMessage, ChatCompletionToolChoiceOption,
+    ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
+    ChatCompletionMessageToolCall, ChatCompletionRequestMessage, ChatCompletionToolChoiceOption,
     CreateChatCompletionStreamResponse, FunctionCall, FunctionType,
 };
 use futures::StreamExt;
@@ -22,6 +23,7 @@ use tokio::sync::mpsc;
 
 use super::super::frame::OutputAccumulator;
 use super::super::guard::AbortGuard;
+use super::chat::chat_logprobs;
 use super::reasoning::ReasoningStreamSplitter;
 use super::responses::{
     ResponseStore, StoredResponse, append_response_output, pending_reasoning_item,
@@ -30,7 +32,7 @@ use super::responses::{
 use super::tools::{chat_delta, chat_finish_reason, dynamo_parser_name};
 use super::{streaming_error, unix_seconds};
 use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem};
+use crate::message::{ChunkEvent, ChunkExtras, EgressItem};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn responses_event_stream(
@@ -51,6 +53,7 @@ pub(super) fn responses_event_stream(
 ) -> impl futures::Stream<Item = String> {
     let stream_id = response_id.clone();
     let stream_model = model.clone();
+    let want_logprobs = request.top_logprobs.is_some();
     let (output_tx, output_rx) = tokio::sync::oneshot::channel();
     let raw = async_stream::stream! {
         let mut output_tx = Some(output_tx);
@@ -115,20 +118,23 @@ pub(super) fn responses_event_stream(
             if splitter.enabled() {
                 let (reasoning_text, normal_text) =
                     splitter.split(&output.text, &output.token_ids);
+                let mut remaining_logprobs =
+                    want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {
                     choices.push(ChatChoiceStream {
                         index: 0,
                         delta: chat_delta(None, None, None, Some(reasoning_text)),
                         finish_reason: None,
-                        logprobs: None,
+                        logprobs: remaining_logprobs.clone(),
                     });
+                    remaining_logprobs = None;
                 }
                 if !normal_text.is_empty() {
                     choices.push(ChatChoiceStream {
                         index: 0,
                         delta: chat_delta(Some(normal_text), None, None, None),
                         finish_reason: None,
-                        logprobs: None,
+                        logprobs: remaining_logprobs,
                     });
                 }
                 if finish_reason.is_some() {
@@ -169,7 +175,7 @@ pub(super) fn responses_event_stream(
                         None,
                     ),
                     finish_reason,
-                    logprobs: None,
+                    logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
                 });
             }
             for choice in choices {
@@ -239,7 +245,7 @@ pub(super) fn responses_event_stream(
         sequence += 1;
 
         let mut completed_items = Vec::new();
-        let mut open_message: Option<(String, u32, String)> = None;
+        let mut open_message: Option<(String, u32, String, Vec<LogProb>)> = None;
         // Open reasoning item (item_id, output_index, text). Python keeps the
         // same single-open-item invariant: reasoning closes the message, and
         // normal text or tool calls close the reasoning item.
@@ -265,12 +271,13 @@ pub(super) fn responses_event_stream(
                     .as_deref()
                     .filter(|text| !text.is_empty())
                 {
-                    if let Some((item_id, output_index, text)) = open_message.take() {
+                    if let Some((item_id, output_index, text, logprobs)) = open_message.take() {
                         for event in finish_response_text_item(
                             &mut sequence,
                             &item_id,
                             output_index,
                             &text,
+                            want_logprobs.then_some(logprobs.as_slice()),
                         ) {
                             yield event;
                         }
@@ -278,6 +285,7 @@ pub(super) fn responses_event_stream(
                             item_id,
                             text,
                             OutputStatus::Completed,
+                            want_logprobs.then_some(logprobs),
                         ));
                     }
                     if reasoning_state.is_none() {
@@ -333,12 +341,13 @@ pub(super) fn responses_event_stream(
                             Some(OutputStatus::Completed),
                         ));
                     }
-                    if let Some((item_id, output_index, text)) = open_message.take() {
+                    if let Some((item_id, output_index, text, logprobs)) = open_message.take() {
                         for event in finish_response_text_item(
                             &mut sequence,
                             &item_id,
                             output_index,
                             &text,
+                            want_logprobs.then_some(logprobs.as_slice()),
                         ) {
                             yield event;
                         }
@@ -346,6 +355,7 @@ pub(super) fn responses_event_stream(
                             item_id,
                             text,
                             OutputStatus::Completed,
+                            want_logprobs.then_some(logprobs),
                         ));
                     }
                     for call in calls {
@@ -454,6 +464,7 @@ pub(super) fn responses_event_stream(
                             item_id.clone(),
                             String::new(),
                             OutputStatus::InProgress,
+                            want_logprobs.then(Vec::new),
                         );
                         yield serialize_response_event(
                             ResponseStreamEvent::ResponseOutputItemAdded(
@@ -472,15 +483,24 @@ pub(super) fn responses_event_stream(
                                     item_id: item_id.clone(),
                                     output_index,
                                     content_index: 0,
-                                    part: text_output_content(String::new()),
+                                    part: text_output_content(
+                                        String::new(),
+                                        want_logprobs.then(Vec::new),
+                                    ),
                                 },
                             ),
                         );
                         sequence += 1;
-                        open_message = Some((item_id, output_index, String::new()));
+                        open_message = Some((item_id, output_index, String::new(), Vec::new()));
                     }
-                    if let Some((item_id, output_index, text)) = open_message.as_mut() {
+                    if let Some((item_id, output_index, text, logprobs)) = open_message.as_mut() {
+                        let delta_logprobs = output_text_logprobs(choice.logprobs.as_ref());
+                        let stream_logprobs = choice
+                            .logprobs
+                            .is_some()
+                            .then(|| response_stream_logprobs(&delta_logprobs));
                         text.push_str(&delta);
+                        logprobs.extend(delta_logprobs);
                         yield serialize_response_event(
                             ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
                                 sequence_number: sequence,
@@ -488,7 +508,7 @@ pub(super) fn responses_event_stream(
                                 output_index: *output_index,
                                 content_index: 0,
                                 delta,
-                                logprobs: None,
+                                logprobs: stream_logprobs,
                             }),
                         );
                         sequence += 1;
@@ -519,7 +539,12 @@ pub(super) fn responses_event_stream(
             let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
             let output_index = 0;
             let pending =
-                text_response_message(item_id.clone(), String::new(), OutputStatus::InProgress);
+                text_response_message(
+                    item_id.clone(),
+                    String::new(),
+                    OutputStatus::InProgress,
+                    want_logprobs.then(Vec::new),
+                );
             yield serialize_response_event(ResponseStreamEvent::ResponseOutputItemAdded(
                 ResponseOutputItemAddedEvent {
                     sequence_number: sequence,
@@ -534,18 +559,19 @@ pub(super) fn responses_event_stream(
                     item_id: item_id.clone(),
                     output_index,
                     content_index: 0,
-                    part: text_output_content(String::new()),
+                    part: text_output_content(String::new(), want_logprobs.then(Vec::new)),
                 },
             ));
             sequence += 1;
-            open_message = Some((item_id, output_index, String::new()));
+            open_message = Some((item_id, output_index, String::new(), Vec::new()));
         }
-        if let Some((item_id, output_index, text)) = open_message {
+        if let Some((item_id, output_index, text, logprobs)) = open_message {
             for event in finish_response_text_item(
                 &mut sequence,
                 &item_id,
                 output_index,
                 &text,
+                want_logprobs.then_some(logprobs.as_slice()),
             ) {
                 yield event;
             }
@@ -553,6 +579,7 @@ pub(super) fn responses_event_stream(
                 item_id,
                 text,
                 OutputStatus::Completed,
+                want_logprobs.then_some(logprobs),
             ));
         }
 
@@ -598,6 +625,7 @@ fn finish_response_text_item(
     item_id: &str,
     output_index: u32,
     text: &str,
+    logprobs: Option<&[LogProb]>,
 ) -> [String; 3] {
     let text_done = serialize_response_event(ResponseStreamEvent::ResponseOutputTextDone(
         ResponseTextDoneEvent {
@@ -606,7 +634,7 @@ fn finish_response_text_item(
             output_index,
             content_index: 0,
             text: text.to_owned(),
-            logprobs: None,
+            logprobs: logprobs.map(response_stream_logprobs),
         },
     ));
     *sequence += 1;
@@ -616,11 +644,16 @@ fn finish_response_text_item(
             item_id: item_id.to_owned(),
             output_index,
             content_index: 0,
-            part: text_output_content(text.to_owned()),
+            part: text_output_content(text.to_owned(), logprobs.map(<[LogProb]>::to_vec)),
         },
     ));
     *sequence += 1;
-    let item = text_response_message(item_id.to_owned(), text.to_owned(), OutputStatus::Completed);
+    let item = text_response_message(
+        item_id.to_owned(),
+        text.to_owned(),
+        OutputStatus::Completed,
+        logprobs.map(<[LogProb]>::to_vec),
+    );
     let item_done = serialize_response_event(ResponseStreamEvent::ResponseOutputItemDone(
         ResponseOutputItemDoneEvent {
             sequence_number: *sequence,
@@ -671,19 +704,24 @@ fn serialize_response_event(event: ResponseStreamEvent) -> String {
     serde_json::to_string(&event).expect("OpenAI response event must serialize")
 }
 
-fn text_output_content(text: String) -> OutputContent {
+fn text_output_content(text: String, logprobs: Option<Vec<LogProb>>) -> OutputContent {
     OutputContent::OutputText(OutputTextContent {
         annotations: vec![],
-        logprobs: None,
+        logprobs,
         text,
     })
 }
 
-pub(super) fn text_response_message(id: String, text: String, status: OutputStatus) -> OutputItem {
+pub(super) fn text_response_message(
+    id: String,
+    text: String,
+    status: OutputStatus,
+    logprobs: Option<Vec<LogProb>>,
+) -> OutputItem {
     OutputItem::Message(OutputMessage {
         content: vec![OutputMessageContent::OutputText(OutputTextContent {
             annotations: vec![],
-            logprobs: None,
+            logprobs,
             text,
         })],
         id,
@@ -691,6 +729,57 @@ pub(super) fn text_response_message(id: String, text: String, status: OutputStat
         phase: None,
         status,
     })
+}
+
+fn output_text_logprobs(logprobs: Option<&ChatChoiceLogprobs>) -> Vec<LogProb> {
+    logprobs
+        .and_then(|logprobs| logprobs.content.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|token| LogProb {
+            bytes: token
+                .bytes
+                .clone()
+                .unwrap_or_else(|| token.token.as_bytes().to_vec()),
+            logprob: f64::from(token.logprob),
+            token: token.token.clone(),
+            top_logprobs: token
+                .top_logprobs
+                .iter()
+                .map(|top| TopLogProb {
+                    bytes: top
+                        .bytes
+                        .clone()
+                        .unwrap_or_else(|| top.token.as_bytes().to_vec()),
+                    logprob: f64::from(top.logprob),
+                    token: top.token.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn response_stream_logprobs(logprobs: &[LogProb]) -> Vec<ResponseLogProb> {
+    logprobs
+        .iter()
+        .map(|token| ResponseLogProb {
+            logprob: token.logprob,
+            token: token.token.clone(),
+            top_logprobs: token
+                .top_logprobs
+                .iter()
+                .map(|top| ResponseTopLobProb {
+                    logprob: top.logprob,
+                    token: top.token.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub(super) fn chunk_response_logprobs(extras: Option<&ChunkExtras>) -> Vec<LogProb> {
+    let logprobs = chat_logprobs(extras);
+    output_text_logprobs(Some(&logprobs))
 }
 
 pub(super) fn responses_usage(prompt_tokens: u32, completion_tokens: u64) -> ResponseUsage {

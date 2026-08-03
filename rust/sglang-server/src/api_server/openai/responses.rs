@@ -38,8 +38,8 @@ use super::super::guard::AbortGuard;
 use super::chat::{SamplingDefaults, chat_sampling, prepare_chat_request};
 use super::reasoning::split_reasoning_unary;
 use super::response_stream::{
-    response_object, response_status, responses_event_stream, responses_usage,
-    text_response_message,
+    chunk_response_logprobs, response_object, response_status, responses_event_stream,
+    responses_usage, text_response_message,
 };
 use super::tools::{dynamo_tool_choice, parse_chat_tool_calls};
 use super::{AppState, collect_output, openai_error, submit_generation, unix_seconds};
@@ -642,6 +642,7 @@ async fn responses(
                 reasoning_parser.as_deref(),
                 tools.as_deref(),
                 request.parallel_tool_calls.unwrap_or(true),
+                request.top_logprobs.is_some(),
             )
             .await
             {
@@ -752,6 +753,7 @@ pub(super) async fn unary_responses(
         reasoning_parser.as_deref(),
         tools.as_deref(),
         request.parallel_tool_calls.unwrap_or(true),
+        request.top_logprobs.is_some(),
     )
     .await
     {
@@ -793,6 +795,7 @@ async fn collect_response_items(
     reasoning_parser: Option<&str>,
     tools: Option<&[ToolDefinition]>,
     parallel_tool_calls: bool,
+    want_logprobs: bool,
 ) -> Result<(ChunkEvent, Vec<OutputItem>), (StatusCode, String)> {
     let output = collect_output(rx, &mut guard, rid).await?;
     // Split reasoning markers out of the content first (Python splits before
@@ -815,10 +818,12 @@ async fn collect_response_items(
             .map(response_function_call),
     );
     if !text.is_empty() || items.is_empty() {
+        let logprobs = want_logprobs.then(|| chunk_response_logprobs(output.extras.as_deref()));
         items.push(text_response_message(
             format!("msg_{}", uuid::Uuid::new_v4().simple()),
             text,
             OutputStatus::Completed,
+            logprobs,
         ));
     }
     Ok((output, items))
@@ -937,10 +942,37 @@ mod tests {
         responses_event_stream, sse_frame, unary_responses,
     };
     use crate::api_server::guard::AbortGuard;
+    use crate::message::{ChunkExtras, EgressItem};
     use dynamo_protocols::types::responses::CreateResponse;
     use dynamo_protocols::types::{ChatCompletionRequestMessage, ChatCompletionToolChoiceOption};
     use futures::StreamExt;
     use tokio::sync::mpsc;
+
+    fn with_logprobs(
+        mut item: EgressItem,
+        token_id: i32,
+        token: &str,
+        logprob: f32,
+        alternative_id: i32,
+        alternative: &str,
+        alternative_logprob: f32,
+    ) -> EgressItem {
+        let output = match &mut item {
+            EgressItem::Frame(output) | EgressItem::Done(output) => output,
+            _ => unreachable!(),
+        };
+        output.extras = Some(Box::new(ChunkExtras {
+            out_lp_val: vec![logprob],
+            out_lp_idx: vec![token_id],
+            out_lp_txt: vec![token.into()],
+            out_top_val: vec![logprob, alternative_logprob],
+            out_top_idx: vec![token_id, alternative_id],
+            out_top_lens: vec![2],
+            out_top_txt: vec![token.into(), alternative.into()],
+            ..Default::default()
+        }));
+        item
+    }
 
     #[test]
     fn structured_responses_input_reuses_chat_history_and_function_tools() {
@@ -1123,6 +1155,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unary_responses_populates_requested_logprobs() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(with_logprobs(
+            chunk("r0", "Paris", true),
+            7,
+            "Paris",
+            -0.25,
+            8,
+            "London",
+            -1.0,
+        ))
+        .await
+        .unwrap();
+        let mut request = response_request(false);
+        request.top_logprobs = Some(2);
+        let response = unary_responses(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            request,
+            None,
+            None,
+            None,
+            new_response_store(),
+            vec![],
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let logprob = &value["output"][0]["content"][0]["logprobs"][0];
+        assert_eq!(logprob["token"], "Paris");
+        assert_eq!(logprob["bytes"], serde_json::json!([80, 97, 114, 105, 115]));
+        assert_eq!(logprob["logprob"], -0.25);
+        assert_eq!(logprob["top_logprobs"][1]["token"], "London");
+        assert_eq!(logprob["top_logprobs"][1]["logprob"], -1.0);
+    }
+
+    #[tokio::test]
     async fn streaming_responses_emits_lifecycle_and_text_deltas() {
         let (tx, rx) = mpsc::channel(8);
         tx.send(chunk("r0", "Par", false)).await.unwrap();
@@ -1169,6 +1244,81 @@ mod tests {
         assert_eq!(created["response"]["created_at"], 1_234_567_890);
         assert_eq!(completed["response"]["created_at"], 1_234_567_890);
         assert_eq!(completed["response"]["usage"]["output_tokens"], 2);
+        assert_eq!(frames.last().unwrap(), "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_populates_delta_and_accumulated_logprobs() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(with_logprobs(
+            chunk("r0", "Par", false),
+            7,
+            "Par",
+            -0.25,
+            8,
+            "Bar",
+            -1.0,
+        ))
+        .await
+        .unwrap();
+        tx.send(with_logprobs(
+            chunk("r0", "is", true),
+            9,
+            "is",
+            -0.5,
+            10,
+            " was",
+            -1.5,
+        ))
+        .await
+        .unwrap();
+        let mut request = response_request(true);
+        request.top_logprobs = Some(2);
+        let stream = responses_event_stream(
+            rx,
+            AbortGuard::new_empty(senders()),
+            "r0".into(),
+            "resp_test".into(),
+            1_234_567_890,
+            "model".into(),
+            request,
+            None,
+            None,
+            None,
+            None,
+            false,
+            new_response_store(),
+            vec![],
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let events = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+            .collect::<Vec<_>>();
+        let deltas = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_text.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(deltas[0]["logprobs"][0]["token"], "Par");
+        assert_eq!(deltas[0]["logprobs"][0]["top_logprobs"][1]["token"], "Bar");
+        assert_eq!(deltas[1]["logprobs"][0]["token"], "is");
+
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_text.done")
+            .unwrap();
+        assert_eq!(done["logprobs"].as_array().unwrap().len(), 2);
+        assert_eq!(done["logprobs"][1]["token"], "is");
+
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        let logprobs = &completed["response"]["output"][0]["content"][0]["logprobs"];
+        assert_eq!(logprobs.as_array().unwrap().len(), 2);
+        assert_eq!(logprobs[0]["bytes"], serde_json::json!([80, 97, 114]));
+        assert_eq!(logprobs[1]["top_logprobs"][1]["token"], " was");
         assert_eq!(frames.last().unwrap(), "[DONE]");
     }
 
