@@ -127,7 +127,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         ht = ht + i_h * V * K
 
     # load initial state
-    if USE_INITIAL_STATE:
+    # Padded rows carry index == -1; skip them (see fused_recurrent).
+    if USE_INITIAL_STATE and index >= 0:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -290,7 +291,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
-    if INPLACE_UPDATE:
+    if INPLACE_UPDATE and index >= 0:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
