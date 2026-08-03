@@ -1,6 +1,6 @@
 """fused_extend_sconv_metadata must be bit-identical to the unfused prep.
 
-The unfused reference is the exact op sequence _prepare_extend_common_metadata
+The unfused reference is the exact op sequence the extend metadata prep
 + precompute_helion_extend_metadata used to launch: zeros + cumsum + slice-copy
 (or arange + ones for verify) + the has_initial_state compare, then != PAD, &,
 clamp, long, to(int64), arange, searchsorted, clamp, to(int32).
