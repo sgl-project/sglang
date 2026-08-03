@@ -321,10 +321,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        self._dsv4_reasoning_effort_profile_override = getattr(
-            self.tokenizer_manager.model_config.hf_config,
-            _DSV4_REASONING_EFFORT_PROFILE_OVERRIDE,
-            None,
+        self._dsv4_reasoning_effort_profile_override = (
+            self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                _DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+            )
         )
         self._dsv4_reasoning_effort_profile_model_path = None
         self._dsv4_reasoning_effort_profile = None
@@ -444,7 +444,8 @@ class OpenAIServingChat(OpenAIServingBase):
         is_local = Path(model_path).is_dir()
         if is_local:
             detected_profile = _detect_dsv4_reasoning_effort_profile(
-                model_path, revision
+                model_path=model_path,
+                revision=revision,
             )
             if detected_profile is not None:
                 return detected_profile
@@ -462,14 +463,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if is_local:
             return "legacy"
 
-        return _detect_dsv4_reasoning_effort_profile(model_path, revision) or "legacy"
+        return (
+            _detect_dsv4_reasoning_effort_profile(
+                model_path=model_path,
+                revision=revision,
+            )
+            or "legacy"
+        )
 
     def _get_dsv4_reasoning_effort_profile(self) -> str:
         model_path = self.tokenizer_manager.model_path
         if model_path != self._dsv4_reasoning_effort_profile_model_path:
             self._dsv4_reasoning_effort_profile = (
                 self._resolve_dsv4_reasoning_effort_profile(
-                    model_path,
+                    model_path=model_path,
                     revision=self.tokenizer_manager.server_args.revision,
                     override=self._dsv4_reasoning_effort_profile_override,
                 )
