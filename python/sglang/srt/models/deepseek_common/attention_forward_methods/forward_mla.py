@@ -981,7 +981,14 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
         else:
-            if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
+            # rotary_emb=None means NoPE-style MLA (Kimi-K3, skip_rope=True):
+            # there is no rope to fuse into the aiter kernel -- and no cos/sin
+            # cache to feed it -- so keep the plain cat path, same as triton.
+            if (
+                _use_aiter_gfx95
+                and self.current_attention_backend == "aiter"
+                and self.rotary_emb is not None
+            ):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -1274,7 +1281,13 @@ class DeepseekMLAForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
         that calls fused_qk_rope_cat_and_cache_mla).
         """
-        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
+        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
+        # fused kernel to apply; keep both prepare and core on the plain path.
+        return (
+            self.rotary_emb is not None
+            and _use_aiter_gfx95
+            and self.current_attention_backend == "aiter"
+        )
 
 
 # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`

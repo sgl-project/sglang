@@ -286,17 +286,24 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            _valid_heads = self.num_head in (4, 8) or (
+            _valid_heads = self.num_head in (4, 8, 12) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
             assert _valid_heads, (
-                f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
+                f"Aiter MLA supports num_head of 4, 8, 12, or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
             )
             self.num_head_padded = 16 if self.num_head < 16 else self.num_head
             self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
+            # num_head=12 (Kimi-K3 at TP8: 96 attention heads) cannot use the
+            # repeat-interleave head pad below (16/12 is non-integral). Instead
+            # zero-pad q to 16 heads for the aiter MLA kernels and slice the
+            # output back; decode PS metadata is already built from
+            # num_head_padded upstream, so a 16-head q matches the kernel's
+            # work partition.
+            self.mla_head_zero_pad = self.num_head == 12
 
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -765,12 +772,36 @@ class AiterAttnBackend(AttentionBackend):
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
             return o[:, :: self.head_repeat_factor, :]
         else:
+            if self.mla_head_zero_pad:
+                # 12 -> 16 heads: zero-pad q, run the decode kernel at 16
+                # heads (metadata is built from num_head_padded), slice the
+                # 12 real heads back out. Strided slice return mirrors the
+                # repeat-interleave branch -- no extra copy kernel.
+                q_zp = q.new_zeros((q.shape[0], self.num_head_padded, q.shape[-1]))
+                q_zp[:, : layer.tp_q_head_num, :] = q
+                o = q.new_empty(
+                    (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                )
+                mla_decode_fwd(q_zp, k_buffer_flat, o, **kwargs)
+                return o[:, : layer.tp_q_head_num, :]
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
             mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
             return o
+
+    def _zero_pad_mla_q_heads(
+        self, q: torch.Tensor, layer: RadixAttention
+    ) -> torch.Tensor:
+        """Zero-pad q heads num_head -> num_head_padded (12 -> 16) for the
+        aiter MLA prefill kernels. Input/return are 3-D (T, H, D); the extra
+        heads compute garbage outputs that are sliced away after the kernel."""
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_pad = q3.new_zeros((q3.shape[0], self.num_head_padded, q3.shape[-1]))
+        q_pad[:, : layer.tp_q_head_num, :] = q3
+        return q_pad
 
     def mla_fp8_prefill_attn(
         self,
@@ -1298,7 +1329,12 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = None
                 fp8_prefill_kv_indices = None
 
-                if _use_fp8_prefill_attn:
+                # fp8 PS-ASM prefill memory-faults on gfx950 for a 12-head
+                # (zero-pad) model even with tensors and PS metadata fully
+                # consistent at the padded head count; keep it off for them
+                # (bf16 absorbed prefill covers the fast path). Fencing here
+                # also skips the per-batch CPU-sync metadata work.
+                if _use_fp8_prefill_attn and not self.mla_head_zero_pad:
                     tile_q = 256
                     qlen_granularity = tile_q // (self.num_head // self.num_kv_head)
                     (
@@ -2022,7 +2058,7 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if _use_fp8_prefill_attn:
+                    if _use_fp8_prefill_attn and not self.mla_head_zero_pad:
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
@@ -2056,6 +2092,7 @@ class AiterAttnBackend(AttentionBackend):
 
                     if (
                         _use_fp8_prefill_attn
+                        and not self.mla_head_zero_pad
                         and layer.kv_b_proj.weight.dtype == torch.uint8
                     ):
                         # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
@@ -2095,7 +2132,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if _use_fp8_prefill_attn:
+                    if _use_fp8_prefill_attn and not self.mla_head_zero_pad:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
@@ -2111,17 +2148,30 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    if layer.qk_head_dim != layer.v_head_dim:
+                    if self.mla_head_zero_pad:
+                        # 12 heads/rank (Kimi-K3 TP8): zero-pad q to 16 heads,
+                        # run the aiter MLA prefill kernel, slice 12 back.
+                        q_in = self._zero_pad_mla_q_heads(q, layer)
                         o = q.new_empty(
-                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                            (q.shape[0], self.num_head_padded, layer.v_head_dim)
                         )
                     else:
-                        o = torch.empty_like(q)
+                        q_in = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                        if layer.qk_head_dim != layer.v_head_dim:
+                            o = q.new_empty(
+                                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                            )
+                        else:
+                            o = torch.empty_like(q)
 
                     mla_prefill_fwd(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        q_in,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        (
+                            o.view(-1, self.num_head_padded, layer.v_head_dim)
+                            if self.mla_head_zero_pad
+                            else o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                        ),
                         qo_indptr,
                         kv_indptr,
                         kv_indices,
@@ -2131,6 +2181,12 @@ class AiterAttnBackend(AttentionBackend):
                         layer.logit_cap,
                     )
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                    if self.mla_head_zero_pad:
+                        return (
+                            o[:, : layer.tp_q_head_num, :]
+                            .contiguous()
+                            .view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
                 work_metadata = self.forward_metadata.work_metadata
