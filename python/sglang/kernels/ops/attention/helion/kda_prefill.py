@@ -80,15 +80,18 @@ def _l2norm_qk(
 
 _GATE_FIXED_CONFIG = helion.Config(
     block_sizes=[16],
-    loop_orders=[[2, 3, 1, 0]],
+    loop_orders=[[1, 2, 0]],
     num_warps=1,
     num_stages=1,
     indexing="pointer",
 )
 
 
+# Fixed chunks use arithmetic indexing; varlen chunks load sequence metadata.
+# Their generated kernels have different occupancy and cache-policy optima.
 _GATE_VARLEN_CONFIG = helion.Config(
     block_sizes=[16],
+    # The sixth generated load streams the gate tile once per program.
     load_eviction_policies=["", "", "", "", "", "first"] + [""] * 11,
     loop_orders=[[2, 1, 0]],
     num_warps=8,
@@ -119,146 +122,7 @@ def _activate_gate(
     config=_GATE_FIXED_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
-def _gate_cumsum_operands_fixed(
-    g: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    beta: torch.Tensor,
-    a_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    gate_scale: float,
-    q_scale: float,
-    lower_bound: float,
-    activate: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
-    has_bias: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
-    use_lower_bound: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Compute cumulative gates and rounded Q/K operands in one pass."""
-    B = g.size(0)
-    T = g.size(1)
-    H = hl.specialize(g.size(2))
-    K = hl.specialize(g.size(3))
-    chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
-    hl.specialize(
-        (
-            g.stride(1),
-            g.stride(2),
-            g.stride(3),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            beta.stride(1),
-            beta.stride(2),
-            a_log.stride(0),
-            dt_bias.stride(0),
-        )
-    )
-
-    out = torch.empty_like(g, dtype=torch.float32)
-    qg = torch.empty_like(q)
-    wk = torch.empty_like(k)
-    kg = torch.empty_like(k)
-    chunk_decay = torch.empty(
-        [B * chunks, H, K],
-        dtype=torch.float32,
-        device=g.device,
-    )
-    g_rows = g.view(B * T * H, K)
-    q_rows = q.view(B * T * H, K)
-    k_rows = k.view(B * T * H, K)
-    beta_rows = beta.view(B * T * H)
-    out_rows = out.view(B * T * H, K)
-    qg_rows = qg.view(B * T * H, K)
-    wk_rows = wk.view(B * T * H, K)
-    kg_rows = kg.view(B * T * H, K)
-    block_k = hl.register_block_size(16, K)
-
-    for tile_b, tile_chunk, tile_h, tile_k in hl.tile(
-        [B, chunks, H, K],
-        block_size=[1, 1, 1, block_k],
-    ):
-        time = hl.arange(64)
-        token = tile_chunk.id * CHUNK_SIZE + time
-        valid = token < T
-        row = (tile_b.id * T + token) * H + tile_h.id
-        value = hl.load(
-            g_rows,
-            [row[:, None], tile_k.index[None, :]],
-            extra_mask=valid[:, None],
-        ).float()
-        if activate:
-            if has_bias:
-                value = value + dt_bias[tile_h.id * K + tile_k.index].float()[None, :]
-            value = _activate_gate(
-                value,
-                a_log[tile_h.id],
-                lower_bound,
-                use_lower_bound,
-            )
-        value = torch.where(valid[:, None], value, 0.0)
-        value = torch.cumsum(value, dim=0) * gate_scale
-        q_value = hl.load(
-            q_rows,
-            [row[:, None], tile_k.index[None, :]],
-            extra_mask=valid[:, None],
-        ).float()
-        k_value = hl.load(
-            k_rows,
-            [row[:, None], tile_k.index[None, :]],
-            extra_mask=valid[:, None],
-        ).float()
-        beta_value = hl.load(beta_rows, [row], extra_mask=valid).float()
-        last_gate = torch.where(time[:, None] == 63, value, 0.0).sum(0)
-        gate_value = torch.exp2(value)
-        global_chunk = tile_b.id * chunks + tile_chunk.id
-        hl.store(
-            out_rows,
-            [row[:, None], tile_k.index[None, :]],
-            value,
-            extra_mask=valid[:, None],
-        )
-        hl.store(
-            qg_rows,
-            [row[:, None], tile_k.index[None, :]],
-            (q_value * q_scale * gate_value).to(q.dtype),
-            extra_mask=valid[:, None],
-        )
-        hl.store(
-            wk_rows,
-            [row[:, None], tile_k.index[None, :]],
-            (k_value * beta_value[:, None] * gate_value).to(k.dtype),
-            extra_mask=valid[:, None],
-        )
-        hl.store(
-            kg_rows,
-            [row[:, None], tile_k.index[None, :]],
-            (k_value * torch.exp2(last_gate[None, :] - value)).to(k.dtype),
-            extra_mask=valid[:, None],
-        )
-        hl.store(
-            chunk_decay,
-            [global_chunk, tile_h.id, tile_k.index],
-            torch.exp2(last_gate),
-        )
-
-    return out, qg, wk, kg, chunk_decay
-
-
-@helion.kernel(
-    static_shapes=False,
-    config=_GATE_VARLEN_CONFIG,
-    ignore_warnings=_IGNORED_WARNINGS,
-)
-def _gate_cumsum_operands_varlen(
+def _gate_cumsum_operands(
     g: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -273,6 +137,7 @@ def _gate_cumsum_operands_varlen(
     activate: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
     has_bias: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
     use_lower_bound: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
+    is_varlen: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -280,11 +145,13 @@ def _gate_cumsum_operands_varlen(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Packed cumulative gates with rounded Q/K operands."""
+    """Compute cumulative gates and rounded Q/K operands in one pass."""
+    B = g.size(0)
     T = g.size(1)
     H = hl.specialize(g.size(2))
     K = hl.specialize(g.size(3))
-    chunks = chunk_indices.size(0)
+    chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
+    total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
     hl.specialize(
         (
             g.stride(1),
@@ -311,29 +178,35 @@ def _gate_cumsum_operands_varlen(
     wk = torch.empty_like(k)
     kg = torch.empty_like(k)
     chunk_decay = torch.empty(
-        [chunks, H, K],
+        [total_chunks, H, K],
         dtype=torch.float32,
         device=g.device,
     )
-    g_rows = g.view(T * H, K)
-    q_rows = q.view(T * H, K)
-    k_rows = k.view(T * H, K)
-    beta_rows = beta.view(T * H)
-    out_rows = out.view(T * H, K)
-    qg_rows = qg.view(T * H, K)
-    wk_rows = wk.view(T * H, K)
-    kg_rows = kg.view(T * H, K)
+    g_rows = g.view(B * T * H, K)
+    q_rows = q.view(B * T * H, K)
+    k_rows = k.view(B * T * H, K)
+    beta_rows = beta.view(B * T * H)
+    out_rows = out.view(B * T * H, K)
+    qg_rows = qg.view(B * T * H, K)
+    wk_rows = wk.view(B * T * H, K)
+    kg_rows = kg.view(B * T * H, K)
     block_k = hl.register_block_size(16, K)
 
     for tile_chunk, tile_h, tile_k in hl.tile(
-        [chunks, H, K],
+        [total_chunks, H, K],
         block_size=[1, 1, block_k],
     ):
+        if is_varlen:
+            sequence = chunk_indices[tile_chunk.id, 0].long()
+            local_chunk = chunk_indices[tile_chunk.id, 1].long()
+            begin = cu_seqlens[sequence].long()
+            end = cu_seqlens[sequence + 1].long()
+        else:
+            sequence = tile_chunk.id // chunks_per_batch
+            local_chunk = tile_chunk.id % chunks_per_batch
+            begin = sequence * T
+            end = begin + T
         time = hl.arange(64)
-        sequence = chunk_indices[tile_chunk.id, 0].long()
-        local_chunk = chunk_indices[tile_chunk.id, 1].long()
-        begin = cu_seqlens[sequence].long()
-        end = cu_seqlens[sequence + 1].long()
         token = begin + local_chunk * CHUNK_SIZE + time
         valid = token < end
         row = token * H + tile_h.id
@@ -399,6 +272,13 @@ def _gate_cumsum_operands_varlen(
     return out, qg, wk, kg, chunk_decay
 
 
+_gate_cumsum_operands_varlen = helion.kernel(
+    static_shapes=False,
+    config=_GATE_VARLEN_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)(_gate_cumsum_operands.fn)
+
+
 def gate_chunk_cumsum_operands(
     g: torch.Tensor,
     q: torch.Tensor,
@@ -435,34 +315,27 @@ def gate_chunk_cumsum_operands(
     use_lower_bound = lower_bound is not None
     lower_bound_value = 0.0 if lower_bound is None else lower_bound
 
-    if cu_seqlens is None:
-        return _gate_cumsum_operands_fixed(
-            g,
-            q,
-            k,
-            beta,
-            flat_a_log,
-            flat_bias,
-            gate_scale,
-            q_scale,
-            lower_bound_value,
-            activate,
-            has_bias,
-            use_lower_bound,
-        )
+    is_varlen = cu_seqlens is not None
+    if is_varlen:
+        if g.size(0) != 1:
+            raise ValueError("varlen KDA requires batch size 1")
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+        metadata = cu_seqlens
+        gate_kernel = _gate_cumsum_operands_varlen
+    else:
+        metadata = torch.empty(0, device=g.device, dtype=torch.int32)
+        chunk_indices = torch.empty(0, 2, device=g.device, dtype=torch.long)
+        gate_kernel = _gate_cumsum_operands
 
-    if g.size(0) != 1:
-        raise ValueError("varlen KDA requires batch size 1")
-    if chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-    return _gate_cumsum_operands_varlen(
+    return gate_kernel(
         g,
         q,
         k,
         beta,
         flat_a_log,
         flat_bias,
-        cu_seqlens,
+        metadata,
         chunk_indices,
         gate_scale,
         q_scale,
@@ -470,6 +343,7 @@ def gate_chunk_cumsum_operands(
         activate,
         has_bias,
         use_lower_bound,
+        is_varlen,
     )
 
 
@@ -558,6 +432,12 @@ def _intra_matrices_wide(
         col = col_token * H + tile_h.id
         anchor_token = chunk_begin + tile_row_block.id * 16
         anchor = anchor_token * H + tile_h.id
+        # Varlen ``end`` is a loaded scalar tensor; fixed ``end`` is symbolic.
+        if is_varlen:
+            diag_anchor_token = torch.minimum(anchor_token + 8, end - 1)
+        else:
+            diag_anchor_token = min(anchor_token + 8, end - 1)
+        diag_anchor = diag_anchor_token * H + tile_h.id
         aqk_off = hl.zeros([16, 64], dtype=torch.float32)
         akk_off = hl.zeros([16, 64], dtype=torch.float32)
         aqk_diag = hl.zeros([16, 16], dtype=torch.float32)
@@ -584,6 +464,11 @@ def _intra_matrices_wide(
                 [anchor, tile_k.index],
                 extra_mask=anchor_token < end,
             ).float()
+            g_diag_anchor = hl.load(
+                g_rows,
+                [diag_anchor, tile_k.index],
+                extra_mask=diag_anchor_token < end,
+            ).float()
             if tile_row_block.id > 0:
                 k_col = hl.load(
                     k_rows,
@@ -601,7 +486,11 @@ def _intra_matrices_wide(
                     g_anchor[None, :] - g_col,
                     0.0,
                 )
-                off_row_factor = torch.exp2(g_row - g_anchor[None, :])
+                off_row_delta = g_row - g_anchor[None, :]
+                # Masked rows load zero; cap only their positive overflow edge.
+                # Valid KDA cumulative gates are non-increasing in each chunk.
+                off_row_delta = torch.clamp(off_row_delta, max=126.0)
+                off_row_factor = torch.exp2(off_row_delta)
                 q_off = (q_row * off_row_factor).to(torch.bfloat16)
                 k_off = (k_row * off_row_factor).to(torch.bfloat16)
                 k_col_off = (k_col * torch.exp2(off_col_delta)).to(torch.bfloat16)
@@ -619,14 +508,15 @@ def _intra_matrices_wide(
                 )
 
             diag_delta = torch.clamp(
-                g_row - g_anchor[None, :],
+                g_row - g_diag_anchor[None, :],
                 -126.0,
                 126.0,
             )
             diag_forward_factor = torch.exp2(diag_delta)
+            diag_backward_factor = torch.exp2(-diag_delta)
             q_diag = q_row * diag_forward_factor
             k_diag_fwd = k_row * diag_forward_factor
-            k_diag_bwd = k_row * torch.exp2(-diag_delta)
+            k_diag_bwd = k_row * diag_backward_factor
             aqk_diag = hl.dot(
                 q_diag,
                 k_diag_bwd.T,
@@ -804,6 +694,8 @@ def _intra_solve_recompute(
     V = hl.specialize(v.size(3))
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
+    # Each CTA owns one (chunk, head) and loads a complete column tile before
+    # overwriting it, so these output aliases do not introduce cross-CTA races.
     w = wk
     u = v
     akk_rows = akk.view(B * T * H, CHUNK_SIZE)
@@ -1305,6 +1197,8 @@ def _chunk_output(
     out_rows = out.view(B * T * H, V)
     block_v = hl.register_block_size(32, V)
 
+    # ``out`` may alias ``v_new``. Each CTA loads its complete input tile before
+    # overwriting that same tile, and no other CTA reads it.
     for tile_chunk, tile_h, tile_v in hl.tile(
         [total_chunks, H, V],
         block_size=[1, 1, block_v],
