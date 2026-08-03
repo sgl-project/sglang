@@ -40,13 +40,13 @@ class DFlashVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
-    num_tokens_per_req: int = -1
+    num_tokens_per_req: Optional[int] = None
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
-        if self.num_tokens_per_req == -1:
+        if self.num_tokens_per_req is None:
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
