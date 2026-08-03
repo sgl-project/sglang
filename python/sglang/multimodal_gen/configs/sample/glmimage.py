@@ -40,11 +40,11 @@ class GlmImageSamplingParams(SamplingParams):
 
 
 def align_glm_image_dimension(value: int) -> int:
-    """Round a GLM-Image dimension to the nearest supported multiple."""
-    half_alignment = GLM_IMAGE_RESOLUTION_ALIGNMENT // 2
+    """Round a GLM-Image dimension up to a supported multiple."""
     return max(
         GLM_IMAGE_RESOLUTION_ALIGNMENT,
-        ((value + half_alignment) // GLM_IMAGE_RESOLUTION_ALIGNMENT)
+        (value + GLM_IMAGE_RESOLUTION_ALIGNMENT - 1)
+        // GLM_IMAGE_RESOLUTION_ALIGNMENT
         * GLM_IMAGE_RESOLUTION_ALIGNMENT,
     )
 

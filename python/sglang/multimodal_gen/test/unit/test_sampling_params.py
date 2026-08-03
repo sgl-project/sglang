@@ -89,7 +89,7 @@ class TestSamplingParamsValidate(unittest.TestCase):
 
 
 class TestSamplingParamsSubclass(unittest.TestCase):
-    def test_glm_image_rounds_resolution_to_nearest_multiple_of_32(self):
+    def test_glm_image_rounds_resolution_up_to_multiple_of_32(self):
         server_args = SimpleNamespace(
             pipeline_config=GlmImagePipelineConfig(),
             output_path=None,
@@ -99,7 +99,8 @@ class TestSamplingParamsSubclass(unittest.TestCase):
             ((500, 500), (512, 512)),
             ((1024, 600), (1024, 608)),
             ((500, 600), (512, 608)),
-            ((550, 1009), (544, 1024)),
+            ((550, 1009), (576, 1024)),
+            ((1280, 720), (1280, 736)),
         ]
 
         for requested, expected in cases:
@@ -125,8 +126,12 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     expected[1],
                 )
 
-    def test_glm_image_resolution_ties_round_up(self):
+    def test_glm_image_resolution_rounds_up(self):
         self.assertEqual(align_glm_image_dimension(560), 576)
+
+    def test_glm_image_resolution_keeps_minimum_alignment(self):
+        self.assertEqual(align_glm_image_dimension(0), 32)
+        self.assertEqual(align_glm_image_dimension(-1), 32)
 
     def test_glm_image_does_not_warn_for_aligned_resolution(self):
         server_args = SimpleNamespace(

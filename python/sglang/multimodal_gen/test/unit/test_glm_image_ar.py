@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -111,7 +112,8 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
         )
         cases = [
             ((500, 500), (512, 512)),
-            ((550, 1009), (544, 1024)),
+            ((550, 1009), (576, 1024)),
+            ((1280, 720), (1280, 736)),
         ]
 
         for requested, expected in cases:
@@ -135,6 +137,39 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
                     width=expected[0],
                     server_args=self._server_args(),
                 )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.load_image",
+        return_value=Image.new("RGB", (1280, 720)),
+    )
+    def test_forward_resizes_edit_image_up_to_d32_grid(
+        self, _mock_load_image, _mock_device
+    ):
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        stage.generate_prior_tokens = MagicMock(
+            return_value=(torch.zeros((1, 1), dtype=torch.long), None)
+        )
+        sampling = GlmImageSamplingParams(
+            prompt="Edit this image",
+            width=1280,
+            height=720,
+            image_path="input.png",
+        )
+        sampling.seed = None
+        batch = Req(sampling_params=sampling)
+
+        stage.forward(batch, self._server_args())
+
+        call_kwargs = stage.generate_prior_tokens.call_args.kwargs
+        self.assertEqual((batch.width, batch.height), (1280, 736))
+        self.assertEqual(call_kwargs["image"][0].size, (1280, 736))
+        self.assertEqual((call_kwargs["width"], call_kwargs["height"]), (1280, 736))
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."

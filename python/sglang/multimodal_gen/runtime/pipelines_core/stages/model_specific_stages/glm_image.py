@@ -121,6 +121,15 @@ def image_path_to_list(image_path: Union[str, List[str]]) -> List[str]:
     return image_path if isinstance(image_path, list) else [image_path]
 
 
+def resize_glm_image_to_alignment(image: PIL.Image.Image) -> PIL.Image.Image:
+    """Resize an image up so both dimensions use GLM-Image's D32 grid."""
+    width, height = image.size
+    aligned_width, aligned_height = align_glm_image_resolution(width, height)
+    if (aligned_width, aligned_height) == (width, height):
+        return image
+    return image.resize((aligned_width, aligned_height), PIL.Image.Resampling.LANCZOS)
+
+
 def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
     pooler_output = getattr(image_features, "pooler_output", None)
     if pooler_output is not None:
@@ -409,7 +418,7 @@ class GlmImageAR(PipelineStage):
         width = batch.width
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path)
+                resize_glm_image_to_alignment(load_image(img_path))
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -789,7 +798,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path)
+                resize_glm_image_to_alignment(load_image(img_path))
                 for img_path in image_path_to_list(batch.image_path)
             ]
         else:
@@ -860,9 +869,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     if isinstance(img, PIL.Image.Image)
                     else img.shape[:2]
                 )
-                multiple_of = self.vae_scale_factor * self.transformer.config.patch_size
-                image_height = (image_height // multiple_of) * multiple_of
-                image_width = (image_width // multiple_of) * multiple_of
+                image_width, image_height = align_glm_image_resolution(
+                    image_width, image_height
+                )
                 img = self.image_processor.preprocess(
                     img, height=image_height, width=image_width
                 )
