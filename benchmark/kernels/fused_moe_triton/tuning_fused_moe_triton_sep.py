@@ -28,6 +28,7 @@ try:
 except Exception:  # ray's tqdm needs a ray context; fall back to plain tqdm.
     from tqdm import tqdm
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
@@ -243,6 +244,14 @@ def benchmark_config(
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
+    # The weights allocated below are private to this call, so nothing cached from
+    # a previous config can ever be reused; release it before we add to the
+    # allocator's footprint. Each stale entry pins a dead w1/w2 (~420 MiB per
+    # config for DeepSeek-OCR, >13 GiB once the 64-entry LRU fills), which on a
+    # 24 GiB card starves graph capture as UR_RESULT_ERROR_OUT_OF_RESOURCES a few
+    # hundred configs in. Clearing is ~4.5us to rebuild vs ~3.4us to look up,
+    # against milliseconds of measured kernel time.
+    clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:

@@ -676,6 +676,19 @@ _B_DESC_CACHE_MAX = 64
 _B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
+def clear_b_tma_desc_cache() -> None:
+    """Drop all cached B TensorDescriptors.
+
+    A TensorDescriptor holds its base tensor by strong reference, so a cached
+    entry keeps that weight resident. During serving the weights live for the
+    process lifetime and this never matters, but a caller that allocates fresh
+    weights repeatedly (the MoE tuner sweeps one weight set per config) leaves
+    behind entries pinning dead weights -- enough to starve large allocations
+    such as graph capture.
+    """
+    _B_DESC_CACHE.clear()
+
+
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
