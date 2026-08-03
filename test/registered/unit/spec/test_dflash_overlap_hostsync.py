@@ -231,6 +231,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            model_config=SimpleNamespace(context_len=2048),
         )
         return HybridAttnBackend(runner, backend(prefill_flag), backend(decode_flag))
 
@@ -255,10 +256,9 @@ class TestFilterBatchHostIndices(CustomTestCase):
 
         keep = [0, 2]
         a, b = make(), make()
-        a.filter_batch(new_indices=torch.tensor(keep), has_been_filtered=False)
+        a.filter_batch(new_indices=torch.tensor(keep))
         b.filter_batch(
             new_indices=torch.tensor(keep),
-            has_been_filtered=False,
             new_indices_cpu=keep,
         )
         torch.testing.assert_close(a.reserved_seq_lens_cpu, b.reserved_seq_lens_cpu)

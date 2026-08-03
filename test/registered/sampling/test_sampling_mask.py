@@ -102,8 +102,12 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             }
         )
+        # The mask keeps at most top_k tokens, plus possibly the actually
+        # sampled token when the sampling kernel picks one just outside the
+        # mask's topk reconstruction (fp cumsum divergence); see
+        # Sampler._attach_sampling_mask_to_output.
         for sampling_mask in top_p_sampling_masks:
-            self.assertLessEqual(len(sampling_mask), _TOP_K)
+            self.assertLessEqual(len(sampling_mask), _TOP_K + 1)
 
         top_k_sampling_masks = self._generate_sampling_masks(
             {
@@ -114,7 +118,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_sampling_masks:
-            self.assertEqual(len(sampling_mask), _TOP_K)
+            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
 
         top_k_top_p_one_sampling_masks = self._generate_sampling_masks(
             {
@@ -126,7 +130,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
-            self.assertEqual(len(sampling_mask), _TOP_K)
+            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
 
     def test_sampling_mask_matches_topk_logprobs(self):
         """Check the returned mask and its renormalized logprobs.

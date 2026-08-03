@@ -173,20 +173,10 @@ class QueueMetrics(msgspec.Struct, array_like=True):
     retracted: int
 
 
-_CORE_KEYS = (
-    "timestamp",
-    "dp_rank",
-    "num_running_reqs",
-    "num_waiting_reqs",
-    "num_waiting_uncached_tokens",
-    "num_used_tokens",
-    "num_total_tokens",
-    "max_total_num_tokens",
-    "max_running_requests",
-    "token_usage",
-    "gen_throughput",
-    "cache_hit_rate",
-    "utilization",
+# LoadSnapshot's nested sub-struct fields; every other struct field is a flat
+# scalar returned under "core".
+_SECTION_FIELDS = frozenset(
+    {"memory", "speculative", "lora", "disaggregation", "queues"}
 )
 
 
@@ -200,12 +190,20 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_waiting_uncached_tokens: int = 0
     num_used_tokens: int = 0
     num_total_tokens: int = 0
+    # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
+    # outside disaggregated decode).
+    num_active_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     utilization: float = 0.0
+    # cumulative counters
+    total_prefill_uncached_tokens: int = 0
+    total_prefill_busy_us: int = 0
+    # Decode step-time moment sums
+    decode_moments: Optional[list[float]] = None
 
     memory: Optional[MemoryMetrics] = None
     speculative: Optional[SpeculativeMetrics] = None
@@ -244,6 +242,12 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             load[field] = msgspec.structs.asdict(section)
 
         return load
+
+
+# Flat scalar fields returned under "core": every struct field but the sections.
+_CORE_KEYS = tuple(
+    f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
+)
 
 
 def _enc_hook(obj):

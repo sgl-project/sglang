@@ -23,6 +23,14 @@ jobs:
           python -m pip install pre-commit
           pre-commit install
 
+      # The clippy-rust-workspace pre-commit hook compiles the rust/ workspace
+      # (debug profile); cache cargo registry + target across runs.
+      - name: Rust cache (rust/ workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: "rust-workspace-lint"
+
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
@@ -51,7 +59,7 @@ jobs:
       - name: Run sgl-kernel clang-format checks
         uses: DoozyX/clang-format-lint-action@v0.20
         with:
-          source: sgl-kernel
+          source: python/sglang/kernels/aot
           extensions: h,c,cpp,hpp,cu,cuh,cc
           clangFormatVersion: 20
           style: file
