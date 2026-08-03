@@ -224,6 +224,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_symm_a2a_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -274,6 +275,68 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_symm_a2a_workspace(self):
+        """Allocate direct DCP A2A symmetric memory before graph capture."""
+        mr = self.model_runner
+        parallel = get_parallel()
+        if mr.server_args.dcp_size <= 1 or parallel.dcp_comm_backend != "symm_a2a":
+            return
+
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            can_use_custom_all_reduce_v2,
+        )
+        from sglang.srt.distributed.parallel_state import in_the_same_node_as
+        from sglang.srt.layers.dcp import (
+            estimate_symm_a2a_workspace_nbytes,
+            init_symm_a2a_workspace,
+        )
+
+        cp_group = parallel.dcp_group
+        device = torch.device(f"cuda:{mr.gpu_id}")
+        custom_ar_supported = can_use_custom_all_reduce_v2(cp_group.cpu_group, device)
+        same_node = all(in_the_same_node_as(cp_group.cpu_group, source_rank=0))
+        if not custom_ar_supported or not same_node:
+            raise RuntimeError(
+                "symm_a2a requires a supported single-node NVLink topology; "
+                "use --dcp-comm-backend a2a or ag_rs instead"
+            )
+
+        head_dim = getattr(mr.model_config, "kv_lora_rank", None)
+        if head_dim is None:
+            raise RuntimeError(
+                "symm_a2a MLA workspace requires model_config.kv_lora_rank"
+            )
+        heads_per_rank = mr.model_config.get_num_attention_heads(parallel.attn_tp_size)
+        max_num_tokens = max(
+            self._eager_max_bs * self._eager_num_tokens_per_req,
+            mr.max_decode_logits_rows(),
+        )
+        num_ubatches = 1  # TBO x DCP is not enabled yet.
+
+        workspace_bytes = estimate_symm_a2a_workspace_nbytes(
+            world_size=cp_group.world_size,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=mr.dtype,
+            num_ubatches=num_ubatches,
+        )
+        if workspace_bytes > 512 * 1024**2:
+            logger.warning(
+                "symm_a2a workspace estimate is %.1f MiB (over 512 MiB)",
+                workspace_bytes / 1024**2,
+            )
+
+        init_symm_a2a_workspace(
+            cp_group,
+            device=device,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=mr.dtype,
+            num_ubatches=num_ubatches,
+        )
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.

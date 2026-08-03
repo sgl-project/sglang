@@ -21,7 +21,7 @@ PR #25090 vs #14194):
 """
 
 import warnings
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -35,7 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_buffer, get_context, get_parallel
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -372,6 +372,433 @@ def all_gather_kv_cache_for_dcp(
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
 
+_SYMM_A2A_WORKSPACE_KEY = "dcp_symm_a2a_workspace"
+
+
+def _align16(value: int) -> int:
+    return (value + 15) // 16 * 16
+
+
+def _shape_nbytes(shape, dtype: torch.dtype) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return numel * torch.empty((), dtype=dtype).element_size()
+
+
+class _SymmA2AWorkspaceLayout(NamedTuple):
+    output_shape: tuple[int, ...]
+    output_nbytes: int
+    lse_shape: tuple[int, ...]
+    lse_offset: int
+    lse_nbytes: int
+    signal_shape: tuple[int, ...]
+    signal_offset: int
+    signal_nbytes: int
+    slab_nbytes: int
+
+
+def _symm_a2a_workspace_layout(
+    *,
+    world_size: int,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int,
+) -> _SymmA2AWorkspaceLayout:
+    """Build the aligned layout for the peer-mapped symmetric slab only."""
+    output_shape = (
+        num_ubatches,
+        2,
+        world_size,
+        max_num_tokens,
+        heads_per_rank,
+        head_dim,
+    )
+    lse_shape = (
+        num_ubatches,
+        2,
+        world_size,
+        max_num_tokens,
+        heads_per_rank,
+    )
+    signal_shape = (num_ubatches, 2, world_size)
+    output_nbytes = _shape_nbytes(output_shape, dtype)
+    lse_offset = _align16(output_nbytes)
+    lse_nbytes = _shape_nbytes(lse_shape, torch.float32)
+    signal_offset = _align16(lse_offset + lse_nbytes)
+    signal_nbytes = _shape_nbytes(signal_shape, torch.int64)
+    return _SymmA2AWorkspaceLayout(
+        output_shape=output_shape,
+        output_nbytes=output_nbytes,
+        lse_shape=lse_shape,
+        lse_offset=lse_offset,
+        lse_nbytes=lse_nbytes,
+        signal_shape=signal_shape,
+        signal_offset=signal_offset,
+        signal_nbytes=signal_nbytes,
+        slab_nbytes=_align16(signal_offset + signal_nbytes),
+    )
+
+
+def estimate_symm_a2a_workspace_nbytes(
+    *,
+    world_size: int,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int = 1,
+) -> int:
+    """Return total workspace bytes: symmetric slab plus local persistent tensors."""
+    layout = _symm_a2a_workspace_layout(
+        world_size=world_size,
+        max_num_tokens=max_num_tokens,
+        heads_per_rank=heads_per_rank,
+        head_dim=head_dim,
+        dtype=dtype,
+        num_ubatches=num_ubatches,
+    )
+    combined_output_nbytes = _shape_nbytes(
+        (num_ubatches, max_num_tokens, heads_per_rank, head_dim), dtype
+    )
+    epoch_nbytes = _shape_nbytes((num_ubatches,), torch.int64)
+    pointer_tables_nbytes = 3 * _shape_nbytes(
+        (num_ubatches, world_size), torch.int64
+    )
+    return (
+        layout.slab_nbytes
+        + combined_output_nbytes
+        + epoch_nbytes
+        + pointer_tables_nbytes
+    )
+
+
+class DirectSymmA2AWorkspace:
+    """Persistent, per-ubatch symmetric-memory workspace for direct DCP A2A."""
+
+    def __init__(
+        self,
+        cp_group: "GroupCoordinator",
+        device: torch.device,
+        max_num_tokens: int,
+        heads_per_rank: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        num_ubatches: int = 1,
+    ) -> None:
+        if cp_group.world_size <= 1:
+            raise ValueError("DirectSymmA2AWorkspace requires dcp world_size > 1")
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be greater than 0")
+        if heads_per_rank <= 0:
+            raise ValueError("heads_per_rank must be greater than 0")
+        if head_dim <= 0 or head_dim % 8 != 0:
+            raise ValueError("head_dim must be positive and divisible by 8")
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise TypeError("dtype must be torch.float16 or torch.bfloat16")
+        if num_ubatches <= 0:
+            raise ValueError("num_ubatches must be greater than 0")
+
+        self.cp_group = cp_group
+        self.device = torch.device(device)
+        self.world_size = cp_group.world_size
+        self.rank = cp_group.rank_in_group
+        self.max_num_tokens = max_num_tokens
+        self.heads_per_rank = heads_per_rank
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.num_ubatches = num_ubatches
+        # The symmetric-memory storage, rendezvous handles and all peer views
+        # must outlive every captured kernel that dereferences their pointers.
+        self._allocations = []
+
+        layout = _symm_a2a_workspace_layout(
+            world_size=self.world_size,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=dtype,
+            num_ubatches=num_ubatches,
+        )
+        storage, handle, peer_slabs = self._allocate_slab(layout.slab_nbytes)
+        self._allocations.append((storage, handle, peer_slabs))
+        self.received_output = self._slice_region(
+            storage, 0, layout.output_nbytes, dtype, layout.output_shape
+        )
+        self.received_lse = self._slice_region(
+            storage,
+            layout.lse_offset,
+            layout.lse_nbytes,
+            torch.float32,
+            layout.lse_shape,
+        )
+        self.received_signal = self._slice_region(
+            storage,
+            layout.signal_offset,
+            layout.signal_nbytes,
+            torch.int64,
+            layout.signal_shape,
+        )
+        peer_output = [
+            self._slice_region(view, 0, layout.output_nbytes, dtype, layout.output_shape)
+            for view in peer_slabs
+        ]
+        peer_lse = [
+            self._slice_region(
+                view,
+                layout.lse_offset,
+                layout.lse_nbytes,
+                torch.float32,
+                layout.lse_shape,
+            )
+            for view in peer_slabs
+        ]
+        peer_signal = [
+            self._slice_region(
+                view,
+                layout.signal_offset,
+                layout.signal_nbytes,
+                torch.int64,
+                layout.signal_shape,
+            )
+            for view in peer_slabs
+        ]
+        self.peer_output_ptrs = self._peer_pointer_table(peer_output, num_ubatches)
+        self.peer_lse_ptrs = self._peer_pointer_table(peer_lse, num_ubatches)
+        self.peer_signal_ptrs = self._peer_pointer_table(peer_signal, num_ubatches)
+        self.epoch = torch.zeros(num_ubatches, dtype=torch.int64, device=self.device)
+        self.combined_output = torch.empty(
+            (num_ubatches, max_num_tokens, heads_per_rank, head_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+
+    @property
+    def geometry(self):
+        return (
+            self.cp_group.device_group.group_name,
+            self.cp_group.cpu_group.group_name,
+            self.world_size,
+            self.rank,
+            self.device,
+            self.max_num_tokens,
+            self.heads_per_rank,
+            self.head_dim,
+            self.dtype,
+            self.num_ubatches,
+        )
+
+    @staticmethod
+    def _slice_region(storage, offset, nbytes, dtype, shape):
+        return storage[offset : offset + nbytes].view(dtype).view(shape)
+
+    def _allocate_slab(self, total_bytes: int):
+        allocation = None
+        local_error = None
+        try:
+            allocation = self._allocate_slab_plan_b(total_bytes)
+        except Exception as error:
+            local_error = error
+
+        local_success = False
+        if allocation is not None:
+            try:
+                storage, _, peer_slabs = allocation
+                storage.zero_()
+                torch.cuda.synchronize(self.device)
+                local_success = self._peer_views_are_valid(peer_slabs)
+            except Exception as error:
+                local_error = error
+
+        # Every rank reaches the same CPU collective even when local allocation,
+        # peer mapping, zeroing, or synchronization fails. This prevents a rank
+        # that returned an exception from leaving its peers blocked in a later
+        # barrier or workspace initialization step.
+        status = torch.tensor(
+            [int(local_success)],
+            dtype=torch.int32,
+            device="cpu",
+        )
+        torch.distributed.all_reduce(
+            status,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.cp_group.cpu_group,
+        )
+        if not status.item():
+            raise RuntimeError(
+                "DCP symmetric-memory allocation or peer mapping failed on at "
+                "least one DCP rank; "
+                "use --dcp-comm-backend a2a on unsupported topologies"
+            ) from local_error
+        assert allocation is not None
+        return allocation
+
+    def _allocate_slab_plan_b(self, total_bytes: int):
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            _allocate_symmetric_memory,
+        )
+
+        storage, handle = _allocate_symmetric_memory(
+            total_bytes,
+            device=self.device,
+            group=self.cp_group.cpu_group,
+        )
+        peer_slabs = []
+        for peer in range(self.world_size):
+            try:
+                peer_slabs.append(handle.get_buffer(peer, [total_bytes], torch.uint8))
+            except Exception:
+                # Preserve the same collective sequence on every rank. The
+                # sentinel is rejected only after the group-wide CPU verdict.
+                peer_slabs.append(None)
+        return storage, handle, peer_slabs
+
+    def _peer_views_are_valid(self, views) -> bool:
+        if len(views) != self.world_size:
+            return False
+        try:
+            return all(view is not None and view.data_ptr() != 0 for view in views)
+        except Exception:
+            return False
+
+    def _peer_pointer_table(self, views, num_ubatches: int) -> torch.Tensor:
+        return torch.tensor(
+            [
+                [view[ubatch].data_ptr() for view in views]
+                for ubatch in range(num_ubatches)
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def lse_reduce(
+        self,
+        attn_out: torch.Tensor,
+        lse: torch.Tensor,
+        is_lse_base_on_e: bool = True,
+        ubatch_id: int = 0,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not isinstance(ubatch_id, int) or not 0 <= ubatch_id < self.num_ubatches:
+            raise ValueError(
+                f"ubatch_id must be in [0, {self.num_ubatches}), got {ubatch_id}"
+            )
+        if len(attn_out.shape) != 3:
+            raise ValueError(
+                "attention output must have shape [tokens, heads, head_dim]"
+            )
+        num_tokens, num_heads, head_dim = attn_out.shape
+        expected_heads = self.world_size * self.heads_per_rank
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"num_tokens {num_tokens} exceeds max_num_tokens {self.max_num_tokens}"
+            )
+        if num_heads != expected_heads:
+            raise ValueError(
+                f"attention heads must equal {expected_heads}, got {num_heads}"
+            )
+        if head_dim != self.head_dim:
+            raise ValueError(f"head_dim must equal {self.head_dim}, got {head_dim}")
+        if attn_out.dtype != self.dtype:
+            raise TypeError(
+                "symm_a2a only supports FP16 and BF16 attention output matching "
+                f"the workspace dtype {self.dtype}; got {attn_out.dtype}. Use "
+                "--dcp-comm-backend a2a when the attention backend emits another "
+                "dtype."
+            )
+        if attn_out.device != self.device:
+            raise ValueError(
+                f"attention output device must be {self.device}, got {attn_out.device}"
+            )
+        if tuple(lse.shape) != (num_tokens, num_heads):
+            raise ValueError(
+                f"LSE shape must be {(num_tokens, num_heads)}, got {tuple(lse.shape)}"
+            )
+        if lse.dtype != torch.float32:
+            raise TypeError("LSE dtype must be float32")
+        if lse.device != self.device:
+            raise ValueError(f"LSE device must be {self.device}, got {lse.device}")
+
+        output_shape = (num_tokens, self.heads_per_rank, self.head_dim)
+        if output is None:
+            output = self.combined_output[ubatch_id, :num_tokens]
+        else:
+            if tuple(output.shape) != output_shape:
+                raise ValueError(
+                    f"output shape must be {output_shape}, got {tuple(output.shape)}"
+                )
+            if output.dtype != self.dtype or output.device != self.device:
+                raise ValueError("output must match workspace dtype and device")
+
+        from sgl_kernel import direct_dcp_a2a_lse_reduce
+
+        return direct_dcp_a2a_lse_reduce(
+            partial_output=attn_out,
+            partial_lse=lse,
+            peer_output_ptrs=self.peer_output_ptrs[ubatch_id],
+            peer_lse_ptrs=self.peer_lse_ptrs[ubatch_id],
+            peer_signal_ptrs=self.peer_signal_ptrs[ubatch_id],
+            received_output=self.received_output[ubatch_id],
+            received_lse=self.received_lse[ubatch_id],
+            received_signal=self.received_signal[ubatch_id],
+            epoch=self.epoch[ubatch_id],
+            world_size=self.world_size,
+            rank=self.rank,
+            max_num_tokens=self.max_num_tokens,
+            is_lse_base_on_e=is_lse_base_on_e,
+            combined_output=output,
+        )
+
+
+def init_symm_a2a_workspace(
+    cp_group: "GroupCoordinator",
+    device: torch.device,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int = 1,
+) -> Optional[DirectSymmA2AWorkspace]:
+    """Initialize the direct-DCP workspace before CUDA graph capture."""
+    if cp_group.world_size == 1:
+        return None
+
+    requested_geometry = (
+        cp_group.device_group.group_name,
+        cp_group.cpu_group.group_name,
+        cp_group.world_size,
+        cp_group.rank_in_group,
+        torch.device(device),
+        max_num_tokens,
+        heads_per_rank,
+        head_dim,
+        dtype,
+        num_ubatches,
+    )
+    current = get_context().resources.buffers.get(_SYMM_A2A_WORKSPACE_KEY)
+    if current is not None and current.geometry != requested_geometry:
+        raise RuntimeError(
+            "symm_a2a workspace geometry conflicts with the existing workspace: "
+            f"existing={current.geometry}, requested={requested_geometry}"
+        )
+    workspace = get_buffer(
+        _SYMM_A2A_WORKSPACE_KEY,
+        lambda: DirectSymmA2AWorkspace(
+            cp_group=cp_group,
+            device=device,
+            max_num_tokens=max_num_tokens,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            dtype=dtype,
+            num_ubatches=num_ubatches,
+        ),
+    )
+    if workspace.geometry != requested_geometry:
+        raise RuntimeError("symm_a2a workspace geometry changed during initialization")
+    return workspace
+
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     # Call once per process BEFORE CUDA-graph capture: the FlashInfer init syncs
@@ -445,6 +872,7 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
+    ubatch_id: int = 0,
 ) -> torch.Tensor:
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
@@ -457,6 +885,14 @@ def dcp_a2a_lse_reduce(
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        )
+    if comm_backend == "symm_a2a":
+        return _dcp_symm_a2a_lse_reduce(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            is_lse_base_on_e,
+            ubatch_id=ubatch_id,
         )
 
     N = cp_group.world_size
@@ -533,6 +969,35 @@ def dcp_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
     return combined
+
+
+def _dcp_symm_a2a_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+    ubatch_id: int = 0,
+) -> torch.Tensor:
+    workspace = get_context().resources.buffers.get(_SYMM_A2A_WORKSPACE_KEY)
+    assert workspace is not None, (
+        "symm_a2a workspace not initialized — call init_symm_a2a_workspace(...) "
+        "at model-runner init (before CUDA graph capture)."
+    )
+    if (
+        workspace.cp_group.device_group.group_name != cp_group.device_group.group_name
+        or workspace.cp_group.cpu_group.group_name != cp_group.cpu_group.group_name
+        or workspace.world_size != cp_group.world_size
+        or workspace.rank != cp_group.rank_in_group
+    ):
+        raise RuntimeError(
+            "symm_a2a workspace geometry does not match the active DCP group"
+        )
+    return workspace.lse_reduce(
+        cp_attn_out,
+        cp_attn_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+        ubatch_id=ubatch_id,
+    )
 
 
 def _dcp_fi_a2a_lse_reduce(

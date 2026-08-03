@@ -26,6 +26,7 @@ else:
     from sgl_kernel.attention import (
         cutlass_mla_decode,
         cutlass_mla_get_workspace_size,
+        direct_dcp_a2a_lse_reduce,
         merge_state_v2,
     )
     from sgl_kernel.cutlass_moe import (
@@ -159,6 +160,7 @@ else:
         "copy_to_gpu_no_ce",
         "cutlass_mla_decode",
         "cutlass_mla_get_workspace_size",
+        "direct_dcp_a2a_lse_reduce",
         "dsv4_fused_k_norm_rope_flashmla",
         "dsv4_fused_q_indexer_rope_hadamard_quant",
         "dsv4_fused_q_norm_rope",

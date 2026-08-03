@@ -1056,9 +1056,11 @@ class ServerArgs:
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            "combine), 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72), or 'symm_a2a' "
+            "(direct symmetric-memory All-to-All; requires CUDA and a "
+            "single-node NVLink domain).",
+            choices=["ag_rs", "a2a", "fi_a2a", "symm_a2a"],
             resolvable=True,
         ),
         NS("parallel"),
@@ -1066,7 +1068,7 @@ class ServerArgs:
     dcp_replicate_q_proj: A[
         Optional[bool],
         Arg(
-            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            help="For MLA decode context parallelism with the a2a/fi_a2a/symm_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
@@ -3781,7 +3783,10 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
+        if (
+            self.dcp_comm_backend in ("a2a", "fi_a2a", "symm_a2a")
+            and self.dcp_size <= 1
+        ):
             raise ValueError(
                 f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
                 "decode context-parallel attention reduction and therefore "
@@ -3796,12 +3801,27 @@ class ServerArgs:
                 "authoritative fabric probe runs at model-runner init; use 'a2a' "
                 "or 'ag_rs' on clusters without MNNVL."
             )
+        if self.dcp_comm_backend == "symm_a2a" and not is_cuda():
+            raise ValueError(
+                "--dcp-comm-backend symm_a2a requires an NVIDIA CUDA platform "
+                "with a single-node NVLink domain. The authoritative symmetric-"
+                "memory capability probe runs at model-runner init; use 'a2a' "
+                "or 'ag_rs' on unsupported platforms."
+            )
+        if self.dcp_comm_backend == "symm_a2a" and self.enable_two_batch_overlap:
+            raise ValueError(
+                "--dcp-comm-backend symm_a2a does not yet support "
+                "--enable-two-batch-overlap because concurrent sub-batches require "
+                "independent symmetric-memory epoch and staging slots. Disable TBO "
+                "or use --dcp-comm-backend a2a/ag_rs."
+            )
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:
                 raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a", "symm_a2a"):
                 raise ValueError(
-                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                    "--dcp-replicate-q-proj only applies to the "
+                    "a2a/fi_a2a/symm_a2a DCP "
                     "communication backend (it removes the head-dim Q all-gather); "
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )

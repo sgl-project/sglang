@@ -248,6 +248,7 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/dcp_direct_a2a.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"

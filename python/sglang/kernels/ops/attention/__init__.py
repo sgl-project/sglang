@@ -7,7 +7,18 @@ KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.direct_dcp_a2a_lse_reduce",
+        backend=KernelBackend.AOT,
+        target="sgl_kernel:direct_dcp_a2a_lse_reduce",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description="Direct symmetric-memory DCP A2A and fused LSE reduction.",
+    )
+)
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
