@@ -227,6 +227,8 @@ jobs:
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-sglang-wheel-build.yml
     with:
+      runs_on: x64-kernel-build-node
+      clean_persistent_workspace: true
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit

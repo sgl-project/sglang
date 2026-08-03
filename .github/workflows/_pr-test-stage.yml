@@ -55,7 +55,7 @@ on:
         type: string
         default: ''
       sglang_wheel_artifact:
-        description: 'Run-local artifact containing a verified x86_64 CPython 3.10 SGLang wheel. Empty uses the source-build fallback.'
+        description: 'Run-local artifact containing a verified architecture-compatible CPython 3.10 SGLang wheel. Empty uses the source-build fallback.'
         type: string
         default: ''
 
