@@ -3193,10 +3193,9 @@ class ServerArgs:
             "up, so they are admitted in one batch instead of one at a time. "
             "Useful when each admission is disproportionately expensive, e.g. "
             "speculative decoding with a separate draft prefill pass. Explicit "
-            "values are capped by max-running-requests. DFlash workloads "
-            "auto-enable this with min(4, max(2, (max-run + 5) // 6)) when "
-            "unset; other workloads stay disabled. Disabled when "
-            "max-running-requests < 8."
+            "values override the DFlash formula and are capped by "
+            "max-running-requests. DFlash workloads auto-enable this with the "
+            "formula when unset; other workloads stay disabled."
         ),
         NS("schedule"),
     ] = None

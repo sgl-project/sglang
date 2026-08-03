@@ -35,7 +35,7 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         # max_running_requests < 8 disables, matching DFlash.
         self.assertIsNone(resolve_min_free_slots(4, 7))
 
-    def test_explicit_value_is_not_capped_to_dflash_formula(self):
+    def test_explicit_value_overrides_dflash_formula(self):
         self.assertEqual(resolve_min_free_slots(8, 512), 8)
         self.assertEqual(resolve_min_free_slots(16, 512), 16)
 
