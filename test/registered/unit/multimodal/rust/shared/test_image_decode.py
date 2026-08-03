@@ -68,17 +68,28 @@ class TestRustImageDecode(CustomTestCase):
             with self.subTest(mode=mode):
                 self.assert_matches_pil(data, tolerance=3)
 
+    def test_lossless_formats_match_pil_exactly(self):
+        """GIF/BMP/lossless-WebP joined the native decoder with the pure-Rust
+        webp/gif/bmp enablement. Their reconstruction is exact by format spec,
+        so parity with PIL is pinned at zero tolerance like PNG."""
+        rgb = np.random.default_rng(4).integers(0, 256, (17, 21, 3), dtype=np.uint8)
+        image = Image.fromarray(rgb)
+        cases = {
+            "gif": encode(image.quantize(colors=64), "GIF"),
+            "bmp": encode(image, "BMP"),
+            "webp-lossless": encode(image, "WEBP", lossless=True),
+        }
+        for name, data in cases.items():
+            with self.subTest(fmt=name):
+                self.assert_matches_pil(data)
+
     def test_unsupported_inputs_fail(self):
-        rgb = Image.fromarray(
-            np.random.default_rng(3).integers(0, 256, (9, 9, 3), dtype=np.uint8)
-        )
         gray16 = Image.fromarray(np.zeros((9, 9), dtype=np.uint16))
         cases = {
             "corrupt": b"not an image",
-            # PIL-only formats and bit depths must error (the request is then
-            # rejected — there is no Python fallback) — never silently diverge.
-            "gif": encode(rgb, "GIF"),
-            "webp": encode(rgb, "WEBP"),
+            # >8-bit depths must error (the request is then rejected — there
+            # is no Python fallback) — never silently diverge from PIL's
+            # clipping.
             "png16": encode(gray16, "PNG"),
         }
         for name, data in cases.items():

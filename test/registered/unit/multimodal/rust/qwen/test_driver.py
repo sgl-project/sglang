@@ -80,11 +80,19 @@ class TestNativeDriverErrorPaths(CustomTestCase):
                 self.assert_rejected(ids, images, "placeholder")
 
     def test_undecodable_images_rejected(self):
-        # PIL-only formats (and corrupt bytes) are outside the native
-        # decoder's scope; the server rejects them as a 400.
-        for name, data in {"gif": gif_bytes(), "corrupt": b"junk"}.items():
-            with self.subTest(image=name):
-                self.assert_rejected(IMAGE_IDS, [data], "decode")
+        # Corrupt bytes are outside the native decoder's scope; the server
+        # rejects them as a 400.
+        self.assert_rejected(IMAGE_IDS, [b"junk"], "decode")
+
+    def test_gif_serves_through_the_pipeline(self):
+        """GIF moved from rejected to served when the pure-Rust webp/gif/bmp
+        decoders were enabled; this pins the accept side of that contract flip
+        (the reject side used to be asserted here and broke in CI)."""
+        _, _, grids, _, offsets, _, _ = QWEN_CORE.process_native_mm(
+            IMAGE_IDS, [gif_bytes()], SPEC
+        )
+        self.assertEqual(len(grids), 1)
+        self.assertEqual(len(offsets), 1)
 
     def test_missing_text_and_input_ids_rejected(self):
         for input_ids in (None, []):
