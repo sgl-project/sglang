@@ -9,7 +9,7 @@
 //! weighted sum needs. Usable standalone via `--policy prefix_cache`, or as a
 //! fused term alongside load.
 
-use super::{Criterion, Verdict};
+use super::{EligibilityFilter, ScoringPolicy};
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
@@ -78,13 +78,15 @@ impl PrefixCachePolicy {
     }
 }
 
-impl Criterion for PrefixCachePolicy {
-    fn judge(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<Verdict> {
-        // Every no-signal path ABSTAINS rather than rejecting. "We cannot tell"
-        // is not "nobody is fit": a term that vetoed the fleet here would make
-        // an unhashable prompt unroutable, and under a fused chain would drag
-        // every lower-priority term down with it.
-        let flat = || vec![Verdict::Score(NO_HOLDING); workers.len()];
+impl PrefixCachePolicy {
+    /// The share of the prompt each worker already holds, in `[0, 1]`.
+    ///
+    /// `NO_HOLDING` for every worker whenever there is no signal at all -- no
+    /// ingress ids, no published block size, not one whole block. Both layers
+    /// read this ONE walk, so the hard and soft halves cannot disagree and the
+    /// tree is descended once per decision, not twice.
+    fn shares(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        let flat = || vec![NO_HOLDING; workers.len()];
 
         // Only the ingress-computed ids. Those are the chat-templated tokens
         // the engine itself cached; re-deriving them from the raw joined
@@ -120,28 +122,57 @@ impl Criterion for PrefixCachePolicy {
                 // ranks appears once per rank: take its BEST. Taking the first
                 // match read an arbitrary rank in HashMap order, which moved
                 // the score run to run. O(workers x ranks), nil at fleet size.
-                let share = depths
+                depths
                     .iter()
                     .filter(|(kw, _)| kw.url == w.url)
                     .map(|(_, &d)| d)
                     .max()
-                    .map_or(NO_HOLDING, |d| d as f32 / total);
-                // `>` and not `>=`, so the off default of 0.0 cannot reject
-                // the worker holding nothing — off must mean off.
-                match self.min_share > 0.0 && share < self.min_share {
-                    true => Verdict::Reject,
-                    false => Verdict::Score(share),
-                }
+                    .map_or(NO_HOLDING, |d| d as f32 / total)
             })
             .collect()
+    }
+}
+
+impl ScoringPolicy for PrefixCachePolicy {
+    fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        self.shares(workers, ctx)
     }
 
     fn weight(&self) -> f32 {
         self.weight
     }
 
+    /// The hard half, and only when a floor was actually configured. `None`
+    /// below that is not cosmetic: it makes `--filter prefix_cache` without
+    /// `--prefix-cache-min-share` fail at startup instead of installing a
+    /// constraint that admits everybody.
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        (self.min_share > 0.0).then_some(self as &dyn EligibilityFilter)
+    }
+
     /// The whole point of this policy is the prompt, so ingress must tokenize.
     /// Saying `false` here would score every request on an empty prompt.
+    fn needs_tokens(&self) -> bool {
+        true
+    }
+}
+
+impl EligibilityFilter for PrefixCachePolicy {
+    /// Admit only the workers already holding at least `min_share` of the
+    /// prompt -- the claim no weight can make, because out-ranking load by
+    /// depth would need a weight that holds at every prompt length, and prompt
+    /// length is a per-request quantity.
+    ///
+    /// No signal means ABSTAIN, not reject. "We cannot tell" is not "nobody is
+    /// fit": vetoing here would make an unhashable prompt unroutable, and under
+    /// a filter chain would cost the request every lower-priority constraint
+    /// too.
+    fn keep(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<bool> {
+        (self.shares(workers, ctx).into_iter())
+            .map(|share| share >= self.min_share)
+            .collect()
+    }
+
     fn needs_tokens(&self) -> bool {
         true
     }
@@ -190,17 +221,14 @@ mod tests {
         PrefixCachePolicy::new(tree, oracle, 1.0)
     }
 
-    /// The held shares as plain numbers, so a case can state the fraction it
-    /// expects. Panics on a rejection: none of these fixtures sets a floor, so
-    /// one appearing would be the default silently turning into a constraint.
+    /// The held shares, plus the claim that with no floor configured the term
+    /// constrains nothing -- so every case below is reading the SOFT half.
     fn shares(p: &PrefixCachePolicy, ws: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
-        p.judge(ws, ctx)
-            .into_iter()
-            .map(|v| match v {
-                Verdict::Score(s) => s,
-                Verdict::Reject => panic!("no floor configured, so nothing may be rejected"),
-            })
-            .collect()
+        assert!(
+            ScoringPolicy::as_filter(p).is_none(),
+            "no floor configured, so this term must not be a filter at all",
+        );
+        p.scores(ws, ctx)
     }
 
     /// The two failure modes that matter together, in one call: a deep holder

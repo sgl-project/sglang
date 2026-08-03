@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::scoring::{Criterion, Verdict};
+use crate::policies::scoring::ScoringPolicy;
 use crate::policies::SelectionContext;
 use crate::workers::Worker;
 use std::sync::Arc;
@@ -16,21 +16,20 @@ impl LoadBasedPolicy {
     }
 }
 
-impl Criterion for LoadBasedPolicy {
+impl ScoringPolicy for LoadBasedPolicy {
     /// `1.0` for the least loaded down to `0.0` for the most, min-max scaled to
     /// the CURRENT fleet -- relative, not absolute, so it cannot saturate:
     /// `1 - load/256` reads a busy fleet as all-`0.0`, tied inside
     /// `TIE_EPSILON`, so the term dies exactly when load matters most.
     ///
-    /// Never [`Verdict::Reject`]: load is a preference, and "everybody is busy"
-    /// is not a reason to refuse to route. That also makes this term safe to
-    /// put last, where it still ranks whatever an earlier constraint left.
-    fn judge(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<Verdict> {
+    /// Purely a preference: "everybody is busy" is not a reason to refuse to
+    /// route, so this term never constrains. Capacity is `--filter`'s job.
+    fn scores(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<f32> {
         let loads: Vec<usize> = workers.iter().map(|w| w.active_load()).collect();
         let lo = loads.iter().min().copied().unwrap_or(0);
         let span = (loads.iter().max().copied().unwrap_or(0) - lo) as f32;
         // `max(1.0)` is exact: a zero span means every `l - lo` is zero too.
-        let score = |l: usize| Verdict::Score(1.0 - (l - lo) as f32 / span.max(1.0));
+        let score = |l: usize| 1.0 - (l - lo) as f32 / span.max(1.0);
         loads.into_iter().map(score).collect()
     }
 }
@@ -77,14 +76,7 @@ mod tests {
             let _held: Vec<_> = (ws.iter().zip(&loads))
                 .flat_map(|(w, n)| (0..*n).map(move |_| w.load_guard()))
                 .collect();
-            let scores: Vec<f32> = p
-                .judge(&ws, &ctx)
-                .into_iter()
-                .map(|v| match v {
-                    Verdict::Score(s) => s,
-                    Verdict::Reject => panic!("load is a preference; it must never reject"),
-                })
-                .collect();
+            let scores = p.scores(&ws, &ctx);
             for (i, j) in (0..loads.len()).flat_map(|i| (0..loads.len()).map(move |j| (i, j))) {
                 let ok = (scores[i] > scores[j] + TIE_EPSILON, scores[i].is_nan());
                 assert_eq!(ok, (loads[i] < loads[j], false), "{spec} scored {scores:?}");
