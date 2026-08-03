@@ -28,7 +28,6 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -197,6 +196,12 @@ def execute_prefill_cp_bcg(
     **kwargs,
 ):
     """Replay a CP-local body and run the global gather/logits tail eagerly."""
+    # Importing a runner submodule while server arguments are being resolved
+    # executes runner/__init__.py, which imports this module through the prefill
+    # runner. Defer the runtime-only dependency until runner initialization has
+    # completed to keep the server-argument compatibility check acyclic.
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
     cp_input = runner.prefill_cp_bcg_input
     assert cp_input is not None
     model = runner.model_runner.model
