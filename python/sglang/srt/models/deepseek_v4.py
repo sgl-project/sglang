@@ -14,6 +14,7 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -477,6 +478,9 @@ class MqaAttentionBase(nn.Module):
                 prefix=add_prefix("wqkv_a", prefix),
             )
             unfusable = _unfusable_layer_leaves(self.wqkv_a, _WQKV_A_FUSABLE_LEAVES)
+            shard_sizes = (self.q_lora_rank, self.head_dim)
+            block_size = getattr(quant_config, "weight_block_size", None)
+            scales_align = _block_scale_concat_is_exact(shard_sizes, block_size)
             if unfusable:
                 # The quantization method built parameters this fusion has no
                 # shard for. The wq_a+wkv fusion concatenates the two checkpoint
@@ -489,6 +493,15 @@ class MqaAttentionBase(nn.Module):
                     f"{list(unfusable)} alongside the leaves this fusion can "
                     f"join ({sorted(_WQKV_A_FUSABLE_LEAVES)})."
                 )
+            elif not scales_align:
+                print_warning_once(
+                    "Disabling the wq_a+wkv fusion: the projection sizes "
+                    f"{shard_sizes} do not split into whole "
+                    f"{block_size[0]}-row scale blocks, so concatenating the "
+                    "two shards' block scales would not reproduce the layout "
+                    "of the fused parameter."
+                )
+            if unfusable or not scales_align:
                 del self.wqkv_a
                 fuse = False
                 self.fuse_wqa_wkv = False
@@ -3292,6 +3305,43 @@ def _unfusable_layer_leaves(
             if name not in fusable_leaves
         )
     )
+
+
+def _block_scale_concat_is_exact(
+    shard_sizes: Sequence[int], weight_block_size: Optional[Sequence[int]]
+) -> bool:
+    """Whether concatenating per-shard block scales reproduces the fused layout.
+
+    A block-quantized weight carries one scale row per ``block`` rows of
+    output, so a shard of ``n`` rows ships ``ceil(n / block)`` scale rows. The
+    fusion concatenates the shards' scales on dim 0 exactly as it concatenates
+    their weights, which gives ``sum(ceil(n_i / block))`` rows against the
+    ``ceil(sum(n_i) / block)`` the fused parameter declares.
+
+    Those differ exactly at a seam where both sides are partial and their two
+    remainders still fit inside one block: the shards then pad to a scale row
+    each where the fused layout shares one, so the concatenation is one row
+    long and every scale past the seam describes the wrong rows. A shard that
+    is a whole number of blocks never creates such a seam, and neither do two
+    remainders that overflow a block, which is why this is computed rather
+    than asserted. The mismatch is a row count the fusion never compares, so
+    it would surface as wrong numbers, not as a shape error.
+
+    Returns True when there is no block scale to worry about (dense and
+    per-tensor schemes report no ``weight_block_size``).
+
+    Every published DeepSeek-V4 geometry divides evenly -- ``q_lora_rank``
+    1024 and ``head_dim`` 512 against a 128-row block -- so this is a
+    precondition on the fusion rather than a live repair.
+    """
+    if not weight_block_size:
+        return True
+    block = weight_block_size[0]
+    if block <= 0:
+        return True
+    total = sum(shard_sizes)
+    per_shard = sum(-(-size // block) for size in shard_sizes)
+    return per_shard == -(-total // block)
 
 
 def _fused_module_prefixes(

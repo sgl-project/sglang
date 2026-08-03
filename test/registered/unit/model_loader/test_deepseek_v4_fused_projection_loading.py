@@ -17,6 +17,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     _classify_fused_shard,
     _fused_module_prefixes,
+    _block_scale_concat_is_exact,
     _unfusable_layer_leaves,
     _pop_fused_weight,
     _reject_unfusable_leaf,
@@ -323,12 +324,51 @@ def layer_with_params(*names):
     return layer
 
 
+class TestBlockScaleConcatPrecondition(unittest.TestCase):
+    """The fusion concatenates block scales on dim 0 like the weights.
+
+    That reproduces the fused parameter's scale layout only while every shard
+    but the last is a whole number of blocks.
+    """
+
+    def test_no_block_size_means_nothing_to_check(self):
+        self.assertTrue(_block_scale_concat_is_exact((1024, 512), None))
+        self.assertTrue(_block_scale_concat_is_exact((1000, 500), []))
+
+    def test_published_v4_geometry_is_exact(self):
+        # q_lora_rank 1024, head_dim 448 + 64, against a 128-row block.
+        self.assertTrue(_block_scale_concat_is_exact((1024, 512), [128, 128]))
+
+    def test_two_partial_shards_that_share_a_block_are_not_exact(self):
+        # 1000 % 128 = 104, 520 % 128 = 8; both partial and 112 <= 128, so the
+        # two shards pad to a scale row each where the fused layout shares one.
+        self.assertFalse(_block_scale_concat_is_exact((1000, 520), [128, 128]))
+
+    def test_a_partial_shard_beside_a_whole_one_is_still_exact(self):
+        self.assertTrue(_block_scale_concat_is_exact((1000, 512), [128, 128]))
+        self.assertTrue(_block_scale_concat_is_exact((1024, 500), [128, 128]))
+
+    def test_remainders_that_overflow_a_block_are_still_exact(self):
+        # 104 + 88 > 128: the seam already costs a whole row either way.
+        self.assertTrue(_block_scale_concat_is_exact((1000, 600), [128, 128]))
+
+    def test_the_mismatch_is_a_row_count_not_a_shape_error(self):
+        """Why this is a precondition and not an assertion downstream.
+
+        The concatenated scales have MORE rows than the fused parameter
+        declares, and the fusion never compares the two, so a misaligned
+        geometry shifts every scale past the seam instead of raising.
+        """
+        block, shards = 128, (1000, 520)
+        per_shard = sum(-(-n // block) for n in shards)
+        fused = -(-sum(shards) // block)
+        self.assertEqual((per_shard, fused), (13, 12))
+
+
 class TestPackedLayerFallback(unittest.TestCase):
     def test_unquantized_replicated_linear_is_fusable(self):
         layer = ReplicatedLinear(8, 4, bias=False, quant_config=None)
-        self.assertEqual(
-            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ()
-        )
+        self.assertEqual(_unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ())
 
     def test_packed_layer_is_not_fusable(self):
         layer = layer_with_params("qweight", "qzeros", "scales")
@@ -362,9 +402,7 @@ class TestPackedLayerFallback(unittest.TestCase):
     def test_block_scaled_fp8_layer_stays_fusable(self):
         """The path this fusion exists for must not be disabled by the widening."""
         layer = layer_with_params("weight", "weight_scale_inv")
-        self.assertEqual(
-            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ()
-        )
+        self.assertEqual(_unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ())
 
     def test_the_weight_only_predicate_accepted_per_tensor_fp8(self):
         """The predicate this replaced, kept executable.
@@ -393,7 +431,7 @@ class TestPackedLayerFallback(unittest.TestCase):
         weights = [
             (f"{ATTN_PREFIX}.{proj}.{leaf}", torch.full((4, 8), float(i)))
             for i, (proj, leaf) in enumerate(
-                (p, l) for p in ("wq_a", "wkv") for l in leaves
+                (projection, name) for projection in ("wq_a", "wkv") for name in leaves
             )
         ]
 
