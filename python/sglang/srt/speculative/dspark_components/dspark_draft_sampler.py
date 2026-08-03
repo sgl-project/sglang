@@ -13,6 +13,9 @@ from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
+# Same free-memory floor init_cuda_graphs requires before draft capture.
+_CAPTURE_HEADROOM_GB = 1.0
+
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
     del step_idx
@@ -95,8 +98,10 @@ class DsparkDraftSampler:
 
         if self.folded_sampling:
 
-            def _step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                 del step_idx
+                # In-graph philox noise: each replay advances the generator
+                # and redraws.
                 noise = self.exp_noise[:bs].exponential_()
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
@@ -105,7 +110,6 @@ class DsparkDraftSampler:
                     exp_noise=noise,
                 )
 
-            sampler = _step_sampler
         else:
             sampler = greedy_step_sampler
 
@@ -143,7 +147,7 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
-    if available_gb - need_gb >= 1.0:
+    if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
         logger.warning(
@@ -168,9 +172,8 @@ def maybe_build_draft_sampler(
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded draft sampler, or return None (with the reason
-    logged) when the draft model cannot support folding and the proposal must
-    stay eager."""
+    """Build the graph-folded draft sampler, or None (reason logged) when the
+    proposal must stay eager."""
 
     def _eager(reason):
         if tp_rank == 0:
