@@ -494,6 +494,10 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
+    # The wrapper already expands the placeholders from the request's own token
+    # IDs, so the retokenize-avoidance rebuild in process_and_combine_mm_data
+    # would only rebuild the identical sequence.
+    preserve_processor_input_ids = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
@@ -540,6 +544,10 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 prompt=input_text,
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
+                # Unlike load_mm_data, fast_load_mm_data does not derive
+                # input_ids from the prompt; without this the wrapper falls
+                # back to re-tokenizing the expanded placeholder string.
+                input_ids=input_text,
             )
         else:
             base_output = await self.load_mm_data(

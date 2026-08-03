@@ -352,6 +352,11 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
                 discard_alpha_channel=False,
+                # Unlike load_mm_data, fast_load_mm_data does not derive
+                # input_ids from the prompt. Without this the wrapper falls
+                # back to re-encoding the decoded string, which is the loss of
+                # the structural/user distinction described above.
+                input_ids=input_text,
             )
         else:
             base_output = await self.load_mm_data(
