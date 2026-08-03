@@ -267,7 +267,9 @@ spec:
             claimName: s3-claim
             readOnly: true
         - name: work
-          emptyDir: {}
+          hostPath:
+            path: /var/lib/minwm-async-work
+            type: DirectoryOrCreate
         - name: shm
           emptyDir:
             medium: Memory
