@@ -787,6 +787,10 @@ class TestPrefillAdder(CustomTestCase):
         adder.can_run_list = [
             SimpleNamespace(extend_input_len=length) for length in extend_lens
         ]
+        # BLOCK_M is auto-detected from the attention backend in production; the
+        # __new__ helper bypasses __init__, so set it explicitly. 64 matches the
+        # block_m the tile-count assertions below are computed against.
+        adder.prefill_tile_block_m = 64
         return adder
 
     def test_estimate_prefill_extend_tile_metrics(self):

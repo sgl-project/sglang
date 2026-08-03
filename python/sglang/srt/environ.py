@@ -463,9 +463,8 @@ class Envs:
     SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)
     # Tile-budget mode: "compact" (default, counts actual per-request tiles) or
     # "legacy" (rectangular grid, max_extend_len-shaped).
+    # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
-    # BLOCK_M for tile estimation; matches extend_attention default.
-    SGLANG_PREFILL_TILE_BLOCK_M = EnvInt(64)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

@@ -91,7 +91,6 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 # compact extend-attention work and is gated on HIP (see _check_prefill_tile_budget),
 # so non-AMD vendors keep the exact legacy scheduler behavior.
 _IS_HIP = is_hip()
-PREFILL_TILE_BLOCK_M = envs.SGLANG_PREFILL_TILE_BLOCK_M.get()
 PREFILL_TILE_BUDGET = envs.SGLANG_PREFILL_TILE_BUDGET.get()
 PREFILL_TILE_BUDGET_MODE = envs.SGLANG_PREFILL_TILE_BUDGET_MODE.get().strip().lower()
 if PREFILL_TILE_BUDGET_MODE not in {"legacy", "compact"}:
@@ -107,7 +106,7 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 
 def estimate_prefill_extend_tile_metrics(
-    extend_lens: List[int], block_m: int = PREFILL_TILE_BLOCK_M
+    extend_lens: List[int], block_m: int
 ) -> Dict[str, Union[int, float, List[int], None]]:
     """Estimate extend-attention query tiles per head for a prefill batch."""
     normalized_lens = [max(0, int(length)) for length in extend_lens]
@@ -502,8 +501,10 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        prefill_tile_block_m: int = 64,
     ):
         self.page_size = page_size
+        self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -601,7 +602,8 @@ class PrefillAdder:
 
     def _candidate_tile_metrics(self, candidate_extend_len: int) -> Dict[str, object]:
         return estimate_prefill_extend_tile_metrics(
-            [*self._admitted_extend_lens(), int(candidate_extend_len)]
+            [*self._admitted_extend_lens(), int(candidate_extend_len)],
+            block_m=self.prefill_tile_block_m,
         )
 
     def _check_prefill_tile_budget(
