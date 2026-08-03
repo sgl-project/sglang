@@ -363,13 +363,17 @@ PY
 cat > "$WORKDIR/ionic_mounts.sh" <<'IONIC_EOF'
 IONIC_MOUNTS=()
 _ionic_provider="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+_ionic_soname="/usr/lib/x86_64-linux-gnu/libionic.so.1"
 if [ ! -e "$_ionic_provider" ]; then
     _ionic_provider=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 \
         -name "libionic.so.*" -print -quit 2>/dev/null)
 fi
 if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
     _ionic_real=$(readlink -f "$_ionic_provider" 2>/dev/null)
+    _ionic_soname_real=$(readlink -f "$_ionic_soname" 2>/dev/null)
     [ -f "$_ionic_real" ] && IONIC_MOUNTS+=( -v "$_ionic_real:$_ionic_real:ro" )
+    [ -f "$_ionic_soname_real" ] && \
+        IONIC_MOUNTS+=( -v "$_ionic_soname_real:$_ionic_soname:ro" )
     [ -d /usr/lib/x86_64-linux-gnu/libibverbs ] && \
         IONIC_MOUNTS+=( -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro )
     [ -d /etc/libibverbs.d ] && \
