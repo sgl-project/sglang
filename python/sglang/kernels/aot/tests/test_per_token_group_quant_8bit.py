@@ -12,6 +12,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    PER_TOKEN_GROUP_QUANT_EPS,
     sglang_per_token_group_quant_8bit,
 )
 from sglang.srt.utils import is_hip
@@ -136,10 +137,12 @@ def test_per_token_group_quant_with_column_major(
         x=x,
         masked_m=masked_m,
         group_size=group_size,
-        eps=1e-10,
         dst_dtype=dst_dtype,
         **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
     )
+    # The Triton reference still takes the absmax floor per call; the sglang entry
+    # point bakes it in (PER_TOKEN_GROUP_QUANT_EPS), so it has no eps parameter.
+    triton_kwargs = dict(execute_kwargs, eps=PER_TOKEN_GROUP_QUANT_EPS)
 
     def _postprocess(x_q, x_s):
         if masked_m is not None:
@@ -150,7 +153,7 @@ def test_per_token_group_quant_with_column_major(
         return x_q, x_s
 
     x_q_triton, x_s_triton = _postprocess(
-        *triton_per_token_group_quant_8bit(**execute_kwargs)
+        *triton_per_token_group_quant_8bit(**triton_kwargs)
     )
     x_q_sglang, x_s_sglang = _postprocess(
         *sglang_per_token_group_quant_8bit(**execute_kwargs)

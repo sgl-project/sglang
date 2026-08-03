@@ -194,7 +194,6 @@ def per_token_group_quant_int8(
 def sglang_per_token_group_quant_int8(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
 ):
     assert (
@@ -202,11 +201,8 @@ def sglang_per_token_group_quant_int8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
     assert dtype == torch.int8
-    # per_token_group_quant bakes the int8 constants in ([-128, 127], eps 1e-10).
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
-
+    # per_token_group_quant bakes the int8 constants in at compile time
+    # ([-128, 127], absmax floor 1e-10), so there is no eps knob here either.
     return per_token_group_quant(x, group_size=group_size, out_dtype=dtype)
 
 

@@ -517,13 +517,18 @@ def create_per_token_group_quant_fp8_output_scale(
 _MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
 _V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
+# The JIT kernel bakes the group-absmax floor in at compile time (QuantTrait::
+# kAmaxFloor in gemm/per_token_group_quant.cuh), so it is not a per-call knob and
+# the entry points below do not expose one. Named here for the MUSA AOT op, which
+# still takes it as a runtime argument.
+PER_TOKEN_GROUP_QUANT_EPS = 1e-10
+
 
 def _run_per_token_group_quant_8bit_kernel(
     x: torch.Tensor,
     x_q: torch.Tensor,
     x_s: torch.Tensor,
     group_size: int,
-    eps: float,
     fp8_min: float,
     fp8_max: float,
     *,
@@ -553,7 +558,7 @@ def _run_per_token_group_quant_8bit_kernel(
             output_q=x_q,
             output_s=x_s,
             group_size=group_size,
-            eps=eps,
+            eps=PER_TOKEN_GROUP_QUANT_EPS,
             min_8bit=fp8_min,
             max_8bit=fp8_max,
             scale_ue8m0=scale_ue8m0,
@@ -568,7 +573,7 @@ def _run_per_token_group_quant_8bit_kernel(
             x_q,
             x_s,
             group_size,
-            eps,
+            PER_TOKEN_GROUP_QUANT_EPS,
             fp8_min,
             fp8_max,
             scale_ue8m0,
@@ -578,9 +583,6 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
         f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
@@ -600,7 +602,6 @@ def _run_per_token_group_quant_8bit_kernel(
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -641,7 +642,6 @@ def sglang_per_token_group_quant_fp8(
             x_q,
             x_s,
             group_size,
-            eps,
             fp8_min,
             fp8_max,
             scale_ue8m0=scale_ue8m0,
@@ -655,7 +655,6 @@ def sglang_per_token_group_quant_fp8(
 def sglang_per_token_group_quant_fp8_row_padded(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
     row_alignment: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quant writing into row-padded buffers (col-major scales).
@@ -682,7 +681,7 @@ def sglang_per_token_group_quant_fp8_row_padded(
     if group_size not in supported_group_sizes:
         # Keep the legacy unpadded path and let the GEMM wrapper do the padding.
         return sglang_per_token_group_quant_fp8(
-            x, group_size, eps, column_major_scales=True
+            x, group_size, column_major_scales=True
         )
 
     m, k = x.shape
@@ -699,7 +698,6 @@ def sglang_per_token_group_quant_fp8_row_padded(
             x_q[:m],
             x_s[:m],
             group_size,
-            eps,
             fp8_min,
             fp8_max,
             scale_ue8m0=False,
@@ -717,7 +715,6 @@ def sglang_per_token_group_quant_fp8_row_padded(
 def sglang_per_token_group_quant_fp8_ue8m0(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert (
         x.shape[-1] % group_size == 0
@@ -743,7 +740,6 @@ def sglang_per_token_group_quant_fp8_ue8m0(
             x_q,
             x_s,
             group_size,
-            eps,
             fp8_min,
             fp8_max,
             scale_ue8m0=True,
@@ -759,7 +755,6 @@ def sglang_per_token_group_quant_8bit(
     x: torch.Tensor,
     group_size: int,
     dst_dtype: torch.dtype,
-    eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -778,14 +773,12 @@ def sglang_per_token_group_quant_8bit(
         return sglang_per_token_group_quant_int8(
             x=x,
             group_size=group_size,
-            eps=eps,
             dtype=dst_dtype,
         )
 
     return sglang_per_token_group_quant_fp8(
         x=x,
         group_size=group_size,
-        eps=eps,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
