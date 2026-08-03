@@ -981,6 +981,13 @@ EXCLUDE_ARG=()
 # original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
 TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
 
+# The EP16 validation needs all four amd-sglang nodes. Keep g20 out of an
+# engine-root position, where its slower MORI bootstrap can miss the timeout.
+if [[ "$MATRIX_CONFIG_NAME" == *-2p1d-ep16* ]]; then
+    EXCLUDE_ARG=()
+    export SLURM_DIST_TAIL="${SLURM_DIST_TAIL:-mia1-p01-g20}"
+fi
+
 # Name the allocation <RUNNER_NAME>-<GITHUB_RUN_ID>-<config> so the workflow's
 # cleanup steps can scancel precisely instead of a blanket `squeue --me` that
 # would kill a concurrent matrix leg. RUNNER_NAME alone is not assumed unique;
