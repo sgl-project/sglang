@@ -1781,7 +1781,7 @@ class DeepseekV4AttnBackend(
         ``self.forward_metadata.sparse_prefill_cache``.
         """
         if _is_xpu:
-            from sgl_kernel import flash_mla_sparse_prefill as flash_mla_sparse_fwd
+            from sgl_kernel import flash_mla_sparse_fwd
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
