@@ -162,8 +162,8 @@ async fn generate(
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
-    // Network media downloads happen here, on the API runtime — never on the
-    // MM worker pool (see `prefetch`).
+    // Media I/O (URL downloads, file reads) happens here, on the API runtime
+    // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
         return pre_submit_error(StatusCode::BAD_REQUEST, &e, stream);
     }

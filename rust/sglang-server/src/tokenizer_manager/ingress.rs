@@ -309,7 +309,7 @@ impl Ingress {
                             return;
                         };
                         match g.to_mm_payload_msgpack() {
-                            // The API layer downloaded network sources already;
+                            // The API layer resolved I/O-backed sources already;
                             // hand their bytes over out-of-band.
                             Ok(p) => {
                                 let fetched =

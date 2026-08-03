@@ -603,9 +603,9 @@ pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
-    /// Bytes of `image_data`'s network sources, downloaded by
-    /// `api_server::prefetch` (in `mm_payload::network_sources` order) so MM
-    /// workers never touch the network. Out-of-band: the opaque values above
+    /// Bytes of `image_data`'s I/O-backed sources (URLs and file paths),
+    /// resolved by `api_server::prefetch` (in `mm_payload::io_sources` order)
+    /// so MM workers never block on I/O. Out-of-band: the opaque values above
     /// stay exactly as the client sent them.
     pub prefetched: Vec<bytes::Bytes>,
 }

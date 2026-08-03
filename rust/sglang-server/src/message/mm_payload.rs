@@ -11,19 +11,23 @@ use bytes::Bytes;
 use rmpv::Value;
 use sglang_mm::driver::{ImageSource, MmInput};
 
-/// True for source forms the API layer must resolve before MM dispatch:
-/// network I/O never runs on the fixed MM worker pool (see
-/// `api_server::prefetch`). Owned here, next to `collect_images`, so the
-/// prefetch walk and the parse walk can never drift.
-pub fn is_network_source(src: &str) -> bool {
-    src.starts_with("http://") || src.starts_with("https://")
+/// True for source forms the API layer must resolve before MM dispatch: I/O —
+/// network *or* disk (a network mount can hang past any HTTP timeout) — never
+/// runs on the fixed MM worker pool (see `api_server::prefetch`). `data:` and
+/// bare base64 are pure CPU and stay on the worker. Owned here, next to
+/// `collect_images`, so the prefetch walk and the parse walk can never drift.
+pub fn is_io_source(src: &str) -> bool {
+    src.starts_with("http://")
+        || src.starts_with("https://")
+        || src.starts_with("file://")
+        || src.starts_with('/')
 }
 
-/// The network sources of an `image_data` value, in `collect_images` order.
-pub fn network_sources(value: &Value) -> Vec<String> {
+/// The I/O-backed sources of an `image_data` value, in `collect_images` order.
+pub fn io_sources(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let mut walk = |value: &Value| {
-        if let Some(src) = value.as_str().filter(|s| is_network_source(s)) {
+        if let Some(src) = value.as_str().filter(|s| is_io_source(s)) {
             out.push(src.to_owned());
         }
     };
@@ -36,8 +40,8 @@ pub fn network_sources(value: &Value) -> Vec<String> {
 }
 
 /// Decode `[text, input_ids, image_data, video_data, audio_data]`.
-/// `prefetched` holds the already-downloaded bytes of the payload's network
-/// sources (in `network_sources` order); those sources are swapped for their
+/// `prefetched` holds the already-resolved bytes of the payload's I/O-backed
+/// sources (in `io_sources` order); those sources are swapped for their
 /// bytes, and one left without an entry is an internal error, not a fetch.
 pub fn parse(payload: &[u8], prefetched: &[Bytes]) -> Result<MmInput, String> {
     let value = rmpv::decode::read_value(&mut &payload[..])
@@ -101,10 +105,10 @@ fn collect_images(
             let value = value
                 .as_str()
                 .ok_or_else(|| "non-utf8 image source".to_string())?;
-            if is_network_source(value) {
+            if is_io_source(value) {
                 let bytes = prefetched
                     .next()
-                    .ok_or_else(|| "network image source was not prefetched".to_string())?;
+                    .ok_or_else(|| "I/O-backed image source was not prefetched".to_string())?;
                 out.push(ImageSource::Bytes(bytes.to_vec()));
             } else {
                 out.push(ImageSource::String(value.to_owned()));
@@ -216,20 +220,17 @@ mod tests {
         assert_eq!(parse(&payload, &[]).unwrap().images.len(), 1);
     }
 
-    /// Network sources are swapped for their prefetched bytes in walk order;
-    /// one left unfetched is an error, so a URL can never reach `fetch` on an
-    /// MM worker.
+    /// I/O-backed sources (URLs and file paths) are swapped for their
+    /// prefetched bytes in walk order; one left unfetched is an error, so
+    /// neither network nor disk I/O can ever reach an MM worker.
     #[test]
-    fn network_sources_use_prefetched_bytes() {
+    fn io_sources_use_prefetched_bytes() {
         let image = Value::Array(vec![
             Value::from("http://a/x.png"),
             Value::from("data:image/png;base64,x"),
-            Value::from("https://b/y.png"),
+            Value::from("/mnt/nfs/y.png"),
         ]);
-        assert_eq!(
-            network_sources(&image),
-            vec!["http://a/x.png", "https://b/y.png"]
-        );
+        assert_eq!(io_sources(&image), vec!["http://a/x.png", "/mnt/nfs/y.png"]);
 
         let fetched = [Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
         let input = parse(&image_payload(image.clone()), &fetched).unwrap();

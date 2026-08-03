@@ -1,8 +1,9 @@
-//! Download network media sources on the API runtime, before MM dispatch.
+//! Resolve I/O-backed media sources on the API runtime, before MM dispatch.
 //!
 //! The MM worker pool is fixed and core-pinned CPU capacity: a slow image
-//! host must never occupy it, and images within a request must download
-//! concurrently (not `n * REQUEST_TIMEOUT`). URLs resolve here — bounded
+//! host — or a file on a hanging network mount — must never occupy it, and
+//! images within a request must download concurrently (not
+//! `n * REQUEST_TIMEOUT`). URLs and file paths resolve here — bounded
 //! globally, via `sglang-mm`'s `fetch_bytes` so proxy/timeout/cap semantics
 //! have one owner — and ride out-of-band as [`MmData::prefetched`];
 //! [`crate::message::mm_payload::parse`] swaps them back in.
@@ -10,24 +11,24 @@
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
-use crate::message::mm_payload::network_sources;
+use crate::message::mm_payload::io_sources;
 use crate::message::{GenerateRequest, MmData};
 
-/// Global bound on concurrent media downloads across all in-flight requests;
+/// Global bound on concurrent media fetches across all in-flight requests;
 /// excess acquisitions queue on the semaphore without holding a thread.
 static PERMITS: Semaphore = Semaphore::const_new(32);
 
-/// Fill [`MmData::prefetched`] for every request; every download across the
+/// Fill [`MmData::prefetched`] for every request; every fetch across the
 /// batch runs concurrently. Any failure rejects the call (fetch errors are
 /// per-request 400s, as on the Python path).
 pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String> {
-    let urls_of = |mm: &Option<Box<MmData>>| {
+    let sources_of = |mm: &Option<Box<MmData>>| {
         mm.as_deref()
             .and_then(|m| m.image_data.as_ref())
-            .map(network_sources)
+            .map(io_sources)
             .unwrap_or_default()
     };
-    let fetches = requests.iter().map(|r| fetch_ordered(urls_of(&r.mm)));
+    let fetches = requests.iter().map(|r| fetch_ordered(sources_of(&r.mm)));
     let fetched = futures::future::try_join_all(fetches).await?;
     for (req, bytes) in requests.iter_mut().zip(fetched) {
         if !bytes.is_empty() {
@@ -37,13 +38,13 @@ pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String
     Ok(())
 }
 
-/// Download every URL concurrently (globally bounded), preserving order.
-async fn fetch_ordered(urls: Vec<String>) -> Result<Vec<Bytes>, String> {
-    futures::future::try_join_all(urls.into_iter().map(|url| async move {
+/// Resolve every source concurrently (globally bounded), preserving order.
+async fn fetch_ordered(sources: Vec<String>) -> Result<Vec<Bytes>, String> {
+    futures::future::try_join_all(sources.into_iter().map(|src| async move {
         let _permit = PERMITS.acquire().await.expect("semaphore never closed");
         // `fetch_bytes` is blocking I/O; tokio's blocking pool threads are
         // unpinned and lazily spawned, so they never contend with CPU stages.
-        tokio::task::spawn_blocking(move || sglang_mm::common::fetch::fetch_bytes(&url))
+        tokio::task::spawn_blocking(move || sglang_mm::common::fetch::fetch_bytes(&src))
             .await
             .map_err(|e| format!("media prefetch: {e}"))?
             .map(Bytes::from)
@@ -91,26 +92,30 @@ mod tests {
         }
     }
 
-    /// URLs download concurrently and land in `prefetched` in source order;
-    /// non-network sources and mm-free requests are untouched.
+    /// URLs and file paths resolve concurrently and land in `prefetched` in
+    /// source order; CPU-only sources and mm-free requests are untouched.
     #[tokio::test]
-    async fn downloads_network_sources_in_order() {
+    async fn resolves_io_sources() {
         let addr = serve(vec![b"one".to_vec(), b"two".to_vec()]);
+        let path = std::env::temp_dir().join(format!("sglang-prefetch-{}", std::process::id()));
+        std::fs::write(&path, b"zzz").unwrap();
         let mut requests = vec![
             mm_request(Value::Array(vec![
                 Value::from(format!("http://{addr}/a.png")),
                 Value::from("data:image/png;base64,x"),
                 Value::from(format!("http://{addr}/b.png")),
+                Value::from(path.display().to_string()),
             ])),
             GenerateRequest::default(),
         ];
         prefetch_all(&mut requests).await.unwrap();
+        std::fs::remove_file(&path).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         // The one-shot server answers in accept order, so contents may swap
-        // between the two URLs; both bodies must arrive.
+        // between the two URLs; all three bodies must arrive.
         let mut got: Vec<&[u8]> = fetched.iter().map(|b| b.as_ref()).collect();
         got.sort();
-        assert_eq!(got, vec![b"one".as_ref(), b"two".as_ref()]);
+        assert_eq!(got, vec![b"one".as_ref(), b"two".as_ref(), b"zzz".as_ref()]);
         assert!(requests[1].mm.is_none());
     }
 
