@@ -679,6 +679,12 @@ EXCLUSIVE_ARG=()
 EXCLUDE_ARG=()
 [[ -n "${SLURM_EXCLUDE:-}" ]] && EXCLUDE_ARG=(--exclude="$SLURM_EXCLUDE")
 
+# Validation-only: run the existing EP8 path with g20 as the prefill node.
+if [[ "$MATRIX_CONFIG_NAME" == "dsv4flash-fp8-1k1k-1p1d" ]]; then
+    NODELIST_ARG=(--nodelist="mia1-p01-g20,mia1-p02-g09")
+    EXCLUDE_ARG=()
+fi
+
 # One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
 TOTAL_NODES=$((PW + DW))
 
