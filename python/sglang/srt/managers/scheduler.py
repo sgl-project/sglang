@@ -235,9 +235,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -246,6 +244,11 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_request_admission_mixin import (
+    QueueAdmissionResult,
+    RejectedRequestCleanup,
+    SchedulerRequestAdmissionMixin,
+)
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -362,6 +365,7 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
+    SchedulerRequestAdmissionMixin,
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -868,9 +872,7 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
-        from sglang.srt.speculative.draft_worker_common import (
-            draft_server_args_copy,
-        )
+        from sglang.srt.speculative.draft_worker_common import draft_server_args_copy
 
         # Launch a draft worker for speculative decoding
         draft_server_args = draft_server_args_copy(
@@ -2163,6 +2165,30 @@ class Scheduler(
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
     @staticmethod
+    def _set_padded_mm_input_ids(req, padded_input_ids, prefix_len: int) -> None:
+        """Replace an MM suffix while preserving a carried streaming fill cache."""
+        padded_input_ids = array("q", padded_input_ids)
+        if not 0 <= prefix_len <= min(len(req.origin_input_ids), len(padded_input_ids)):
+            raise ValueError(
+                f"Invalid multimodal padding prefix: {prefix_len=} "
+                f"old_len={len(req.origin_input_ids)} new_len={len(padded_input_ids)}"
+            )
+        if padded_input_ids[:prefix_len] != req.origin_input_ids[:prefix_len]:
+            raise ValueError("Multimodal padding changed tokens before the MM suffix")
+        fill_ids = req.full_untruncated_fill_ids
+        if fill_ids:
+            if len(fill_ids) == len(req.origin_input_ids):
+                # Streaming append can carry the completed prefix without a
+                # rebuild. Keep that cache coherent when MM padding rewrites
+                # or expands the newly appended raw placeholder tokens.
+                fill_ids[prefix_len:] = padded_input_ids[prefix_len:]
+            else:
+                # A non-empty, differently sized cache cannot be updated by
+                # position. Force _refresh_fill_ids() to rebuild it.
+                req.full_untruncated_fill_ids = array("q")
+        req.origin_input_ids = padded_input_ids
+
+    @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
         """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
         if absent, call pad_input_ids_func"""
@@ -2178,11 +2204,16 @@ class Scheduler(
         if prefix_len < 0:
             return False
 
-        padded_input_ids = array("q", padded_input_ids)
         if prefix_len == 0:
-            req.origin_input_ids = padded_input_ids
+            new_input_ids = padded_input_ids
         else:
-            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
+            new_input_ids = req.origin_input_ids[:prefix_len] + array(
+                "q", padded_input_ids
+            )
+        if req.session is not None and req.session.streaming:
+            Scheduler._set_padded_mm_input_ids(req, new_input_ids, prefix_len)
+        else:
+            req.origin_input_ids = array("q", new_input_ids)
         return True
 
     def _maybe_compute_mrope_positions(self, req) -> None:
@@ -2451,9 +2482,17 @@ class Scheduler(
                 not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
                 and self.pad_input_ids_func
             ):
-                req.origin_input_ids = array(
-                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
+                padded_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
                 )
+                if req.session is not None and req.session.streaming:
+                    recv_input_len = (
+                        len(recv_req.input_ids) if recv_req.input_ids is not None else 0
+                    )
+                    prefix_len = max(0, len(req.origin_input_ids) - recv_input_len)
+                    self._set_padded_mm_input_ids(req, padded_input_ids, prefix_len)
+                else:
+                    req.origin_input_ids = array("q", padded_input_ids)
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
@@ -2575,6 +2614,12 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
+        if (
+            self._admit_request_to_queue(req, is_retracted=is_retracted)
+            is QueueAdmissionResult.REJECT
+        ):
+            return
+        if self.disaggregation_mode == DisaggregationMode.NULL:
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2613,6 +2658,7 @@ class Scheduler(
                 },
                 rid=req.rid,
             )
+            self._cleanup_rejected_queued_request(req)
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
@@ -2653,6 +2699,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
+        self._cleanup_rejected_queued_request(req_to_abort)
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
@@ -2679,6 +2726,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                self._cleanup_rejected_queued_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2954,7 +3002,14 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
-        if self.dllm_config is not None:
+        running_batch, defer_prefill = self._merge_custom_decode_admission(
+            running_batch
+        )
+        if defer_prefill:
+            # A custom decode row with no sampled output cannot safely merge
+            # with a newly prefilling row that may activate penalty state.
+            new_batch = None
+        elif self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -3163,11 +3218,16 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            admission_context = self._begin_request_prefill_admission(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+            )
+            admitted = bool(adder.can_run_list and req is adder.can_run_list[-1])
+            self._finish_request_prefill_admission(
+                req, admission_context, admitted=admitted
             )
 
             if self.enable_lora:
@@ -3186,8 +3246,7 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if not added:
+                if not admitted:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
@@ -4269,9 +4328,12 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            cleanup = self._cleanup_rejected_queued_request(req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and cleanup is RejectedRequestCleanup.NOT_HANDLED
+            ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4291,8 +4353,10 @@ class Scheduler(
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
+                and cleanup is RejectedRequestCleanup.NOT_HANDLED
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:

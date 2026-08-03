@@ -530,6 +530,11 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def customize_forward_batch(
+        self, batch: ScheduleBatch, forward_batch: ForwardBatch
+    ) -> None:
+        """Apply model-family-specific adjustments before the forward pass."""
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -551,6 +556,7 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            self.customize_forward_batch(batch, forward_batch)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None

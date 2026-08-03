@@ -37,10 +37,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.distributed.parallel_state import (
-    graph_capture,
-    set_pdmux_status,
-)
+from sglang.srt.distributed.parallel_state import graph_capture, set_pdmux_status
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -78,12 +75,8 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
     BreakableCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
-from sglang.srt.model_executor.runner_backend_utils import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
-)
-from sglang.srt.model_executor.runner_utils.buffers import (
-    DecodeInputBuffers,
-)
+from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FAILED_MSG
+from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_lora_variant,
     model_capture_mode,
@@ -225,6 +218,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.require_decode_input_embeds = model_runner.forward_input_embeds_to_decode
+        self.capture_input_embeds = (
+            model_runner.spec_algorithm.is_dflash_family()
+            and model_runner.is_draft_worker
+        ) or self.require_decode_input_embeds
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -945,8 +943,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash_family()
-                    and self.model_runner.is_draft_worker
+                    self.capture_input_embeds
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
@@ -1034,15 +1031,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                not is_ragged
-                and self.model_runner.spec_algorithm.is_dflash_family()
-                and self.model_runner.is_draft_worker
-                and forward_batch.input_embeds is not None
-            ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
-                )
+            self._copy_decode_input_embeds(
+                forward_batch, self.raw_num_token, is_ragged=is_ragged
+            )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1096,13 +1087,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if (
-            not is_ragged
-            and self.model_runner.spec_algorithm.is_dflash_family()
-            and self.model_runner.is_draft_worker
-            and forward_batch.input_embeds is not None
-        ):
-            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+        self._copy_decode_input_embeds(
+            forward_batch, raw_num_token, is_ragged=is_ragged
+        )
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         if self.enable_two_batch_overlap:
@@ -1149,6 +1136,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label
         )
+
+    def _copy_decode_input_embeds(
+        self, forward_batch: ForwardBatch, num_tokens: int, *, is_ragged: bool
+    ) -> None:
+        if is_ragged or not self.capture_input_embeds:
+            return
+        if forward_batch.input_embeds is None:
+            if self.require_decode_input_embeds:
+                raise RuntimeError(
+                    "Decode CUDA graph requires input_embeds for this model"
+                )
+            return
+        self.buffers.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid

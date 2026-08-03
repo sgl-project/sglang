@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.session.streaming_session import get_streaming_session
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -462,6 +463,11 @@ class PrefillAdder:
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
+        self._session_state_cache = get_streaming_session(tree_cache)
+        self._streaming_lifecycle_enabled = (
+            self._session_state_cache is not None
+            and self._session_state_cache.has_attached_lifecycle
+        )
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
@@ -715,13 +721,35 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _next_prefill_chunk_end(self, req: Req, start: int, end: int) -> int:
+        if req.session is None or not req.session.streaming:
+            return end
+        chunk_end = self._session_state_cache.next_prefill_chunk_end(req, start, end)
+        if not start < chunk_end <= end:
+            raise RuntimeError(
+                "Streaming lifecycle returned an invalid prefill boundary: "
+                f"start={start} chunk_end={chunk_end} end={end}"
+            )
+        if chunk_end < end and self.rem_chunk_tokens is None:
+            raise RuntimeError(
+                "Streaming lifecycle prefill boundaries require chunked prefill"
+            )
+        if chunk_end < end and chunk_end % self.page_size != 0:
+            raise RuntimeError(
+                "Streaming lifecycle prefill boundary is not page-aligned: "
+                f"boundary={chunk_end} page_size={self.page_size}"
+            )
+        return chunk_end
+
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
-        # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
-        # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
-        if not no_token and self.rem_mamba_slots is not None:
+        if (
+            not no_token
+            and self.rem_mamba_slots is not None
+            and not self._streaming_lifecycle_enabled
+        ):
             no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
@@ -737,6 +765,13 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
+
+    def _has_mamba_budget_for_req(self, req: Req) -> bool:
+        return (
+            self.rem_mamba_slots is None
+            or req.mamba_pool_idx is not None
+            or self.rem_mamba_slots >= 1
+        )
 
     def _update_prefill_budget(
         self,
@@ -899,6 +934,13 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if self._streaming_lifecycle_enabled:
+            chunk_end = self._next_prefill_chunk_end(
+                req, len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
+            if chunk_end < len(req.full_untruncated_fill_ids):
+                new_len = min(new_len, chunk_end - len(req.prefix_indices))
+                truncated = True
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1059,6 +1101,10 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if self._streaming_lifecycle_enabled and not self._has_mamba_budget_for_req(
+            req
+        ):
+            return AddReqResult.NO_TOKEN
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1182,6 +1228,18 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
+            lifecycle_end = len(req.full_untruncated_fill_ids)
+            if self._streaming_lifecycle_enabled and self.dllm_config is None:
+                lifecycle_end = self._next_prefill_chunk_end(
+                    req, prefix_len, lifecycle_end
+                )
+                if lifecycle_end < len(req.full_untruncated_fill_ids):
+                    if truncation_align_size is not None:
+                        raise RuntimeError(
+                            "Streaming lifecycle prefill boundaries do not support "
+                            "deterministic truncation alignment"
+                        )
+
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -1192,7 +1250,9 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+            elif lifecycle_end == len(req.full_untruncated_fill_ids) and (
+                chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit
+            ):
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1211,8 +1271,12 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
+                if self._streaming_lifecycle_enabled and has_chunked_req:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+                if lifecycle_end < len(req.full_untruncated_fill_ids):
+                    trunc_len = min(trunc_len, lifecycle_end - prefix_len)
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
@@ -1251,6 +1315,8 @@ class PrefillAdder:
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
+                if lifecycle_end < len(req.full_untruncated_fill_ids):
+                    return AddReqResult.OTHER
 
         return self.budget_state()
 

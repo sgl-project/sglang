@@ -2,13 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    List,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 import zmq
@@ -22,10 +16,7 @@ from sglang.srt.managers.io_struct import (
     CachedTokensDetails,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.schedule_batch import BaseFinishReason, Req
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
@@ -398,6 +389,10 @@ class _GenerationStreamAccumulator:
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
+        # Unlike no_stop_trim (detokenizer presentation), this also aligns
+        # engine-side per-token metadata with the retained session history.
+        drop_trailing_stop_token = req.drop_trailing_stop_token
+        emit_len = len(output_ids_)
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
@@ -503,7 +498,7 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = emit_len if drop_trailing_stop_token else max(emit_len, 1)
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
@@ -546,7 +541,11 @@ class _GenerationStreamAccumulator:
         if self.return_sampling_mask:
             if req.return_sampling_mask:
                 send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
-                sampling_mask_end = len(req.output_token_sampling_mask)
+                sampling_mask_end = (
+                    emit_len
+                    if drop_trailing_stop_token
+                    else len(req.output_token_sampling_mask)
+                )
                 self.output_token_sampling_mask.append(
                     req.output_token_sampling_mask[
                         send_output_sampling_mask_offset:sampling_mask_end
@@ -567,15 +566,22 @@ class _GenerationStreamAccumulator:
                 if req.return_hidden_states == "last":
                     # Collection keeps this list bounded to the final valid
                     # accepted token, including speculative verify overshoot.
+                    hidden_state_index = (
+                        emit_len - 1 if drop_trailing_stop_token else -1
+                    )
                     self.output_hidden_states.append(
-                        req.hidden_states[-1] if req.hidden_states else None
+                        req.hidden_states[hidden_state_index]
+                        if req.hidden_states and emit_len
+                        else None
                     )
                 else:
                     # Mirror output_ids_through_stop: spec verify steps can
                     # overshoot finished_len.
                     hs = req.hidden_states
                     if req.finished_len is not None:
-                        hs = hs[: req.finished_len]
+                        hs = hs[
+                            : emit_len if drop_trailing_stop_token else req.finished_len
+                        ]
                     self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)

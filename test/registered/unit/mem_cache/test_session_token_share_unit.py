@@ -15,21 +15,33 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+from sglang.srt.managers.schedule_batch import (
+    MultimodalInputs,
+    StreamingSessionAbortPolicy,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
+from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, mm_inputs=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
-        mm_inputs=None,
+        mm_inputs=mm_inputs,
         session_params=SimpleNamespace(
-            id="s", rid=None, offset=None, replace=False, drop_previous_output=False
+            id="s",
+            rid=None,
+            offset=None,
+            replace=False,
+            drop_previous_output=False,
+            drop_trailing_stop_token=False,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
@@ -56,9 +68,14 @@ class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
-    def _create(self, rid, input_ids, max_new_tokens=8):
+    def _create(self, rid, input_ids, max_new_tokens=8, mm_inputs=None):
         return self.session.create_req(
-            _recv(rid, input_ids, max_new_tokens=max_new_tokens),
+            _recv(
+                rid,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                mm_inputs=mm_inputs,
+            ),
             tokenizer=None,
             vocab_size=VOCAB,
         )
@@ -99,6 +116,35 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
+    def test_bos_only_turn_forwards_retained_tail_before_boundary(self):
+        bos, empty_audio = 200000, 201472
+        first = self._create("first", [10], max_new_tokens=1)
+        self._decode_and_finish(first, [99])
+
+        direct_append = (
+            list(first.origin_input_ids) + list(first.output_ids) + [empty_audio]
+        )
+        self.assertEqual(direct_append[1:], [99, empty_audio])
+
+        drain = self.session.create_req(
+            _recv("drain", [bos], max_new_tokens=0),
+            tokenizer=SimpleNamespace(bos_token_id=bos),
+            vocab_size=VOCAB,
+        )
+        self.assertEqual(list(drain.origin_input_ids), [10, 99])
+        self.session.finish_req(drain)
+
+        boundary = self._create("boundary", [empty_audio])
+        self.assertEqual(list(boundary.origin_input_ids), [10, 99, empty_audio])
+        self.assertEqual(
+            list(boundary.origin_input_ids)[self.session.committed_origin_len :],
+            [empty_audio],
+        )
+
+    def test_streaming_boundary_replacement_rejects_none(self):
+        with self.assertRaisesRegex(ValueError, "cannot be None"):
+            self.session.replace_streaming_boundary(None)
+
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
         r1 = self._create("r1", in1)
@@ -110,7 +156,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
         r2._refresh_fill_ids()
-        self.session.abort_req()
+        self.session.abort_req(r2)
         self.assertEqual(self.session.committed_origin_len, len(in1))
 
         # Turn 3 must see exactly r1's history — no [50, 51], no doubled out1.
@@ -119,15 +165,174 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
         # Two aborted attempts in a row heal idempotently.
-        self.session.abort_req()
+        self.session.abort_req(r3)
         r4 = self._create("r4", [70])
         self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [70])
         self.assertEqual(list(r4.full_untruncated_fill_ids), list(r4.origin_input_ids))
 
-    def test_first_turn_abort(self):
-        self._create("r1", [1, 2, 3])
+    def test_retraction_checkpoint_keeps_turn_inflight(self):
+        r1 = self._create("r1", [1, 2, 3])
+        r1.output_ids.extend([4, 5])
+        r1._refresh_fill_ids()
+
+        self.session.checkpoint_retracted_req(r1)
+
         self.assertTrue(self.session._inflight)
-        self.session.abort_req()
+        [node] = self.session.req_nodes.values()
+        self.assertIs(node.req, r1)
+        with get_parallel().override(tp_rank=0):
+            overlapping = self._create("overlap", [6])
+        self.assertIsNotNone(overlapping.to_finish)
+        self.assertIn("already has an active request", overlapping.to_finish.message)
+
+        self.session.abort_req(r1)
+        resumed = self._create("resumed", [7])
+        self.assertEqual(list(resumed.origin_input_ids), [1, 2, 3, 4, 5, 7])
+
+    def test_detaching_rejected_concurrent_request_preserves_owner(self):
+        owner = self._create("owner", [1, 2, 3])
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("rejected", [4])
+        self.assertIsNotNone(rejected.to_finish)
+
+        cache = StreamingSession(SimpleNamespace())
+        control = Mock()
+        cache.attach_session_lifecycle(control)
+
+        self.assertTrue(cache.detach_queued_request(rejected))
+        self.assertIsNone(rejected.session)
+        self.assertTrue(self.session._inflight)
+        self.assertIs(self.session._inflight_req, owner)
+        control.on_session_released.assert_not_called()
+
+        self.assertTrue(cache.detach_queued_request(owner))
+        self.assertFalse(self.session._inflight)
+        self.assertIsNone(self.session._inflight_req)
+        control.on_session_released.assert_called_once_with("s")
+
+    def test_preaborted_concurrent_request_preserves_owner(self):
+        owner = self._create("owner", [1, 2, 3])
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("rejected", [4])
+        cache = StreamingSession(SimpleNamespace())
+        slot = SessionSlot(
+            req_pool_idx=1,
+            kv=SimpleNamespace(kv_allocated_len=0, swa_evicted_seqlen=0),
+        )
+        cache.slots["s"] = slot
+
+        self.assertIsNone(cache.find_active_slot(rejected))
+
+        self.assertIsNone(rejected.session)
+        self.assertTrue(self.session._inflight)
+        self.assertIs(self.session._inflight_req, owner)
+        self.assertIs(cache.slots["s"], slot)
+
+    def test_finishing_rejected_concurrent_request_preserves_owner(self):
+        owner = self._create("owner", [1, 2, 3])
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("rejected", [4])
+        rejected.finished_reason = rejected.to_finish
+
+        cache = StreamingSession(SimpleNamespace())
+        control = Mock()
+        cache.attach_session_lifecycle(control)
+        release_session = Mock(wraps=cache.release_session)
+        cache.release_session = release_session
+
+        self.assertTrue(cache.try_cache_finished_req(rejected))
+
+        self.assertIsNone(rejected.session)
+        self.assertIsNone(rejected.req_pool_idx)
+        self.assertIsNone(rejected.kv)
+        self.assertTrue(self.session._inflight)
+        self.assertIs(self.session._inflight_req, owner)
+        release_session.assert_not_called()
+        control.on_session_released.assert_not_called()
+
+    def test_canceling_rejected_concurrent_request_preserves_owner_slot(self):
+        retained_item = SimpleNamespace(feature=object())
+        boundary = self._create("boundary", [1, 2])
+        boundary.multimodal_inputs = MultimodalInputs(mm_items=[retained_item])
+        self._decode_and_finish(boundary, [])
+
+        owner = self._create("owner", [3])
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("rejected", [4])
+        rejected.finished_reason = rejected.to_finish
+        rejected.streaming_abort_policy = StreamingSessionAbortPolicy.COMMIT_FORWARDED
+        rejected_item = SimpleNamespace(feature=object())
+        rejected.multimodal_inputs = MultimodalInputs(
+            mm_items=[retained_item, rejected_item]
+        )
+
+        cache = StreamingSession(SimpleNamespace())
+        slot = SessionSlot(
+            req_pool_idx=1,
+            kv_committed_len=3,
+            kv=SimpleNamespace(kv_allocated_len=3, swa_evicted_seqlen=0),
+        )
+        cache.slots["s"] = slot
+        control = Mock()
+        cache.attach_session_lifecycle(control)
+        release_session = Mock(wraps=cache.release_session)
+        cache.release_session = release_session
+
+        self.assertTrue(cache.try_cache_finished_req(rejected))
+
+        self.assertIsNone(rejected.session)
+        self.assertTrue(self.session._inflight)
+        self.assertIs(self.session._inflight_req, owner)
+        self.assertIs(cache.slots["s"], slot)
+        self.assertIsNotNone(retained_item.feature)
+        self.assertIsNone(rejected_item.feature)
+        self.assertIsNone(rejected.multimodal_inputs)
+        release_session.assert_not_called()
+        control.on_request_committed.assert_not_called()
+        control.on_session_released.assert_not_called()
+
+    def test_resumed_retracted_request_finishes_without_self_detach(self):
+        r1 = self._create("r1", [1, 2, 3])
+        r1.output_ids.extend([4])
+        r1._refresh_fill_ids()
+        self.session.checkpoint_retracted_req(r1)
+
+        self.session.finish_req(r1)
+
+        self.assertFalse(self.session._inflight)
+        self.assertIs(r1.session, self.session)
+        [node] = self.session.req_nodes.values()
+        self.assertIs(node.req, r1)
+
+    def test_retracted_queue_rejection_retains_partial_append_boundary(self):
+        r1 = self._create("r1", [1, 2, 3])
+        r1.output_ids.extend([4, 5])
+        r1._refresh_fill_ids()
+        retained_mm = MultimodalInputs(mm_items=["retained-audio"])
+        r1.multimodal_inputs = retained_mm
+        r1.req_pool_idx = 0
+        r1.kv_committed_len = 5
+        r1.kv = SimpleNamespace(kv_allocated_len=5, swa_evicted_seqlen=0)
+        cache = StreamingSession(SimpleNamespace())
+
+        cache.cache_finished_req(r1, is_insert=False)
+        r1.reset_for_retract()
+
+        self.assertTrue(self.session._inflight)
+        self.assertTrue(cache.detach_queued_request(r1))
+        self.assertFalse(self.session._inflight)
+        self.assertIsNone(r1.session)
+        self.assertIs(r1.multimodal_inputs, retained_mm)
+        self.assertEqual(cache.slots["s"].kv_committed_len, 5)
+
+        r2 = self._create("r2", [6])
+        self.assertEqual(list(r2.origin_input_ids), [1, 2, 3, 4, 5, 6])
+        self.assertIs(r2.multimodal_inputs, retained_mm)
+
+    def test_first_turn_abort(self):
+        r1 = self._create("r1", [1, 2, 3])
+        self.assertTrue(self.session._inflight)
+        self.session.abort_req(r1)
         self.assertFalse(self.session._inflight)
         # No finish_req ran: nothing committed, next turn starts from scratch.
         self.assertIsNone(self.session.committed_origin_len)
@@ -136,6 +341,23 @@ class TestSessionTokenShare(CustomTestCase):
         self._decode_and_finish(r2, [9])
         r3 = self._create("r3", [6])
         self.assertEqual(list(r3.origin_input_ids), [4, 5, 9, 6])
+
+    def test_aborted_turn_does_not_mutate_committed_multimodal_history(self):
+        committed_mm = MultimodalInputs(mm_items=["committed"])
+        r1 = self._create("r1", [1])
+        r1.multimodal_inputs = committed_mm
+        self._decode_and_finish(r1, [2])
+
+        incoming_mm = MultimodalInputs(mm_items=["aborted"])
+        r2 = self._create("r2", [3], mm_inputs=incoming_mm)
+        self.assertIsNot(r2.multimodal_inputs, r1.multimodal_inputs)
+        r2.multimodal_inputs.merge(incoming_mm)
+        self.assertEqual(r2.multimodal_inputs.mm_items, ["committed", "aborted"])
+        self.session.abort_req(r2)
+
+        self.assertEqual(r1.multimodal_inputs.mm_items, ["committed"])
+        r3 = self._create("r3", [4], mm_inputs=MultimodalInputs(mm_items=["next"]))
+        self.assertEqual(r3.multimodal_inputs.mm_items, ["committed"])
 
     def test_max_new_tokens_overshoot_falls_back(self):
         in1 = list(range(300, 310))

@@ -48,6 +48,7 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 
 logger = logging.getLogger(__name__)
 
+
 # Reduce system time calls by computing time.time() based on calibrated perf_counter() values.
 global_diff_realtime_monotonic = time.time() - time.perf_counter()
 
@@ -1226,7 +1227,16 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         _attrs["forward_mode"] = "prebuilt"
 
     for req in batch.reqs:
-        req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)
+        forward_mode = batch.forward_mode
+        attrs = _attrs
+        if req.custom_decode_needs_prefill_schedule:
+            # Direct admission physically merges this request into a decode
+            # batch, but its first step replaces the one-token prefill. Preserve
+            # that semantic timing label once; later decode steps stay decode.
+            req.custom_decode_needs_prefill_schedule = False
+            forward_mode = ForwardMode.EXTEND
+            attrs = {**_attrs, "forward_mode": "prefill"}
+        req.time_stats.set_last_scheduled_time(forward_mode, ts, attrs)
 
 
 def set_time_batch(

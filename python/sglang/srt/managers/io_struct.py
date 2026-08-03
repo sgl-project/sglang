@@ -137,6 +137,9 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
+    # Streaming sessions only: exclude a sampled-but-unforwarded stop token
+    # from the next turn's committed context.
+    drop_trailing_stop_token: Optional[bool] = None
 
 
 # Type definitions for multimodal input data

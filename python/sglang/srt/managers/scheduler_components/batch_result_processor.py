@@ -2,14 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -23,10 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
-from sglang.srt.mem_cache.common import (
-    maybe_cache_unfinished_req,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -39,6 +29,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_server_args,
 )
+from sglang.srt.session.streaming_session import get_streaming_session
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -59,10 +50,7 @@ if TYPE_CHECKING:
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.managers.utils import (
-        EmbeddingBatchResult,
-        GenerationBatchResult,
-    )
+    from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -269,6 +257,7 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
+                    self._maybe_record_streaming_session_decode(req)
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -304,6 +293,11 @@ class SchedulerBatchResultProcessor:
 
                 else:
                     # being chunked reqs' prefill is not finished
+                    self._maybe_record_streaming_session_prefill(
+                        req,
+                        start=batch.prefix_lens[i],
+                        end=batch.prefix_lens[i] + batch.extend_lens[i],
+                    )
                     req.inflight_middle_chunks -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
@@ -860,7 +854,7 @@ class SchedulerBatchResultProcessor:
             new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
-            req.time_stats.set_last_decode_finish_time()
+            self._record_decode_step_finish_time(req)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
@@ -911,6 +905,31 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+
+    @staticmethod
+    def _record_decode_step_finish_time(req: Req) -> None:
+        if req.custom_decode_needs_prefill_completion:
+            req.custom_decode_needs_prefill_schedule = False
+            req.custom_decode_needs_prefill_completion = False
+            req.time_stats.set_prefill_finished_time()
+        else:
+            req.time_stats.set_last_decode_finish_time()
+
+    def _maybe_record_streaming_session_decode(self, req: Req) -> None:
+        if req.session is None or not req.session.streaming:
+            return
+        session_state_cache = get_streaming_session(self.tree_cache)
+        if session_state_cache is not None:
+            session_state_cache.record_decode_token(req)
+
+    def _maybe_record_streaming_session_prefill(
+        self, req: Req, *, start: int, end: int
+    ) -> None:
+        if req.session is None or not req.session.streaming:
+            return
+        session_state_cache = get_streaming_session(self.tree_cache)
+        if session_state_cache is not None:
+            session_state_cache.record_prefill_forward_complete(req, start, end)
 
     def _normalize_decode_outputs(
         self,
@@ -1016,6 +1035,9 @@ class SchedulerBatchResultProcessor:
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
         self._mamba_prefix_cache_update(req, batch, result, i)
+        # Streaming checkpoints must capture post-boundary recurrent state
+        # before a finished request releases it.
+        self._maybe_record_streaming_session_decode(req)
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache

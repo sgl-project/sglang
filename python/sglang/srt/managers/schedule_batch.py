@@ -79,10 +79,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -265,6 +262,20 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class StreamingSessionAbortPolicy(Enum):
+    """How a streaming session handles an aborted active request.
+
+    ``RELEASE_SESSION`` discards the in-flight request boundary and releases
+    its streaming-cache slot, leaving any earlier committed boundary available
+    for a later re-prefill. ``COMMIT_FORWARDED`` retains tokens already sent to
+    the client while dropping the sampled-but-unforwarded tail token, then
+    saves that retained prefix as the next session boundary.
+    """
+
+    RELEASE_SESSION = auto()
+    COMMIT_FORWARDED = auto()
+
+
 class Modality(Enum):
     IMAGE = auto()
     VIDEO = auto()
@@ -296,7 +307,9 @@ class MultimodalDataItem:
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
 
-    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
+    Each item has its own hash and pad_value, enabling per-item embedding
+    caching. Stateful encoders set ``embedding_cacheable=False`` because their
+    output depends on stream history in addition to the hashed raw feature.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -316,6 +329,11 @@ class MultimodalDataItem:
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    # Stateful encoders must run for every item even when its raw feature hash
+    # matches an earlier item. Stateless image/audio inputs keep the cacheable
+    # default.
+    embedding_cacheable: bool = True
 
     def __getattr__(self, name: str):
         if (
@@ -919,6 +937,14 @@ class Req(ReqDllmMixin):
         self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
+        # Streaming sessions: drop the trailing stop token from the committed
+        # sequence on finish (set from SessionParams in Session.create_req).
+        self.drop_trailing_stop_token = False
+        self.streaming_abort_policy = StreamingSessionAbortPolicy.RELEASE_SESSION
+        # A custom decode row replaces a one-token prefill. Scheduling and
+        # completion can be consumed in different overlap iterations.
+        self.custom_decode_needs_prefill_schedule = False
+        self.custom_decode_needs_prefill_completion = False
         # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop,
@@ -1618,6 +1644,8 @@ class Req(ReqDllmMixin):
         self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
+        self.custom_decode_needs_prefill_schedule = False
+        self.custom_decode_needs_prefill_completion = False
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None

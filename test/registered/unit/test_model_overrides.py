@@ -23,11 +23,7 @@ from sglang.srt.arg_groups.overrides import (
     validate_declarations,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    get_context,
-    get_server_args,
-    reset_context,
-)
+from sglang.srt.runtime_context import get_context, get_server_args, reset_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -300,9 +296,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         return ServerArgs(model_path=config_dir, **server_kwargs)
 
     def _publish(self, server_args):
-        from sglang.srt.server_args import (
-            set_global_server_args_for_scheduler,
-        )
+        from sglang.srt.server_args import set_global_server_args_for_scheduler
 
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
@@ -846,10 +840,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_v4_sm120_moe_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_v4_sm120_moe,
-        )
+        from sglang.srt.arg_groups.overrides import ResolvedView, _deepseek_v4_sm120_moe
 
         def _view(arch="DeepseekV4ForCausalLM", **kw):
             hf = SimpleNamespace(architectures=[arch])
@@ -2010,7 +2001,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="deepep", ep_size=1, tp_size=8)
+                )
             ),
             {"ep_size": 8},
         )
