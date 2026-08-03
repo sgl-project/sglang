@@ -53,5 +53,4 @@ export const benchmarks = [
   { match: { hw: "gb300"  , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
   { match: { hw: "h200"   , variant: "lora"    , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   } },
   { match: { hw: "gb300"  , variant: "lora"    , quant: "bf16"  , strategy: "balanced"     , nodes: "multi-2"  } },
-  { match: { hw: "h200"   , variant: "lora"    , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
 ];

@@ -134,6 +134,11 @@ sglang generate \
   --save-output
 ```
 
+MiniMax-H3 supports this path while preserving its required FP32 patch,
+timestep, and output projections. See the
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#6-runtime-feature-recipes)
+for its distributed serving recipe.
+
 ### MXFP4 Online Quantization
 
 MXFP4 provides aggressive 4-bit compression with online quantization. **Note: Requires ROCm and MI350+ (gfx95x) GPU.**

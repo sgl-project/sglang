@@ -68,7 +68,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -105,8 +105,8 @@ def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
         server_args.decode_attention_backend or server_args.attention_backend
     )
     return (
-        server_args.speculative_algorithm == "DSPARK"
-        and server_args.speculative_attention_mode == "decode"
+        get_spec().speculative_algorithm == "DSPARK"
+        and get_spec().speculative_attention_mode == "decode"
         and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
     )
 
@@ -177,7 +177,7 @@ def _should_defer_dsa_cp_kv_gather(
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
-            get_server_args().flashinfer_mla_disable_ragged
+            get_exec().kernel.flashinfer_mla_disable_ragged
         )
 
     def should_run_indexer(
@@ -359,7 +359,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_server_args().dcp_replicate_q_proj
+            get_parallel().dcp_replicate_q_proj
             and _is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
@@ -774,15 +774,24 @@ class DeepseekMLAForwardMixin:
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
-        if (
-            (dsa_prefill_cp or mla_prefill_cp)
-            and not defer_kv_gather_until_after_rope
-            and not is_cp_v2_active(forward_batch)
-        ):
+        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
+            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
+
+            k_nope, k_pe = materialize_full_kv_cp(
+                self,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_pe,
+            )
+        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
             # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
             # backend via the strategy (materialize_full_mla_kv).
             k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+                latent_cache,
+                forward_batch,
+                k_nope,
+                k_pe,
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
@@ -1020,7 +1029,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            dcp_comm_backend = get_server_args().dcp_comm_backend
+            dcp_comm_backend = get_parallel().dcp_comm_backend
             if dcp_comm_backend in ("a2a", "fi_a2a"):
                 # A2A exchange of head partials + LSE, then local Triton combine.
                 # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
@@ -1230,8 +1239,8 @@ class DeepseekMLAForwardMixin:
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_server_args().dsa_decode_backend == "trtllm"
-                or get_server_args().dsa_prefill_backend == "trtllm"
+                get_exec().kernel.dsa_decode_backend == "trtllm"
+                or get_exec().kernel.dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
@@ -1254,8 +1263,8 @@ class DeepseekMLAForwardMixin:
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                server_args.dsa_decode_backend == "tilelang"
-                or server_args.dsa_prefill_backend == "tilelang"
+                get_exec().kernel.dsa_decode_backend == "tilelang"
+                or get_exec().kernel.dsa_prefill_backend == "tilelang"
             )
         )
 

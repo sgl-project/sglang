@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -41,6 +42,45 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_return_hidden_states_mode_configuration(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.enable_return_hidden_states)
+        self.assertIsNone(disabled.return_hidden_states_mode)
+
+        last = ServerArgs(
+            model_path="dummy",
+            return_hidden_states_mode="last",
+        )
+        self.assertTrue(last.enable_return_hidden_states)
+        self.assertEqual(last.return_hidden_states_mode, "last")
+
+        legacy_full = ServerArgs(
+            model_path="dummy",
+            enable_return_hidden_states=True,
+        )
+        self.assertTrue(legacy_full.enable_return_hidden_states)
+        self.assertEqual(legacy_full.return_hidden_states_mode, "full")
+
+        parsed_last = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--return-hidden-states-mode",
+                "last",
+            ]
+        )
+        self.assertTrue(parsed_last.enable_return_hidden_states)
+        self.assertEqual(parsed_last.return_hidden_states_mode, "last")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states_mode must be one of",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                return_hidden_states_mode="lst",
+            )
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -64,6 +104,30 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMmEncoderDataParallelLogging(CustomTestCase):
+    def test_logs_when_encoder_dp_has_no_parallelism(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=1
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=1", logs.output[0])
+        self.assertIn("no data-parallel work", logs.output[0])
+
+    def test_logs_encoder_dp_tradeoff_for_tp(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=4
+        )
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=4", logs.output[0])
+        self.assertIn("high-resolution or multi-image", logs.output[0])
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -194,6 +258,56 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+
+    def test_pd_prefill_dcp_warns_about_performance(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            dcp_size=4,
+        )
+        with self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs:
+            server_args._handle_pd_disaggregation()
+        self.assertIn("without improving prefill performance", "\n".join(logs.output))
+
+    def test_pd_decode_dcp_forces_chunk_cache(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            dcp_size=4,
+        )
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="fake",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_radix_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            disaggregation_decode_enable_radix_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+            server_args._handle_pd_disaggregation()
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
@@ -1197,17 +1311,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
-
-
-class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_session_radix_cache=True,
-            radix_eviction_policy="lru",
-        )
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            server_args._handle_cache_compatibility()
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
