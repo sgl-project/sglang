@@ -484,12 +484,24 @@ fn split_mm_column(
 }
 
 /// One request handed to the MM worker pool: the rid to correlate the result
-/// plus the msgpack payload from [`GenerateRequest::to_mm_payload_msgpack`].
+/// plus the typed, owned inputs from [`GenerateRequest::take_mm_work`] — no
+/// serialization within the process.
 #[derive(Debug)]
 pub struct MmRequest {
     pub rid: crate::ids::Rid,
-    pub payload: Bytes,
-    /// See [`MmData::prefetched`]; consumed by `mm_payload::parse`.
+    pub work: MmWorkItem,
+}
+
+/// The parked request's fields the MM worker owns, converted to the driver
+/// input by [`super::mm_payload::to_mm_input`].
+#[derive(Debug, Default)]
+pub struct MmWorkItem {
+    pub text: Option<String>,
+    pub input_ids: Option<Vec<i32>>,
+    pub image_data: Option<rmpv::Value>,
+    pub video_data: Option<rmpv::Value>,
+    pub audio_data: Option<rmpv::Value>,
+    /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
 }
 
@@ -627,35 +639,22 @@ impl GenerateRequest {
         })
     }
 
-    /// Serialize the fields the MM worker pool needs for this request: a
-    /// msgpack array `[text, input_ids, image_data, video_data, audio_data]`
-    /// (decoded by [`super::mm_payload::parse`] in the native pipeline).
-    pub fn to_mm_payload_msgpack(&self) -> Result<Bytes, Error> {
-        use rmpv::Value;
-        let text_val = match &self.text {
-            Some(t) => Value::from(t.as_str()),
-            None => Value::Nil,
+    /// Carve out the MM worker's inputs. `text` is cloned — the scheduler
+    /// header still needs it; `input_ids` is taken — the expanded ids replace
+    /// it when the worker finishes; the mm values move wholesale.
+    pub fn take_mm_work(&mut self) -> MmWorkItem {
+        let mut work = MmWorkItem {
+            text: self.text.clone(),
+            input_ids: self.input_ids.take(),
+            ..Default::default()
         };
-        let input_ids_val = match &self.input_ids {
-            Some(ids) => Value::Array(ids.iter().map(|&i| Value::from(i)).collect()),
-            None => Value::Nil,
-        };
-        let mm_field = |f: fn(&MmData) -> &Option<Value>| -> Value {
-            self.mm
-                .as_deref()
-                .and_then(|m| f(m).clone())
-                .unwrap_or(Value::Nil)
-        };
-        let arr = Value::Array(vec![
-            text_val,
-            input_ids_val,
-            mm_field(|m| &m.image_data),
-            mm_field(|m| &m.video_data),
-            mm_field(|m| &m.audio_data),
-        ]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(Bytes::from(buf))
+        if let Some(m) = self.mm.as_deref_mut() {
+            work.image_data = m.image_data.take();
+            work.video_data = m.video_data.take();
+            work.audio_data = m.audio_data.take();
+            work.prefetched = std::mem::take(&mut m.prefetched);
+        }
+        work
     }
 
     pub fn encode_header(&self) -> Result<Bytes, Error> {
@@ -972,21 +971,21 @@ mod tests {
         assert!(ps[1].has_multimodal());
     }
 
-    /// The mm payload for the MM worker pool is a positional msgpack array
-    /// `[text, input_ids, image_data, video_data, audio_data]`.
+    /// `take_mm_work` clones `text` (the scheduler header still needs it) and
+    /// moves everything the worker owns out of the request.
     #[test]
-    fn mm_payload_shape() {
-        let (ps, _) =
+    fn mm_work_item_takes_owned_fields() {
+        let (mut ps, _) =
             requests(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
-        let payload = ps[0].to_mm_payload_msgpack().unwrap();
-        let val = rmpv::decode::read_value(&mut &payload[..]).unwrap();
-        let arr = val.as_array().unwrap();
-        assert_eq!(arr.len(), 5);
-        assert_eq!(arr[0].as_str(), Some("hi"));
-        assert!(arr[1].is_nil());
-        assert_eq!(arr[2].as_array().unwrap().len(), 2);
-        assert!(arr[3].is_nil());
-        assert_eq!(arr[4].as_str(), Some("a"));
+        let work = ps[0].take_mm_work();
+        assert_eq!(work.text.as_deref(), Some("hi"));
+        assert!(work.input_ids.is_none());
+        assert_eq!(work.image_data.unwrap().as_array().unwrap().len(), 2);
+        assert!(work.video_data.is_none());
+        assert_eq!(work.audio_data.unwrap().as_str(), Some("a"));
+        // Moved out, not cloned; `text` survives for the header.
+        assert!(ps[0].mm.as_ref().unwrap().image_data.is_none());
+        assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 
     /// The body limit is disabled, so an unbounded batch turns a small body into an

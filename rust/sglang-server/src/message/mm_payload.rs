@@ -1,7 +1,5 @@
-//! The MM wire payload: parse the msgpack blob built by
-//! [`super::request::GenerateRequest::to_mm_payload_msgpack`] into the typed
-//! [`MmInput`] the `sglang-mm` driver consumes. Encoder and decoder live in
-//! this crate so the wire contract has one owner.
+//! Convert a parked request's [`MmWorkItem`] into the typed [`MmInput`] the
+//! `sglang-mm` driver consumes — an in-process handoff, nothing serialized.
 //!
 //! Every `Err` rejects the request back to the client (there is no Python
 //! fallback path); the message says whether the input is malformed or merely
@@ -10,6 +8,8 @@
 use bytes::Bytes;
 use rmpv::Value;
 use sglang_mm::driver::{ImageSource, MmInput};
+
+use super::request::MmWorkItem;
 
 /// True for source forms the API layer must resolve before MM dispatch: I/O —
 /// network *or* disk (a network mount can hang past any HTTP timeout) — never
@@ -39,57 +39,24 @@ pub fn io_sources(value: &Value) -> Vec<String> {
     out
 }
 
-/// Decode `[text, input_ids, image_data, video_data, audio_data]`.
-/// `prefetched` holds the already-resolved bytes of the payload's I/O-backed
-/// sources (in `io_sources` order); those sources are swapped for their
+/// `work.prefetched` holds the already-resolved bytes of the I/O-backed
+/// sources (in [`io_sources`] order); those sources are swapped for their
 /// bytes, and one left without an entry is an internal error, not a fetch.
-pub fn parse(payload: &[u8], prefetched: &[Bytes]) -> Result<MmInput, String> {
-    let value = rmpv::decode::read_value(&mut &payload[..])
-        .map_err(|e| format!("mm payload decode: {e}"))?;
-    let Value::Array(fields) = value else {
-        return Err("mm payload is not an array".into());
-    };
-    if fields.len() != 5 {
-        return Err("mm payload arity mismatch".into());
-    }
-    if value_present(&fields[3]) || value_present(&fields[4]) {
+pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
+    let present = |v: &Option<Value>| v.as_ref().is_some_and(value_present);
+    if present(&work.video_data) || present(&work.audio_data) {
         return Err("unsupported modality: video/audio input".into());
     }
-
-    let text = match &fields[0] {
-        Value::Nil => None,
-        Value::String(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| "mm payload: non-utf8 text".to_string())?
-                .to_owned(),
-        ),
-        _ => return Err("mm payload: non-string text".into()),
-    };
-    let input_ids = match &fields[1] {
-        Value::Nil => None,
-        Value::Array(values) => Some(
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_i64()
-                        .and_then(|id| i32::try_from(id).ok())
-                        .ok_or_else(|| "mm payload: non-int input id".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        _ => return Err("mm payload: bad input_ids".into()),
-    };
-
     let mut images = Vec::new();
-    collect_images(&fields[2], &mut prefetched.iter(), &mut images)?;
+    if let Some(image_data) = &work.image_data {
+        collect_images(image_data, &mut work.prefetched.iter(), &mut images)?;
+    }
     if images.is_empty() {
-        return Err("no raw image sources in mm payload".into());
+        return Err("no raw image sources in mm input".into());
     }
     Ok(MmInput {
-        text,
-        input_ids,
+        text: work.text,
+        input_ids: work.input_ids,
         images,
     })
 }
@@ -151,48 +118,37 @@ pub fn value_present(value: &Value) -> bool {
 mod tests {
     use super::*;
 
-    fn encode(fields: Vec<Value>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &Value::Array(fields)).unwrap();
-        bytes
-    }
-
-    fn image_payload(image: Value) -> Vec<u8> {
-        encode(vec![
-            Value::from("prompt"),
-            Value::Nil,
-            image,
-            Value::Nil,
-            Value::Nil,
-        ])
+    fn image_work(image: Value) -> MmWorkItem {
+        MmWorkItem {
+            text: Some("prompt".into()),
+            image_data: Some(image),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn parses_string_and_list_images() {
-        let one = parse(&image_payload(Value::from("data:image/png;base64,x")), &[]).unwrap();
+    fn converts_string_and_list_images() {
+        let one = to_mm_input(image_work(Value::from("data:image/png;base64,x"))).unwrap();
         assert_eq!(one.images.len(), 1);
-        let many = parse(
-            &image_payload(Value::Array(vec![Value::from("a"), Value::from("b")])),
-            &[],
-        )
+        let many = to_mm_input(image_work(Value::Array(vec![
+            Value::from("a"),
+            Value::from("b"),
+        ])))
         .unwrap();
         assert_eq!(many.images.len(), 2);
     }
 
     #[test]
     fn unsupported_modalities_and_shapes_rejected() {
-        let video = encode(vec![
-            Value::from("prompt"),
-            Value::Nil,
-            Value::Nil,
-            Value::from("video.mp4"),
-            Value::Nil,
-        ]);
-        assert!(parse(&video, &[]).err().unwrap().contains("video/audio"));
+        let video = MmWorkItem {
+            video_data: Some(Value::from("video.mp4")),
+            ..Default::default()
+        };
+        assert!(to_mm_input(video).err().unwrap().contains("video/audio"));
 
         let dict = Value::Map(vec![(Value::from("format"), Value::from("x"))]);
         assert!(
-            parse(&image_payload(Value::Array(vec![dict])), &[])
+            to_mm_input(image_work(Value::Array(vec![dict])))
                 .err()
                 .unwrap()
                 .contains("image_data shape")
@@ -200,24 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_payloads_fail() {
-        // Truncated msgpack (array header, no elements) and wrong arity.
-        assert!(parse(b"\x91", &[]).is_err());
-        let three = encode(vec![Value::Nil, Value::Nil, Value::from("a")]);
-        assert!(parse(&three, &[]).is_err());
-    }
-
-    #[test]
     fn empty_video_audio_lists_are_not_modalities() {
         // Mirrors Python `has_valid_data`: nil / empty lists don't count.
-        let payload = encode(vec![
-            Value::Nil,
-            Value::Array(vec![Value::from(1)]),
-            Value::from("a"),
-            Value::Array(vec![]),
-            Value::Array(vec![Value::Array(vec![])]),
-        ]);
-        assert_eq!(parse(&payload, &[]).unwrap().images.len(), 1);
+        let work = MmWorkItem {
+            input_ids: Some(vec![1]),
+            image_data: Some(Value::from("a")),
+            video_data: Some(Value::Array(vec![])),
+            audio_data: Some(Value::Array(vec![Value::Array(vec![])])),
+            ..Default::default()
+        };
+        assert_eq!(to_mm_input(work).unwrap().images.len(), 1);
     }
 
     /// I/O-backed sources (URLs and file paths) are swapped for their
@@ -232,8 +180,9 @@ mod tests {
         ]);
         assert_eq!(io_sources(&image), vec!["http://a/x.png", "/mnt/nfs/y.png"]);
 
-        let fetched = [Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
-        let input = parse(&image_payload(image.clone()), &fetched).unwrap();
+        let mut work = image_work(image.clone());
+        work.prefetched = vec![Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
+        let input = to_mm_input(work).unwrap();
         let as_bytes = |i: usize| match &input.images[i] {
             ImageSource::Bytes(b) => b.as_slice(),
             other => panic!("expected bytes, got {other:?}"),
@@ -242,34 +191,23 @@ mod tests {
         assert_eq!(as_bytes(2), b"bb");
         assert!(matches!(&input.images[1], ImageSource::String(_)));
 
-        let err = parse(&image_payload(image), &[]).err().unwrap();
+        let err = to_mm_input(image_work(image)).err().unwrap();
         assert!(err.contains("not prefetched"), "{err}");
     }
 
     #[test]
-    fn image_free_payload_rejected() {
+    fn image_free_work_rejected() {
         assert!(
-            parse(&image_payload(Value::Nil), &[])
+            to_mm_input(image_work(Value::Nil))
                 .err()
                 .unwrap()
                 .contains("no raw image sources")
         );
-    }
-
-    #[test]
-    fn rejects_non_integer_input_ids() {
-        for bad_id in [
-            Value::from("not-an-id"),
-            Value::from(i64::from(i32::MAX) + 1),
-        ] {
-            let payload = encode(vec![
-                Value::Nil,
-                Value::Array(vec![bad_id]),
-                Value::from("a"),
-                Value::Nil,
-                Value::Nil,
-            ]);
-            assert!(parse(&payload, &[]).is_err());
-        }
+        assert!(
+            to_mm_input(MmWorkItem::default())
+                .err()
+                .unwrap()
+                .contains("no raw image sources")
+        );
     }
 }

@@ -299,7 +299,7 @@ impl Ingress {
                 // re-enters via `MmEncoded` (→ PreSendValidating) or `MmFailed`
                 // (→ reject). Doesn't loop.
                 RequestState::Encoding => {
-                    let (payload, prefetched) = {
+                    let work = {
                         let RequestKind::Generate(g) = &mut req.kind else {
                             self.fail(
                                 &mut req,
@@ -308,24 +308,11 @@ impl Ingress {
                             );
                             return;
                         };
-                        match g.to_mm_payload_msgpack() {
-                            // The API layer resolved I/O-backed sources already;
-                            // hand their bytes over out-of-band.
-                            Ok(p) => {
-                                let fetched =
-                                    g.mm.as_mut().map(|m| std::mem::take(&mut m.prefetched));
-                                (p, fetched.unwrap_or_default())
-                            }
-                            Err(e) => {
-                                self.fail(&mut req, e, registered);
-                                return;
-                            }
-                        }
+                        g.take_mm_work()
                     };
                     let msg = MmRequest {
                         rid: req.rid.clone(),
-                        payload,
-                        prefetched,
+                        work,
                     };
                     // Full channel = the MM pool can't keep up → backpressure,
                     // same as a full ingress ring. Disconnected = pool gone.
@@ -1499,16 +1486,15 @@ mod tests {
         let (mut ingress, _detok_rx, consumer, _tm_tx, mm_rx) = make_ingress();
         ingress.drive(mm_generate_req("mm-1"));
 
-        // Submitted to the mm pool with the mm payload; nothing on the ring yet.
+        // Submitted to the mm pool with the typed work item; nothing on the ring yet.
         let sub = mm_rx.try_recv().expect("mm pool must receive the request");
         assert_eq!(sub.rid.as_str(), "mm-1");
-        let val = rmpv::decode::read_value(&mut &sub.payload[..]).unwrap();
-        let arr = val
-            .as_array()
-            .expect("payload is [text, ids, img, vid, aud]");
-        assert_eq!(arr[0].as_str(), Some("<image> hi"));
-        assert!(arr[1].is_nil(), "no client input_ids");
-        assert_eq!(arr[2].as_str(), Some("data:image/jpeg;base64,xxxx"));
+        assert_eq!(sub.work.text.as_deref(), Some("<image> hi"));
+        assert!(sub.work.input_ids.is_none(), "no client input_ids");
+        assert_eq!(
+            sub.work.image_data.as_ref().and_then(|v| v.as_str()),
+            Some("data:image/jpeg;base64,xxxx")
+        );
         assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
 
         // Bridge returns the final expanded ids → pushed to the ring.

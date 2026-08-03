@@ -169,8 +169,8 @@ impl Context {
 /// Run the pipeline for one request. `Ok` returns the final
 /// placeholder-expanded ids (the mm buffers are parked in the sidecar
 /// strictly before returning); `Err` rejects the request back to the client.
-fn process(ctx: &Context, req: &MmRequest) -> Result<Vec<i32>, String> {
-    let input = crate::message::mm_payload::parse(&req.payload, &req.prefetched)?;
+fn process(ctx: &Context, rid: &crate::ids::Rid, work: crate::message::MmWorkItem) -> Result<Vec<i32>, String> {
+    let input = crate::message::mm_payload::to_mm_input(work)?;
     let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
         let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
             "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
@@ -184,7 +184,7 @@ fn process(ctx: &Context, req: &MmRequest) -> Result<Vec<i32>, String> {
         FeatureStore::Inline(drain.features)
     };
     ctx.sidecar.lock().unwrap().insert(
-        req.rid.as_str().to_owned(),
+        rid.as_str().to_owned(),
         MmResult {
             features,
             grids: drain.grids,
@@ -269,8 +269,8 @@ impl MmWorker {
     /// finds it; an error rejects the request back to the client as a 400.
     fn run(self) {
         while let Ok(req) = self.rx.recv() {
-            let rid = req.rid.clone();
-            let event = match process(&self.ctx, &req) {
+            let rid = req.rid;
+            let event = match process(&self.ctx, &rid, req.work) {
                 Ok(input_ids) => {
                     tracing::debug!(%rid, tokens = input_ids.len(), "mm: processed");
                     TmEvent::MmEncoded { rid, input_ids }
