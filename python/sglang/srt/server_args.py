@@ -4456,6 +4456,7 @@ class ServerArgs:
             is_deepseek_v4,
             is_nemotron_h,
         )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4482,7 +4483,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
