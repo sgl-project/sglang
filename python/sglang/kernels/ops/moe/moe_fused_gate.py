@@ -9,10 +9,10 @@ import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.ops.moe import moe_route_radix
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
 
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -290,6 +290,30 @@ def moe_fused_gate(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
+    # K3 radix-select fast path: native-CUDA radix-select replaces the 16
+    # dependent argmax rounds (single CTA per token; ids bit-identical to this
+    # triton kernel incl. ties).
+    # The radix kernel keeps keys register-resident and returns winners in
+    # expert-id order (skipping the biased-descending sort; downstream MoE
+    # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
+    # kernel at [1..8192, 896] top-16 on B200.
+    if (
+        scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and moe_softcapping == 0.0
+    ):
+        radix_args = (
+            scores,
+            bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        if moe_route_radix.covered(scores, bias, topk):
+            return moe_route_radix.route_radix(*radix_args, sorted=False)
+
     M, N = scores.shape
     K = topk
     K_routed = topk - num_fused_shared_experts
@@ -309,7 +333,10 @@ def moe_fused_gate(
     # stay occupancy-bound. Swept on H100/B200: this beats the AOT kernels across
     # shapes, whereas larger tiles / more warps regress (register pressure).
     BLOCK_M = max(1, min(4, 256 // BLOCK_N))
-    num_warps = 1
+    # For wide rows (e.g. Kimi K3: 896 experts, BLOCK_N 1024) the K sequential
+    # argmax passes dominate and benefit from more warps despite the
+    # cross-warp reduction cost.
+    num_warps = 1 if BLOCK_N <= 512 else 4
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}

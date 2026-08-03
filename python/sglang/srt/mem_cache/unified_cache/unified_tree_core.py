@@ -21,7 +21,7 @@ import sys
 from array import array
 from collections import defaultdict
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
@@ -161,6 +161,7 @@ class UnifiedLRUList:
         component_type: ComponentType,
         tree_components: tuple[ComponentType, ...],
         use_host_ptr: bool = False,
+        is_referenced: Optional[Callable[[UnifiedTreeNode], bool]] = None,
     ):
         self.component_type = component_type
         # Pointer slot: host LRU uses offset slots so device/host pointers
@@ -171,6 +172,19 @@ class UnifiedLRUList:
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
+        # Session partition: [head .. mid) holds session-referenced nodes and
+        # (mid .. tail] unreferenced ones, so evictions directly walks (tail -> head).
+        self._is_referenced = is_referenced
+        self.mid: Optional[UnifiedTreeNode] = None
+        self.cursor: Optional[UnifiedTreeNode] = None
+        if is_referenced is not None:
+            self.mid = UnifiedTreeNode(tree_components)
+            self.cursor = UnifiedTreeNode(tree_components)
+            for ct in tree_components:
+                for node in (self.mid, self.cursor):
+                    node.component_data[ct].lock_ref = 1
+                    node.component_data[ct].host_lock_ref = 1
+            self._add_node_after(self.head, self.mid)
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
         pt = self._pt
@@ -180,7 +194,10 @@ class UnifiedLRUList:
         prev_node.lru_next[pt] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
-        self._add_node_after(self.head, node)
+        if self._is_referenced is None or self._is_referenced(node):
+            self._add_node_after(self.head, node)
+        else:
+            self._add_node_after(self.mid, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
         pt = self._pt
@@ -205,19 +222,50 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
+    def cursor_begin(self):
+        if self.cursor.lru_prev[self._pt] is not None:
+            self._remove_node(self.cursor)
+        self._add_node_after(self.tail.lru_prev[self._pt], self.cursor)
+
+    def cursor_next(self, *, host_lock: bool = False):
+        pt = self._pt
+        ct = self.component_type
+        x = self.cursor.lru_prev[pt]
+        while x is not self.head:
+            cd = x.component_data[ct]
+            if (cd.host_lock_ref if host_lock else cd.lock_ref) == 0:
+                break
+            x = x.lru_prev[pt]
+        if x is self.head:
+            return None
+        self._remove_node(self.cursor)
+        self._add_node_after(x.lru_prev[pt], self.cursor)
+        return x
+
+    def cursor_end(self):
+        """Unlink the walk-cursor sentinel after a walk."""
+        self._remove_node(self.cursor)
+
     def reset_node_and_parents_mru(
         self,
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
         should_include,
     ):
-        prev_node = self.head
+        is_referenced = self._is_referenced
+        prev_ref = self.head
+        prev_unref = self.head if self.mid is None else self.mid
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
+                part = is_referenced is None or is_referenced(node)
                 self._remove_node(node)
-                self._add_node_after(prev_node, node)
-                prev_node = node
+                if part:
+                    self._add_node_after(prev_ref, node)
+                    prev_ref = node
+                else:
+                    self._add_node_after(prev_unref, node)
+                    prev_unref = node
             node = node.parent
 
     def reset_node_and_window_ancestors_mru(
@@ -227,14 +275,21 @@ class UnifiedLRUList:
         window_size: int,
         should_include,
     ):
-        prev_node = self.head
+        is_referenced = self._is_referenced
+        prev_ref = self.head
+        prev_unref = self.head if self.mid is None else self.mid
         accumulated = 0
         while node != root_node and accumulated < window_size:
             if should_include(node):
                 assert node.id in self.cache
+                part = is_referenced is None or is_referenced(node)
                 self._remove_node(node)
-                self._add_node_after(prev_node, node)
-                prev_node = node
+                if part:
+                    self._add_node_after(prev_ref, node)
+                    prev_ref = node
+                else:
+                    self._add_node_after(prev_unref, node)
+                    prev_unref = node
             accumulated += len(node.key)
             node = node.parent
 
@@ -334,6 +389,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
+        self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
 
         # ``device`` is derived from the construction-time allocator; the
@@ -361,6 +417,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     # ==== Tree API ====
 
+    def _session_lru_predicate(self, ct: ComponentType):
+        if not self.enable_session_radix_cache or ct is ComponentType.FULL:
+            return None
+        return lambda node: node.component_data[ct].session_ref > 0
+
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
@@ -382,13 +443,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.component_protected_size_ = {ct: 0 for ct in self.component_types}
 
         self.lru_lists = {
-            ct: UnifiedLRUList(ct, self.component_types) for ct in self.component_types
+            ct: UnifiedLRUList(
+                ct, self.component_types, is_referenced=self._session_lru_predicate(ct)
+            )
+            for ct in self.component_types
         }
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
         self.host_lru_lists = {
-            ct: UnifiedLRUList(ct, self.component_types, use_host_ptr=True)
+            ct: UnifiedLRUList(
+                ct,
+                self.component_types,
+                use_host_ptr=True,
+                is_referenced=self._session_lru_predicate(ct),
+            )
             for ct in self.component_types
         }
 
@@ -442,10 +511,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Drop a tree node from the arena."""
         self._node_arena.pop(node.id, None)
 
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
         node = self.node_by_id(node_id)
         result = IncLockRefResult()
         for component in self.components:
+            if component.component_type in skip_lock_components:
+                # Leave this component's value evictable and record every
+                # non-root node (incl tombstones) so the matching dec skips a
+                # lock we never took, which may be another req's on a shared node.
+                if node is not self.root_node:
+                    result.skip_lock_node_ids.setdefault(
+                        component.component_type, set()
+                    ).add(node.id)
+                continue
             result = component.acquire_component_lock(node=node, result=result)
         self._update_evictable_leaf_sets(node)
         return result
@@ -466,7 +546,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return DecLockRefResult()
 
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self,
+        node_id: NodeId,
+        swa_uuid_for_lock: Optional[int],
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> DecSwaLockOnlyResult:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
@@ -479,9 +562,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node.
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node,
+        # honoring skip ids so we don't drop a lock a partial inc never took
+        # (matters for FULL+SWA+MAMBA models, e.g. Inkling).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+        dec_params = DecLockRefParams(
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            skip_lock_node_ids=skip_lock_node_ids or {},
+        )
         for comp in self.components:
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, dec_params)
@@ -748,7 +836,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.root_node.priority = max(self.root_node.priority, priority)
         if len(key) == 0:
             return InsertStepResult(
-                actions=[], result=InsertResult(prefix_len=0, mamba_exist=True)
+                actions=[],
+                result=InsertResult(
+                    prefix_len=0,
+                    mamba_exist=True,
+                    last_device_node=self.root_node.id,
+                ),
             )
 
         self._ongoing_insert_walk_state = _InsertWalkState(
@@ -883,7 +976,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # e.g. Mamba attaches mamba_value to the leaf node
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
-        state.result = InsertResult(prefix_len=state.total_prefix_length)
+        state.result = InsertResult(
+            prefix_len=state.total_prefix_length,
+            last_device_node=state.target_node.id,
+        )
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,
@@ -1268,6 +1364,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             is_leaf = node in self.evictable_host_leaves
 
         trigger_priority = trigger.eviction_priority(is_leaf)
+        base_evicted = False
 
         for comp in self.components:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
@@ -1285,6 +1382,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                             continue
                         if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                             continue
+                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
@@ -1297,6 +1396,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         device_frees=device_frees,
                         host_frees=host_frees,
                     )
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        base_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
@@ -1307,9 +1408,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ):
             node.component_data[trigger.component_type].value = None
 
+        if EvictLayer.DEVICE in target and base_evicted:
+            node.component_data[BASE_COMPONENT_TYPE].value = None
+
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        for component in self.components:
+            component.discard_deleted_session_leaf(node)
+
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
@@ -1857,6 +1964,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
 
+        if self.enable_session_radix_cache:
+            for component in self.components:
+                component.validate_session_state(all_node_set, E)
+
         # Stale nodes: leaf sets must only contain tree-reachable nodes
         stale = self.evictable_device_leaves - all_node_set
         if stale:
@@ -1992,6 +2103,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         while x is not None and x != lru.tail:
             if x.lru_prev[pt] != prev:
                 errors.append(f"[{label}][{ct}] broken prev at node {x.id}")
+            if x is lru.mid or x is lru.cursor:
+                prev = x
+                x = x.lru_next[pt]
+                continue
             if x.id not in lru.cache:
                 errors.append(f"[{label}][{ct}] node {x.id} in list not cache")
             if x.id in visited:

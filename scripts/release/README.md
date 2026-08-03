@@ -109,11 +109,11 @@ python scripts/release/bump_kernel_version.py 0.4.0
 ```
 
 **Files updated:**
-- `sgl-kernel/pyproject.toml`
-- `sgl-kernel/pyproject_cpu.toml`
-- `sgl-kernel/pyproject_rocm.toml`
-- `sgl-kernel/pyproject_musa.toml`
-- `sgl-kernel/python/sgl_kernel/version.py`
+- `python/sglang/kernels/aot/pyproject.toml`
+- `python/sglang/kernels/aot/pyproject_cpu.toml`
+- `python/sglang/kernels/aot/pyproject_rocm.toml`
+- `python/sglang/kernels/aot/pyproject_musa.toml`
+- `python/sglang/kernels/aot/python/sgl_kernel/version.py`
 
 ## Manual Testing Instructions
 
@@ -155,8 +155,8 @@ python scripts/release/bump_kernel_version.py 0.4.0
 
 3. **Check specific files contain the new version:**
    ```bash
-   grep -r "0.4.0" sgl-kernel/python/sgl_kernel/version.py
-   grep -r "0.4.0" sgl-kernel/pyproject.toml
+   grep -r "0.4.0" python/sglang/kernels/aot/python/sgl_kernel/version.py
+   grep -r "0.4.0" python/sglang/kernels/aot/pyproject.toml
    ```
 
 4. **Reset changes (if testing):**
