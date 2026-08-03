@@ -50,8 +50,8 @@ def should_run_flashinfer_autotune(
     if mr.server_args.disable_flashinfer_autotune:
         return False
     if mr.server_args.enable_deterministic_inference:
-        # Autotuning selects kernel configs per problem shape, so the reduction
-        # order would vary with batch shape.
+        # Tuned configs are per problem shape, so the reduction order would follow
+        # the batch shape.
         return False
 
     server_args = mr.server_args

@@ -219,10 +219,7 @@ class TestInklingCacheConsistency(CustomTestCase):
                 prefix_len_min=384,
                 prefix_len_max=512,
                 new_tokens=256,
-                # How many requests the scheduler retracts depends on the pool
-                # size, so it tracks GPU memory. This workload measured 8; keep
-                # the floor low enough to absorb that while still failing if
-                # retraction never runs.
+                # Retraction count tracks pool size, hence GPU memory; measured 8.
                 min_retracted_requests=4,
             )
 

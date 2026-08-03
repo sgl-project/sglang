@@ -455,10 +455,8 @@ def symm_mem_all_reduce(
     ):
         n = input.numel()
         num_tokens = input.shape[0] if input.dim() >= 2 else n
-        # select_ar_config() picks the kernel, block count and block size from
-        # the token count, so the reduction order changes with batch shape.
-        # Deterministic inference needs one fixed path: fall through to plain
-        # multimem, whose reduction order is shape-independent.
+        # select_ar_config() keys off the token count; plain multimem below
+        # reduces in a shape-independent order.
         res = (
             _get_inkling_ar_resources(comm)
             if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
