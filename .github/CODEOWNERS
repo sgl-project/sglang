@@ -7,7 +7,7 @@
 /python/sglang/kernels @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
-/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf
+/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @Makcum888e
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @OrangeRedeng @TallMessiWu
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
