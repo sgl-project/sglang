@@ -126,9 +126,20 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
 
 def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
+    # Single image, so this empty rank takes the broadcast fast path: the
+    # buffer it allocates is shaped from config.hidden_size, then filled by
+    # the owner rank.
+    owner_embedding = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+    broadcast_src = []
+
     class _GatherGroup:
         def all_gather(self, tensor, dim):
             return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
+
+        def broadcast(self, tensor, src):
+            broadcast_src.append(src)
+            tensor.copy_(owner_embedding)
+            return tensor
 
     tower = _MoonViT3dTower()
     parallel = SimpleNamespace(
@@ -146,7 +157,40 @@ def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
         )
 
     assert output.shape == (1, 4, 2)
+    assert torch.equal(output, owner_embedding)
+    assert broadcast_src == [0]
     assert tower.grid_thws is None
+
+
+def test_dp_helper_broadcasts_a_single_image_from_its_owner_rank():
+    broadcast_src = []
+
+    class _GatherGroup:
+        def all_gather(self, tensor, dim):
+            raise AssertionError("a single image must not reach the all-gather")
+
+        def broadcast(self, tensor, src):
+            broadcast_src.append(src)
+            return tensor
+
+    tower = _MoonViT3dTower()
+    pixel_values = torch.randn(4, 2)
+    parallel = SimpleNamespace(
+        attn_tp_size=2,
+        attn_tp_rank=0,
+        attn_tp_group=_GatherGroup(),
+    )
+
+    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
+        output = run_dp_sharded_mrope_vision_model(
+            tower,
+            pixel_values,
+            [[1, 2, 2]],
+            rope_type="rope_2d_packed",
+        )
+
+    assert torch.equal(output, pixel_values.reshape(1, 4, 2))
+    assert broadcast_src == [0]
 
 
 def test_dp_helper_lazily_loads_only_its_local_image_shard():

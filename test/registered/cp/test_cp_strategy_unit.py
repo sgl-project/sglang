@@ -547,6 +547,108 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
 
+    def test_zigzag_combined_attention_matches_two_half_reference(self):
+        def reference_attention(
+            q,
+            cu_seqlens_q,
+            cache_seqlens,
+            cu_seqlens_kv,
+            *,
+            sequence_offset,
+        ):
+            outputs = []
+            for seq_id in range(cache_seqlens.numel()):
+                q_start = int(cu_seqlens_q[seq_id])
+                q_end = int(cu_seqlens_q[seq_id + 1])
+                q_seq = q[q_start:q_end]
+                q_len = q_end - q_start
+                kv_len = int(cache_seqlens[seq_id])
+                self.assertEqual(
+                    int(cu_seqlens_kv[seq_id + 1] - cu_seqlens_kv[seq_id]),
+                    kv_len,
+                )
+
+                absolute_seq_id = sequence_offset + seq_id + 1
+                positions = torch.arange(kv_len, dtype=q.dtype)
+                k_seq = torch.stack(
+                    (
+                        positions / (kv_len + 1),
+                        torch.sin(positions + absolute_seq_id),
+                        torch.full_like(positions, absolute_seq_id / 10),
+                    ),
+                    dim=1,
+                )
+                v_seq = torch.stack(
+                    (
+                        torch.cos(positions + absolute_seq_id),
+                        positions / (absolute_seq_id + 1),
+                        torch.full_like(positions, absolute_seq_id),
+                    ),
+                    dim=1,
+                )
+                q_positions = kv_len - q_len + torch.arange(q_len)
+                allowed = torch.arange(kv_len)[None, :] <= q_positions[:, None]
+                scores = q_seq @ k_seq.T / q.shape[-1] ** 0.5
+                outputs.append(
+                    torch.softmax(scores.masked_fill(~allowed, -torch.inf), dim=-1)
+                    @ v_seq
+                )
+            return torch.cat(outputs, dim=0)
+
+        cp_size = 4
+        seq_lens = [19, 27]
+        extend_seq_lens = [11, 13]
+        for rank in range(cp_size):
+            with self.subTest(rank=rank):
+                metadata = self._metadata_for_rank(
+                    rank,
+                    cp_size=cp_size,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                )
+                logical_tokens = (
+                    metadata.total_q_prev_tokens + metadata.total_q_next_tokens
+                )
+                q = torch.linspace(
+                    -0.75,
+                    0.75,
+                    steps=logical_tokens * 3,
+                    dtype=torch.float32,
+                ).view(logical_tokens, 3)
+                q_prev = q[: metadata.total_q_prev_tokens]
+                q_next = q[metadata.total_q_prev_tokens :]
+
+                two_half_out = torch.cat(
+                    (
+                        reference_attention(
+                            q_prev,
+                            metadata.cu_seqlens_q_prev_tensor,
+                            metadata.kv_len_prev_tensor,
+                            metadata.cu_seqlens_kv_prev_tensor,
+                            sequence_offset=0,
+                        ),
+                        reference_attention(
+                            q_next,
+                            metadata.cu_seqlens_q_next_tensor,
+                            metadata.kv_len_next_tensor,
+                            metadata.cu_seqlens_kv_next_tensor,
+                            sequence_offset=metadata.bs,
+                        ),
+                    ),
+                    dim=0,
+                )
+                combined_out = reference_attention(
+                    q,
+                    metadata.cu_seqlens_q_combined_tensor,
+                    metadata.kv_len_combined_tensor,
+                    metadata.cu_seqlens_kv_combined_tensor,
+                    sequence_offset=0,
+                )
+
+                torch.testing.assert_close(
+                    combined_out, two_half_out, atol=1e-5, rtol=1e-5
+                )
+
 
 class TestCPInterleaveStrategy(CustomTestCase):
     def setUp(self):

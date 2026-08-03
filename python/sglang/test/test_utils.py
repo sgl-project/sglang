@@ -1064,6 +1064,27 @@ def popen_launch_server(
     raise TimeoutError(error_msg)
 
 
+def terminate_and_kill_process_tree(
+    process,
+    terminate_timeout: float = 60,
+    **kill_kwargs,
+) -> None:
+    """Shut a launched server down gracefully, then SIGKILL whatever is left.
+
+    A bare ``kill_process_tree`` leaves the kernel to unwind the CUDA context
+    and unpin the host memory during process reclaim, which can hold GPU memory
+    for minutes on a busy host -- long enough to trip the per-class GPU-idle
+    gate in the next ``setUpClass``. SIGTERM first so the server releases those
+    resources in userspace.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_process_tree(process.pid, **kill_kwargs)
+
+
 def popen_launch_pd_server(
     model: str,
     base_url: str,
