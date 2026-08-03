@@ -4813,36 +4813,49 @@ class ServerArgs:
         # use_mla_backend is a method at args time but ModelRunner overwrites it
         # with a bool on global_server_args (see the FIXME there) -- handle both.
         use_mla = self.use_mla_backend
-        if not (
-            envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
-            and self.device == "cuda"
-            and self.dcp_size == 1
-            and not (use_mla() if callable(use_mla) else use_mla)
-            and self.kv_cache_dtype != "fp4_e2m1"
-            and not self.prefill_only_disable_kv_cache
-            and not self.enable_memory_saver
-            and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
-            # Accurate sizing assumes graph-covered execution (graphs retain the
-            # activation workspace, so it is measured post-capture). An eager
-            # phase would pay activations outside the measurement: DP attention
-            # runs prefill eager internally, and an explicitly disabled phase
-            # backend runs eager -- keep those on the heuristic reserve.
-            and not self.enable_dp_attention
-            and (
-                self.disaggregation_mode == "decode"
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
-            )
-            and (
-                self.disaggregation_mode == "prefill"
-                or self.cuda_graph_config.decode.backend != Backend.DISABLED
-            )
+        mla_enabled = use_mla() if callable(use_mla) else use_mla
+        if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
+            return False
+        if self.device != "cuda":
+            return False
+        if self.dcp_size != 1:
+            return False
+        if mla_enabled:
+            return False
+        if self.kv_cache_dtype == "fp4_e2m1":
+            return False
+        if self.prefill_only_disable_kv_cache:
+            return False
+        if self.enable_memory_saver:
+            return False
+        if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+            return False
+
+        if (
+            self.disaggregation_mode != "prefill"
+            and self.cuda_graph_config.decode.backend == Backend.DISABLED
         ):
             return False
+
+        if self.disaggregation_mode != "decode":
+            prefill_cfg = self.cuda_graph_config.prefill
+            # We can only skip eager activation headroom when the largest
+            # prefill forward batch size is already graph-captured. Otherwise,
+            # an eager forward will need more memory and lead to OOM.
+            if (
+                prefill_cfg.backend == Backend.DISABLED
+                or self.chunked_prefill_size <= 0
+                or self.max_prefill_buffer_tokens() > max(prefill_cfg.bs or (0,))
+            ):
+                return False
 
         from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
         hf_config = self.get_model_config().hf_config
-        return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
+        if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+            return False
+
+        return True
 
     def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Runtime activation working-set reserve for eager decode above the captured
