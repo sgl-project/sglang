@@ -92,6 +92,16 @@ class DllmConfig:
                 "dllm prefill_block_size must be a positive multiple of block_size "
                 f"and no smaller than it: {prefill_block_size=}, {block_size=}"
             )
+
+        # Each dLLM step needs one complete block. Reject smaller budgets to
+        # avoid unschedulable requests and scheduler livelock.
+        max_prefill_tokens = getattr(server_args, "max_prefill_tokens", None)
+        if max_prefill_tokens is not None and max_prefill_tokens < block_size:
+            raise ValueError(
+                "max_prefill_tokens must be at least the dLLM block_size: "
+                f"{max_prefill_tokens=}, {block_size=}"
+            )
+
         # Read the resolved backend so declaration overrides are visible during
         # ServerArgs resolution, before they are materialized onto raw fields.
         from sglang.srt.arg_groups.overrides import attention_backends_of
