@@ -1,38 +1,26 @@
 # Usage (to build SGLang ROCm docker image):
-#
-#   docker build \
-#     --build-arg GPU_ARCH=gfx1250-rocm7_15 \
-#     --build-arg GPU_ARCH_LIST_ARG=gfx1250 \
-#     --build-arg ROCM_VERSION=7.15.0a20260629 \
-#     --build-arg INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/ \
-#     --build-arg TORCH_VERSION=2.11.0 \
-#     --build-arg TORCHVISION_VERSION=0.26.0 \
-#     --build-arg TRITON_VERSION=3.7.0+gitb4e20bbe \
-#     -t rocm/ufb-private:sglang-latest-gfx1250-rocm7.15.0a20260623-full \
-#     -f docker/rocm.Dockerfile .
-#
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 -t v0.5.10.post1-rocm715-gfx1250 -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx1250-rocm7_15 -t v0.5.16-rocm715-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx942 -t v0.5.16-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.16-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx950 -t v0.5.16-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.16-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
 # Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
 # if no set this arg, it will support nic auto detection. On a target with more than 1 type of
 # RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm715-gfx1250 -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx1250-rocm7_15 --build-arg ENABLE_MORI=1 -t v0.5.16-rocm715-gfx1250 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.16-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.16-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.16-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.16-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
 # Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
 # Set ENABLE_NIXL=0 to skip NIXL.
 # At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.16 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.16-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_1250_ROCM7_15="ubuntu:24.04"
@@ -103,10 +91,8 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-# Workaround: Pull latest (up to 0722) for gfx1250 support
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 ENV TRITON_COMMIT_DEFAULT="c57bbbd8c1d83a8388baa508cf1286bfdad1695d"
-ENV MORI_COMMIT_DEFAULT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
 
 # ===============================
 # Base image 942 with rocm700 and args
