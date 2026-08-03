@@ -87,10 +87,9 @@ def _expand_image_token_ids(
 ) -> torch.Tensor:
     """Expand one placeholder per image without tokenizing the media string again.
 
-    Same rebuild as ``BaseMultimodalProcessor._expand_input_ids``, kept separate
-    because that one returns a list: staying in the array domain here skips a
-    full list round trip on the way to the processor's output tensor. The two
-    are pinned together by test_kimi_k25.py.
+    Same rebuild as ``BaseMultimodalProcessor._expand_input_ids``, but staying in
+    the array domain skips a list round trip on the way to the output tensor.
+    test_kimi_k25.py pins the two together.
     """
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.detach().flatten().cpu().numpy()
@@ -129,10 +128,9 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     constants downstream. No-op if already on the device.
     """
     if image.dtype != torch.uint8:
-        # The whole pipeline assumes raw 0-255 pixels: the resize quantizes to
-        # integers to match PIL, and the normalization folds in a 1/255 scale.
-        # An already-normalized float image would be rounded to 0/1 and then
-        # rescaled, so refuse it instead of returning garbage.
+        # Raw 0-255 is load-bearing downstream: the resize rounds to integers
+        # and the normalization folds in a 1/255 scale, so a normalized float
+        # image would collapse to 0/1 and then be rescaled.
         raise ValueError(
             f"Kimi GPU preprocessing expects raw uint8 pixels, got {image.dtype}"
         )
@@ -153,13 +151,10 @@ def _resize_bicubic_if_needed(
 ) -> torch.Tensor:
     """Match the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
 
-    Kimi's HF processors only ever downscale (NaViT scale <= 1.0), and PIL's
-    bicubic widens the kernel support by the scale factor, i.e. it always
-    antialiases; ``F.interpolate`` needs ``antialias=True`` to do the same.
-    PIL also returns uint8, so quantize the resized result back to integer
-    pixel values before normalization (round-to-nearest, clipped to [0, 255]);
-    without this the float overshoot leaks past the [-1, 1] range the model
-    was trained on.
+    NaViT only ever downscales, and PIL's bicubic widens its kernel support by
+    the scale factor -- it always antialiases, which ``F.interpolate`` only does
+    under ``antialias=True``. PIL also returns uint8, so round and clip back to
+    integer pixels; the bicubic overshoot would otherwise survive normalization.
     """
     image = image.float()
     if image.shape[-2:] == (target_height, target_width):
@@ -410,9 +405,9 @@ class KimiGPUProcessorWrapper:
                 )
             )
 
-        # 2. Reuse the request's existing tokenization when available. The
-        # media placeholder expansion is exact and avoids tokenizing thousands
-        # of repeated ``<|media_pad|>`` strings.
+        # 2. Reuse the request's tokenization when available: expanding the
+        # placeholders is exact, and skips tokenizing thousands of repeated
+        # ``<|media_pad|>`` strings.
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids
         )
@@ -482,9 +477,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
-    # The wrapper already expands the placeholders from the request's own token
-    # IDs, so the retokenize-avoidance pass in process_and_combine_mm_data would
-    # only rebuild the identical sequence.
+    # The GPU wrapper expands placeholders from the request's own token IDs.
     preserve_processor_input_ids = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
@@ -532,9 +525,9 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 prompt=input_text,
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
-                # Unlike load_mm_data, fast_load_mm_data does not derive
-                # input_ids from the prompt; without this the wrapper falls
-                # back to re-tokenizing the expanded placeholder string.
+                # fast_load_mm_data, unlike load_mm_data, does not derive
+                # input_ids from the prompt; without this the wrapper falls back
+                # to re-tokenizing the expanded string.
                 input_ids=input_text,
             )
         else:

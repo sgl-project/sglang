@@ -618,16 +618,7 @@ def mm_projection_auto(
     mm_projector: torch.nn.Module | None,
     vt_output: torch.Tensor | Sequence[torch.Tensor],
 ) -> torch.Tensor:
-    """Project vision outputs and return one flattened feature tensor.
-
-    MoonViT may return one tensor per image because image resolutions vary, but
-    the language-model embedding path consumes the images as one contiguous
-    sequence.  The previous implementation split the projected tensor back
-    into per-image views and immediately concatenated those views at the call
-    site. Keeping the packed result avoids a redundant split/cat pair, and a
-    single-item sequence reuses its tensor directly. The returned feature is
-    always flattened to the 2D contract consumed by ``get_image_feature``.
-    """
+    """Project MoonViT's per-image outputs into one flattened (tokens, dim) feature."""
     batched = (
         vt_output
         if isinstance(vt_output, torch.Tensor)

@@ -102,9 +102,8 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
 
 
 def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
-    # The GPU path must reproduce PIL.Image.resize(..., BICUBIC), which is what
-    # Kimi's HF media processor uses. Plain F.interpolate skips PIL's implicit
-    # antialiasing on downscale and drifts far outside 8-bit rounding.
+    # Plain F.interpolate skips PIL's implicit antialiasing on downscale and
+    # drifts far outside 8-bit rounding; photo-like content, not pure noise.
     rng = np.random.default_rng(0)
     yy, xx = np.mgrid[0:512, 0:512].astype(np.float32)
     plane = np.clip(
@@ -165,9 +164,8 @@ def test_kimi_expansion_rejects_a_placeholder_count_mismatch():
 
 
 def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
-    # K2.5 sets preserve_processor_input_ids because these two must agree; if
-    # they ever diverge, skipping the base rebuild would change the prompt.
-    # Both are checked against a literal transcription of the original loop.
+    # preserve_processor_input_ids skips the base rebuild, which is only safe
+    # while both produce the same sequence. Reference is the original loop.
     def reference(original_ids, counts, placeholder):
         rebuilt, next_image = [], 0
         for token_id in original_ids:
@@ -196,8 +194,6 @@ def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
 
 
 def test_kimi_refuses_already_normalized_float_pixels():
-    # The resize quantizes to integers to match PIL and the normalization folds
-    # in a 1/255 scale, so a float image would be rounded to 0/1 and rescaled.
     with pytest.raises(ValueError, match="uint8"):
         _ensure_chw_rgb(torch.rand(3, 8, 8))
 
