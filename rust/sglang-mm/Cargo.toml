@@ -49,7 +49,14 @@ numpy = { version = "0.29", optional = true }
 base64 = "0.22"
 blake3 = "1"
 half = "2.4"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# The formats the Python (PIL) path commonly accepts; all pure-Rust decoders.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+] }
 rayon = { version = "1.10", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

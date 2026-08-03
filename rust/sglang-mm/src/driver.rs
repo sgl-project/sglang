@@ -8,6 +8,11 @@
 use crate::common::{self, fetch, par, token_layout};
 use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
+/// Per-request bounds: together with [`fetch::MAX_FETCH_BYTES`] they cap what
+/// one request can make the pipeline buffer.
+pub const MAX_ITEMS_PER_REQUEST: usize = 64;
+pub const MAX_REQUEST_BYTES: u64 = 256 << 20;
+
 /// One raw image source from the request.
 #[derive(Debug)]
 pub enum ImageSource {
@@ -66,18 +71,32 @@ pub fn process(
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
-    // Stage 1 (fetch) is blocking I/O and runs inline, sequentially: it must
-    // NOT go through `par::try_map` — one request's slow URLs would occupy the
-    // CPU workers other requests need for decode/resize. The server supplies
-    // concurrency across requests, and its request shape is pre-fetched
-    // `Bytes` anyway; give fetch its own I/O pool before ever fanning it out.
-    let fetched: Vec<std::borrow::Cow<'_, [u8]>> =
-        input.images.iter().map(resolve).collect::<Result<_, _>>()?;
+    if input.images.len() > MAX_ITEMS_PER_REQUEST {
+        return Err(format!(
+            "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
+        ));
+    }
+    // Stage 1 (fetch) is blocking I/O and runs inline, sequentially — never on
+    // the CPU pool, where a slow URL would starve decode/resize for other
+    // requests. Contract: callers on a fixed worker pool (the server) must
+    // resolve network sources on their own I/O layer and pass `Bytes`.
+    let mut fetched: Vec<std::borrow::Cow<'_, [u8]>> = Vec::with_capacity(input.images.len());
+    let mut total: u64 = 0;
+    for source in &input.images {
+        let bytes = resolve(source)?;
+        total += bytes.len() as u64;
+        if total > MAX_REQUEST_BYTES {
+            return Err(format!(
+                "multimodal request exceeds {MAX_REQUEST_BYTES} total media bytes"
+            ));
+        }
+        fetched.push(bytes);
+    }
     let processed: Vec<(ProcessedItem, u64)> =
         par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
             let hash = common::content_hash_u64(bytes);
-            // The Python (PIL) path decodes more formats (GIF/WebP/BMP, 16-bit
-            // PNG); those error here and reject the request.
+            // Inputs PIL accepts but decode_rgb refuses (e.g. 16-bit PNG)
+            // error here and reject the request.
             let (rgb, height, width) = common::decode_rgb(bytes)?;
             let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
             Ok((item, hash))
@@ -151,6 +170,88 @@ mod tests {
             panic!("qwen emits mrope")
         };
         assert_eq!(positions.len(), 3 * out.input_ids.len());
+    }
+
+    /// String sources — HTTP URL, `file://`, and bare path — all resolve to
+    /// the same bytes and flow through the full pipeline.
+    #[test]
+    fn fetches_url_and_file_sources() {
+        let png = png(8, 8);
+        let dir = std::env::temp_dir().join(format!("sglang-mm-driver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("img.png");
+        std::fs::write(&path, &png).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = png.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear(); // headers until the blank line
+            }
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let family = pipeline_from_spec(SPEC).unwrap();
+        let input = MmInput {
+            text: None,
+            input_ids: Some(vec![7, 1, 1, 1, 8]),
+            images: vec![
+                ImageSource::String(format!("http://{addr}/img.png")),
+                ImageSource::String(format!("file://{}", path.display())),
+                ImageSource::String(path.display().to_string()),
+            ],
+        };
+        let out = process(family.as_ref(), input, |_| unreachable!()).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(out.items.len(), 3);
+        // Identical source bytes → identical content hashes.
+        assert_eq!(out.items[0].hash, out.items[1].hash);
+        assert_eq!(out.items[1].hash, out.items[2].hash);
+        assert_eq!(out.input_ids.len(), 5 + 3 * 3); // each placeholder → 4 tokens
+    }
+
+    #[test]
+    fn per_request_caps_enforced() {
+        let family = pipeline_from_spec(SPEC).unwrap();
+        let too_many = MmInput {
+            text: None,
+            input_ids: Some(vec![1]),
+            images: (0..=MAX_ITEMS_PER_REQUEST)
+                .map(|_| ImageSource::Bytes(vec![]))
+                .collect(),
+        };
+        let err = process(family.as_ref(), too_many, |_| unreachable!())
+            .err()
+            .unwrap();
+        assert!(err.contains("media items"), "{err}");
+
+        let chunk = (MAX_REQUEST_BYTES / 2 + 1) as usize;
+        let too_big = MmInput {
+            text: None,
+            input_ids: Some(vec![1, 1]),
+            images: vec![
+                ImageSource::Bytes(vec![0; chunk]),
+                ImageSource::Bytes(vec![0; chunk]),
+            ],
+        };
+        let err = process(family.as_ref(), too_big, |_| unreachable!())
+            .err()
+            .unwrap();
+        assert!(err.contains("total media bytes"), "{err}");
     }
 
     #[test]

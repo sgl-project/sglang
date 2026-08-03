@@ -44,8 +44,9 @@ src/
 
 ```
 MmInput { text?, input_ids?, images }
-  1. per image (fanned out via common::par):
-       fetch_bytes → decode_rgb → family.process_item()
+  1. per image: fetch_bytes (inline, sequential — see Design notes), then
+       fanned out via common::par:
+       content hash → decode_rgb → family.process_item()
                                     → ProcessedItem { feature, aux, geometry }
   2. family.layout(input_ids, geometries)   → TokenLayout
        apply_layout: expanded input_ids + per-item (start, end) offsets
@@ -61,9 +62,10 @@ the request. With qwen as the example:
 
 - **`process_item`** — one decoded image → `ProcessedItem`:
   - `feature`: the model's feature tensor. Qwen: `pixel_values`, from
-    smart_resize → bicubic → normalize → patchify. The driver hashes its
-    bytes as the item identity (Python: `MultimodalDataItem.feature` +
-    `hash_feature`).
+    smart_resize → bicubic → normalize → patchify. The item identity is the
+    driver's hash of the raw encoded source bytes, taken before decode — the
+    same role as Python's `hash_feature`, but a different algorithm over
+    different input, so never comparable across paths.
   - `aux`: named tensors for the model runner. Qwen: `image_grid_thw`;
     other families: `image_sizes`, `tgt_sizes`, ... (Python:
     `model_specific_data`).
@@ -104,9 +106,11 @@ Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 `family` arm in `pipeline_from_spec`.
 
 `common::fetch` matches the Python `get_image_bytes` semantics
-(`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`) with two
-deliberate differences: HTTP downloads are capped at 64 MiB, and `file://` URLs
-actually work (the Python helper passes the un-stripped URL to `open()`).
+(`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` including
+IPv4-CIDR and `host:port` entries) with two deliberate differences: every
+source form is capped at 64 MiB — plus 64 items / 256 MiB per request in the
+driver — and `file://` URLs actually work (the Python helper passes the
+un-stripped URL to `open()`).
 
 ## Python API
 
@@ -191,10 +195,11 @@ impl ImageProcessorSpec for MyModelProcessor {
   Note that sizing a pool to 1 is *not* the same as off: `install` blocks the
   caller and would serialize every concurrent request in the process.
 - Media fetch is blocking I/O and deliberately never enters the CPU pool; it
-  runs inline and sequentially in `driver::process`. The server hands over
-  pre-fetched bytes, so fetch would get its own I/O pool before ever being
-  fanned out.
-- PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB. Samples deeper
+  runs inline and sequentially in `driver::process`. Contract: callers on a
+  fixed worker pool (sglang-server) must resolve network sources on their own
+  I/O layer and pass bytes, so a slow remote host never blocks a worker.
+- PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB. WebP/GIF/BMP also
+  decode (GIF: first frame); their parity is not bit-audited. Samples deeper
   than 8 bits are rejected rather than rescaled (PIL clips instead).
 - Lanczos and Bicubic resize are bit-exact clones of PIL's fixed-point
   implementations.
