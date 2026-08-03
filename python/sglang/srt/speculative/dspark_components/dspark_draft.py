@@ -217,25 +217,23 @@ class DraftBlockProposer:
         ):
             folded = True
             if draft_sampler.folded_sampling:
-                draft_block = DraftBlockResult(
-                    draft_tokens=draft_sampler.out[: bs * self.gamma].view(
-                        bs, self.gamma
-                    ),
-                    # The sampling accept path needs the markov-corrected block
-                    # logits; greedy accept only compares tokens.
-                    corrected_logits=(
-                        None
-                        if all_greedy
-                        else draft_sampler.corrected_out[: bs * self.gamma].view(
-                            bs, self.gamma, -1
-                        )
-                    ),
-                    greedy_mask=draft_sampler.greedy_mask[:bs],
-                    temperatures=draft_sampler.temperatures[:bs],
+                greedy_mask = draft_sampler.greedy_mask[:bs]
+                temperatures = draft_sampler.temperatures[:bs]
+                # The sampling accept path needs the markov-corrected block
+                # logits; greedy accept only compares tokens.
+                corrected_logits = (
+                    None
+                    if all_greedy
+                    else draft_sampler.corrected_out[: bs * self.gamma].view(
+                        bs, self.gamma, -1
+                    )
                 )
             else:
                 # Greedy-only folding: the hook argmaxed every row and kept no
                 # sampling buffers, so derive the params on the fly.
+                greedy_mask = resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
                 if sampling_info is None:
                     temperatures = torch.ones(bs, dtype=torch.float32, device=device)
                 else:
@@ -244,16 +242,13 @@ class DraftBlockProposer:
                         .to(torch.float32)
                         .clamp_min(1e-5)
                     )
-                draft_block = DraftBlockResult(
-                    draft_tokens=draft_sampler.out[: bs * self.gamma].view(
-                        bs, self.gamma
-                    ),
-                    corrected_logits=None,
-                    greedy_mask=resolve_greedy_mask(
-                        bs=bs, sampling_info=sampling_info, device=device
-                    ),
-                    temperatures=temperatures,
-                )
+                corrected_logits = None
+            draft_block = DraftBlockResult(
+                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
+                corrected_logits=corrected_logits,
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
+            )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
         else:
