@@ -101,10 +101,10 @@ class _FakeRoutedMoeLayer(_FakeFusedMoEWithLoRA, _IdentityMoeSlices):
 
 
 class _FakeDenseLayer:
-    def slice_lora_a_weights(self, weights, _rank):
+    def slice_lora_a_weights(self, weights):
         return weights
 
-    def slice_lora_b_weights(self, weights, _rank):
+    def slice_lora_b_weights(self, weights):
         return weights
 
 
@@ -994,6 +994,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 dtype=torch.bfloat16,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
+                attn_tp_size=tp_size,
                 max_lora_rank=8,
                 target_modules={"qkv_proj"},
                 base_model=base_model,
@@ -1089,6 +1090,9 @@ def _fake_base_model_with_hidden_dim(num_experts: int) -> torch.nn.Module:
                 return cfg.hidden_size, cfg.moe_intermediate_size * 2
             if module_name == "down_proj_moe":
                 return cfg.moe_intermediate_size, cfg.hidden_size
+            if module_name == "in_proj_qkvz":
+                # linear-attention qkvz input projection (column-parallel)
+                return cfg.hidden_size, 4 * cfg.hidden_size
             raise NotImplementedError(module_name)
 
     return _Model()
@@ -1119,6 +1123,9 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
+        # Without --enable-dp-attention the attention TP group equals the
+        # outer TP group.
+        pool.attn_tp_size = tp_size
         pool.moe_ep_size = ep_size
         pool.moe_ep_rank = ep_rank
         pool.moe_tp_size = moe_tp_size
@@ -1216,6 +1223,76 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         q_b = pool.get_lora_B_shape("qkv_proj", model, 8, 0)
         # head_dim * (heads + 2*kv_heads) / tp_size = 8 * 24 / 4 = 48.
         self.assertEqual(q_b, (2, 48, 8))
+
+
+class TestAttnModulesShardByAttnTp(unittest.TestCase):
+    """Regression: attention-module LoRA buffers must shard by `attn_tp_size`,
+    not the outer `tp_size`.
+
+    Under `--enable-dp-attention` attention layers are built on the attn_tp
+    group (`attn_tp_size = tp_size // dp_size`), so e.g. MLA `o_proj` holds an
+    attn_tp-local input shard. Sizing the LoRA buffer by the outer `tp_size`
+    would make it narrower than the slice produced by
+    `RowParallelLinearWithLoRA.slice_lora_a_weights` (which slices by the base
+    layer's attn_tp-local rank), failing the shape-match assert at load time.
+    """
+
+    def _pool(self, *, tp_size: int, attn_tp_size: int) -> LoRAMemoryPool:
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 2
+        pool.tp_size = tp_size
+        pool.tp_rank = 0
+        pool.attn_tp_size = attn_tp_size
+        pool.moe_ep_size = 1
+        pool.moe_ep_rank = 0
+        pool.moe_tp_size = tp_size
+        pool.moe_tp_rank = 0
+        pool.moe_use_local_expert_ids = False
+        pool._num_experts_local = 1
+        pool.experts_shared_outer_loras = False
+        pool.base_hf_config = types.SimpleNamespace(
+            hidden_size=64,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=8,
+            intermediate_size=256,
+            moe_intermediate_size=192,
+        )
+        return pool
+
+    def test_attn_tp_1_keeps_attention_buffers_full_width(self):
+        """tp=4 with attn_tp=1 (dp-attention, dp=4): attention weights are
+        replicated across ranks, so the LoRA buffers must be full-width.
+        """
+        pool = self._pool(tp_size=4, attn_tp_size=1)
+        model = _fake_base_model_with_hidden_dim(num_experts=1)
+        # o_proj is row-parallel: A input_dim = head_dim*num_heads = 64,
+        # undivided under attn_tp=1 (pre-fix: 16).
+        self.assertEqual(pool.get_lora_A_shape("o_proj", model, 8, 0), (2, 8, 64))
+        # qkv_proj is column-parallel: B output_dim = 8 * 24 = 192,
+        # undivided under attn_tp=1 (pre-fix: 48).
+        self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (2, 192, 8))
+
+    def test_attn_tp_gt1_still_shards_attention_buffers(self):
+        """tp=4 with attn_tp=2 (dp=2): attention weights are sharded 2-way."""
+        pool = self._pool(tp_size=4, attn_tp_size=2)
+        model = _fake_base_model_with_hidden_dim(num_experts=1)
+        self.assertEqual(pool.get_lora_A_shape("o_proj", model, 8, 0), (2, 8, 32))
+        self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (2, 96, 8))
+
+    def test_linear_attention_in_proj_shards_by_attn_tp(self):
+        """Regression: in_proj_qkvz is built on the attn-TP group under
+        dp-attention (qwen3_5.py passes tp_rank=attn_tp_rank), but it was
+        classified as outer-TP, so with tp=4 / attn_tp=1 its LoRA B buffer
+        came out 4x narrower than the wrapper's attn_tp-local slice and
+        adapter load failed on the shape assert."""
+        pool = self._pool(tp_size=4, attn_tp_size=1)
+        model = _fake_base_model_with_hidden_dim(num_experts=1)
+        # column-parallel: B output_dim = 4*64 = 256, undivided under
+        # attn_tp=1 (pre-fix: divided by the outer tp=4 -> 64).
+        self.assertEqual(
+            pool.get_lora_B_shape("in_proj_qkvz", model, 8, 0), (2, 256, 8)
+        )
 
 
 class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):

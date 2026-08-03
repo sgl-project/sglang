@@ -88,19 +88,48 @@ export const Playground = ({ config }) => {
   // An overlay option may also REMOVE cell flags, declared as `stripPrefixes`
   // (a static list, or a function of the selection). L3 uses it to drop the
   // whole DCP operating point, which the server rejects with an L3 backend.
-  const overlayStrip = (cellFlags, sel) => {
+  //
+  // Overlay flags append, except a flag whose family the same overlay stripped:
+  // that one is spliced back where the stripped flag was, so a rewritten
+  // parallelism block (DSPARK folding a pipeline flat) stays put instead of
+  // landing past the --host/--port tail with the multi-node trio behind it.
+  const overlayCompose = (cellFlags, sel) => {
     const strip = overlayPart(sel, "stripPrefixes");
-    if (!strip.length) return [...(cellFlags || [])];
-    return (cellFlags || []).filter((f) => !strip.includes(f.split(/[\s=]/)[0]));
+    const add = overlayPart(sel, "flags");
+    if (!strip.length) return [...(cellFlags || []), ...add];
+    const used = new Set();
+    // Consumed once, so a family the cell carries twice is not emitted twice.
+    const replacementsFor = (tok) => {
+      const out = [];
+      add.forEach((f, i) => {
+        if (used.has(i) || f.split(/[\s=]/)[0] !== tok) return;
+        used.add(i);
+        out.push(f);
+      });
+      return out;
+    };
+    const out = [];
+    for (const f of (cellFlags || [])) {
+      const tok = f.split(/[\s=]/)[0];
+      if (!strip.includes(tok)) out.push(f);
+      else out.push(...replacementsFor(tok));
+    }
+    add.forEach((f, i) => { if (!used.has(i)) out.push(f); });
+    return out;
   };
   // ==== end MIRROR ====
   const withOverlay = (cell, sel) => (cell && {
     ...cell,
-    flags: [...overlayStrip(cell.flags, sel), ...overlayPart(sel, "flags")],
+    flags: overlayCompose(cell.flags, sel),
     env: [...(cell.env || []), ...overlayPart(sel, "env")],
   }) || cell;
   // Shared with `_deployment.jsx` (HOST/PORT/etc. unified across the page).
   const STORAGE_KEY = "sglang-deploy-env";
+  // ==== MIRROR of DEPLOYMENT_COMPONENT_ID in _deployment.jsx — keep identical ====
+  // Snippets cannot import each other. The Deploy panel puts this id on its
+  // root (carrying its own scrollMarginTop), which is what "jump to the base"
+  // should land on.
+  const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
 
   const pgFeatures = config.playgroundFeatures || {};
   // Single-host PD runs prefill + decode as two engines on one box. Each derives
@@ -787,6 +816,7 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
+              || head === "--speculative-dspark-block-size"
               || head === "--speculative-ngram-max-bfs-breadth";
         });
         if (baseSpec.length === 0) return "off";
@@ -798,18 +828,21 @@ export const Playground = ({ config }) => {
         return "current";
       },
 
-      apply: ({ flags, env, value, fc, h, derived }) => {
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (value === "current") return { flags, env };
         // No-op when the pick already matches base (preserves flag position).
         if (derived && value === derived) return { flags, env };
         const picked = (fc.options || []).find((p) => p.id === value);
-        if (picked && h.evaluateChip(picked,
-            { dpAttnOn: h.hasFlag(flags, "--enable-dp-attention") }).disabled) {
+        if (picked && h.evaluateChip(picked, {
+          ...sel,
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+        }).disabled) {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-dspark-block-size",
           "--speculative-ngram-max-bfs-breadth",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
@@ -868,6 +901,10 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
+        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
+        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+          return { flags, env };
+        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -917,7 +954,12 @@ export const Playground = ({ config }) => {
         return { flags, env };
       },
 
-      getRenderHints: (value) => {
+      getRenderHints: (value, fc, context) => {
+        const specAlgorithm = (context.h.findFlagArg(
+          context.flags, "--speculative-algorithm") || "").toUpperCase();
+        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+          return null;
+        }
         if (value.mode === "prefill" || value.mode === "decode") {
           return { pdMode: value.mode };
         }
@@ -1313,11 +1355,15 @@ export const Playground = ({ config }) => {
       const value = allDeltas[axisId];
       if (value === undefined) continue;
       const derived = derivedMap ? derivedMap[axisId] : null;
-      const out = handler.apply({ flags, env, value, fc, sel, h: helpers, derived });
+      const specAlgorithm = (findFlagArg(
+        flags, "--speculative-algorithm") || "").toUpperCase() || null;
+      const liveSel = { ...sel, specAlgorithm };
+      const out = handler.apply({ flags, env, value, fc, sel: liveSel, h: helpers, derived });
       flags = out.flags;
       env = out.env;
       if (handler.getRenderHints) {
-        const hints = handler.getRenderHints(value, fc) || {};
+        const hints = handler.getRenderHints(
+          value, fc, { flags, env, sel: liveSel, h: helpers }) || {};
         if (hints.pdMode) pdMode = hints.pdMode;
       }
     }
@@ -1360,21 +1406,39 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
+      // `hw`; `:dev` if unmapped (matches _deployment.jsx). The strategy key covers
+      // a tier that needs its own build (e.g. a spec-decoding preview image), so the
+      // playground base must resolve it too or it hands back an image that cannot
+      // run the command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
+      // (Mintlify strips module state, so the engines cannot share it).
+      const HW_MULTINODE_DOCKER_FLAGS = {
+        "dgx-spark": [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ],
+      };
+      const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
         (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...f.map((x) => "    " + x),
       ];
       cmd = dockerLines.join(" \\\n");
@@ -1995,12 +2059,20 @@ export const Playground = ({ config }) => {
     ? attnDelta.cpStrategy
     : (attnDerived.cpStrategy !== undefined ? attnDerived.cpStrategy : null))
     || "interleave";
+  const constraintEffective = baseCell
+    ? applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap)
+    : null;
   const pdCardOwnsMode = ((pgFeatures.pdDisagg && pgFeatures.pdDisagg.modes) || []).length > 0;
   const pdMode = pdCardOwnsMode
-    ? ((deltas.pdDisagg && deltas.pdDisagg.mode) || "off")
+    ? ((constraintEffective && constraintEffective.pdMode) || "off")
     : (base.pdMode || "off");
+  const specAlgorithm = constraintEffective
+    ? ((findFlagArg(constraintEffective.flags,
+        "--speculative-algorithm") || "").toUpperCase() || null)
+    : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
+    specAlgorithm,
   };
 
   let baseCommand = "";
@@ -2059,12 +2131,20 @@ export const Playground = ({ config }) => {
   const matchedSiblingCell = (matchedCell
     && DIMENSIONS.some((d) => matchedCell.match[d] !== base[d]))
     ? matchedCell : null;
-  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
-  // toggles speculative decoding on without setting --max-running-requests
-  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
-  const pgMtpHint =
-    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+  const pgSpecAlgoFlag = pgFlagsLatest.find(
+    (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  const pgSpecHint =
+    !!pgSpecAlgoFlag &&
     !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  const specAlgoLabels = {
+    EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
+    DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
+    STANDALONE: "standalone draft",
+  };
+  const pgSpecAlgoValue = pgSpecAlgoFlag
+    ? (pgSpecAlgoFlag.split(/[\s=]/).filter(Boolean)[1] || "") : "";
+  const pgSpecAlgoName = specAlgoLabels[pgSpecAlgoValue.toUpperCase()]
+    || pgSpecAlgoValue || "MTP";
 
   // Interleave prefill-CP + DP-Attention hint on the EFFECTIVE command:
   // deliberately allowed (combined support is planned upstream), but current
@@ -2218,12 +2298,16 @@ export const Playground = ({ config }) => {
         <span style={{ fontWeight: 600 }}>Inherited base from Deployment:</span>
         <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
         {/* scrollIntoView (not hash nav) so the base-cell hash survives.
-            Deploy heading slugs to "deployment" or "deploy". */}
+            Target the configurator ITSELF: the "## Deployment" heading sits
+            above the install accordion and a screenful of prose, so landing on
+            the heading leaves the panel you came for off-screen. The heading
+            slugs stay as fallbacks for a page that renders no configurator. */}
         <button
           type="button"
           style={s.switchBaseBtn}
           onClick={() => {
-            const el = document.getElementById("deployment")
+            const el = document.getElementById(DEPLOYMENT_COMPONENT_ID)
+              || document.getElementById("deployment")
               || document.getElementById("deploy");
             if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
           }}
@@ -2334,9 +2418,9 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
-          {pgMtpHint && (
+          {pgSpecHint && (
             <div style={s.mtpWarn}>
-              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              ⚠️ Speculative decoding ({pgSpecAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
             </div>
           )}
           {pgCpDpHint && (
