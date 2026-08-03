@@ -143,20 +143,42 @@ _MXFP4_TARGET_SPEC: Dict[str, Any] = {
     "bias": None,
 }
 
-_FP8_PER_TENSOR_SPEC: Dict[str, Any] = {
-    "weight": {
-        "dtype": "fp8_e4m3",
-        "qscheme": "per_tensor",
-        "is_dynamic": False,
-    },
-    "input_tensors": {
-        "dtype": "fp8_e4m3",
-        "qscheme": "per_tensor",
-        "is_dynamic": True,
-    },
-    "output_tensors": None,
-    "bias": None,
-}
+
+def _fp8_per_tensor_spec(is_dynamic_input: bool) -> Dict[str, Any]:
+    return {
+        "weight": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": False,
+        },
+        "input_tensors": {
+            "dtype": "fp8_e4m3",
+            "qscheme": "per_tensor",
+            "is_dynamic": is_dynamic_input,
+        },
+        "output_tensors": None,
+        "bias": None,
+    }
+
+
+def _fp8_is_dynamic_from_config_groups(
+    config_groups: Any,
+) -> bool:
+    """Return whether FP8 activation quantization is dynamic, from config_groups.
+
+    Reads the `input_activations.dynamic` field of the first config_group whose
+    `num_bits` is 8, and falls back to True (dynamic) when none exists or the
+    format is not a recognised dict-of-dicts.
+    """
+    if not isinstance(config_groups, dict):
+        return True
+    for group in config_groups.values():
+        if not isinstance(group, dict):
+            continue
+        input_act = group.get("input_activations") or {}
+        if input_act.get("num_bits") == 8:
+            return bool(input_act.get("dynamic", True))
+    return True
 
 
 def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -180,6 +202,7 @@ def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str
 
 def _build_mixed_precision_layer_quant_config(
     layer_map: Dict[str, str],
+    config_groups: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], bool]:
     """Collapse a per-layer {name: quant_algo} map into a compact
     `layer_quant_config` keyed by fnmatch glob patterns.
@@ -191,6 +214,9 @@ def _build_mixed_precision_layer_quant_config(
         # unindexed); this is the part shared across all layer indices.
         tail = re.split(r"\.layers\.\d+\.", name, maxsplit=1)[-1]
         tail_algos.setdefault(tail, set()).add(algo)
+
+    fp8_is_dynamic = _fp8_is_dynamic_from_config_groups(config_groups or {})
+    fp8_spec = _fp8_per_tensor_spec(is_dynamic_input=fp8_is_dynamic)
 
     layer_quant_config: Dict[str, Any] = {}
     has_nvfp4 = False
@@ -207,7 +233,7 @@ def _build_mixed_precision_layer_quant_config(
             layer_quant_config[pattern] = _MXFP4_TARGET_SPEC
             has_nvfp4 = True
         elif algo == "FP8":
-            layer_quant_config[pattern] = _FP8_PER_TENSOR_SPEC
+            layer_quant_config[pattern] = fp8_spec
         else:
             raise NotImplementedError(
                 f"MIXED_PRECISION layer group {tail!r} uses unsupported "
@@ -417,8 +443,9 @@ class QuarkConfig(QuantizationConfig):
             # own scheme
             layer_map = _mixed_precision_layer_map(config)
             if layer_map is not None:
+                config_groups = config.get("config_groups")
                 layer_quant_config, has_nvfp4 = (
-                    _build_mixed_precision_layer_quant_config(layer_map)
+                    _build_mixed_precision_layer_quant_config(layer_map, config_groups)
                 )
                 if not has_nvfp4:
                     raise NotImplementedError(
