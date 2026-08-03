@@ -261,38 +261,109 @@ class AsyncVAEWorker:
                 drop_leading_frames = 1
 
         decode_started = time.perf_counter()
+        encode_tasks: list[asyncio.Task[tuple[EncodedFrameBatch, ...]]] = []
+        callback_tail: asyncio.Task | None = None
+        frame_batch_index = 0
+        remaining_drop = drop_leading_frames
+
         async with self._actor_lock:
-            frames = self.engine.decode(
+            async for raw_frames in self._iter_decoded_frames(
                 state.decoder,
+                source,
+                first_chunk=first_chunk,
+            ):
+                frames = self._normalize_frames(raw_frames)
+                if remaining_drop:
+                    drop_count = min(remaining_drop, int(frames.shape[2]))
+                    frames = frames[:, :, drop_count:]
+                    remaining_drop -= drop_count
+                if frames.shape[2] == 0:
+                    continue
+
+                task = asyncio.create_task(
+                    self._encode_and_emit(
+                        frames,
+                        state.opened,
+                        frame_batch_index=frame_batch_index,
+                        previous_callback=callback_tail,
+                        on_frame_batch=job.on_frame_batch,
+                    )
+                )
+                encode_tasks.append(task)
+                callback_tail = task
+                frame_batch_index += (
+                    int(frames.shape[2]) + self.encoded_frames_per_batch - 1
+                ) // self.encoded_frames_per_batch
+
+        decode_ms = (time.perf_counter() - decode_started) * 1000.0
+        encoded_groups = (
+            await asyncio.gather(*encode_tasks) if encode_tasks else []
+        )
+        encoded = tuple(batch for group in encoded_groups for batch in group)
+        encode_ms = sum(batch.encode_ms for batch in encoded)
+
+        return DecodeResult(
+            disposition=AcceptDisposition.ACCEPT,
+            num_frames=sum(batch.num_frames for batch in encoded),
+            frame_batches=encoded,
+            queue_wait_ms=queue_wait_ms,
+            decode_ms=decode_ms,
+            encode_ms=encode_ms,
+        )
+
+    async def _iter_decoded_frames(self, decoder, source, *, first_chunk):
+        iterator_factory = getattr(self.engine, "iter_decode", None)
+        if iterator_factory is None:
+            frames = self.engine.decode(
+                decoder,
                 source,
                 first_chunk=first_chunk,
             )
             if inspect.isawaitable(frames):
                 frames = await frames
-        decode_ms = (time.perf_counter() - decode_started) * 1000.0
-        frames = self._normalize_frames(frames)
-        if drop_leading_frames:
-            frames = frames[:, :, drop_leading_frames:]
+            yield frames
+            return
 
-        encode_started = time.perf_counter()
-        encoded = await asyncio.to_thread(
-            self._encode_frames,
-            frames,
-            state.opened,
-        )
-        encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        if job.on_frame_batch is not None:
-            for frame_batch in encoded:
-                await job.on_frame_batch(frame_batch)
+        frames = iterator_factory(decoder, source, first_chunk=first_chunk)
+        if inspect.isawaitable(frames):
+            frames = await frames
+        if hasattr(frames, "__aiter__"):
+            async for frame_batch in frames:
+                yield frame_batch
+            return
+        for frame_batch in frames:
+            yield frame_batch
+            await asyncio.sleep(0)
 
-        return DecodeResult(
-            disposition=AcceptDisposition.ACCEPT,
-            num_frames=sum(batch.num_frames for batch in encoded),
-            frame_batches=tuple(encoded),
-            queue_wait_ms=queue_wait_ms,
-            decode_ms=decode_ms,
-            encode_ms=encode_ms,
+    async def _encode_and_emit(
+        self,
+        frames: torch.Tensor,
+        opened: SessionOpen,
+        *,
+        frame_batch_index: int,
+        previous_callback: asyncio.Task | None,
+        on_frame_batch: FrameBatchCallback | None,
+    ) -> tuple[EncodedFrameBatch, ...]:
+        encoded = await asyncio.to_thread(self._encode_frames, frames, opened)
+        indexed = tuple(
+            EncodedFrameBatch(
+                payloads=batch.payloads,
+                content_type=batch.content_type,
+                width=batch.width,
+                height=batch.height,
+                frame_batch_index=frame_batch_index + offset,
+                # chunk_complete is the authoritative end marker for streamed output.
+                is_final=False,
+                encode_ms=batch.encode_ms,
+            )
+            for offset, batch in enumerate(encoded)
         )
+        if previous_callback is not None:
+            await previous_callback
+        if on_frame_batch is not None:
+            for batch in indexed:
+                await on_frame_batch(batch)
+        return indexed
 
     @staticmethod
     def _normalize_frames(frames: torch.Tensor) -> torch.Tensor:
@@ -457,17 +528,23 @@ class TAEHVEngine:
         return StreamingTAEHV(self.model).eval()
 
     @torch.no_grad()
-    def decode(self, decoder, latents: torch.Tensor, *, first_chunk: bool):
+    def iter_decode(self, decoder, latents: torch.Tensor, *, first_chunk: bool):
         if first_chunk:
             decoder.reset()
         source = latents.to(device=self.device, dtype=self.dtype, non_blocking=True)
         source = (source * self.std + self.mean).permute(0, 2, 1, 3, 4).contiguous()
-        decoded_frames = []
         frame = decoder.decode(source)
         while frame is not None:
-            decoded_frames.append(frame)
+            yield frame.permute(0, 2, 1, 3, 4).contiguous().clamp(0, 1)
             frame = decoder.decode()
-        if not decoded_frames:
-            return source.new_empty((1, 3, 0, source.shape[-2] * 16, source.shape[-1] * 16))
-        frames = torch.cat(decoded_frames, dim=1)
-        return frames.permute(0, 2, 1, 3, 4).contiguous().clamp(0, 1)
+
+    @torch.no_grad()
+    def decode(self, decoder, latents: torch.Tensor, *, first_chunk: bool):
+        decoded_frames = list(
+            self.iter_decode(decoder, latents, first_chunk=first_chunk)
+        )
+        if decoded_frames:
+            return torch.cat(decoded_frames, dim=2)
+        height = int(latents.shape[-2]) * 16
+        width = int(latents.shape[-1]) * 16
+        return torch.empty((1, 3, 0, height, width), dtype=self.dtype)

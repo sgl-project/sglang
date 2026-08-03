@@ -309,7 +309,7 @@ Commit: `git commit -am "feat(realtime): add bounded stateful TAEHV worker"`
 - Modify: `python/sglang/multimodal_gen/runtime/entrypoints/openai/realtime/adapters/sana_wm_realtime_adapter.py`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_pipeline.py`
 
-- [ ] **Step 1: Write failing overlap and order tests**
+- [x] **Step 1: Write failing overlap and order tests**
 
 ```python
 @pytest.mark.asyncio
@@ -332,13 +332,13 @@ async def test_cancel_releases_remote_generation_and_local_chunk_tasks():
     assert session.vae_client.closed
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_pipeline.py -q`
 
 Expected: FAIL because the current loop waits for local decode.
 
-- [ ] **Step 3: Implement bounded two-stage loop**
+- [x] **Step 3: Implement bounded two-stage loop**
 
 ```python
 async def _generate_loop_async_vae(ws, session):
@@ -357,7 +357,7 @@ async def _generate_loop_async_vae(ws, session):
 
 `RealtimeVAEClient` 建立持久 WebSocket，按 header+binary latent 发送，校验每个 FrameBatch identity，收到 `LatentAccepted` 后发放绑定 next chunk 的单次 credit。Decode task 完成后调用 Adapter 的 chunk-aware `on_chunk_complete`。发生 timeout、stale generation、队列满或连接断开时取消所有本地 task、向 VAE 发送 abort 并释放 Scheduler Session。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_pipeline.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q`
 

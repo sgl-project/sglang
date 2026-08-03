@@ -58,6 +58,7 @@ class GenerateSession:
         self.adapter_state: Any = None
         self.output_pace_next_send_at: float | None = None
         self.output_pace_last_event_id: int | None = None
+        self.vae_client: Any = None
 
     def set_adapter(self, adapter: BaseRealtimeModelAdapter):
         self.adapter = adapter
@@ -85,6 +86,7 @@ class GenerateSession:
         self.adapter_state = None
         self.output_pace_next_send_at = None
         self.output_pace_last_event_id = None
+        self.vae_client = None
         self.realtime_session.dispose()
 
     @property

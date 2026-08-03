@@ -60,6 +60,20 @@ class _BlockingEngine(_FakeEngine):
         return await super().decode(decoder, latents, first_chunk=first_chunk)
 
 
+class _StreamingEngine(_FakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.first_decoded = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def iter_decode(self, decoder, latents, *, first_chunk):
+        del decoder, latents, first_chunk
+        self.first_decoded.set()
+        yield torch.zeros((1, 3, 1, 8, 8), dtype=torch.float32)
+        await self.release_second.wait()
+        yield torch.ones((1, 3, 1, 8, 8), dtype=torch.float32)
+
+
 def test_worker_keeps_decoder_state_per_generation():
     async def scenario():
         engine = _FakeEngine()
@@ -139,6 +153,38 @@ def test_worker_t2v_reseeds_chunk_one_and_drops_duplicate_frame():
         assert engine.calls[1][1].shape[2] == 3
         assert engine.calls[1][2] is True
         assert second.num_frames == 2
+        await worker.close_all()
+
+    asyncio.run(scenario())
+
+
+def test_worker_emits_first_streaming_frame_before_decode_finishes():
+    async def scenario():
+        engine = _StreamingEngine()
+        worker = AsyncVAEWorker(engine, max_sessions=1, encoded_frames_per_batch=1)
+        await worker.open(SessionOpen("s", "g"))
+        first_emitted = asyncio.Event()
+        batches = []
+
+        async def on_frame_batch(batch):
+            batches.append(batch)
+            first_emitted.set()
+
+        decode = asyncio.create_task(
+            worker.decode(
+                _header("s", "g", 0),
+                torch.zeros(1, 48, 1, 2, 2, dtype=torch.bfloat16),
+                on_frame_batch=on_frame_batch,
+            )
+        )
+        await engine.first_decoded.wait()
+        await asyncio.wait_for(first_emitted.wait(), timeout=1)
+        assert not decode.done()
+
+        engine.release_second.set()
+        result = await decode
+        assert result.num_frames == 2
+        assert [batch.frame_batch_index for batch in batches] == [0, 1]
         await worker.close_all()
 
     asyncio.run(scenario())

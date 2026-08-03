@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     RealtimeFrameSendStats,
+    empty_frame_send_stats,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
@@ -39,6 +40,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.realtime.async_vae_client import (
+    RealtimeVAEClient,
+    RemoteDecodeHandle,
+    RemoteFrameBatch,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -53,6 +60,30 @@ _ACTIVE_SESSION_WAIT_SECONDS = 1.0
 _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
 _TRACE_EVENT_QUEUE_LIMIT = 256
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
+
+
+class _OrderedDecodeCoordinator:
+    """Keep decode completion ordered while the caller denoises the next chunk."""
+
+    def __init__(self) -> None:
+        self.pending: asyncio.Task | None = None
+
+    async def submit(self, factory) -> None:
+        if self.pending is not None:
+            await self.pending
+        self.pending = asyncio.create_task(factory())
+
+    async def finish(self) -> None:
+        if self.pending is not None:
+            await self.pending
+            self.pending = None
+
+    async def cancel(self) -> None:
+        if self.pending is None:
+            return
+        self.pending.cancel()
+        await asyncio.gather(self.pending, return_exceptions=True)
+        self.pending = None
 
 
 class _LockedRealtimeWebSocket:
@@ -411,6 +442,228 @@ async def _send_realtime_chunk_stats(
 
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
+    server_args = get_global_server_args()
+    if getattr(server_args, "realtime_vae_worker_url", None):
+        return await _generate_loop_async_vae(ws, session, server_args)
+    return await _generate_loop_local(ws, session)
+
+
+def _merge_send_stats(
+    target: RealtimeFrameSendStats,
+    update: RealtimeFrameSendStats,
+) -> None:
+    for key in (
+        "header_pack_ms",
+        "header_write_ms",
+        "raw_payload_build_ms",
+        "raw_write_ms",
+        "ws_write_ms",
+        "pace_wait_ms",
+        "raw_bytes",
+        "ws_payload_bytes",
+        "num_frames",
+        "num_batches",
+    ):
+        target[key] += update[key]
+    if update["frame_shape"] is not None:
+        target["frame_shape"] = update["frame_shape"]
+    if update["content_type"]:
+        target["content_type"] = update["content_type"]
+
+
+async def _send_remote_frame_batch(
+    ws: WebSocket,
+    session: GenerateSession,
+    batch: "Req",
+    frame_batch: RemoteFrameBatch,
+    send_stats: RealtimeFrameSendStats,
+) -> None:
+    if session.adapter is None:
+        raise ValueError("realtime adapter is not initialized")
+    partial = OutputBatch(
+        raw_frame_batches=[list(frame_batch.payloads)],
+        raw_frame_content_type=frame_batch.content_type,
+        raw_frame_metadata={
+            "width": frame_batch.width,
+            "height": frame_batch.height,
+            "channels": 3,
+            "bytes_per_frame": frame_batch.width * frame_batch.height * 3,
+        },
+        metrics=batch.metrics,
+    )
+    send_group = getattr(ws, "send_group", None)
+    send_context = send_group() if send_group is not None else _NullAsyncContext()
+    async with send_context:
+        partial_stats = await session.adapter.send_output(ws, session, partial, batch)
+    _merge_send_stats(send_stats, partial_stats)
+
+
+async def _complete_remote_chunk(
+    ws: WebSocket,
+    session: GenerateSession,
+    chunk: RealtimeChunkContext,
+    batch: "Req",
+    handle: RemoteDecodeHandle,
+    send_stats: RealtimeFrameSendStats,
+    request_prepare_ms: float,
+    scheduler_forward_ms: float,
+    chunk_started: float,
+) -> None:
+    remote_result = await handle.wait()
+    chunk_total_ms = (time.perf_counter() - chunk_started) * 1000.0
+    log_realtime_trace(
+        logger,
+        session,
+        "server.remote_vae_complete",
+        request_id=chunk.request_id,
+        chunk_index=chunk.index,
+        event_id=getattr(batch, "realtime_event_id", None),
+        vae_queue_wait_ms=round(remote_result.queue_wait_ms, 3),
+        vae_decode_ms=round(remote_result.decode_ms, 3),
+        frame_encode_ms=round(remote_result.encode_ms, 3),
+        latent_to_gateway_complete_ms=round(remote_result.transfer_ms, 3),
+        num_frames=remote_result.num_frames,
+    )
+    _log_realtime_chunk_timing(
+        session,
+        chunk,
+        batch,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        chunk_total_ms,
+        send_stats,
+    )
+    await _send_realtime_chunk_stats(
+        ws,
+        session,
+        chunk,
+        batch,
+        request_prepare_ms,
+        scheduler_forward_ms,
+        chunk_total_ms,
+        send_stats,
+    )
+    session.generate_chunk_completed(chunk)
+
+
+async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
+    adapter = session.adapter
+    if adapter is None or session.request is None:
+        raise ValueError("realtime adapter and request must be initialized")
+
+    session.max_inflight_chunks = 2
+    client = RealtimeVAEClient(
+        server_args.realtime_vae_worker_url,
+        session_id=session.id,
+        generation_id=session.generation_id,
+        timeout_s=server_args.realtime_vae_timeout_s,
+        max_message_bytes=server_args.realtime_vae_max_message_mb * 1024 * 1024,
+    )
+    session.vae_client = client
+    output_format = session.request.realtime_output_format or "webp"
+    quality = int(session.request.output_compression or 90)
+    await client.open(
+        output_format=output_format,
+        quality=quality,
+        preview_max_width=session.request.realtime_preview_max_width,
+    )
+    coordinator = _OrderedDecodeCoordinator()
+
+    try:
+        while session.can_schedule_chunk():
+            if coordinator.pending is not None and coordinator.pending.done():
+                await coordinator.finish()
+
+            wait_started = time.perf_counter()
+            await adapter.wait_for_next_chunk(session)
+            wait_ms = (time.perf_counter() - wait_started) * 1000.0
+            log_realtime_trace(
+                logger,
+                session,
+                "server.chunk_wait_done",
+                next_chunk_index=session.next_chunk_index,
+                wait_ms=round(wait_ms, 3),
+            )
+
+            timer = RealtimeStageTimer()
+            chunk_started = time.perf_counter()
+            chunk = session.new_chunk()
+            batch = adapter.prepare_next_request(session, server_args, chunk)
+            request_prepare_ms = timer.mark_ms()
+            log_realtime_trace(
+                logger,
+                session,
+                "server.scheduler_forward_start",
+                request_id=chunk.request_id,
+                chunk_index=chunk.index,
+                request_prepare_ms=round(request_prepare_ms, 3),
+                event_id=getattr(batch, "realtime_event_id", None),
+            )
+            _, result = await process_generation_batch(async_scheduler_client, batch)
+            scheduler_forward_ms = timer.mark_ms()
+            _emit_realtime_result_stage_traces(session, chunk, batch, result)
+            if result.realtime_latents is None or result.realtime_handoff is None:
+                raise RuntimeError("remote VAE path received no latent handoff")
+
+            send_stats = empty_frame_send_stats()
+
+            async def on_frame_batch(
+                frame_batch: RemoteFrameBatch,
+                *,
+                batch=batch,
+                send_stats=send_stats,
+            ) -> None:
+                await _send_remote_frame_batch(
+                    ws,
+                    session,
+                    batch,
+                    frame_batch,
+                    send_stats,
+                )
+
+            handle = await client.submit(
+                result.realtime_latents,
+                result.realtime_handoff,
+                on_frame_batch=on_frame_batch,
+            )
+            result.realtime_latents = None
+            await coordinator.submit(
+                lambda chunk=chunk, batch=batch, handle=handle, send_stats=send_stats,
+                request_prepare_ms=request_prepare_ms,
+                scheduler_forward_ms=scheduler_forward_ms,
+                chunk_started=chunk_started: _complete_remote_chunk(
+                    ws,
+                    session,
+                    chunk,
+                    batch,
+                    handle,
+                    send_stats,
+                    request_prepare_ms,
+                    scheduler_forward_ms,
+                    chunk_started,
+                )
+            )
+        await coordinator.finish()
+    except asyncio.CancelledError:
+        await coordinator.cancel()
+        raise
+    except WebSocketDisconnect:
+        await coordinator.cancel()
+        logger.info("client disconnected during async VAE generation: %s", session.id)
+    except Exception as exc:
+        await coordinator.cancel()
+        err_msg = str(exc).splitlines()[0]
+        logger.error("error during async VAE generate loop: %s", err_msg)
+        try:
+            await write_error_msg(f"error during generate loop: {err_msg}", ws)
+        except Exception:
+            pass
+    finally:
+        await client.close()
+        session.vae_client = None
+
+
+async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
         raise ValueError("realtime adapter is not initialized")
