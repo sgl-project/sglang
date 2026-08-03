@@ -184,6 +184,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             )
 
     def test_image_response_adds_image_count_to_usage(self):
+        set_global_server_args(SimpleNamespace(enable_cache_report=False))
         response = _build_image_response_kwargs(
             ["/tmp/glm-image-0.jpg", "/tmp/glm-image-1.jpg"],
             "b64_json",
@@ -195,6 +196,7 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
                     "completion_tokens": 25,
                     "total_tokens": 38,
                     "reasoning_tokens": 0,
+                    "cached_tokens": 5,
                 }
             ),
             b64_list=["aGVsbG8=", "d29ybGQ="],
@@ -202,6 +204,33 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
         )
 
         self.assertEqual(response["usage"]["image_count"], 2)
+        self.assertNotIn("prompt_tokens_details", response["usage"])
+        self.assertNotIn("cached_tokens", response["usage"])
+
+    def test_image_response_reports_cached_tokens_when_cache_report_enabled(self):
+        set_global_server_args(SimpleNamespace(enable_cache_report=True))
+        response = _build_image_response_kwargs(
+            ["/tmp/glm-image-0.jpg"],
+            "b64_json",
+            "A simple product sketch",
+            "req-0",
+            OutputBatch(
+                usage={
+                    "prompt_tokens": 13,
+                    "completion_tokens": 25,
+                    "total_tokens": 38,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 5,
+                }
+            ),
+            b64_list=["aGVsbG8="],
+            is_persistent=False,
+        )
+
+        self.assertEqual(
+            response["usage"]["prompt_tokens_details"], {"cached_tokens": 5}
+        )
+        self.assertNotIn("cached_tokens", response["usage"])
 
 
 if __name__ == "__main__":

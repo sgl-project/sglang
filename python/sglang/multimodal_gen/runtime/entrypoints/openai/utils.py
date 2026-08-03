@@ -431,7 +431,19 @@ def add_common_data_to_response(
         response["inference_time_s"] = result.metrics.total_duration_s
 
     if result.usage is not None:
-        response["usage"] = dict(result.usage)
+        usage = dict(result.usage)
+        cached_tokens = usage.pop("cached_tokens", None)
+        enable_cache_report = getattr(
+            get_global_server_args(), "enable_cache_report", False
+        )
+        if (
+            enable_cache_report
+            and cached_tokens is not None
+            and int(cached_tokens) > 0
+            and usage.get("prompt_tokens_details") is None
+        ):
+            usage["prompt_tokens_details"] = {"cached_tokens": int(cached_tokens)}
+        response["usage"] = usage
 
     response["id"] = request_id
 
