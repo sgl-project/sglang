@@ -92,7 +92,12 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    get_spec,
+    publish_shared_ep_forward_flags,
+)
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -935,6 +940,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
+                publish_shared_ep_forward_flags(forward_batch)
 
                 kwargs = {}
                 if (

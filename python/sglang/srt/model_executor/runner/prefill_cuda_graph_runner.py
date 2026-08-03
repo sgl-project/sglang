@@ -103,7 +103,11 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    publish_shared_ep_forward_flags,
+)
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -635,6 +639,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.global_num_tokens_cpu,
         )
         set_is_extend_in_batch(False)
+        publish_shared_ep_forward_flags(forward_batch)
 
         with self._prefill_forward_context(forward_batch):
             if self._uses_eager_prefill_tail():
@@ -706,6 +711,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             fb.global_num_tokens_cpu,
         )
         set_is_extend_in_batch(False)
+        publish_shared_ep_forward_flags(fb)
 
         with (
             forward_context(

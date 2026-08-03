@@ -2207,6 +2207,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer",
         "mori",
         "pplx",
+        "shared_ep",
     }
 )
 
@@ -2229,6 +2230,25 @@ def _a2a_backend_overrides(view: Any) -> dict:
         )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
+    return {}
+
+
+@register_post_process
+def _shared_ep_runner_resolution(view: Any) -> dict:
+    """Resolve the platform-native prefill runner for composite SharedEP."""
+
+    if view.moe_a2a_backend != "shared_ep":
+        return {}
+    from sglang.srt.layers.moe.utils import get_shared_ep_prefill_backend
+
+    expected = get_shared_ep_prefill_backend().value
+    if view.moe_runner_backend == "auto":
+        return {"moe_runner_backend": expected}
+    if view.moe_runner_backend != expected:
+        raise ValueError(
+            "SharedEP requires --moe-runner-backend "
+            f"{expected} on this platform, got {view.moe_runner_backend}."
+        )
     return {}
 
 

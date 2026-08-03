@@ -669,6 +669,26 @@ class TestEpBufferState(_IsolatedServerArgs):
         reset_context()
         self.assertIsNone(DeepEPBuffer._state().buffer)
 
+    def test_deepep_mode_transition_before_lazy_buffer_allocation(self):
+        try:
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPBuffer,
+                DeepEPDispatchMode,
+            )
+        except ImportError:
+            self.skipTest("deep_ep not installed")
+
+        reset_context()
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+
+        # CUDA Graph adapters publish the phase before the dispatcher's first
+        # lazy buffer allocation. NORMAL -> LOW_LATENCY has nothing to clean.
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+
+        state = DeepEPBuffer._state()
+        self.assertIsNone(state.buffer)
+        self.assertEqual(state.dispatch_mode, DeepEPDispatchMode.LOW_LATENCY)
+
 
 class TestForwardFlags(_IsolatedServerArgs):
     """ctx.forward: contextvar-backed per-forward flags; scoped() restores,
@@ -686,6 +706,187 @@ class TestForwardFlags(_IsolatedServerArgs):
                 self.assertFalse(fwd.multi_stream)
             self.assertTrue(fwd.multi_stream)
         self.assertFalse(fwd.multi_stream)
+
+    def test_shared_ep_route_follows_global_mode_on_idle_rank(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        reset_context()
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.DECODE,
+                shared_ep_generation=3,
+            )
+        )
+        self.assertTrue(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+        self.assertEqual(get_forward().shared_ep_generation, 3)
+
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.TARGET_VERIFY,
+                shared_ep_generation=0,
+            )
+        )
+        self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+
+        publish_shared_ep_forward_flags(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.EXTEND,
+                shared_ep_generation=0,
+            )
+        )
+        self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertTrue(get_forward().shared_ep_is_prefill)
+
+    def test_shared_ep_gathers_rank_consistent_counts_before_forward(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        parallel = SimpleNamespace(
+            moe_ep_group=SimpleNamespace(cpu_group="cpu_group"),
+            moe_ep_size=8,
+            attn_dp_size=8,
+            attn_dp_rank=0,
+        )
+
+        def gather_counts(output, value, *, group):
+            self.assertEqual(group, "cpu_group")
+            self.assertEqual(value.tolist(), [3, int(ForwardMode.DECODE)])
+            output.copy_(
+                torch.tensor(
+                    [
+                        (3, int(ForwardMode.DECODE)),
+                        (4, int(ForwardMode.IDLE)),
+                        (2, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                        (1, int(ForwardMode.IDLE)),
+                    ],
+                    dtype=torch.int64,
+                ).view(-1)
+            )
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="shared_ep")
+                ),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=parallel,
+            ),
+            patch("torch.distributed.get_world_size", return_value=8),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=gather_counts,
+            ),
+        ):
+            publish_shared_ep_forward_flags(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    global_forward_mode=ForwardMode.DECODE,
+                    shared_ep_generation=0,
+                    global_num_tokens_cpu=(3,),
+                )
+            )
+
+        self.assertEqual(
+            get_forward().shared_ep_global_num_tokens,
+            (3, 4, 2, 1, 1, 1, 1, 1),
+        )
+        self.assertTrue(get_forward().shared_ep_counts_synchronized)
+        self.assertTrue(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+
+    def test_shared_ep_mixed_dp_phases_force_materialized_fallback(self):
+        from types import SimpleNamespace
+
+        import torch
+
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import (
+            get_forward,
+            publish_shared_ep_forward_flags,
+        )
+
+        parallel = SimpleNamespace(
+            moe_ep_group=SimpleNamespace(cpu_group="cpu_group"),
+            moe_ep_size=8,
+            attn_dp_size=8,
+            attn_dp_rank=0,
+        )
+
+        def gather_state(output, value, *, group):
+            self.assertEqual(group, "cpu_group")
+            self.assertEqual(value.tolist(), [1024, int(ForwardMode.EXTEND)])
+            output.copy_(
+                torch.tensor(
+                    [
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1, int(ForwardMode.DECODE)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                        (1024, int(ForwardMode.EXTEND)),
+                    ],
+                    dtype=torch.int64,
+                ).view(-1)
+            )
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_a2a_backend="shared_ep")
+                ),
+            ),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=parallel,
+            ),
+            patch("torch.distributed.get_world_size", return_value=8),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=gather_state,
+            ),
+        ):
+            publish_shared_ep_forward_flags(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    global_forward_mode=None,
+                    shared_ep_generation=0,
+                    global_num_tokens_cpu=(1024,),
+                )
+            )
+
+        self.assertFalse(get_forward().shared_ep_is_decode)
+        self.assertFalse(get_forward().shared_ep_is_prefill)
+        self.assertTrue(get_forward().shared_ep_counts_synchronized)
 
     def test_scoped_restores_on_exception_and_validates_keys(self):
         from sglang.srt.runtime_context import get_forward
@@ -744,6 +945,9 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
                 x = x + 16
+            if fwd.shared_ep_is_decode:
+                x = x + 32
+            x = x + fwd.shared_ep_generation * 64
             return x
 
         self.assertEqual(probe(torch.zeros(())).item(), 0)
@@ -758,6 +962,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             flashinfer_trtllm_bypass=True,
         ):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
+        with get_forward().scoped(
+            shared_ep_is_decode=True,
+            shared_ep_generation=2,
+        ):
+            self.assertEqual(probe(torch.zeros(())).item(), 160)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):

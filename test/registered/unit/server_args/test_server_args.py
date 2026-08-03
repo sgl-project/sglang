@@ -5,7 +5,7 @@ import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
@@ -19,6 +19,10 @@ from sglang.srt.entrypoints.sidecar import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
+from sglang.srt.layers.moe.shared_ep.admission import (
+    validate_shared_ep_server_args,
+)
+from sglang.srt.layers.moe.utils import get_shared_ep_prefill_backend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -1936,6 +1940,251 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestSharedEpConstraints(CustomTestCase):
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.moe_a2a_backend = "shared_ep"
+        args.moe_runner_backend = get_shared_ep_prefill_backend().value
+        args.tp_size = 8
+        args.ep_size = 8
+        args.dp_size = 8
+        args.nnodes = 1
+        args.enable_dp_attention = True
+        args.enable_lora = False
+        args.lora_paths = None
+        args.enable_two_batch_overlap = False
+        args.enable_single_batch_overlap = False
+        args.speculative_algorithm = None
+        args.speculative_moe_a2a_backend = None
+        args.speculative_moe_runner_backend = None
+        args.speculative_num_steps = None
+        args.speculative_eagle_topk = None
+        args.speculative_num_draft_tokens = None
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
+                backend=Backend.FULL, max_bs=32, bs=[1, 2, 4, 8, 16, 32]
+            ),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_release_decode_capacity_is_admitted(self):
+        validate_shared_ep_server_args(self._args())
+
+    def test_release_defaults_global_request_limit_to_dp_capacity(self):
+        args = self._args(max_running_requests=None)
+
+        validate_shared_ep_server_args(args)
+
+        self.assertEqual(args.max_running_requests, 32 * 8)
+
+    def test_release_rejects_global_request_limit_above_dp_capacity(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "max-running-requests 256",
+        ):
+            validate_shared_ep_server_args(self._args(max_running_requests=257))
+
+    def test_release_requires_dp8_with_dp_attention(self):
+        for overrides, pattern in (
+            ({"ep_size": 4}, "EP8"),
+            ({"dp_size": 4}, "DP8"),
+            ({"enable_dp_attention": False}, "enable-dp-attention"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    validate_shared_ep_server_args(self._args(**overrides))
+
+    def test_release_rejects_cross_node(self):
+        with self.assertRaisesRegex(ValueError, "same-host"):
+            validate_shared_ep_server_args(self._args(nnodes=2))
+
+    def test_release_rejects_lora(self):
+        for overrides in (
+            {"enable_lora": True},
+            {"lora_paths": ["adapter"]},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "LoRA"):
+                    validate_shared_ep_server_args(self._args(**overrides))
+
+    def test_release_rejects_unlaned_pdmux_streams(self):
+        with self.assertRaisesRegex(ValueError, "PD-Multiplexing"):
+            validate_shared_ep_server_args(self._args(enable_pdmux=True))
+
+    def test_auto_target_runner_resolves_to_platform_backend(self):
+        args = self._args(moe_runner_backend="auto")
+
+        validate_shared_ep_server_args(args)
+
+        self.assertEqual(
+            args.moe_runner_backend,
+            get_shared_ep_prefill_backend().value,
+        )
+
+    @patch("sglang.srt.layers.moe.utils.is_hip", return_value=True)
+    def test_rocm_resolution_pass_selects_aiter(self, _is_hip):
+        from sglang.srt.arg_groups.overrides import (
+            _shared_ep_runner_resolution,
+        )
+
+        self.assertEqual(
+            _shared_ep_runner_resolution(
+                SimpleNamespace(
+                    moe_a2a_backend="shared_ep",
+                    moe_runner_backend="auto",
+                )
+            ),
+            {"moe_runner_backend": "aiter"},
+        )
+
+    def test_conflicting_target_runner_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend"):
+            validate_shared_ep_server_args(self._args(moe_runner_backend="triton"))
+
+    @patch("sglang.srt.layers.moe.shared_ep.admission.get_shared_ep_prefill_backend")
+    def test_rocm_auto_runner_resolves_to_aiter(self, get_prefill_backend):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        get_prefill_backend.return_value = MoeRunnerBackend.AITER
+        args = self._args(moe_runner_backend="auto")
+        with patch.dict(os.environ, {"SGLANG_USE_AITER": "0"}):
+            validate_shared_ep_server_args(args)
+            self.assertEqual(args.moe_runner_backend, "aiter")
+            self.assertTrue(envs.SGLANG_USE_AITER.get())
+
+    @patch("sglang.srt.layers.moe.shared_ep.admission.get_shared_ep_prefill_backend")
+    def test_rocm_rejects_non_aiter_runner(self, get_prefill_backend):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        get_prefill_backend.return_value = MoeRunnerBackend.AITER
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend aiter"):
+            validate_shared_ep_server_args(self._args(moe_runner_backend="deep_gemm"))
+
+    def test_tbo_is_admitted_but_sbo_is_rejected(self):
+        validate_shared_ep_server_args(self._args(enable_two_batch_overlap=True))
+        with self.assertRaisesRegex(ValueError, "SBO"):
+            validate_shared_ep_server_args(self._args(enable_single_batch_overlap=True))
+
+    def test_mtp_without_algorithm_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "MTP"):
+            validate_shared_ep_server_args(
+                self._args(
+                    speculative_algorithm=None,
+                    speculative_num_steps=1,
+                )
+            )
+
+    def test_linear_nextn_mtp_with_materialized_fallback_is_admitted(self):
+        backend = get_shared_ep_prefill_backend()
+        speculative_a2a = "mori" if backend.is_aiter() else "deepep"
+        validate_shared_ep_server_args(
+            self._args(
+                enable_two_batch_overlap=True,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=2,
+                speculative_moe_a2a_backend=speculative_a2a,
+                speculative_moe_runner_backend=backend.value,
+            )
+        )
+
+    def test_speculative_tree_and_unmaterialized_draft_are_rejected(self):
+        backend = get_shared_ep_prefill_backend()
+        speculative_a2a = "mori" if backend.is_aiter() else "deepep"
+        base = dict(
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=2,
+            speculative_moe_a2a_backend=speculative_a2a,
+            speculative_moe_runner_backend=backend.value,
+        )
+        with self.assertRaisesRegex(ValueError, "topk 1"):
+            validate_shared_ep_server_args(
+                self._args(**{**base, "speculative_eagle_topk": 2})
+            )
+        with self.assertRaisesRegex(ValueError, "materialized draft fallback"):
+            validate_shared_ep_server_args(
+                self._args(**{**base, "speculative_moe_a2a_backend": "none"})
+            )
+
+    def test_lane_count_above_fixed_cap_is_rejected(self):
+        backend = get_shared_ep_prefill_backend()
+        speculative_a2a = "mori" if backend.is_aiter() else "deepep"
+        with self.assertRaisesRegex(ValueError, "fixed release cap"):
+            validate_shared_ep_server_args(
+                self._args(
+                    enable_two_batch_overlap=True,
+                    speculative_algorithm="EAGLE",
+                    speculative_num_steps=4,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=5,
+                    speculative_moe_a2a_backend=speculative_a2a,
+                    speculative_moe_runner_backend=backend.value,
+                )
+            )
+
+    def test_release_rejects_unregistered_model_architecture(self):
+        args = self._args()
+        args.model_path = "unsupported-model"
+        args.get_model_config = Mock(
+            return_value=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["UnsupportedMoeForCausalLM"])
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "GLM-5.2"):
+            validate_shared_ep_server_args(args)
+
+    def test_release_accepts_registered_model_architectures(self):
+        for architecture in (
+            "GlmMoeDsaForCausalLM",
+            "DeepseekV4ForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
+                args = self._args()
+                args.model_path = "supported-model"
+                args.get_model_config = Mock(
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=[architecture])
+                    )
+                )
+                validate_shared_ep_server_args(args)
+
+    def test_oversized_decode_cuda_graph_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "32"):
+            validate_shared_ep_server_args(
+                self._args(
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(
+                            backend=Backend.FULL,
+                            max_bs=64,
+                            bs=[1, 32, 64],
+                        ),
+                        prefill=PhaseConfig(backend=Backend.DISABLED),
+                    )
+                )
+            )
+
+    def test_disabled_decode_cuda_graph_ignores_capture_size(self):
+        validate_shared_ep_server_args(
+            self._args(
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(
+                        backend=Backend.DISABLED,
+                        max_bs=64,
+                        bs=[64],
+                    ),
+                    prefill=PhaseConfig(backend=Backend.DISABLED),
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

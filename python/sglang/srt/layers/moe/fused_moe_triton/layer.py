@@ -120,7 +120,7 @@ def _maybe_copy_weight_view_before_h2d(
 def _get_deepep_comm_group(a2a_backend):
     group = get_tp_group().device_group
 
-    if a2a_backend.is_mori():
+    if a2a_backend.is_mori() or (a2a_backend.is_shared_ep() and _is_hip):
         group = get_tp_group()
 
     elif _is_npu:
@@ -133,7 +133,16 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
-    elif (
+
+    if a2a_backend.is_shared_ep():
+        from sglang.srt.layers.moe.shared_ep import create_shared_ep_dispatcher
+
+        return create_shared_ep_dispatcher(
+            moe_runner_config,
+            group=_get_deepep_comm_group(a2a_backend),
+        )
+
+    if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()
@@ -251,6 +260,7 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        shared_ep_model_namespace: str = "target",
     ):
         super().__init__()
         if params_dtype is None:
@@ -342,6 +352,7 @@ class FusedMoE(torch.nn.Module):
             top_k=top_k,
             num_fused_shared_experts=num_fused_shared_experts,
             params_dtype=params_dtype,
+            shared_ep_model_namespace=shared_ep_model_namespace,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             inplace=inplace,

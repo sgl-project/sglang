@@ -169,6 +169,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    publish_shared_ep_forward_flags,
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -1460,6 +1461,7 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        publish_shared_ep_forward_flags(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:

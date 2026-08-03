@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     PermuteMethodPool,
 )
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
@@ -61,6 +60,10 @@ class MoeRunner:
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmRunnerCore,
+            )
+
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():
             from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
@@ -112,9 +115,17 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
+        self.is_shared_ep = get_moe_a2a_backend().is_shared_ep()
+
         # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
         if not lora_enabled:
-            a2a_backend_name = get_moe_a2a_backend().value
+            a2a_backend = get_moe_a2a_backend()
+            if a2a_backend.is_shared_ep():
+                # SharedEP owns a composite dispatch/GEMM/combine path. Import it
+                # before the one-time fused-op lookup in this runner instance.
+                from sglang.srt.layers.moe import shared_ep  # noqa: F401
+
+            a2a_backend_name = a2a_backend.value
             runner_backend_name = runner_backend.value
 
             # TODO(cwan): add a server argument to disable fused func
@@ -139,16 +150,42 @@ class MoeRunner:
                 "SGLANG_CI_DISABLE_MOE_FUSED_FUNC is set to 1, disabling fused func"
             )
             self.fused_func = None
+        if get_moe_a2a_backend().is_shared_ep() and self.fused_func is None:
+            raise RuntimeError(
+                "SharedEP requires its registered fused execution path; "
+                "the generic runner cannot consume SharedEP decode objects."
+            )
 
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
         if self.fused_func is not None and not self.lora_enabled:
-            return self.fused_func(dispatch_output, quant_info, self.config)
+            if not self.is_shared_ep or getattr(
+                dispatch_output,
+                "uses_shared_ep_fused",
+                getattr(dispatch_output, "is_shared_ep_decode", False),
+            ):
+                return self.fused_func(dispatch_output, quant_info, self.config)
+
+            # Unsupported SharedEP phases return the platform dispatcher's
+            # native object and continue through this constructed runner core.
+            from sglang.srt.layers.moe.moe_runner.shared_ep import (
+                SharedEpQuantInfo,
+            )
+
+            if not isinstance(quant_info, SharedEpQuantInfo):
+                raise TypeError(
+                    "SharedEP prefill requires SharedEpQuantInfo with "
+                    "backend-specific fallback metadata"
+                )
+            quant_info = quant_info.fallback_for(self.runner_backend)
 
         assert self.runner_core is not None
 
         def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+            if not self.lora_enabled or lora_info is None:
+                return None
+
             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
@@ -160,13 +197,11 @@ class MoeRunner:
             else:
                 hidden_states = _runner_input.hidden_states
                 topk_ids = getattr(_runner_input, "topk_ids", None)
-            if self.lora_enabled and lora_info is not None:
-                return build_lora_hooks(
-                    hidden_states,
-                    lora_info,
-                    topk_ids,
-                )
-            return None
+            return build_lora_hooks(
+                hidden_states,
+                lora_info,
+                topk_ids,
+            )
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.

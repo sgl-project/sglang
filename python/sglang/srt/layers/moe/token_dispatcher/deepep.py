@@ -287,7 +287,7 @@ class DeepEPBuffer:
     @classmethod
     def clean_buffer(cls):
         state = cls._state()
-        if not state.buffer.low_latency_mode:
+        if state.buffer is None or not state.buffer.low_latency_mode:
             return
         state.buffer.clean_low_latency_buffer(
             state.num_max_dispatch_tokens_per_rank,

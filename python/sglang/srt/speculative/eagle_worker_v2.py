@@ -615,6 +615,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             spec_info.hidden_states = hidden_states
+            # Keep any graph-static EP state selected by this draft generation
+            # disjoint from the other in-flight generations. SharedEP admission
+            # currently routes NEXTN draft MoE through MoRI, but propagating the
+            # selector here makes the lane contract explicit and graph-visible.
+            forward_batch.shared_ep_generation = i
 
             # Run forward under a per-step ForwardContext so the model layer
             # reads attn_backends[i] for the i-th draft step, plus a canary

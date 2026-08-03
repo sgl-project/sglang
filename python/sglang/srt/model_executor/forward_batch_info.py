@@ -478,6 +478,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
+    # Graph-static SharedEP generation lane. Speculative draft loops assign a
+    # distinct value before each model forward; target/ordinary decode is zero.
+    shared_ep_generation: int = 0
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None

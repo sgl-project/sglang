@@ -1399,6 +1399,66 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             self._ensure_cutlass_buffers_initialized(layer)
 
+    @staticmethod
+    def _prepare_shared_ep_aiter_fallback_weights(layer: Module) -> None:
+        """Keep decode canonical and isolate AITER's private shuffled layout."""
+
+        w13_weight = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+        w2_weight = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+        w13_weight.is_shuffled = True
+        w2_weight.is_shuffled = True
+        layer._shared_ep_aiter_w13_weight = w13_weight
+        layer._shared_ep_aiter_w2_weight = w2_weight
+        layer.w13_weight.is_shuffled = False
+        layer.w2_weight.is_shuffled = False
+
+    @staticmethod
+    def _prepare_shared_ep_aiter_mxfp4_fallback(
+        layer: Module,
+        *,
+        gate_up_interleaved: bool,
+    ) -> None:
+        """Keep canonical MXFP4 tensors plus an explicit MoRI prefill copy."""
+
+        for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+            scale = getattr(layer, scale_name)
+            num_experts, num_rows, _ = scale.shape
+            is_w13_scale = scale_name == "w13_weight_scale_inv"
+            shuffled = shuffle_scale(
+                scale.reshape(-1, scale.shape[-1]),
+                num_experts,
+                gate_up_interleaved,
+                is_w13_scale,
+            ).view(num_experts, num_rows, -1)
+            shuffled.is_shuffled = True
+            fallback_name = (
+                "_shared_ep_aiter_w13_scale"
+                if is_w13_scale
+                else "_shared_ep_aiter_w2_scale"
+            )
+            setattr(layer, fallback_name, shuffled)
+            scale.is_shuffled = False
+
+        layer._shared_ep_aiter_w13_weight = shuffle_weight(
+            layer.w13_weight,
+            is_guinterleave=gate_up_interleaved,
+            gate_up=True,
+        )
+        layer._shared_ep_aiter_w2_weight = shuffle_weight(
+            layer.w2_weight,
+            is_guinterleave=gate_up_interleaved,
+            gate_up=False,
+        )
+        layer._shared_ep_aiter_w13_weight.is_shuffled = True
+        layer._shared_ep_aiter_w2_weight.is_shuffled = True
+        layer.w13_weight.is_shuffled = False
+        layer.w2_weight.is_shuffled = False
+        logger.warning_once(
+            "SharedEP DSV4-Pro MXFP4 keeps canonical decode tensors and "
+            "currently allocates an explicit shuffled duplicate for "
+            "MoRI+AITER prefill."
+        )
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
@@ -1484,30 +1544,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     new_s2, requires_grad=False
                 )
 
-            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-                scale = getattr(layer, scale_name)
-                num_experts, num_rows, _ = scale.shape
-                is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
-
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            is_shuffled = _is_shuffle_moe_mxfp4
-            if is_shuffled:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight,
-                    is_guinterleave=gu_intv,
-                    gate_up=True,
+            if get_moe_a2a_backend().is_shared_ep():
+                if not _is_shuffle_moe_mxfp4:
+                    raise RuntimeError(
+                        "SharedEP MXFP4 requires gfx950 AITER weight shuffling "
+                        "for its temporary prefill fallback"
+                    )
+                self._prepare_shared_ep_aiter_mxfp4_fallback(
+                    layer,
+                    gate_up_interleaved=gu_intv,
                 )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight,
-                    is_guinterleave=gu_intv,
-                    gate_up=False,
-                )
-            layer.w13_weight.is_shuffled = is_shuffled
-            layer.w2_weight.is_shuffled = is_shuffled
+            else:
+                for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                    scale = getattr(layer, scale_name)
+                    num_experts, _, _ = scale.shape
+                    is_w13_scale = scale_name == "w13_weight_scale_inv"
+                    scale_2d = scale.reshape(-1, scale.shape[-1])
+                    scale.data = shuffle_scale(
+                        scale_2d,
+                        num_experts,
+                        gu_intv,
+                        is_w13_scale,
+                    )
+
+                is_shuffled = _is_shuffle_moe_mxfp4
+                if is_shuffled:
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight,
+                        is_guinterleave=gu_intv,
+                        gate_up=True,
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight,
+                        is_guinterleave=gu_intv,
+                        gate_up=False,
+                    )
+                layer.w13_weight.is_shuffled = is_shuffled
+                layer.w2_weight.is_shuffled = is_shuffled
             return
 
         if self.convert_mxfp8_to_block:
@@ -1543,12 +1619,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and self.runner.runner_backend.is_aiter()
             )
             if _use_aiter and runner_is_aiter:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                )
+                if get_moe_a2a_backend().is_shared_ep():
+                    self._prepare_shared_ep_aiter_fallback_weights(layer)
+                else:
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1581,20 +1660,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             layer.w2_input_scale = None
             if _use_aiter:
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                )
+                if get_moe_a2a_backend().is_shared_ep():
+                    self._prepare_shared_ep_aiter_fallback_weights(layer)
+                else:
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
         elif _use_aiter:
-            # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
+            if get_moe_a2a_backend().is_shared_ep():
+                self._prepare_shared_ep_aiter_fallback_weights(layer)
+            else:
+                # Pre-shuffle weights
+                t = shuffle_weight(layer.w13_weight, (16, 16))
+                layer.w13_weight.copy_(t)
+                del t
+                t = shuffle_weight(layer.w2_weight, (16, 16))
+                layer.w2_weight.copy_(t)
+                del t
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -2120,7 +2205,57 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            dispatcher_quant_config = {"weight_dtype": layer.w13_weight.dtype}
+            if get_moe_a2a_backend().is_shared_ep():
+                from sglang.srt.layers.moe.moe_runner.shared_ep import (
+                    SharedEpScaleLayout,
+                    SharedEpWeightLayout,
+                )
+
+                is_canonical = not (
+                    getattr(layer.w13_weight, "is_shuffled", False)
+                    or getattr(layer.w2_weight, "is_shuffled", False)
+                )
+                w13_scale = getattr(layer, "w13_weight_scale_inv", None)
+                w2_scale = getattr(layer, "w2_weight_scale_inv", None)
+                scales_are_canonical = not (
+                    getattr(w13_scale, "is_shuffled", False)
+                    or getattr(w2_scale, "is_shuffled", False)
+                )
+                if self.is_fp4_expert:
+                    shared_ep_quantization = "mxfp4"
+                    block_shape = (1, 32)
+                elif self.block_quant and not self.use_mxfp8:
+                    shared_ep_quantization = "block_fp8"
+                    block_shape = tuple(self.weight_block_size or ())
+                else:
+                    shared_ep_quantization = "unsupported"
+                    block_shape = tuple(self.weight_block_size or ())
+                dispatcher_quant_config.update(
+                    shared_ep_quantization=shared_ep_quantization,
+                    shared_ep_weight_layout=(
+                        SharedEpWeightLayout.CANONICAL.value
+                        if is_canonical
+                        else SharedEpWeightLayout.AITER_SHUFFLED.value
+                    ),
+                    shared_ep_scale_layout=(
+                        SharedEpScaleLayout.CANONICAL.value
+                        if scales_are_canonical
+                        else SharedEpScaleLayout.AITER_SHUFFLED.value
+                    ),
+                    block_shape=block_shape,
+                    weight_group_size=32 if self.is_fp4_expert else None,
+                    scale_format="e8m0" if self.is_fp4_expert else None,
+                    weight_scale_dtype=getattr(w13_scale, "dtype", None),
+                    w13_shape=tuple(layer.w13_weight.shape),
+                    w2_shape=tuple(layer.w2_weight.shape),
+                    w13_scale_shape=tuple(getattr(w13_scale, "shape", ())),
+                    w2_scale_shape=tuple(getattr(w2_scale, "shape", ())),
+                    fallback_uses_duplicate_tensors=hasattr(
+                        layer, "_shared_ep_aiter_w13_weight"
+                    ),
+                )
+            layer.dispatcher.set_quant_config(dispatcher_quant_config)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
@@ -2319,6 +2454,63 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
         )
 
+    def _wrap_shared_ep_quant_info(
+        self,
+        layer: torch.nn.Module,
+        fallback_quant_info,
+    ):
+        if not get_moe_a2a_backend().is_shared_ep():
+            return fallback_quant_info
+
+        from sglang.srt.layers.moe.moe_runner.shared_ep import (
+            SharedEpQuantCapability,
+            SharedEpQuantInfo,
+            SharedEpQuantization,
+            SharedEpScaleLayout,
+            SharedEpWeightLayout,
+        )
+
+        is_mxfp4 = self.is_fp4_expert
+        has_fallback_duplicate = hasattr(layer, "_shared_ep_aiter_w13_weight")
+        return SharedEpQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            block_shape=(1, 32) if is_mxfp4 else tuple(self.weight_block_size or ()),
+            fallback_quant_info=fallback_quant_info,
+            fallback_backend=self.runner.runner_backend,
+            quantization=(
+                SharedEpQuantization.MXFP4
+                if is_mxfp4
+                else SharedEpQuantization.BLOCK_FP8
+            ),
+            weight_layout=SharedEpWeightLayout.CANONICAL,
+            scale_layout=SharedEpScaleLayout.CANONICAL,
+            weight_group_size=32 if is_mxfp4 else None,
+            scale_format="e8m0" if is_mxfp4 else None,
+            capabilities=frozenset(
+                {
+                    (
+                        SharedEpQuantCapability.CANONICAL_MXFP4
+                        if is_mxfp4
+                        else SharedEpQuantCapability.CANONICAL_BLOCK_FP8
+                    )
+                }
+            ),
+            fallback_weight_layout=(
+                SharedEpWeightLayout.AITER_SHUFFLED
+                if has_fallback_duplicate
+                else SharedEpWeightLayout.CANONICAL
+            ),
+            fallback_scale_layout=(
+                SharedEpScaleLayout.AITER_SHUFFLED
+                if is_mxfp4 and has_fallback_duplicate
+                else SharedEpScaleLayout.CANONICAL
+            ),
+            fallback_uses_duplicate_tensors=has_fallback_duplicate,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2369,6 +2561,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_config.no_combine,
             )
             if quant_info is not None:
+                quant_info = self._wrap_shared_ep_quant_info(layer, quant_info)
                 return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_xpu_backend():
@@ -2485,6 +2678,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
             )
+            quant_info = self._wrap_shared_ep_quant_info(layer, quant_info)
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()
             or self.runner.runner_backend.is_flashinfer_trtllm_routed()
@@ -2618,8 +2812,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             AiterQuantType,
         )
 
-        w13_weight = layer.w13_weight
-        w2_weight = layer.w2_weight
+        if get_moe_a2a_backend().is_shared_ep():
+            w13_weight = getattr(layer, "_shared_ep_aiter_w13_weight", None)
+            w2_weight = getattr(layer, "_shared_ep_aiter_w2_weight", None)
+            if w13_weight is None or w2_weight is None:
+                raise RuntimeError(
+                    "SharedEP ROCm prefill requires isolated AITER-shuffled "
+                    "weights; canonical decode weights must not be reused"
+                )
+            if self.is_fp4_expert:
+                w13_scale = getattr(layer, "_shared_ep_aiter_w13_scale", None)
+                w2_scale = getattr(layer, "_shared_ep_aiter_w2_scale", None)
+                if w13_scale is None or w2_scale is None:
+                    raise RuntimeError(
+                        "SharedEP ROCm MXFP4 prefill requires isolated "
+                        "AITER-shuffled E8M0 scales"
+                    )
+            else:
+                w13_scale = layer.w13_weight_scale_inv
+                w2_scale = layer.w2_weight_scale_inv
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            w13_scale = (
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale1
+            )
+            w2_scale = (
+                layer.w2_weight_scale_inv
+                if self.block_quant
+                else layer.w2_weight_scale1
+            )
 
         if self.block_quant:
             quant_type = (
@@ -2629,18 +2853,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             if self.is_fp4_expert:
+                is_shuffled = getattr(w13_weight, "is_shuffled", False)
                 fp4_weight_dtype = _require_fp4_dtype()
                 w13_weight = w13_weight.view(fp4_weight_dtype)
                 w2_weight = w2_weight.view(fp4_weight_dtype)
-                if getattr(layer.w13_weight, "is_shuffled", False):
+                if is_shuffled:
                     w13_weight.is_shuffled = True
                     w2_weight.is_shuffled = True
-            w13_scale = layer.w13_weight_scale_inv
-            w2_scale = layer.w2_weight_scale_inv
         else:
             quant_type = AiterQuantType.PER_TOKEN
-            w13_scale = layer.w13_weight_scale1
-            w2_scale = layer.w2_weight_scale1
         return AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
