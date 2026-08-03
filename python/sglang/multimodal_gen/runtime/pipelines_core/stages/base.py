@@ -8,6 +8,7 @@ This module defines the abstract base classes for pipeline stages that can be
 composed to create complete diffusion pipelines.
 """
 
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -34,6 +35,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.realtime_trace import (
+    log_realtime_trace_for_batch,
+)
 
 logger = init_logger(__name__)
 
@@ -365,6 +369,7 @@ class PipelineStage(StageDedupMixin, ABC):
         previous_batch_is_warmup = self._current_batch_is_warmup
         self._current_batch_is_warmup = batch.is_warmup
         try:
+            forward_started_at = time.perf_counter()
             with StageProfiler(
                 stage_name,
                 logger=logger,
@@ -374,6 +379,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 perf_dump_path_provided=batch.perf_dump_path is not None,
             ):
                 result = self.forward(batch, server_args)
+            forward_duration_ms = (time.perf_counter() - forward_started_at) * 1000
         finally:
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
@@ -385,6 +391,21 @@ class PipelineStage(StageDedupMixin, ABC):
         except Exception as e:
             logger.error("Output verification failed for %s: %s", stage_name, str(e))
             raise
+
+        if not batch.is_warmup and getattr(batch, "realtime_trace_id", None):
+            metrics = getattr(batch, "metrics", None)
+            if metrics is not None:
+                metrics.record_stage(stage_name, forward_duration_ms / 1000)
+            log_realtime_trace_for_batch(
+                logger,
+                batch,
+                "server.pipeline_stage_complete",
+                stage=stage_name,
+                request_id=getattr(batch, "request_id", None),
+                chunk_index=getattr(batch, "block_idx", None),
+                event_id=getattr(batch, "realtime_event_id", None),
+                duration_ms=round(forward_duration_ms, 3),
+            )
 
         return result
 

@@ -51,11 +51,18 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.realtime_trace import (
+    realtime_trace_span,
+    tensor_trace_metadata,
+)
 
 MINWM_ACTION_HISTORY_CACHE = "minwm_action_history"
 MINWM_INITIAL_NOISE_CACHE = "minwm_initial_noise"
 MINWM_INITIAL_NOISE_CURSOR_CACHE = "minwm_initial_noise_cursor"
 MINWM_T2V_FIRST_LATENT_CACHE = "minwm_t2v_first_latent"
+
+logger = init_logger(__name__)
 
 
 def _parity_dump(name: str, value) -> None:
@@ -699,6 +706,26 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if getattr(batch, "realtime_trace_id", None):
+            with realtime_trace_span(
+                logger,
+                batch,
+                "server.model_denoise_complete",
+                component="minwm_denoising",
+                input_tensor=batch.latents,
+                chunk_index=batch.block_idx,
+                event_id=getattr(batch, "realtime_event_id", None),
+                stage=self.__class__.__name__,
+                num_inference_steps=getattr(batch, "num_inference_steps", None),
+            ) as trace_span:
+                result = self._forward_impl(batch, server_args)
+                trace_span.add_fields(
+                    **tensor_trace_metadata(result.latents, prefix="latents"),
+                )
+                return result
+        return self._forward_impl(batch, server_args)
+
+    def _forward_impl(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.block_idx == 0:
             self._parity_forward_index = 0
         ctx = self._prepare_causal_dmd_forward_context(batch, server_args)

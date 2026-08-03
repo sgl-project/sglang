@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.utils.realtime_trace import (
+    compact_client_trace,
+    normalize_trace_id,
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSession,
@@ -31,6 +36,10 @@ class GenerateSession:
 
     def __init__(self):
         self.id = uuid4().hex
+        self.trace_id = self.id
+        self.trace_started_at = time.perf_counter()
+        self.trace_started_epoch_ms = int(time.time() * 1000)
+        self.client_trace: dict[str, Any] | None = None
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0
@@ -45,13 +54,19 @@ class GenerateSession:
         self.adapter = adapter
         self.adapter_state = adapter.create_state()
 
+    def bind_trace(self, request: RealtimeVideoGenerationsRequest):
+        self.trace_id = normalize_trace_id(request.trace_id, fallback=self.trace_id)
+        self.client_trace = compact_client_trace(request.client_trace)
+
     def set_request(self, request: RealtimeVideoGenerationsRequest):
+        self.bind_trace(request)
         self.request = request
 
     def dispose(self):
         if self.adapter is not None:
             self.adapter.dispose(self)
         self.request = None
+        self.client_trace = None
         self.input_temp_dir = None
         self.generate_chunk_cnt = 0
         self.current_chunk = None

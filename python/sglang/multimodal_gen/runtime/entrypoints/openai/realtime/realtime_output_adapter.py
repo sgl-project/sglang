@@ -46,6 +46,7 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     raw_size: int
     encoding: str
     delta_reference: str
+    trace_id: str
     payload_lengths: list[int]
     event_id: int
     frame_batch_index: int
@@ -469,6 +470,8 @@ class RawRGBRealtimeOutputAdapter:
             chunk_index_start=batch.block_idx,
             request_id=batch.request_id,
             event_id=getattr(batch, "realtime_event_id", None),
+            trace_id=getattr(batch, "realtime_trace_id", None)
+            or getattr(session, "trace_id", None),
             frame_metadata=frame_metadata,
             output_format=output_format,
             transport_quality=getattr(batch, "output_compression", None),
@@ -486,6 +489,7 @@ class RawRGBRealtimeOutputAdapter:
         chunk_index_start: int,
         request_id: str,
         event_id: int | None = None,
+        trace_id: str | None = None,
         frame_metadata: dict[str, int | str] | None = None,
         output_format: str | None = None,
         transport_quality: int | None = None,
@@ -562,6 +566,8 @@ class RawRGBRealtimeOutputAdapter:
                 }
                 if event_id is not None:
                     header["event_id"] = event_id
+                if trace_id:
+                    header["trace_id"] = trace_id
                 header.update(transport_metadata)
                 header.update(transport_payload.metadata)
 

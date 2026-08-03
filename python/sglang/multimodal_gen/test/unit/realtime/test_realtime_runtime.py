@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     RAW_RGB_CONTENT_TYPE,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 
 class _Req(SimpleNamespace):
@@ -583,6 +584,40 @@ def test_send_output_emits_chunk_stats_message():
     assert message["ws_payload_bytes"] == 450
     assert message["content_type"] == "image/webp"
     assert bytes([0xCB]) not in sent_messages[-1]
+
+
+def test_scheduler_stage_metrics_emit_dedicated_realtime_trace_events(monkeypatch):
+    emitted = []
+
+    def fake_log_realtime_trace(_logger, _session, event, **fields):
+        emitted.append((event, fields))
+
+    monkeypatch.setattr(realtime_video_api, "log_realtime_trace", fake_log_realtime_trace)
+
+    session = GenerateSession()
+    session.trace_id = "trace-stage"
+    chunk = SimpleNamespace(request_id="chunk-req")
+    batch = SimpleNamespace(block_idx=4, realtime_event_id=9)
+    metrics = RequestMetrics("metrics-req")
+    metrics.record_stage("RealtimeImageVAEEncodingStage", 0.012)
+    metrics.record_stage("MinWMCausalDMDDenoisingStage", 0.620)
+    metrics.record_stage("MinWMCausalVaeDecodingStage", 0.180)
+    result = OutputBatch(metrics=metrics)
+
+    realtime_video_api._emit_realtime_result_stage_traces(session, chunk, batch, result)
+
+    event_names = [event for event, _fields in emitted]
+    assert event_names.count("server.pipeline_stage_complete") == 3
+    assert "server.vae_encode_complete" in event_names
+    assert "server.model_denoise_complete" in event_names
+    assert "server.vae_decode_complete" in event_names
+    denoise = next(
+        fields for event, fields in emitted if event == "server.model_denoise_complete"
+    )
+    assert denoise["chunk_index"] == 4
+    assert denoise["event_id"] == 9
+    assert denoise["duration_ms"] == 620
+    assert denoise["source"] == "scheduler_result_metrics"
 
 
 def test_listen_generate_request_propagates_disconnect_without_error_write():

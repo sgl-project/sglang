@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sglang-diffusion Realtime Studio</title>
-    <link rel="stylesheet" href="./styles.css?v=realtime-t2v-v50" />
+    <link rel="stylesheet" href="./styles.css?v=realtime-t2v-dump-trace-v1" />
   </head>
   <body>
     <main class="shell">
@@ -99,6 +99,32 @@
       </section>
 
       <section class="workspace" aria-label="Realtime workspace">
+        <div class="workspace-switcher" role="tablist" aria-label="Workspace view">
+          <button
+            id="previewPaneButton"
+            class="workspace-switch is-active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="previewPane"
+            data-workspace-view="preview"
+          >
+            Preview
+          </button>
+          <button
+            id="tracePaneButton"
+            class="workspace-switch"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tracePane"
+            data-workspace-view="trace"
+          >
+            Trace
+          </button>
+        </div>
+
+        <div id="previewPane" class="workspace-pane is-active" role="tabpanel" aria-labelledby="previewPaneButton">
         <section class="stage" aria-label="Realtime preview">
           <div class="topbar">
             <span id="statusDot" class="dot"></span>
@@ -108,6 +134,9 @@
               <span class="record-button-icon" aria-hidden="true"></span>
               <span id="recordLabel">Record</span>
               <span id="recordDuration" class="record-button-duration">00:00</span>
+            </button>
+            <button id="recordFolderBtn" class="record-folder-button" type="button" title="Choose recording folder">
+              <span id="recordFolderLabel">Folder</span>
             </button>
             <span class="topbar-spacer"></span>
             <label class="preview-scale-control">Preview
@@ -178,10 +207,37 @@
           <div class="section-title">History</div>
           <div id="historyList" class="history-list"></div>
         </section>
+        </div>
+
+        <section id="tracePane" class="workspace-pane panel trace-panel" role="tabpanel" aria-labelledby="tracePaneButton" hidden>
+          <div class="trace-header">
+            <div>
+              <div class="section-title">Realtime Trace</div>
+              <h2>Current Request Topology</h2>
+            </div>
+            <div class="trace-summary">
+              <span>Trace<b id="traceIdText">-</b></span>
+              <span>Chunk<b id="traceChunkText">-</b></span>
+              <span>Events<b id="traceEventCountText">0</b></span>
+            </div>
+          </div>
+          <div id="traceTopology" class="trace-topology" aria-live="polite"></div>
+          <div class="trace-insights">
+            <span><b id="traceChunkTotalText">-</b> chunk total</span>
+            <span><b id="traceSchedulerText">-</b> scheduler</span>
+            <span><b id="traceVaeEncodeText">-</b> VAE encode</span>
+            <span><b id="traceDenoiseText">-</b> denoise</span>
+            <span><b id="traceVaeDecodeText">-</b> VAE decode</span>
+            <span><b id="traceAsyncEstimateText">-</b> async VAE estimate</span>
+          </div>
+          <div class="section-title">Recent Trace Events</div>
+          <div id="traceEventList" class="trace-event-list"></div>
+        </section>
       </section>
     </main>
   <script src="./runtime-config.js"></script>
   <script src="./playback_controller.js?v=realtime-playback-v21"></script>
-  <script src="./app.js?v=realtime-t2v-v95"></script>
+  <script src="./trace_topology.js?v=realtime-trace-topology-v4"></script>
+  <script src="./app.js?v=realtime-t2v-dump-trace-v1"></script>
 </body>
 </html>

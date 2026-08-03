@@ -206,6 +206,8 @@ class Req:
 
     # realtime
     realtime_session_id: str | None = None
+    realtime_trace_id: str | None = None
+    realtime_trace_started_at: float | None = None
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None

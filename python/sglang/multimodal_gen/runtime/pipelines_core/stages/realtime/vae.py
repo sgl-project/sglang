@@ -19,7 +19,15 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.realtime_trace import (
+    log_realtime_trace_for_batch,
+    realtime_trace_span,
+    tensor_trace_metadata,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
 
 
 class RealtimeVAEState(BaseRealtimeState):
@@ -59,14 +67,48 @@ class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
                 state.image_latent = None
             elif state.image_latent is not None:
                 batch.image_latent = state.image_latent
+                log_realtime_trace_for_batch(
+                    logger,
+                    batch,
+                    "server.vae_encode_complete",
+                    component="vae_encoder_cache",
+                    chunk_index=batch.block_idx,
+                    first_chunk=False,
+                    cache_hit=True,
+                    duration_ms=0.0,
+                    **tensor_trace_metadata(batch.image_latent, prefix="image_latent"),
+                )
                 return batch
 
         if batch.condition_image is None:
             if state is not None and state.image_latent is not None:
                 batch.image_latent = state.image_latent
+                log_realtime_trace_for_batch(
+                    logger,
+                    batch,
+                    "server.vae_encode_complete",
+                    component="vae_encoder_cache",
+                    chunk_index=batch.block_idx,
+                    first_chunk=batch.block_idx == 0,
+                    cache_hit=True,
+                    duration_ms=0.0,
+                    **tensor_trace_metadata(batch.image_latent, prefix="image_latent"),
+                )
             return batch
 
-        batch = super().forward(batch, server_args)
+        with realtime_trace_span(
+            logger,
+            batch,
+            "server.vae_encode_complete",
+            component="vae_encoder",
+            input_tensor=batch.condition_image,
+            chunk_index=batch.block_idx,
+            first_chunk=batch.block_idx == 0,
+        ) as trace_span:
+            batch = super().forward(batch, server_args)
+            trace_span.add_fields(
+                **tensor_trace_metadata(batch.image_latent, prefix="image_latent"),
+            )
 
         if state is not None and batch.image_latent is not None:
             state.image_latent = batch.image_latent
@@ -178,7 +220,16 @@ class CausalVaeDecodingStage(DecodingStage):
         if batch.session is None:
             return super().forward(batch, server_args)
 
-        self.load_model()
+        with realtime_trace_span(
+            logger,
+            batch,
+            "server.vae_decoder_load_complete",
+            component="vae_decoder_load",
+            measure_cuda=False,
+            chunk_index=batch.block_idx,
+            first_chunk=batch.block_idx == 0,
+        ):
+            self.load_model()
 
         reset_causal_state = self._get_causal_decode_reset_fn()
         decode_state = batch.session.get_or_create_state(RealtimeVAEDecodeState)
@@ -186,12 +237,43 @@ class CausalVaeDecodingStage(DecodingStage):
         if batch.block_idx == 0 and callable(reset_causal_state):
             reset_causal_state()
 
-        frames = self.decode_causal(
-            batch.latents,
-            server_args,
+        vae_config = getattr(server_args.pipeline_config, "vae_config", None)
+        with realtime_trace_span(
+            logger,
+            batch,
+            "server.vae_decode_complete",
+            component="vae_decoder",
+            input_tensor=batch.latents,
+            chunk_index=batch.block_idx,
             first_chunk=batch.block_idx == 0,
-        )
-        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            decoder_backend="causal_vae",
+            vae_precision=server_args.pipeline_config.vae_precision,
+            vae_tiling=server_args.pipeline_config.vae_tiling,
+            use_parallel_decode=bool(
+                getattr(vae_config, "use_parallel_decode", False)
+            ),
+            parallel_decode_mode=getattr(vae_config, "parallel_decode_mode", None),
+        ) as trace_span:
+            frames = self.decode_causal(
+                batch.latents,
+                server_args,
+                first_chunk=batch.block_idx == 0,
+            )
+            trace_span.add_fields(**tensor_trace_metadata(frames, prefix="frames"))
+        with realtime_trace_span(
+            logger,
+            batch,
+            "server.post_decode_complete",
+            component="post_decode",
+            input_tensor=frames,
+            measure_cuda=False,
+            chunk_index=batch.block_idx,
+            first_chunk=batch.block_idx == 0,
+        ) as trace_span:
+            frames = server_args.pipeline_config.post_decoding(frames, server_args)
+            trace_span.add_fields(
+                **tensor_trace_metadata(frames, prefix="post_decoded_frames")
+            )
 
         return OutputBatch(
             output=frames,

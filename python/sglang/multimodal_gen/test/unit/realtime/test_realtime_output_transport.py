@@ -176,6 +176,7 @@ def test_raw_rgb_realtime_output_adapter_can_send_explicit_lossless_raw_payload(
             height=1,
             enable_upscaling=False,
             realtime_event_id=3,
+            realtime_trace_id="trace-raw",
             realtime_output_format="raw",
         )
         result = OutputBatch(
@@ -197,6 +198,7 @@ def test_raw_rgb_realtime_output_adapter_can_send_explicit_lossless_raw_payload(
 
     [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
     assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert first_header["trace_id"] == "trace-raw"
     assert first_header["encoding"] == "raw"
     assert first_header["event_id"] == 3
     assert first_header["format"] == "rgb24"

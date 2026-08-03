@@ -173,3 +173,50 @@ def test_causal_vae_decoding_stage_prefers_native_causal_decode(monkeypatch):
 
     assert tuple(frames.shape) == (1, 1, 1, 1, 1)
     assert vae.calls == ["causal_decode"]
+
+
+def test_causal_vae_decoding_stage_reads_parallel_decode_from_vae_config():
+    class _Session:
+        def __init__(self):
+            self.state = None
+
+        def get_or_create_state(self, state_cls):
+            if self.state is None:
+                self.state = state_cls()
+            return self.state
+
+    class _PipelineConfig:
+        vae_precision = "fp32"
+        vae_tiling = False
+        vae_config = SimpleNamespace(
+            use_parallel_decode=True,
+            parallel_decode_mode="auto",
+        )
+
+        def post_decoding(self, frames, server_args):
+            del server_args
+            return frames
+
+    stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
+    stage.load_model = lambda: None
+    stage._get_causal_decode_reset_fn = lambda: None
+    stage.decode_causal = (
+        lambda latents, server_args, *, first_chunk=False: latents + 1
+    )
+    batch = SimpleNamespace(
+        block_idx=0,
+        latents=torch.zeros(1, 1, 1, 1, 1),
+        session=_Session(),
+        trajectory_timesteps=None,
+        trajectory_latents=None,
+        rollout_trajectory_data=None,
+        metrics=None,
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=_PipelineConfig(),
+        disable_autocast=True,
+    )
+
+    output = stage.forward(batch, server_args)
+
+    assert torch.equal(output.output, torch.ones(1, 1, 1, 1, 1))
