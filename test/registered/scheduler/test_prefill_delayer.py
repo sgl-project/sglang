@@ -418,46 +418,6 @@ _NEGOTIATE_TEST_CASES = [
         # Two slot-condition delays accumulated after the skip-first pass.
         expected_wait_forward_passes=2,
     ),
-    # slot_condition delay must also respect the wall-clock bound
-    # (max_delay_ms), independent of the pass cap.
-    NegotiateTestCase(
-        name="slot_condition_wall_clock_timeout",
-        max_delay_passes=100,
-        token_usage_low_watermark=0.8,
-        max_delay_ms=50,
-        calls=[
-            # skip_first_delayer consumes the first would-be delay.
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=128,
-            ),
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=128,
-            ),
-            NegotiateCall(
-                prefillable=[True, True, True, True],
-                token_usage=[0.9, 0.9, 0.9, 0.9],
-                running_batch=[100, 100, 100, 100],
-                max_prefill_bs=[80, 80, 80, 80],
-                waiting_queue_len=[10, 10, 10, 10],
-                max_running_requests=128,
-                sleep_before_s=0.2,  # > max_delay_ms (50ms)
-            ),
-        ],
-        expected_allow=True,
-        expected_reason="wait_timeout",
-        # One slot-condition delay was recorded before the wall-clock release.
-        expected_wait_forward_passes=1,
-    ),
 ]
 
 
