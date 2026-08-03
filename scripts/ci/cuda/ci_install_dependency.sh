@@ -137,7 +137,6 @@ install_apt_packages() {
     apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
-        util-linux
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
@@ -220,85 +219,6 @@ configure_rust_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-configure_rust_build_store() {
-    # Native extensions are compiled while preparing the editable Python
-    # package. Preserve reusable compiler output outside the checkout because
-    # the checkout is scrubbed between CI jobs.
-    #
-    # Each slot represents an exact set of local Rust/proto contents together
-    # with a compatible compiler, interpreter, and architecture. Checkouts that
-    # differ only in file timestamps can safely select the same slot.
-    local source_identity interpreter_signature compiler_signature slot_id
-    source_identity=$(
-        python3 "${SCRIPT_DIR}/rust_build_inputs.py" --repo-root "${REPO_ROOT}"
-    )
-    interpreter_signature=$(
-        python3 - <<'PY'
-import sys
-import sysconfig
-
-print(
-    "{}-{}".format(
-        sys.implementation.cache_tag,
-        sysconfig.get_config_var("SOABI") or "unknown",
-    )
-)
-PY
-    )
-    compiler_signature=$(
-        # setuptools-rust invokes Cargo from the Python build context, which is
-        # outside rust/rust-toolchain.toml's directory-based override.
-        cd "${REPO_ROOT}/python"
-        rustc -vV
-        cargo -vV
-    )
-    slot_id=$(
-        printf '%s\n' "$(uname -m)" "${interpreter_signature}" "${source_identity}" "${compiler_signature}" \
-            | sha256sum | awk '{print $1}'
-    )
-
-    # Bootstrap exception: sglang is not importable yet, so this descriptor is
-    # registered in sglang.srt.environ but must be read directly by the shell.
-    RUST_BUILD_STORE="${SGLANG_RUST_BUILD_STORE:-${HOME}/.cache/sglang-ci/rust-builds}"
-    RUST_BUILD_SLOT="${RUST_BUILD_STORE}/${slot_id}"
-    export CARGO_TARGET_DIR="${RUST_BUILD_SLOT}/artifacts"
-    mkdir -p "${RUST_BUILD_STORE}"
-
-    # Keep a read lease until dependency installation exits. Retirement takes
-    # a write lease, ensuring artifacts cannot disappear during compilation.
-    exec {RUST_BUILD_LEASE_FD}>"${RUST_BUILD_SLOT}.lease"
-    flock -s "${RUST_BUILD_LEASE_FD}"
-    mkdir -p "${CARGO_TARGET_DIR}"
-    touch "${RUST_BUILD_SLOT}/.last-access"
-
-    # Retire week-old slots opportunistically. Busy slots are skipped instead
-    # of delaying a test job. Host maintenance remains responsible for the
-    # exceptional case where every large slot is recent or busy.
-    local old_slot old_slot_lease retirement_fd retired_slots=0
-    for old_slot in "${RUST_BUILD_STORE}"/*; do
-        [ -d "${old_slot}" ] || continue
-        [ "${old_slot}" != "${RUST_BUILD_SLOT}" ] || continue
-        [ -f "${old_slot}/.last-access" ] || continue
-        find "${old_slot}/.last-access" -maxdepth 0 -mmin +10080 -print -quit | grep -q . || continue
-
-        old_slot_lease="${old_slot}.lease"
-        exec {retirement_fd}>"${old_slot_lease}"
-        if flock -n -x "${retirement_fd}"; then
-            echo "Retiring unused Rust build slot: ${old_slot}"
-            rm -rf "${old_slot}"
-            retired_slots=$((retired_slots + 1))
-        fi
-        exec {retirement_fd}>&-
-    done
-
-    echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
-    echo "Rust build slot inputs: arch=$(uname -m), python=${interpreter_signature}, source=${source_identity:0:12}"
-    echo "Retired ${retired_slots} unused Rust build slot(s)"
-    du -sh "${RUST_BUILD_SLOT}" 2>/dev/null || true
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 setup_pip_toolchain() {
     python3 -m pip install --upgrade pip
 
@@ -307,10 +227,6 @@ setup_pip_toolchain() {
     fi
 
     export UV_LINK_MODE=copy
-    # Preparing the same local distribution is serialized by uv. Allow enough
-    # time for preceding jobs to populate the reusable native-build slot while
-    # retaining the workflow's outer installation deadline.
-    export UV_LOCK_TIMEOUT="${UV_LOCK_TIMEOUT:-900}"
     PIP_CMD="uv pip"
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
@@ -737,7 +653,6 @@ main() {
     if [ -z "${SGLANG_CI_PREBUILT_WHEEL:-}" ]; then
         install_rust_build_dependencies
         configure_rust_toolchain
-        configure_rust_build_store
     else
         echo "Prebuilt SGLang wheel selected; skipping Rust build setup"
     fi

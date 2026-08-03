@@ -293,9 +293,6 @@ class Envs:
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
-    # Optional root for compatibility-keyed Rust build artifacts in CUDA CI.
-    # The dependency bootstrap shell reads this raw before sglang is importable.
-    SGLANG_RUST_BUILD_STORE = EnvStr(None)
     # Optional verified regular wheel used by CI dependency bootstrap. The
     # bootstrap shell reads this raw before sglang is importable.
     SGLANG_CI_PREBUILT_WHEEL = EnvStr(None)
