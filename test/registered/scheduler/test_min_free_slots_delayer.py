@@ -35,10 +35,12 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         # max_running_requests < 8 disables, matching DFlash.
         self.assertIsNone(resolve_min_free_slots(4, 7))
 
-    def test_caps_to_formula(self):
-        # Capped down so it never delays more aggressively than DFlash.
-        self.assertEqual(resolve_min_free_slots(10, 512), 4)
-        self.assertEqual(resolve_min_free_slots(10, 8), 2)  # (8 + 5) // 6 = 2
+    def test_explicit_value_is_not_capped_to_dflash_formula(self):
+        self.assertEqual(resolve_min_free_slots(8, 512), 8)
+        self.assertEqual(resolve_min_free_slots(16, 512), 16)
+
+    def test_explicit_value_is_capped_to_max_running_requests(self):
+        self.assertEqual(resolve_min_free_slots(16, 8), 8)
 
     def test_respects_smaller_user_value(self):
         # Below the formula cap is taken as-is.

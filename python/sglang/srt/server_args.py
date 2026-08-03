@@ -3192,10 +3192,11 @@ class ServerArgs:
             "Hold new prefills until at least N running-request slots have freed "
             "up, so they are admitted in one batch instead of one at a time. "
             "Useful when each admission is disproportionately expensive, e.g. "
-            "speculative decoding with a separate draft prefill pass. Capped to "
-            "the DFlash formula (disabled when max-running-requests < 8; "
-            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "speculative decoding with a separate draft prefill pass. Explicit "
+            "values are capped by max-running-requests. DFlash workloads "
+            "auto-enable this with min(4, max(2, (max-run + 5) // 6)) when "
+            "unset; other workloads stay disabled. Disabled when "
+            "max-running-requests < 8."
         ),
         NS("schedule"),
     ] = None

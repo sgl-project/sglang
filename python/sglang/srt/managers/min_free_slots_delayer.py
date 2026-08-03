@@ -8,10 +8,11 @@ def resolve_min_free_slots(
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
-    A user value (>1) is capped to the DFlash formula so the trigger never
-    delays more aggressively than the legacy heuristic. When unset, DFlash
-    workloads fall back to the formula (preserving the always-on behavior);
-    other workloads stay disabled. Also disabled when max_running_requests < 8.
+    When unset, DFlash workloads fall back to the legacy formula (preserving
+    their always-on behavior); other workloads stay disabled. An explicit
+    value is capped only by max_running_requests so non-DFlash workloads can
+    deliberately accumulate larger admission batches. Also disabled when
+    max_running_requests < 8.
     """
     max_running_requests = max(0, int(max_running_requests))
     formula = min(4, max(2, (max_running_requests + 5) // 6))
@@ -22,7 +23,7 @@ def resolve_min_free_slots(
         return None
     if max_running_requests < 8:
         return None
-    return min(user_value, formula)
+    return min(user_value, max_running_requests)
 
 
 class MinFreeSlotsDelayer:
