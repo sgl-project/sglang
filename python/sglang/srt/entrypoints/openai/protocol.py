@@ -1816,6 +1816,7 @@ class ResponsesResponse(BaseModel):
             "input_tokens": usage.prompt_tokens,
             "input_tokens_details": {
                 "cached_tokens": cached,
+                # required (no default) in the SDK's InputTokensDetails model
                 "cache_write_tokens": 0,
             },
             "output_tokens": usage.completion_tokens or 0,

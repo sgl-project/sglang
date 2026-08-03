@@ -2326,9 +2326,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             tool_call_states[tool_index] = state
                         if not state["added"]:
                             state["added"] = True
-                            # Name must be set before the ``added`` event.
-                            if call.name and not state["name"]:
-                                state["name"] = call.name
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(
                                     type="response.output_item.added",
