@@ -884,6 +884,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        # Q stays sharded across attention TP ranks; K/V are replicated within
+        # each DCP group.
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,

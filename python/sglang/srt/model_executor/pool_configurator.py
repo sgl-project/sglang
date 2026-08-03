@@ -194,6 +194,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_parallel().attn_tp_size
+        dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -287,7 +289,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
-            n = kvc.mha_kv_head_num
+            n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
                 n
                 * (model_config.head_dim + model_config.v_head_dim)
