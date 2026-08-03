@@ -1873,6 +1873,9 @@ class MHATokenToKVPool(KVCache):
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
+        use_cpu_fp8_scale = (
+            _is_cpu and _cpu_has_amx_support and self.dtype == torch.float8_e4m3fn
+        )
         if self.is_quantized_kv_cache:
             if self.post_capture_active:
                 raise NotImplementedError(
@@ -1885,9 +1888,13 @@ class MHATokenToKVPool(KVCache):
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
+                if use_cpu_fp8_scale:
+                    raise NotImplementedError(
+                        "CPU FP8 E4M3 KV cache does not support post-capture KV backing."
+                    )
                 self._alloc_post_capture_buffers()
             else:
-                self._create_buffers_normal()
+                self._create_buffers_normal(use_cpu_fp8_scale)
         self._kv_buffer_descs = self._build_kv_buffer_descs()
         self._init_data_ptrs_and_strides()
 
@@ -1999,7 +2006,11 @@ class MHATokenToKVPool(KVCache):
             (rows, self.head_num, self.v_head_dim),
         )
 
-    def _create_buffers_normal(self):
+    def _create_buffers_normal(self, use_cpu_fp8_scale: bool):
+        if use_cpu_fp8_scale and self.use_hnd:
+            raise NotImplementedError(
+                "CPU FP8 E4M3 KV cache does not support SGLANG_USE_HND_KVCACHE."
+            )
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -2051,6 +2062,23 @@ class MHATokenToKVPool(KVCache):
                         torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
+                    if use_cpu_fp8_scale:
+                        self.k_scale_buffer = [
+                            torch.zeros(
+                                (self.size + self.page_size, 1, 1),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_scale_buffer = [
+                            torch.zeros(
+                                (self.size + self.page_size, 1, 1),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
@@ -2308,7 +2336,7 @@ class MHATokenToKVPool(KVCache):
         cache_k_scale = None
         cache_v_scale = None
         if cache_k.dtype != self.dtype:
-            if hasattr(self, "k_scale_buffer") and hasattr(self, "v_scale_buffer"):
+            if self.k_scale_buffer is not None and self.v_scale_buffer is not None:
                 cache_k_fp8, cache_k_scale = (
                     torch.ops.sgl_kernel.quantize_fp8_e4m3fn_cpu(cache_k)
                 )
@@ -2330,6 +2358,10 @@ class MHATokenToKVPool(KVCache):
             cache_v = cache_v.view(self.store_dtype)
 
         if dcp_kv_mask is not None:
+            if self.k_scale_buffer is not None or self.v_scale_buffer is not None:
+                raise NotImplementedError(
+                    "CPU FP8 E4M3 KV cache does not support DCP KV masks."
+                )
             N, H, D = cache_k.shape
             masked_set_kv_buffer_kernel[(N,)](
                 cache_k,
