@@ -1458,7 +1458,7 @@ def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_minwm_ulysses_qkv_pack_uses_reusable_peer_first_buffers(
+def test_minwm_ulysses_qkv_cpu_fallback_uses_reusable_peer_first_buffers(
     monkeypatch, batch_size
 ):
     import sglang.multimodal_gen.runtime.layers.usp as usp_module
@@ -1467,6 +1467,7 @@ def test_minwm_ulysses_qkv_pack_uses_reusable_peer_first_buffers(
     query = torch.arange(8 * batch_size, dtype=torch.float32).reshape(
         batch_size, 2, 4, 1
     )
+    assert not query.is_cuda
     key = query + 10
     value = query + 20
     send_buffer = torch.empty(3 * query.numel())

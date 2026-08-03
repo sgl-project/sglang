@@ -58,6 +58,51 @@ def _usp_all_to_all_single(
     return output.reshape(x_shape)
 
 
+def _usp_pack_peer_first_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    world_size: int,
+    output_buffer: torch.Tensor | None,
+) -> torch.Tensor:
+    h_local = query.shape[2] // world_size
+    packed_shape = (
+        world_size,
+        query.shape[0],
+        query.shape[1],
+        h_local,
+        3 * query.shape[3],
+    )
+    if (
+        query.is_cuda
+        and torch.version.hip is None
+        and query.is_contiguous()
+        and key.is_contiguous()
+        and value.is_contiguous()
+    ):
+        try:
+            from sglang.jit_kernel.diffusion.triton.ulysses_qkv_pack import (
+                fused_pack_peer_first_qkv,
+            )
+        except ImportError:
+            pass
+        else:
+            return fused_pack_peer_first_qkv(
+                query, key, value, world_size, output_buffer
+            )
+
+    qkv_peer_first = (
+        query.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        key.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+        value.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
+    )
+    if output_buffer is None:
+        return torch.cat(qkv_peer_first, dim=-1)
+    packed = output_buffer.view(packed_shape)
+    torch.cat(qkv_peer_first, dim=-1, out=packed)
+    return packed
+
+
 def _usp_input_all_to_all_qkv(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -82,22 +127,16 @@ def _usp_input_all_to_all_qkv(
         )
     h_local = h_global // world_size
     packed_shape = (world_size, b, s_local, h_local, 3 * d)
-    qkv_peer_first = (
-        query.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
-        key.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
-        value.unflatten(2, (world_size, h_local)).permute(2, 0, 1, 3, 4),
-    )
-    if input_buffer is None:
-        packed = torch.cat(qkv_peer_first, dim=-1)
-    else:
+    if input_buffer is not None:
         if (
             input_buffer.numel() != 3 * query.numel()
             or input_buffer.dtype != query.dtype
             or input_buffer.device != query.device
         ):
             raise ValueError("Ulysses input buffer must match packed Q/K/V")
-        packed = input_buffer.view(packed_shape)
-        torch.cat(qkv_peer_first, dim=-1, out=packed)
+    packed = _usp_pack_peer_first_qkv(query, key, value, world_size, input_buffer).view(
+        packed_shape
+    )
 
     exchanged = _usp_all_to_all_single(packed, output_buffer=output_buffer)
     # Keep each destination's head shard sequence-major in the collective.
