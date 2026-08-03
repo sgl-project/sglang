@@ -105,6 +105,31 @@ fn shm_name(item: usize) -> String {
     format!("sglmm-{}-{n}-{item}", std::process::id())
 }
 
+/// Python parity (`TokenizerManager`'s `mm_hashes` handling): caller hashes
+/// override the computed ones so an external router's keys align with the
+/// prefix cache; a length mismatch or malformed entry warns and falls back —
+/// it never blocks the request.
+fn apply_caller_hashes(hashes: &mut [u64], caller: &[String]) {
+    if caller.is_empty() {
+        return;
+    }
+    if caller.len() != hashes.len() {
+        tracing::warn!(
+            caller = caller.len(),
+            items = hashes.len(),
+            "mm_hashes length != mm item count; ignoring caller hashes"
+        );
+        return;
+    }
+    for (hash, entry) in hashes.iter_mut().zip(caller) {
+        let hex = entry.strip_prefix("0x").unwrap_or(entry);
+        match u64::from_str_radix(hex, 16) {
+            Ok(v) => *hash = v,
+            Err(_) => tracing::warn!(%entry, "malformed mm_hashes entry; keeping computed hash"),
+        }
+    }
+}
+
 /// One parked sidecar entry: the feature/aux buffers the drain-time Python
 /// adapter needs (the expanded `input_ids` travel separately, via
 /// `TmEvent::MmEncoded`). This is the qwen scheduler-drain shape
@@ -184,7 +209,12 @@ impl Context {
 /// Run the pipeline for one request. `Ok` returns the final
 /// placeholder-expanded ids (the mm buffers are parked in the sidecar
 /// strictly before returning); `Err` rejects the request back to the client.
-fn process(ctx: &Context, rid: &crate::ids::Rid, work: crate::message::MmWorkItem) -> Result<Vec<i32>, String> {
+fn process(
+    ctx: &Context,
+    rid: &crate::ids::Rid,
+    mut work: crate::message::MmWorkItem,
+) -> Result<Vec<i32>, String> {
+    let caller_hashes = std::mem::take(&mut work.mm_hashes);
     let input = crate::message::mm_payload::to_mm_input(work)?;
     let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
         let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
@@ -192,7 +222,8 @@ fn process(ctx: &Context, rid: &crate::ids::Rid, work: crate::message::MmWorkIte
         })?;
         tokenizer.encode(text).map_err(|error| error.to_string())
     })?;
-    let drain = sglang_mm::qwen_vl::pack_drain(output)?;
+    let mut drain = sglang_mm::qwen_vl::pack_drain(output)?;
+    apply_caller_hashes(&mut drain.hashes, &caller_hashes);
     let features = if ctx.feature_shm {
         park_features_in_shm(&drain.features, &drain.grids)
     } else {
@@ -305,6 +336,24 @@ impl MmWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Caller hashes override computed ones; length mismatches and malformed
+    /// entries fall back per item — never a rejection (Python parity).
+    #[test]
+    fn caller_hashes_override_with_fallback() {
+        let mut hashes = vec![1, 2, 3];
+        apply_caller_hashes(&mut hashes, &[]);
+        assert_eq!(hashes, [1, 2, 3]);
+
+        apply_caller_hashes(&mut hashes, &["ff".into()]); // length mismatch
+        assert_eq!(hashes, [1, 2, 3]);
+
+        apply_caller_hashes(
+            &mut hashes,
+            &["ff".into(), "not-hex".into(), "0x10".into()],
+        );
+        assert_eq!(hashes, [0xff, 2, 0x10]);
+    }
 
     fn shm_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new("/dev/shm").join(name)

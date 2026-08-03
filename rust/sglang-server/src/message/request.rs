@@ -112,6 +112,12 @@ pub struct GenerateBody {
     // `_normalize_{image,video,audio}_data` batch rules.
     #[serde(default)]
     pub image_data: Option<rmpv::Value>,
+    /// Caller-supplied per-item content hashes (hex strings) that override the
+    /// computed ones, so an external router's keys align with the prefix
+    /// cache. Python parity: honored on single requests only — the Python
+    /// `__getitem__` fan-out does not forward it to batch sub-requests.
+    #[serde(default)]
+    pub mm_hashes: Option<rmpv::Value>,
     #[serde(default)]
     pub video_data: Option<rmpv::Value>,
     #[serde(default)]
@@ -148,6 +154,7 @@ impl GenerateBody {
             image_data,
             video_data,
             audio_data,
+            mm_hashes,
             // Unported `GenerateReqInput` fields land here and are dropped, as they
             // are on the Python path.
             ..
@@ -412,6 +419,21 @@ impl GenerateBody {
             },
         )
         .collect();
+        let mut requests: Vec<GenerateRequest> = requests;
+        // Python parity: `mm_hashes` reaches the processor only for single
+        // requests (the batch `__getitem__` drops it); malformed shapes are
+        // ignored, never a 400.
+        if !is_batch {
+            if let (Some(rmpv::Value::Array(vals)), Some(req)) = (mm_hashes, requests.first_mut())
+            {
+                if let Some(mm) = req.mm.as_deref_mut() {
+                    mm.mm_hashes = vals
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect();
+                }
+            }
+        }
         Ok((requests, is_batch))
     }
 }
@@ -430,7 +452,7 @@ fn pack_mm(
         image_data,
         video_data,
         audio_data,
-        prefetched: Vec::new(),
+        ..Default::default()
     }))
 }
 
@@ -510,6 +532,8 @@ pub struct MmWorkItem {
     pub audio_data: Option<rmpv::Value>,
     /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
+    /// See [`GenerateBody::mm_hashes`].
+    pub mm_hashes: Vec<String>,
 }
 
 /// Rust mirror of Python `has_valid_data` for an opaque mm field: `null` and
@@ -627,6 +651,8 @@ pub struct MmData {
     /// so MM workers never block on I/O. Out-of-band: the opaque values above
     /// stay exactly as the client sent them.
     pub prefetched: Vec<bytes::Bytes>,
+    /// See [`GenerateBody::mm_hashes`]; applied by the MM worker.
+    pub mm_hashes: Vec<String>,
 }
 
 impl GenerateRequest {
@@ -660,6 +686,7 @@ impl GenerateRequest {
             work.video_data = m.video_data.take();
             work.audio_data = m.audio_data.take();
             work.prefetched = std::mem::take(&mut m.prefetched);
+            work.mm_hashes = std::mem::take(&mut m.mm_hashes);
         }
         work
     }
@@ -1011,6 +1038,24 @@ mod tests {
         // Small scalars broadcast fine.
         let small = rmpv::Value::from("u1");
         assert!(split_mm_column(Some(small), 2, true, MmBroadcast::AsIs).is_ok());
+    }
+
+    /// `mm_hashes` rides only on single requests (Python `__getitem__`
+    /// parity: batches drop it) and moves into the work item.
+    #[test]
+    fn mm_hashes_single_only() {
+        let (mut ps, _) =
+            requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#)
+                .unwrap();
+        assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
+        assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
+        assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
+
+        let (ps, _) = requests(
+            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
+        )
+        .unwrap();
+        assert!(ps.iter().all(|p| p.mm.as_ref().unwrap().mm_hashes.is_empty()));
     }
 
     /// `take_mm_work` clones `text` (the scheduler header still needs it) and
