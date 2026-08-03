@@ -125,18 +125,14 @@ fi
 
 install_workspace_pinned_toolchain
 
-# A runner image that already ships a usable rustc takes the "rust already
-# installed" path above, so the image's own toolchain stays selected and crates
-# requiring the pin fail to build.
+# An image that already ships a usable rustc takes the "rust already installed"
+# path above, leaving its own toolchain selected so crates needing the pin fail.
 #
-# Select it with RUSTUP_TOOLCHAIN rather than `rustup default`: the latter
-# rewrites ~/.rustup for every later job on this self-hosted runner, and jobs
-# sharing that directory would race on it. The env var also outranks the
-# rust-toolchain.toml pin, so it applies where the pin does not - cargo runs
-# started outside rust/, which is how setuptools-rust invokes it.
-#
-# This only reaches subsequent steps, since callers run this script as a child
-# process; anything building within the same step exports it itself.
+# RUSTUP_TOOLCHAIN rather than `rustup default`: the latter rewrites the shared
+# ~/.rustup on this self-hosted runner, which concurrent jobs would race on. It
+# also outranks rust-toolchain.toml, so it covers cargo runs started outside
+# rust/, which is how setuptools-rust invokes it. As a child process this only
+# reaches later steps; same-step builders export it themselves.
 export RUSTUP_TOOLCHAIN="${DEFAULT_CHANNEL}"
 if [ -n "${GITHUB_ENV:-}" ]; then
     # Self-heal a missing _runner_file_commands/, as with GITHUB_PATH above.
@@ -144,6 +140,5 @@ if [ -n "${GITHUB_ENV:-}" ]; then
     echo "RUSTUP_TOOLCHAIN=${DEFAULT_CHANNEL}" >> "${GITHUB_ENV}" || true
 fi
 
-# Reports what RUSTUP_TOOLCHAIN just selected, not the image default.
 rustc --version
 cargo --version
