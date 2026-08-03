@@ -423,16 +423,14 @@ impl GenerateBody {
         // Python parity: `mm_hashes` reaches the processor only for single
         // requests (the batch `__getitem__` drops it); malformed shapes are
         // ignored, never a 400.
-        if !is_batch {
-            if let (Some(rmpv::Value::Array(vals)), Some(req)) = (mm_hashes, requests.first_mut())
-            {
-                if let Some(mm) = req.mm.as_deref_mut() {
-                    mm.mm_hashes = vals
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect();
-                }
-            }
+        if !is_batch
+            && let (Some(rmpv::Value::Array(vals)), Some(req)) = (mm_hashes, requests.first_mut())
+            && let Some(mm) = req.mm.as_deref_mut()
+        {
+            mm.mm_hashes = vals
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
         }
         Ok((requests, is_batch))
     }
@@ -502,8 +500,7 @@ fn split_mm_column(
             // A scalar broadcast deep-clones the value once per prompt — the
             // same abort-on-allocation-failure blow-up as sampling_params
             // above. Bound the product before any clone.
-            check_broadcast_budget(scalar.heap_bytes(), n, "value")
-                .map_err(|e| e.to_string())?;
+            check_broadcast_budget(scalar.heap_bytes(), n, "value").map_err(|e| e.to_string())?;
             Ok(match broadcast {
                 MmBroadcast::WrapInList => vec![Some(rmpv::Value::Array(vec![scalar])); n],
                 MmBroadcast::AsIs => vec![Some(scalar); n],
@@ -1045,8 +1042,7 @@ mod tests {
     #[test]
     fn mm_hashes_single_only() {
         let (mut ps, _) =
-            requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#)
-                .unwrap();
+            requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#).unwrap();
         assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
         assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
         assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
@@ -1055,7 +1051,10 @@ mod tests {
             r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
         )
         .unwrap();
-        assert!(ps.iter().all(|p| p.mm.as_ref().unwrap().mm_hashes.is_empty()));
+        assert!(
+            ps.iter()
+                .all(|p| p.mm.as_ref().unwrap().mm_hashes.is_empty())
+        );
     }
 
     /// `take_mm_work` clones `text` (the scheduler header still needs it) and

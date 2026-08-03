@@ -348,10 +348,7 @@ mod tests {
         apply_caller_hashes(&mut hashes, &["ff".into()]); // length mismatch
         assert_eq!(hashes, [1, 2, 3]);
 
-        apply_caller_hashes(
-            &mut hashes,
-            &["ff".into(), "not-hex".into(), "0x10".into()],
-        );
+        apply_caller_hashes(&mut hashes, &["ff".into(), "not-hex".into(), "0x10".into()]);
         assert_eq!(hashes, [0xff, 2, 0x10]);
     }
 

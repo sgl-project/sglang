@@ -6,6 +6,7 @@ extension (unlike the qwen parity suite)."""
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -47,15 +48,15 @@ class TestBuildNativeMm(CustomTestCase):
         features = np.arange(30, dtype=np.float32)
         output = NativeMmHost.build_native_mm(
             self.spec,
-            (
-                None if shm_names else features,
-                shm_names,
-                self.GRIDS,
-                self.HASHES,
-                self.OFFSETS,
-                np.arange(30, dtype=np.int64),
-                -3,
-            )
+            SimpleNamespace(  # the shape of Rust's MmHandoff
+                features=None if shm_names else features,
+                shm_names=shm_names,
+                grids=self.GRIDS,
+                hashes=self.HASHES,
+                offsets=self.OFFSETS,
+                mrope=np.arange(30, dtype=np.int64),
+                mrope_delta=-3,
+            ),
         )
         return output, features
 
@@ -133,15 +134,15 @@ class TestBuildNativeMmShm(TestBuildNativeMm):
         names = self._park(features)
         output = NativeMmHost.build_native_mm(
             self.spec,
-            (
-                None,
-                names,
-                self.GRIDS,
-                self.HASHES,
-                self.OFFSETS,
-                np.arange(30, dtype=np.int64),
-                -3,
-            )
+            SimpleNamespace(  # the shape of Rust's MmHandoff
+                features=None,
+                shm_names=names,
+                grids=self.GRIDS,
+                hashes=self.HASHES,
+                offsets=self.OFFSETS,
+                mrope=np.arange(30, dtype=np.int64),
+                mrope_delta=-3,
+            ),
         )
         return output, features
 

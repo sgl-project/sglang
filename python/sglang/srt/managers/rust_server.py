@@ -14,7 +14,7 @@ import logging
 import os
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import msgspec
 
@@ -228,7 +228,7 @@ class NativeMmHost:
         )
 
     @staticmethod
-    def build_native_mm(spec: NativeMmSpec, entry: tuple):
+    def build_native_mm(spec: NativeMmSpec, entry):
         """Drain-time adapter: wrap the Rust-produced buffers into the
         scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
         here — all processing (load, resize, patchify, token expansion, M-RoPE)
@@ -248,7 +248,11 @@ class NativeMmHost:
             MultimodalProcessorOutput,
         )
 
-        features_arr, shm_names, grids, hashes, offsets, mrope_arr, mrope_delta = entry
+        # `entry` is the Rust `MmHandoff` (named fields; tests pass a
+        # SimpleNamespace of the same shape).
+        features_arr, shm_names = entry.features, entry.shm_names
+        grids, hashes, offsets = entry.grids, entry.hashes, entry.offsets
+        mrope_arr, mrope_delta = entry.mrope, entry.mrope_delta
         if shm_names is None:
             features = torch.from_numpy(features_arr.reshape(-1, spec.feature_dim))
         items = []

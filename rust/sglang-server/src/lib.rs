@@ -32,21 +32,22 @@ use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
-/// One drained MM result (see [`Server::take_mm`]):
-/// `(features_f32 | None, shm_names | None, grids, hashes, offsets,
-/// mrope_i64, mrope_delta)`. Exactly one of the first two is `Some`:
-/// inline features for single-rank serving (zero-copy into numpy), or one
-/// POSIX shm segment name per item when the scheduler broadcasts across TP
-/// ranks (the Python side wraps each name in a `ShmPointerMMData` stub).
-type MmHandoff<'py> = (
-    Option<Bound<'py, numpy::PyArray1<f32>>>,
-    Option<Vec<String>>,
-    Vec<(u32, u32, u32)>,
-    Vec<u64>,
-    Vec<(u32, u32)>,
-    Bound<'py, numpy::PyArray1<i64>>,
-    i64,
-);
+/// One drained MM result (see [`Server::take_mm`]), named fields instead of
+/// a positional tuple so the Rust/Python schema is explicit. Exactly one of
+/// `features`/`shm_names` is `Some`: inline features for single-rank serving
+/// (zero-copy into numpy), or one POSIX shm segment name per item when the
+/// scheduler broadcasts across TP ranks (the Python side wraps each name in
+/// a `ShmPointerMMData` stub).
+#[pyclass(frozen, get_all)]
+struct MmHandoff {
+    features: Option<Py<numpy::PyArray1<f32>>>,
+    shm_names: Option<Vec<String>>,
+    grids: Vec<(u32, u32, u32)>,
+    hashes: Vec<u64>,
+    offsets: Vec<(u32, u32)>,
+    mrope: Py<numpy::PyArray1<i64>>,
+    mrope_delta: i64,
+}
 
 /// Columnar ingress batch handed to Python by [`Server::recv_requests`].
 /// `frozen`: immutable snapshot, so field access never contends on a borrow.
@@ -250,12 +251,12 @@ impl Server {
     /// under the GIL) between decode steps, so any per-byte work here (memcpy,
     /// hashing — tens of MB per image-heavy request) would stall every running
     /// request's inter-token latency.
-    fn take_mm<'py>(&self, py: Python<'py>, rid: &str) -> Option<MmHandoff<'py>> {
+    fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmHandoff> {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_sidecar.take(rid)?;
         let (features, shm_names) = match res.features {
-            mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py)), None),
+            mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
             // Ownership of the segments (and the duty to unlink) moves to
             // Python here: `materialize()` unlinks after the post-broadcast
             // clone on every rank.
@@ -264,17 +265,15 @@ impl Server {
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),
             ),
         };
-        let mrope = res.mrope.into_pyarray(py);
-        let grids = res.grids.iter().map(|g| (g[0], g[1], g[2])).collect();
-        Some((
+        Some(MmHandoff {
             features,
             shm_names,
-            grids,
-            res.hashes,
-            res.offsets,
-            mrope,
-            res.mrope_delta,
-        ))
+            grids: res.grids.iter().map(|g| (g[0], g[1], g[2])).collect(),
+            hashes: res.hashes,
+            offsets: res.offsets,
+            mrope: res.mrope.into_pyarray(py).unbind(),
+            mrope_delta: res.mrope_delta,
+        })
     }
 
     /// Signal all threads to stop (best effort).
@@ -323,5 +322,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
+    m.add_class::<MmHandoff>()?;
     Ok(())
 }

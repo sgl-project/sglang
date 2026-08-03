@@ -1505,7 +1505,10 @@ mod tests {
 
         // The late result must be dropped, not queued, and the sidecar purged.
         ingress.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
-        assert!(consumer.drain(16).headers.is_empty(), "cancelled, not queued");
+        assert!(
+            consumer.drain(16).headers.is_empty(),
+            "cancelled, not queued"
+        );
         assert!(ingress.mm_sidecar.take("mm-gone").is_none(), "entry purged");
     }
 

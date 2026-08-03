@@ -75,7 +75,15 @@ class TestQwenNativeMmHost(CustomTestCase):
             spec,
             # Inline entry shape (single-rank; `shm_names=None`). The shm
             # shape's wrapping contract is pinned by test_build_native_mm.
-            (features, None, grids, hashes, offsets, mrope, delta)
+            SimpleNamespace(
+                features=features,
+                shm_names=None,
+                grids=grids,
+                hashes=hashes,
+                offsets=offsets,
+                mrope=mrope,
+                mrope_delta=delta,
+            ),
         )
         request = SimpleNamespace(video_data=None, audio_data=None, rid="parity")
         python_output = asyncio.run(
