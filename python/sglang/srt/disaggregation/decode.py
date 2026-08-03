@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    resolve_physical_kv_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -470,8 +471,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
-        if self.transfer_backend == TransferBackend.NIXL:
-            kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -1141,6 +1141,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
+                # req_to_token holds VIRTUAL ids under the unified memory pool
+                # (MultiEndedAllocator), which relocates physical pages -> virtual
+                # != physical after churn. Resolve to current PHYSICAL so prefill's
+                # RDMA write lands in the right decode slots (mirrors prefill
+                # send_kv_chunk). getattr-guarded: no-op without translate_kv_loc.
+                kv_indices = resolve_physical_kv_indices(
+                    self.token_to_kv_pool_allocator, kv_indices
+                )
 
             seq_len = origin_input_len
 
@@ -1259,11 +1267,58 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            device_page_indices = None
+            if (
+                self.scheduler.enable_hisparse
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                # alloc_logical_only() allocated the shared pages used by C4
+                # indexer and C128 KV. req_to_token can hold virtual ids under
+                # MultiEndedAllocator, while PD writes physical buffer offsets;
+                # resolve the current physical locations before page conversion.
+                full_kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx,
+                    prefix_len:origin_input_len,
+                ]
+                full_kv_indices = resolve_physical_kv_indices(
+                    self.token_to_kv_pool_allocator, full_kv_indices
+                )
+                device_page_indices = kv_to_page_indices(
+                    full_kv_indices,
+                    page_size,
+                ).astype(np.int32)
+                if self.transfer_backend not in (
+                    TransferBackend.MOONCAKE,
+                    TransferBackend.MORI,
+                ):
+                    raise NotImplementedError(
+                        "DSV4 HiSparse direct PD transfer currently requires "
+                        "the Mooncake or MoRI backend"
+                    )
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if device_page_indices is not None:
+                if self.transfer_backend == TransferBackend.MORI:
+                    # MoRI tracks source-aligned logical/device pages as the
+                    # primary destination index space. C4 host rows can be
+                    # more granular in unified-KV mode (64 compressed rows per
+                    # logical page), so carry them separately without changing
+                    # the sender's expected logical page count.
+                    if self.scheduler.hisparse_coordinator.mem_pool_host.layer_num > 0:
+                        metadata_kwargs["host_kv_indices"] = page_indices
+                    page_indices = device_page_indices
+                else:
+                    if getattr(self.token_to_kv_pool, "unified_hisparse", False):
+                        raise NotImplementedError(
+                            "Unified-KV DSV4 HiSparse PD transfer requires MoRI: "
+                            "Mooncake does not support row-granular host destinations"
+                        )
+                    metadata_kwargs["device_kv_indices"] = device_page_indices
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(

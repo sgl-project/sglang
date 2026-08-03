@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
+    HiSparseUnifiedC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
@@ -286,6 +287,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.compress_ratio = 4
 
         self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
+        # Unified-KV (ROCm) mirrors the full C4 budget on the host cold pool;
+        # only it reports host-backed capacity. CUDA separate-KV is unchanged.
+        self._is_unified_hisparse = isinstance(
+            self.hisparse_kvcache, HiSparseUnifiedC4DevicePool
+        )
         self._size_full = logical_attn_allocator.size_full
         self._size_hisparse = self.hisparse_kvcache.size
 
@@ -310,7 +316,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.hisparse_page_size,
+                    self._kvcache.c4_logical_size
+                    + self.page_size // self.compress_ratio,
                     dtype=torch.int64,
                     device=self.device,
                 ),
@@ -360,10 +367,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
     def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        if not self._is_unified_hisparse:
+            return min(
+                self.logical_attn_allocator.full_available_size(),
+                self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+            )
+        # unified-KV: cold C4 is host-resident, so capacity tracks the logical
+        # full-token pool; device pressure is handled by alloc_extend.
+        return self.logical_attn_allocator.full_available_size()
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
@@ -372,10 +383,13 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_swa(free_indices)
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
+        if not self._is_unified_hisparse:
+            return min(
+                self.logical_attn_allocator.available_size(),
+                self.hisparse_attn_allocator.available_size() * self.compress_ratio,
+            )
+        # unified-KV: see full_available_size.
+        return self.logical_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(

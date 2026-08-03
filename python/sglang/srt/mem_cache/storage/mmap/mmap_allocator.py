@@ -77,6 +77,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
     # works correctly in tests.
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    strict_hugepages = envs.SGLANG_HUGEPAGE_STRICT.get()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
 
     if hugepage_size == "":
@@ -86,6 +87,12 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     elif hugepage_size == "1GB":
         page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
     else:
+        if strict_hugepages:
+            raise ValueError(
+                "SGLANG_HUGEPAGE_STRICT=1 requires "
+                "SGLANG_HUGEPAGE_SIZE=2MB or 1GB, "
+                f"got {envs.SGLANG_HUGEPAGE_SIZE.get()!r}"
+            )
         logger.warning(
             "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
             "Falling back to plain page-size mmap.",
@@ -97,11 +104,13 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
 
     if extra_flags:
         if _libc is None:
-            logger.error(
+            message = (
                 "Hugepage mmap requested but libc.so.6 could not be loaded; "
-                "falling back to plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
-                hugepage_size,
+                f"SGLANG_HUGEPAGE_SIZE={hugepage_size} cannot be honored."
             )
+            if strict_hugepages:
+                raise RuntimeError(message)
+            logger.error("%s Falling back to plain mmap.", message)
         else:
             try:
                 array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
@@ -109,12 +118,13 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
             except OSError as e:
-                logger.error(
-                    "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
-                    "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
-                    e,
-                    hugepage_size,
+                message = (
+                    f"Hugepage mmap via libc failed ({e}); "
+                    f"SGLANG_HUGEPAGE_SIZE={hugepage_size} cannot be honored."
                 )
+                if strict_hugepages:
+                    raise RuntimeError(message) from e
+                logger.error("%s Falling back to plain mmap.", message)
         alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
 
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.

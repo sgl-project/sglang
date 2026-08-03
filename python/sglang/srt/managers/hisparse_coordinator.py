@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import math
 from typing import List, NamedTuple, Union
 
 import torch
@@ -9,6 +10,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -20,6 +22,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -27,6 +30,20 @@ device_module = get_device_module()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _align_host_pages_for_hugepage(
+    num_host_pages: int, item_bytes: int, hugepage_size: str
+) -> int:
+    if (hugepage_size or "").strip().upper() != "2MB":
+        return num_host_pages
+    hugepage_bytes = 2 * 1024 * 1024
+    rows_per_alignment = hugepage_bytes // math.gcd(hugepage_bytes, item_bytes)
+    return (
+        (num_host_pages + rows_per_alignment - 1)
+        // rows_per_alignment
+        * rows_per_alignment
+    )
 
 
 class HiSparseAct(NamedTuple):
@@ -68,21 +85,66 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        # unified-KV HiSparse (ROCm) keeps the compressed C4 hot/cold data in
+        # the bf16 unified layout, so swap-in/backup use the generic linear MLA
+        # path instead of the FP8 page-padded dsv4 path.
+        self.is_unified_hisparse = False
+        if self.is_dsv4_hisparse:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                HiSparseUnifiedC4DevicePool,
+            )
+
+            self.is_unified_hisparse = isinstance(
+                self.token_to_kv_pool_allocator.hisparse_kvcache,
+                HiSparseUnifiedC4DevicePool,
+            )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
+            item_bytes = self.mem_pool_device.bytes_per_page_padded
+            server_args = get_server_args()
+            # Host cold-pool sizing (unified-KV / dsv4 path): the host pool is
+            # bound to size_full/compress_ratio -- a mirror of the GPU full-token
+            # c4 budget, not an independent expansion into host RAM.
+            # host_to_device_ratio (== c4_shrink_factor, >= 1) sets how much of
+            # that budget stays GPU-resident: ratio=1 keeps the full c4 pool
+            # on-GPU (host == device, a 1:1 mirror); ratio>1 shrinks the GPU c4
+            # pool (freeing memory for a larger overall token budget) while the
+            # host mirror still tracks the full budget. This is orthogonal to the
+            # per-request device_buffer_size hot window (the swap trigger), which
+            # is never scaled by ratio.
             num_host_pages = (
                 self.token_to_kv_pool_allocator.size_full // self.compress_ratio
                 + page_size
                 - 1
             ) // page_size
+            if server_args.disaggregation_transfer_backend == "mori":
+                aligned_num_host_pages = _align_host_pages_for_hugepage(
+                    num_host_pages,
+                    item_bytes,
+                    envs.SGLANG_HUGEPAGE_SIZE.get(),
+                )
+                if aligned_num_host_pages != num_host_pages:
+                    logger.info(
+                        "Aligned DSV4 HiSparse host pages %d -> %d for 2MiB "
+                        "MoRI registrations",
+                        num_host_pages,
+                        aligned_num_host_pages,
+                    )
+                    num_host_pages = aligned_num_host_pages
+            host_register_chunk_bytes = (
+                envs.SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES.get()
+                if server_args.disaggregation_transfer_backend == "mori"
+                else None
+            )
             self.mem_pool_host = DeepSeekV4PagedHostPool(
                 pool_name="dsv4_hisparse_c4",
                 device_buffers=self.mem_pool_device.kv_buffer,
-                item_bytes=self.mem_pool_device.bytes_per_page_padded,
+                item_bytes=item_bytes,
                 num_host_pages=num_host_pages,
                 slot_page_size=page_size,
                 layout="layer_first",
+                host_register_chunk_bytes=host_register_chunk_bytes,
             )
             self.item_size_bytes = (
                 self.mem_pool_device.kv_cache_total_dim
@@ -634,11 +696,17 @@ class HiSparseCoordinator:
         """Load top-k selected tokens into device memory and return their device indices.
 
         This is a naive per-request loop implementation for debugging/validation.
-        Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
+        Production code uses swap_in_selected_pages (JIT CUDA/HIP kernel) instead.
+        Used as a kernel oracle in test_hisparse_unit.py.
 
-        Note: dsv4 hisparse is not supported — DeepSeekV4SingleKVPoolHost has no
-        load_to_device_per_layer and indices live in compressed space. Currently
-        only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
+        Both the non-dsv4 and the dsv4 (DeepSeek V4 separate-KV C4) layouts are
+        supported. The per-request loc-selection logic below is layout-agnostic:
+        it indexes req_to_device_buffer / req_to_host_pool and delegates the
+        host->device byte copy to mem_pool_host.load_to_device_per_layer. For the
+        dsv4 path mem_pool_host is a DeepSeekV4PagedHostPool (which implements
+        load_to_device_per_layer for the token-granular, page-padded C4 value/
+        scale layout), and seq_lens / top_k_tokens are expressed in compressed C4
+        space (matching swap_in_selected_pages, called with compressed_seq_lens).
 
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
@@ -649,9 +717,6 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -814,11 +879,13 @@ class HiSparseCoordinator:
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 
-        swap_in_fn = (
-            load_cache_to_device_buffer_dsv4_mla
-            if self.is_dsv4_hisparse
-            else load_cache_to_device_buffer_mla
-        )
+        if self.is_dsv4_hisparse and not self.is_unified_hisparse:
+            # separate-KV: FP8 page-padded device + host C4 layout.
+            swap_in_fn = load_cache_to_device_buffer_dsv4_mla
+        else:
+            # unified-KV HiSparse (bf16 linear rows) and generic DSA MLA both
+            # use the linear swap path (stride == item_size_bytes).
+            swap_in_fn = load_cache_to_device_buffer_mla
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],

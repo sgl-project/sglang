@@ -48,6 +48,22 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
 
+def resolve_physical_kv_indices(
+    token_to_kv_pool_allocator, kv_indices: torch.Tensor
+) -> torch.Tensor:
+    """Resolve allocator-owned logical KV ids at the raw PD I/O boundary.
+
+    Unified memory-pool allocators keep stable virtual ids in req_to_token and
+    may relocate their physical pages during compaction. Connectors consume
+    physical buffer offsets, so the translation must happen immediately before
+    page conversion. Allocators without virtual addressing preserve the input.
+    """
+    translate_kv_loc = getattr(token_to_kv_pool_allocator, "translate_kv_loc", None)
+    if translate_kv_loc is None:
+        return kv_indices
+    return translate_kv_loc(kv_indices.long())
+
+
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,

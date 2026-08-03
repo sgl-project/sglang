@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
+    resolve_physical_kv_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -233,6 +234,7 @@ class PrefillBootstrapQueue:
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        kv_args.kv_data_mem_kinds = ["VRAM"] * len(kv_data_ptrs)
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -1241,6 +1243,15 @@ class SchedulerDisaggregationPrefillMixin:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
+        # Under the unified memory pool (MultiEndedAllocator), req_to_token stores
+        # VIRTUAL token ids and physical pages get relocated by compaction, so
+        # virtual != physical after churn. The KV buffer / PD transfer is indexed by
+        # PHYSICAL slot, so resolve virtual -> current physical here, mirroring the
+        # attention backend (translate_kv_loc). getattr-guarded: no-op for allocators
+        # without translate_kv_loc, leaving every other backend/config unchanged.
+        kv_indices = resolve_physical_kv_indices(
+            self.token_to_kv_pool_allocator, kv_indices
+        )
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
