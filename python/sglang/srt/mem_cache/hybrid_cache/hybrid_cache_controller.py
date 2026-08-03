@@ -560,6 +560,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.layer_num + i,
                         self.io_backend,
                         pool_transfers=resolved_pool_transfers,
+                        is_draft=True,
                     )
                 producer_event.complete(i)
             ack_finish_event.record()

@@ -238,14 +238,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
-        if not self._is_device_layer_owned(device_pool, layer_id):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         host_indices = self.dcp_kernel_indices(host_indices)
         device_indices = self.dcp_kernel_indices(device_indices)
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -328,11 +336,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def _backup_from_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         # Indices arrive already translated by backup_from_device_all_layer.
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -413,6 +429,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device_indices,
                     self.device_pool.layer_num + draft_layer_id,
                     io_backend,
+                    is_draft=True,
                 )
             return
 

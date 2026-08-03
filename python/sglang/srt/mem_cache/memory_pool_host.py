@@ -431,6 +431,8 @@ class MambaPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend="kernel",
+        *,
+        is_draft: bool = False,
     ):
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
@@ -703,7 +705,14 @@ class LogicalHostPool:
         pass
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         pass
 
@@ -987,7 +996,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
             return
@@ -1373,7 +1389,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if host_indices is None or device_indices is None:
             return
@@ -1620,19 +1643,20 @@ class HostPoolGroup:
         layer_id,
         io_backend,
         pool_transfers: Optional[list] = None,
+        *,
+        is_draft: bool = False,
     ) -> None:
-        override_device_pool = device_pool is not self.anchor_entry.device_pool
-
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
         local_layer_id = anchor.layer_mapper(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
             anchor.host_pool.load_to_device_per_layer(
-                device_pool,
+                device_pool if is_draft else anchor.device_pool,
                 host_indices,
                 device_indices,
                 local_layer_id,
                 io_backend,
+                is_draft=is_draft,
             )
 
         # 2. Extra pool transfers
@@ -1644,11 +1668,12 @@ class HostPoolGroup:
             if local_layer_id is None:
                 continue
             entry.host_pool.load_to_device_per_layer(
-                device_pool if override_device_pool else entry.device_pool,
+                device_pool if is_draft else entry.device_pool,
                 transfer.host_indices,
                 transfer.device_indices,
                 local_layer_id,
                 io_backend,
+                is_draft=is_draft,
             )
 
     def _backup_uses_cpu_host_indices(self, host_pool, io_backend) -> bool:
@@ -1883,12 +1908,20 @@ class DSAIndexerPoolHost(HostKVCache):
         return host_page_indices, device_page_indices
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
-        if not self._is_device_layer_owned(device_pool, layer_id):
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -1939,10 +1972,18 @@ class DSAIndexerPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def _backup_from_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
-        host_layer_id = self._host_layer_index(layer_id)
-        device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+        # MTP draft layers do not participate in CP layer sharding.
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -1998,6 +2039,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     device_indices,
                     self.device_pool.layer_num + draft_layer_id,
                     io_backend,
+                    is_draft=True,
                 )
             return
 

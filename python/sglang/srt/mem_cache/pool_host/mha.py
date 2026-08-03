@@ -239,12 +239,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if self.device_pool is not None:
-            if not self._is_device_layer_owned(device_pool, layer_id):
+            if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
-            host_layer_id = self._host_layer_index(layer_id)
-            device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+            # MTP draft layers do not participate in CP layer sharding.
+            host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+            device_layer_id = 0 if is_draft else layer_id
         else:
             host_layer_id = device_layer_id = layer_id
 
@@ -787,7 +790,14 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         return [self.k_buffer]
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -1133,12 +1143,15 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         device_indices,
         layer_id,
         io_backend,
+        *,
+        is_draft: bool = False,
     ):
         if self.device_pool is not None:
-            if not self._is_device_layer_owned(device_pool, layer_id):
+            if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
                 return
-            host_layer_id = self._host_layer_index(layer_id)
-            device_layer_id = 0 if layer_id >= self.device_pool.layer_num else layer_id
+            # MTP draft layers do not participate in CP layer sharding.
+            host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+            device_layer_id = 0 if is_draft else layer_id
         else:
             host_layer_id = device_layer_id = layer_id
 
