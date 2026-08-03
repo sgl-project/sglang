@@ -334,8 +334,8 @@ jobs:
           key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
           restore-keys: hf-cpu-${{ matrix.partition }}-
 
-      # Same snapshot every shard, so the LPT split is consistent. Without it
-      # this suite falls back to in-source est_time and mis-partitions.
+      # Pinned SHA so every shard splits against the same snapshot; without
+      # the file run_suite falls back to the (drifting) in-source est_time.
       - name: Fetch live partition model
         if: needs.check-changes.outputs.partition_model_sha != ''
         run: |
@@ -344,9 +344,9 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
-      # compute_partitions reads this budget back to size the fanout, so it
-      # drives shard count rather than capping it. 10m left only ~96s per
-      # shard once the ~354s setup bias came out, which asked for 33 shards.
+      # compute_partitions reads this back as the per-shard budget, so it
+      # drives the fanout rather than capping it -- shrinking it buys more
+      # shards, not shorter ones.
       - name: Run test
         timeout-minutes: 15
         env:

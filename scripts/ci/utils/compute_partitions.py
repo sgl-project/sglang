@@ -35,17 +35,16 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# base-a is the critical-path entry gate; pin its fanout to sanity-coverage
-# defaults instead of est_time. max_parallel = size (no throttle).
+# Single-shard sanity gate on the critical path; pinned rather than sized
+# from est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
     "base-a-test-1-gpu-small": 1,
 }
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
-# base-a-test-cpu is inlined in pr-test.yml rather than dispatched through the
-# reusable stage, so its budget has to be read off the job's own `Run test`
-# step instead of a `run_timeout_minutes` input.
+# Inlined in pr-test.yml rather than dispatched through the reusable stage,
+# so there is no `run_timeout_minutes` input to read the budget from.
 _INLINE_SUITE_JOB_IDS = {"base-a-test-cpu": "base-a-test-cpu"}
 _RUN_TEST_STEP_NAME = "Run test"
 
@@ -201,9 +200,9 @@ def compute_partitions(
                     f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
                 )
             size = max(1, ideal_size)
-            # The throttle rations scarce self-hosted GPU runners. CPU suites
-            # land on hosted ubuntu-latest, which is elastic -- capping them
-            # would serialize the shards and inflate wall clock for nothing.
+            # The throttle rations scarce self-hosted GPU runners; hosted
+            # ubuntu-latest is elastic, so capping CPU shards would only
+            # serialize them.
             on_hosted_runners = all(t.backend == HWBackend.CPU for t in group)
             max_parallel = (
                 size
