@@ -10,9 +10,9 @@
 export const config = {
   modelName: "Kimi-K3",
 
-  // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8: NOSPEC lays the 16 GPUs
-  // out as PP2 × TP8, or PP2 × DCPEP8 for High-Throughput, while
-  // DSPARK re-lays the same 16 as flat TP16 / DCPEP16), GB200 (4×4 TP16 MNNVL),
+  // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8: NOSPEC is PP2 × TP8 on
+  // Low-Latency, PP2 × DCPEP8 on Balanced and High-Throughput, while DSPARK
+  // re-lays the same 16 as flat TP16 / DCPEP16), GB200 (4×4 TP16 MNNVL),
   // H200 (2×8 TP16/EP16, or 4×8 TP32/EP32 for High-Throughput), H100
   // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
   supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"],
@@ -369,7 +369,7 @@ export const config = {
               },
               {
                 when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
-                reason: "NOSPEC, the B200 Unified recipes already use all 16 GPUs as TP8 × PP2; changing TP to 16 would require 32 ranks. Switch Spec Decode to DSPARK — it drops the pipeline and re-lays the same GPUs as flat TP16.",
+                reason: "With Spec Decode off, the B200 Unified recipes already use all 16 GPUs as TP8 × PP2, so changing TP to 16 would require 32 ranks. Switch Spec Decode to DSPARK — it drops the pipeline and re-lays the same GPUs as flat TP16.",
               },
               ...config.pipelinedKnobDisableRules,
             ]; },
@@ -387,7 +387,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
-                  reason: "NOSPEC, the B200 Unified recipes run TP8 within each PP2 stage, so dp=8 leaves attn_tp=1 and each rank holds the full unsharded MLA KV — prefer dp=2/attn_tp=4, or switch Spec Decode to DSPARK for the flat TP16 shape.",
+                  reason: "With Spec Decode off, the B200 Unified recipes run TP8 within each PP2 stage, so dp=8 leaves attn_tp=1 and each rank holds the full unsharded MLA KV — prefer dp=2/attn_tp=4, or switch Spec Decode to DSPARK for the flat TP16 shape.",
                 },
                 ...config.pipelinedKnobDisableRules,
               ]; },
@@ -401,7 +401,7 @@ export const config = {
                 },
                 {
                   when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
-                  reason: "NOSPEC, the B200 Unified recipes use TP8 within each PP2 stage, so DP-Attention cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
+                  reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so DP-Attention cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
                 },
                 ...config.pipelinedKnobDisableRules,
               ]; },
@@ -455,7 +455,7 @@ export const config = {
             },
             {
               when: { hw: ["b200"], pdMode: ["unified"], spec: ["none"] },
-              reason: "NOSPEC, the B200 Unified recipes use TP8 within each PP2 stage, so EP cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
+              reason: "With Spec Decode off, the B200 Unified recipes use TP8 within each PP2 stage, so EP cannot exceed 8. Switch Spec Decode to DSPARK for the flat TP16 shape.",
             },
             ...config.pipelinedKnobDisableRules,
           ]; },
@@ -876,9 +876,11 @@ export const config = {
       ],
     },
     {
-      // Same PP2 × TP8 shape as Low-Latency: DCP is what buys KV capacity, and
-      // it only pays for itself once the batch is deep enough to amortize its
-      // extra ITL, which is the High-Throughput point. DSPARK rewrites to TP16.
+      // PP2 × DCPEP8: DCP8 deduplicates the TP-replicated MLA KV within each
+      // pipeline stage, EP8 shards the 896 experts across the same 8 ranks.
+      // EP here is plain expert sharding (a2a backend stays `none`), so unlike
+      // DeepEP/MegaMoE it allocates no dispatch buffers to reclaim the KV DCP
+      // just bought. DSPARK rewrites the pair to TP16 + DCP16 + EP16.
       match: { hw: "b200", pdMode: "unified", strategy: "balanced" },
       nnodes: 2,
       // Under a pp_size == 1 speculative algorithm, re-lay this recipe flat at
@@ -892,7 +894,16 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--pp-size 2",
+        "--dcp-size 8",
+        "--ep-size 8",
+        // Both pinned to the brought-up shape rather than left to the auto
+        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
+        // cubin pool the published image ships; drop it to get the Marlin
+        // fallback on an install without one.
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--watchdog-timeout 3600",
         "--reasoning-parser kimi_k3",
@@ -903,11 +914,7 @@ export const config = {
       ],
     },
     {
-      // PP2 × DCPEP8: DCP8 deduplicates the TP-replicated MLA KV within each
-      // pipeline stage, EP8 shards the 896 experts across the same 8 ranks.
-      // EP here is plain expert sharding (a2a backend stays `none`), so unlike
-      // DeepEP/MegaMoE it allocates no dispatch buffers to reclaim the KV DCP
-      // just bought. DSPARK rewrites the pair to TP16 + DCP16 + EP16.
+      // Balanced baseline; High-Throughput routes to the large-scale presets.
       // Still redirects: the 16-GPU cell is the floor of the large-scale lane.
       match: { hw: "b200", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 2,
@@ -926,7 +933,10 @@ export const config = {
         "--pp-size 2",
         "--dcp-size 8",
         "--ep-size 8",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
+        "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--watchdog-timeout 3600",
         "--reasoning-parser kimi_k3",
@@ -2114,8 +2124,8 @@ export const config = {
     b200: [
       // One hint list per hw, shared by every cell, so it has to name the shape
       // per role rather than assume the Unified one.
-      "Unified NOSPEC runs TP8 within a node and PP2 across the two; with DSPARK (pp_size == 1) it runs TP16 across both nodes instead.",
-      "Prefill is TP1 x PP16 — one pipeline stage per GPU, NOSPEC only. Decode is flat TP16 (+DCP16 on Balanced and High-Throughput).",
+      "Unified with Spec Decode off runs TP8 within a node and PP2 across the two (+DCP8/EP8 on Balanced and High-Throughput); with DSPARK (pp_size == 1) it runs TP16 across both nodes instead.",
+      "Prefill is TP1 × PP16 — one pipeline stage per GPU, non-speculative only. Decode is flat TP16 (+DCP16 on Balanced and High-Throughput).",
       "Multi-node K3 needs the cross-node NIC pinned on BOTH ranks:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
       "  NCCL_SOCKET_IFNAME=<your-nic>   # force NCCL off kube-ipvs0",

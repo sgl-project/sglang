@@ -88,15 +88,39 @@ export const Playground = ({ config }) => {
   // An overlay option may also REMOVE cell flags, declared as `stripPrefixes`
   // (a static list, or a function of the selection). L3 uses it to drop the
   // whole DCP operating point, which the server rejects with an L3 backend.
-  const overlayStrip = (cellFlags, sel) => {
+  //
+  // Overlay flags append, except a flag whose family the same overlay stripped:
+  // that one is spliced back where the stripped flag was, so a rewritten
+  // parallelism block (DSPARK folding a pipeline flat) stays put instead of
+  // landing past the --host/--port tail with the multi-node trio behind it.
+  const overlayCompose = (cellFlags, sel) => {
     const strip = overlayPart(sel, "stripPrefixes");
-    if (!strip.length) return [...(cellFlags || [])];
-    return (cellFlags || []).filter((f) => !strip.includes(f.split(/[\s=]/)[0]));
+    const add = overlayPart(sel, "flags");
+    if (!strip.length) return [...(cellFlags || []), ...add];
+    const used = new Set();
+    // Consumed once, so a family the cell carries twice is not emitted twice.
+    const replacementsFor = (tok) => {
+      const out = [];
+      add.forEach((f, i) => {
+        if (used.has(i) || f.split(/[\s=]/)[0] !== tok) return;
+        used.add(i);
+        out.push(f);
+      });
+      return out;
+    };
+    const out = [];
+    for (const f of (cellFlags || [])) {
+      const tok = f.split(/[\s=]/)[0];
+      if (!strip.includes(tok)) out.push(f);
+      else out.push(...replacementsFor(tok));
+    }
+    add.forEach((f, i) => { if (!used.has(i)) out.push(f); });
+    return out;
   };
   // ==== end MIRROR ====
   const withOverlay = (cell, sel) => (cell && {
     ...cell,
-    flags: [...overlayStrip(cell.flags, sel), ...overlayPart(sel, "flags")],
+    flags: overlayCompose(cell.flags, sel),
     env: [...(cell.env || []), ...overlayPart(sel, "env")],
   }) || cell;
   // Shared with `_deployment.jsx` (HOST/PORT/etc. unified across the page).
