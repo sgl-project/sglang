@@ -9,6 +9,12 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.inkling import (
+    InklingAudioConfig,
+    InklingMMConfig,
+    InklingModelConfig,
+    InklingVisionConfig,
+)
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -31,7 +37,12 @@ from sglang.srt.configs.nano_nemotron_vl import (
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
-from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+from sglang.srt.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
+)
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
@@ -65,6 +76,8 @@ __all__ = [
     "Qwen3NextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
+    "Qwen3_5TextConfig",
+    "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
@@ -86,6 +99,10 @@ __all__ = [
     "MiniMaxM3VLConfig",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "InklingAudioConfig",
+    "InklingMMConfig",
+    "InklingModelConfig",
+    "InklingVisionConfig",
     "UnlimitedVLConfig",
     "ZayaConfig",
 ]

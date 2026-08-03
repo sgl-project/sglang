@@ -19,14 +19,14 @@ Step-3.7-Flash is currently available in SGLang via Docker image install.
 ### Docker (NVIDIA)
 ```bash Command
 # Pull the docker image
-docker pull lmsysorg/sglang:dev-step-3.7-flash
+docker pull lmsysorg/sglang:latest
 
 # Launch the container
 docker run -it --gpus all \
   --shm-size=32g \
   --ipc=host \
   --network=host \
-  lmsysorg/sglang:dev-step-3.7-flash bash
+  lmsysorg/sglang:latest bash
 ```
 
 ## 3. Model Deployment
