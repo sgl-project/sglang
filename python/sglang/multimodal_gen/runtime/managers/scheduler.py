@@ -600,20 +600,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _record_batch_dispatch_metrics(
         self,
-        batch_size: int,
+        request_count: int,
+        output_count: int,
         queue_wait_ms: float,
-        effective_max_batch_size: int,
+        effective_max_output_count: int,
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
         if not self._batch_metrics_enabled:
             return
 
-        effective_max_batch_size = max(1, effective_max_batch_size)
+        effective_max_output_count = max(1, effective_max_output_count)
         logger.info(
-            "Dynamic batch dispatch: size=%d/%d, user_max=%d, queue_wait=%.2fms, stop_reason=%s",
-            batch_size,
-            effective_max_batch_size,
+            "Dynamic batch dispatch: requests=%d, outputs=%d/%d, "
+            "user_max_outputs=%d, queue_wait=%.2fms, stop_reason=%s",
+            request_count,
+            output_count,
+            effective_max_output_count,
             self._batching_max_size,
             max(queue_wait_ms, 0.0),
             stop_reason or "unspecified",
@@ -621,11 +624,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         window = self._batch_metrics_window
         window.dispatches += 1
-        window.total_requests += batch_size
-        window.total_capacity += effective_max_batch_size
-        if batch_size > 1:
+        window.total_requests += request_count
+        window.total_outputs += output_count
+        window.total_capacity += effective_max_output_count
+        if request_count > 1:
             window.merged_dispatches += 1
-        if self._dynamic_batching_enabled() and batch_size >= effective_max_batch_size:
+        if (
+            self._dynamic_batching_enabled()
+            and output_count >= effective_max_output_count
+        ):
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
         if reject_reasons:
@@ -642,8 +649,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if window.dispatches == 0:
             return
 
-        avg_size = window.total_requests / window.dispatches
-        utilization = window.total_requests / max(1, window.total_capacity)
+        avg_requests = window.total_requests / window.dispatches
+        avg_outputs = window.total_outputs / window.dispatches
+        utilization = window.total_outputs / max(1, window.total_capacity)
         avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
         p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
         merged_rate = window.merged_dispatches / window.dispatches
@@ -656,9 +664,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             top_rejects = "none"
 
         logger.info(
-            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_rejects=%s",
+            "Dynamic batch stats (last %d dispatches): avg_requests=%.2f, "
+            "avg_outputs=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, "
+            "utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, "
+            "top_rejects=%s",
             window.dispatches,
-            avg_size,
+            avg_requests,
+            avg_outputs,
             merged_rate * 100.0,
             full_rate * 100.0,
             utilization * 100.0,
@@ -951,10 +963,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if not self._dynamic_batching_enabled():
             identity, req, enqueue_time = self.waiting_queue.popleft()
             if isinstance(req, Req):
+                output_count = max(1, int(req.num_outputs_per_prompt or 1))
                 self._record_batch_dispatch_metrics(
-                    batch_size=1,
+                    request_count=1,
+                    output_count=output_count,
                     queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
-                    effective_max_batch_size=1,
+                    effective_max_output_count=output_count,
                     stop_reason="dynamic_disabled",
                 )
             return [(identity, req)]
@@ -973,10 +987,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 reason = self._get_dynamic_batch_reject_reason(req, req)
                 if reason is not None:
                     reject_reasons.append(f"head:{reason}")
+            output_count = max(1, int(req.num_outputs_per_prompt or 1))
             self._record_batch_dispatch_metrics(
-                batch_size=1,
+                request_count=1,
+                output_count=output_count,
                 queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
-                effective_max_batch_size=1,
+                effective_max_output_count=output_count,
                 reject_reasons=reject_reasons,
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
@@ -1037,9 +1053,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             else:
                 stop_reason = "ready"
         self._record_batch_dispatch_metrics(
-            batch_size=batch_len,
+            request_count=batch_len,
+            output_count=sum(
+                max(1, int(req.num_outputs_per_prompt or 1))
+                for req in compatible_reqs
+            ),
             queue_wait_ms=oldest_wait_s * 1000.0,
-            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
+            effective_max_output_count=self._batch_admission.max_admissible_batch_size(
                 compatible_reqs[0]
             ),
             reject_reasons=reject_reasons,
