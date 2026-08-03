@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -59,12 +60,6 @@ def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
             f"KDA num_heads ({num_heads}) must be divisible by global tp_size ({tp_size})"
         )
     return num_heads // tp_size
-
-
-def _materialize_residual_stream(
-    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
-) -> torch.Tensor:
-    return hidden_states if residual is None else hidden_states + residual
 
 
 class KimiMoE(nn.Module):
@@ -519,7 +514,7 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class KimiLinearModel(nn.Module):
+class KimiLinearModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -596,7 +591,9 @@ class KimiLinearModel(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        aux_hidden_states = []
+        # DSpark aux capture routes the post-layer residual stream into a
+        # fused sink stashed for the outer wrapper to pop.
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
@@ -608,13 +605,8 @@ class KimiLinearModel(nn.Module):
                     residual=residual,
                     zero_allocator=zero_allocator,
                 )
-            if (
-                self.dspark_layers_to_capture is not None
-                and i in self.dspark_layers_to_capture
-            ):
-                aux_hidden_states.append(
-                    _materialize_residual_stream(hidden_states, residual)
-                )
+            if aux_sink is not None and i in self.dspark_layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -630,8 +622,8 @@ class KimiLinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.dspark_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
         return hidden_states
 
 
@@ -662,7 +654,6 @@ class KimiLinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
-        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -676,8 +667,10 @@ class KimiLinearForCausalLM(nn.Module):
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+        # DSpark target capture uses the fused sink + stash handoff; the outer
+        # forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(layer_ids))
 
     @torch.no_grad()
     def forward(
@@ -696,9 +689,9 @@ class KimiLinearForCausalLM(nn.Module):
             pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
-            aux_hidden_states = None
-            if self.capture_aux_hidden_states:
-                hidden_states, aux_hidden_states = hidden_states
+            # None unless DSpark capture is enabled and the model stashed the
+            # fused aux buffer this forward.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
             return self.logits_processor(
                 input_ids,
                 hidden_states,

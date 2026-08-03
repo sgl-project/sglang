@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -363,7 +364,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class LlamaModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -431,10 +432,12 @@ class LlamaModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
             deferred_norm = None
 
-        aux_hidden_states = []
+        # EAGLE3/DFlash aux capture routes selected residual hiddens into a
+        # fused sink stashed for the outer wrapper to pop.
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -453,10 +456,9 @@ class LlamaModel(nn.Module):
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -543,8 +545,6 @@ class LlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        self.capture_aux_hidden_states = False
-
     def _init_model(
         self,
         config: LlamaConfig,
@@ -572,8 +572,10 @@ class LlamaForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
@@ -887,14 +889,15 @@ class LlamaForCausalLM(nn.Module):
             return
 
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture now uses the same fused sink + stash handoff as
+        # DFlash; the draft shares the same fused stash path.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
@@ -905,8 +908,9 @@ class LlamaForCausalLM(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.enable_aux_capture(len(layer_ids))
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

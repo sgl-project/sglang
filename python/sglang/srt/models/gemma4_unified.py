@@ -203,7 +203,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(text_config)
-        self.capture_aux_hidden_states = False
 
         # The unified checkpoint folds mm-projection vectors into the eoi/eoa
         # rows of the (tied) embed_tokens, which inflates their lm-head logits.

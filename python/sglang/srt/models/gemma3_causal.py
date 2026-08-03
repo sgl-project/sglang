@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -552,7 +553,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale
 
 
-class Gemma3TextModel(PreTrainedModel):
+class Gemma3TextModel(AuxCaptureMixin, PreTrainedModel):
     def __init__(
         self,
         config: Gemma3TextConfig,
@@ -633,14 +634,16 @@ class Gemma3TextModel(PreTrainedModel):
         else:
             hidden_states = input_embeds
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         residual = None
 
         num_layers = len(self.layers)
         if _is_cpu and _is_cpu_amx_available:
             for i, layer in enumerate(self.layers):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states)
+                # The layer output is split as (hidden, residual) with the add
+                # fused into the next norm; capture the complete activation.
+                if aux_sink is not None and i in self.layers_to_capture:
+                    aux_sink.append_add(hidden_states, residual)
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=None,
@@ -657,8 +660,9 @@ class Gemma3TextModel(PreTrainedModel):
             position_embeddings_global = self.rotary_emb(hidden_states, positions)
             position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
             for i, layer in enumerate(self.layers):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states)
+                # See above: capture hidden + residual (fused-norm layout).
+                if aux_sink is not None and i in self.layers_to_capture:
+                    aux_sink.append_add(hidden_states, residual)
                 hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=position_embeddings_global,
@@ -672,15 +676,14 @@ class Gemma3TextModel(PreTrainedModel):
         # Capture the output of the last layer if requested.
         # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
         # so index num_layers means the output of the final layer.
-        if num_layers in self.layers_to_capture:
-            aux_hidden_states.append(hidden_states)
+        if aux_sink is not None and num_layers in self.layers_to_capture:
+            aux_sink.append_add(hidden_states, residual)
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Gemma3ForCausalLM(PreTrainedModel):
@@ -758,7 +761,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        self.capture_aux_hidden_states = False
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -784,8 +786,10 @@ class Gemma3ForCausalLM(PreTrainedModel):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         return self.logits_processor(
             input_ids,
@@ -919,14 +923,15 @@ class Gemma3ForCausalLM(PreTrainedModel):
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
     def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
         """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
@@ -974,7 +979,6 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         # Pooler so this ordering is preserved.
         self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
         self.projector = self._build_sentence_transformer_projector(config)
-        self.capture_aux_hidden_states = False
 
     @staticmethod
     def _build_sentence_transformer_projector(config: Gemma3TextConfig):

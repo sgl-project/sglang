@@ -81,7 +81,6 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
         )
-        self.capture_aux_hidden_states = False
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

@@ -8576,6 +8576,21 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+            if self.enable_two_batch_overlap and self.speculative_algorithm in (
+                "EAGLE3",
+                "DFLASH",
+                "DSPARK",
+            ):
+                raise ValueError(
+                    "--enable-two-batch-overlap is not supported with "
+                    f"--speculative-algorithm {self.speculative_algorithm}: "
+                    "these algorithms capture per-layer aux hidden states on "
+                    "the target model, but the TBO forward path does not "
+                    "thread the aux-capture sink through its layer segments, "
+                    "so capture layers inside a TBO segment would be skipped "
+                    "and the draft model would receive no usable aux hidden "
+                    "states."
+                )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

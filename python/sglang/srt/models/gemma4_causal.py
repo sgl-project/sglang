@@ -34,6 +34,7 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -752,7 +753,7 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
-class Gemma4TextModel(PreTrainedModel):
+class Gemma4TextModel(AuxCaptureMixin, PreTrainedModel):
     def __init__(
         self,
         config: Gemma4TextConfig,
@@ -971,12 +972,12 @@ class Gemma4TextModel(PreTrainedModel):
             # pipeline; non-PLE models simply omit the key.
             per_layer_inputs = pp_proxy_tensors.tensors.get("per_layer_inputs", None)
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         num_layers = self.config.num_hidden_layers
 
         for layer_idx in range(self.start_layer, self.end_layer):
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
+            if aux_sink is not None and layer_idx in self.layers_to_capture:
+                aux_sink.append(hidden_states)
 
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
@@ -1012,15 +1013,14 @@ class Gemma4TextModel(PreTrainedModel):
         # Capture the output of the last layer if requested.
         # layers_to_capture uses +1 offset, so num_layers means
         # "output of the last layer" which is only available after the loop.
-        if num_layers in self.layers_to_capture:
-            aux_hidden_states.append(hidden_states)
+        if aux_sink is not None and num_layers in self.layers_to_capture:
+            aux_sink.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Gemma4ForCausalLM(PreTrainedModel):
@@ -1097,7 +1097,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         else:
             self.lm_head = PPMissingLayer()
 
-        self.capture_aux_hidden_states = False
         self.post_init()
 
     def tie_weights(self, *args, **kwargs):
@@ -1129,8 +1128,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.enable_aux_capture(len(layer_ids))
 
     @torch.no_grad()
     def forward(
@@ -1159,8 +1159,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -1406,14 +1408,15 @@ class Gemma4ForCausalLM(PreTrainedModel):
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 EntryClass = Gemma4ForCausalLM

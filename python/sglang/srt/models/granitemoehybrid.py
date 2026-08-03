@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -360,7 +361,7 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class GraniteMoeHybridModel(nn.Module):
+class GraniteMoeHybridModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: GraniteMoeHybridConfig,
@@ -435,10 +436,10 @@ class GraniteMoeHybridModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -457,10 +458,9 @@ class GraniteMoeHybridModel(nn.Module):
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class GraniteMoeHybridForCausalLM(
@@ -489,7 +489,6 @@ class GraniteMoeHybridForCausalLM(
     ):
         super().__init__()
 
-        self.capture_aux_hidden_states = False
         self.pp_group = get_pp_group()
 
         self.quant_config = quant_config
@@ -542,8 +541,10 @@ class GraniteMoeHybridForCausalLM(
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             if not get_embedding:

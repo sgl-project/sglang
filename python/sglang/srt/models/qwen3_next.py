@@ -16,6 +16,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -878,7 +879,7 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class Qwen3NextModel(nn.Module):
+class Qwen3NextModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -927,11 +928,13 @@ class Qwen3NextModel(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self.enable_aux_capture(len(layers_to_capture))
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self.enable_aux_capture(len(layers_to_capture))
 
     def forward(
         self,
@@ -951,7 +954,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -962,7 +965,7 @@ class Qwen3NextModel(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
+                        aux_sink
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
@@ -974,10 +977,9 @@ class Qwen3NextModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class HybridLayerType(enum.Enum):
@@ -1030,8 +1032,6 @@ class Qwen3NextForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
 
         self.num_fused_shared_experts = self._get_num_fused_shared_experts()
         if self.num_fused_shared_experts > 1:
@@ -1074,8 +1074,10 @@ class Qwen3NextForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -1264,7 +1266,9 @@ class Qwen3NextForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the inner Model.set_eagle3_layers_to_capture enables the sink
+        # and the outer forward pops the stashed aux buffer.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.set_eagle3_layers_to_capture(
@@ -1286,7 +1290,7 @@ class Qwen3NextForCausalLM(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
 

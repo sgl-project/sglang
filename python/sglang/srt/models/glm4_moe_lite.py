@@ -37,6 +37,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -750,7 +751,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         return output
 
 
-class Glm4MoeLiteModel(nn.Module):
+class Glm4MoeLiteModel(AuxCaptureMixin, nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -833,11 +834,11 @@ class Glm4MoeLiteModel(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                if aux_sink is not None and i in self.layers_to_capture:
+                    aux_sink.append_add(hidden_states, residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -875,9 +876,9 @@ class Glm4MoeLiteModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
@@ -916,7 +917,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock)
             }
         )
-        self.capture_aux_hidden_states = False
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -973,8 +973,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1015,17 +1017,18 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # TODO (Qiaolin-Yu): check if other draft models need similar layer id
             # adjustment
             if layer_ids and layer_ids[0] == 1:
                 self.model.layers_to_capture = [val + 1 for val in layer_ids]
             else:
                 self.model.layers_to_capture = list(layer_ids)
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
@@ -1036,8 +1039,9 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.enable_aux_capture(len(layer_ids))
 
     def load_weights(
         self,

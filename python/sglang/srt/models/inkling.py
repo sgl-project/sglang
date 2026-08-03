@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -573,7 +574,7 @@ class InklingDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class InklingCausalLLM(nn.Module):
+class InklingCausalLLM(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: InklingModelConfig,
@@ -703,6 +704,9 @@ class InklingCausalLLM(nn.Module):
             )
 
         self._dflash_layers_to_capture = set(layer_ids)
+        # DFlash uses the fused sink + stash handoff: the model forward stashes
+        # the fused aux buffer and the outer wrapper pops it.
+        self.enable_aux_capture(len(layer_ids))
         # Inkling can defer an MoE all-reduce into the next layer. A tapped
         # layer must instead materialize a complete hidden state at its tap.
         for layer in self.layers:
@@ -813,11 +817,11 @@ class InklingCausalLLM(nn.Module):
             fuse_ar_sconv = True
             fuse_attn_ar = True
         prev_mlp_partial = False
-        aux_hidden_states: Optional[list[torch.Tensor]] = (
-            []
-            if self._dflash_layers_to_capture
-            and not forward_batch.forward_mode.is_idle()
-            else None
+        # DFlash aux capture routes the post-layer taps into a fused sink
+        # stashed for the outer wrapper to pop. Idle forwards have no tokens
+        # to tap, so no sink (and hence no stash) is created.
+        aux_sink = (
+            None if forward_batch.forward_mode.is_idle() else self.make_aux_sink()
         )
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -834,7 +838,7 @@ class InklingCausalLLM(nn.Module):
             prev_mlp_sconv = layer.mlp_sconv
             prev_mlp_partial = fuse_ar_sconv and layer.mlp_ar_fusable
             if (
-                aux_hidden_states is not None
+                aux_sink is not None
                 and layer.layer_id in self._dflash_layers_to_capture
             ):
                 # The trained taps are post-layer and precede the deferred
@@ -842,9 +846,11 @@ class InklingCausalLLM(nn.Module):
                 tap_hidden = hidden_states
                 if layer.scattered_sconv:
                     tap_hidden = all_gather_hidden(tap_hidden, layer.attn_tp_group)
-                aux_hidden_states.append(
-                    tap_hidden if residual is None else tap_hidden + residual
-                )
+                aux_sink.append_add(tap_hidden, residual)
+        # Every capture layer was tapped inside the loop, so the sink is
+        # complete here; the deferred-sconv tail below has early returns.
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
         # The final layer's mlp_sconv was deferred; run it now — as an eager break
         # under BCG (so it re-reads live per-seq metadata at replay), else inline.
         if prev_mlp_sconv is not None and not forward_batch.forward_mode.is_idle():
@@ -861,11 +867,7 @@ class InklingCausalLLM(nn.Module):
                         norm=self.norm,
                         norm_residual=residual,
                     )
-                    return (
-                        (hidden_states, aux_hidden_states)
-                        if self._dflash_layers_to_capture
-                        else hidden_states
-                    )
+                    return hidden_states
                 # Fused extend tail: {AR + scattered sconv}, then the final
                 # norm unfused on the gathered [T, H].
                 hidden_states = ar_scattered_sconv_fused(
@@ -875,11 +877,7 @@ class InklingCausalLLM(nn.Module):
                     get_tensor_model_parallel_group(),
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return (
-                    (hidden_states, aux_hidden_states)
-                    if self._dflash_layers_to_capture
-                    else hidden_states
-                )
+                return hidden_states
             if prev_mlp_partial:
                 fm = forward_batch.forward_mode
                 if fm.is_decode() or fm.is_target_verify():
@@ -893,11 +891,7 @@ class InklingCausalLLM(nn.Module):
                         forward_batch,
                         get_tensor_model_parallel_group(),
                     )
-                    return (
-                        (hidden_states, aux_hidden_states)
-                        if self._dflash_layers_to_capture
-                        else hidden_states
-                    )
+                    return hidden_states
                 # Fused extend tail: {AR + full-width sconv + cache update}
                 # (non-scattered), then the final norm unfused.
                 hidden_states = ar_fullwidth_sconv_fused(
@@ -907,11 +901,7 @@ class InklingCausalLLM(nn.Module):
                     get_tensor_model_parallel_group(),
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return (
-                    (hidden_states, aux_hidden_states)
-                    if self._dflash_layers_to_capture
-                    else hidden_states
-                )
+                return hidden_states
             # Same gate as the per-layer group: the eager break needs the tc_piecewise
             # context (installed only by the prefill BCG runner) to read the live
             # forward_batch at replay; else run inline with the passed forward_batch.
@@ -939,11 +929,7 @@ class InklingCausalLLM(nn.Module):
                         hidden_states, self.layers[-1].attn_tp_group
                     )
         hidden_states, _ = self.norm(hidden_states, residual)
-        return (
-            (hidden_states, aux_hidden_states)
-            if self._dflash_layers_to_capture
-            else hidden_states
-        )
+        return hidden_states
 
 
 class InklingAudio(nn.Module):
@@ -1182,9 +1168,9 @@ class InklingForConditionalGeneration(nn.Module):
             data_embedding_funcs=data_embedding_funcs,
             positions=positions,
         )
-        aux_hidden_states = None
-        if self.llm._dflash_layers_to_capture:
-            hidden_states, aux_hidden_states = hidden_states
+        # DFlash stashes the fused aux buffer on the inner model for the
+        # wrapper to pop; None for plain generation and idle forwards.
+        aux_hidden_states = self.llm.pop_aux_hidden_states()
         mup_width_multiplier = self.config.text_config.logits_mup_width_multiplier
         hidden_states_for_logits = (
             hidden_states

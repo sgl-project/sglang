@@ -40,6 +40,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -1017,7 +1018,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         return output
 
 
-class Glm4MoeModel(nn.Module):
+class Glm4MoeModel(AuxCaptureMixin, nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1099,11 +1100,11 @@ class Glm4MoeModel(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                if aux_sink is not None and i in self.layers_to_capture:
+                    aux_sink.append_add(hidden_states, residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -1138,9 +1139,9 @@ class Glm4MoeModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class Glm4MoeForCausalLM(nn.Module):
@@ -1168,9 +1169,6 @@ class Glm4MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-
-        # For EAGLE3 support
-        self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(self):
         if get_exec().moe.disable_shared_experts_fusion:
@@ -1227,8 +1225,10 @@ class Glm4MoeForCausalLM(nn.Module):
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1448,14 +1448,15 @@ class Glm4MoeForCausalLM(nn.Module):
             return
 
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):

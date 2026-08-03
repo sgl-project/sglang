@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
@@ -359,17 +360,15 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(model.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model; None for plain generation and for non-last PP ranks, which
+            # return a PPProxyTensors before stashing.
+            aux_hidden_states = model.model.pop_aux_hidden_states()
 
         if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
+            return hidden_states
 
         hidden_states = cp_gather_after_forward(
             hidden_states, forward_batch, torch.cuda.current_stream()

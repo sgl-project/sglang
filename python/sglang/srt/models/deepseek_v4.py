@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -2128,7 +2129,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(AuxCaptureMixin, nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -2395,7 +2396,7 @@ class DeepseekV4Model(nn.Module):
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
                 "of them: DSpark static-verify is CP-off for v1."
             )
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        aux_sink = self.make_aux_sink()
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
@@ -2437,7 +2438,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    aux_sink.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2464,7 +2465,10 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            # Stash the fused DSpark aux buffer on the model; the outer wrapper
+            # pops it. Body-captured prefill graphs re-arm the stash after a
+            # replay that skipped this Python.
+            self.stash_aux_hidden_states(aux_sink.finalize())
 
         return hidden_states, pre_hc_head
 
@@ -2508,7 +2512,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -2549,8 +2552,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
+        # DSpark uses the fused sink + stash handoff.
         self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.enable_aux_capture(len(layer_ids))
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
@@ -2618,9 +2622,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        # DSpark stashes the fused aux buffer on the inner model; None for
+        # plain generation.
+        aux_hidden_states = self.model.pop_aux_hidden_states()
         hidden_states, pre_hc_head = hidden_states
 
         return self.logits_processor(

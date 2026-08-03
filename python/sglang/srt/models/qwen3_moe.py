@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
@@ -929,6 +930,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        self.enable_aux_capture(len(layers_to_capture))
 
 
 class Qwen3MoeForCausalLM(nn.Module):
@@ -963,7 +965,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
 
         self.attn_cp_size = get_parallel().attn_cp_size
         self.attn_cp_rank = get_parallel().attn_cp_rank
@@ -1005,8 +1006,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         if self.pp_group.is_last_rank:
             logits_output = self.logits_processor(
@@ -1074,7 +1077,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the inner Model.set_eagle3_layers_to_capture enables the sink
+        # and the outer forward pops the stashed aux buffer.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.set_eagle3_layers_to_capture(
@@ -1096,7 +1101,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
 
-        self.capture_aux_hidden_states = True
+        # DFlash uses the fused sink + stash handoff.
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(

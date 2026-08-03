@@ -215,21 +215,19 @@ def execute_prefill_cp_bcg(
             static_forward_batch,
             **kwargs,
         )
-        local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
+        hidden_states = _slice_output_rows(local_output, cp_input.live_local_tokens)
 
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        # Replay skips the model's forward() Python, so the fused aux hidden
+        # states live in the runner's static capture buffer rather than the
+        # AuxCaptureMixin stash; the live rows match the sliced body output.
         aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = local_output
-        else:
-            hidden_states = local_output
+        if runner.static_aux_hidden_states is not None:
+            aux_hidden_states = runner.static_aux_hidden_states[
+                : cp_input.live_local_tokens
+            ]
 
         if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
+            return hidden_states
 
         hidden_states = cp_gather_after_forward(
             hidden_states,

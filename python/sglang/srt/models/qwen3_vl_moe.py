@@ -94,15 +94,13 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx += self.start_layer
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            if aux_sink is not None and layer_idx in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
 
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
@@ -141,10 +139,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                         hidden_states, residual, post_residual_addition=last_deepstack
                     )
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 def load_fused_expert_weights(

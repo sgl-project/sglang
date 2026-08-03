@@ -49,6 +49,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -585,7 +586,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         return hidden_states, residual, prev_topk_indices
 
 
-class LongcatFlashModel(nn.Module):
+class LongcatFlashModel(AuxCaptureMixin, nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -658,11 +659,11 @@ class LongcatFlashModel(nn.Module):
 
         residual = None
 
-        aux_hidden_states = []
+        aux_sink = self.make_aux_sink()
         topk_indices = None
         for i in range(total_num_layers):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+            if aux_sink is not None and i in self.layers_to_capture:
+                aux_sink.append_add(hidden_states, residual)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
@@ -680,10 +681,9 @@ class LongcatFlashModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if aux_sink is not None:
+            self.stash_aux_hidden_states(aux_sink.finalize())
+        return hidden_states
 
 
 class LongcatFlashForCausalLM(nn.Module):
@@ -724,7 +724,6 @@ class LongcatFlashForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -740,8 +739,10 @@ class LongcatFlashForCausalLM(nn.Module):
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+        if isinstance(self.model, AuxCaptureMixin):
+            # DFlash/DSpark and EAGLE3 stash the fused aux buffer on the inner
+            # model for the wrapper to pop; None for plain generation.
+            aux_hidden_states = self.model.pop_aux_hidden_states()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
@@ -1159,12 +1160,13 @@ class LongcatFlashForCausalLM(nn.Module):
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # EAGLE3 target capture uses the fused sink + stash handoff (same as
+        # DFlash); the outer forward pops the stashed aux buffer.
+        self.model.enable_aux_capture(len(self.model.layers_to_capture))
 
 
 EntryClass = [LongcatFlashForCausalLM]

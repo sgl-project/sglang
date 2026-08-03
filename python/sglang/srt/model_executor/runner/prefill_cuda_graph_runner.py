@@ -53,6 +53,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.aux_capture import AuxCaptureMixin
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
@@ -517,13 +518,58 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 params.index("input_embeds") if "input_embeds" in params else None
             )
 
+        # Body-captured backends (BCG / Full) skip the model's forward() Python
+        # at replay, so a model whose aux-hidden handoff is a Python-side
+        # stash/pop (DFlash/DSpark or EAGLE3, all via AuxCaptureMixin) never
+        # re-arms the stash there. Both backends are supported: give the model
+        # one static aux buffer shared by every captured shape, and execute()
+        # re-arms the stash with a live-row view before the eager tail (Full
+        # trims to raw tokens; BCG keeps the padded body-output width).
+        self.static_aux_hidden_states: Optional[torch.Tensor] = None
+        if self.layer_model is not None:
+            has_aux_stash = isinstance(self.layer_model, AuxCaptureMixin)
+            num_aux_capture_layers = (
+                self.layer_model.num_aux_capture_layers if has_aux_stash else 0
+            )
+            if (
+                model_runner.spec_algorithm.is_dflash_family()
+                and not model_runner.is_draft_worker
+                and not has_aux_stash
+            ):
+                raise RuntimeError(
+                    "Body-captured prefill CUDA graph "
+                    f"({self.prefill_backend_name}) with a dflash-family target "
+                    "requires the aux stash protocol, which "
+                    f"{type(self.layer_model).__name__} does not expose. Use "
+                    "--cuda-graph-backend-prefill tc_piecewise or disable the "
+                    "prefill CUDA graph."
+                )
+            if num_aux_capture_layers > 0:
+                aux_width = (
+                    num_aux_capture_layers * model_runner.model_config.hidden_size
+                )
+                with torch.device(self.device):
+                    self.static_aux_hidden_states = torch.zeros(
+                        (self.max_num_tokens, aux_width), dtype=model_runner.dtype
+                    )
+                self.layer_model.set_aux_capture_static_buffer(
+                    self.static_aux_hidden_states
+                )
+
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        finally:
+            # Prefill graphs have baked the static aux buffer's address;
+            # detach it so later whole-graph captures (decode/verify) and
+            # eager forwards go back to per-forward allocation.
+            if self.static_aux_hidden_states is not None:
+                self.layer_model.set_aux_capture_static_buffer(None)
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
@@ -660,12 +706,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                return self.layer_model.forward(
+                out = self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
                 )
+                # Body capture drives the inner model without its wrapper, so
+                # the stash armed by this capture/warmup forward has no popper.
+                # Discard it to keep stash/pop strictly paired (the collision
+                # check in AuxCaptureMixin.stash_aux_hidden_states relies on
+                # that pairing).
+                if isinstance(self.layer_model, AuxCaptureMixin):
+                    self.layer_model.pop_aux_hidden_states()
+                return out
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -747,6 +801,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 input_embeds=fb.input_embeds,
                 input_deepstack_embeds=deepstack_embeds,
             )
+        # This dummy forward drives the inner model directly (no wrapper runs,
+        # so nothing pops); discard any stash to keep stash/pop paired.
+        inner = getattr(language_model, "model", language_model)
+        if isinstance(inner, AuxCaptureMixin):
+            inner.pop_aux_hidden_states()
         return True
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
@@ -1629,6 +1688,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
+        # The armed view aliases the shared buffer the next replay
+        # overwrites; the popped aux must be consumed before then. Full trims
+        # its body output to raw tokens (tail runs on the real batch), so aux
+        # matches at raw_num_tokens; BCG returns the padded body output and its
+        # tail runs on the padded static batch, so aux matches at
+        # static_num_tokens (same rows the captured graph wrote).
+        if self.static_aux_hidden_states is not None:
+            aux_rows = raw_num_tokens if full_path else static_num_tokens
+            self.layer_model.stash_aux_hidden_states(
+                self.static_aux_hidden_states[:aux_rows]
+            )
         try:
             with self._prefill_forward_context(
                 static_forward_batch,
