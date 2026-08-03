@@ -11,19 +11,11 @@ from types import ModuleType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+import mori.umbp  # noqa: F401
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+from sglang.test.ci.ci_register import register_amd_ci
 
-# UMBPStore wraps mori's UMBP client (AMD/ROCm only). On machines without mori
-# (e.g. NVIDIA / CPU CI) the whole TestCase is skipped instead of failing at
-# import time, so the CI runner (`python3 <file> -f`) exits cleanly.
-try:
-    import mori.umbp  # noqa: F401
-
-    HAS_MORI = True
-except ImportError:
-    HAS_MORI = False
+register_amd_ci(est_time=30, suite="stage-a-test-1-gpu-small-amd")
 
 
 @dataclass
@@ -126,7 +118,6 @@ def make_indices(indices):
     return indices
 
 
-@unittest.skipUnless(HAS_MORI, "mori.umbp not available (AMD/ROCm only)")
 class TestUMBPStore(unittest.TestCase):
     def test_basic_set_get(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
