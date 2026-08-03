@@ -552,10 +552,9 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
-    server_args = get_server_args()
-    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+    # The pool's recycler counts the whole TP group, so the acknowledgement must
     # match that count even when an attention subgroup is smaller.
-    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+    consumer_count = max(get_server_args().tp_size, 1)
     for item in items:
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
