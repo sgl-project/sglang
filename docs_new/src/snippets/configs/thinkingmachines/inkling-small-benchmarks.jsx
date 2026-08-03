@@ -15,6 +15,8 @@ export const benchmarks = [
   { match: { hw: "h200"   , variant: "default" , quant: "nvfp4" , strategy: "balanced"     , nodes: "single"   },
     sglang_version: "dev-inkling-dspark (b7252cc)",
     accuracy: { aime26_pct: 95.00, bfcl_pct: 76.02, mmau_pct: 74.70 } },
+  { match: { hw: "dgx-spark", variant: "default" , quant: "nvfp4" , strategy: "balanced"   , nodes: "multi-2"  },
+    sglang_version: "dev-inkling-small-dgx-spark" },
   { match: { hw: "mi350x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
   { match: { hw: "mi355x" , variant: "default" , quant: "bf16"  , strategy: "balanced"     , nodes: "single"   } },
   { match: { hw: "b200"   , variant: "default" , quant: "nvfp4" , strategy: "mtp"          , nodes: "single"   },
