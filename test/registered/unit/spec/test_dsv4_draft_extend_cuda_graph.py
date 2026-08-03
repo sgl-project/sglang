@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -18,13 +19,11 @@ class TestDSV4DraftExtendCudaGraph(TestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
 
-        seq_lens_casual, req_pool_indices = (
-            backend.expand_extend_with_same_length(
-                bs=1,
-                qo_len=4,
-                seq_lens=torch.tensor([1], dtype=torch.int32),
-                req_pool_indices=torch.tensor([0], dtype=torch.int32),
-            )
+        seq_lens_casual, req_pool_indices = backend.expand_extend_with_same_length(
+            bs=1,
+            qo_len=4,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
         )
 
         self.assertEqual(seq_lens_casual.tolist(), [1, 1, 1, 1])
@@ -54,3 +53,7 @@ class TestDSV4DraftExtendCudaGraph(TestCase):
 
                 self.assertEqual(output, "output")
                 self.assertEqual(call_order, expected_order)
+
+
+if __name__ == "__main__":
+    unittest.main()
