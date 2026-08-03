@@ -36,7 +36,7 @@ source sglang-metal/bin/activate
 
 # (Optional) Compile sgl-kernel
 uv pip install --upgrade pip
-uv run sgl-kernel/setup_metal.py install
+uv run python/sglang/kernels/aot/setup_metal.py install
 
 # Install sglang python package along with diffusion support
 rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
