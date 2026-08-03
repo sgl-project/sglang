@@ -24,6 +24,7 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    is_draft_worker: bool = False
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -32,6 +33,27 @@ class RemoteInstanceWeightTransporter:
     @property
     def model(self) -> torch.nn.Module:
         return self.get_model()
+
+    @property
+    def transfers_weights(self) -> bool:
+        """Whether this runner takes part in remote-instance weight transfer.
+
+        Draft models are outside R-Fork: the seed only ever exports its target
+        model, and a client's draft loads from its own load_format (see
+        --speculative-draft-load-format). The draft runner must therefore stay
+        out entirely -- it publishes under the same tp_rank key as the target
+        (the bootstrap server has no per-model dimension), and since it
+        initializes second it would otherwise overwrite the target's session id
+        and weight layout, handing the client the draft model's memory regions.
+        """
+        return (
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and not self.is_draft_worker
+        )
+
+    def maybe_init_engine(self):
+        if self.transfers_weights:
+            self.init_engine()
 
     def init_engine(self):
         try:
@@ -55,7 +77,7 @@ class RemoteInstanceWeightTransporter:
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            self.transfers_weights
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.

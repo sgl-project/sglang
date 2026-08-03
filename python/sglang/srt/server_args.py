@@ -94,7 +94,12 @@ from sglang.srt.utils.common import (
     torch_release,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port,
+    local_ephemeral_port_range,
+    wait_port_available,
+)
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
@@ -7259,6 +7264,8 @@ class ServerArgs:
                     "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
                 )
                 self.load_format = "auto"
+            else:
+                self.validate_remote_instance_group_ports()
 
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
@@ -8949,6 +8956,30 @@ class ServerArgs:
         self.mem_fraction_static = (
             original_server_arg_mem_fraction * final_overall_factor
         )
+
+    def validate_remote_instance_group_ports(self):
+        """Reject send-weights group ports that sit in the ephemeral port range.
+
+        The seed *listens* on these, but the kernel also hands them out to
+        outbound connections, so an overlapping choice races with whatever else
+        the host is dialing and loses with EADDRINUSE some fraction of the time.
+        Fail at startup instead of intermittently mid-transfer.
+        """
+        ports = self.remote_instance_weight_loader_send_weights_group_ports
+        if not ports:
+            return
+        port_range = local_ephemeral_port_range()
+        if port_range is None:
+            return
+        low, high = port_range
+        clashing = [p for p in ports if low <= p <= high]
+        if clashing:
+            raise ValueError(
+                f"--remote-instance-weight-loader-send-weights-group-ports {clashing} "
+                f"fall inside this host's ephemeral port range ({low}-{high}), where "
+                f"the kernel may already have handed the port to an outbound "
+                f"connection. Pick ports below {low}."
+            )
 
     def validate_transfer_engine(self):
         try:

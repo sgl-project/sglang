@@ -515,6 +515,7 @@ class ModelRunner:
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def init_ngram_embedding_manager(self):
@@ -622,8 +623,7 @@ class ModelRunner:
         )
 
     def maybe_init_remote_instance_transfer_engine(self):
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_weight_transporter.init_engine()
+        self.remote_instance_weight_transporter.maybe_init_engine()
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:

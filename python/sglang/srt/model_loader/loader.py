@@ -18,7 +18,6 @@ import math
 import os
 import re
 import shutil
-import socket
 import tempfile
 import threading
 import time
@@ -45,6 +44,7 @@ from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
+    local_instance_id,
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils.network import NetworkAddress
 
 # Try to import accelerate (optional dependency)
 try:
@@ -82,6 +83,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layernorm import refresh_derived_weight_buffers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -337,6 +339,10 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    # Those same loaders also skip the per-parameter weight_loader hooks, which is
+    # where weight-derived buffers are filled in. Rebuild them from the parameters
+    # now that the parameters hold their final values.
+    refresh_derived_weight_buffers(model)
 
 
 class BaseModelLoader(ABC):
@@ -3114,7 +3120,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
-            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+            model_weights = NetworkAddress(
+                load_config.remote_instance_weight_loader_seed_instance_ip,
+                load_config.remote_instance_weight_loader_send_weights_group_ports[
+                    load_config.tp_rank
+                ],
+            ).to_url("instance")
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.INSTANCE:
@@ -3150,7 +3161,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             success = self.load_model_from_remote_instance_by_transfer_engine(
                 model,
                 load_config.remote_instance_weight_loader_transfer_engine,
-                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                NetworkAddress(
+                    load_config.remote_instance_weight_loader_seed_instance_ip,
+                    load_config.remote_instance_weight_loader_seed_instance_service_port,
+                ).to_url(),
                 load_config.tp_rank,
             )
             if not success:
@@ -3183,7 +3197,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
-        instance_ip = socket.gethostbyname(socket.gethostname())
+        # Must match the token the seed was handed in
+        # maybe_trigger_remote_instance_nccl_send_group -- see local_instance_id.
+        instance_ip = local_instance_id()
         start_build_group_tic = time.time()
         client.build_group(
             gpu_id=device_config.gpu_id,
