@@ -202,7 +202,7 @@ impl Ingress {
         }
         // A rejected request never reaches the scheduler drain: purge any
         // parked MM result (no-op for the common non-mm request).
-        self.mm_sidecar.lock().unwrap().remove(req.rid.as_str());
+        self.mm_sidecar.purge(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
@@ -481,7 +481,7 @@ impl Ingress {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
             // The request will never reach the scheduler drain, so its
             // sidecar entry (if any) must be purged here or it leaks.
-            self.mm_sidecar.lock().unwrap().remove(rid.as_str());
+            self.mm_sidecar.purge(rid.as_str());
             return;
         };
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -511,14 +511,15 @@ impl Ingress {
     /// misdelivered — the rid is unique to this request for the process's lifetime
     /// ([`Rid::from_client`]), so no later request can ever answer to it.
     ///
-    /// A request parked in `pending_mm` is deliberately left there: its MM
-    /// processing completes, it flows to the scheduler, and its output is
-    /// dropped by the (deregistered) detok shard. That keeps the sidecar entry
-    /// from leaking (the ring drain always consumes it) at the cost of one
-    /// bounded wasted generation — the Python server has the same race when an
-    /// abort lands while `_tokenize_one_request` is mid-flight.
-    fn on_abort(&self, source: AbortSource) {
+    /// A request parked in `pending_mm` is cancelled here: the entry is
+    /// removed, so the worker's late result lands in `on_mm_encoded`'s
+    /// no-entry branch, which purges the sidecar — no generation runs for
+    /// output nobody will read.
+    fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
+        if self.pending_mm.remove(&rid).is_some() {
+            tracing::debug!(rid = %rid, "abort cancelled request parked for MM");
+        }
         let _ = self
             .senders
             .detok_for(&rid)
@@ -829,7 +830,7 @@ mod tests {
             let (ingress_producer, consumer) = ingress_ring(16);
             let (sd_tx, sd_rx) = flume::unbounded::<()>();
             std::mem::forget(sd_tx);
-            let ingress = Ingress::new(
+            let mut ingress = Ingress::new(
                 flume::unbounded().1,
                 flume::unbounded().1,
                 Senders {
@@ -1207,7 +1208,7 @@ mod tests {
         let (_tm_tx, tm_rx) = flume::unbounded();
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(
+        let mut ingress = Ingress::new(
             tm_rx,
             abort_rx,
             senders,
@@ -1476,6 +1477,36 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    /// An abort while the request is parked for MM cancels it: the pending
+    /// entry is removed, the worker's late result is dropped, and its parked
+    /// sidecar entry is purged — no scheduler work runs for a dead client.
+    #[test]
+    fn abort_cancels_parked_mm_request() {
+        let (mut ingress, _detok_rx, consumer, _tm_tx, mm_rx) = make_ingress();
+        ingress.drive(mm_generate_req("mm-gone"));
+        mm_rx.try_recv().expect("parked to mm pool");
+
+        // The worker parks its result, as it always does before MmEncoded.
+        ingress.mm_sidecar.park(
+            "mm-gone".into(),
+            crate::mm::MmSidecarEntry {
+                features: crate::mm::FeatureStore::Inline(vec![]),
+                grids: vec![],
+                hashes: vec![],
+                offsets: vec![],
+                mrope: vec![],
+                mrope_delta: 0,
+            },
+        );
+        ingress.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
+        assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
+
+        // The late result must be dropped, not queued, and the sidecar purged.
+        ingress.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
+        assert!(consumer.drain(16).headers.is_empty(), "cancelled, not queued");
+        assert!(ingress.mm_sidecar.take("mm-gone").is_none(), "entry purged");
     }
 
     /// A multimodal request parks in `Encoding` (submitted to the mm worker

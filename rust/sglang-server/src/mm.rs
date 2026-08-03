@@ -105,11 +105,12 @@ fn shm_name(item: usize) -> String {
     format!("sglmm-{}-{n}-{item}", std::process::id())
 }
 
-/// One mm result: everything the drain-time Python adapter needs. This is
-/// the qwen scheduler-drain shape (`sglang_mm::qwen_vl::pack_drain`);
-/// it generalizes to a named-tensor handoff when a family needs a
-/// different shape.
-pub struct MmResult {
+/// One parked sidecar entry: the feature/aux buffers the drain-time Python
+/// adapter needs (the expanded `input_ids` travel separately, via
+/// `TmEvent::MmEncoded`). This is the qwen scheduler-drain shape
+/// (`sglang_mm::qwen_vl::pack_drain`); it generalizes to a named-tensor
+/// handoff when a family needs a different shape.
+pub struct MmSidecarEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -129,11 +130,25 @@ pub enum FeatureStore {
     Shm(Vec<ShmSegment>),
 }
 
-/// Results parked between a worker's `MmEncoded` and the scheduler's drain.
-/// An entry is stored strictly before `MmEncoded` is emitted and popped by
-/// `Server.take_mm`; late results for rejected requests are purged by the
-/// ingress.
-pub type Sidecar = Arc<Mutex<HashMap<String, MmResult>>>;
+/// Entries parked between a worker's `MmEncoded` and the scheduler's drain,
+/// keyed by rid. Owns the lifecycle: [`park`](Self::park) strictly before
+/// `MmEncoded` is emitted, [`take`](Self::take) at the scheduler drain, and
+/// [`purge`](Self::purge) for requests that die while parked (rejected or
+/// aborted), so entries never leak.
+#[derive(Clone, Default)]
+pub struct Sidecar(Arc<Mutex<HashMap<String, MmSidecarEntry>>>);
+
+impl Sidecar {
+    pub fn park(&self, rid: String, entry: MmSidecarEntry) {
+        self.0.lock().unwrap().insert(rid, entry);
+    }
+    pub fn take(&self, rid: &str) -> Option<MmSidecarEntry> {
+        self.0.lock().unwrap().remove(rid)
+    }
+    pub fn purge(&self, rid: &str) {
+        self.0.lock().unwrap().remove(rid);
+    }
+}
 
 /// Shared state of the mm path, built once at `start_mm_workers`.
 pub struct Context {
@@ -183,9 +198,9 @@ fn process(ctx: &Context, rid: &crate::ids::Rid, work: crate::message::MmWorkIte
     } else {
         FeatureStore::Inline(drain.features)
     };
-    ctx.sidecar.lock().unwrap().insert(
+    ctx.sidecar.park(
         rid.as_str().to_owned(),
-        MmResult {
+        MmSidecarEntry {
             features,
             grids: drain.grids,
             hashes: drain.hashes,

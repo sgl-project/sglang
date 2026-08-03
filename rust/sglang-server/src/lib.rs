@@ -253,7 +253,7 @@ impl Server {
     fn take_mm<'py>(&self, py: Python<'py>, rid: &str) -> Option<MmHandoff<'py>> {
         use numpy::IntoPyArray;
 
-        let res = self.rt.mm_sidecar.lock().unwrap().remove(rid)?;
+        let res = self.rt.mm_sidecar.take(rid)?;
         let (features, shm_names) = match res.features {
             mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py)), None),
             // Ownership of the segments (and the duty to unlink) moves to
