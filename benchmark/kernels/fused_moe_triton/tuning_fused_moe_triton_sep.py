@@ -86,6 +86,10 @@ _accel_mod = torch.cuda if _ACCEL == "cuda" else torch.xpu
 _supports_graph = _ACCEL == "cuda" or (
     _ACCEL == "xpu" and hasattr(torch.xpu, "XPUGraph")
 )
+# CPUs to request per tuning worker. Tuning is GPU-bound, but ray derives a
+# worker's OMP_NUM_THREADS from its CPU share, so asking for 1 would pin host-side
+# work (kernel compile, tensor setup) to a single thread.
+_CPUS_PER_WORKER = 8
 
 
 def _accel_synchronize() -> None:
@@ -550,12 +554,24 @@ class BestConfigTrace:
 class BenchmarkWorker:
 
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
-        torch.set_default_device(_ACCEL)
+        # The device index to allocate this worker's tensors and kernels on, as
+        # torch numbers them -- which is not what ray.get_gpu_ids() returns.
+        #
+        # Ray assigns each worker one accelerator. On CUDA it also sets
+        # CUDA_VISIBLE_DEVICES, so the assigned device is the only one torch can
+        # see and its local index is always 0 (get_gpu_ids() reports the global
+        # id, which torch would reject). XPU gets no such masking: ray exports
+        # ONEAPI_DEVICE_SELECTOR only after the worker has initialized the
+        # level-zero stack, so both it and ZE_AFFINITY_MASK are ignored and every
+        # worker enumerates all devices -- the global id *is* the local index, and
+        # without an explicit set_device every worker would pile onto device 0 and
+        # serialize. Empty in the driver process (serial path) -> device 0.
+        assigned = ray.get_gpu_ids() if _ACCEL == "xpu" and ray.is_initialized() else []
+        self.device_id = int(assigned[0]) if assigned else 0
+        _accel_mod.set_device(self.device_id)
+        torch.set_default_device(f"{_ACCEL}:{self.device_id}")
         _accel_manual_seed_all(0)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU.
-        self.device_id = 0  # int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
         # Resolve the saved-dataset layer layout for this model. Done here so it is
         # also set inside each ray worker process (CUDA), not just the serial path.
@@ -874,20 +890,40 @@ def main(args: argparse.Namespace):
         num_gpus = int(ray.available_resources()["GPU"])
         use_ray = True
     else:
-        # XPU: Ray's IntelGPUAcceleratorManager (requires dpctl) advertises XPUs
-        # as the "GPU" resource and isolates each worker via ONEAPI_DEVICE_SELECTOR,
-        # so the assigned device appears as index 0 inside the worker (same as
-        # CUDA). When Ray cannot see multiple devices, fall back to a single
-        # in-process worker.
-        ray.init(num_gpus=get_device_count())
+        # XPU: Ray's IntelGPUAcceleratorManager (requires dpctl) advertises XPUs as
+        # the "GPU" resource. Unlike CUDA it does NOT effectively isolate them --- it
+        # exports ONEAPI_DEVICE_SELECTOR only after the worker has initialized the
+        # level-zero stack, so each worker still enumerates every device and
+        # BenchmarkWorker must pick its own (see its __init__).
+        #
+        # num_cpus must be bounded. Ray sizes its prestarted worker pool from the
+        # core count, and on a many-core host (512 here) it spawns hundreds of
+        # workers that each pay the oneAPI + sglang import cost; ray.init() then
+        # never returns (measured: no completion after 600s, raylet reporting 473
+        # workers "hanging during start"). Tuning only ever needs one worker per
+        # device, so cap the pool at that -- with enough CPU per worker that ray
+        # does not pin it to a single OMP thread.
+        # When ray cannot see multiple devices, fall back to one in-process worker.
+        num_devices = get_device_count()
+        # Workers import this module by path, so they need its directory on
+        # PYTHONPATH to resolve the sibling `common_utils`. Ray overwrites the keys
+        # named in env_vars and inherits the rest, so ${PYTHONPATH} (which ray
+        # expands in the worker) must be kept -- dropping it would strip whatever
+        # the caller put there.
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        ray.init(
+            num_gpus=num_devices,
+            num_cpus=num_devices * _CPUS_PER_WORKER,
+            runtime_env={"env_vars": {"PYTHONPATH": this_dir + ":${PYTHONPATH}"}},
+        )
         num_gpus = int(ray.available_resources().get("GPU", 0))
         use_ray = num_gpus > 1
 
     if use_ray:
-        workers = [
-            ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
-            for _ in range(num_gpus)
-        ]
+        # num_cpus must match what ray.init() reserved per device above, or ray
+        # admits more workers than there are devices (its default is 1 CPU each).
+        worker_cls = ray.remote(num_gpus=1, num_cpus=_CPUS_PER_WORKER)(BenchmarkWorker)
+        workers = [worker_cls.remote(args.seed, server_args) for _ in range(num_gpus)]
 
         def _distribute(method: str, inputs: List[Any]) -> List[Any]:
             outputs = []
