@@ -10,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 BASE_MANIFESTS = (
+    "gpu-device-plugin.yaml",
     "h100-denoiser.yaml",
     "l4-vae.yaml",
     "gateway-service.yaml",
@@ -77,6 +78,13 @@ def validate(documents: list[dict]) -> None:
     }
     assert env["REALTIME_VAE_WORKER_URL"].startswith("ws://minwm-async-vae")
     assert "REALTIME_SESSION_LEASE_TABLE" not in env
+
+    plugin = find(
+        documents, "DaemonSet", "minwm-async-nvidia-device-plugin"
+    )
+    assert plugin["spec"]["template"]["spec"]["nodeSelector"] == {
+        "seedleap.ai/test-run": "minwm-async-vae-benchmark"
+    }
 
 
 def main() -> None:
