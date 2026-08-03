@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -1244,7 +1245,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            # MXFP4 hard-codes Swiglu in the AITER kernel path, so the
+            # checkpoint's "silu" has to be translated. K3's SiTU is the one
+            # activation the kernel selects on its own -- leave it alone.
+            aiter_config = moe_runner_config
+            if aiter_config.activation != "situ":
+                aiter_config = replace(aiter_config, activation="swiglu")
+            self.runner = MoeRunner(moe_runner_backend, aiter_config)
         elif (
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
