@@ -813,7 +813,6 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
-        top_k_indices.fill_(-1)
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla

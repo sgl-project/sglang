@@ -59,7 +59,7 @@ jobs:
       - name: Run sgl-kernel clang-format checks
         uses: DoozyX/clang-format-lint-action@v0.20
         with:
-          source: sgl-kernel
+          source: python/sglang/kernels/aot
           extensions: h,c,cpp,hpp,cu,cuh,cc
           clangFormatVersion: 20
           style: file

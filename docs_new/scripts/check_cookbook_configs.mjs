@@ -99,7 +99,10 @@ const selectionSpace = (config) => {
 
 const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
   e.isDirectory() ? walk(join(dir, e.name))
-    : (e.name.endsWith(".jsx") && !e.name.includes("benchmark") ? [join(dir, e.name)] : []));
+    : (e.name.endsWith(".jsx")
+      && !e.name.includes("benchmark")
+      && e.name !== "popular-models.jsx"
+      ? [join(dir, e.name)] : []));
 
 for (const path of walk(CONFIGS)) {
   const where = relative(join(SNIPPETS, ".."), path);
@@ -181,6 +184,14 @@ for (const path of walk(CONFIGS)) {
         }, `${tag}.${key}`);
       }
     }
+  }
+  if (typeof config.curl === "function") {
+    probe((sel) => {
+      const out = config.curl(sel, null);
+      if (typeof out !== "string") {
+        throw new Error(`curl returned ${typeof out}, expected a string`);
+      }
+    }, "curl");
   }
 }
 
