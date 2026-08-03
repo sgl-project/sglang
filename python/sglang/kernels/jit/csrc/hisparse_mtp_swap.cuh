@@ -89,21 +89,21 @@ struct PackedRingState {
 
 template <int32_t HOT_BUFFER_SIZE>
 struct PackedRingEntry {
-  static constexpr int32_t SLOT_BITS = ceil_log2_constexpr(HOT_BUFFER_SIZE);
-  static constexpr uint64_t SLOT_MASK = (uint64_t{1} << SLOT_BITS) - 1;
   static constexpr int64_t TOKEN_CAPACITY = int64_t{1} << 31;
 
+  // Keep the token in the low word so the common lookup path can compare it
+  // without a 64-bit shift; the slot is decoded only after a token match.
   __device__ static int64_t pack(int32_t token, int32_t slot) {
     return static_cast<int64_t>(
-        (static_cast<uint64_t>(static_cast<uint32_t>(token)) << SLOT_BITS) | static_cast<uint32_t>(slot));
+        (static_cast<uint64_t>(static_cast<uint32_t>(slot)) << 32) | static_cast<uint32_t>(token));
   }
 
   __device__ static int32_t token(int64_t packed) {
-    return static_cast<int32_t>(static_cast<uint64_t>(packed) >> SLOT_BITS);
+    return static_cast<int32_t>(static_cast<uint32_t>(packed));
   }
 
   __device__ static int32_t slot(int64_t packed) {
-    return static_cast<int32_t>(static_cast<uint64_t>(packed) & SLOT_MASK);
+    return static_cast<int32_t>(static_cast<uint64_t>(packed) >> 32);
   }
 };
 
@@ -185,14 +185,14 @@ __device__ __forceinline__ int32_t ring_hash_lookup(
     return -1;
   }
   using Entry = PackedRingEntry<HOT_BUFFER_SIZE>;
-  const int32_t primary = keys[ring_hash_slot(token, hash_size)];
+  const int64_t primary = keys[ring_hash_slot(token, hash_size)];
   if (primary >= 0 && Entry::token(primary) == token) {
     const int32_t slot = Entry::slot(primary);
     if (slot < HOT_BUFFER_SIZE && req_device_buffer_tokens[slot] == token) {
       return slot;
     }
   }
-  const int32_t secondary = vals[ring_hash_slot_secondary(token, hash_size)];
+  const int64_t secondary = vals[ring_hash_slot_secondary(token, hash_size)];
   if (secondary >= 0 && Entry::token(secondary) == token) {
     const int32_t slot = Entry::slot(secondary);
     if (slot < HOT_BUFFER_SIZE && req_device_buffer_tokens[slot] == token) {
@@ -907,13 +907,10 @@ void load_cache_to_device_buffer_mtp(
     tvm::ffi::TensorView top_k_device_locs,
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
-    tvm::ffi::TensorView ring_hash_keys,
-    tvm::ffi::TensorView ring_hash_vals,
-    tvm::ffi::TensorView ring_epoch,
-    tvm::ffi::TensorView cache_ref_bits,
+    tvm::ffi::TensorView cache_index,
+    tvm::ffi::TensorView cache_policy,
     tvm::ffi::TensorView scratch_locs,
-    tvm::ffi::TensorView scratch_tokens,
-    tvm::ffi::TensorView scratch_counts,
+    tvm::ffi::TensorView scratch_state,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size) {
   using namespace host;
@@ -928,19 +925,30 @@ void load_cache_to_device_buffer_mtp(
   RuntimeCheck(top_k_device_locs.ndim() == 3, "MTP output must have shape [batch, steps, top_k].");
   RuntimeCheck(top_k_tokens.shape()[1] == NUM_STEPS, "top_k_tokens step dimension mismatch.");
   RuntimeCheck(top_k_tokens.shape()[2] == NUM_TOP_K, "top_k_tokens top-k dimension mismatch.");
-  RuntimeCheck(ring_hash_keys.shape()[1] == ring_hash_vals.shape()[1], "ring hash key/value capacity mismatch.");
   RuntimeCheck(
-      ring_hash_keys.shape()[1] > 0 && (ring_hash_keys.shape()[1] & (ring_hash_keys.shape()[1] - 1)) == 0,
+      cache_index.ndim() == 3 && cache_index.shape()[1] == 2,
+      "MTP cache_index must have shape [num_requests, 2, hash_size].");
+  const int64_t ring_hash_size = cache_index.shape()[2];
+  RuntimeCheck(
+      ring_hash_size > 0 && (ring_hash_size & (ring_hash_size - 1)) == 0,
       "ring hash capacity must be a power of two.");
-  RuntimeCheck(cache_ref_bits.shape()[1] >= HOT_BUFFER_SIZE, "cache_ref_bits hot capacity is too small.");
-  RuntimeCheck(scratch_locs.shape()[1] > 0, "MTP scratch_locs must not be empty.");
   RuntimeCheck(
-      scratch_tokens.ndim() == 2 && scratch_tokens.shape()[1] >= 5 * total_occurrences,
-      "MTP scratch metadata capacity is too small.");
-  RuntimeCheck(scratch_tokens.strides()[0] % 2 == 0, "MTP scratch metadata stride must be 64-bit aligned.");
+      scratch_locs.ndim() == 2 && scratch_locs.shape()[1] > 0,
+      "MTP scratch_locs must have shape [num_requests, scratch_capacity].");
+  const int64_t num_request_slots = scratch_locs.shape()[0];
   RuntimeCheck(
-      scratch_counts.ndim() == 1 && scratch_counts.shape()[0] >= 4 * scratch_locs.shape()[0],
-      "MTP scratch counter capacity is too small.");
+      cache_index.shape()[0] >= num_request_slots,
+      "MTP cache_index request capacity is smaller than scratch_locs.");
+  RuntimeCheck(
+      cache_policy.ndim() == 2 && cache_policy.shape()[0] >= num_request_slots + 1 &&
+          cache_policy.shape()[1] >= HOT_BUFFER_SIZE,
+      "MTP cache_policy must contain one CLOCK control row and one reference-epoch row per request.");
+  RuntimeCheck(
+      scratch_state.ndim() == 2 && scratch_state.shape()[0] >= num_request_slots + 1 &&
+          scratch_state.shape()[1] >= 4 * num_request_slots &&
+          scratch_state.shape()[1] >= 5 * total_occurrences,
+      "MTP scratch_state must contain one counter row and one miss-metadata row per request.");
+  RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "MTP scratch metadata stride must be 64-bit aligned.");
 
   const int64_t host_stride = host_cache_locs.shape()[1];
   RuntimeCheck(
@@ -952,27 +960,33 @@ void load_cache_to_device_buffer_mtp(
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
-  const int64_t ring_hash_stride_0 = ring_hash_keys.strides()[0];
-  const int64_t ring_hash_size = ring_hash_keys.shape()[1];
-  const int64_t cache_ref_stride_0 = cache_ref_bits.strides()[0];
+  const int64_t cache_index_stride_0 = cache_index.strides()[0];
+  const int64_t cache_index_stride_1 = cache_index.strides()[1];
+  const int64_t cache_policy_stride_0 = cache_policy.strides()[0];
   const int64_t scratch_stride_0 = scratch_locs.strides()[0];
-  const int64_t scratch_tokens_stride_0 = scratch_tokens.strides()[0];
-  const int64_t scratch_count_capacity = scratch_counts.shape()[0] / 4;
+  const int64_t scratch_state_stride_0 = scratch_state.strides()[0];
+
+  // Preserve the device kernels' independent restrict-qualified views while
+  // exposing only four packed tensors through FFI. Row 0 is the control
+  // plane; request-owned rows begin at row 1.
+  auto* cache_index_ptr = static_cast<int64_t*>(cache_index.data_ptr());
+  auto* cache_policy_ptr = static_cast<int32_t*>(cache_policy.data_ptr());
+  auto* scratch_state_ptr = static_cast<int32_t*>(scratch_state.data_ptr());
   const MtpCacheState cache_state{
-      static_cast<int64_t*>(ring_hash_keys.data_ptr()),
-      static_cast<int64_t*>(ring_hash_vals.data_ptr()),
-      static_cast<int32_t*>(ring_epoch.data_ptr()),
-      static_cast<int32_t*>(cache_ref_bits.data_ptr()),
-      ring_hash_stride_0,
+      cache_index_ptr,
+      cache_index_ptr + cache_index_stride_1,
+      cache_policy_ptr,
+      cache_policy_ptr + cache_policy_stride_0,
+      cache_index_stride_0,
       ring_hash_size,
-      cache_ref_stride_0};
+      cache_policy_stride_0};
   const MtpMissWorkspace miss_workspace{
       static_cast<int32_t*>(scratch_locs.data_ptr()),
-      static_cast<int32_t*>(scratch_tokens.data_ptr()),
-      static_cast<int32_t*>(scratch_counts.data_ptr()),
+      scratch_state_ptr + scratch_state_stride_0,
+      scratch_state_ptr,
       scratch_stride_0,
-      scratch_tokens_stride_0,
-      scratch_count_capacity};
+      scratch_state_stride_0,
+      num_request_slots};
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
   bool use_pdl = false;

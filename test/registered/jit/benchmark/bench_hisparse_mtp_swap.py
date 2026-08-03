@@ -7,8 +7,7 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 from sglang.kernels.ops.kvcache.hisparse_mtp import (
-    HiSparseMTPCacheState,
-    HiSparseMTPMissWorkspace,
+    HiSparseMTPSwapState,
     load_cache_to_device_buffer_mtp_mla,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -46,8 +45,7 @@ class _BenchmarkState(NamedTuple):
     lru_slots: torch.Tensor
     mtp_out: torch.Tensor
     lru_out: torch.Tensor
-    cache_state: HiSparseMTPCacheState
-    miss_workspace: HiSparseMTPMissWorkspace
+    swap_state: HiSparseMTPSwapState
 
 
 def _make_top_k_tokens(batch_size: int) -> torch.Tensor:
@@ -87,17 +85,15 @@ def _make_top_k_tokens(batch_size: int) -> torch.Tensor:
     return top_k_tokens
 
 
-def _make_ring_hash(
-    batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_cache_index(batch_size: int) -> torch.Tensor:
     hash_size = 1 << (2 * HOT_BUFFER_SIZE - 1).bit_length()
-    primary = torch.full((batch_size, hash_size), -1, dtype=torch.int64, device=DEVICE)
-    secondary = torch.full_like(primary, -1)
+    cache_index = torch.full(
+        (batch_size, 2, hash_size), -1, dtype=torch.int64, device=DEVICE
+    )
     tokens = torch.arange(HOT_BUFFER_SIZE, dtype=torch.int64, device=DEVICE)
     hash_slots = ((tokens * 2654435761) & (hash_size - 1)).to(torch.long)
-    slot_bits = (HOT_BUFFER_SIZE - 1).bit_length()
-    primary[:, hash_slots] = (tokens << slot_bits) | tokens
-    return primary, secondary
+    cache_index[:, 0, hash_slots] = (tokens << 32) | tokens
+    return cache_index
 
 
 def _build_state(batch_size: int) -> _BenchmarkState:
@@ -141,8 +137,14 @@ def _build_state(batch_size: int) -> _BenchmarkState:
     hot_locs = device_buffer_locs[:, :HOT_BUFFER_SIZE].to(torch.long)
     device_buffer[hot_locs] = host_cache[:HOT_BUFFER_SIZE].to(DEVICE)
 
-    hash_primary, hash_secondary = _make_ring_hash(batch_size)
     total_occurrences = NUM_STEPS * TOP_K
+    scratch_state = torch.full(
+        (batch_size + 1, max(4 * batch_size, 5 * total_occurrences)),
+        -1,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    scratch_state[0].zero_()
     return _BenchmarkState(
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
@@ -160,25 +162,15 @@ def _build_state(batch_size: int) -> _BenchmarkState:
         .repeat(batch_size, 1),
         mtp_out=torch.full_like(top_k_tokens, -1),
         lru_out=torch.full_like(top_k_tokens, -1),
-        cache_state=HiSparseMTPCacheState(
-            hash_primary=hash_primary,
-            hash_secondary=hash_secondary,
-            ring_state=torch.zeros(batch_size, dtype=torch.int32, device=DEVICE),
-            ref_epochs=torch.zeros(
-                (batch_size, HOT_BUFFER_SIZE),
+        swap_state=HiSparseMTPSwapState(
+            cache_index=_make_cache_index(batch_size),
+            cache_policy=torch.zeros(
+                (batch_size + 1, HOT_BUFFER_SIZE),
                 dtype=torch.int32,
                 device=DEVICE,
             ),
-        ),
-        miss_workspace=HiSparseMTPMissWorkspace(
-            locs=scratch_locs,
-            metadata=torch.full(
-                (batch_size, 5 * total_occurrences),
-                -1,
-                dtype=torch.int32,
-                device=DEVICE,
-            ),
-            counters=torch.zeros(4 * batch_size, dtype=torch.int32, device=DEVICE),
+            scratch_locs=scratch_locs,
+            scratch_state=scratch_state,
         ),
     )
 
@@ -194,8 +186,7 @@ def _run_mtp(state: _BenchmarkState) -> None:
         top_k_device_locs=state.mtp_out,
         req_pool_indices=state.req_pool_indices,
         seq_lens=state.seq_lens,
-        cache_state=state.cache_state,
-        miss_workspace=state.miss_workspace,
+        state=state.swap_state,
         num_real_reqs=state.num_real_reqs,
     )
 

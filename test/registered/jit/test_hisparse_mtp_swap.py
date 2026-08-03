@@ -6,8 +6,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse_mtp import (
-    HiSparseMTPCacheState,
-    HiSparseMTPMissWorkspace,
+    HiSparseMTPSwapState,
     load_cache_to_device_buffer_mtp_mla,
 )
 from sglang.srt.utils import is_npu, is_xpu
@@ -31,22 +30,19 @@ class _SwapState(NamedTuple):
     host_cache_locs: torch.Tensor
     host_cache: torch.Tensor
     device_buffer: torch.Tensor
-    cache_state: HiSparseMTPCacheState
-    miss_workspace: HiSparseMTPMissWorkspace
+    swap_state: HiSparseMTPSwapState
 
 
-def _make_ring_hash(
-    num_reqs: int, hot_buffer_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_cache_index(num_reqs: int, hot_buffer_size: int) -> torch.Tensor:
     hash_size = 1 << (2 * hot_buffer_size - 1).bit_length()
-    primary = torch.full((num_reqs, hash_size), -1, dtype=torch.int64, device=DEVICE)
-    secondary = torch.full_like(primary, -1)
+    cache_index = torch.full(
+        (num_reqs, 2, hash_size), -1, dtype=torch.int64, device=DEVICE
+    )
     tokens = torch.arange(hot_buffer_size, dtype=torch.int64, device=DEVICE)
     hash_slots = ((tokens * 2654435761) & (hash_size - 1)).to(torch.long)
-    slot_bits = (hot_buffer_size - 1).bit_length()
-    packed_entries = (tokens << slot_bits) | tokens
-    primary[:, hash_slots] = packed_entries
-    return primary, secondary
+    packed_entries = (tokens << 32) | tokens
+    cache_index[:, 0, hash_slots] = packed_entries
+    return cache_index
 
 
 def _make_state(
@@ -99,24 +95,22 @@ def _make_state(
     hot_locs = device_buffer_locs[:, :hot_buffer_size].to(torch.long)
     device_buffer[hot_locs] = host_cache[:hot_buffer_size].to(DEVICE)
 
-    hash_primary, hash_secondary = _make_ring_hash(num_reqs, hot_buffer_size)
-    cache_state = HiSparseMTPCacheState(
-        hash_primary=hash_primary,
-        hash_secondary=hash_secondary,
-        ring_state=torch.zeros(num_reqs, dtype=torch.int32, device=DEVICE),
-        ref_epochs=torch.zeros(
-            (num_reqs, hot_buffer_size), dtype=torch.int32, device=DEVICE
-        ),
+    scratch_state = torch.full(
+        (num_reqs + 1, max(4 * num_reqs, 5 * metadata_occurrences)),
+        -1,
+        dtype=torch.int32,
+        device=DEVICE,
     )
-    miss_workspace = HiSparseMTPMissWorkspace(
-        locs=scratch_locs,
-        metadata=torch.full(
-            (num_reqs, 5 * metadata_occurrences),
-            -1,
+    scratch_state[0].zero_()
+    swap_state = HiSparseMTPSwapState(
+        cache_index=_make_cache_index(num_reqs, hot_buffer_size),
+        cache_policy=torch.zeros(
+            (num_reqs + 1, hot_buffer_size),
             dtype=torch.int32,
             device=DEVICE,
         ),
-        counters=torch.zeros(4 * num_reqs, dtype=torch.int32, device=DEVICE),
+        scratch_locs=scratch_locs,
+        scratch_state=scratch_state,
     )
     return _SwapState(
         device_buffer_tokens=device_buffer_tokens,
@@ -124,8 +118,7 @@ def _make_state(
         host_cache_locs=host_cache_locs,
         host_cache=host_cache,
         device_buffer=device_buffer,
-        cache_state=cache_state,
-        miss_workspace=miss_workspace,
+        swap_state=swap_state,
     )
 
 
@@ -157,8 +150,7 @@ def _run_swap(
         top_k_device_locs=out,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
-        cache_state=state.cache_state,
-        miss_workspace=state.miss_workspace,
+        state=state.swap_state,
         num_real_reqs=num_real_reqs,
     )
     return out
@@ -202,7 +194,7 @@ class TestHiSparseMTPSwap(CustomTestCase):
         torch.cuda.synchronize()
 
         _assert_output_matches_tokens(state, out, top_k_tokens)
-        self.assertEqual(int(state.miss_workspace.counters[0].item()), miss_count)
+        self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), miss_count)
         repeated_miss_locs = out[0, :, -miss_count:]
         self.assertTrue(torch.all(repeated_miss_locs == repeated_miss_locs[0]).item())
 
@@ -245,7 +237,7 @@ class TestHiSparseMTPSwap(CustomTestCase):
         torch.cuda.synchronize()
 
         _assert_output_matches_tokens(state, out, top_k_tokens)
-        self.assertEqual(int(state.miss_workspace.counters[0].item()), 782)
+        self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 782)
 
     def test_resolves_all_speculative_extra_page_slots_without_host_io(self) -> None:
         hot_size, page_size = 4096, 64
@@ -286,7 +278,7 @@ class TestHiSparseMTPSwap(CustomTestCase):
 
         _assert_output_matches_tokens(state, out, top_k_tokens)
         torch.testing.assert_close(out[0, :, -1].to(torch.long), extra_locs)
-        self.assertEqual(int(state.miss_workspace.counters[0].item()), 0)
+        self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 0)
 
     def test_full_union_overflow_preserves_all_8192_outputs(self) -> None:
         hot_size, page_size = 4096, 64
@@ -312,7 +304,7 @@ class TestHiSparseMTPSwap(CustomTestCase):
         _assert_output_matches_tokens(state, out, top_k_tokens)
         self.assertEqual(torch.unique(out).numel(), total_occurrences)
         self.assertEqual(
-            int(state.miss_workspace.counters[0].item()), total_occurrences
+            int(state.swap_state.scratch_state[0, 0].item()), total_occurrences
         )
 
     def test_packed_ring_supports_glm52_native_context_length(self) -> None:
@@ -342,6 +334,14 @@ class TestHiSparseMTPSwap(CustomTestCase):
 
         _assert_output_matches_tokens(state, out, top_k_tokens)
         self.assertTrue(out.ge(0).all().item())
+
+        # The first call admits the high token into the packed hash. The
+        # second call must resolve it as a hot hit rather than truncating the
+        # packed int64 entry and repeating Host-to-GPU IO.
+        out = _run_swap(top_k_tokens=top_k_tokens, seq_lens=seq_lens, state=state)
+        torch.cuda.synchronize()
+        _assert_output_matches_tokens(state, out, top_k_tokens)
+        self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 0)
 
     def test_cuda_graph_replay_preserves_valid_locations(self) -> None:
         hot_size, page_size = 4096, 64

@@ -16,21 +16,24 @@ _MAX_OCCURRENCES = 8192
 _GATHER_BLOCK_SIZE = 64
 
 
-class HiSparseMTPCacheState(NamedTuple):
-    """Persistent per-request state for the MTP CLOCK cache."""
+class HiSparseMTPSwapState(NamedTuple):
+    """Persistent cache state and reusable miss workspace for MTP swap.
 
-    hash_primary: torch.Tensor
-    hash_secondary: torch.Tensor
-    ring_state: torch.Tensor
-    ref_epochs: torch.Tensor
+    ``cache_index`` stores the two int64 hash banks as
+    ``[num_requests, 2, hash_size]``. ``cache_policy`` uses a control-plane row
+    for the packed CLOCK states followed by one reference-epoch row per
+    request: ``[1 + num_requests, hot_buffer_size]``.
 
+    ``scratch_locs`` stores the physical locations assigned to unique misses.
+    ``scratch_state`` likewise uses its first row for four contiguous counter
+    banks and one metadata row per request. Its shape is
+    ``[1 + num_requests, max(4 * num_requests, 5 * max_occurrences)]``.
+    """
 
-class HiSparseMTPMissWorkspace(NamedTuple):
-    """Reusable scratch space for deduplicating and resolving MTP misses."""
-
-    locs: torch.Tensor
-    metadata: torch.Tensor
-    counters: torch.Tensor
+    cache_index: torch.Tensor
+    cache_policy: torch.Tensor
+    scratch_locs: torch.Tensor
+    scratch_state: torch.Tensor
 
 
 @cache_once
@@ -72,8 +75,7 @@ def load_cache_to_device_buffer_mtp_mla(
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    cache_state: HiSparseMTPCacheState,
-    miss_workspace: HiSparseMTPMissWorkspace,
+    state: HiSparseMTPSwapState,
     num_real_reqs: torch.Tensor,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair."""
@@ -81,7 +83,7 @@ def load_cache_to_device_buffer_mtp_mla(
         raise ValueError("top_k_tokens must have shape [batch, steps, top_k].")
 
     batch_size, num_steps, num_top_k = top_k_tokens.shape
-    hot_buffer_size = cache_state.ref_epochs.size(1)
+    hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
     total_occurrences = num_steps * num_top_k
     if not (
@@ -120,13 +122,10 @@ def load_cache_to_device_buffer_mtp_mla(
         top_k_device_locs,
         req_pool_indices,
         seq_lens,
-        cache_state.hash_primary,
-        cache_state.hash_secondary,
-        cache_state.ring_state,
-        cache_state.ref_epochs,
-        miss_workspace.locs,
-        miss_workspace.metadata,
-        miss_workspace.counters,
+        state.cache_index,
+        state.cache_policy,
+        state.scratch_locs,
+        state.scratch_state,
         num_real_reqs,
         page_size,
     )
