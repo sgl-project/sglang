@@ -344,10 +344,9 @@ jobs:
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
             "$URL" -o /tmp/partition-model.json
 
-      # The fanout is pinned at 8 (compute_partitions._BASE_A_OVERRIDES), so
-      # this budget has to be sized by hand. ~450s of tests per shard today;
-      # LPT's 4/3 worst case is ~600s, which a 10m budget cut exactly. 15m
-      # tolerates a 675s average, i.e. 50% growth before the next bump.
+      # compute_partitions reads this budget back to size the fanout, so it
+      # drives shard count rather than capping it. 10m left only ~96s per
+      # shard once the ~354s setup bias came out, which asked for 33 shards.
       - name: Run test
         timeout-minutes: 15
         env:
