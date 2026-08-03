@@ -240,7 +240,7 @@ Commit: `git commit -am "feat(minwm): expose remote VAE latent handoff"`
 - Create: `python/sglang/multimodal_gen/runtime/entrypoints/realtime_vae_server.py`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_worker.py`
 
-- [ ] **Step 1: Write failing state isolation and queue tests**
+- [x] **Step 1: Write failing state isolation and queue tests**
 
 ```python
 @pytest.mark.asyncio
@@ -262,13 +262,13 @@ async def test_worker_rejects_second_waiting_latent():
         await worker.decode(chunk("s", "g", 2))
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_worker.py -q`
 
 Expected: FAIL because worker does not exist.
 
-- [ ] **Step 3: Implement model preload, per-Session state, actor serialization, and immediate frame output**
+- [x] **Step 3: Implement model preload, per-Session state, actor serialization, and immediate frame output**
 
 ```python
 class TAEHVEngine:
@@ -292,7 +292,7 @@ class TAEHVEngine:
 
 Worker 使用全局 actor lock 串行启动 Decode kernel、每 Session `asyncio.Queue(maxsize=1)`、generation-aware state、10 分钟 max lifetime、60 秒 heartbeat TTL；T2V chunk 0/1 保留并重放首 latent 后移除重复首帧，I2V chunk 0 接受已拼接 reference latent。输出按 1 至 3 帧小批立即编码 WebP/JPEG，不等待逻辑 Chunk 全部编码完成。入口提供 `/health`、`/metrics` 和 `/v1/realtime_vae/decode` WebSocket。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_worker.py -q`
 
