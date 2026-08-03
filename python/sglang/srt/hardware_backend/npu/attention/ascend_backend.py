@@ -2238,7 +2238,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or self.is_hybrid_swa:
+        if sinks is not None or (self.is_hybrid_swa and self.use_fia):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -2280,30 +2280,55 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                    query,
-                    k_cache,
-                    v_cache,
-                    num_query_heads=layer.tp_q_head_num,
-                    num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
-                    pre_tokens=(
-                        layer.sliding_window_size
-                        if layer.sliding_window_size != -1
-                        else FULL_ATTENTION_WINDOW
-                    ),
-                    next_tokens=(
-                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
-                    ),
-                    atten_mask=self.fia_mask.to(torch.int8),
-                    sparse_mode=sparse_mode,
-                    softmax_scale=layer.scaling,
-                    block_table=block_tables,
-                    block_size=self.page_size,
-                    actual_seq_qlen=actual_seq_lengths,
-                    actual_seq_kvlen=actual_seq_lengths_kv,
-                    learnable_sink=sinks,
-                )
+                if sinks is None and layer.sliding_window_size != -1:
+                    # Decode (S1=1) makes the kernel ignore pre_tokens, so the
+                    # BSND layout encodes the window in the static swa_mask.
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k_cache,
+                        v_cache,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        pre_tokens=layer.sliding_window_size,
+                        next_tokens=0,
+                        atten_mask=self.forward_metadata.swa_mask,
+                        sparse_mode=sparse_mode,
+                        softmax_scale=layer.scaling,
+                        block_table=block_tables,
+                        block_size=self.page_size,
+                        actual_seq_qlen=[1] * q.shape[0],
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                    )
+                else:
+                    # Use the TND split-fuse path with the window in pre_tokens
+                    # and the fixed 2048-wide causal mask.
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        query,
+                        k_cache,
+                        v_cache,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        pre_tokens=(
+                            layer.sliding_window_size
+                            if layer.sliding_window_size != -1
+                            else FULL_ATTENTION_WINDOW
+                        ),
+                        next_tokens=(
+                            0
+                            if layer.sliding_window_size == -1
+                            else FULL_ATTENTION_WINDOW
+                        ),
+                        atten_mask=self.fia_mask.to(torch.int8),
+                        sparse_mode=sparse_mode,
+                        softmax_scale=layer.scaling,
+                        block_table=block_tables,
+                        block_size=self.page_size,
+                        actual_seq_qlen=actual_seq_lengths,
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                        learnable_sink=sinks,
+                    )
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
