@@ -1,9 +1,9 @@
 //! OpenAI Responses endpoint, response storage, and lifecycle events.
 
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{
@@ -32,7 +32,7 @@ use dynamo_protocols::types::{
     ResponseFormat,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use super::super::guard::AbortGuard;
 use super::chat::{SamplingDefaults, chat_sampling, prepare_chat_request};
@@ -42,19 +42,34 @@ use super::response_stream::{
     text_response_message,
 };
 use super::tools::{dynamo_tool_choice, parse_chat_tool_calls};
-use super::{
-    AppState, ResponseStore, StoredResponse, collect_output, openai_error, submit_generation,
-    unix_seconds,
-};
+use super::{AppState, collect_output, openai_error, submit_generation, unix_seconds};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem, GenerateRequest};
 use crate::tokenizer_manager::AbortSource;
 
+#[derive(Clone)]
+pub(super) struct StoredResponse {
+    pub(super) response: OpenAIResponse,
+    pub(super) messages: Vec<ChatCompletionRequestMessage>,
+    pub(super) rid: Option<Rid>,
+}
+
+pub(super) type ResponseStore = Arc<RwLock<HashMap<String, StoredResponse>>>;
+
+pub(super) fn new_response_store() -> ResponseStore {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 pub(super) fn routes() -> Router<AppState> {
+    routes_with_store(new_response_store())
+}
+
+pub(super) fn routes_with_store(store: ResponseStore) -> Router<AppState> {
     Router::new()
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{response_id}", get(retrieve_response))
         .route("/v1/responses/{response_id}/cancel", post(cancel_response))
+        .layer(Extension(store))
 }
 
 fn invalid_response_id(response_id: &str) -> Option<String> {
@@ -77,14 +92,13 @@ pub(super) fn sse_frame(data: String) -> Event {
 }
 
 async fn retrieve_response(
-    State(state): State<AppState>,
+    Extension(store): Extension<ResponseStore>,
     Path(response_id): Path<String>,
 ) -> Response {
     if let Some(message) = invalid_response_id(&response_id) {
         return openai_error(StatusCode::BAD_REQUEST, message);
     }
-    let response = state
-        .response_store
+    let response = store
         .read()
         .await
         .get(&response_id)
@@ -100,12 +114,13 @@ async fn retrieve_response(
 
 async fn cancel_response(
     State(state): State<AppState>,
+    Extension(store): Extension<ResponseStore>,
     Path(response_id): Path<String>,
 ) -> Response {
     if let Some(message) = invalid_response_id(&response_id) {
         return openai_error(StatusCode::BAD_REQUEST, message);
     }
-    let mut store = state.response_store.write().await;
+    let mut store = store.write().await;
     let Some(stored) = store.get_mut(&response_id) else {
         return openai_error(
             StatusCode::NOT_FOUND,
@@ -397,6 +412,7 @@ pub(super) fn responses_chat_request(
 
 async fn responses(
     State(state): State<AppState>,
+    Extension(store): Extension<ResponseStore>,
     body: Result<Json<CreateResponse>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -467,7 +483,7 @@ async fn responses(
         if let Some(message) = invalid_response_id(response_id) {
             return openai_error(StatusCode::BAD_REQUEST, message);
         }
-        match state.response_store.read().await.get(response_id) {
+        match store.read().await.get(response_id) {
             Some(stored) => stored.messages.clone(),
             None => {
                 return openai_error(
@@ -570,7 +586,7 @@ async fn responses(
             vec![],
             None,
         );
-        state.response_store.write().await.insert(
+        store.write().await.insert(
             response_id.clone(),
             StoredResponse {
                 response: queued.clone(),
@@ -578,7 +594,7 @@ async fn responses(
                 rid: Some(rid.clone()),
             },
         );
-        let store = state.response_store.clone();
+        let store = store.clone();
         let task_response_id = response_id.clone();
         tokio::spawn(async move {
             {
@@ -657,7 +673,7 @@ async fn responses(
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
-            state.response_store,
+            store,
             response_messages,
         )
         // Python `_send_event` frames each event as
@@ -679,7 +695,7 @@ async fn responses(
             parser,
             reasoning_parser,
             tools,
-            state.response_store,
+            store,
             response_messages,
         )
         .await
@@ -889,7 +905,10 @@ fn unary_response_value(response: OpenAIResponse) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chunk, response_request, senders};
-    use super::{responses_chat_request, responses_event_stream, sse_frame, unary_responses};
+    use super::{
+        new_response_store, responses_chat_request, responses_event_stream, sse_frame,
+        unary_responses,
+    };
     use crate::api_server::guard::AbortGuard;
     use dynamo_protocols::types::responses::CreateResponse;
     use dynamo_protocols::types::{ChatCompletionRequestMessage, ChatCompletionToolChoiceOption};
@@ -958,7 +977,7 @@ mod tests {
             None,
             None,
             None,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         )
         .await;
@@ -995,7 +1014,7 @@ mod tests {
             None,
             None,
             false,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         );
         futures::pin_mut!(stream);
@@ -1079,7 +1098,7 @@ mod tests {
             None,
             None,
             false,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         );
         futures::pin_mut!(stream);
@@ -1116,7 +1135,7 @@ mod tests {
             None,
             None,
             false,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         );
         futures::pin_mut!(stream);
@@ -1157,7 +1176,7 @@ mod tests {
             Some("llama3".into()),
             Some("deepseek-r1".into()),
             None,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         )
         .await;
@@ -1196,7 +1215,7 @@ mod tests {
             None,
             Some("deepseek-r1".into()),
             None,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         )
         .await;
@@ -1233,7 +1252,7 @@ mod tests {
             None,
             None,
             false,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         );
         futures::pin_mut!(stream);
@@ -1330,7 +1349,7 @@ mod tests {
             None,
             None,
             false,
-            super::super::new_response_store(),
+            new_response_store(),
             vec![],
         );
         futures::pin_mut!(stream);
@@ -1365,7 +1384,7 @@ mod tests {
     async fn unary_responses_stores_reasoning_for_the_next_turn() {
         use dynamo_protocols::types::ChatCompletionRequestMessage;
 
-        let store = super::super::new_response_store();
+        let store = new_response_store();
         let (tx, rx) = mpsc::channel(8);
         tx.send(chunk("r0", "<think>think hard</think>Paris", true))
             .await

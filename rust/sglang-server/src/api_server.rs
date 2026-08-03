@@ -21,14 +21,13 @@ use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,
-/// and API-owned formatter/response-store state.
+/// and API-owned formatter state.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     chat_formatter: Option<openai::ChatFormatter>,
-    response_store: openai::ResponseStore,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
@@ -50,7 +49,6 @@ pub async fn serve(
         egress_buf,
         server_args: server_args.clone(),
         chat_formatter,
-        response_store: openai::new_response_store(),
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.

@@ -19,9 +19,9 @@ use dynamo_protocols::types::responses::{CreateResponse, Status};
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::new_response_store;
 use super::response_stream::response_object;
-use super::{StoredResponse, routes, unix_seconds};
+use super::responses::{StoredResponse, new_response_store, routes_with_store};
+use super::{routes, unix_seconds};
 use crate::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem};
 use crate::runtime::ServerArgs;
@@ -127,7 +127,6 @@ pub(super) fn app_state(senders: Senders) -> super::AppState {
         egress_buf: 8,
         server_args: server_args(),
         chat_formatter: None,
-        response_store: new_response_store(),
         egress_activity: Default::default(),
     }
 }
@@ -410,7 +409,8 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
 async fn response_retrieve_and_cancel_lifecycle() {
     let (senders, abort_rx) = senders_with_abort_rx();
     let state = app_state(senders);
-    let app = routes().with_state(state.clone());
+    let store = new_response_store();
+    let app = routes_with_store(store.clone()).with_state(state);
 
     // Unknown / malformed ids.
     let response = oneshot(app.clone(), request("GET", "/v1/responses/resp_missing")).await;
@@ -422,7 +422,7 @@ async fn response_retrieve_and_cancel_lifecycle() {
     // need a real scheduler behind the tm lane. `Rid::from_client` mints a
     // fresh uniquified rid per call, so capture the one the store holds.
     let seeded_rid = Rid::from_client("resp_seeded");
-    state.response_store.write().await.insert(
+    store.write().await.insert(
         "resp_seeded".into(),
         StoredResponse {
             response: response_object(
