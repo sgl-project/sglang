@@ -99,16 +99,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
-
         self.page_size = params.page_size
         self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(self.hybrid_kv_cache, HybridLinearKVPool):
