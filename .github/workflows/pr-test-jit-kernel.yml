@@ -57,14 +57,14 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
@@ -95,14 +95,14 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
@@ -135,14 +135,14 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
@@ -175,14 +175,14 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 

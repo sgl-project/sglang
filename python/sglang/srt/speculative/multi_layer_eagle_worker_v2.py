@@ -50,6 +50,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
+    organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -82,6 +83,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.profile_utils import build_step_span_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -130,6 +133,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        self._rebuild_topk1_chain_buffers()
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
@@ -401,7 +406,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -440,6 +445,30 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
 
+        # Chain-style (topk=1, one token per draft step, all of them selected):
+        # _draft_forward_organize's slice/cat/topk/sort/gather is the identity on
+        # topk_index, and parent_list is the constant [-1, 0, .., S-2] per row.
+        parents_prealloc = self._topk1_parents_prealloc
+        if (
+            parents_prealloc is not None
+            and topk_index.shape[1] == self.speculative_num_steps
+            and topk_index.shape[0] <= parents_prealloc.shape[0]
+        ):
+            bs = topk_index.shape[0]
+            return (
+                parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
+                topk_index,
+            )
+
+        return self._draft_forward_organize(topk_p, topk_index, hidden_states)
+
+    def _draft_forward_organize(
+        self,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -471,33 +500,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         )
                     )
 
-        # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
-
-        return parent_list, top_scores_index, draft_tokens
 
     def draft_extend(self):
         pass
@@ -727,7 +732,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
+        can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
@@ -737,54 +742,57 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ret_draft_probs = None
         next_token_ids_backup = batch_result.next_token_ids.clone()
 
-        if can_cuda_graph:
-            cgr = self.cuda_graph_runner_for_draft_extend
-            # Populate the single shared buffer set once; each step replays
-            # against it and the chain is advanced in place between steps.
-            cgr.prepare(forward_batch)
-            rotates_in_graph = cgr.rotates_in_graph
-            for step in range(self.speculative_num_steps):
-                _out, ret_topk_p, ret_topk_index = cgr.replay(step)
-                # Rejection sampling with the per-step runner re-picks X ~ q
-                # worker-side so the worker rotation carries it to step N+1; the
-                # single-CG runner samples in-graph (q cloned after the loop).
-                if (
-                    self.use_rejection_sampling
-                    and self.topk == 1
-                    and not rotates_in_graph
-                ):
-                    if cgr.prune_draft_extend_logits:
-                        step_logits = _out.next_token_logits
+        if can_run_decode_cuda_graph:
+            # Graph replay bypasses ModelRunner.forward, which emits the
+            # step[...] trace span for every other phase; emit it here.
+            with profile_range(build_step_span_name(forward_batch)):
+                cgr = self.cuda_graph_runner_for_draft_extend
+                # Populate the single shared buffer set once; each step replays
+                # against it and the chain is advanced in place between steps.
+                cgr.prepare(forward_batch)
+                rotates_in_graph = cgr.rotates_in_graph
+                for step in range(self.speculative_num_steps):
+                    _out, ret_topk_p, ret_topk_index = cgr.replay(step)
+                    # Rejection sampling with the per-step runner re-picks X ~ q
+                    # worker-side so the worker rotation carries it to step N+1; the
+                    # single-CG runner samples in-graph (q cloned after the loop).
+                    if (
+                        self.use_rejection_sampling
+                        and self.topk == 1
+                        and not rotates_in_graph
+                    ):
+                        if cgr.prune_draft_extend_logits:
+                            step_logits = _out.next_token_logits
+                        else:
+                            sel = cgr.buffers.select_index[: cgr.raw_bs]
+                            step_logits = _out.next_token_logits[sel]
+                        probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                            step_logits,
+                            forward_batch.sampling_info.temperatures,
+                        )
+                        ret_draft_probs_list.append(probs)
+                    if rotates_in_graph:
+                        # Single-CG step outputs coexist until the trailing cat.
+                        ret_topk_p_list.append(ret_topk_p)
+                        ret_topk_index_list.append(ret_topk_index)
                     else:
-                        sel = cgr.buffers.select_index[: cgr.raw_bs]
-                        step_logits = _out.next_token_logits[sel]
-                    probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        step_logits,
-                        forward_batch.sampling_info.temperatures,
-                    )
-                    ret_draft_probs_list.append(probs)
-                if rotates_in_graph:
-                    # Single-CG step outputs coexist until the trailing cat.
-                    ret_topk_p_list.append(ret_topk_p)
-                    ret_topk_index_list.append(ret_topk_index)
-                else:
-                    # Per-step graphs share the global graph pool; snapshot
-                    # before the next step's replay can reuse the buffer.
-                    ret_topk_p_list.append(ret_topk_p.clone())
-                    ret_topk_index_list.append(ret_topk_index.clone())
-                # Advance the draft chain by rotating the shared input_ids window
-                # in place; step N+1's graph then reads the rotated values. The
-                # single-CG runner rotates in-graph, so skip the worker-side rotate.
-                if step < self.speculative_num_steps - 1 and not rotates_in_graph:
-                    rotate_input_ids(
-                        cgr.buffers.input_ids[: cgr.raw_num_tokens],
-                        cgr.buffers.extend_start_loc[: cgr.raw_bs],
-                        cgr.buffers.extend_seq_lens[: cgr.raw_bs],
-                        ret_topk_index,
-                        cgr.buffers.select_index[: cgr.raw_bs],
-                    )
-            if self.use_rejection_sampling and self.topk == 1 and rotates_in_graph:
-                ret_draft_probs = cgr.clone_draft_probs()
+                        # Per-step graphs share the global graph pool; snapshot
+                        # before the next step's replay can reuse the buffer.
+                        ret_topk_p_list.append(ret_topk_p.clone())
+                        ret_topk_index_list.append(ret_topk_index.clone())
+                    # Advance the draft chain by rotating the shared input_ids window
+                    # in place; step N+1's graph then reads the rotated values. The
+                    # single-CG runner rotates in-graph, so skip the worker-side rotate.
+                    if step < self.speculative_num_steps - 1 and not rotates_in_graph:
+                        rotate_input_ids(
+                            cgr.buffers.input_ids[: cgr.raw_num_tokens],
+                            cgr.buffers.extend_start_loc[: cgr.raw_bs],
+                            cgr.buffers.extend_seq_lens[: cgr.raw_bs],
+                            ret_topk_index,
+                            cgr.buffers.select_index[: cgr.raw_bs],
+                        )
+                if self.use_rejection_sampling and self.topk == 1 and rotates_in_graph:
+                    ret_draft_probs = cgr.clone_draft_probs()
         else:
             logger.warning_once(
                 "can't use cuda graph for draft extend! may have correctness issue!"
@@ -897,12 +905,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
         )
 
         self._draft_worker = MultiLayerEagleDraftWorker(
