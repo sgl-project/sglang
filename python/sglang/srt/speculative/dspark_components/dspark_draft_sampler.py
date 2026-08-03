@@ -20,13 +20,8 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
 
 
 class DsparkDraftSampler:
-    """Graph-folded draft proposal head, captured as a draft-graph tail hook.
-
-    With folded_sampling, greedy rows argmax and sampling rows Gumbel-sample
-    in one in-graph pass (params staged into static buffers before each
-    replay; corrected block logits exported for the sampling accept path).
-    Without it, every row argmaxes and sampling batches propose eagerly.
-    """
+    """Draft proposal head folded into the draft graph as a tail hook; with
+    folded_sampling it also Gumbel-samples non-greedy rows in-graph."""
 
     def __init__(
         self,
