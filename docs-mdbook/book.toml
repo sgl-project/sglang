@@ -1,0 +1,13 @@
+[book]
+title = "SGLang 源码深度解读：从入门到进阶"
+description = "面向 AI 基础设施工程师的 SGLang 代码库深入分析文档，基于本仓库 main 分支 (dd6ddc053) 编写。"
+authors = ["SGLang Study Notes"]
+language = "zh"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[build]
+create-missing = false
