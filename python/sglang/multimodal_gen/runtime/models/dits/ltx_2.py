@@ -10,11 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.ltx2_qknorm_split_rope import (
+from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
 )
-from sglang.jit_kernel.diffusion.residual_gate_add import (
+from sglang.kernels.ops.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
 )
@@ -182,7 +182,7 @@ def _ltx2_try_fused_ada_values9(
         return None
 
     try:
-        from sglang.jit_kernel.diffusion.triton.ltx2_ada_values import (
+        from sglang.kernels.ops.diffusion.triton.ltx2_ada_values import (
             ltx2_ada_values9,
         )
 
@@ -264,7 +264,7 @@ def apply_split_rotary_emb(
         and cos.is_cuda
         and sin.is_cuda
     ):
-        from sglang.jit_kernel.diffusion.triton.ltx2_rotary import (
+        from sglang.kernels.ops.diffusion.triton.ltx2_rotary import (
             apply_ltx2_split_rotary_emb,
         )
 
