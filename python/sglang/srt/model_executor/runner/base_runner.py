@@ -289,7 +289,7 @@ class BaseRunner(ABC):
         )
 
         cp_group = parallel.dcp_group
-        device = torch.device(mr.device)
+        device = torch.device(f"cuda:{mr.gpu_id}")
         custom_ar_supported = can_use_custom_all_reduce_v2(cp_group.cpu_group, device)
         same_node = all(in_the_same_node_as(cp_group.cpu_group, source_rank=0))
         if not custom_ar_supported or not same_node:
