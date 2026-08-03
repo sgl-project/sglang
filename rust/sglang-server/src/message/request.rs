@@ -476,10 +476,17 @@ fn split_mm_column(
             }
             Ok(items.into_iter().map(Some).collect())
         }
-        scalar => Ok(match broadcast {
-            MmBroadcast::WrapInList => vec![Some(rmpv::Value::Array(vec![scalar])); n],
-            MmBroadcast::AsIs => vec![Some(scalar); n],
-        }),
+        scalar => {
+            // A scalar broadcast deep-clones the value once per prompt — the
+            // same abort-on-allocation-failure blow-up as sampling_params
+            // above. Bound the product before any clone.
+            check_broadcast_budget(scalar.heap_bytes(), n, "value")
+                .map_err(|e| e.to_string())?;
+            Ok(match broadcast {
+                MmBroadcast::WrapInList => vec![Some(rmpv::Value::Array(vec![scalar])); n],
+                MmBroadcast::AsIs => vec![Some(scalar); n],
+            })
+        }
     }
 }
 
@@ -704,6 +711,23 @@ impl HeapBytes for TokenIds {
 impl<T: HeapBytes> HeapBytes for Option<T> {
     fn heap_bytes(&self) -> usize {
         self.as_ref().map_or(0, HeapBytes::heap_bytes)
+    }
+}
+impl HeapBytes for rmpv::Value {
+    fn heap_bytes(&self) -> usize {
+        use rmpv::Value;
+        const NODE: usize = std::mem::size_of::<rmpv::Value>();
+        match self {
+            Value::String(s) => s.as_bytes().len(),
+            Value::Binary(b) => b.len(),
+            Value::Ext(_, b) => b.len(),
+            Value::Array(items) => items.iter().map(|v| NODE + v.heap_bytes()).sum(),
+            Value::Map(entries) => entries
+                .iter()
+                .map(|(k, v)| 2 * NODE + k.heap_bytes() + v.heap_bytes())
+                .sum(),
+            _ => 0,
+        }
     }
 }
 
@@ -969,6 +993,24 @@ mod tests {
         let video = ps[1].mm.as_ref().unwrap().video_data.clone().unwrap();
         assert_eq!(video.as_str(), Some("v"));
         assert!(ps[1].has_multimodal());
+    }
+
+    /// A scalar mm value broadcast to a batch is budget-checked before the
+    /// deep clones (16 MiB × 4096 prompts would be 64 GiB and an abort);
+    /// per-item lists clone nothing and are never charged.
+    #[test]
+    fn oversized_mm_broadcast_rejected() {
+        let big = rmpv::Value::from("x".repeat(MAX_BROADCAST_CLONE_BYTES / 2 + 1));
+        let err = split_mm_column(Some(big.clone()), 2, true, MmBroadcast::WrapInList)
+            .err()
+            .unwrap();
+        assert!(err.contains("broadcast"), "{err}");
+        // A per-item list of the same total size moves, not clones: accepted.
+        let list = rmpv::Value::Array(vec![big, rmpv::Value::from("y")]);
+        assert!(split_mm_column(Some(list), 2, true, MmBroadcast::WrapInList).is_ok());
+        // Small scalars broadcast fine.
+        let small = rmpv::Value::from("u1");
+        assert!(split_mm_column(Some(small), 2, true, MmBroadcast::AsIs).is_ok());
     }
 
     /// `take_mm_work` clones `text` (the scheduler header still needs it) and
