@@ -1142,7 +1142,7 @@ mod tests {
     /// pins. Nothing may reach the scheduler ring.
     #[test]
     fn detokenize_flows_register_then_decode_and_skips_the_ring() {
-        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
         let (tx, mut rx) = mpsc::channel(8);
         ingress.drive(Request {
             rid: "41".into(),
@@ -1177,7 +1177,7 @@ mod tests {
     /// leak and no decode job to drop).
     #[test]
     fn detokenize_negative_ids_reject_before_registration() {
-        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
         let (tx, mut rx) = mpsc::channel(8);
         ingress.drive(Request {
             rid: "43".into(),
