@@ -515,9 +515,10 @@ class HybridCacheController(BaseHiCacheController):
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
+            target_device_pool = self.mem_pool_host.anchor_entry.device_pool
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+                    target_device_pool,
                     host_indices,
                     device_indices,
                     i,
