@@ -99,6 +99,9 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            from sglang.srt.runtime_context import get_parallel
+
+            _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -106,6 +109,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=allocator_type,
+                dcp_size=_parallel.attn_dcp_size,
+                dcp_rank=_parallel.attn_dcp_rank,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
