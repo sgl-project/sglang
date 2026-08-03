@@ -65,9 +65,8 @@ class CpCacheLayerSplitPoolBase:
         )
 
     def _is_layer_owned(self, layer_id: int) -> bool:
-        local_idx = self._local_layer_idx(layer_id)
-        owned_start, owned_end = self._owned_local_layer_range()
-        return owned_start <= local_idx < owned_end
+        owned_start, owned_end = self._owned_global_layer_range()
+        return owned_start <= layer_id < owned_end
 
     def _get_layer_owner_rank(self, layer_id: int) -> int:
         return get_layer_owner(
@@ -84,26 +83,15 @@ class CpCacheLayerSplitPoolBase:
         }
 
     def _log_layer_shard_plan(self) -> None:
-        partitions = []
-        for rank in range(self.cp_size):
-            start, end = get_global_layer_shard_range(
-                rank,
-                self.cp_size,
-                self._layer_shard_start_layer,
-                self._layer_shard_layer_num,
-            )
-            partitions.append(f"r{rank}:[{start},{end})")
         owned_start, owned_end = self._owned_global_layer_range()
         logger.info(
-            "Cache LayerSplit plan: stage=[%s,%s), cp_rank=%s, cp_size=%s, "
-            "owned=[%s,%s), partitions=%s",
+            "Cache LayerSplit shard: stage=[%s,%s), cp_rank=%s/%s, owned=[%s,%s)",
             self._layer_shard_start_layer,
             self._layer_shard_start_layer + self._layer_shard_layer_num,
             self.cp_rank,
             self.cp_size,
             owned_start,
             owned_end,
-            "; ".join(partitions),
         )
 
 

@@ -79,9 +79,11 @@ class TestCpCacheLayerSplitOwnership(CustomTestCase):
         self.assertEqual(mapping[30], 0)
         self.assertEqual(mapping[34], 4)
 
-    def test_layer_outside_stage_is_rejected(self):
+    def test_layer_outside_stage_is_not_owned_and_has_no_owner(self):
         pool = _OwnershipOnlyPool(0, 2, 10, 4)
 
+        self.assertFalse(pool._is_layer_owned(9))
+        self.assertFalse(pool._is_layer_owned(14))
         with self.assertRaisesRegex(ValueError, "outside Cache LayerSplit stage"):
             pool._get_layer_owner_rank(9)
 
