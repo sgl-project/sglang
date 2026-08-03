@@ -124,7 +124,28 @@ experimental/  # 实验性组件，如 sgl-router
 
 现在你只需要记住一点：**入口在 `srt`，前端在 `lang`**。其他目录遇到时再认识。
 
-## 2.7 本章自测
+## 2.7 三种语言，各管一摊
+
+如果你扫一眼仓库，会发现代码不止 Python：有 `rust/`，还有一堆 `.cu`、`.cpp` 和 Triton 文件。它们不是"同一个功能的三种写法"，而是**各管各的一层**：
+
+```text
+Python       = 总指挥：接请求、排队、决定 GPU 跑什么
+Rust         = 替代 Python 干"高频 CPU 杂活"：HTTP 解析、文本 ↔ token
+CUDA/Triton  = GPU 上真正干重活的内核：注意力、矩阵乘、采样
+```
+
+一个请求大致是这么穿过三层的：
+
+```text
+你的请求 → Rust/Python 把文本变成 token ids
+         → Python 调度器决定"这一批跑什么"
+         → CUDA/Triton 内核在 GPU 上算出新 token
+         → Python/Rust 把 token 拼回文本返回给你
+```
+
+现在只需要记住这个分工，不用记细节。第 9 章会讲 GPU 内核，第 16 章会讲 Rust 与 Python 的边界和完整分层。
+
+## 2.8 本章自测
 
 1. 启动日志里 `KV Cache is allocated` 的 `#tokens` 是什么含义？
 2. `usage.prompt_tokens` 和 `completion_tokens` 分别对应哪个阶段？
