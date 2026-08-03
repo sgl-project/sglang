@@ -5,9 +5,11 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import msgspec.msgpack
 
+from sglang.srt.entrypoints import v1_loads
 from sglang.srt.entrypoints.v1_loads import get_loads
 from sglang.srt.managers.load_snapshot import (
     HEADER_STRUCT,
@@ -91,6 +93,19 @@ class TestLoadsResponse(CustomTestCase):
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
 
 
+class TestLoadsAcceleratorField(CustomTestCase):
+    def test_accelerator_reported_in_json(self):
+        """Guards the response contract: the JSON envelope carries an
+        "accelerator" field with the detected device name."""
+        manager = _FakeHttpTokenizerManager([LoadSnapshot(dp_rank=0)])
+
+        with mock.patch.object(
+            v1_loads, "_accelerator_name", return_value="NVIDIA GB300"
+        ):
+            response = asyncio.run(get_loads(tokenizer_manager=manager))
+            self.assertEqual(response["accelerator"], "NVIDIA GB300")
+
+
 class TestGetLoads(CustomTestCase):
     def test_load_snapshot_wire_format_is_msgpack_slots(self):
         path = _temp_path()
@@ -156,7 +171,9 @@ class TestGetLoads(CustomTestCase):
                     disaggregation=DisaggregationMetrics(
                         mode="decode", decode_transfer_queue_reqs=4
                     ),
-                    queues=QueueMetrics(waiting=2, grammar=1, paused=0, retracted=3),
+                    queues=QueueMetrics(
+                        waiting=2, grammar=1, paused=0, retracted=3, prealloc_ready=1
+                    ),
                 )
             )
 

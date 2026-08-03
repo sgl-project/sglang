@@ -96,6 +96,15 @@ class MoeRunner:
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
         elif runner_backend.is_hpc_ops():
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
+            if major != 9:
+                raise ValueError(
+                    "--moe-runner-backend hpc_ops requires an SM90 (Hopper) "
+                    "GPU (the HPC-Ops kernels ship sm90a only), got "
+                    f"sm{major}{minor}."
+                )
             self.runner_core = None  # HPC-Ops only supports the fused path
             # Import here (not at module top, to avoid a circular import) to
             # register the hpc_ops fused func before the pool lookup.

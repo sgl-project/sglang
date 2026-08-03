@@ -53,7 +53,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_device, get_parallel
 
 
 @dataclass
@@ -79,11 +79,18 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     cu_seqlens_q_prev_tensor: Optional[Any] = None
     cu_seqlens_q_next_tensor: Optional[Any] = None
 
+    # Combined prev-then-next TRT-LLM geometry (shape [2 * bs] or [2 * bs + 1]).
+    actual_seq_q_combined_tensor: Optional[Any] = None
+    kv_len_combined_tensor: Optional[Any] = None
+    cu_seqlens_q_combined_tensor: Optional[Any] = None
+    cu_seqlens_kv_combined_tensor: Optional[Any] = None
+
     # Scalars derived from the per-sequence lists above.
     total_q_prev_tokens: int = 0
     total_q_next_tokens: int = 0
     max_seqlen_q_prev: int = 0
     max_seqlen_q_next: int = 0
+    max_seqlen_q_combined: int = 0
 
     # Per-sequence CPU lists, useful for indexers and diagnostics.
     kv_len_prev_list: Optional[List[int]] = None
@@ -208,16 +215,18 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
 
-        from sglang.srt.runtime_context import get_server_args
-
         try:
-            device = torch.device(get_server_args().device)
+            device = torch.device(get_device().device)
         except Exception:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cu_prev = [0] + list(accumulate(actual_seq_q_prev_list))
         cu_next = [0] + list(accumulate(actual_seq_q_next_list))
         cu_kv_prev = [0] + list(accumulate(kv_len_prev_list))
         cu_kv_next = [0] + list(accumulate(kv_len_next_list))
+        actual_seq_q_combined_list = actual_seq_q_prev_list + actual_seq_q_next_list
+        kv_len_combined_list = kv_len_prev_list + kv_len_next_list
+        cu_q_combined = [0] + list(accumulate(actual_seq_q_combined_list))
+        cu_kv_combined = [0] + list(accumulate(kv_len_combined_list))
 
         total_seq_lens = sum(extend_seqs_len)
         assert len(split_list) == bs * cp_segment_num
@@ -258,6 +267,18 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             cu_seqlens_q_next_tensor=torch.tensor(
                 cu_next, device=device, dtype=torch.int32
             ),
+            actual_seq_q_combined_tensor=torch.tensor(
+                actual_seq_q_combined_list, device=device, dtype=torch.int32
+            ),
+            kv_len_combined_tensor=torch.tensor(
+                kv_len_combined_list, device=device, dtype=torch.int32
+            ),
+            cu_seqlens_q_combined_tensor=torch.tensor(
+                cu_q_combined, device=device, dtype=torch.int32
+            ),
+            cu_seqlens_kv_combined_tensor=torch.tensor(
+                cu_kv_combined, device=device, dtype=torch.int32
+            ),
             total_q_prev_tokens=cu_prev[-1],
             total_q_next_tokens=cu_next[-1],
             max_seqlen_q_prev=(
@@ -265,6 +286,9 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             ),
             max_seqlen_q_next=(
                 max(actual_seq_q_next_list) if actual_seq_q_next_list else 0
+            ),
+            max_seqlen_q_combined=(
+                max(actual_seq_q_combined_list) if actual_seq_q_combined_list else 0
             ),
             kv_len_prev_list=kv_len_prev_list,
             kv_len_next_list=kv_len_next_list,
@@ -336,24 +360,31 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         prev_kwargs = {}
         next_kwargs = {}
         if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
-            prev_kwargs["cu_seqlens_kv"] = meta.cu_seqlens_kv_prev_tensor
-            next_kwargs["cu_seqlens_kv"] = meta.cu_seqlens_kv_next_tensor
+            result = attn_fn(
+                q[:logical_tokens],
+                meta.cu_seqlens_q_combined_tensor,
+                meta.kv_len_combined_tensor,
+                meta.max_seqlen_q_combined,
+                cu_seqlens_kv=meta.cu_seqlens_kv_combined_tensor,
+                use_zigzag_page_table=True,
+            )
+        else:
+            result_prev = attn_fn(
+                q_prev,
+                meta.cu_seqlens_q_prev_tensor,
+                meta.kv_len_prev_tensor,
+                meta.max_seqlen_q_prev,
+                **prev_kwargs,
+            )
+            result_next = attn_fn(
+                q_next,
+                meta.cu_seqlens_q_next_tensor,
+                meta.kv_len_next_tensor,
+                meta.max_seqlen_q_next,
+                **next_kwargs,
+            )
+            result = torch.cat([result_prev, result_next], dim=0)
 
-        result_prev = attn_fn(
-            q_prev,
-            meta.cu_seqlens_q_prev_tensor,
-            meta.kv_len_prev_tensor,
-            meta.max_seqlen_q_prev,
-            **prev_kwargs,
-        )
-        result_next = attn_fn(
-            q_next,
-            meta.cu_seqlens_q_next_tensor,
-            meta.kv_len_next_tensor,
-            meta.max_seqlen_q_next,
-            **next_kwargs,
-        )
-        result = torch.cat([result_prev, result_next], dim=0)
         pad_size = q.shape[0] - logical_tokens
         assert pad_size >= 0
         if pad_size > 0:
@@ -363,8 +394,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return result
 
     def materialize_full_kv(
-        self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
-    ) -> None:
+        self,
+        forward_batch,
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
+        swa_loc: Optional[Any] = None,
+    ) -> Any:
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
