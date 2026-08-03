@@ -318,8 +318,12 @@ class Mxfp4Config(QuantizationConfig):
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
+            # Attention wrappers, embeddings and other non-linear modules do
+            # not carry fp4 tensors in an MXFP4 checkpoint (only the experts
+            # do); returning None routes them through the default unquantized
+            # path, same as every other quant config does. Raising here made
+            # any model with a real attention module unloadable.
+            return None
         return None
 
     def get_scaled_act_names(self) -> List[str]:
