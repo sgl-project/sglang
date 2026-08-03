@@ -1006,6 +1006,12 @@ EXCLUSIVE_ARG=()
 EXCLUDE_ARG=()
 [[ -n "${SLURM_EXCLUDE:-}" ]] && EXCLUDE_ARG=(--exclude="$SLURM_EXCLUDE")
 
+# Validation-only: exercise the existing EP8 path with g20 as prefill.
+if [[ "$MATRIX_CONFIG_NAME" == "dsv4flash-fp8-1k1k-1p1d" ]]; then
+    NODELIST_ARG=(--nodelist="mia1-p01-g20,mia1-p02-g09")
+    EXCLUDE_ARG=()
+fi
+
 # Nodes = sum over engines of nodes-per-engine. EP<=8 (PN_PER=DN_PER=1) gives the
 # original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
 TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
