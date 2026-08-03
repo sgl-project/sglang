@@ -707,7 +707,7 @@ TWO_GPU_CASES = [
                 "seed": 42,
             },
         ),
-        run_perf_check=False,
+        run_perf_check=True,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
