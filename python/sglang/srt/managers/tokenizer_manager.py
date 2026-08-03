@@ -147,6 +147,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.shm_transport_utils import SHM_TRANSPORT, is_shm_ref
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -337,6 +338,39 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+
+def _input_embeds_width(input_embeds: Any) -> Optional[int]:
+    """Row width of inline embeds or of a shm TensorRef (None for the
+    nested-batch inline form, which normalization has already split)."""
+    if is_shm_ref(input_embeds):
+        return int(input_embeds["shape"][1])
+    first_row = input_embeds[0]
+    if isinstance(first_row, (list, tuple)):
+        if not first_row:
+            return 0
+        if isinstance(first_row[0], bool) or not isinstance(
+            first_row[0], (int, float)
+        ):
+            return None
+        return len(first_row)
+    return None
+
+
+def _input_embeds_len(input_embeds: Any) -> int:
+    """Row count of inline embeds or of a shm TensorRef (validating its shape)."""
+    if not is_shm_ref(input_embeds):
+        return len(input_embeds)
+    shape = input_embeds.get("shape")
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 2
+        or not all(isinstance(dim, int) and dim > 0 for dim in shape)
+        or not isinstance(input_embeds.get("name"), str)
+    ):
+        raise ValueError(f"malformed shm input_embeds ref: {input_embeds!r}")
+    return shape[0]
 
 
 class InputFormat(Enum):
@@ -922,6 +956,94 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _validate_context_forward_fields(self, obj: GenerateReqInput) -> None:
+        """Pin the session-context-forward v1 envelope at the API boundary so
+        unsupported paths reject loudly instead of running subtly wrong."""
+        if obj.query_attention is not None:
+            if obj.query_attention != "bidirectional":
+                raise ValueError(
+                    f"unsupported query_attention: {obj.query_attention!r} "
+                    "(only 'bidirectional' exists)"
+                )
+            if obj.input_embeds is None:
+                raise ValueError("query_attention requires input_embeds")
+            if (obj.sampling_params or {}).get("max_new_tokens") != 0:
+                raise ValueError(
+                    "query_attention requires max_new_tokens=0 "
+                    "(context forwards are prefill-only)"
+                )
+            prefill_backend = self.server_args.get_attention_backends()[0]
+            if prefill_backend not in ("fa3", "fa4"):
+                raise ValueError(
+                    "query_attention requires a flashattention prefill "
+                    f"backend, got {prefill_backend!r}"
+                )
+            if self.server_args.tp_size != 1:
+                raise ValueError(
+                    "query_attention requires tp_size=1, got "
+                    f"{self.server_args.tp_size}"
+                )
+            if self.server_args.pp_size != 1:
+                raise ValueError(
+                    "query_attention requires pp_size=1, got "
+                    f"{self.server_args.pp_size}"
+                )
+            if self.server_args.disaggregation_mode != "null":
+                raise ValueError("query_attention is unsupported under disaggregation")
+            if self.server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "query_attention is unsupported with speculative decoding"
+                )
+            if self.server_args.page_size > 1:
+                raise ValueError(
+                    "query_attention requires page_size=1 (page-aligned radix "
+                    "matching cannot satisfy tail coverage)"
+                )
+            embeds_len = _input_embeds_len(obj.input_embeds)
+            if embeds_len > self.server_args.chunked_prefill_size > 0:
+                # a chunk-split bidirectional span would degrade to
+                # block-causal attention; the scheduler also refuses to split
+                raise ValueError(
+                    f"query span of {embeds_len} exceeds chunked_prefill_size "
+                    f"{self.server_args.chunked_prefill_size}"
+                )
+        if obj.hidden_states_transport is not None:
+            if obj.hidden_states_transport != SHM_TRANSPORT:
+                raise ValueError(
+                    f"unsupported hidden_states_transport: "
+                    f"{obj.hidden_states_transport!r} (only 'shm' exists)"
+                )
+            if not obj.return_hidden_states:
+                raise ValueError(
+                    "hidden_states_transport requires return_hidden_states"
+                )
+            sampling = obj.sampling_params or {}
+            if sampling.get("max_new_tokens") != 0:
+                raise ValueError(
+                    "hidden_states_transport requires max_new_tokens=0 "
+                    "(prefill-only requests)"
+                )
+            if sampling.get("n", 1) != 1:
+                raise ValueError("hidden_states_transport requires n=1")
+        if obj.token_positions is not None:
+            if obj.query_attention is None:
+                raise ValueError(
+                    "token_positions require query_attention and input_embeds"
+                )
+            dims = (
+                obj.token_positions
+                if obj.token_positions and isinstance(obj.token_positions[0], list)
+                else [obj.token_positions]
+            )
+            if not dims[0] or any(len(dim) != len(dims[0]) for dim in dims):
+                raise ValueError("token_positions must be non-empty, equal-length dims")
+            if len(dims[0]) != _input_embeds_len(obj.input_embeds):
+                raise ValueError(
+                    "token_positions must cover exactly the embeds span "
+                    f"({len(dims[0])} positions, "
+                    f"{_input_embeds_len(obj.input_embeds)} embeds)"
+                )
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -934,12 +1056,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+        # context-forward fields exist on GenerateReqInput only
+        is_context_forward = (
+            isinstance(obj, GenerateReqInput) and obj.query_attention is not None
+        )
+        if isinstance(obj, GenerateReqInput):
+            self._validate_context_forward_fields(obj)
         if obj.input_embeds is not None:
-            if not self.server_args.disable_radix_cache:
+            # Context forwards never enter the radix tree, so they may coexist
+            # with it; plain embeds requests still require the cache to be off
+            # (no token ids to key the tree).
+            if not self.server_args.disable_radix_cache and not is_context_forward:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
+                )
+            embeds_len = _input_embeds_len(obj.input_embeds)
+            if embeds_len == 0:
+                raise ValueError("input_embeds must be non-empty when provided")
+            if obj.input_ids is not None and embeds_len > len(obj.input_ids):
+                raise ValueError(
+                    "input_embeds cannot be longer than input_ids "
+                    f"({embeds_len} > {len(obj.input_ids)})"
+                )
+            embeds_width = _input_embeds_width(obj.input_embeds)
+            hidden_size = self.model_config.hidden_size
+            if embeds_width is not None and embeds_width != hidden_size:
+                # a wrong-width row would reach the model's first layer and
+                # kill the scheduler inside a kernel
+                raise ValueError(
+                    f"input_embeds width {embeds_width} does not match the "
+                    f"model hidden size {hidden_size}"
                 )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
@@ -1308,12 +1456,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
+                query_attention=obj.query_attention,
+                token_positions=obj.token_positions,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                hidden_states_transport=obj.hidden_states_transport,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,

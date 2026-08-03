@@ -29,6 +29,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.shm_transport_utils import package_hidden_states
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -573,9 +574,13 @@ class _GenerationStreamAccumulator:
                 else:
                     # Mirror output_ids_through_stop: spec verify steps can
                     # overshoot finished_len.
+                    # Prefill-only requests (finished_len == 0) keep their prefill entry.
                     hs = req.hidden_states
-                    if req.finished_len is not None:
+                    if req.finished_len is not None and not req.is_prefill_only:
                         hs = hs[: req.finished_len]
+                    if req.hidden_states_transport is not None and hs:
+                        # prefill-only by validation; the client reads and unlinks
+                        hs = package_hidden_states(hs, kind="hs")
                     self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)

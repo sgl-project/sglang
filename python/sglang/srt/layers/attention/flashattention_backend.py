@@ -1784,6 +1784,11 @@ class FlashAttentionBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+        if forward_batch.query_attention == "bidirectional":
+            # Extend tokens attend to each other and to the whole prefix;
+            # prefix KV is read-only so no prefix-internal attention occurs
+            causal = False
+            window_size = (-1, -1)
 
         kwargs = {}
         if sinks is not None:

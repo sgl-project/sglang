@@ -96,7 +96,15 @@ def free_swa_out_of_window_slots(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if req.skip_radix_cache_insert:
+        if kwargs.get("chunked", False):
+            # Advance the chunk-resume frontier without a radix insert so
+            # PrefillAdder::add_chunked_req resumes past this chunk; the KV
+            # written so far becomes the request-local prefix.
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.extend_range.end
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

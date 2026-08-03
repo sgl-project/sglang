@@ -75,6 +75,11 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 
+# Processors set this marker on mm items when their model computes decode
+# positions from mm inputs inside forward(); such image-bearing decode
+# batches must run eager instead of replaying a captured graph.
+EAGER_MM_DECODE_KEY = "eager_mm_decode"
+
 
 def _elastic_should_preserve_local_token_counts(
     *,
@@ -451,6 +456,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
+    # Extend-span attention mode: None (causal) or "bidirectional" (extend
+    # tokens attend to each other and to the whole prefix)
+    query_attention: Optional[str] = None
+    # Multi-dim explicit positions for the extend span ([dims, n]); models with
+    # multi-axis rope read this, `positions` stays 1D for the runtime
+    token_positions: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
@@ -777,6 +788,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            query_attention=batch.query_attention,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -923,8 +935,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
-            if ret.positions is None:
+            if batch.token_positions is not None and batch.token_positions.dim() == 1:
+                # Explicit 1D positions win; multi-dim schemes stay off the
+                # runtime's 1D `positions` and are read from `token_positions`
+                ret.positions = batch.token_positions
+            elif ret.positions is None:
                 ret.positions = positions
+            ret.token_positions = batch.token_positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.ngram_embedding_manager.enabled:
@@ -1079,6 +1096,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
+
+    def mm_decode_needs_eager(self) -> bool:
+        """True when any mm item carries EAGER_MM_DECODE_KEY: the model
+        derives decode positions from its mm inputs inside forward(), which
+        a captured graph replay would skip. Set by the model's processor."""
+        if self.mm_inputs is None:
+            return False
+        for mm_input in self.mm_inputs:
+            if mm_input is None:
+                continue
+            for item in mm_input.mm_items:
+                if item.model_specific_data.get(EAGER_MM_DECODE_KEY):
+                    return True
+        return False
 
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():

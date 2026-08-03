@@ -27,6 +27,8 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import numpy as np
+
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -298,6 +300,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.shm_transport_utils import is_shm_ref, read_shm_tensor
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -315,6 +318,26 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tail_coverage_intact(req: Req) -> bool:
+    """Tail-covering input_embeds require the uncovered head to be cached."""
+    if req.input_embeds is None or req.query_attention is None:
+        return True
+    embeds_start = len(req.origin_input_ids) - len(req.input_embeds)
+    return len(req.prefix_indices) >= embeds_start
+
+
+def _token_positions_dims(req: Req) -> Optional[int]:
+    """Dimensionality of a req's explicit positions (None when unset)."""
+    if req.token_positions is None:
+        return None
+    return (
+        len(req.token_positions)
+        if isinstance(req.token_positions[0], list)
+        else 1
+    )
+
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2231,13 +2254,13 @@ class Scheduler(
             recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
+        if recv_req.input_embeds is not None and not recv_req.input_ids:
+            # Generate fake input_ids based on the length of input_embeds
+            seq_length = len(recv_req.input_embeds)
+            recv_req.input_ids = array("q", [1]) * seq_length
+
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
-            if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                recv_req.input_ids = array("q", [1]) * seq_length
-
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -2256,11 +2279,14 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
+                query_attention=recv_req.query_attention,
+                token_positions=recv_req.token_positions,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
+                hidden_states_transport=recv_req.hidden_states_transport,
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
@@ -2286,6 +2312,23 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+           
+            if is_shm_ref(req.input_embeds):
+                # copy out of the client's segment now; the client unlinks it
+                # once the response arrives
+                try:
+                    req.input_embeds = read_shm_tensor(req.input_embeds).astype(
+                        np.float32, copy=False
+                    )
+                except (OSError, KeyError, TypeError, ValueError) as e:
+                    error_msg = f"unreadable shm input_embeds ref: {e}"
+                    logger.error(error_msg)
+                    prepare_abort(
+                        req, error_msg, status_code=HTTPStatus.BAD_REQUEST
+                    )
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3114,6 +3157,15 @@ class Scheduler(
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
+            if adder.can_run_list and (
+                req.query_attention != adder.can_run_list[0].query_attention
+                or _token_positions_dims(req)
+                != _token_positions_dims(adder.can_run_list[0])
+            ):
+                # extend-span attention mode and position dimensionality are
+                # batch-wide; keep incompatible reqs separate
+                continue
+
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
@@ -3141,6 +3193,16 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if not _tail_coverage_intact(req):
+                # the cached prefix backing a context forward was evicted;
+                # fail this request instead of tripping the scheduler-fatal
+                # invariant in prepare_for_extend
+                req.input_embeds = None
+                req.token_positions = None
+                req.set_finish_with_abort(
+                    "context forward prefix was evicted; resubmit to re-prefill"
+                )
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

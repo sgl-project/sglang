@@ -1211,6 +1211,11 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
+                if req.query_attention is not None:
+                    # a chunk-split bidirectional span would silently degrade
+                    # to block-causal attention; wait for budget instead
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
