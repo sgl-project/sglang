@@ -58,7 +58,7 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -254,7 +254,7 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
@@ -788,7 +788,7 @@ class Gemma4TextModel(PreTrainedModel):
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
             sa = get_server_args()
-            if sa is not None and not sa.disable_cuda_graph:
+            if sa is not None and not get_exec().graph.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "
