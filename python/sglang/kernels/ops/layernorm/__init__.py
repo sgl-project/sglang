@@ -5,9 +5,8 @@ pure-``torch`` reference (``forward_native``) plus optimized per-device backends
 all behind one signature. The public module-level functions are thin wrappers
 over module-level instances; auto-selection follows the production default for
 the live device: AOT ``sgl_kernel`` on CUDA, ``aiter`` (or rocm-triton for
-gemma) on ROCm, ``sgl_kernel_npu`` or ``torch_npu`` on Ascend depending on the
-operator, and the native reference otherwise. Gemma normalization on Ascend
-always delegates its SoC-specific implementation to ``sgl_kernel_npu``.
+gemma) on ROCm, ``torch_npu`` on Ascend (``sgl_kernel_npu`` for gemma, whose
+implementation is SoC-specific), native reference otherwise.
 Pick a specific backend with e.g.
 ``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
 ``SGLANG_FORCE_FUSED_OP_BACKEND``.
@@ -15,6 +14,7 @@ Pick a specific backend with e.g.
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -31,8 +31,6 @@ _NORM_DTYPES = ("float16", "bfloat16")
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
 _NPU = frozenset({CapabilityRequirement.NPU})
-
-
 # Unlike the gated-activation ops, sgl_kernel does *not* build the rmsnorm ops
 # for ROCm (production: ``if _is_cuda or _is_xpu or _is_musa: from sgl_kernel
 # import rmsnorm`` — HIP is absent), so AOT here is CUDA-only. ROCm instead has
@@ -49,6 +47,24 @@ _NORM_PRIORITY = (
     KernelBackend.TORCH_NPU,
     KernelBackend.TORCH,
 )
+
+
+def _sgl_kernel_npu_gemma(module: str, symbol: str):
+    """Resolve a Gemma kernel from ``sgl_kernel_npu``, or explain what is missing.
+
+    The Gemma provider is picked when the sgl-kernel-npu wheel is built (native
+    ``torch_npu`` operator on Ascend 910, ACLNN on Ascend 950), so an older or
+    mismatched wheel shows up here as a plain ImportError. Unlike
+    ``srt/layers/layernorm.py``, this path does not fall back to ``torch_npu``:
+    a backend selected by name must not silently run a different provenance.
+    """
+    try:
+        return getattr(importlib.import_module(module), symbol)
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "Gemma RMSNorm on Ascend requires a target-specific sgl-kernel-npu "
+            f"wheel that provides {module}.{symbol}"
+        ) from error
 
 
 class RMSNormOp(BaseFusedOp):
@@ -359,15 +375,9 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        try:
-            from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
-        except ImportError as error:
-            raise RuntimeError(
-                "Gemma RMSNorm on Ascend requires a target-specific "
-                "sgl-kernel-npu wheel that provides "
-                "sgl_kernel_npu.norm.gemma_rmsnorm"
-            ) from error
-
+        npu_gemma_rms_norm = _sgl_kernel_npu_gemma(
+            "sgl_kernel_npu.norm.gemma_rmsnorm", "npu_gemma_rms_norm"
+        )
         result, _ = npu_gemma_rms_norm(input, weight, eps)
         if out is None:
             return result
@@ -381,7 +391,8 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
     op = "layernorm.gemma_fused_add_rmsnorm"
     priority = _NORM_PRIORITY
     # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path on HIP.
-    # Ascend delegates provider selection to the stable sgl_kernel_npu API.
+    # NPU uses ``sgl_kernel_npu.norm.add_rmsnorm_bias.add_gemma_rms_norm`` — the
+    # SGL_KERNEL_NPU provenance, not torch_npu.
     capabilities = {
         KernelBackend.AOT: _CUDA,
         KernelBackend.JIT: _HIP,
@@ -403,7 +414,8 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
             "(sgl_kernel_npu, Ascend)."
         ),
         KernelBackend.TORCH: (
-            "Gemma-style fused residual-add + RMS normalization (pure-torch reference)."
+            "Gemma-style fused residual-add + RMS normalization "
+            "(pure-torch reference)."
         ),
     }
 
@@ -464,18 +476,13 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        try:
-            from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
-        except ImportError as error:
-            raise RuntimeError(
-                "Gemma RMSNorm on Ascend requires a target-specific "
-                "sgl-kernel-npu wheel that provides "
-                "sgl_kernel_npu.norm.gemma_rmsnorm"
-            ) from error
-
-        norm_output, residual_sum = add_gemma_rms_norm(input, weight, residual, eps)
-        input.copy_(norm_output)
-        residual.copy_(residual_sum)
+        add_gemma_rms_norm = _sgl_kernel_npu_gemma(
+            "sgl_kernel_npu.norm.add_rmsnorm_bias", "add_gemma_rms_norm"
+        )
+        # sgl_kernel_npu returns (normed, new_residual); honor the in-place contract.
+        norm_out, residual_out = add_gemma_rms_norm(input, weight, residual, eps)
+        input.copy_(norm_out)
+        residual.copy_(residual_out)
 
 
 _RMSNORM = register_fused_op(RMSNormOp(), __name__, "_RMSNORM")
