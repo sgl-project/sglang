@@ -10,7 +10,7 @@ on:
   #     - "python/**"
   #     - "scripts/ci/**"
   #     - "test/**"
-  #     - "sgl-kernel/**"
+  #     - "python/sglang/kernels/aot/**"
   #     - ".github/workflows/pr-test-amd-rocm724.yml"
   #     - "docker/rocm.Dockerfile"
   # pull_request:
@@ -18,7 +18,7 @@ on:
   #     - "python/**"
   #     - "scripts/ci/**"
   #     - "test/**"
-  #     - "sgl-kernel/**"
+  #     - "python/sglang/kernels/aot/**"
   #     - ".github/workflows/pr-test-amd-rocm724.yml"
   #     - "docker/rocm.Dockerfile"
   workflow_dispatch:
@@ -179,7 +179,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
@@ -187,10 +189,11 @@ jobs:
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd-rocm724.yml"
             sgl_kernel:
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd-rocm724.yml"
             jit_kernel:
-              - "python/sglang/kernels/**"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**"
               - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd-rocm724.yml"
             multimodal_gen:
@@ -217,6 +220,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd-extra.yml
     with:
       ref: ${{ inputs.pr_head_sha || inputs.ref || '' }}
+      runner_arch: mi300
       rocm_version: rocm724
       aiter_ref: ${{ inputs.aiter_ref }}
       amd_ci_image: ${{ inputs.amd_ci_image }}
@@ -238,7 +242,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -260,15 +264,15 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_align.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_activation.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_topk.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_kvcacheio.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
+          docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
 
   sgl-kernel-unit-test-2-gpu-amd-rocm724:
     needs: [check-changes]
@@ -284,7 +288,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -325,7 +329,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -363,7 +367,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -401,7 +405,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -439,8 +443,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{matrix.runner}}
     steps:
@@ -460,9 +465,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic-rocm724:
     needs: [check-changes]
@@ -479,7 +484,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -554,8 +559,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
@@ -575,9 +581,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd-rocm724:
     needs: [check-changes]
@@ -593,8 +599,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -614,9 +621,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 120
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd-rocm724:
     needs: [check-changes]
@@ -632,8 +639,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
@@ -649,7 +657,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
@@ -665,16 +673,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
-          # This directory persists across container restarts on the self-hosted runner
-          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
-
-          # Clear pre-built AITER kernels from Docker image to avoid segfaults
-          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
-          echo "Clearing pre-built AITER kernels from Docker image..."
-          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
-          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
-          echo "AITER kernels cleared - will be rebuilt on first use"
+          docker exec ci_sglang mkdir -p /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
@@ -695,7 +694,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -717,7 +716,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -734,7 +733,6 @@ jobs:
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
-            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
@@ -772,8 +770,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
@@ -789,7 +788,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
@@ -805,15 +804,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
-          docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
-
-          # Clear pre-built AITER kernels from Docker image to avoid segfaults
-          # The image may have stale/incompatible kernels at /sgl-workspace/aiter/aiter/jit/
-          echo "Clearing pre-built AITER kernels from Docker image..."
-          docker exec ci_sglang rm -rf /sgl-workspace/aiter/aiter/jit/*.so 2>/dev/null || true
-          docker exec ci_sglang rm -rf /sgl-data/aiter-kernels/*.so 2>/dev/null || true
-          echo "AITER kernels cleared - will be rebuilt on first use"
+          docker exec ci_sglang mkdir -p /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Create persistent cache marker if /sgl-data is a real mount (not ephemeral)
           # This tells the test cleanup code to NOT delete downloaded models
@@ -834,7 +825,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -856,7 +847,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 150
+        timeout-minutes: 180
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -873,7 +864,6 @@ jobs:
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
-            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
@@ -912,7 +902,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -926,7 +916,7 @@ jobs:
         if: needs.check-changes.outputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
@@ -946,7 +936,6 @@ jobs:
           # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
           # memory-format behavior that the ROCm conv path doesn't reproduce.
           docker exec \
-            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
@@ -968,7 +957,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-4gpu-sglang]
+        runner: [linux-mi300-4gpu-sglang]
         part: [0]
     runs-on: ${{matrix.runner}}
     steps:
@@ -989,7 +978,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e NCCL_CUMEM_ENABLE=0 \
@@ -1002,7 +991,7 @@ jobs:
               --suite stage-c-test-4-gpu-amd \
               --auto-partition-id ${{ matrix.part }} \
               --auto-partition-size 1 \
-              --timeout-per-file 1800 \
+              --timeout-per-file 5400 \
               --enable-retry \
               --max-attempts 2 \
               --retry-wait-seconds 120 \
@@ -1022,11 +1011,12 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi325-8gpu-sglang
+      RUNNER_LABELS: linux-mi300-8gpu-sglang
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        runner: [linux-mi325-8gpu-sglang]
+        runner: [linux-mi300-8gpu-sglang]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
@@ -1275,6 +1265,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e SGLANG_DSV4_ACCURACY_ONLY=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
@@ -1323,6 +1314,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e SGLANG_DSV4_ACCURACY_ONLY=1 \
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             python3 registered/amd/test_deepseek_v4_pro_fp4.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           if [[ "${{ inputs.continue_on_error }}" == "true" ]]; then
