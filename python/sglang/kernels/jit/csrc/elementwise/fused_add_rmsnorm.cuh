@@ -54,9 +54,11 @@ SGL_DEVICE packed_t rms(float2 valf, packed_t& weight, float rsqrt_square_sum) {
 }
 
 template <bool kCastXBeforeOutMul, bool kScaleInput, typename T, int VEC_SIZE_IN_BYTE>
+// clang-format off
 __global__ void fused_add_rmsnorm_reg_kernel(
     T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps,
     float input_scale) {
+// clang-format on
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
