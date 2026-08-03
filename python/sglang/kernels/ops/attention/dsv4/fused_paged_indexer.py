@@ -73,7 +73,12 @@ def _fused_paged_indexer_kernel(
     H: tl.constexpr,
     BN: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
+    # program_id is int32 and Triton does not promote int multiplies: at
+    # 1M-context prefill shapes the row base pid_b * s_out_b crosses 2^31
+    # (bisected: first IMA exactly one step past B*msl = 2^31), so every
+    # per-row base below is computed in int64. Same class of bug as the
+    # vLLM-side indexer overflow (vllm#50576).
+    pid_b = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1)
     offs_n = pid_n * BN + tl.arange(0, BN)
     n_mask = offs_n < PADDED_EFF
