@@ -89,7 +89,10 @@ buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t s
     "llvm.amdgcn.raw.buffer.store.v4i32");
 #else
 __quickreduce_device_inline__ static int32x4_t
-buffer_load_dwordx4(int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {}
+buffer_load_dwordx4(int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {
+  __builtin_trap();
+  return int32x4_t{};
+}
 
 __quickreduce_device_inline__ static void
 buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {}
