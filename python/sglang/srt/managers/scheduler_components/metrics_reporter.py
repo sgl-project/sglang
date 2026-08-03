@@ -26,7 +26,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_context, get_observability, get_spec
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -215,11 +215,11 @@ class SchedulerMetricsReporter:
             self.scheduler._fpm_worker_id = (
                 self.scheduler.server_args.forward_pass_metrics_worker_id
             )
-            base_endpoint = self.scheduler.server_args.forward_pass_metrics_ipc_name
+            base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
                 base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.override(
+                get_context().override(
                     "metrics_reporter.ipc_endpoint",
                     forward_pass_metrics_ipc_name=base_endpoint,
                 )
@@ -1020,10 +1020,9 @@ class SchedulerMetricsReporter:
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
-        self.stats.hicache_host_used_tokens = (
-            host_pool.size - host_pool.available_size()
-        )
-        self.stats.hicache_host_total_tokens = host_pool.size
+        host_total = host_pool.logical_size
+        self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
+        self.stats.hicache_host_total_tokens = host_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt import runtime_context as rc
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GenerateReqInput,
@@ -318,9 +319,8 @@ class TestB64MetaInfo(CustomTestCase):
 
 
 def _make_logprob_processor() -> SchedulerLogprobResultProcessor:
-    # The processor only reads enable_mis and vocab_size from these.
+    # enable_mis comes from the published exec bag, not from here; see setUp.
     return SchedulerLogprobResultProcessor(
-        server_args=SimpleNamespace(enable_mis=False),
         model_config=SimpleNamespace(vocab_size=1_000_000),
     )
 
@@ -340,6 +340,14 @@ _SCHED_IDX_ROWS = [[11, 22], [33, 44], [55, 66], [77, 88], [99, 100]]
 
 class TestSchedulerFlatAssembly(CustomTestCase):
     """Scheduler-side flat assembly in the logprob result processor."""
+
+    def setUp(self):
+        super().setUp()
+        self._server_args_override = rc.get_context().override_server_args()
+        self._server_args_override.install()
+
+    def tearDown(self):
+        self._server_args_override.restore()
 
     def _make_req(self, flat: bool, num_tokens: int = 5) -> Req:
         return Req(

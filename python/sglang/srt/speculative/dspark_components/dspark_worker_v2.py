@@ -15,7 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -33,6 +33,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -389,7 +391,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
-            if self.server_args.enable_dp_attention:
+            if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
@@ -457,7 +459,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _dp_verify_tier_num_tokens(self, batch: ScheduleBatch) -> Optional[int]:
         if not (
             self._draft_is_moe
-            and self.server_args.enable_dp_attention
+            and get_parallel().enable_dp_attention
             and batch.global_num_tokens is not None
             and self._verify_planner.is_compact_mode
         ):
@@ -501,7 +503,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
-            if self.server_args.enable_dp_attention:
+            if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
                     self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
@@ -563,7 +565,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         global_num_reqs = (
             max(batch.global_num_tokens)
             if self._draft_is_moe
-            and self.server_args.enable_dp_attention
+            and get_parallel().enable_dp_attention
             and batch.global_num_tokens is not None
             else None
         )
@@ -592,6 +594,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
+            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # sampling batches must take the eager accept path even when the
+            # draft proposal itself folded.
+            and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
@@ -731,14 +737,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Chain layout only: step index = commit_lens - 1. A tree (topk > 1)
         # layout would need the accept-index mapping the shared spec_utils
         # commit helper does.
-        assert self.server_args.speculative_eagle_topk in (None, 1)
+        assert get_spec().speculative_eagle_topk in (None, 1)
         attn_backend = self.target_worker.model_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval

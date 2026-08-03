@@ -64,6 +64,64 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 
 ## Quick Recipes
 
+### MiniMax-H3 first: lossless joint video/audio
+
+H3 has a stricter contract than the generic recipes below. Keep its DiT eager
+for consistency ground truth, use Ulysses rather than Ring, do not enable CFG
+parallel, and leave the released overlapping tiled video-VAE decode in place.
+
+Four H200 GPUs can keep the complete BF16/FP32 pipeline resident:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+On 4x H100 80 GB, start from the fastest measured lossless resident topology:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+On B200/B300, the verified resident sweep uses 8 GPUs with Ulysses8. H3 also
+has a verified 4x B200 FSDP-capacity path, but FSDP all-gathers are a memory
+policy rather than the default latency choice. Benchmark the target topology
+with the H3 driver from `sglang-diffusion-benchmark-profile`.
+
+Use the FL2VA partition for both `t2va` and `fl2va`; use
+`--model-variant ref2va` for image/video/audio reference conditioning. The root
+IDs are `MiniMaxAI/MiniMax-H3` on Hugging Face and `MiniMax/MiniMax-H3` on
+ModelScope. Do not point `--model-path` at a partition subdirectory.
+
+Current H3 restrictions:
+
+- `torch.compile` is opt-in experimentation only because it changes numerical
+  output; it is not a lossless baseline
+- Ring attention and CFG parallel are incompatible with the packed single
+  denoising branch
+- SageAttention is rejected for the current packed multi-segment attention
+- `--vae-config.parallel-decode-mode spatial`, `spatial_shard`, and patch VAE
+  decode are rejected after mismatches; use the default tiled recipe
+- Breakable CUDA Graph is opt-in and signature-specific; the validated
+  1344x768 Ref2VA capture uses `--bcg-text-buckets 5504`, but it did not show a
+  measured speedup
+- the `quality=high|medium|low` Cache-DiT profiles and online FP8 are
+  approximate; keep them outside lossless comparisons
+
 ### Maximum speed, video model, multi-GPU, lossless (Wan A14B, 8 GPUs)
 
 ```bash
@@ -255,6 +313,7 @@ Use these as first commands to benchmark, not as universal winners.
 
 | Model family | First performance shape | Starting flags | Notes |
 |---|---|---|---|
+| MiniMax-H3 | 1344x768 resolved canvas, 5 seconds / 124 frames at 24 fps, 50 joint video/audio steps | H200: `--num-gpus 4 --ulysses-degree 4 --performance-mode speed --enable-torch-compile false`; H100: TP2 + Ulysses2 | Root ID plus `--model-variant fl2va` for T2VA/FL2VA or `ref2va` for Ref2VA. Ulysses only; no Ring/CFG/SageAttention. Preserve tiled video-VAE decode. Profile joint denoise, video VAE, audio VAE/vocoder, encoder, and collectives separately. |
 | FLUX.1 / FLUX.2 image | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | `black-forest-labs/FLUX.*` repos are gated; for FP8/NVFP4 use validated `--transformer-path` or `--transformer-weights-path` flows from the quant skill. |
 | FLUX.2 Klein / Klein Base | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup --dit-layerwise-offload false` | Current registry has `black-forest-labs/FLUX.2-klein-4B`, `FLUX.2-klein-9B`, and base variants. Klein is step-distilled; Klein Base is not. |
 | Qwen-Image / Qwen-Image-Edit | 1024x1024, runtime-default steps/guidance, 1 GPU | `--enable-torch-compile --warmup`; optionally native `SGLANG_CACHE_DIT_ENABLED=true` | Cache-DiT is lossy. For edit tasks, keep reference image, seed, and output size fixed. |
@@ -289,6 +348,6 @@ about whether the work has merged:
 - **Offload tuning**: after the first request, the runtime logs peak GPU memory and which components could stay resident. Use this to decide which `--*-cpu-offload` flags to disable.
 - **Backend selection**: `--backend sglang` (default, auto-detected) enables native optimizations (fused kernels, SP, native Cache-DiT env knobs, etc.). `--backend diffusers` falls back to Diffusers pipelines and is the path that accepts `--cache-dit-config` plus diffusers attention backend names.
 - **Wan2.2-I2V sizing**: explicit `--width/--height` on `Wan2.2-I2V-A14B` control the target area while preserving the condition-image aspect ratio.
-- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers GroupNorm+SiLU, Z-Image bf16-native Triton norm modulation, fused diffusion `QK norm + RoPE`, LTX2 split RoPE, LTX2 residual-gate add, varlen USP pack/scatter, packed QKV/NVFP4 expectations, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
+- **Mainline diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It covers H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV/USP relayout and batched TP AdaLN, plus GroupNorm+SiLU, Z-Image bf16-native Triton norm modulation, LTX2 split RoPE, LTX2 residual-gate add, varlen USP pack/scatter, packed QKV/NVFP4 expectations, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
 - **NVFP4 trace interpretation**: on FLUX.2 NVFP4 and Nunchaku-style checkpoints, packed QKV is expected. SGLang intentionally uses fused projection modules such as `to_qkv` / `to_added_qkv` instead of separate `to_q` / `to_k` / `to_v`, so a split-QKV trace usually means the quantized path did not engage rather than a brand new fusion opportunity.
 - **Hotspot workflow split**: use `sglang-diffusion-benchmark-profile` to prove and classify a slowdown with perf dumps plus `torch.profiler`; hand concrete kernel work off with the perf/profile evidence attached instead of expanding the benchmark skill.
