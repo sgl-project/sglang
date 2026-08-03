@@ -358,5 +358,55 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
     ), f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
 
 
+def test_sparse_gqa_one_page_per_block():
+    """The block-table fast path must match token-table addressing."""
+    torch.manual_seed(43)
+    bs, nqh, nkh, hd, blk, tk = 2, 16, 1, 128, 128, 4
+    seq_lens_list = [513, 768]
+    q, sink, k_cache, v_cache, _, seq_lens, _, topk_idx = build_inputs(
+        bs,
+        nqh,
+        nkh,
+        hd,
+        seq_lens_list,
+        blk,
+        tk,
+        paged=False,
+    )
+
+    pages_per_req = max(seq_lens_list) // blk
+    page_table = torch.randperm(
+        bs * pages_per_req, device=DEVICE, dtype=torch.int32
+    ).view(bs, pages_per_req)
+    req_to_token = (
+        page_table[:, :, None] * blk
+        + torch.arange(blk, device=DEVICE, dtype=torch.int32)[None, None, :]
+    ).reshape(bs, -1)
+
+    o_kernel = flash_decode_with_gqa_share_sparse(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        blk,
+        topk_idx,
+        page_size=blk,
+    )
+    o_ref = pytorch_sparse_gqa_reference(
+        q,
+        sink,
+        k_cache,
+        v_cache,
+        req_to_token,
+        seq_lens,
+        blk,
+        topk_idx,
+    ).to(o_kernel.dtype)
+
+    assert torch.allclose(o_kernel.float(), o_ref.float(), rtol=RTOL, atol=ATOL)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
