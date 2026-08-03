@@ -109,6 +109,27 @@ class TestFoldPagedIndexerApprox(CustomTestCase):
         exact = fused_paged_mqa_logits(q, kv, w, sl, pt, None, msl, clean_logits=False)
         self.assertTrue(torch.equal(got, exact))
 
+    def test_peak_memory_stays_near_output_size(self):
+        # The folded GEMM walks the sequence axis in blocks of
+        # ~256 MB / (B*4) columns; computed whole it materialises two [B, n]
+        # fp32 transients on top of the output (measured +1.66 GB at 128K,
+        # B=8192), which is how the flag once took a needle run down. The
+        # shape here makes n exceed one block (B=4096 -> 16384-column steps,
+        # n=18432), so the chunked walk is actually exercised. Budget: output
+        # + one ~256 MB block + decoded KV + slack; the whole-tensor form
+        # needs output + 2n*B*4 (= +604 MB here) and must trip this.
+        q, kv, w, sl, pt, msl = _case(4096, 320, 288, 18432, 3, shared=True)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        out = fold_paged_mqa_logits_approx(
+            q, kv, w, sl, pt, None, msl, clean_logits=False
+        )
+        peak_over_base = torch.cuda.max_memory_allocated() - base
+        out_bytes = out.numel() * out.element_size()
+        self.assertLess(peak_over_base, out_bytes + (320 << 20))
+
 
 if __name__ == "__main__":
     unittest.main()

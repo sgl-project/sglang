@@ -711,6 +711,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_INDEXER_FOLD_APPROX</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in <b>lossy</b> approximation of the DeepSeek V4 indexer scoring for prefill-sized calls: folds the head dimension out before the GEMM, skipping the per-head ReLU. Swaps a measured share of the top-k selection (grid mean top-512 overlap 0.748 across layers and context lengths) for a 4&ndash;21% prefill speedup over the exact fused kernel. The docstring at <code>fold_paged_mqa_logits_approx</code> carries the full measured cost grid. Exact scoring stays the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_REASONING_EFFORT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it (accepts <code>max</code>, <code>high</code>; empty means unset).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
