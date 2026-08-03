@@ -1,9 +1,11 @@
 /// \file warp.cuh
-/// \brief Warp-level reduction primitives.
+/// \brief Warp-level reduction and cooperative-copy primitives.
 
 #pragma once
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <cstdint>
 #include <type_traits>
@@ -117,6 +119,93 @@ SGL_DEVICE T reduce_max(T value, mask_t active_mask = kFullMask) {
 template <uint32_t kNumThreads = kWarpThreads, bool kInner = true, typename T>
 SGL_DEVICE T reduce_min(T value, mask_t active_mask = kFullMask) {
   return reduce<ReductionOp::MIN, kNumThreads, kInner>(value, active_mask);
+}
+
+/// \brief Warp-cooperative gmem -> smem copy of a compile-time byte count.
+///
+/// Picks the widest vector width that divides both the per-thread share and
+/// the byte total. The caller guarantees ``src`` is aligned to the picked
+/// width (16B for kBytes % (16*32) == 0, else 8/4) and ``dst`` is the start
+/// of a 16B-aligned per-warp smem slot.
+// Warp-cooperative byte copy between any two address spaces, vectorised to the
+// widest unit `kBytes` allows. Named for what it does rather than where it is
+// used: the MLA call sites happen to target shared memory, but nothing here is
+// global->shared specific -- no cp.async, no TMA, the payload moves through
+// registers.
+//
+// The strategy was measured against the two async alternatives on B300 (sm_103,
+// 148 SMs), copying one MLA row per warp out of a 512 MB pool so every row
+// streams from HBM (grid 296, 64 rows/warp, 50 launches):
+//
+//   1152 B/warp (bf16, nope 1024 + rope 128)   576 B/warp (fp8, 512 + 64)
+//     this (generic)     47.3 us  3.69 TB/s      40.8 us  2.14 TB/s
+//     cp.async (ldgsts)  73.9 us  2.36 TB/s      56.4 us  1.55 TB/s
+//     cp.async.bulk/TMA  50.0 us  3.50 TB/s      43.2 us  2.02 TB/s
+//
+// The generic path wins at both sizes: a ~1 KB row is too small to amortise
+// cp.async's per-lane 16 B issues or TMA's fixed issue plus mbarrier round trip.
+// Revisit if a call site ever copies substantially more than one row per warp.
+template <int64_t kBytes>
+SGL_DEVICE void copy_bytes(const void* __restrict__ src, void* __restrict__ dst) {
+  constexpr int64_t kAlignment = (kBytes % (16 * kWarpThreads) == 0)  ? 16
+                                 : (kBytes % (8 * kWarpThreads) == 0) ? 8
+                                 : (kBytes % (4 * kWarpThreads) == 0) ? 4
+                                 : (kBytes % 4 == 0)                  ? 4
+                                                                      : 0;
+  static_assert(kAlignment > 0, "kBytes must be a multiple of 4");
+
+  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
+  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
+  constexpr auto kLoopCount = kBytes / kLoopBytes;
+  constexpr int64_t kTailVecs = (kBytes - kLoopCount * kLoopBytes) / sizeof(vec_t);
+
+  const auto gmem = tile::Memory<vec_t>::warp();
+
+#pragma unroll
+  for (int64_t i = 0; i < kLoopCount; ++i) {
+    const auto v = gmem.load(src, i);
+    gmem.store(dst, v, i);
+  }
+  if constexpr (kTailVecs > 0) {
+    if (gmem.in_bound(kLoopCount * kWarpThreads + kTailVecs, kLoopCount)) {
+      const auto v = gmem.load(src, kLoopCount);
+      gmem.store(dst, v, kLoopCount);
+    }
+  }
+}
+
+/// Inclusive prefix sum across one warp, thread-rank order. Distinct from
+/// reduce_sum above: every lane keeps its own running total rather than the
+/// whole-warp result.
+SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
+  static_assert(kWarpThreads == 32);
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
+    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
+#endif
+    if (lane_id >= offset) val += n;
+  }
+  return val;
+}
+
+// One elected lane, via elect.sync. Raw PTX rather than cute::elect_one_sync,
+// which would drag the whole CuTe include path into elementwise JIT modules;
+// cuda::ptx has no elect_sync in CUDA 13.0. Use this to gate a single-thread
+// TMA issue instead of a lane-index predicate.
+SGL_DEVICE bool elect_one_lane() {
+  uint32_t pred;
+  asm volatile(
+      "{\n"
+      "  .reg .pred p;\n"
+      "  .reg .b32  r;\n"
+      "  elect.sync r|p, 0xFFFFFFFF;\n"
+      "  selp.b32 %0, 1, 0, p;\n"
+      "}\n"
+      : "=r"(pred));
+  return pred != 0;
 }
 
 }  // namespace device::warp
