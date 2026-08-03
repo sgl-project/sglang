@@ -85,12 +85,14 @@ def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
 def should_use_dsa_fused_topk(
     server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
-    """Select fused TopK while preserving allocator-independent PD seeds.
+    """Select fused TopK for PD IndexShare.
 
-    On the prefill worker, target prefill uses fused TopK, while draft extend
-    keeps its seed in request-relative position space and falls back. On the
-    draft worker, draft extend, target verify, and draft decode use fused TopK
-    after the seed is remapped to decode-local physical slots.
+    Prefill worker:
+    - Target prefill: enabled.
+    - Draft extend: disabled.
+
+    Draft worker:
+    - Draft extend, target verify, and draft decode: enabled.
     """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
