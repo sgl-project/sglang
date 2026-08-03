@@ -41,6 +41,13 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
+    def test_quality_must_be_a_non_empty_profile_name(self):
+        self.assertEqual(SamplingParams(quality="high").quality, "high")
+        with self.assertRaisesRegex(ValueError, r"quality must be a non-empty string"):
+            SamplingParams(quality="")
+        with self.assertRaisesRegex(ValueError, r"quality must be a non-empty string"):
+            SamplingParams(quality=True)  # type: ignore[arg-type]
+
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
         self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
@@ -223,6 +230,12 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(
             self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
             [7, 8],
+        )
+
+    def test_quality_is_request_scoped_cli_arg(self):
+        self.assertNotIn("quality", self._parse_cli_kwargs([]))
+        self.assertEqual(
+            self._parse_cli_kwargs(["--quality", "medium"])["quality"], "medium"
         )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
