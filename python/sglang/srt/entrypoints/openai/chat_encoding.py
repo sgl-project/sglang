@@ -27,7 +27,6 @@ def _detect_dsv4_reasoning_effort_profile(
     encoder_path = Path(model_path) / _DSV4_REASONING_EFFORT_ENCODER
     try:
         if not encoder_path.is_file():
-            # Remote inspection needs Hugging Face Hub; local profiles do not.
             from huggingface_hub import hf_hub_download
 
             encoder_path = Path(
@@ -48,9 +47,7 @@ def _detect_dsv4_reasoning_effort_profile(
         )
         return None
 
-    prompt_keys = set()
-    default_effort = None
-    has_legacy_max = False
+    assignments = {}
     for node in tree.body:
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -64,26 +61,30 @@ def _detect_dsv4_reasoning_effort_profile(
         for target in targets:
             if not isinstance(target, ast.Name):
                 continue
-            if target.id == "REASONING_EFFORT_PROMPTS" and isinstance(value, ast.Dict):
-                prompt_keys = {
-                    key.value
-                    for key in value.keys
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
-                }
-            elif (
-                target.id == "DEFAULT_REASONING_EFFORT"
-                and isinstance(value, ast.Constant)
-                and isinstance(value.value, str)
-            ):
-                default_effort = value.value
-            elif target.id == "REASONING_EFFORT_MAX":
-                has_legacy_max = True
+            try:
+                assignments[target.id] = ast.literal_eval(value)
+            except (TypeError, ValueError):
+                continue
 
-    if default_effort == "low" and {"low", "high", "max"} <= prompt_keys:
+    prompts = assignments.get("REASONING_EFFORT_PROMPTS")
+    if (
+        assignments.get("DEFAULT_REASONING_EFFORT") == "low"
+        and isinstance(prompts, dict)
+        and {"low", "high", "max"} <= prompts.keys()
+    ):
         return "0731"
-    if has_legacy_max:
+    if "REASONING_EFFORT_MAX" in assignments:
         return "legacy"
     return None
+
+
+def _validate_dsv4_reasoning_effort_profile(profile: str) -> str:
+    if profile not in encoding_dsv4.REASONING_EFFORT_PROFILES:
+        raise ValueError(
+            f"Invalid {DSV4_REASONING_EFFORT_PROFILE_OVERRIDE}: {profile!r}; "
+            f"expected one of {list(encoding_dsv4.REASONING_EFFORT_PROFILES)}"
+        )
+    return profile
 
 
 def resolve_dsv4_reasoning_effort_profile(
@@ -93,35 +94,7 @@ def resolve_dsv4_reasoning_effort_profile(
     override: Optional[str] = None,
 ) -> str:
     if override is not None:
-        if override not in encoding_dsv4.REASONING_EFFORT_PROFILES:
-            raise ValueError(
-                f"Invalid {DSV4_REASONING_EFFORT_PROFILE_OVERRIDE}: {override!r}; "
-                f"expected one of {list(encoding_dsv4.REASONING_EFFORT_PROFILES)}"
-            )
-        return override
-
-    normalized_path = model_path.rstrip("/").lower()
-    is_local = Path(model_path).is_dir()
-    if is_local:
-        detected_profile = _detect_dsv4_reasoning_effort_profile(
-            model_path=model_path,
-            revision=revision,
-        )
-        if detected_profile is not None:
-            return detected_profile
-    if "deepseek-v4-flash-0731" in normalized_path:
-        return "0731"
-    if (
-        normalized_path.rsplit("/", 1)[-1]
-        in {
-            "deepseek-v4-flash",
-            "deepseek-v4-flash-dspark",
-        }
-        and not is_local
-    ):
-        return "legacy"
-    if is_local:
-        return "legacy"
+        return _validate_dsv4_reasoning_effort_profile(override)
 
     return (
         _detect_dsv4_reasoning_effort_profile(
@@ -136,23 +109,30 @@ class Dsv4ReasoningEffortProfileResolver:
     def __init__(
         self,
         *,
-        model_path: str,
+        model_path: Optional[str] = None,
         revision: Optional[str] = None,
         override: Optional[str] = None,
     ):
-        self._override = override
+        self._override = (
+            _validate_dsv4_reasoning_effort_profile(override)
+            if override is not None
+            else None
+        )
         self._model_path = None
+        self._revision = None
         self._profile = None
-        self.resolve(model_path=model_path, revision=revision)
+        if model_path is not None:
+            self.resolve(model_path=model_path, revision=revision)
 
     def resolve(self, *, model_path: str, revision: Optional[str] = None) -> str:
-        if model_path != self._model_path:
+        if (model_path, revision) != (self._model_path, self._revision):
             self._profile = resolve_dsv4_reasoning_effort_profile(
                 model_path=model_path,
                 revision=revision,
                 override=self._override,
             )
             self._model_path = model_path
+            self._revision = revision
             logger.info(
                 "Resolved DeepSeek-V4 reasoning effort profile %r for %s",
                 self._profile,

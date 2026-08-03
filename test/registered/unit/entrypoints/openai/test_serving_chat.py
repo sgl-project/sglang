@@ -40,6 +40,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+_DSV4_LEGACY_ENCODER = 'REASONING_EFFORT_MAX = "legacy"\n'
+_DSV4_0731_ENCODER = (
+    'REASONING_EFFORT_PROMPTS = {"low": "", "high": "h", "max": "m"}\n'
+    'DEFAULT_REASONING_EFFORT = "low"\n'
+)
+
+
+def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
+    model_dir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(model_dir.cleanup)
+    encoder_path = Path(model_dir.name) / "encoding" / "encoding_dsv4.py"
+    encoder_path.parent.mkdir(parents=True)
+    encoder_path.write_text(source, encoding="utf-8")
+    return model_dir.name
+
 
 class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
@@ -62,7 +77,9 @@ class _MockTokenizerManager:
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
-        mock_hf_config.to_dict.return_value = {}
+        mock_hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "legacy"
+        }
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -1768,36 +1785,10 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dsv4_reasoning_effort_profile_resolution(self):
         resolve = resolve_dsv4_reasoning_effort_profile
-        self.assertEqual(
-            resolve(model_path="deepseek-ai/DeepSeek-V4-Flash"),
-            "legacy",
-        )
-        self.assertEqual(
-            resolve(model_path="deepseek-ai/DeepSeek-V4-Flash-DSpark"),
-            "legacy",
-        )
-        self.assertEqual(
-            resolve(model_path="deepseek-ai/DeepSeek-V4-Flash-0731"), "0731"
-        )
-
-        with tempfile.TemporaryDirectory() as model_path:
-            encoder_path = Path(model_path) / "encoding" / "encoding_dsv4.py"
-            encoder_path.parent.mkdir()
-            encoder_path.write_text(
-                'REASONING_EFFORT_PROMPTS = {"low": "", "high": "h", "max": "m"}\n'
-                'DEFAULT_REASONING_EFFORT = "low"\n',
-                encoding="utf-8",
-            )
-            self.assertEqual(resolve(model_path=model_path), "0731")
-
-        with tempfile.TemporaryDirectory(suffix="DeepSeek-V4-Flash-0731") as model_path:
-            encoder_path = Path(model_path) / "encoding" / "encoding_dsv4.py"
-            encoder_path.parent.mkdir()
-            encoder_path.write_text(
-                'REASONING_EFFORT_MAX = "legacy"\n',
-                encoding="utf-8",
-            )
-            self.assertEqual(resolve(model_path=model_path), "legacy")
+        legacy_model_path = _create_dsv4_checkpoint(self, _DSV4_LEGACY_ENCODER)
+        release_model_path = _create_dsv4_checkpoint(self, _DSV4_0731_ENCODER)
+        self.assertEqual(resolve(model_path=legacy_model_path), "legacy")
+        self.assertEqual(resolve(model_path=release_model_path), "0731")
 
         self.assertEqual(resolve(model_path="renamed/model", override="0731"), "0731")
         self.assertEqual(
@@ -1809,11 +1800,14 @@ class ServingChatTestCase(unittest.TestCase):
     def test_dsv4_reasoning_effort_profile_refreshes_after_weight_update(self):
         from sglang.srt.parser.template_manager import TemplateManager
 
+        legacy_model_path = _create_dsv4_checkpoint(self, _DSV4_LEGACY_ENCODER)
+        release_model_path = _create_dsv4_checkpoint(self, _DSV4_0731_ENCODER)
         tm = _MockTokenizerManager()
         tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {}
         tm.model_config.hf_config.dspark_block_size = 5
         tm.model_config.hf_config.dspark_markov_rank = 256
-        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+        tm.model_path = legacy_model_path
         tm.server_args.model_path = tm.model_path
         serving_chat = OpenAIServingChat(tm, TemplateManager())
 
@@ -1827,7 +1821,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("Reasoning Effort: Absolute maximum", legacy_prompt)
         self.assertNotIn("Reasoning Effort: Beyond maximum", legacy_prompt)
 
-        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        tm.model_path = release_model_path
         tm.server_args.model_path = tm.model_path
         serving_chat._process_messages(request, is_multimodal=False)
         release_prompt = tm.tokenizer.encode.call_args.args[0]
@@ -1858,12 +1852,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("Reasoning Effort: Beyond maximum", prompt)
 
     def test_dsv4_invalid_profile_override_fails_at_construction(self):
-        """An invalid DSV4 profile override is rejected at construction, not deferred to the first request.
-
-        Guards fail-fast boot validation: a misconfigured
-        ``dsv4_reasoning_effort_profile`` should prevent the server from starting,
-        not surface as an HTTP 400 on every request.
-        """
         from sglang.srt.parser.template_manager import TemplateManager
 
         tm = _MockTokenizerManager()
