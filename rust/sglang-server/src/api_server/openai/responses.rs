@@ -39,7 +39,7 @@ use super::chat::{SamplingDefaults, chat_sampling, prepare_chat_request};
 use super::reasoning::split_reasoning_unary;
 use super::response_stream::{
     chunk_response_logprobs, response_object, response_status, responses_event_stream,
-    responses_usage, text_response_message,
+    responses_usage, text_output_content, text_response_message,
 };
 use super::tools::{dynamo_tool_choice, parse_chat_tool_calls};
 use super::{AppState, collect_output, openai_error, submit_generation, unix_seconds};
@@ -409,7 +409,7 @@ pub(super) fn responses_chat_request(
         top_p: request.top_p,
         response_format,
         top_logprobs: request.top_logprobs,
-        logprobs: request.top_logprobs.map(|value| value > 0),
+        logprobs: request.top_logprobs.map(|_| true),
         parallel_tool_calls: request.parallel_tool_calls,
         tools,
         tool_choice,
@@ -821,9 +821,8 @@ async fn collect_response_items(
         let logprobs = want_logprobs.then(|| chunk_response_logprobs(output.extras.as_deref()));
         items.push(text_response_message(
             format!("msg_{}", uuid::Uuid::new_v4().simple()),
-            text,
             OutputStatus::Completed,
-            logprobs,
+            text_output_content(text, logprobs),
         ));
     }
     Ok((output, items))

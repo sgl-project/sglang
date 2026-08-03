@@ -245,7 +245,7 @@ pub(super) fn responses_event_stream(
         sequence += 1;
 
         let mut completed_items = Vec::new();
-        let mut open_message: Option<(String, u32, String, Vec<LogProb>)> = None;
+        let mut open_message: Option<(String, u32, OutputTextContent)> = None;
         // Open reasoning item (item_id, output_index, text). Python keeps the
         // same single-open-item invariant: reasoning closes the message, and
         // normal text or tool calls close the reasoning item.
@@ -271,22 +271,14 @@ pub(super) fn responses_event_stream(
                     .as_deref()
                     .filter(|text| !text.is_empty())
                 {
-                    if let Some((item_id, output_index, text, logprobs)) = open_message.take() {
-                        for event in finish_response_text_item(
-                            &mut sequence,
-                            &item_id,
-                            output_index,
-                            &text,
-                            want_logprobs.then_some(logprobs.as_slice()),
-                        ) {
+                    if let Some((item_id, output_index, content)) = open_message.take() {
+                        let (events, item) = finish_response_text_item(
+                            &mut sequence, item_id, output_index, content,
+                        );
+                        for event in events {
                             yield event;
                         }
-                        completed_items.push(text_response_message(
-                            item_id,
-                            text,
-                            OutputStatus::Completed,
-                            want_logprobs.then_some(logprobs),
-                        ));
+                        completed_items.push(item);
                     }
                     if reasoning_state.is_none() {
                         let item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
@@ -332,31 +324,21 @@ pub(super) fn responses_event_stream(
                     // Python closes the reasoning item before opening tool-call
                     // items.
                     if let Some((item_id, output_index, text)) = reasoning_state.take() {
-                        for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+                        let (events, item) =
+                            finish_reasoning_item(&mut sequence, item_id, output_index, text);
+                        for event in events {
                             yield event;
                         }
-                        completed_items.push(response_reasoning_item(
-                            item_id,
-                            text,
-                            Some(OutputStatus::Completed),
-                        ));
+                        completed_items.push(item);
                     }
-                    if let Some((item_id, output_index, text, logprobs)) = open_message.take() {
-                        for event in finish_response_text_item(
-                            &mut sequence,
-                            &item_id,
-                            output_index,
-                            &text,
-                            want_logprobs.then_some(logprobs.as_slice()),
-                        ) {
+                    if let Some((item_id, output_index, content)) = open_message.take() {
+                        let (events, item) = finish_response_text_item(
+                            &mut sequence, item_id, output_index, content,
+                        );
+                        for event in events {
                             yield event;
                         }
-                        completed_items.push(text_response_message(
-                            item_id,
-                            text,
-                            OutputStatus::Completed,
-                            want_logprobs.then_some(logprobs),
-                        ));
+                        completed_items.push(item);
                     }
                     for call in calls {
                         tool_call_emitted = true;
@@ -447,24 +429,25 @@ pub(super) fn responses_event_stream(
                     // Python closes the reasoning item when normal text
                     // resumes, before opening or continuing the message.
                     if let Some((item_id, output_index, text)) = reasoning_state.take() {
-                        for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+                        let (events, item) =
+                            finish_reasoning_item(&mut sequence, item_id, output_index, text);
+                        for event in events {
                             yield event;
                         }
-                        completed_items.push(response_reasoning_item(
-                            item_id,
-                            text,
-                            Some(OutputStatus::Completed),
-                        ));
+                        completed_items.push(item);
                     }
                     if open_message.is_none() {
                         let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                         let output_index =
                             u32::try_from(completed_items.len()).unwrap_or(u32::MAX);
+                        let content = text_output_content(
+                            String::new(),
+                            want_logprobs.then(Vec::new),
+                        );
                         let pending = text_response_message(
                             item_id.clone(),
-                            String::new(),
                             OutputStatus::InProgress,
-                            want_logprobs.then(Vec::new),
+                            content.clone(),
                         );
                         yield serialize_response_event(
                             ResponseStreamEvent::ResponseOutputItemAdded(
@@ -483,24 +466,25 @@ pub(super) fn responses_event_stream(
                                     item_id: item_id.clone(),
                                     output_index,
                                     content_index: 0,
-                                    part: text_output_content(
-                                        String::new(),
-                                        want_logprobs.then(Vec::new),
-                                    ),
+                                    part: OutputContent::OutputText(content.clone()),
                                 },
                             ),
                         );
                         sequence += 1;
-                        open_message = Some((item_id, output_index, String::new(), Vec::new()));
+                        open_message = Some((item_id, output_index, content));
                     }
-                    if let Some((item_id, output_index, text, logprobs)) = open_message.as_mut() {
+                    if let Some((item_id, output_index, content)) = open_message.as_mut() {
                         let delta_logprobs = output_text_logprobs(choice.logprobs.as_ref());
-                        let stream_logprobs = choice
-                            .logprobs
-                            .is_some()
-                            .then(|| response_stream_logprobs(&delta_logprobs));
-                        text.push_str(&delta);
-                        logprobs.extend(delta_logprobs);
+                        let stream_logprobs = delta_logprobs
+                            .as_deref()
+                            .map(response_stream_logprobs);
+                        content.text.push_str(&delta);
+                        if let Some(delta_logprobs) = delta_logprobs {
+                            content
+                                .logprobs
+                                .get_or_insert_default()
+                                .extend(delta_logprobs);
+                        }
                         yield serialize_response_event(
                             ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent {
                                 sequence_number: sequence,
@@ -526,25 +510,23 @@ pub(super) fn responses_event_stream(
             }
         };
         if let Some((item_id, output_index, text)) = reasoning_state.take() {
-            for event in finish_reasoning_item(&mut sequence, &item_id, output_index, &text) {
+            let (events, item) =
+                finish_reasoning_item(&mut sequence, item_id, output_index, text);
+            for event in events {
                 yield event;
             }
-            completed_items.push(response_reasoning_item(
-                item_id,
-                text,
-                Some(OutputStatus::Completed),
-            ));
+            completed_items.push(item);
         }
         if open_message.is_none() && completed_items.is_empty() {
             let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
             let output_index = 0;
-            let pending =
-                text_response_message(
-                    item_id.clone(),
-                    String::new(),
-                    OutputStatus::InProgress,
-                    want_logprobs.then(Vec::new),
-                );
+            let content =
+                text_output_content(String::new(), want_logprobs.then(Vec::new));
+            let pending = text_response_message(
+                item_id.clone(),
+                OutputStatus::InProgress,
+                content.clone(),
+            );
             yield serialize_response_event(ResponseStreamEvent::ResponseOutputItemAdded(
                 ResponseOutputItemAddedEvent {
                     sequence_number: sequence,
@@ -559,28 +541,19 @@ pub(super) fn responses_event_stream(
                     item_id: item_id.clone(),
                     output_index,
                     content_index: 0,
-                    part: text_output_content(String::new(), want_logprobs.then(Vec::new)),
+                    part: OutputContent::OutputText(content.clone()),
                 },
             ));
             sequence += 1;
-            open_message = Some((item_id, output_index, String::new(), Vec::new()));
+            open_message = Some((item_id, output_index, content));
         }
-        if let Some((item_id, output_index, text, logprobs)) = open_message {
-            for event in finish_response_text_item(
-                &mut sequence,
-                &item_id,
-                output_index,
-                &text,
-                want_logprobs.then_some(logprobs.as_slice()),
-            ) {
+        if let Some((item_id, output_index, content)) = open_message {
+            let (events, item) =
+                finish_response_text_item(&mut sequence, item_id, output_index, content);
+            for event in events {
                 yield event;
             }
-            completed_items.push(text_response_message(
-                item_id,
-                text,
-                OutputStatus::Completed,
-                want_logprobs.then_some(logprobs),
-            ));
+            completed_items.push(item);
         }
 
         let final_status = response_status(&output);
@@ -622,47 +595,41 @@ pub(super) fn responses_event_stream(
 
 fn finish_response_text_item(
     sequence: &mut u64,
-    item_id: &str,
+    item_id: String,
     output_index: u32,
-    text: &str,
-    logprobs: Option<&[LogProb]>,
-) -> [String; 3] {
+    content: OutputTextContent,
+) -> ([String; 3], OutputItem) {
     let text_done = serialize_response_event(ResponseStreamEvent::ResponseOutputTextDone(
         ResponseTextDoneEvent {
             sequence_number: *sequence,
-            item_id: item_id.to_owned(),
+            item_id: item_id.clone(),
             output_index,
             content_index: 0,
-            text: text.to_owned(),
-            logprobs: logprobs.map(response_stream_logprobs),
+            text: content.text.clone(),
+            logprobs: content.logprobs.as_deref().map(response_stream_logprobs),
         },
     ));
     *sequence += 1;
     let part_done = serialize_response_event(ResponseStreamEvent::ResponseContentPartDone(
         ResponseContentPartDoneEvent {
             sequence_number: *sequence,
-            item_id: item_id.to_owned(),
+            item_id: item_id.clone(),
             output_index,
             content_index: 0,
-            part: text_output_content(text.to_owned(), logprobs.map(<[LogProb]>::to_vec)),
+            part: OutputContent::OutputText(content.clone()),
         },
     ));
     *sequence += 1;
-    let item = text_response_message(
-        item_id.to_owned(),
-        text.to_owned(),
-        OutputStatus::Completed,
-        logprobs.map(<[LogProb]>::to_vec),
-    );
+    let item = text_response_message(item_id, OutputStatus::Completed, content);
     let item_done = serialize_response_event(ResponseStreamEvent::ResponseOutputItemDone(
         ResponseOutputItemDoneEvent {
             sequence_number: *sequence,
             output_index,
-            item,
+            item: item.clone(),
         },
     ));
     *sequence += 1;
-    [text_done, part_done, item_done]
+    ([text_done, part_done, item_done], item)
 }
 
 /// Close an open reasoning item: the `reasoning_text.done` event followed by
@@ -670,60 +637,54 @@ fn finish_response_text_item(
 /// summary events — summary requests are rejected up front).
 fn finish_reasoning_item(
     sequence: &mut u64,
-    item_id: &str,
+    item_id: String,
     output_index: u32,
-    text: &str,
-) -> [String; 2] {
+    text: String,
+) -> ([String; 2], OutputItem) {
     let text_done = serialize_response_event(ResponseStreamEvent::ResponseReasoningTextDone(
         ResponseReasoningTextDoneEvent {
             sequence_number: *sequence,
-            item_id: item_id.to_owned(),
+            item_id: item_id.clone(),
             output_index,
             content_index: 0,
-            text: text.to_owned(),
+            text: text.clone(),
         },
     ));
     *sequence += 1;
-    let item = response_reasoning_item(
-        item_id.to_owned(),
-        text.to_owned(),
-        Some(OutputStatus::Completed),
-    );
+    let item = response_reasoning_item(item_id, text, Some(OutputStatus::Completed));
     let item_done = serialize_response_event(ResponseStreamEvent::ResponseOutputItemDone(
         ResponseOutputItemDoneEvent {
             sequence_number: *sequence,
             output_index,
-            item,
+            item: item.clone(),
         },
     ));
     *sequence += 1;
-    [text_done, item_done]
+    ([text_done, item_done], item)
 }
 
 fn serialize_response_event(event: ResponseStreamEvent) -> String {
     serde_json::to_string(&event).expect("OpenAI response event must serialize")
 }
 
-fn text_output_content(text: String, logprobs: Option<Vec<LogProb>>) -> OutputContent {
-    OutputContent::OutputText(OutputTextContent {
+pub(super) fn text_output_content(
+    text: String,
+    logprobs: Option<Vec<LogProb>>,
+) -> OutputTextContent {
+    OutputTextContent {
         annotations: vec![],
         logprobs,
         text,
-    })
+    }
 }
 
 pub(super) fn text_response_message(
     id: String,
-    text: String,
     status: OutputStatus,
-    logprobs: Option<Vec<LogProb>>,
+    content: OutputTextContent,
 ) -> OutputItem {
     OutputItem::Message(OutputMessage {
-        content: vec![OutputMessageContent::OutputText(OutputTextContent {
-            annotations: vec![],
-            logprobs,
-            text,
-        })],
+        content: vec![OutputMessageContent::OutputText(content)],
         id,
         role: AssistantRole::Assistant,
         phase: None,
@@ -731,32 +692,35 @@ pub(super) fn text_response_message(
     })
 }
 
-fn output_text_logprobs(logprobs: Option<&ChatChoiceLogprobs>) -> Vec<LogProb> {
-    logprobs
-        .and_then(|logprobs| logprobs.content.as_deref())
-        .unwrap_or_default()
-        .iter()
-        .map(|token| LogProb {
-            bytes: token
-                .bytes
-                .clone()
-                .unwrap_or_else(|| token.token.as_bytes().to_vec()),
-            logprob: f64::from(token.logprob),
-            token: token.token.clone(),
-            top_logprobs: token
-                .top_logprobs
-                .iter()
-                .map(|top| TopLogProb {
-                    bytes: top
-                        .bytes
-                        .clone()
-                        .unwrap_or_else(|| top.token.as_bytes().to_vec()),
-                    logprob: f64::from(top.logprob),
-                    token: top.token.clone(),
-                })
-                .collect(),
-        })
-        .collect()
+fn output_text_logprobs(logprobs: Option<&ChatChoiceLogprobs>) -> Option<Vec<LogProb>> {
+    logprobs.map(|logprobs| {
+        logprobs
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|token| LogProb {
+                bytes: token
+                    .bytes
+                    .clone()
+                    .unwrap_or_else(|| token.token.as_bytes().to_vec()),
+                logprob: f64::from(token.logprob),
+                token: token.token.clone(),
+                top_logprobs: token
+                    .top_logprobs
+                    .iter()
+                    .map(|top| TopLogProb {
+                        bytes: top
+                            .bytes
+                            .clone()
+                            .unwrap_or_else(|| top.token.as_bytes().to_vec()),
+                        logprob: f64::from(top.logprob),
+                        token: top.token.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    })
 }
 
 fn response_stream_logprobs(logprobs: &[LogProb]) -> Vec<ResponseLogProb> {
@@ -779,7 +743,7 @@ fn response_stream_logprobs(logprobs: &[LogProb]) -> Vec<ResponseLogProb> {
 
 pub(super) fn chunk_response_logprobs(extras: Option<&ChunkExtras>) -> Vec<LogProb> {
     let logprobs = chat_logprobs(extras);
-    output_text_logprobs(Some(&logprobs))
+    output_text_logprobs(Some(&logprobs)).unwrap_or_default()
 }
 
 pub(super) fn responses_usage(prompt_tokens: u32, completion_tokens: u64) -> ResponseUsage {
