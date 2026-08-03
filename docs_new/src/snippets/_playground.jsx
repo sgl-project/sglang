@@ -1390,18 +1390,31 @@ export const Playground = ({ config }) => {
       const di = config.dockerImages || {};
       const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
+      // (Mintlify strips module state, so the engines cannot share it).
+      const HW_MULTINODE_DOCKER_FLAGS = {
+        "dgx-spark": [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ],
+      };
+      const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
       const dockerLines = [
         "docker run --gpus all",
         "  --shm-size 32g",
         (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...f.map((x) => "    " + x),
       ];
       cmd = dockerLines.join(" \\\n");

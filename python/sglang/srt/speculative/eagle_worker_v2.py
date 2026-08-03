@@ -264,12 +264,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
         elif get_spec().speculative_token_map is not None:
             self.hot_token_id = load_token_map(get_spec().speculative_token_map)
-            self.server_args.override(
-                "eagle_worker.hot_token_map",
-                json_model_override_args=(
-                    f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-                ),
-            )
         else:
             self.hot_token_id = None
 
@@ -468,7 +462,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -478,12 +472,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
         )
         if (
-            can_cuda_graph
+            can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
         ):
-            can_cuda_graph = False
+            can_run_decode_cuda_graph = False
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -497,7 +491,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
@@ -882,14 +876,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
+        can_run_decode_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
-        if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
+        if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:
             forward_batch.spec_info.dsa_seed_topk_capture = (
                 self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
             )
@@ -906,7 +900,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
         with canary_ctx:
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
                 )
@@ -917,18 +911,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
         )
         maybe_detect_inf(
             draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
+            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
         )
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 dsa_extend_topk_capture = (
                     self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
                 )
@@ -1008,12 +1002,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
         )
 
         self._draft_worker = EagleDraftWorker(
@@ -1210,7 +1198,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_mask = attn_backend.verify_mask
         # Every position in a 1-node tree is visible, so an all-True fill is
         # correct under either layout.
-        if verify_mask is not None and verify_mask.fits(bs, 1):
+        if verify_mask is not None and verify_mask.fits(bs):
             custom_mask = verify_mask.buffer
             custom_mask.fill_(True)
         else:

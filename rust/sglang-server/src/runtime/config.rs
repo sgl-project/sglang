@@ -96,6 +96,11 @@ pub struct ServerArgs {
     /// text. Matches the Python `TokenizerManager`.
     #[serde(default)]
     pub incremental_streaming_output: bool,
+    /// PD-disaggregation role: `"null"` (unified), `"prefill"`, or `"decode"`.
+    /// (On prefill, the KV bootstrap registry is mounted on the api router —
+    /// see [`Self::enable_pd_bootstrap`].)
+    #[serde(default = "default_disaggregation_mode")]
+    pub disaggregation_mode: String,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
     #[serde(default)]
     pub model_config: ModelConfig,
@@ -140,6 +145,14 @@ pub struct ModelConfig {
     pub vocab_size: Option<u64>,
 }
 
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn default_host() -> String {
     "127.0.0.1".into()
 }
@@ -148,6 +161,9 @@ fn default_port() -> u16 {
 }
 fn default_log_level() -> String {
     "info".into()
+}
+fn default_disaggregation_mode() -> String {
+    "null".into()
 }
 fn default_worker_num() -> usize {
     1
@@ -170,13 +186,37 @@ impl ServerArgs {
         if self.model_config.vocab_size.is_none() {
             return Err("no resolvable vocab size (model_config.vocab_size)".into());
         }
+        if !matches!(
+            self.disaggregation_mode.as_str(),
+            "null" | "prefill" | "decode"
+        ) {
+            return Err(format!(
+                "unknown disaggregation_mode '{}' in server_args",
+                self.disaggregation_mode
+            ));
+        }
         Ok(())
     }
 
+    /// True on a prefill or decode node — requests need bootstrap routing.
+    pub fn is_disaggregation(&self) -> bool {
+        self.disaggregation_mode != "null"
+    }
+
+    /// Serve the PD KV bootstrap registry on the api listener: every prefill
+    /// rust server hosts it, unconditionally — no extra topology gating. KV
+    /// managers and decode nodes reach the registry at the resolved
+    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
+    /// api port, so whichever prefill server that port names is the one that
+    /// receives the registrations.
+    pub fn enable_pd_bootstrap(&self) -> bool {
+        self.disaggregation_mode == "prefill"
+    }
+
     /// Bind address `host:port`. `host` is expected to be an IP — the result is
-    /// parsed as a `SocketAddr`.
+    /// parsed as a `SocketAddr`, so a bare IPv6 host gets bracketed.
     pub fn bind(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        join_host_port(&self.host, self.port)
     }
 
     /// Whether the HTTP access log is emitted, mirroring the Python server:
