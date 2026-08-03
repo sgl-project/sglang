@@ -764,6 +764,30 @@ class C4IndexerBackendMixin:
                 end = start + int(extend_seq_lens[i].item())
                 request_ranges.append((i, start, end))
 
+        # Use real-time free memory for the chunk budget instead of the
+        # cached value from ``_get_mqa_logits_budget_bytes``.  The cached
+        # budget is calculated once (typically right after CUDA-graph
+        # capture when free memory is near its peak) and never updated.
+        # At prefill time the actual free memory can be significantly
+        # lower due to KV-cache occupancy and prefill activations, so a
+        # chunk sized from the stale cache can still OOM.
+        #
+        # ``mem_get_info`` is a lightweight CUDA runtime query (~1-10 µs)
+        # that does NOT synchronise the device.  We call it once per
+        # request (not per chunk) and apply a conservative 0.5 factor to
+        # leave headroom for the KV gather and other intermediates that
+        # are allocated between the query and the logits allocation.
+        if get_is_capture_mode():
+            # During CUDA-graph capture we cannot call mem_get_info; fall
+            # back to the (already conservative) static budget.
+            realtime_budget = budget_bytes
+        else:
+            free_mem, _ = torch.cuda.mem_get_info(device.index)
+            total_mem = torch.cuda.get_device_properties(device.index).total_memory
+            static_cap = int(total_mem * _MQA_LOGITS_TOTAL_MEM_FRACTION)
+            realtime_budget = min(int(free_mem * 0.5), static_cap)
+            realtime_budget = max(1, realtime_budget)
+
         bytes_per_row = max_c4_seq_len * _MQA_LOGITS_BYTES_PER_ELEM
 
         for req_idx, req_start, req_end in request_ranges:
@@ -801,8 +825,9 @@ class C4IndexerBackendMixin:
             k_fp8 = k_u8.view(FP8_DTYPE)
             k_scale = scale_u8.view(torch.float32).squeeze(-1)
 
-            # Query-axis chunk loop.
-            max_rows = max(1, budget_bytes // max(bytes_per_row, 1))
+            # Query-axis chunk loop — use the real-time budget so the
+            # chunk size adapts to current GPU free memory.
+            max_rows = max(1, realtime_budget // max(bytes_per_row, 1))
             max_rows = min(max_rows, req_query_rows)
 
             q_offset = 0
