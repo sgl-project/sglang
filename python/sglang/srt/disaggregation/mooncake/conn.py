@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -282,35 +282,41 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
-    def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
+    def _registerable_regions(self) -> List[Tuple[int, int]]:
+        """(ptr, len) regions to (de)register, exact duplicates removed.
 
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
+        Deduped because the unified memory pool reports one raw buffer as both
+        its KV and its mamba state component, and double registration fails in
+        the engine.
+        """
+        regions: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
 
+        def add(ptrs: List[int], lens: List[int]) -> None:
+            for ptr, length in zip(ptrs or [], lens or []):
+                if (ptr, length) not in seen:
+                    seen.add((ptr, length))
+                    regions.append((ptr, length))
+
+        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+            add(ptrs, lens)
+        return regions
+
+    def register_buffer_to_engine(self):
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, lens = zip(*regions)
+            self.engine.batch_register(list(ptrs), list(lens))
 
     def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
-
-        if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
-
-        for ptrs in self.kv_args.state_data_ptrs or []:
-            if ptrs:
-                self.engine.batch_deregister(ptrs)
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, _ = zip(*regions)
+            self.engine.batch_deregister(list(ptrs))
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -1243,6 +1249,17 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
+                    src_item_lens
+                ) != list(dst_item_lens):
+                    raise RuntimeError(
+                        "Mamba state layouts differ between prefill and decode "
+                        f"(src item_lens={src_item_lens}, dst item_lens="
+                        f"{dst_item_lens}) and no per-tensor dim metadata is "
+                        "available to reslice. With --enable-unified-memory, "
+                        "prefill and decode must both enable it and use equal "
+                        "attention TP sizes."
+                    )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size

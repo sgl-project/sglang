@@ -1178,9 +1178,11 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
+                    self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                    )
                     .cpu()
                     .numpy()
                 ]
@@ -1287,6 +1289,13 @@ class SchedulerDisaggregationPrefillMixin:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, seg_start:seg_end
             ]
+            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+            # physical ones. Per segment, since each is its own gather.
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
