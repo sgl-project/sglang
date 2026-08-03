@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -36,7 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -167,9 +168,9 @@ class TritonAttnBackend(AttentionBackend):
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
         self.use_verify_splitkv = (
@@ -296,8 +297,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         self.forward_metadata: ForwardMetadata = None
-
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
 
@@ -496,7 +496,9 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_indices=window_kv_indices,
                 )
             )
-        custom_mask = self.cuda_graph_custom_mask
+        custom_mask = (
+            self._verify_mask.buffer if self._verify_mask is not None else None
+        )
         if (
             spec_info is not None
             and getattr(spec_info, "custom_mask", None) is not None
@@ -991,12 +993,18 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if not self.skip_prefill and not self.is_draft_runner:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device=self.device,
-            )
+        # Layout is draft * (seq_len + draft) per request (seq_mask_len cumsum
+        # below) -- the same bound the shared sizing covers. Read as uint8.
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.is_draft_runner,
+            skip_prefill=self.skip_prefill,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=self.num_draft_tokens,
+            device=self.device,
+            is_read=True,
+            dtype=torch.uint8,
+        )
 
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
@@ -1079,8 +1087,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
-                self.cuda_graph_custom_mask
-                if spec_info is not None
+                self._verify_mask.buffer
+                if self._verify_mask is not None
+                and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
                 else None
             )
@@ -1174,13 +1183,9 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
