@@ -430,11 +430,9 @@ async def lifespan(fast_api_app: FastAPI):
 
 # Fast API
 class ORJSONRequest(Request):
-    """Request whose ``json()`` uses orjson.
-
-    Large multimodal chat bodies (data-URL images are tens of MB) otherwise
-    pay stdlib ``json.loads`` inside FastAPI's dependency resolution; orjson
-    parses the same bytes several times faster with identical semantics.
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
     """
 
     async def json(self) -> Any:
@@ -476,10 +474,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+# route_class is per-router, so included routers need it set too.
+v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
+elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
 
