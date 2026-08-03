@@ -195,8 +195,7 @@ def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
 
 
 def test_kimi_cpu_fallback_keeps_the_request_tokens():
-    # preserve_processor_input_ids disables the base class rebuild for every
-    # path, so the no-CUDA fallback has to preserve the tokens on its own.
+    # preserve_processor_input_ids disables the base rebuild on every path.
     hf_processor = Mock()
     hf_processor.media_processor.media_tokens_calculator = Mock(return_value=3)
     hf_processor.return_value = {"input_ids": torch.tensor([[99, 99, 99]])}

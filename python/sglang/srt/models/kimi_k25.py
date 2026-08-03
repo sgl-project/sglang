@@ -460,9 +460,9 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
-        # The kernel templates on the q/k dtype, and precompile_fused_qk_complex
-        # _rope only warms up fp16/bf16. Other dtypes would JIT-compile on the
-        # first request, so route them to the portable complex path instead.
+        # The kernel templates on the q/k dtype and only fp16/bf16 get warmed up
+        # by precompile_fused_qk_complex_rope; anything else would JIT-compile
+        # on the first request, so leave it on the portable path.
         if self.use_fused_rope and hidden_states.dtype in (
             torch.float16,
             torch.bfloat16,

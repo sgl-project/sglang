@@ -156,9 +156,9 @@ def _resize_bicubic_if_needed(
     under ``antialias=True``. PIL also returns uint8, so round and clip back to
     integer pixels; the bicubic overshoot would otherwise survive normalization.
 
-    Close but not exact: PIL evaluates uint8 resizes in fixed point while this
-    stays in fp32, leaving a few 8-bit levels of residual. Against PIL's own
-    float path the two agree to ~5e-3.
+    Close but not exact: PIL evaluates uint8 resizes in fixed point, so a few
+    8-bit levels of residual remain -- against PIL's float path we agree to 5e-3,
+    i.e. the kernel matches and only the arithmetic differs.
     """
     image = image.float()
     if image.shape[-2:] == (target_height, target_width):
