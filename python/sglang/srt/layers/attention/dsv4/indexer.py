@@ -101,9 +101,13 @@ def fold_paged_mqa_logits_approx(
       layer (40) bottoms at 0.11 on single rows.
     - ~50% of per-head products are negative at every layer and depth;
       the ReLU removes ~46% of the |w|-weighted score mass.
-    - Task-level: needle 4/4 at 32K-256K and GSM8K parity were observed on
-      a fold-enabled build; those tasks are coarse, and the mechanism-level
-      divergence above is the honest picture.
+    - Task-level, controlled A/B on this branch with fold engagement
+      verified: needle 128K/256K 4/4 in both modes; GSM8K full-1319 at
+      0.942 with the fold vs 0.941 exact, same harness. What the trade
+      buys on top of the exact fused kernel: 53.9 s vs 56.3 s needle wall
+      at 128K and 112.3 s vs 141.4 s at 256K, i.e. 4-21% at these lengths.
+      Those tasks are coarse; the mechanism-level divergence above is the
+      honest picture.
 
     Taken only for prefill-sized calls where every row shares one page table
     (single-sequence prefill); anything else falls back to the exact fused
