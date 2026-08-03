@@ -33,9 +33,9 @@ def _init() -> bool:
     _INITIALIZED = True
     if not envs.SGLANG_K3_GEMM_AR.get():
         return False
-    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+    from sglang.srt.runtime_context import get_parallel
 
-    world_size = get_tensor_model_parallel_world_size()
+    world_size = get_parallel().tp_size
     if not (2 <= world_size <= 8):
         logger.warning("SGLANG_K3_GEMM_AR requires 2 <= TP <= 8; disabled.")
         return False
@@ -56,13 +56,11 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     if not _init():
         return
     from sglang.kernels.ops.kimi_k3 import gemm_ar as mod
-    from sglang.srt.distributed import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-    )
     from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
-    world_size = get_tensor_model_parallel_world_size()
+    parallel = get_parallel()
+    world_size = parallel.tp_size
     if not o_proj.reduce_results or o_proj.tp_size != world_size:
         return
     weight = o_proj.weight
@@ -75,7 +73,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
 
     mod.init(
         world_size=world_size,
-        rank=get_tensor_model_parallel_rank(),
+        rank=parallel.tp_rank,
         group=get_tp_group().cpu_group,
         k=weight.shape[1],
     )

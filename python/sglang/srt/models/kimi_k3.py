@@ -20,7 +20,6 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -1964,7 +1963,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.all_reduce_fusion = (
             not self._sp_moe
             and attn_tp_size > 1
-            and attn_tp_size == get_tensor_model_parallel_world_size()
+            and attn_tp_size == get_parallel().tp_size
             and config.attn_res_block_size is not None
             and k3_ar_fusion.enabled()
         )

@@ -79,13 +79,13 @@ def _get_state() -> Optional[_State]:
                 server_args.moe_a2a_backend,
             )
             return None
-    from sglang.srt.distributed import get_tensor_model_parallel_world_size
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
     from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
-    if get_tensor_model_parallel_world_size() <= 1:
+    if get_parallel().tp_size <= 1:
         return None
     group = get_tp_group()
     comm = group.ca_comm

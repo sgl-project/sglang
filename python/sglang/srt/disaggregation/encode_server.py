@@ -1873,7 +1873,8 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        transfer_backend = self.server_args.encoder_transfer_backend
+        if transfer_backend == "mooncake":
             # Wait for async VIT forward completion if needed
             req_id = mm_data.req_id
             if req_id in self._forward_ready_events:
@@ -1945,7 +1946,7 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if transfer_backend == "mooncake":
             # Mooncake already pushed the embedding via RDMA;
             new_mm_data = mm_data.copy_without_embedding()
             serialized_data = pickle.dumps(new_mm_data)
@@ -2034,13 +2035,10 @@ class MMEncoder:
                 sock.close(linger=5000)
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
-        if (
-            encoder_metrics_collector is not None
-            and get_disagg().encoder_transfer_backend != "mooncake"
-        ):
+        if encoder_metrics_collector is not None and transfer_backend != "mooncake":
             encoder_metrics_collector.observe_transfer(
                 time.perf_counter() - _zmq_xfer_start,
-                backend=get_disagg().encoder_transfer_backend,
+                backend=transfer_backend,
             )
 
     async def encode(
