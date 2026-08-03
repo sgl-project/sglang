@@ -22,8 +22,10 @@ from sglang.srt.models.kimi_k25 import (
 )
 from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    _ensure_chw_rgb,
     _expand_image_token_ids,
     _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
@@ -160,6 +162,44 @@ def test_kimi_expands_one_placeholder_per_image_from_existing_ids():
 def test_kimi_expansion_rejects_a_placeholder_count_mismatch():
     with pytest.raises(ValueError, match="placeholder"):
         _expand_image_token_ids([1, 7, 2], image_token_id=7, image_token_counts=[3, 2])
+
+
+def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
+    # K2.5 sets preserve_processor_input_ids because these two must agree; if
+    # they ever diverge, skipping the base rebuild would change the prompt.
+    # Both are checked against a literal transcription of the original loop.
+    def reference(original_ids, counts, placeholder):
+        rebuilt, next_image = [], 0
+        for token_id in original_ids:
+            if token_id == placeholder:
+                rebuilt.extend([placeholder] * counts[next_image])
+                next_image += 1
+            else:
+                rebuilt.append(token_id)
+        return rebuilt
+
+    rng = np.random.default_rng(0)
+    for n_images in (1, 3, 8):
+        # Placeholder 7 is below the random range, so only the inserted
+        # positions count as placeholders.
+        ids = rng.integers(100, 5000, 400).tolist()
+        for slot in range(n_images):
+            ids.insert(slot * 37 + 5, 7)
+        counts = rng.integers(1, 400, n_images).tolist()
+        expected = reference(ids, counts, 7)
+
+        assert BaseMultimodalProcessor._expand_input_ids(ids, counts, 7) == expected
+        wrapper = _expand_image_token_ids(
+            ids, image_token_id=7, image_token_counts=counts
+        )
+        assert wrapper.flatten().tolist() == expected
+
+
+def test_kimi_refuses_already_normalized_float_pixels():
+    # The resize quantizes to integers to match PIL and the normalization folds
+    # in a 1/255 scale, so a float image would be rounded to 0/1 and rescaled.
+    with pytest.raises(ValueError, match="uint8"):
+        _ensure_chw_rgb(torch.rand(3, 8, 8))
 
 
 def test_kimi_placeholder_validation_only_claims_real_token_ids():

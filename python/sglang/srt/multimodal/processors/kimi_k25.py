@@ -85,7 +85,13 @@ def _expand_image_token_ids(
     image_token_id: int,
     image_token_counts: List[int],
 ) -> torch.Tensor:
-    """Expand one placeholder per image without tokenizing the media string again."""
+    """Expand one placeholder per image without tokenizing the media string again.
+
+    Same rebuild as ``BaseMultimodalProcessor._expand_input_ids``, kept separate
+    because that one returns a list: staying in the array domain here skips a
+    full list round trip on the way to the processor's output tensor. The two
+    are pinned together by test_kimi_k25.py.
+    """
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.detach().flatten().cpu().numpy()
     input_ids = np.asarray(input_ids, dtype=np.int64)
@@ -122,6 +128,14 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     input does not trip a device mismatch against the CUDA normalization
     constants downstream. No-op if already on the device.
     """
+    if image.dtype != torch.uint8:
+        # The whole pipeline assumes raw 0-255 pixels: the resize quantizes to
+        # integers to match PIL, and the normalization folds in a 1/255 scale.
+        # An already-normalized float image would be rounded to 0/1 and then
+        # rescaled, so refuse it instead of returning garbage.
+        raise ValueError(
+            f"Kimi GPU preprocessing expects raw uint8 pixels, got {image.dtype}"
+        )
     image = image.cuda()
     if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
         image = image.unsqueeze(0)
@@ -468,6 +482,10 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
+    # The wrapper already expands the placeholders from the request's own token
+    # IDs, so the retokenize-avoidance pass in process_and_combine_mm_data would
+    # only rebuild the identical sequence.
+    preserve_processor_input_ids = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
