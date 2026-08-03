@@ -2525,8 +2525,10 @@ def _setup_and_run_http_server(
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
             port_args,
             server_args,
-            scheduler_infos[0],
-            tokenizer_manager.startup_time,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:

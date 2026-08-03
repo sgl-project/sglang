@@ -1686,7 +1686,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
-        for phase in ("load_weight", "kv_cache_allocation", "e2e"):
+        for phase in ("load_weight", "kv_cache_allocation", "scheduler_e2e", "e2e"):
             self.startup_time_seconds.labels(
                 **self.labels,
                 phase=phase,

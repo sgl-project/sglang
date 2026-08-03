@@ -246,6 +246,7 @@ class TestEnableMetrics(CustomTestCase):
             ),
             ("sglang:startup_time_seconds", {"phase": "load_weight"}),
             ("sglang:startup_time_seconds", {"phase": "kv_cache_allocation"}),
+            ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
             ("sglang:startup_time_seconds", {"phase": "e2e"}),
             ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
         ]

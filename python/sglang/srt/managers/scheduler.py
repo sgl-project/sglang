@@ -386,6 +386,7 @@ class Scheduler(
         # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
         # with minimal glue. Move substantial component-specific logic into
         # dedicated methods instead of adding inline blocks here.
+        self.init_startup_timer()
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
@@ -639,6 +640,26 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+        self.init_startup_time()
+
+    def init_startup_timer(self) -> None:
+        self.scheduler_startup_tic = time.perf_counter()
+
+    def init_startup_time(self) -> None:
+        self.startup_time = build_scheduler_startup_time(
+            target_load_weight=self.tp_worker.weight_load_time,
+            draft_load_weight=(
+                0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
+            ),
+            kv_cache_allocation=self.kv_cache_allocation_time,
+            scheduler_e2e=time.perf_counter() - self.scheduler_startup_tic,
+            target_cuda_graph=self.tp_worker.graph_time_usage,
+            draft_cuda_graph=(
+                None
+                if self.draft_worker is None
+                else self.draft_worker.graph_time_usage
+            ),
+        )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
         if not (
@@ -957,7 +978,7 @@ class Scheduler(
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
         self.init_memory_pools()
-        kv_cache_allocation_time = time.perf_counter() - tic
+        self.kv_cache_allocation_time = time.perf_counter() - tic
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
@@ -966,21 +987,7 @@ class Scheduler(
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
-            kv_cache_allocation_time += time.perf_counter() - tic
-
-        self.startup_time = build_scheduler_startup_time(
-            target_load_weight=self.tp_worker.weight_load_time,
-            draft_load_weight=(
-                0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
-            ),
-            kv_cache_allocation=kv_cache_allocation_time,
-            target_cuda_graph=self.tp_worker.graph_time_usage,
-            draft_cuda_graph=(
-                None
-                if self.draft_worker is None
-                else self.draft_worker.graph_time_usage
-            ),
-        )
+            self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if (
             get_exec().moe.elastic_ep_backend is not None
