@@ -40,8 +40,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-_DSV4_LEGACY_ENCODER = 'REASONING_EFFORT_MAX = "legacy"\n'
-_DSV4_0731_ENCODER = (
+_DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
+_DSV4_OFFICIAL_ENCODER = (
     'REASONING_EFFORT_PROMPTS = {"low": "", "high": "h", "max": "m"}\n'
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
@@ -1024,7 +1024,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders should reject history tool call scalars as BadRequest."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat._dsv4_reasoning_effort_profile = "legacy"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1062,7 +1062,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat._dsv4_reasoning_effort_profile = "legacy"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1562,7 +1562,7 @@ class ServingChatTestCase(unittest.TestCase):
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
         mock_hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "legacy"
+            "dsv4_reasoning_effort_profile": "preview"
         }
         tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
@@ -1762,40 +1762,42 @@ class ServingChatTestCase(unittest.TestCase):
                 reasoning_effort_profile=profile,
             )
 
-        legacy_high = encode("legacy", "high")
-        legacy_max = encode("legacy", "max")
-        release_low = encode("0731", "low")
-        release_high = encode("0731", "high")
-        release_max = encode("0731", "max")
+        preview_high = encode("preview", "high")
+        preview_max = encode("preview", "max")
+        official_low = encode("official", "low")
+        official_high = encode("official", "high")
+        official_max = encode("official", "max")
 
-        self.assertNotIn("Reasoning Effort:", legacy_high)
+        self.assertNotIn("Reasoning Effort:", preview_high)
         self.assertTrue(
-            legacy_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
+            preview_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
         )
-        self.assertNotIn("Reasoning Effort:", release_low)
+        self.assertNotIn("Reasoning Effort:", official_low)
         self.assertTrue(
-            release_high.startswith(encoding_dsv4.bos_token + absolute_maximum)
+            official_high.startswith(encoding_dsv4.bos_token + absolute_maximum)
         )
         self.assertTrue(
-            release_max.startswith(encoding_dsv4.bos_token + beyond_maximum)
+            official_max.startswith(encoding_dsv4.bos_token + beyond_maximum)
         )
-        self.assertEqual(encode("legacy", None), legacy_high)
-        self.assertEqual(encode("0731", None), release_low)
-        self.assertEqual(len({release_low, release_high, release_max}), 3)
+        self.assertEqual(encode("preview", None), preview_high)
+        self.assertEqual(encode("official", None), official_low)
+        self.assertEqual(len({official_low, official_high, official_max}), 3)
 
         with self.assertRaises(ValueError):
-            encode("legacy", "low")
+            encode("preview", "low")
 
     def test_dsv4_reasoning_effort_profile_resolution(self):
         resolve = resolve_dsv4_reasoning_effort_profile
-        legacy_model_path = _create_dsv4_checkpoint(self, _DSV4_LEGACY_ENCODER)
-        release_model_path = _create_dsv4_checkpoint(self, _DSV4_0731_ENCODER)
-        self.assertEqual(resolve(model_path=legacy_model_path), "legacy")
-        self.assertEqual(resolve(model_path=release_model_path), "0731")
+        preview_model_path = _create_dsv4_checkpoint(self, _DSV4_PREVIEW_ENCODER)
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        self.assertEqual(resolve(model_path=preview_model_path), "preview")
+        self.assertEqual(resolve(model_path=official_model_path), "official")
 
-        self.assertEqual(resolve(model_path="renamed/model", override="0731"), "0731")
         self.assertEqual(
-            resolve(model_path="renamed/model", override="legacy"), "legacy"
+            resolve(model_path="renamed/model", override="official"), "official"
+        )
+        self.assertEqual(
+            resolve(model_path="renamed/model", override="preview"), "preview"
         )
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             resolve(model_path="renamed/model", override="auto")
@@ -1803,13 +1805,13 @@ class ServingChatTestCase(unittest.TestCase):
     def test_dsv4_reasoning_effort_profile_from_checkpoint(self):
         from sglang.srt.parser.template_manager import TemplateManager
 
-        release_model_path = _create_dsv4_checkpoint(self, _DSV4_0731_ENCODER)
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
         tm = _MockTokenizerManager()
         tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
         tm.model_config.hf_config.to_dict.return_value = {}
         tm.model_config.hf_config.dspark_block_size = 5
         tm.model_config.hf_config.dspark_markov_rank = 256
-        tm.model_path = release_model_path
+        tm.model_path = official_model_path
         tm.server_args.model_path = tm.model_path
         serving_chat = OpenAIServingChat(tm, TemplateManager())
 
@@ -1828,7 +1830,7 @@ class ServingChatTestCase(unittest.TestCase):
         tm = _MockTokenizerManager()
         tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
         tm.model_config.hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "0731"
+            "dsv4_reasoning_effort_profile": "official"
         }
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         request = ChatCompletionRequest(

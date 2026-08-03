@@ -72,9 +72,9 @@ def _detect_dsv4_reasoning_effort_profile(
         and isinstance(prompts, dict)
         and {"low", "high", "max"} <= prompts.keys()
     ):
-        return "0731"
+        return "official"
     if "REASONING_EFFORT_MAX" in assignments:
-        return "legacy"
+        return "preview"
     return None
 
 
@@ -101,7 +101,7 @@ def resolve_dsv4_reasoning_effort_profile(
             model_path=model_path,
             revision=revision,
         )
-        or "legacy"
+        or "preview"
     )
 
 
