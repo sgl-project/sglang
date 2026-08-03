@@ -58,7 +58,7 @@ runtime:
   # differ, so these split what the single-node EP<=8 recipes leave symmetric.
   wide_ep:
     kv_cache_dtype: fp8_e4m3
-    prefill_mem_fraction_static: 0.8
+    prefill_mem_fraction_static: 0.85
     decode_mem_fraction_static: 0.85
     prefill_chunked_prefill_size: 131072
     prefill_max_running_requests: 1024
