@@ -379,7 +379,7 @@ class RuntimeHandle:
             "model_path": self.tokenizer_manager.model_path,
             "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": self.tokenizer_manager.server_args.weight_version,
+            "weight_version": self.tokenizer_manager.config_value("weight_version"),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -393,7 +393,9 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.resolved_config_dict(
+            dataclasses.asdict(self.tokenizer_manager.server_args)
+        )
         result.update(self.scheduler_info)
         return json.dumps(msgspec_to_builtins(result), default=str)
 

@@ -316,15 +316,21 @@ class TestCreateGrammarBackend(unittest.TestCase):
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
         from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
+        from sglang.srt.runtime_context import get_context, get_exec
 
         mock_xgrammar_cls.side_effect = TokenizerNotSupportedError(
             "unsupported tokenizer"
         )
-        args = self._make_server_args("xgrammar")
+        override = get_context().override_server_args(grammar_backend="xgrammar")
+        server_args = override.install()
+        self.addCleanup(override.restore)
 
-        result = create_grammar_backend(args, "tok", 32000, {1})
-        self.assertIsNone(result)
-        self.assertEqual(args.grammar_backend, "none")
+        self.assertIsNone(create_grammar_backend(server_args, "tok", 32000, {1}))
+        self.assertEqual(get_exec().kernel.grammar_backend, "none")
+        self.assertEqual(
+            get_context().resolved_server_args_dict()["grammar_backend"], "none"
+        )
+        self.assertEqual(server_args.grammar_backend, "xgrammar")
 
     @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):
