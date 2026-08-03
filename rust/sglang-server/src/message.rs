@@ -24,9 +24,9 @@ pub use egress::{
 pub use finish_reason::Matched;
 pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
 pub use request::{GenerateBody, GenerateRequest, MmRequest, RequestKind};
-// Only tests build an `MmData` directly; everything else receives it packed
-// inside a `GenerateRequest` by `split`.
-#[cfg(test)]
+// Built directly only by tests; `api_server::prefetch` fills its
+// `prefetched` field, everything else receives it packed inside a
+// `GenerateRequest` by `split`.
 pub use request::MmData;
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};

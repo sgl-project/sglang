@@ -299,8 +299,8 @@ impl Ingress {
                 // re-enters via `MmEncoded` (→ PreSendValidating) or `MmFailed`
                 // (→ reject). Doesn't loop.
                 RequestState::Encoding => {
-                    let payload = {
-                        let RequestKind::Generate(g) = &req.kind else {
+                    let (payload, prefetched) = {
+                        let RequestKind::Generate(g) = &mut req.kind else {
                             self.fail(
                                 &mut req,
                                 Error::Internal("non-generate request in Encoding".into()),
@@ -309,7 +309,13 @@ impl Ingress {
                             return;
                         };
                         match g.to_mm_payload_msgpack() {
-                            Ok(p) => p,
+                            // The API layer downloaded network sources already;
+                            // hand their bytes over out-of-band.
+                            Ok(p) => {
+                                let fetched =
+                                    g.mm.as_mut().map(|m| std::mem::take(&mut m.prefetched));
+                                (p, fetched.unwrap_or_default())
+                            }
                             Err(e) => {
                                 self.fail(&mut req, e, registered);
                                 return;
@@ -319,6 +325,7 @@ impl Ingress {
                     let msg = MmRequest {
                         rid: req.rid.clone(),
                         payload,
+                        prefetched,
                     };
                     // Full channel = the MM pool can't keep up → backpressure,
                     // same as a full ingress ring. Disconnected = pool gone.

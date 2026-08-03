@@ -7,11 +7,39 @@
 //! fallback path); the message says whether the input is malformed or merely
 //! outside the pipeline's scope (video/audio, precomputed features, ...).
 
+use bytes::Bytes;
 use rmpv::Value;
 use sglang_mm::driver::{ImageSource, MmInput};
 
+/// True for source forms the API layer must resolve before MM dispatch:
+/// network I/O never runs on the fixed MM worker pool (see
+/// `api_server::prefetch`). Owned here, next to `collect_images`, so the
+/// prefetch walk and the parse walk can never drift.
+pub fn is_network_source(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://")
+}
+
+/// The network sources of an `image_data` value, in `collect_images` order.
+pub fn network_sources(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut walk = |value: &Value| {
+        if let Some(src) = value.as_str().filter(|s| is_network_source(s)) {
+            out.push(src.to_owned());
+        }
+    };
+    if let Value::Array(values) = value {
+        values.iter().for_each(&mut walk);
+    } else {
+        walk(value);
+    }
+    out
+}
+
 /// Decode `[text, input_ids, image_data, video_data, audio_data]`.
-pub fn parse(payload: &[u8]) -> Result<MmInput, String> {
+/// `prefetched` holds the already-downloaded bytes of the payload's network
+/// sources (in `network_sources` order); those sources are swapped for their
+/// bytes, and one left without an entry is an internal error, not a fetch.
+pub fn parse(payload: &[u8], prefetched: &[Bytes]) -> Result<MmInput, String> {
     let value = rmpv::decode::read_value(&mut &payload[..])
         .map_err(|e| format!("mm payload decode: {e}"))?;
     let Value::Array(fields) = value else {
@@ -51,7 +79,7 @@ pub fn parse(payload: &[u8]) -> Result<MmInput, String> {
     };
 
     let mut images = Vec::new();
-    collect_images(&fields[2], &mut images)?;
+    collect_images(&fields[2], &mut prefetched.iter(), &mut images)?;
     if images.is_empty() {
         return Err("no raw image sources in mm payload".into());
     }
@@ -62,14 +90,25 @@ pub fn parse(payload: &[u8]) -> Result<MmInput, String> {
     })
 }
 
-fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), String> {
+fn collect_images(
+    value: &Value,
+    prefetched: &mut std::slice::Iter<Bytes>,
+    out: &mut Vec<ImageSource>,
+) -> Result<(), String> {
     match value {
         Value::Nil => Ok(()),
         Value::String(value) => {
             let value = value
                 .as_str()
                 .ok_or_else(|| "non-utf8 image source".to_string())?;
-            out.push(ImageSource::String(value.to_owned()));
+            if is_network_source(value) {
+                let bytes = prefetched
+                    .next()
+                    .ok_or_else(|| "network image source was not prefetched".to_string())?;
+                out.push(ImageSource::Bytes(bytes.to_vec()));
+            } else {
+                out.push(ImageSource::String(value.to_owned()));
+            }
             Ok(())
         }
         Value::Binary(value) => {
@@ -79,7 +118,9 @@ fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), Strin
         Value::Array(values) => {
             for value in values {
                 match value {
-                    Value::String(_) | Value::Binary(_) | Value::Nil => collect_images(value, out)?,
+                    Value::String(_) | Value::Binary(_) | Value::Nil => {
+                        collect_images(value, prefetched, out)?
+                    }
                     _ => {
                         return Err("unsupported image_data shape: nested/typed item".into());
                     }
@@ -124,12 +165,12 @@ mod tests {
 
     #[test]
     fn parses_string_and_list_images() {
-        let one = parse(&image_payload(Value::from("data:image/png;base64,x"))).unwrap();
+        let one = parse(&image_payload(Value::from("data:image/png;base64,x")), &[]).unwrap();
         assert_eq!(one.images.len(), 1);
-        let many = parse(&image_payload(Value::Array(vec![
-            Value::from("a"),
-            Value::from("b"),
-        ])))
+        let many = parse(
+            &image_payload(Value::Array(vec![Value::from("a"), Value::from("b")])),
+            &[],
+        )
         .unwrap();
         assert_eq!(many.images.len(), 2);
     }
@@ -143,11 +184,11 @@ mod tests {
             Value::from("video.mp4"),
             Value::Nil,
         ]);
-        assert!(parse(&video).err().unwrap().contains("video/audio"));
+        assert!(parse(&video, &[]).err().unwrap().contains("video/audio"));
 
         let dict = Value::Map(vec![(Value::from("format"), Value::from("x"))]);
         assert!(
-            parse(&image_payload(Value::Array(vec![dict])))
+            parse(&image_payload(Value::Array(vec![dict])), &[])
                 .err()
                 .unwrap()
                 .contains("image_data shape")
@@ -157,9 +198,9 @@ mod tests {
     #[test]
     fn malformed_payloads_fail() {
         // Truncated msgpack (array header, no elements) and wrong arity.
-        assert!(parse(b"\x91").is_err());
+        assert!(parse(b"\x91", &[]).is_err());
         let three = encode(vec![Value::Nil, Value::Nil, Value::from("a")]);
-        assert!(parse(&three).is_err());
+        assert!(parse(&three, &[]).is_err());
     }
 
     #[test]
@@ -172,13 +213,42 @@ mod tests {
             Value::Array(vec![]),
             Value::Array(vec![Value::Array(vec![])]),
         ]);
-        assert_eq!(parse(&payload).unwrap().images.len(), 1);
+        assert_eq!(parse(&payload, &[]).unwrap().images.len(), 1);
+    }
+
+    /// Network sources are swapped for their prefetched bytes in walk order;
+    /// one left unfetched is an error, so a URL can never reach `fetch` on an
+    /// MM worker.
+    #[test]
+    fn network_sources_use_prefetched_bytes() {
+        let image = Value::Array(vec![
+            Value::from("http://a/x.png"),
+            Value::from("data:image/png;base64,x"),
+            Value::from("https://b/y.png"),
+        ]);
+        assert_eq!(
+            network_sources(&image),
+            vec!["http://a/x.png", "https://b/y.png"]
+        );
+
+        let fetched = [Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
+        let input = parse(&image_payload(image.clone()), &fetched).unwrap();
+        let as_bytes = |i: usize| match &input.images[i] {
+            ImageSource::Bytes(b) => b.as_slice(),
+            other => panic!("expected bytes, got {other:?}"),
+        };
+        assert_eq!(as_bytes(0), b"aa");
+        assert_eq!(as_bytes(2), b"bb");
+        assert!(matches!(&input.images[1], ImageSource::String(_)));
+
+        let err = parse(&image_payload(image), &[]).err().unwrap();
+        assert!(err.contains("not prefetched"), "{err}");
     }
 
     #[test]
     fn image_free_payload_rejected() {
         assert!(
-            parse(&image_payload(Value::Nil))
+            parse(&image_payload(Value::Nil), &[])
                 .err()
                 .unwrap()
                 .contains("no raw image sources")
@@ -198,7 +268,7 @@ mod tests {
                 Value::Nil,
                 Value::Nil,
             ]);
-            assert!(parse(&payload).is_err());
+            assert!(parse(&payload, &[]).is_err());
         }
     }
 }

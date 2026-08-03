@@ -170,7 +170,7 @@ impl Context {
 /// placeholder-expanded ids (the mm buffers are parked in the sidecar
 /// strictly before returning); `Err` rejects the request back to the client.
 fn process(ctx: &Context, req: &MmRequest) -> Result<Vec<i32>, String> {
-    let input = crate::message::mm_payload::parse(&req.payload)?;
+    let input = crate::message::mm_payload::parse(&req.payload, &req.prefetched)?;
     let output = sglang_mm::driver::process(ctx.family.as_ref(), input, |text| {
         let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
             "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()

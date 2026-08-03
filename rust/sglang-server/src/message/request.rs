@@ -430,6 +430,7 @@ fn pack_mm(
         image_data,
         video_data,
         audio_data,
+        prefetched: Vec::new(),
     }))
 }
 
@@ -488,6 +489,8 @@ fn split_mm_column(
 pub struct MmRequest {
     pub rid: crate::ids::Rid,
     pub payload: Bytes,
+    /// See [`MmData::prefetched`]; consumed by `mm_payload::parse`.
+    pub prefetched: Vec<Bytes>,
 }
 
 /// Rust mirror of Python `has_valid_data` for an opaque mm field: `null` and
@@ -600,6 +603,11 @@ pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
+    /// Bytes of `image_data`'s network sources, downloaded by
+    /// `api_server::prefetch` (in `mm_payload::network_sources` order) so MM
+    /// workers never touch the network. Out-of-band: the opaque values above
+    /// stay exactly as the client sent them.
+    pub prefetched: Vec<bytes::Bytes>,
 }
 
 impl GenerateRequest {
