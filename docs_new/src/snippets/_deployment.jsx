@@ -502,10 +502,34 @@ export const Deployment = ({ config, benchmarks }) => {
   // An overlay option may also REMOVE cell flags, declared as `stripPrefixes`
   // (a static list, or a function of the selection). L3 uses it to drop the
   // whole DCP operating point, which the server rejects with an L3 backend.
-  const overlayStrip = (cellFlags, sel) => {
+  //
+  // Overlay flags append, except a flag whose family the same overlay stripped:
+  // that one is spliced back where the stripped flag was, so a rewritten
+  // parallelism block (DSPARK folding a pipeline flat) stays put instead of
+  // landing past the --host/--port tail with the multi-node trio behind it.
+  const overlayCompose = (cellFlags, sel) => {
     const strip = overlayPart(sel, "stripPrefixes");
-    if (!strip.length) return [...(cellFlags || [])];
-    return (cellFlags || []).filter((f) => !strip.includes(f.split(/[\s=]/)[0]));
+    const add = overlayPart(sel, "flags");
+    if (!strip.length) return [...(cellFlags || []), ...add];
+    const used = new Set();
+    // Consumed once, so a family the cell carries twice is not emitted twice.
+    const replacementsFor = (tok) => {
+      const out = [];
+      add.forEach((f, i) => {
+        if (used.has(i) || f.split(/[\s=]/)[0] !== tok) return;
+        used.add(i);
+        out.push(f);
+      });
+      return out;
+    };
+    const out = [];
+    for (const f of (cellFlags || [])) {
+      const tok = f.split(/[\s=]/)[0];
+      if (!strip.includes(tok)) out.push(f);
+      else out.push(...replacementsFor(tok));
+    }
+    add.forEach((f, i) => { if (!used.has(i)) out.push(f); });
+    return out;
   };
   // ==== end MIRROR ====
   const findCell = (cells, sel) =>
@@ -653,7 +677,6 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // `flags` / `env` / `hints` may each be a function of the whole selection, so an
   // "Auto" option can resolve against another row (draft tokens per strategy).
-  const overlayFlags = (sel) => overlayPart(sel, "flags");
   const overlayEnv = (sel) => overlayPart(sel, "env");
   const overlayHints = (sel) => overlayPart(sel, "hints");
 
@@ -664,7 +687,7 @@ export const Deployment = ({ config, benchmarks }) => {
     const nnodes = cellNnodes(cell, sel);
     const multinode = nnodes > 1;
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
-    const flags = [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)];
+    const flags = overlayCompose(cell.flags, sel);
     if (multinode) {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
@@ -1224,7 +1247,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // the Spec Decode overlay as well as the cell. SGLang resets
   // --max-running-requests to 48 when spec is on and it's unset; verified for both
   // EAGLE/MTP and DSPARK (server_args reports max_running_requests=48 either way).
-  const effFlags = cell ? [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)] : [];
+  const effFlags = cell ? overlayCompose(cell.flags, sel) : [];
   const specAlgoFlag = effFlags.find(
     (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
   const specMrrFlag = effFlags.find(

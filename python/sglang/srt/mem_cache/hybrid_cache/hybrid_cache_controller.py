@@ -536,6 +536,21 @@ class HybridCacheController(BaseHiCacheController):
                         i,
                         self.io_backend,
                     )
+
+                # HiCache now supports draft caches through two paths:
+                #
+                # - Packed: standard NextN/MTP models (DeepSeek-V3.2, GLM-5.x,
+                #   DeepSeek-V4, MiMo-V2.5) and DeepSeek-V4 DSpark. Draft KV/indexer/SWA
+                #   buffers are appended to the matching target host pools as tail layers
+                #   and share their slot mappings. D2H/H2D therefore moves target and draft
+                #   in the same cache operation; the branch below restores the tail layers.
+                #
+                # - Sidecar: standalone EAGLE/EAGLE3 (for example Llama-2/Llama-3.1),
+                #   DFlash (for example Gemma-4), and non-DeepSeek-V4 DSpark. Draft
+                #   KV/indexer/SWA gets a separate host-pool entry sized to its source target
+                #   pool. Its PoolTransfer follows the target KV or SWA indices and is
+                #   attached to the same cache operation.
+
                 if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
                     self.mem_pool_host.load_to_device_per_layer(
                         self.mtp_draft_device_pools[i],
