@@ -133,7 +133,7 @@ class SchedulerLoadPublisher:
         """Publish a load snapshot, throttled to [`LOAD_PUBLISH_INTERVAL`]
         calls unless `force`.
 
-        `load_provider` returns a live load snapshot (a `GetLoadsReqOutput`)
+        `load_provider` returns a live load snapshot (a `LoadSnapshot`)
         read directly from scheduler state — used instead of metrics stats,
         whose values are only populated under `--enable-metrics`. Invoked only
         after the throttle passes, so the snapshot is computed only when
