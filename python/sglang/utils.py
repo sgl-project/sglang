@@ -90,8 +90,19 @@ def has_diffusion_overlay_registry_match(
 
 def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
     model_path_lower = model_path.lower()
-    return any(
+    if any(
         pattern in model_path_lower
+        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+    ):
+        return True
+    # Fallback: match the directory basename against the short names of
+    # registered patterns (e.g. "MiniMaxAI/MiniMax-H3" -> "minimax-h3"), so
+    # local downloads named after the repo (e.g. /data/models/MiniMax-H3)
+    # resolve like the other families in the list instead of falling back to
+    # the standard LLM server path.
+    base_name = os.path.basename(os.path.normpath(model_path_lower))
+    return any(
+        "/" in pattern and base_name == pattern.rsplit("/", 1)[-1]
         for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
     )
 

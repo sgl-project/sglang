@@ -1176,4 +1176,13 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
         if pattern in model_path_lower:
             return pipeline_name
+    # Fallback: match the basename against the short names of registered
+    # patterns (e.g. "MiniMaxAI/MiniMax-H3" -> "minimax-h3"), so local repos
+    # downloaded by repo name (e.g. /data/models/MiniMax-H3) resolve like the
+    # other families in the list (pi05, hunyuan3d, ...) instead of falling
+    # back to the diffusers backend and attempting a Hub download.
+    model_short_name = get_model_short_name(model_path_lower)
+    for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
+        if "/" in pattern and pattern.rsplit("/", 1)[-1] == model_short_name:
+            return pipeline_name
     return None
