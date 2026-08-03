@@ -7,7 +7,7 @@ metadata:
     seedleap.ai/ttl-after-test: required
 spec:
   limits:
-    cpu: "8"
+    cpu: "16"
     nvidia.com/gpu: "1"
   disruption:
     consolidationPolicy: WhenEmpty
