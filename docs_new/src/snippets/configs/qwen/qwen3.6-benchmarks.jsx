@@ -4,18 +4,16 @@
 // --warmup-requests 64, --flush-cache), run1 landed. tokens_per_sec_per_gpu =
 // output_throughput / tp * (isl+osl)/osl (tp=1). LL @ conc 1+16, HT @ conc 1024+4096.
 //
-// Coverage: B200 (12), H200 (8), B300 (measured subset). Pending (GPU capacity / crash):
-// H100 (all), B300 35B-A3B NVFP4 (loader crash, under investigation). sglang_version
-// per box (B200 0.5.15; H200/B300 0.5.16). Cells without an entry render "pending".
-
+// Coverage: B200 (12) @ 0.5.15, H200 (8) + B300 (12) @ 0.5.16. Pending: H100 (all, GPU
+// capacity) and Xeon (4, no CPU box). Cells without an entry render "pending".
 //
-// 35B-A3B NVFP4 (MoE) note: on sglang 0.5.16 the generator's command crashes at
-// CUDA-graph capture (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM moe runner);
-// the config adds --moe-runner-backend flashinfer_cutlass for these cells (the
-// engine-recommended fix — generator should adopt it). B300 35B-A3B NVFP4 cells
-// were measured on 0.5.16 WITH that flag; B200's are on 0.5.15 (pre-check, plain
-// FLASHINFER_TRTLLM path) — different backend, compare with care. 27B NVFP4 is
-// dense (no MoE) and unaffected.
+// 35B-A3B NVFP4 (MoE) note: on sglang 0.5.16 the plain generator command crashes at
+// CUDA-graph capture (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM moe runner), so the
+// B300 cells (0.5.16) add --moe-runner-backend flashinfer_cutlass and were measured WITH
+// it. The B200 cells stay on 0.5.15, where the default FLASHINFER_TRTLLM path works — they
+// keep the plain generator command (no flag) and were measured that way. So each cell
+// matches exactly what was benched. Follow-up: re-bench B200 on 0.5.16 + the flag to unify
+// the backend across Blackwell. 27B NVFP4 is dense (no MoE) and unaffected.
 
 export const benchmarks = [
   {

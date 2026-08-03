@@ -1,9 +1,9 @@
 // Qwen3.6 cookbook config — consumed by /src/snippets/_deployment.jsx and
 // /src/snippets/_playground.jsx. Pure data literal (no spreads/calls/IIFE).
 //
-// Ported from the Qwen3.6 command generator (docs_new/src/snippets/autoregressive/
-// qwen36-deployment.jsx == upstream/main). Two strategies map onto its speculative
-// toggle: low-latency = MTP on (EAGLE + mamba radix cache v2), high-throughput = MTP off.
+// Ported verbatim from the legacy Qwen3.6 command generator (now removed in this
+// migration). Two strategies map onto its speculative toggle: low-latency = MTP on
+// (EAGLE + mamba radix cache v2), high-throughput = MTP off.
 // Cells reproduce the generator's output verbatim EXCEPT the reasoning/tool-call parser
 // flags are omitted (a Playground feature, not part of a Deployment/benchmark command —
 // DSv4/Qwen3.5 convention). All variants tp=1 single-node. nvfp4 is Blackwell-only
@@ -12,7 +12,7 @@
 export const config = {
   modelName: "Qwen3.6",
 
-  supportedHardware: ["h100", "h200", "b200", "b300"],
+  supportedHardware: ["h100", "h200", "b200", "b300", "xeon"],
 
   hardware: [],
 
@@ -29,6 +29,7 @@ export const config = {
 
   strategies: [
     { id: "low-latency",     label: "Low-Latency" },
+    { id: "balanced",        label: "Balanced" },
     { id: "high-throughput", label: "High-Throughput" },
   ],
 
@@ -447,7 +448,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 1",
         "--attention-backend trtllm_mha",
-        "--moe-runner-backend flashinfer_cutlass",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -465,7 +465,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 1",
         "--attention-backend trtllm_mha",
-        "--moe-runner-backend flashinfer_cutlass",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -671,6 +670,63 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 1",
         "--attention-backend trtllm_mha",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ---- Xeon (CPU) — speculative unsupported -> single recipe -> balanced.
+    // Ported verbatim from the legacy generator (--device cpu --disable-overlap-schedule
+    // --tp {3 for 35B-A3B, 6 for 27B}; no spec/mamba/mem-fraction/trtllm_mha). NVFP4 is
+    // Blackwell-only, so Xeon has bf16+fp8 only. verified:false — no Xeon box to benchmark.
+    {
+      match: { hw: "xeon", variant: "35b-a3b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "35b-a3b", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "27b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "27b", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
