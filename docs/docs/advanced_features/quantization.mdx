@@ -159,7 +159,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes (SM80-SM90 via Marlin; SM100+ native FP4)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell; supports load-time BF16/FP16/FP8 MoE conversion with per-tensor FP32 activation scales</td>
     </tr>
     <tr>
       <td><code>nvfp4_online</code></td>
@@ -851,7 +851,7 @@ python3 -m sglang.launch_server \
 
 ### `nvfp4_online` online quantization method
 
-Use `--quantization nvfp4_online` to convert eligible BF16, FP16, or FP8 MoE expert weights to NVFP4 at load time with per-token FP32 activation scales. Use `modelopt_fp4` for serialized NVFP4 checkpoints or load-time BF16/FP16 conversion with per-tensor FP32 activation scales.
+Use `--quantization nvfp4_online` to convert eligible BF16, FP16, or FP8 MoE expert weights to NVFP4 at load time with per-token FP32 activation scales. Use `modelopt_fp4` for serialized NVFP4 checkpoints or the same load-time conversion with per-tensor FP32 activation scales.
 
 The design separates weight quantization from activation scaling:
 
@@ -862,7 +862,7 @@ The design separates weight quantization from activation scaling:
 
 Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
 
-FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. To keep specific routed MoE layers out of online FP4 conversion, include their module path in `SGLANG_FP4_IGNORED_LAYERS`; FP8 checkpoints keep those ignored experts in FP8 checkpoint precision.
+FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. Both online modes honor `SGLANG_FP4_IGNORED_LAYERS`; for FP8 source checkpoints, listed experts remain FP8 instead of being converted to NVFP4.
 
 ```bash Command
 python3 -m sglang.launch_server \

@@ -1213,9 +1213,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     - Serialized + per-token FP32 activation scales: set
       `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
       `flashinfer_trtllm` or `flashinfer_trtllm_routed`.
-    - BF16/FP16 MoE + per-tensor FP32 activation scales: quantize expert weights
-      on load, keep dense weights in source precision, and default missing
-      scales to 1.0; checkpoint scales override the default.
+    - BF16/FP16/FP8 MoE + per-tensor FP32 activation scales: quantize expert
+      weights on load, keep dense weights in source precision or FP8, and use
+      1.0 when the checkpoint has no NVFP4 activation scale.
     - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
     """
 
@@ -1266,15 +1266,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def for_online_weight_quantization(
         cls,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
-    ) -> ModelOptFp4Config:
+    ) -> QuantizationConfig:
         """Use per-tensor FP32 activation scales for load-time MoE quantization."""
-        return cls(
-            is_checkpoint_nvfp4_serialized=False,
-            group_size=16,
-            exclude_modules=[],
-            packed_modules_mapping=packed_modules_mapping,
-            use_per_token_activation=False,
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            make_modelopt_fp4_online_config,
         )
+
+        return make_modelopt_fp4_online_config(packed_modules_mapping)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -1318,12 +1316,20 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return next(iter(sizes))
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
+    def from_config(cls, config: Dict[str, Any]) -> QuantizationConfig:
         # Handle two different config formats:
         # 1. hf_quant_config.json format: {"quantization": {"quant_algo": "NVFP4", ...}}
         # 2. config.json quantization_config format: {"quant_algo": "NVFP4", ...}
         # In future modelopt will deprecate hf_quant_config.json, and only keep config.json.
         # For legacy reasons, we keep hf_quant_config.json for now.
+
+        quant_method = str(config.get("quant_method", "")).lower()
+        if quant_method == "fp8":
+            from sglang.srt.layers.quantization.nvfp4_online import (
+                make_modelopt_fp4_online_config_from_fp8,
+            )
+
+            return make_modelopt_fp4_online_config_from_fp8(config)
 
         # Initialize variables
         kv_cache_quant_algo = None
@@ -2215,8 +2221,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
-        # Keep nvfp4_online input scales uninitialized to expose unintended
-        # per-tensor scaling.
+        # nvfp4_online installs per-token activation scales after loading;
+        # per-tensor paths default to 1.0 here.
         input_scale_fill = 1.0 if not is_nvfp4_online else None
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),

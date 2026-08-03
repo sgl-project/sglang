@@ -4098,12 +4098,23 @@ def get_model_loader(
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
 
-    # Online modelopt_fp4 converts weights through DefaultModelLoader. Non-local
-    # loaders also bypass ModelOptModelLoader because they own weight transport.
+    modelopt_config = load_config.modelopt_config
+    modelopt_workflow_requested = modelopt_config is not None and any(
+        (
+            modelopt_config.checkpoint_restore_path,
+            modelopt_config.checkpoint_save_path,
+            modelopt_config.export_path,
+        )
+    )
+
+    # Online modelopt_fp4 converts weights through DefaultModelLoader unless the
+    # caller explicitly requests ModelOpt calibration/checkpoint/export work.
+    # Non-local loaders still own their weight transport path.
     modelopt_fp4_online = (
         model_config
         and model_config.quantization == "modelopt_fp4"
         and not model_config._is_already_quantized()
+        and not modelopt_workflow_requested
     )
     model_optloader_allowed = (
         model_config

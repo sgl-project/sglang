@@ -234,6 +234,27 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def _resolve_explicit_draft_quant_config(
+    model_config: ModelConfig,
+    quant_config: QuantizationConfig,
+) -> QuantizationConfig:
+    if not (
+        model_config.is_draft_model and model_config.is_draft_quantization_explicit
+    ):
+        return quant_config
+
+    if model_config.quantization == "modelopt_fp4" and (
+        isinstance(quant_config, ModelOptFp4Config)
+        and quant_config.is_checkpoint_nvfp4_serialized
+        and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
+    ):
+        return ModelOptFp4Config.for_online_weight_quantization(
+            quant_config.packed_modules_mapping
+        )
+
+    return quant_config
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -242,14 +263,6 @@ def get_quant_config(
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
-
-    if model_config.is_draft_model and model_config.is_draft_quantization_explicit:
-        if model_config.quantization == "modelopt_fp4":
-            # An explicit draft selection requests online conversion instead of
-            # inheriting the target checkpoint's serialized quantization metadata.
-            return ModelOptFp4Config.for_online_weight_quantization(
-                packed_modules_mapping
-            )
 
     # GGUF doesn't have config file
     if model_config.quantization == "gguf":
@@ -290,7 +303,9 @@ def get_quant_config(
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
 
-            return quant_cls.from_config(hf_quant_config)
+            return _resolve_explicit_draft_quant_config(
+                model_config, quant_cls.from_config(hf_quant_config)
+            )
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -381,8 +396,12 @@ def get_quant_config(
             elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
                 return ModelOptFp8Config.from_config(config)
             elif "FP4" in quant_algo:
-                return ModelOptFp4Config.from_config(config)
-        return quant_cls.from_config(config)
+                return _resolve_explicit_draft_quant_config(
+                    model_config, ModelOptFp4Config.from_config(config)
+                )
+        return _resolve_explicit_draft_quant_config(
+            model_config, quant_cls.from_config(config)
+        )
 
 
 def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:

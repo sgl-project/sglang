@@ -25,7 +25,11 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    ModelOptModelLoader,
+    get_model_loader,
+)
 from sglang.srt.model_loader.weight_utils import get_quant_config
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -521,11 +525,36 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
+    def test_explicit_draft_modelopt_fp4_preserves_fp8_source(self):
+        self.model_config.quantization = "modelopt_fp4"
+        self.model_config.is_draft_model = True
+        self.model_config.is_draft_quantization_explicit = True
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value={"quant_method": "fp8"},
+            ),
+            patch.object(
+                self.model_config,
+                "_find_quant_modelslim_config",
+                return_value=None,
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "modelopt_fp4")
+
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
-    def test_draft_modelopt_fp4_respects_explicit_quantization(self):
-        for is_explicit, is_serialized in ((True, False), (False, True)):
-            with self.subTest(is_explicit=is_explicit):
+    def test_draft_modelopt_fp4_uses_checkpoint_exclusions(self):
+        cases = (
+            ("explicit embedded draft", True, ["mtp.layers.0*"], False),
+            ("explicit serialized draft", True, [], True),
+            ("inherited embedded draft", False, ["mtp.layers.0*"], True),
+        )
+        for name, is_explicit, ignored_layers, is_serialized in cases:
+            with self.subTest(name=name):
                 model_config = SimpleNamespace(
                     model_path="target-model",
                     quantization="modelopt_fp4",
@@ -535,15 +564,63 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                         quantization_config={
                             "quant_algo": "NVFP4",
                             "group_size": 16,
-                            "ignore": [],
+                            "ignore": ignored_layers,
                         }
                     ),
                 )
 
                 config = get_quant_config(model_config, LoadConfig(), {})
 
-                self.assertIsInstance(config, ModelOptFp4Config)
+                self.assertEqual(config.get_name(), "modelopt_fp4")
                 self.assertEqual(config.is_checkpoint_nvfp4_serialized, is_serialized)
+
+    def test_explicit_draft_modelopt_fp4_preserves_fp8_source(self):
+        model_config = SimpleNamespace(
+            model_path="draft-model",
+            quantization="modelopt_fp4",
+            is_draft_model=True,
+            is_draft_quantization_explicit=True,
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "fp8",
+                    "quant_algo": "FP8",
+                    "activation_scheme": "dynamic",
+                }
+            ),
+        )
+
+        config = get_quant_config(model_config, LoadConfig(), {})
+
+        self.assertEqual(config.get_name(), "modelopt_fp4")
+        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
+        self.assertIsInstance(
+            config.get_quant_method(
+                ReplicatedLinear.__new__(ReplicatedLinear),
+                "model.layers.0.self_attn.q_proj",
+            ),
+            Fp8LinearMethod,
+        )
+
+    def test_unquantized_modelopt_fp4_preserves_modelopt_workflows(self):
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp4",
+            _is_already_quantized=lambda: False,
+        )
+
+        online_loader = get_model_loader(LoadConfig(), model_config)
+        self.assertIsInstance(online_loader, DefaultModelLoader)
+        self.assertNotIsInstance(online_loader, ModelOptModelLoader)
+
+        for option in (
+            "modelopt_checkpoint_restore_path",
+            "modelopt_checkpoint_save_path",
+            "modelopt_export_path",
+        ):
+            with self.subTest(option=option):
+                loader = get_model_loader(
+                    LoadConfig(**{option: "/tmp/modelopt"}), model_config
+                )
+                self.assertIsInstance(loader, ModelOptModelLoader)
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):

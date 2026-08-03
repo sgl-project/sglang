@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
     ModelOptNvFp4FusedMoEMethod,
     ModelOptQuantConfig,
 )
@@ -43,6 +44,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     is_nvfp4_online = True
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
+    _use_per_token_activation = True
 
     @staticmethod
     def _normalize_ignored_layers(
@@ -83,7 +85,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.fp4_ignored_layers = fp4_ignored_layers
         # NVFP4 weight scales are fixed at load time; FlashInfer computes one
         # FP32 activation scale per token at runtime.
-        self.use_per_token_activation = True
+        self.use_per_token_activation = self._use_per_token_activation
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
         self.dequant_fp4_to_fp8 = False
@@ -154,6 +156,39 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         return None
 
 
+class _ModelOptFp4OnlineConfig(NvFp4OnlineConfig):
+    """`modelopt_fp4` adapter for online per-tensor activation scaling."""
+
+    is_nvfp4_online = False
+    _use_per_token_activation = False
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_fp4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return ModelOptFp4Config.get_supported_act_dtypes()
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return ModelOptFp4Config.get_min_capability()
+
+
+def make_modelopt_fp4_online_config(
+    packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+) -> ModelOptQuantConfig:
+    return _ModelOptFp4OnlineConfig(
+        packed_modules_mapping=packed_modules_mapping,
+    )
+
+
+def make_modelopt_fp4_online_config_from_fp8(
+    config: Dict[str, Any],
+) -> ModelOptQuantConfig:
+    return _ModelOptFp4OnlineConfig.from_config(config)
+
+
 class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """MoE method that converts source expert weights to NVFP4 during loading."""
 
@@ -173,8 +208,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             raise ValueError(
                 "--quantization nvfp4_online requires online per-token FP32 "
                 "activation scales and supports only flashinfer_trtllm or "
-                "flashinfer_trtllm_routed. Use modelopt_fp4 for per-tensor "
-                "FP32 activation scales."
+                "flashinfer_trtllm_routed. Use --quantization modelopt_fp4 "
+                "for per-tensor FP32 activation scales."
             )
 
     def prepare_weight_loader(self, layer, weight_loader):
@@ -287,7 +322,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     ) -> torch.Tensor:
         if self.quant_config.use_mxfp8:
             raise ValueError(
-                "--quantization nvfp4_online does not support online "
+                "Online NVFP4 weight conversion does not support "
                 "requantization from MXFP8 expert checkpoints."
             )
 
@@ -601,6 +636,10 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 )
                 return
             if cls._should_skip_loaded_expert(layer, param, expert_id):
+                return
+
+            # FP8 activation scales do not describe the requantized NVFP4 input.
+            if fp8_dequantizer is not None and "input_scale" in weight_name:
                 return
 
             if cls._is_fp8_weight_scale_name(weight_name):
