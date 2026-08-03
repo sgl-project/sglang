@@ -189,6 +189,28 @@ clean_site_packages() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+setup_cargo_cache() {
+    # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
+    # rust/target, so every job recompiles the whole dependency graph. Move the
+    # target dir out of the tree: setuptools-rust has no target-dir option of its
+    # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
+    export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    mkdir -p "${CARGO_TARGET_DIR}"
+
+    # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
+    # carries the ENOSPC story). cargo cannot prune partially, so drop the whole
+    # tree and pay one cold build.
+    local used
+    used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+    if [ "${used:-0}" -ge 85 ]; then
+        echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+        rm -rf "${CARGO_TARGET_DIR}"
+        mkdir -p "${CARGO_TARGET_DIR}"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 setup_pip_toolchain() {
     python3 -m pip install --upgrade pip
 
@@ -602,6 +624,7 @@ main() {
     cleanup_stale_shm
     install_apt_packages
     clean_site_packages
+    setup_cargo_cache
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer
