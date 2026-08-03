@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any
+from typing import Any, Iterator, List
 
 import zmq
 

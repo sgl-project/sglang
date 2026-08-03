@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Generator, List, Optional, Type, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile

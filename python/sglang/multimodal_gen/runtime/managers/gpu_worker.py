@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, List, Optional, Set, Union
 
 import numpy as np
 import torch
