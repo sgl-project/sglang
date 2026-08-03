@@ -19,6 +19,23 @@ from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+_XPU_SILU_AND_MUL = None
+_XPU_SILU_AND_MUL_IMPORT_FAILED = False
+
+
+def _get_xpu_silu_and_mul():
+    global _XPU_SILU_AND_MUL, _XPU_SILU_AND_MUL_IMPORT_FAILED
+    if _XPU_SILU_AND_MUL is not None:
+        return _XPU_SILU_AND_MUL
+    if _XPU_SILU_AND_MUL_IMPORT_FAILED:
+        return None
+    try:
+        from sgl_kernel import silu_and_mul
+    except ImportError:
+        _XPU_SILU_AND_MUL_IMPORT_FAILED = True
+        return None
+    _XPU_SILU_AND_MUL = silu_and_mul
+    return silu_and_mul
 
 
 def _vit_norm_input(module, hidden_states):
@@ -84,6 +101,15 @@ class FeedForward(nn.Module):
                 and hidden_states.shape[-1] % 32 == 0
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+            elif (
+                isinstance(self.act_fn, nn.SiLU)
+                and hidden_states.device.type == "xpu"
+                and hidden_states.dtype in (torch.float16, torch.bfloat16)
+                and hidden_states.is_contiguous()
+                and hidden_states.shape[-1] % 16 == 0
+                and (silu_and_mul := _get_xpu_silu_and_mul()) is not None
+            ):
+                hidden_states = silu_and_mul(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)

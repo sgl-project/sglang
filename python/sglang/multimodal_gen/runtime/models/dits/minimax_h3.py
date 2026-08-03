@@ -284,8 +284,73 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
         and hidden.shape[-1] % 16 == 0
     ):
         return silu_and_mul_with_activation_rounding_(hidden)
+    if (
+        reuse_input
+        and hidden.device.type == "xpu"
+        and hidden.dtype == _BF16_DTYPE
+        and hidden.is_contiguous()
+        and hidden.shape[-1] % 16 == 0
+    ):
+        import sgl_kernel
+
+        return sgl_kernel.silu_and_mul(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
+
+
+def _can_use_xpu_fused_qknorm_rope(head_dim: int, rope_dim: int) -> bool:
+    num_reduce_stages = 16
+    elems_per_lane = head_dim // num_reduce_stages
+    if elems_per_lane <= 0 or head_dim % num_reduce_stages or rope_dim % elems_per_lane:
+        return False
+    rotary_lanes = rope_dim // elems_per_lane
+    return (
+        current_platform.is_xpu()
+        and head_dim in (64, 128, 256)
+        and rope_dim <= head_dim
+        and rotary_lanes >= 2
+        and rotary_lanes & (rotary_lanes - 1) == 0
+    )
+
+
+def _xpu_fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    eps: float,
+    head_dim: int,
+) -> bool:
+    if (
+        q.device.type != "xpu"
+        or q.dtype != _BF16_DTYPE
+        or q.dtype != k.dtype
+        or q.dtype != q_weight.dtype
+        or q.dtype != k_weight.dtype
+        or q.stride(-1) != 1
+        or k.stride(-1) != 1
+        or not _can_use_xpu_fused_qknorm_rope(head_dim, cos_sin_cache.shape[-1])
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    import sgl_kernel
+
+    sgl_kernel.fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache.to(dtype=_FP32_DTYPE, copy=False),
+        positions,
+        True,
+        eps,
+        head_dim,
+        cos_sin_cache.shape[-1],
+    )
+    return True
 
 
 def _apply_qk_norm(
@@ -377,6 +442,7 @@ def _apply_rope_qk(
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not q.is_cuda:
+        cos_sin_cache = cos_sin_cache.to(dtype=q.dtype, copy=False)
         half = cos_sin_cache.shape[-1] // 2
         cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
         cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
@@ -548,15 +614,18 @@ class MiniMaxH3Attention(nn.Module):
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
+            (
+                current_platform.is_cuda()
+                and can_use_fused_inplace_qknorm_rope(
+                    arch.attention_head_dim,
+                    rope_dim,
+                    True,
+                    _BF16_DTYPE,
+                    cache_dtype=_BF16_DTYPE,
+                    round_norm_before_rope=True,
+                )
             )
+            or _can_use_xpu_fused_qknorm_rope(arch.attention_head_dim, rope_dim)
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
@@ -647,19 +716,40 @@ class MiniMaxH3Attention(nn.Module):
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
-                fused_inplace_qknorm_rope(
-                    q,
-                    k,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    cos_sin_cache,
-                    positions,
-                    is_neox=True,
-                    eps=self.q_norm.eps,
-                    head_dim=self.head_dim,
-                    rope_dim=cos_sin_cache.shape[-1],
-                    round_norm_before_rope=True,
-                )
+                if q.device.type == "xpu":
+                    used_fused = _xpu_fused_inplace_qknorm_rope(
+                        q,
+                        k,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        positions,
+                        eps=self.q_norm.eps,
+                        head_dim=self.head_dim,
+                    )
+                    if not used_fused:
+                        q, k = _apply_qk_norm(
+                            q,
+                            k,
+                            self.q_norm,
+                            self.k_norm,
+                            self.head_dim,
+                        )
+                        q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
+                else:
+                    fused_inplace_qknorm_rope(
+                        q,
+                        k,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        positions,
+                        is_neox=True,
+                        eps=self.q_norm.eps,
+                        head_dim=self.head_dim,
+                        rope_dim=cos_sin_cache.shape[-1],
+                        round_norm_before_rope=True,
+                    )
             else:
                 q, k = _apply_qk_norm(
                     q,
@@ -1282,8 +1372,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
+        rope_dim = 6 * self.arch.rope_inv_freq_len
+        rope_cache_dtype = (
+            _FP32_DTYPE
+            if _can_use_xpu_fused_qknorm_rope(self.arch.attention_head_dim, rope_dim)
+            else _BF16_DTYPE
+        )
         return (
-            _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
+            _rope_cos_sin_cache(rope_freqs, dtype=rope_cache_dtype),
             torch.arange(
                 local_seq_len,
                 device=device,
