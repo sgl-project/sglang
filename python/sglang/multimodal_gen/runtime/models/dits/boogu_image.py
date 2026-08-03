@@ -245,12 +245,13 @@ class BooguAttention(nn.Module):
             ]
         )
 
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
@@ -297,7 +298,14 @@ class BooguAttention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self._qkv(hidden_states)
         q, k = self._norm_and_rope(q, k, freqs_cis)
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            q = nn.functional.pad(q, (0, pad))
+            k = nn.functional.pad(k, (0, pad))
+            v = nn.functional.pad(v, (0, pad))
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
+        if pad:
+            out = out[..., : self.head_dim]
         out, _ = self.to_out[0](out.flatten(2))
         return out
 
@@ -403,12 +411,13 @@ class BooguJointAttention(nn.Module):
             ]
         )
 
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
@@ -463,7 +472,14 @@ class BooguJointAttention(nn.Module):
             )
         query, key = apply_rope_per_sample(query, key, freqs_cis)
 
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            query = nn.functional.pad(query, (0, pad))
+            key = nn.functional.pad(key, (0, pad))
+            value = nn.functional.pad(value, (0, pad))
         joint = self.attn(query, key, value, attn_mask_meta=attn_mask_meta)
+        if pad:
+            joint = joint[..., : self.head_dim]
         joint = joint.flatten(2)
 
         instruct_out, img_out = split_instruct_image(
