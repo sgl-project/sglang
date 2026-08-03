@@ -236,10 +236,10 @@ jobs:
           cd test
           python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  stage-b-test-4-npu-a3:
+  stage-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-4
+    runs-on: linux-aarch64-a3-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -283,13 +283,13 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite stage-b-test-1-npu-a3 --timeout-per-file 3600
 
 
-  stage-b-test-16-npu-a3:
+  stage-b-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -332,6 +332,161 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a3 --timeout-per-file 3600
+
+
+  stage-b-test-4-npu-a3:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: linux-aarch64-a3-4
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [ 0, 1 ]
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          pip install sglang_router
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+
+  stage-b-test-8-npu-a3:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: linux-aarch64-a3-8
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-8-npu-a3 --timeout-per-file 3600
+
+  stage-b-test-16-npu-a3:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: linux-aarch64-a3-16
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+
+      - name: Run test
+        timeout-minutes: 120
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
+        run: |
+          apt-get install -y libssl-dev
+          pip install sglang_router
           cd test
           python3 run_suite.py --hw npu --suite stage-b-test-16-npu-a3 --timeout-per-file 3600
 
@@ -537,27 +692,27 @@ jobs:
           # NPU accuracy tests
           - name: glm4_7_flash_1p_gsm8k
             runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
+            test_case: test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_vl_30b_a3b_bf16_2p_gsm8k
             runner: linux-aarch64-a3-4
-            test_case: test/registered/ascend/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
+            test_case: test/registered/npu/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
             test_type: 'accuracy'
           - name: glm5_top64_pruned_bf16_8p_gsm8k
             runner: linux-aarch64-a3-16
-            test_case: test/registered/ascend/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
+            test_case: test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
             test_type: 'accuracy'
           - name: moonshotai_moonlight_16b_a3b_bf16_1p_gsm8k
             runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
+            test_case: test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_5_9b_bf16_1p_gsm8k
             runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
+            test_case: test/registered/npu/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_vl_8b_bf16_2p_gsm8k
             runner: linux-aarch64-a3-4
-            test_case: test/registered/ascend/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
+            test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
             test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
@@ -578,8 +733,11 @@ jobs:
 
         stage-a-unit-test-npu,
         stage-b-test-1-npu-a2,
+        stage-b-test-1-npu-a3,
         stage-b-test-2-npu-a2,
+        stage-b-test-2-npu-a3,
         stage-b-test-4-npu-a3,
+        stage-b-test-8-npu-a3,
         stage-b-test-16-npu-a3,
 
         multimodal-gen-test-1-npu-a3,

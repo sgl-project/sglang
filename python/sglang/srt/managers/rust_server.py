@@ -76,6 +76,13 @@ class RustServer:
                 "drop --preferred-sampling-params and send those values per request."
             )
         http_addr = f"{server_args.host}:{server_args.port}"
+
+        # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
+        # so the rank is not conflated with rank 0 of a one-rank group.
+        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
+        if dp_rank is not None:
+            http_addr = f"{server_args.host}:{server_args.port + dp_rank}"
+
         launch_cores, server_cores = cls._partition_cores()
 
         server = Server(
@@ -93,9 +100,15 @@ class RustServer:
             except OSError as e:
                 logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
 
+        # Under DP every rank runs its own server on its own port, so the rank is
+        # what tells two otherwise identical startup lines apart.
+        dp_note = (
+            "" if dp_rank is None else f" (DP rank {dp_rank}/{scheduler.ps.dp_size})"
+        )
         logger.info(
-            "SGLANG_RUST_SERVER enabled, Rust server listen on %s",
+            "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
             http_addr,
+            dp_note,
         )
 
         return cls(server)
@@ -339,6 +352,13 @@ class RustServer:
         server_args = dict(vars(scheduler.server_args))
         model_config = dict(vars(scheduler.model_config))
         model_config["hf_config"] = None  # HF config is not JSON-serializable
+        # Resolved default sampling params (generation_config.json when
+        # `--sampling-defaults model`, {} otherwise). The rust server consumes
+        # these for omitted temperature/top_p in chat conversions instead of
+        # hard-coding the OpenAI terminal defaults.
+        model_config["default_sampling_params"] = (
+            scheduler.model_config.get_default_sampling_params()
+        )
         server_args["model_config"] = model_config
         # Launch-time facts Python's /server_info reports from scheduler_info /
         # the package — stamped here so the rust endpoint can serve them

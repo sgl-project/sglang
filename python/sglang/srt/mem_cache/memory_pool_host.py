@@ -38,7 +38,7 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
@@ -650,6 +650,8 @@ class LogicalHostPool:
                 f"got size={size}, page_size={page_size}"
             )
         self.size = size
+        # Stands in for a host pool (and group anchor); DCP never widens it.
+        self.logical_size = size
         self.page_size = page_size
         self.device = "cpu"
         self.layout = layout
@@ -1528,6 +1530,7 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
+        self.logical_size = self.anchor_entry.host_pool.logical_size
         child_write_back_jit = [
             getattr(entry.host_pool, "can_use_write_back_jit", False)
             for entry in entries
