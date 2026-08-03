@@ -2470,6 +2470,8 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    verify_weights_on_load = True
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -3121,39 +3123,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        # A filtered reload may select a subset of runtime parameters, but each
+        # fused target still requires all of its checkpoint shards.
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
-        unloaded_params = params_dict.keys() - loaded_params
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-        skipped_checking_patterns = [
+        if not is_nextn:
+            self._prewarm_mhc_pre_kernels()
+        return loaded_params
+
+    def is_optional_weight(self, name: str) -> bool:
+        patterns = [
             "attn_mqa.k_scale",
             "attn_mqa.v_scale",
             "blockscale_swizzled",
         ]
         if not self.pp_group.is_first_rank:
-            skipped_checking_patterns.append("embed_tokens")
+            patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:
-            skipped_checking_patterns.append("model.norm.")
-            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
-        if is_nextn:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
-        unloaded_params = {
-            p
-            for p in unloaded_params
-            if all(
-                skipped_checking_pattern not in p
-                for skipped_checking_pattern in skipped_checking_patterns
-            )
-        }
-        if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
-
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
-
-        if not is_nextn:
-            self._prewarm_mhc_pre_kernels()
+            patterns.extend(["model.norm.", "lm_head", "hc_head_"])
+        return any(pattern in name for pattern in patterns)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -447,6 +447,8 @@ class Llama4VisionModel(nn.Module):
 
 
 class Llama4ForConditionalGeneration(nn.Module):
+    verify_weights_on_load = True
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -711,11 +713,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints {unloaded_params}"
-            )
+        return loaded_params
 
     def _should_skip_weight(self, name: str) -> bool:
         """Check if we should skip loading this weight."""
