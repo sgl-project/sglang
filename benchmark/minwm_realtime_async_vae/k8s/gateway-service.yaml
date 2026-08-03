@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-async-vae
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-async-vae
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minwm-async-vae
+  ports:
+    - name: vae
+      port: 18081
+      targetPort: vae
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-async-gateway
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-async-gateway
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,test_run=minwm-async-vae-benchmark
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  allocateLoadBalancerNodePorts: false
+  loadBalancerSourceRanges:
+    - 5.34.217.44/32
+    - 13.250.53.242/32
+    - 45.8.204.4/32
+    - 54.255.94.0/32
+  selector:
+    app.kubernetes.io/name: minwm-async-denoiser
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+    - name: api
+      port: 30000
+      targetPort: api

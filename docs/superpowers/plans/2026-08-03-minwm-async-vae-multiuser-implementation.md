@@ -497,7 +497,7 @@ Commit: `git commit -am "bench(minwm): add async VAE concurrency report"`
 - Create: `benchmark/minwm_realtime_async_vae/k8s/validate_manifests.py`
 - Test: `benchmark/minwm_realtime_async_vae/k8s/test_manifests.py`
 
-- [ ] **Step 1: Write failing manifest policy tests**
+- [x] **Step 1: Write failing manifest policy tests**
 
 ```python
 def test_gpu_nodepools_are_spot_only_and_bounded():
@@ -508,17 +508,17 @@ def test_gpu_nodepools_are_spot_only_and_bounded():
     assert all(container_has_limits(c) for c in gpu_containers(docs))
 ```
 
-- [ ] **Step 2: Run test and verify failure**
+- [x] **Step 2: Run test and verify failure**
 
 Run: `PYTHONPATH=python .venv/bin/python -m pytest benchmark/minwm_realtime_async_vae/k8s/test_manifests.py -q`
 
 Expected: FAIL because manifests do not exist.
 
-- [ ] **Step 3: Add parameterized Spot manifests**
+- [x] **Step 3: Add parameterized Spot manifests**
 
 H100 NodePool allows only `p5.4xlarge/p5.48xlarge` Spot and requests the exact Denoiser GPU count; initial test uses the smallest fitting shape. VAE NodePool starts with L4 `g6` Spot and a one-GPU Worker; L40S `g6e` is an explicit alternate overlay, never an automatic on-demand fallback. Deployments carry git SHA, model/checkpoint fingerprint, owner/test-run labels, `ttl-after-test`, startup probes, `/metrics`, `terminationGracePeriodSeconds`, queue/session limits and topology affinity. Gateway NLB remains one replica for the benchmark so no DynamoDB write is required.
 
-- [ ] **Step 4: Validate and commit**
+- [x] **Step 4: Validate and commit**
 
 Run: `PYTHONPATH=python .venv/bin/python -m pytest benchmark/minwm_realtime_async_vae/k8s/test_manifests.py -q && kubectl kustomize benchmark/minwm_realtime_async_vae/k8s >/tmp/minwm-async-rendered.yaml`
 

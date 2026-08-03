@@ -1,0 +1,177 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-async-vae-l4
+  labels:
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  limits:
+    cpu: "16"
+    nvidia.com/gpu: "1"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-async-vae-l4
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      expireAfter: 4h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: ray-gpu-ec2-all
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: [us-east-2a, us-east-2b, us-east-2c]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [g6.2xlarge, g6.4xlarge]
+      taints:
+        - key: seedleap.ai/task
+          value: minwm-async-vae
+          effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-async-vae
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-async-vae
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-vae
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-async-vae
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-async-vae-l4
+        karpenter.sh/capacity-type: spot
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Equal
+          value: minwm-async-vae
+          effect: NoSchedule
+      containers:
+        - name: vae
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_GIT_REF
+              value: REPLACE_WITH_GIT_SHA
+            - name: TAEHV_REVISION
+              value: 093b918971d59001a0bad6dfd6e0409b5e1752cf
+            - name: TAEHV_CHECKPOINT_SHA256
+              value: d26151e76cdc2c9424bef988de874b33d9a53f30ef3060cd556c429c469c797e
+            - name: TAEHV_CHECKPOINT_PATH
+              value: /opt/taehv/taew2_1.pth
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+              python3 - <<'PY'
+              from pathlib import Path
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --no-cache-dir --no-deps \
+                "taehv @ git+https://github.com/madebyollin/taehv.git@${TAEHV_REVISION}" \
+                --root-user-action=ignore
+              mkdir -p /opt/taehv
+              curl --fail --location --retry 3 \
+                "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REVISION}/taew2_1.pth" \
+                --output "${TAEHV_CHECKPOINT_PATH}"
+              echo "${TAEHV_CHECKPOINT_SHA256}  ${TAEHV_CHECKPOINT_PATH}" | sha256sum -c -
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_vae_server \
+                --checkpoint-path "${TAEHV_CHECKPOINT_PATH}" \
+                --device cuda \
+                --dtype bfloat16 \
+                --max-sessions 8 \
+                --queue-depth-per-session 1 \
+                --max-message-mb 64 \
+                --host 0.0.0.0 \
+                --port 18081
+          ports:
+            - name: vae
+              containerPort: 18081
+          startupProbe:
+            httpGet:
+              path: /health
+              port: vae
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: vae
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: vae
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "6"
+              memory: 24Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7"
+              memory: 28Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/gpu: "1"

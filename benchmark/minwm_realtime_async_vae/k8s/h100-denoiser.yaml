@@ -1,0 +1,274 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-async-denoiser-h100
+  labels:
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  limits:
+    cpu: "8"
+    nvidia.com/gpu: "1"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-async-denoiser-h100
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      expireAfter: 4h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: minwm-test-h100-single-ec2
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [p5.4xlarge]
+      taints:
+        - key: seedleap.ai/task
+          value: minwm-async-denoiser
+          effect: NoSchedule
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-async-denoiser
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-async-denoiser
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  progressDeadlineSeconds: 5400
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-denoiser
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-async-denoiser
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-async-denoiser-h100
+        karpenter.sh/capacity-type: spot
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Equal
+          value: minwm-async-denoiser
+          effect: NoSchedule
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      containers:
+        - name: denoiser
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_GIT_REF
+              value: REPLACE_WITH_GIT_SHA
+            - name: REALTIME_VAE_WORKER_URL
+              value: ws://minwm-async-vae.default.svc.cluster.local:18081/v1/realtime_vae/decode
+            - name: REALTIME_MAX_SESSIONS
+              value: "8"
+            - name: MINWM_CHECKPOINT_SOURCE
+              value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
+            - name: MINWM_CHECKPOINT
+              value: /s3/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
+            - name: MINWM_DONOR
+              value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
+            - name: TAEHV_REVISION
+              value: 093b918971d59001a0bad6dfd6e0409b5e1752cf
+            - name: TAEHV_CHECKPOINT_SHA256
+              value: d26151e76cdc2c9424bef988de874b33d9a53f30ef3060cd556c429c469c797e
+            - name: TAEHV_CHECKPOINT_PATH
+              value: /opt/taehv/taew2_1.pth
+            - name: MINWM_ATTENTION_IMPL
+              value: packed
+            - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
+              value: "false"
+            - name: MINWM_NATIVE_COMPONENTS
+              value: text_encoder,vae
+            - name: SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D
+              value: "false"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              [[ -f "${MINWM_CHECKPOINT}" ]]
+              [[ -d "${MINWM_DONOR}/transformer" ]]
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
+
+              python3 - <<'PY'
+              from pathlib import Path
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if text.count(block) != 1:
+                  raise RuntimeError("expected exactly one SGLang gRPC extension block")
+              path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --no-cache-dir --no-deps \
+                "taehv @ git+https://github.com/madebyollin/taehv.git@${TAEHV_REVISION}" \
+                --root-user-action=ignore
+              mkdir -p /opt/taehv
+              curl --fail --location --retry 3 \
+                "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REVISION}/taew2_1.pth" \
+                --output "${TAEHV_CHECKPOINT_PATH}"
+              echo "${TAEHV_CHECKPOINT_SHA256}  ${TAEHV_CHECKPOINT_PATH}" | sha256sum -c -
+
+              MODEL_STAMP="/work/model/.ready-${SGLANG_GIT_REF}"
+              if [[ ! -f "${MODEL_STAMP}" ]]; then
+                rm -rf /work/checkpoint /work/pretrained /work/model
+                mkdir -p /work/checkpoint /work/pretrained /work/model
+                cp "${MINWM_CHECKPOINT}" /work/checkpoint/model.pt
+                cp -a "${MINWM_DONOR}/." /work/pretrained/
+                python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+                  --minwm-checkpoint /work/checkpoint/model.pt \
+                  --donor-diffusers-dir /work/pretrained \
+                  --output-dir /work/model \
+                  --link-donor \
+                  --source-uri "${MINWM_CHECKPOINT_SOURCE}" \
+                  --action-type auto \
+                  --local-attn-size 32 \
+                  --sink-size 8 \
+                  --sliding-window-num-frames 32 \
+                  --rope-position-mode block_relative \
+                  --rope-max-frame-gap 12 \
+                  --prompt-first-frame-pin-enabled
+                touch "${MODEL_STAMP}"
+              fi
+
+              WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
+              python3 "${WEBUI_DIR}/server.py" >/tmp/minwm-webui.log 2>&1 &
+              WEBUI_PID=$!
+
+              serve_args=(
+                python3 -m sglang.multimodal_gen.runtime.launch_server
+                --model-path /work/model
+                --pipeline-class-name MinWMCausalDMDPipeline
+                --attention-backend fa
+                --performance-mode speed
+                --num-gpus 1
+                --sp-degree 1
+                --enable-cfg-parallel false
+                --enable-torch-compile false
+                --warmup-mode off
+                --batching-max-size 4
+                --batching-delay-ms 2
+                --realtime-max-sessions "${REALTIME_MAX_SESSIONS}"
+                --realtime-max-sessions-per-worker "${REALTIME_MAX_SESSIONS}"
+                --realtime-session-idle-timeout-s 60
+                --realtime-session-max-lifetime-s 600
+                --realtime-admission-wait-s 10
+                --realtime-causal-sink-size 8
+                --realtime-causal-kv-cache-num-frames 32
+                --host 0.0.0.0
+                --port 30000
+              )
+              if [[ -n "${REALTIME_VAE_WORKER_URL}" ]]; then
+                serve_args+=(--realtime-vae-worker-url "${REALTIME_VAE_WORKER_URL}")
+              else
+                serve_args+=(--vae-config.taehv-checkpoint-path "${TAEHV_CHECKPOINT_PATH}")
+              fi
+              "${serve_args[@]}" &
+              SERVER_PID=$!
+              cleanup() {
+                kill -TERM "${SERVER_PID}" "${WEBUI_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" "${WEBUI_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT INT TERM
+              wait "${SERVER_PID}"
+          ports:
+            - name: api
+              containerPort: 30000
+            - name: webui
+              containerPort: 18080
+          startupProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 270
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "6"
+              memory: 160Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7"
+              memory: 220Gi
+              ephemeral-storage: 300Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-claim
+            readOnly: true
+        - name: work
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
