@@ -851,16 +851,23 @@ mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 # LOCALLY-BINDABLE IP (torch-dist + tokenizer ZMQ bind to it), and a node's
 # forward DNS can be stale/point at a non-local mgmt alias (observed: a decode
 # root whose hostname resolved to an unpingable IP, ZMQ bind => "Cannot assign
-# requested address"). Fall back to getent if the interface lookup is empty.
-# $DIST_NIC empty (every EP<=8 recipe) => getent path only => unchanged behavior.
+# requested address"). Fall back to Slurm's NodeAddr, then DNS.
 resolve_ip() {
-  local n="$1" ip=""
+  local n="$1" ip="" addr="" field
   if [[ -n "$DIST_NIC" ]]; then
     ip=$(srun --overlap -N1 --nodelist="$n" ip -4 -o addr show "$DIST_NIC" 2>/dev/null \
            | awk '{print $4}' | cut -d/ -f1 | head -1)
   fi
-  [[ -z "$ip" ]] && ip=$(getent ahostsv4 "$n" | head -1 | awk '{print $1}')
-  echo "$ip"
+  if [[ -z "$ip" ]]; then
+    for field in $(scontrol show node "$n" -o); do
+      case "$field" in
+        NodeAddr=*) addr="${field#NodeAddr=}"; break ;;
+      esac
+    done
+    [[ -n "$addr" ]] || addr="$n"
+    read -r ip _ < <(getent ahostsv4 "$addr")
+  fi
+  printf '%s\n' "$ip"
 }
 # SLURM canonicalizes (sorts) SLURM_JOB_NODELIST, so the requested --nodelist
 # order is already lost here. To keep a "slow-root" node out of any engine's
@@ -980,6 +987,13 @@ EXCLUDE_ARG=()
 # Nodes = sum over engines of nodes-per-engine. EP<=8 (PN_PER=DN_PER=1) gives the
 # original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
 TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
+
+# EP16 needs all four amd-sglang nodes. Keep g20 out of an engine-root position,
+# where its slower MORI bootstrap can miss the worker-connect timeout.
+if [[ "$MATRIX_CONFIG_NAME" == *-2p1d-ep16* ]]; then
+    EXCLUDE_ARG=()
+    export SLURM_DIST_TAIL="${SLURM_DIST_TAIL:-mia1-p01-g20}"
+fi
 
 # Name the allocation <RUNNER_NAME>-<GITHUB_RUN_ID>-<config> so the workflow's
 # cleanup steps can scancel precisely instead of a blanket `squeue --me` that
