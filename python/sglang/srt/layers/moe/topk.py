@@ -148,7 +148,10 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
-_aiter_fse_topk_meta: dict[tuple[torch.device, int, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+_aiter_fse_topk_meta: dict[
+    tuple[torch.device, int, int, int, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 
 
 def _get_aiter_fse_topk_meta(
@@ -160,7 +163,13 @@ def _get_aiter_fse_topk_meta(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     total_topk = routed_topk + num_fused_shared_experts
-    key = (device, routed_topk, num_fused_shared_experts, dtype)
+    key = (
+        device,
+        routed_topk,
+        num_fused_shared_experts,
+        num_routed_experts,
+        dtype,
+    )
     cached = _aiter_fse_topk_meta.get(key)
     if cached is None or cached[0].shape[0] < num_tokens:
         cap = max(num_tokens, 32768)
@@ -1584,7 +1593,9 @@ def biased_grouped_topk_gpu(
             topk_weights = total_weights[:, :topk]
             topk_ids = total_ids[:, :topk]
         else:
-            topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+            topk_weights = torch.empty(
+                (token, topk), dtype=torch.float32, device=device
+            )
             topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
 
         aiter_biased_grouped_topk(

@@ -10,10 +10,6 @@ the fused shared expert's topk weight on the two paths this fix covers:
     routed_scaling_factor afterward, so the shared weight must be 1/rsf.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,7 +18,10 @@ import torch
 
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestFusedSharedExpertScaling(CustomTestCase):
@@ -32,7 +31,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     EP_RANK = 0
     ROUTED_SCALING_FACTOR = 2.5
 
-    def _run_remap(self, *, use_aiter):
+    def _run_remap(self, *, use_aiter, aiter_backend=None):
         # Layout: [routed, routed, routed, shared]; the trailing column is the
         # fused shared expert. The shared weight starts at a sentinel to prove
         # the function overwrites it.
@@ -46,8 +45,15 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
         )
 
+        if aiter_backend is None:
+            aiter_backend = use_aiter
         with (
             patch.object(topk_module, "_use_aiter", use_aiter),
+            patch.object(
+                topk_module,
+                "get_moe_runner_backend",
+                return_value=SimpleNamespace(is_aiter=lambda: aiter_backend),
+            ),
             patch.object(
                 topk_module,
                 "get_parallel",
@@ -80,6 +86,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         shared_weight = self._run_remap(use_aiter=False)
         self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
 
+    def test_aiter_helpers_do_not_change_non_aiter_backend_scaling(self):
+        shared_weight = self._run_remap(use_aiter=True, aiter_backend=False)
+        self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
+
     def test_shared_expert_ids_route_to_home_rank(self):
         # Sanity: the shared slot id is placed at this rank's interleaved
         # position (ep_rank * num_local_experts + num_local_routed).
@@ -92,6 +102,11 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         )
         with (
             patch.object(topk_module, "_use_aiter", True),
+            patch.object(
+                topk_module,
+                "get_moe_runner_backend",
+                return_value=SimpleNamespace(is_aiter=lambda: True),
+            ),
             patch.object(
                 topk_module,
                 "get_parallel",
@@ -111,6 +126,31 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         num_local_experts = num_local_routed + 1  # 33
         expected_shared_id = self.EP_RANK * num_local_experts + num_local_routed
         self.assertEqual(out_ids[0, -1].item(), expected_shared_id)
+
+    def test_aiter_fse_metadata_cache_separates_expert_counts(self):
+        topk_module._aiter_fse_topk_meta.clear()
+        try:
+            _, ids_128 = topk_module._get_aiter_fse_topk_meta(
+                num_tokens=2,
+                routed_topk=4,
+                num_fused_shared_experts=1,
+                num_routed_experts=128,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+            _, ids_64 = topk_module._get_aiter_fse_topk_meta(
+                num_tokens=2,
+                routed_topk=4,
+                num_fused_shared_experts=1,
+                num_routed_experts=64,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+
+            self.assertTrue(torch.equal(ids_128[:, -1], torch.tensor([128, 128])))
+            self.assertTrue(torch.equal(ids_64[:, -1], torch.tensor([64, 64])))
+        finally:
+            topk_module._aiter_fse_topk_meta.clear()
 
 
 if __name__ == "__main__":

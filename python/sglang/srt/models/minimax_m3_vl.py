@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
-    is_hip,
+    is_cuda_alike,
     log_info_on_rank0,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -57,7 +57,6 @@ logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _device_sm = get_device_sm()
 
 
@@ -163,7 +162,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        elif not (_is_cuda or _is_hip):
+        elif not is_cuda_alike():
             disable_reason = (
                 "Shared experts fusion currently requires CUDA or ROCm devices."
             )

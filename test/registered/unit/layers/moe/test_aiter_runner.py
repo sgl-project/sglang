@@ -40,7 +40,7 @@ def _quant_info(**overrides):
 def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter = ModuleType("aiter")
     fake_aiter.__path__ = []
-    fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
+    fake_aiter.ActivationType = SimpleNamespace(Silu="Silu", Swiglu="Swiglu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
@@ -52,7 +52,8 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_flydsl.__path__ = []
     fake_moe_common = ModuleType("aiter.ops.flydsl.moe_common")
     fake_moe_common.GateMode = SimpleNamespace(
-        INTERLEAVE=SimpleNamespace(value="INTERLEAVE")
+        INTERLEAVE=SimpleNamespace(value="INTERLEAVE"),
+        SEPARATED=SimpleNamespace(value="SEPARATED"),
     )
 
     monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
@@ -62,7 +63,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.moe_common", fake_moe_common)
 
 
-def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch):
+def test_aiter_runner_forwards_no_combine(monkeypatch):
     captured = {}
 
     def fused_moe(**kwargs):
@@ -78,14 +79,42 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
 
     runner.run(
         _runner_input(),
-        _quant_info(fused_moe_kwargs={"custom_fused_moe_kwarg": "enabled"}),
+        _quant_info(),
         running_state={},
     )
 
     assert captured["activation"] == "Silu"
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
-    assert captured["custom_fused_moe_kwarg"] == "enabled"
+
+
+@pytest.mark.parametrize(
+    ("gate_up_interleaved", "expected_gate_mode"),
+    [(True, "INTERLEAVE"), (False, "SEPARATED")],
+)
+def test_aiter_runner_forwards_explicit_layout_and_activation(
+    monkeypatch, gate_up_interleaved, expected_gate_mode
+):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(
+            activation="swiglu",
+            gate_up_interleaved=gate_up_interleaved,
+        ),
+        running_state={},
+    )
+
+    assert captured["activation"] == "Swiglu"
+    assert captured["gate_mode"] == expected_gate_mode
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
