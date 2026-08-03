@@ -132,10 +132,13 @@ class XPUAttentionImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
+        q_ = query.contiguous()
+        k_ = key.contiguous()
+        v_ = value.contiguous()
         output = flash_attn_func(
-            q=query,
-            k=key,
-            v=value,
+            q=q_,
+            k=k_,
+            v=v_,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
