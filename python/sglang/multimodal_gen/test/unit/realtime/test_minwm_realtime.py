@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     _minwm_project_output_in_reference_row_bucket,
     _minwm_qk_norm_op,
     _minwm_qk_norm_rope_op,
+    _minwm_should_restore_reference_output_projection,
     _minwm_uniform_cu_seqlens,
     _minwm_uniform_frame_indices,
     apply_minwm_rotary_embedding,
@@ -1459,6 +1460,44 @@ def test_minwm_output_projection_rejects_mismatched_shard():
             (3, 2),
             0,
         )
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "dtype", "splits", "capability", "hip", "expected"),
+    [
+        (True, torch.bfloat16, (1,) * 8, (9, 0), None, True),
+        (True, torch.bfloat16, (2,) * 4, (9, 0), None, False),
+        (True, torch.bfloat16, (1,) * 8, (10, 0), None, False),
+        (True, torch.bfloat16, (1,) * 8, (9, 4), "6.3", False),
+        (True, torch.float16, (1,) * 8, (9, 0), None, False),
+        (False, torch.bfloat16, (1,) * 8, (9, 0), None, False),
+    ],
+)
+def test_minwm_output_projection_reference_bucket_policy(
+    monkeypatch,
+    is_cuda,
+    dtype,
+    splits,
+    capability,
+    hip,
+    expected,
+):
+    hidden_states = SimpleNamespace(
+        is_cuda=is_cuda,
+        dtype=dtype,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: capability,
+    )
+
+    assert (
+        _minwm_should_restore_reference_output_projection(hidden_states, splits)
+        is expected
+    )
 
 
 def test_minwm_causal_cache_uses_local_ulysses_heads(monkeypatch):

@@ -1433,12 +1433,9 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             timestep_value,
             self.norm_out.norm.eps,
         )
-        if (
-            sequence_shard_splits is not None
-            and len(sequence_shard_splits) == 8
-            and normalized.is_cuda
-            and normalized.dtype == torch.bfloat16
-            and torch.cuda.get_device_capability(normalized.device)[0] == 9
+        if _minwm_should_restore_reference_output_projection(
+            normalized,
+            sequence_shard_splits,
         ):
             return _minwm_project_output_in_reference_row_bucket(
                 self.proj_out,
@@ -1447,6 +1444,20 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
                 sequence_shard_rank,
             )
         return self.proj_out(normalized)
+
+
+def _minwm_should_restore_reference_output_projection(
+    hidden_states: torch.Tensor,
+    sequence_shard_splits: list[int] | tuple[int, ...] | None,
+) -> bool:
+    return bool(
+        sequence_shard_splits is not None
+        and len(sequence_shard_splits) == 8
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(hidden_states.device) == (9, 0)
+    )
 
 
 def _minwm_project_output_in_reference_row_bucket(
