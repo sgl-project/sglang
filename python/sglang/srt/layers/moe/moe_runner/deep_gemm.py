@@ -1145,10 +1145,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
         running_state["deepep_v2_expanded"] = True
 
         if deepep_v2_use_masked:
-            # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
-            # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
-            # GEMM bounds compute by per-expert real counts (masked_m), decoupled
-            # from the dispatch capacity. Static shapes -> cuda-graph safe.
+            # Masked-GEMM bridge: see expand_to_masked_slab -- bounds compute by
+            # per-expert masked_m instead of the dispatch capacity, cuda-graph safe.
             from sglang.kernels.ops.moe.ep_moe_kernels import expand_to_masked_slab
 
             num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
@@ -1170,11 +1168,12 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 use_masked_gemm=True,
                 masked_m=masked_m,
                 expected_m=deepep_v2_expected_m,
-                hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
             )
 
-        # do_cpu_sync=False -> recv buffer is worst-case sized; ep_expand_init only
-        # writes real-token slots, so pre-fill the tail with -1 to skip padding rows.
+        # do_cpu_sync=False -> the recv buffer is worst-case sized. ep_expand_init
+        # labels each expert's rows up to its 128-aligned end (the contiguous layout
+        # needs a whole 128-row tile to share one expert id) but never touches the
+        # tail past the last expert, so pre-fill with -1 to make the GEMM skip it.
         m_indices = torch.full(
             (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
         )
@@ -1206,12 +1205,15 @@ def pre_permute_deepep_v2_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    # Match the legacy deepep_normal adapter (same ep_scatter + grouped GEMM): the
-    # scatter writes only real-token rows and the post-permute ep_gather reads them
-    # back via output_index, so the per-expert alignment padding rows are never
-    # consumed and the activation buffer needs no zero-init. The ue8m0 packed-scale
-    # layout keeps zeros (its in-int32 padding lanes must be zero).
-    input_tensor = torch.empty(
+    # Match the legacy deepep_normal adapter (same ep_scatter + grouped GEMM):
+    # ep_scatter writes only real-token rows and the post-permute ep_gather reads
+    # them back via output_index, so the alignment padding rows are never consumed
+    # and need no zero-init -- except under deterministic inference, where pad
+    # garbage would leak batch-dependent values into the grouped GEMM. The ue8m0
+    # packed-scale layout always keeps zeros (its in-int32 padding lanes must be 0).
+    deterministic = get_exec().deterministic.enable_deterministic_inference
+    buffer_init = torch.zeros if deterministic else torch.empty
+    input_tensor = buffer_init(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -1221,10 +1223,10 @@ def pre_permute_deepep_v2_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
+        input_tensor_scale = buffer_init(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
     if psum_num_recv_tokens_per_expert is not None:
         # Contiguous-path alignment contract: this psum comes from ElasticBuffer
@@ -1302,7 +1304,7 @@ def post_permute_deep_gemm_to_deepep_v2(
                 running_state["deepep_v2_expert_alignment"],
                 topk_weights=topk_weights,
             )
-            return DeepEPv2CombineInput(hidden_states, None, None)
+            return DeepEPv2CombineInput(hidden_states, None)
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights, so apply them to
             # each expert slot before combine. Keep this out-of-place until the
@@ -1310,7 +1312,7 @@ def post_permute_deep_gemm_to_deepep_v2(
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)
-        return DeepEPv2CombineInput(hidden_states, None, None)
+        return DeepEPv2CombineInput(hidden_states, None)
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1324,6 +1326,5 @@ def post_permute_deep_gemm_to_deepep_v2(
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
     return DeepEPv2CombineInput(
         hidden_states=gather_out,
-        topk_ids=topk_ids,
         topk_weights=topk_weights,
     )

@@ -198,7 +198,7 @@ class DeepEPv2RunnerCapability(NamedTuple):
     """
     Describes the DeepEP v2 dispatcher contract required by the active MoE runner.
 
-    This capability is resolved once (in get_deepep_v2_runner_capability, which reads
+    This capability is resolved in one place (get_deepep_v2_runner_capability, which reads
     runner-side flags such as DeepGEMM JIT TMA/UE8M0 settings) and then consumed
     by the dispatcher. The dispatcher depends only on this resolved contract and
     does not peek at runner implementation details itself.

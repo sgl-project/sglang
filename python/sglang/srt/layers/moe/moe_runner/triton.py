@@ -267,9 +267,6 @@ def pre_permute_standard_to_triton(
 
     # Registered fallback for format-conversion tests and examples.
 
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-        _prepare_fused_moe_run,
-    )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     hidden_states, topk_output = (
@@ -279,37 +276,12 @@ def pre_permute_standard_to_triton(
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
-    (
-        config,
-        down_config,
-        down_moe_use_tma,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-    ) = _prepare_fused_moe_run(
+    return _prepare_triton_runner_input(
         hidden_states,
-        quant_info.w13_weight,
-        quant_info.w2_weight,
         topk_output.topk_ids,
-        use_fp8_w8a8=quant_info.use_fp8_w8a8,
-        use_int8_w8a8=quant_info.use_int8_w8a8,
-        use_int8_w8a16=quant_info.use_int8_w8a16,
-        use_int4_w4a16=quant_info.use_int4_w4a16,
-        per_channel_quant=quant_info.per_channel_quant,
-        block_shape=quant_info.block_shape,
-    )
-
-    running_state["config"] = config
-    running_state["down_config"] = down_config
-    running_state["down_moe_use_tma"] = down_moe_use_tma
-
-    return TritonRunnerInput(
-        hidden_states=hidden_states,
-        topk_weights=topk_output.topk_weights,
-        topk_ids=topk_output.topk_ids,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
+        topk_output.topk_weights,
+        quant_info,
+        running_state,
     )
 
 
@@ -395,7 +367,6 @@ def pre_permute_deepep_v2_to_triton(
     valid_rows = (topk_ids >= 0).any(dim=1)
     running_state["deepep_v2_output_shape"] = hidden_states.shape
     running_state["deepep_v2_valid_rows"] = valid_rows
-    running_state["deepep_v2_topk_ids"] = topk_ids
     running_state["deepep_v2_topk_weights"] = topk_weights
     hidden_states = hidden_states[valid_rows].contiguous()
     topk_ids = topk_ids[valid_rows].contiguous()
@@ -423,6 +394,5 @@ def post_permute_triton_to_deepep_v2(
     output[valid_rows] = runner_output.hidden_states
     return DeepEPv2CombineInput(
         hidden_states=output,
-        topk_ids=running_state["deepep_v2_topk_ids"],
         topk_weights=running_state["deepep_v2_topk_weights"],
     )

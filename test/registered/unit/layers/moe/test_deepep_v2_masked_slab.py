@@ -38,19 +38,25 @@ def _build_layout(counts, align, hidden, dtype, with_scale=False, scale_hidden=4
         prev_end = end
     total = max(((prev_end + align - 1) // align) * align, 1)
 
-    # unique, exactly-representable values per real row (row index, kept small)
+    # Unique value per real row (kept small so the x2 column stays inside the
+    # e4m3 range), alternating x1/x2 along hidden so a kernel that broadcast one
+    # column across the row, or mis-strided the hidden offset, is caught.
     base = torch.zeros((total, hidden), dtype=torch.float32, device=DEVICE)
-    for e, (s, c) in enumerate(zip(starts, counts)):
+    col_gain = 1.0 + (torch.arange(hidden, device=DEVICE) % 2).float()
+    for s, c in zip(starts, counts):
         for j in range(c):
-            base[s + j] = float((s + j) % 200 + 1)
+            base[s + j] = float((s + j) % 200 + 1) * col_gain
     recv_x = base.to(dtype)
 
     scale = None
     if with_scale:
         scale = torch.zeros((total, scale_hidden), dtype=torch.float32, device=DEVICE)
-        for e, (s, c) in enumerate(zip(starts, counts)):
+        # Distinct value per scale column: a row constant along scale_hidden
+        # cannot catch a kernel that reads column 0 for every column.
+        col = torch.arange(scale_hidden, dtype=torch.float32, device=DEVICE)
+        for s, c in zip(starts, counts):
             for j in range(c):
-                scale[s + j] = float((s + j) % 50 + 1) * 0.5
+                scale[s + j] = float((s + j) % 50 + 1) * 0.5 + col
 
     psum_t = torch.tensor(psum, dtype=torch.int32, device=DEVICE)
     return recv_x, scale, psum_t, starts, total
@@ -121,11 +127,9 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         self._check_expand_roundtrip([3, 1, 6, 2], torch.float8_e4m3fn, with_scale=True)
 
     def test_empty_experts(self):
-        # all experts empty
         self._check_expand_roundtrip([0, 0, 0, 0], torch.bfloat16, with_scale=False)
 
     def test_single_hot_expert(self):
-        # one expert holds many tokens, the rest empty
         self._check_expand_roundtrip(
             [0, self.MAX_M, 0, 0], torch.bfloat16, with_scale=False, topk=True
         )
@@ -155,7 +159,10 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             sglang_per_token_group_quant_fp8,
         )
 
-        hidden = 512  # multiple of the 128 quant group size
+        # 1024 = 8 quant groups of 128 -> the packed scale has ceil(8/4) = 2 int32
+        # columns. At hidden <= 512 it collapses to a single column: the pack-dim
+        # offset is always 0 and the pack-dim stride is never exercised.
+        hidden = 1024
         raw, _, psum, starts, total = _build_layout(
             counts, self.ALIGN, hidden, torch.bfloat16
         )
@@ -167,6 +174,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
             scale_ue8m0=True,
         )
         self.assertEqual(recv_x_scale.dtype, torch.int32)
+        self.assertGreater(recv_x_scale.shape[1], 1, "pack dim must be indexed")
         self.assertNotEqual(recv_x_scale.stride(1), 1)
         return recv_x, recv_x_scale, psum, starts, total, hidden
 
@@ -215,6 +223,9 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         self.assertEqual(masked_m.tolist(), list(counts))
         for e, (s, c) in enumerate(zip(starts, counts)):
             for j in range(c):
+                torch.testing.assert_close(
+                    masked_x[e, j].float(), recv_x[s + j].float()
+                )
                 torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
 
 

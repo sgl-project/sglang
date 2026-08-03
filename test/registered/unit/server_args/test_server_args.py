@@ -1655,6 +1655,28 @@ class TestDeepEPv2Args(CustomTestCase):
         args._handle_a2a_moe()
         self.assertEqual(args.moe_runner_backend, "triton")
 
+    def test_runner_restored_by_declaration_fails_fast(self):
+        # mxfp8 + auto: a model declaration restores an unsupported runner at
+        # materialize time, which runs after this handler. The handler must
+        # validate the declaration-resolved runner, not the raw value it just set.
+        args = self._args(moe_runner_backend="auto")
+        args._resolved_overrides = [
+            ("test_mxfp8", {"moe_runner_backend": "flashinfer_trtllm"})
+        ]
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+    def test_declarations_materialize_ep_size_and_fusion(self):
+        from sglang.srt.arg_groups.overrides import materialize_declarations
+
+        args = self._args(moe_runner_backend="auto", tp_size=2)
+        args._handle_a2a_moe()
+        # ep_size / shared-experts fusion are declared by the a2a passes and land
+        # on the fields only at materialization, like every other a2a backend.
+        materialize_declarations(args)
+        self.assertEqual(args.ep_size, args.tp_size)
+        self.assertTrue(args.disable_shared_experts_fusion)
+
     def test_auto_runner_defaults_to_deep_gemm(self):
         args = self._args(
             moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="auto"
@@ -2027,56 +2049,3 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestDeepEPv2RunnerResolution(CustomTestCase):
-    """DeepEP v2 resolves --moe-runner-backend auto and validates the FINAL
-    declaration-resolved runner, not the raw field. A model-identity
-    declaration (e.g. mxfp8 + auto -> flashinfer_trtllm) is materialized after
-    _handle_a2a_moe, so the handler reads resolved_view and fails fast on an
-    unsupported resolved runner instead of silently running it. Driven at the
-    handler level because __post_init__ short-circuits for the dummy path."""
-
-    def _make(self, **kwargs):
-        base = dict(
-            model_path="dummy",
-            moe_a2a_backend="deepep_v2",
-            moe_runner_backend="auto",
-            deepep_v2_dispatcher_output_dtype="fp8",
-            tp_size=2,
-            chunked_prefill_size=0,
-        )
-        base.update(kwargs)
-        sa = ServerArgs(**base)
-        # __post_init__ returns early for the dummy model, so the cuda-graph
-        # config the handler writes to is not built yet; supply a default.
-        sa.cuda_graph_config = CudaGraphConfig()
-        return sa
-
-    def test_auto_fp8_resolves_to_deep_gemm(self):
-        from sglang.srt.arg_groups.overrides import materialize_declarations
-
-        sa = self._make()
-        sa._handle_a2a_moe()
-        self.assertEqual(sa.moe_runner_backend, "deep_gemm")
-        # ep_size / shared-experts fusion are declared by the a2a passes and
-        # land on the fields only at materialization, like every other backend.
-        materialize_declarations(sa)
-        self.assertEqual(sa.ep_size, sa.tp_size)
-        self.assertTrue(sa.disable_shared_experts_fusion)
-
-    def test_auto_bf16_resolves_to_triton(self):
-        sa = self._make(deepep_v2_dispatcher_output_dtype="bf16")
-        sa._handle_a2a_moe()
-        self.assertEqual(sa.moe_runner_backend, "triton")
-
-    def test_runner_restored_by_declaration_fails_fast(self):
-        # Simulate mxfp8 + auto: a model declaration restores an unsupported
-        # runner at materialize time. _handle_a2a_moe must validate the
-        # resolved runner (resolved_view), not the raw deep_gemm it just set.
-        sa = self._make()
-        sa._resolved_overrides = [
-            ("test_mxfp8", {"moe_runner_backend": "flashinfer_trtllm"})
-        ]
-        with self.assertRaises(ValueError):
-            sa._handle_a2a_moe()

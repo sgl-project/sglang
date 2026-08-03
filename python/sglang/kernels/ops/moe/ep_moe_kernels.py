@@ -2147,13 +2147,9 @@ def fp8_per_token_to_per_tensor_quant_triton(
 _DEEPEP_V2_REPACK_WORKERS_PER_EXPERT = 64
 
 
-# Repack kernel for the DeepEP v2 masked decode path: expand the
-# [total, hidden] dispatch output (valid rows packed per expert via psum
-# offsets) into per-expert masked slabs [E_local, max_m, hidden] for
-# DeepGEMM's masked grouped GEMM, copying activations and, for FP8
-# dispatch, the block scales. recv_x_scale_stride1 carries the scale
-# pack-dim stride so both row-major (Hopper) and column-major packed
-# UE8M0 (Blackwell) scale layouts are read correctly.
+# recv_x_scale_stride1 carries the scale pack-dim stride so the repack reads
+# both row-major (Hopper fp32) and column-major packed UE8M0 (Blackwell int32)
+# dispatch-scale layouts correctly.
 @triton.jit
 def _fwd_kernel_expand_to_masked_slab(
     psum_ptr,
@@ -2253,8 +2249,10 @@ def expand_to_masked_slab(
         # return a [E, max_m, sh] view with mn-major stride. This matches
         # deep_gemm's mn-major TMA-aligned scale layout, so the per-layer
         # get_mn_major_tma_aligned_tensor call on the GEMM side is a no-op.
-        # (That call still runs and would transpose if the layout ever failed to
-        # match, so correctness does not depend on this optimization.)
+        # On Hopper that call still runs and would transpose if the layout ever
+        # failed to match. On Blackwell (DEEPGEMM_SCALE_UE8M0) it does not:
+        # _run_masked_gemm takes the packed-ue8m0 branch and consumes this scale
+        # as-is, so correctness there does depend on this write being mn-major.
         output_tensor_scale = torch.empty(
             (num_local_experts * sh, max_m),
             device=recv_x.device,
@@ -2368,8 +2366,6 @@ def masked_slab_to_expand(
     only on real rows (not the worst-case buffer).
     """
     num_local_experts, max_m, hidden = input_tensor.shape
-    # combine reads only real rows via handle metadata, so padding need not be
-    # zeroed -> use empty to skip the worst-case-buffer memset.
     output_tensor = torch.empty(
         (total_expanded_tokens, hidden),
         device=input_tensor.device,

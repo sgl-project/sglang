@@ -2678,8 +2678,6 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    # Keep the original deepep-class scope here and only add DeepEP v2,
-                    # so unrelated backends' allocator sizing is unchanged.
                     is_a2a_moe = (
                         is_deepep_class_backend()
                         or get_moe_a2a_backend().is_deepep_v2()

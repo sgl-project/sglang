@@ -69,7 +69,6 @@ class DeepEPv2DispatchOutput(NamedTuple):
 
 class DeepEPv2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
-    topk_ids: Optional[torch.Tensor]
     topk_weights: Optional[torch.Tensor]
 
     @property
@@ -114,9 +113,9 @@ def _ensure_fp8_quant_available() -> None:
 
 def _get_allow_hybrid_mode() -> bool:
     # direct/hybrid is a communication-topology knob resolved from ServerArgs.
-    # Callers without a running server (synthetic/unit tests) must pass
-    # allow_hybrid_mode explicitly instead (get_server_args() raises when the
-    # process-wide ServerArgs is not set).
+    # Callers without a running server (synthetic/unit tests) pass
+    # allow_hybrid_mode to DeepEPv2Buffer.get_buffer instead (get_server_args()
+    # raises when the process-wide ServerArgs is not set).
     from sglang.srt.runtime_context import get_server_args
 
     return get_server_args().deepep_v2_mode == "hybrid"
@@ -218,7 +217,6 @@ class _DeepEPv2Impl:
         hidden_size: int,
         capability: DeepEPv2RunnerCapability,
         num_max_dispatch_tokens_per_rank: int,
-        allow_hybrid_mode: Optional[bool] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -227,7 +225,6 @@ class _DeepEPv2Impl:
         self.hidden_size = hidden_size
         self.capability = capability
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        self.allow_hybrid_mode = allow_hybrid_mode
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
@@ -250,7 +247,6 @@ class _DeepEPv2Impl:
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
             self._uses_fp8_dispatch_output(),
-            allow_hybrid_mode=self.allow_hybrid_mode,
         )
 
     def _resolve_num_sms_qps(self, buffer: ElasticBuffer) -> Tuple[int, int]:
@@ -301,9 +297,8 @@ class _DeepEPv2Impl:
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DeepEPv2DispatchOutput:
-        # Handle lifecycle: dispatch produces exactly one handle that the next
-        # combine() consumes. Guard-first (before the import check) so misuse is
-        # reportable without DeepEP installed.
+        # Guard-first (before the import check) so misuse is reportable without
+        # DeepEP installed.
         if self._handle is not None:
             raise RuntimeError(
                 "DeepEP v2 dispatch called while the previous dispatch handle is "
@@ -335,17 +330,16 @@ class _DeepEPv2Impl:
         # tokens never fires the dispatch notify / scale-up-reduction warps, so no
         # rank's recv count becomes "ready" and the do_cpu_sync CPU readback times
         # out ("Dispatch CPU wait", buffer.hpp:1032). Pad an empty local batch to a
-        # single dummy token (routed to local expert 0); the contiguous slice in
-        # dispatch_b yields 0 real rows and combine_b drops it back to an empty
-        # output. The masked decode path tolerates empty (do_cpu_sync=False), so it
-        # is left untouched.
+        # single dummy token; combine() slices that row back off so this rank's
+        # output is empty again. The masked decode path tolerates empty
+        # (do_cpu_sync=False), so it is left untouched.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
             # A token's top-k experts must be DISTINCT valid ids: duplicates (e.g.
             # all-zero -> expert 0 repeated) fault the dispatch kernel. Route the
             # dummy to experts [0, 1, ..., topk-1] with zero weights so it
-            # contributes nothing even before combine_b slices it off.
+            # contributes nothing even before combine() slices it off.
             topk_ids = torch.arange(
                 topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
             ).unsqueeze(0)
@@ -384,11 +378,10 @@ class _DeepEPv2Impl:
         # fixed _num_max_dispatch_tokens_per_rank rather than a per-forward token
         # count. Do NOT derive it from the local hidden_states.shape[0]: under
         # ragged DP load (or TP attention) the ranks would disagree on this
-        # collective arg. (The masked slab max_m below is likewise fixed at
-        # cap * ep_group_size for the same cross-rank / overflow safety; only
-        # expected_m, a per-rank-local GEMM schedule hint, uses the actual batch.)
+        # collective arg.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        # Non-masked (hybrid / direct-extend) path reads exact per-expert recv
+        # Non-masked (extend/prefill, or a BF16 runner) path reads exact per-expert
+        # recv
         # counts on the CPU, so it must wait for the GPU to finish writing them
         # (matches the DeepEP elastic test which passes do_cpu_sync=1). Leaving
         # it None lets the CPU read zeros on multi-node (scaleup) dispatch. Only
@@ -535,7 +528,6 @@ class DeepEPv2Dispatcher(BaseDispatcher):
         num_local_experts: int,
         hidden_size: int,
         params_dtype: torch.dtype,
-        allow_hybrid_mode: Optional[bool] = None,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -544,7 +536,6 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 f"got {params_dtype}"
             )
         capability = get_deepep_v2_runner_capability(self)
-        self.output_dtype = capability.output_dtype
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
@@ -556,13 +547,11 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             capability=capability,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            allow_hybrid_mode=allow_hybrid_mode,
         )
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         capability = get_deepep_v2_runner_capability(self)
-        self.output_dtype = capability.output_dtype
         self._impl.set_runner_capability(capability)
 
     # This backend intentionally exposes only single-shot dispatch()/combine():

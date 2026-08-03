@@ -2274,11 +2274,13 @@ class ServerArgs:
         "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
         "inference phase, independent of this knob; not equivalent to DeepEP v1 "
         "normal/low_latency.",
+        NS("exec.moe"),
     ] = "direct"
     deepep_v2_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8"],
         "DeepEP v2 dispatcher output dtype. `auto`: fp8 for the DeepGEMM runner, bf16 for "
         "Triton.",
+        NS("exec.moe"),
     ] = "auto"
     moe_runner_backend: A[
         str,
@@ -6733,8 +6735,9 @@ class ServerArgs:
             # guard), which small smoke traffic may never trigger. Decode does
             # not need a boot check: with CUDA graphs the padded capture batch
             # goes through the same runtime guard during startup, and without
-            # graphs the guard still fails fast at runtime. Mirrors the MORI
-            # chunk check and the CuteDSL token-budget check below.
+            # graphs the guard still fails fast at runtime. Mirrors the MoRI and
+            # pplx chunk checks later in this handler, and the CuteDSL
+            # token-budget check in its own __post_init__ slot.
             if (
                 self.chunked_prefill_size
                 and self.chunked_prefill_size > 0
@@ -6767,14 +6770,8 @@ class ServerArgs:
             deepep_v2_graph_ok = resolved_runner == "deep_gemm" and deepep_v2_fp8
             if not deepep_v2_graph_ok:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            else:
-                # The decode masked-GEMM path is capture-safe under any comm mode
-                # (static shapes, no host readback). The prefill/extend path goes
-                # through the non-masked contiguous layout with a host readback and
-                # is not capturable, so keep the decode graph but always disable the
-                # prefill graph under DeepEP v2.
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            # The prefill/extend contiguous path is never capturable.
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

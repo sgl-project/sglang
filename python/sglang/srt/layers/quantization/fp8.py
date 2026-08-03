@@ -1684,11 +1684,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     use_deepgemm_runner=will_use_deepgemm,
                 ):
                     if not isinstance(layer, DeepEPMoE):
-                        # UE8M0 in-place weight requant is wired only for the
-                        # DeepEPMoE layer. Both the deepep and deepep_v2 backends
-                        # route through DeepEPMoE (get_moe_impl_class), so this
-                        # fires only for an unexpected layer type; fail fast with
-                        # a clear message instead of asserting.
+                        # Both deepep and deepep_v2 resolve to DeepEPMoE in
+                        # get_moe_impl_class, so this is an unexpected layer type.
                         raise NotImplementedError(
                             "DeepGEMM UE8M0 weight requant requires the "
                             f"DeepEPMoE layer, got {type(layer).__name__}. Use a "
