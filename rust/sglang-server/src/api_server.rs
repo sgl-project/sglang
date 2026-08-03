@@ -9,6 +9,7 @@ mod guard;
 mod log;
 mod native_api;
 mod openai;
+mod pd_bootstrap;
 mod submit;
 
 use std::sync::Arc;
@@ -19,13 +20,14 @@ use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
-/// Shared handler state: the submit machinery (`senders`, `egress_buf`)
-/// + shared tokenizer.
+/// Shared handler state: submission handles, immutable server configuration,
+/// and the API-owned chat formatter.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    chat_formatter: Option<openai::ChatFormatter>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
@@ -41,14 +43,16 @@ pub async fn serve(
     // releases.
     shutdown: flume::Receiver<()>,
 ) {
+    let chat_formatter = openai::load_chat_support(&server_args);
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
+        chat_formatter,
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes())
@@ -59,6 +63,14 @@ pub async fn serve(
         // No body limit, matching the Python server.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    if server_args.enable_pd_bootstrap() {
+        // Merged after `with_state` (the registry carries its own state) and
+        // before `log::apply`, so bootstrap traffic shows in the access log.
+        let (bootstrap_routes, sweeper) = pd_bootstrap::router_and_sweeper();
+        tokio::spawn(sweeper); // cancelled with the runtime on shutdown
+        app = app.merge(bootstrap_routes);
+        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+    }
     let app = log::apply(app, &server_args);
 
     // The listener was already bound synchronously in `runtime::start` (so a port
@@ -79,6 +91,14 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
+    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
+    // Nagle/delayed-ACK penalty on keep-alive connections.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|io| {
+        if let Err(e) = io.set_nodelay(true) {
+            tracing::debug!(error = %e, "set_nodelay failed");
+        }
+    });
     // `with_connect_info` exposes the peer address to the access-log middleware.
     let serve = axum::serve(
         listener,
