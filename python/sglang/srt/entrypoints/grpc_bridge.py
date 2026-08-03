@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -376,12 +377,19 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": self.server_args.tokenizer_path,
+            "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.tokenizer_manager.server_args.weight_version,
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
+        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+        if embedding_model_spec is not None:
+            result["embedding"] = resolved_embedding_plan(
+                embedding_model_spec,
+                server_args=self.server_args,
+                model_config=model_config,
+            )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
@@ -424,7 +432,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.server_args.enable_lora and hasattr(
+        if self.tokenizer_manager.server_args.enable_lora and hasattr(
             self.tokenizer_manager, "lora_registry"
         ):
             lora_registry = self.tokenizer_manager.lora_registry

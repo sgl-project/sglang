@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "turbo", "raw"]} />
+
 ## 1. Model Introduction
 
 [Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is a high-quality text-to-image diffusion model from [Krea](https://www.krea.ai/). It ships in two variants that share the same backbone and differ only in their sampling recipe:

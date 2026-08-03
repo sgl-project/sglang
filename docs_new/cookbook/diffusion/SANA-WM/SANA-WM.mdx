@@ -4,6 +4,10 @@ metatags:
     description: "Deploy SANA-WM with SGLang - a camera-controlled text+image-to-video world model with WASD/IJKL 6-DoF camera control, served three ways: dense bidirectional and chunk-causal batch streaming over /v1/videos (SanaWMTwoStagePipeline), and live over a realtime WebSocket API (SanaWMRealtimePipeline, /v1/realtime_video/generate)."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["video", "realtime", "world model", "camera control", "two-stage"]} />
+
 ## 1. Model Introduction
 
 [SANA-WM](https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional) is an efficient open-source **world model** from NVLabs, trained natively for one-minute video generation. It is a **2.6B-parameter text+image-to-video (TI2V) diffusion transformer** that synthesizes **720p, minute-scale videos with precise 6-DoF camera control**, paired with an **LTX-2 refiner** for high-fidelity decoding. It builds on the [SANA](https://github.com/NVlabs/Sana) family — efficient high-resolution synthesis with a linear diffusion transformer.
