@@ -179,6 +179,7 @@ def fp8_paged_mqa_logits_torch_sm120(
     deep_gemm_metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
     _ = deep_gemm_metadata
@@ -194,14 +195,14 @@ def fp8_paged_mqa_logits_torch_sm120(
         # with B=8192 that is twice ~8.6 GB before any scoring work, and it is
         # what OOMed after the chunk-size budget was fixed. The loop caps the
         # transient at a single sub-output.
-        out = torch.full(
-            (batch_size, max_seq_len),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp8.device,
-        )
+        if out is None:
+            out = torch.empty(
+                (batch_size, max_seq_len),
+                dtype=torch.float32,
+                device=q_fp8.device,
+            )
         for start in range(0, batch_size, _QUERY_CHUNK):
-            out[start : start + _QUERY_CHUNK] = fp8_paged_mqa_logits_torch_sm120(
+            fp8_paged_mqa_logits_torch_sm120(
                 q_fp8[start : start + _QUERY_CHUNK],
                 kvcache_fp8,
                 weight[start : start + _QUERY_CHUNK],
@@ -210,6 +211,7 @@ def fp8_paged_mqa_logits_torch_sm120(
                 deep_gemm_metadata,
                 max_seq_len,
                 clean_logits=clean_logits,
+                out=out[start : start + _QUERY_CHUNK],
             )
         return out
 
@@ -246,12 +248,20 @@ def fp8_paged_mqa_logits_torch_sm120(
     q = q_fp8[:, 0].to(torch.bfloat16)  # [B, NH, 128]
     # The output dtype has to match the unchunked path: there the score is
     # multiplied by fp32 weight/kv_scale, so it lands in fp32.
-    logits = torch.full(
-        (batch_size, max_seq_len),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q_fp8.device,
-    )
+    # Writing into a caller-provided buffer removes the last full-output-size
+    # transient in the chunked path: without it every 1024-row sub-call
+    # allocates its own [chunk, max_seq_len] fp32 before the copy -- the third
+    # and final allocation site the 1M OOM walked to.
+    if out is not None:
+        logits = out
+        logits.fill_(float("-inf"))
+    else:
+        logits = torch.full(
+            (batch_size, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
     # Peak per gathered KV token: bf16 values (head_dim * 2) + bf16 scores
     # (num_heads * 2) + the fp32 product the weighted head sum materialises
     # (num_heads * 4). That last term was missing from the budget: the cap
