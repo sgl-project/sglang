@@ -10,10 +10,13 @@ Covers:
   - _handle_batch_output cleans up rid_to_state on finished requests
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
+  - Every cleanup path hands the request's LoRA reference back to the registry
 """
 
 import asyncio
 import unittest
+from http import HTTPStatus
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -118,6 +121,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    tm._lora_release_tasks = set()
     return tm
 
 
@@ -128,6 +132,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.stream = False
     obj.return_logprob = False
     obj.lora_path = None
+    obj.lora_id = None
     obj.log_metrics = False
     return ReqState(
         out_list=[],
@@ -519,6 +524,296 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+
+
+class _RecordingLoRARegistry:
+    """Stands in for LoRARegistry, recording acquired and released IDs."""
+
+    def __init__(self):
+        self.acquired = []
+        self.released = []
+
+    async def get_unregistered_loras(self, lora_paths):
+        return []
+
+    async def acquire(self, lora_paths):
+        if isinstance(lora_paths, list):
+            lora_ids = [
+                f"id:{path}" if path is not None else None for path in lora_paths
+            ]
+            self.acquired.extend(lora_id for lora_id in lora_ids if lora_id is not None)
+            return lora_ids
+
+        lora_id = f"id:{lora_paths}"
+        self.acquired.append(lora_id)
+        return lora_id
+
+    async def release(self, lora_id):
+        if isinstance(lora_id, list):
+            self.released.extend(item for item in lora_id if item is not None)
+        else:
+            self.released.append(lora_id)
+
+
+def _enable_lora(tm: TokenizerManager) -> TokenizerManager:
+    tm.enable_lora = True
+    tm.lora_registry = _RecordingLoRARegistry()
+    return tm
+
+
+def _make_lora_req_state(rid: str, lora_id: str = "lora-1") -> ReqState:
+    state = _make_req_state(rid)
+    state.obj.lora_path = "adapter"
+    state.obj.lora_id = lora_id
+    return state
+
+
+class TestLoraReferenceRelease(CustomTestCase):
+    """Every path that drops a request must release its LoRA reference.
+
+    The registry counts in-flight requests per adapter and
+    /unload_lora_adapter waits for that count to reach zero, so a single
+    reference that is never handed back wedges every later adapter swap.
+    """
+
+    def test_abort_releases_reference(self):
+        tm = _enable_lora(_make_tokenizer_manager())
+        rid = "lora_abort_rid"
+        tm.rid_to_state[rid] = _make_lora_req_state(rid)
+
+        async def drive():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(tm.lora_registry.released, ["lora-1"])
+
+    def test_bad_request_abort_releases_reference(self):
+        tm = _enable_lora(_make_tokenizer_manager())
+        rid = "lora_bad_request_rid"
+        state = _make_lora_req_state(rid)
+        tm.rid_to_state[rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                    "message": "rejected by the scheduler",
+                }
+            }
+        }
+
+        async def drive():
+            with self.assertRaises(ValueError):
+                await tm._handle_abort_finish_reason(out, state, is_stream=False)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(tm.lora_registry.released, ["lora-1"])
+
+    def test_dispatch_failure_releases_reference(self):
+        tm = _enable_lora(_make_tm_for_generate())
+        rid = "lora_overlen_rid"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.lora_path = "adapter"
+        obj.lora_id = "lora-1"
+        tm._tokenize_one_request = AsyncMock(side_effect=ValueError("input too long"))
+        tm._send_one_request = Mock()
+
+        async def drive():
+            with self.assertRaises(ValueError):
+                await tm.generate_request(obj).__anext__()
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(tm.lora_registry.released, ["lora-1"])
+
+    def test_reference_released_once_when_cleanup_paths_race(self):
+        """A finish and a late abort echo for the same rid release only once."""
+        tm = _enable_lora(_make_tokenizer_manager())
+        rid = "lora_race_rid"
+        tm.rid_to_state[rid] = _make_lora_req_state(rid)
+
+        async def drive():
+            await tm._handle_batch_output(_make_batch_str_output(rid))
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.released, ["lora-1"])
+
+    def test_no_release_without_lora(self):
+        tm = _enable_lora(_make_tokenizer_manager())
+        rid = "no_lora_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+
+        async def drive():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.released, [])
+
+    def test_no_release_when_lora_acquire_never_succeeded(self):
+        tm = _enable_lora(_make_tokenizer_manager())
+        rid = "unacquired_lora_rid"
+        state = _make_req_state(rid)
+        state.obj.lora_path = "missing-adapter"
+        state.obj.lora_id = None
+        tm.rid_to_state[rid] = state
+
+        async def drive():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.released, [])
+
+    def test_explicit_rids_release_every_parallel_acquire_on_failure(self):
+        """One parent rid can own n references until parallel fan-out."""
+
+        async def drive():
+            tm = _enable_lora(_make_tokenizer_manager())
+            tm.server_args.max_loaded_loras = None
+            obj = GenerateReqInput(
+                text=["hello", "world"],
+                rid=["parent-a", "parent-b"],
+                lora_path=["adapter-a", "adapter-b"],
+                sampling_params={"n": 3, "max_new_tokens": 8},
+            )
+            obj.received_time = 0.0
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            await tm._resolve_lora_path(obj)
+
+            # Simulate tokenization/validation failing before child states are
+            # created. Cleanup must balance all batch_size * n acquisitions.
+            tm._discard_pending_req_states(obj)
+            await asyncio.gather(*list(tm._lora_release_tasks))
+
+            self.assertCountEqual(
+                tm.lora_registry.released,
+                tm.lora_registry.acquired,
+            )
+            self.assertEqual(len(tm.lora_registry.released), 6)
+
+        asyncio.run(drive())
+
+    def test_abort_during_lora_acquire_releases_orphaned_reference(self):
+        """An abort racing acquire cannot strand the newly acquired ID."""
+
+        async def drive():
+            tm = _enable_lora(_make_tokenizer_manager())
+            tm.server_args.max_loaded_loras = None
+            obj = GenerateReqInput(
+                text="hello",
+                rid="acquire-race",
+                lora_path="adapter",
+            )
+            obj.received_time = 0.0
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+
+            acquire_started = asyncio.Event()
+            finish_acquire = asyncio.Event()
+            original_acquire = tm.lora_registry.acquire
+
+            async def blocked_acquire(lora_path):
+                acquire_started.set()
+                await finish_acquire.wait()
+                return await original_acquire(lora_path)
+
+            tm.lora_registry.acquire = blocked_acquire
+            resolve_task = asyncio.create_task(tm._resolve_lora_path(obj))
+            await acquire_started.wait()
+            tm._handle_abort_req(_make_abort_req(obj.rid))
+            finish_acquire.set()
+
+            with self.assertRaisesRegex(ValueError, "aborted while resolving"):
+                await resolve_task
+
+            self.assertEqual(tm.lora_registry.acquired, ["id:adapter"])
+            self.assertEqual(tm.lora_registry.released, ["id:adapter"])
+
+        asyncio.run(drive())
+
+    def test_parallel_sampling_releases_only_real_samples(self):
+        """The prefix-cache warm-up and parent states do not own references."""
+
+        async def drive(text, rid, lora_path, lora_ids):
+            tm = _enable_lora(_make_tokenizer_manager())
+            obj = GenerateReqInput(
+                text=text,
+                rid=rid,
+                lora_path=lora_path,
+                sampling_params={"n": 4, "max_new_tokens": 8},
+            )
+            obj.received_time = 0.0
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+
+            # Mirror _resolve_lora_path after acquiring four references.
+            obj.lora_id = lora_ids
+            for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+                sub_obj.lora_id = obj.lora_id[i]
+            missing_rids, orphaned_lora_ids = tm._assign_lora_release_ownership(obj)
+            self.assertEqual(missing_rids, [])
+            self.assertEqual(orphaned_lora_ids, [])
+
+            async def tokenize(req):
+                return SimpleNamespace(
+                    input_ids=[1],
+                    mm_inputs=None,
+                    rid=req.rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=8),
+                    stream=False,
+                )
+
+            async def finish(req, request=None):
+                state = tm.rid_to_state.pop(req.rid)
+                tm._release_lora_once(state)
+                yield {"meta_info": {"id": req.rid}}
+
+            tm._tokenize_one_request = tokenize
+            tm._send_one_request = Mock()
+            tm._wait_one_response = finish
+
+            outputs = [out async for out in tm._handle_batch_request(obj)]
+            await asyncio.sleep(0)
+
+            self.assertEqual(len(outputs), 1)
+            self.assertCountEqual(
+                tm.lora_registry.released,
+                lora_ids,
+            )
+            self.assertEqual(tm.rid_to_state, {})
+
+        # Both accepted rid shapes exercise different parent-state counts.
+        asyncio.run(
+            drive(
+                "hello",
+                None,
+                "adapter",
+                ["stable-upsert-id"] * 4,
+            )
+        )
+        asyncio.run(
+            drive(
+                ["hello", "world"],
+                ["parallel-a", "parallel-b"],
+                ["adapter-a", "adapter-b"],
+                ["stable-a", "stable-b"] * 4,
+            )
+        )
 
 
 if __name__ == "__main__":
