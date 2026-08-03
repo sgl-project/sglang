@@ -27,15 +27,15 @@ def build_memory_usage(
         draft_graph_memory_usage,
     )
     return {
-        "weight": round(weight_gb, 2),
-        "kvcache": round(kv_cache_gb, 2),
-        "startup_available": round(startup_available_gb, 2),
+        "weight": round(weight_gb, 3),
+        "kvcache": round(kv_cache_gb, 3),
+        "startup_available": round(startup_available_gb, 3),
         "token_capacity": int(token_capacity),
         "token_capacity_swa": (
             None if token_capacity_swa is None else int(token_capacity_swa)
         ),
         "graph": {
-            phase: round(memory_gb, 2)
+            phase: round(memory_gb, 3)
             for phase, memory_gb in graph_memory_usage.items()
         },
     }
