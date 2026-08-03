@@ -17,7 +17,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     _classify_fused_shard,
     _fused_module_prefixes,
-    _is_dense_linear,
+    _unfusable_layer_leaves,
     _pop_fused_weight,
     _reject_unfusable_leaf,
     _summarize_unplaced_weights,
@@ -310,16 +310,97 @@ class TestLoadWeightsFusedProjection(unittest.TestCase):
         torch.testing.assert_close(params[f"{ATTN_PREFIX}.wq_a.qweight"].data, qweight)
 
 
-class TestPackedLayerFallback(unittest.TestCase):
-    def test_unquantized_replicated_linear_is_dense(self):
-        layer = ReplicatedLinear(8, 4, bias=False, quant_config=None)
-        self.assertTrue(_is_dense_linear(layer))
+def layer_with_params(*names):
+    """A stand-in for a built linear carrying exactly ``names``.
 
-    def test_packed_layer_is_not_dense(self):
-        layer = torch.nn.Module()
-        for packed_name in ("qweight", "qzeros", "scales"):
-            layer.register_parameter(packed_name, torch.nn.Parameter(torch.zeros(2, 2)))
-        self.assertFalse(_is_dense_linear(layer))
+    Used for the schemes whose real quantization method cannot be constructed
+    without a device (compressed tensors probes the device capability before it
+    picks a scheme). The parameter names are the ones those methods register.
+    """
+    layer = torch.nn.Module()
+    for name in names:
+        layer.register_parameter(name, torch.nn.Parameter(torch.zeros(2, 2)))
+    return layer
+
+
+class TestPackedLayerFallback(unittest.TestCase):
+    def test_unquantized_replicated_linear_is_fusable(self):
+        layer = ReplicatedLinear(8, 4, bias=False, quant_config=None)
+        self.assertEqual(
+            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ()
+        )
+
+    def test_packed_layer_is_not_fusable(self):
+        layer = layer_with_params("qweight", "qzeros", "scales")
+        self.assertEqual(
+            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES),
+            ("qweight", "qzeros", "scales"),
+        )
+
+    def test_per_tensor_fp8_layer_is_not_fusable(self):
+        """`weight` is present, so a `weight`-only test would leave the fusion on.
+
+        `Fp8LinearMethod` registers `weight_scale` and `input_scale` beside the
+        weight; the fusion has no shard for either, so the layer has to build
+        the separate projections.
+        """
+        layer = layer_with_params("weight", "weight_scale", "input_scale")
+        self.assertEqual(
+            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES),
+            ("input_scale", "weight_scale"),
+        )
+
+    def test_compressed_tensors_packed_layer_is_not_fusable(self):
+        layer = layer_with_params(
+            "weight_packed", "weight_scale", "weight_shape", "weight_zero_point"
+        )
+        self.assertEqual(
+            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES),
+            ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point"),
+        )
+
+    def test_block_scaled_fp8_layer_stays_fusable(self):
+        """The path this fusion exists for must not be disabled by the widening."""
+        layer = layer_with_params("weight", "weight_scale_inv")
+        self.assertEqual(
+            _unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES), ()
+        )
+
+    def test_the_weight_only_predicate_accepted_per_tensor_fp8(self):
+        """The predicate this replaced, kept executable.
+
+        `hasattr(layer, "weight")` answers True for per-tensor fp8, which is why
+        that checkpoint reached `_reject_unfusable_leaf` at load time instead of
+        building the separate projections.
+        """
+        layer = layer_with_params("weight", "weight_scale", "input_scale")
+        self.assertTrue(hasattr(layer, "weight"))
+        self.assertTrue(_unfusable_layer_leaves(layer, _WQKV_A_FUSABLE_LEAVES))
+
+    def test_per_tensor_fp8_checkpoint_loads_through_the_separate_projections(self):
+        """End to end: every scale reaches its own parameter.
+
+        Before the build-side check covered it, the layer kept `wqkv_a`, the
+        `weight` shards fused, and the first scale tensor raised -- a checkpoint
+        that loads unfused became one that does not load.
+        """
+        leaves = ("weight", "weight_scale", "input_scale")
+        params = {
+            f"{ATTN_PREFIX}.{proj}.{leaf}": torch.nn.Parameter(torch.zeros(4, 8))
+            for proj in ("wq_a", "wkv")
+            for leaf in leaves
+        }
+        weights = [
+            (f"{ATTN_PREFIX}.{proj}.{leaf}", torch.full((4, 8), float(i)))
+            for i, (proj, leaf) in enumerate(
+                (p, l) for p in ("wq_a", "wkv") for l in leaves
+            )
+        ]
+
+        run_load_weights(params, weights, fuse_wqa_wkv=True)
+
+        for name, expected in weights:
+            torch.testing.assert_close(params[name].data, expected)
 
     def test_loader_skips_fusion_when_the_model_has_no_wqkv_a(self):
         # MqaAttentionBase built the unfused pair because the quantization

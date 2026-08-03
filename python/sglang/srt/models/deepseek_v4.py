@@ -476,16 +476,18 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wqkv_a", prefix),
             )
-            if not _is_dense_linear(self.wqkv_a):
-                # The quantization method built a packed layer instead of a
-                # plain weight. The wq_a+wkv fusion concatenates the two
-                # checkpoint tensors on dim 0, which is the output axis of the
-                # dense layout only, so fall back to the separate projections
-                # rather than joining tensors on the wrong axis.
+            unfusable = _unfusable_layer_leaves(self.wqkv_a, _WQKV_A_FUSABLE_LEAVES)
+            if unfusable:
+                # The quantization method built parameters this fusion has no
+                # shard for. The wq_a+wkv fusion concatenates the two checkpoint
+                # tensors on dim 0, which is the output axis of the dense layout
+                # only, so fall back to the separate projections rather than
+                # joining tensors on the wrong axis or dropping the rest.
                 print_warning_once(
                     "Disabling the wq_a+wkv fusion: quantization method "
-                    f"{type(self.wqkv_a.quant_method).__name__} builds a packed "
-                    "layer with no plain 'weight' parameter."
+                    f"{type(self.wqkv_a.quant_method).__name__} builds "
+                    f"{list(unfusable)} alongside the leaves this fusion can "
+                    f"join ({sorted(_WQKV_A_FUSABLE_LEAVES)})."
                 )
                 del self.wqkv_a
                 fuse = False
@@ -3263,15 +3265,33 @@ def _summarize_unplaced_weights(names: List[str], top: int = 5) -> str:
     )
 
 
-def _is_dense_linear(layer: nn.Module) -> bool:
-    """Whether the layer's quantization method built a plain dense weight.
+def _unfusable_layer_leaves(
+    layer: nn.Module, fusable_leaves: frozenset
+) -> Tuple[str, ...]:
+    """Parameters of ``layer`` this fusion cannot join, sorted.
 
-    Format-agnostic: packed schemes register their own parameters
-    (`.qweight`/`.qzeros`/`.scales` and friends) and no `weight`, so a missing
-    `weight` is the signal that the layer cannot take a dim-0 concatenation of
-    two dense checkpoint tensors.
+    The build-side counterpart of `_reject_unfusable_leaf`: both ask the same
+    question -- can this leaf be concatenated on dim 0 -- one of the layer that
+    was built, the other of the tensor that arrived. Asking it of the built
+    parameters is what keeps the check format-agnostic, and it is strictly
+    wider than testing for a plain `weight`: a scheme can register `weight` and
+    still carry parameters the fusion has no shard for. Per-tensor fp8 is the
+    case in the tree today -- `Fp8LinearMethod` registers `weight` plus
+    `weight_scale` and `input_scale` (`layers/quantization/fp8.py`), so a
+    `weight`-only test leaves the fusion enabled and the two scale tensors then
+    reach `_reject_unfusable_leaf`, turning a checkpoint that would load
+    unfused into one that does not load at all. Packed schemes register
+    `.qweight`/`.qzeros`/`.scales` and friends and no `weight`; compressed
+    tensors registers `weight_packed`/`weight_scale`/`weight_shape`/
+    `weight_zero_point`. None of them has to be named here.
     """
-    return hasattr(layer, "weight")
+    return tuple(
+        sorted(
+            name
+            for name, _ in layer.named_parameters(recurse=False)
+            if name not in fusable_leaves
+        )
+    )
 
 
 def _fused_module_prefixes(
