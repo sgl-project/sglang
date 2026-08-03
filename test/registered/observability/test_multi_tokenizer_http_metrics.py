@@ -39,8 +39,9 @@ class TestMultiTokenizerHttpMetrics(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--enable-metrics",
-                # > 1 forces multi-tokenizer (Granian multi-worker) mode, the path
-                # that previously dropped the HTTP response-tracking middleware.
+                # > 1 forces multi-tokenizer mode (uvicorn with workers=N here,
+                # since --enable-http2 is not set), the path that previously
+                # dropped the HTTP response-tracking middleware.
                 "--tokenizer-worker-num",
                 2,
                 "--mem-fraction-static",
