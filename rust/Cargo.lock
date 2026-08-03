@@ -3703,6 +3703,7 @@ dependencies = [
  "rmpv",
  "serde",
  "serde_json",
+ "socket2 0.6.4",
  "thiserror",
  "tokio",
  "tower 0.5.3",

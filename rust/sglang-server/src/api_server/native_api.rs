@@ -61,6 +61,10 @@ fn health_routes() -> Router<AppState> {
         .route("/health_generate", probe)
 }
 
+/// Sentinel host that makes the KV connector no-op. Parity with
+/// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
+const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 iff the egress heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
@@ -80,6 +84,10 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
+    //
+    // On a PD node the scheduler 400-aborts room-less requests, so inject the
+    // same fake bootstrap pair Python uses (`FAKE_BOOTSTRAP_HOST` / room 0).
+    let pd = state.server_args.is_disaggregation();
     let probe = GenerateRequest {
         // The `HEALTH_CHECK_<uuid>` rid form
         rid: Rid::new_health_check(),
@@ -91,6 +99,8 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
             ..Default::default()
         },
         stream: false,
+        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
+        bootstrap_room: pd.then_some(0),
         ..Default::default()
     };
     let (rid, _keepalive) =
