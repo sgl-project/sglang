@@ -756,10 +756,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return image_features
 
         pixel_values = materialize_item_features(list(range(len(items))))
-        # grid_thws stays on the host: MoonViT3d only ever reads it as shape
-        # metadata (.tolist() in the pos-emb, RoPE and merger), so moving it to
-        # CUDA would just buy a device sync per read. Same contract the encoder
-        # -DP path above relies on.
+        # grid_thws stays on the host: MoonViT3d only reads it as shape metadata
+        # (.tolist() in the pos-emb, RoPE and merger), so a device copy would
+        # buy one sync per read. Same contract the encoder-DP path relies on.
         image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 

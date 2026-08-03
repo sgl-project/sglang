@@ -466,8 +466,7 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     nn.Module.__init__(model)
     model.use_data_parallel = False
     model.vision_tower = _MoonViT3dTower()
-    # A device that is not the host, so a stray .to(tower.device) is visible
-    # without needing a GPU.
+    # Not the host, so a stray .to(tower.device) shows up without a GPU.
     model.vision_tower.device = torch.device("meta")
     model.mm_projector = _IdentityProjector()
     items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
@@ -480,8 +479,7 @@ def test_kimi_non_dp_keeps_grid_thws_on_the_host():
     ):
         model.get_image_feature(items)
 
-    # MoonViT3d only reads grid_thws via .tolist(); on CUDA each of those reads
-    # would synchronize. The encoder-DP path already passes it on the host.
+    # A device copy would cost one sync per .tolist() inside MoonViT3d.
     assert model.vision_tower.grid_thws.device.type == "cpu"
 
 
