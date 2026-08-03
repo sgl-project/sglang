@@ -19,6 +19,10 @@ on:
         description: Remove files retained by a self-hosted runner before checkout.
         type: boolean
         default: false
+      python_version:
+        description: CPython version matching the consuming runner environment.
+        type: string
+        default: '3.10'
       git_ref:
         type: string
         default: ''
@@ -55,12 +59,12 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      - name: Set up Python 3.10
+      - name: Set up Python ${{ inputs.python_version }}
         id: python
         continue-on-error: true
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ inputs.python_version }}
 
       - name: Install native build tools
         id: tools

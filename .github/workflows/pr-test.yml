@@ -249,6 +249,7 @@ jobs:
       job_display_name: Build SGLang Wheel Arm
       arch_suffix: '-aarch64'
       clean_persistent_workspace: true
+      python_version: '3.12'
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
