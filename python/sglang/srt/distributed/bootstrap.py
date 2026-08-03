@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
 )
@@ -128,6 +129,10 @@ def init_torch_distributed(
             and ps.tp_size > 1
         ):
             _prewarm_tp_lm_head_all_to_all()
+
+    maybe_wait_for_gated_launch(
+        host=server_args.host, port=server_args.gated_launch_port
+    )
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
