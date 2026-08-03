@@ -74,7 +74,8 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
-        envs.SGLANG_DSA_FUSE_TOPK.get()
+        is_cuda()
+        and envs.SGLANG_DSA_FUSE_TOPK.get()
         and server_args.disaggregation_mode == "decode"
         and not server_args.enable_hisparse
         and server_args.dcp_size == 1
@@ -84,6 +85,13 @@ def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
 def should_use_dsa_fused_topk(
     server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
+    """Select fused TopK while preserving allocator-independent PD seeds.
+
+    On the prefill worker, target prefill uses fused TopK, while draft extend
+    keeps its seed in request-relative position space and falls back. On the
+    draft worker, draft extend, target verify, and draft decode use fused TopK
+    after the seed is remapped to decode-local physical slots.
+    """
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )

@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -202,7 +203,9 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             dcp_size=1,
         )
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
+            "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
+        ):
             self.assertTrue(
                 should_use_dsa_fused_topk(
                     server_args, seed_dsa_topk_from_draft_extend=True

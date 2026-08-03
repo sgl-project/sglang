@@ -59,10 +59,8 @@ def build_eagle_disagg_draft_input(
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
         dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
         if should_remap_pd_dsa_seed_to_local_slots(server_args):
-            # PD transports request-relative positions because the prefill and
-            # decode allocators are independent. The fused TopK path consumes
-            # physical slots, so materialize them once through the decode-local
-            # page table before the seed enters the draft loop/CUDA graph.
+            # PD sends request-relative positions; fused TopK consumes
+            # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token
             table_width = req_to_token.shape[1]
             valid_positions = dsa_topk_indices >= 0
