@@ -1279,7 +1279,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     logger.warning(
                         "Model '%s' supports only 'low' reasoning effort; "
                         "requested '%s' treated as default thinking",
-                        self.tokenizer_manager.server_args.served_model_name,
+                        self.tokenizer_manager.served_model_name,
                         request.reasoning_effort,
                     )
 
