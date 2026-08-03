@@ -3862,6 +3862,9 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # Flush any health-check signal deferred while the engine was busy.
+        self.maybe_send_health_check_signal()
+
         if not self.is_fully_idle():
             return
 
@@ -3920,6 +3923,14 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+
+        if (
+            for_health_check
+            and not self._engine_paused
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_prealloc_queue is not None
+        ):
+            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
