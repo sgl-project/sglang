@@ -442,17 +442,18 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 8",
         "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algorithm DSPARK",
         "--chunked-prefill-size 4096",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -479,13 +480,13 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--dp 4",
+        "--tp 8",
+        "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
@@ -515,15 +516,15 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--dp 4",
+        "--tp 8",
+        "--dp 8",
         "--enable-dp-attention",
         "--moe-a2a-backend megamoe",
         "--host {{HOST_IP}}",
@@ -1469,7 +1470,7 @@ sgl-eval run aime25 \\
 
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1500,7 +1501,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1508,6 +1509,7 @@ sgl-eval run aime25 \\
         "--tp 4",
         "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1531,7 +1533,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

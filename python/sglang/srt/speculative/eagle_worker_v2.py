@@ -264,12 +264,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
         elif get_spec().speculative_token_map is not None:
             self.hot_token_id = load_token_map(get_spec().speculative_token_map)
-            self.server_args.override(
-                "eagle_worker.hot_token_map",
-                json_model_override_args=(
-                    f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-                ),
-            )
         else:
             self.hot_token_id = None
 
@@ -1008,12 +1002,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
         )
 
         self._draft_worker = EagleDraftWorker(

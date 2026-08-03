@@ -53,6 +53,11 @@ pub enum EgressItem {
     /// A control-request result: one verbatim payload (e.g. `/server_info`),
     /// delivered as-is with no per-protocol formatting.
     Control(Bytes),
+    /// Reply to an internal service request (`RequestKind::Detokenize`): raw
+    /// bytes for the SUBMITTER to consume (e.g. the decoded prompt text), not
+    /// client-bound JSON like `Control` and not a generation frame. Generation
+    /// and control drains never see it.
+    Data(Bytes),
     /// Terminal failure: handler emits an error frame (stream) or status (unary).
     Error(Error),
 }
