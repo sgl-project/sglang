@@ -7,11 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -43,8 +39,11 @@ class TestLMHeadFP32(unittest.TestCase):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        get_server_args().enable_fp32_lm_head = enable_fp32
+        # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
+        # from the published config.
+        override = get_context().override_server_args(enable_fp32_lm_head=enable_fp32)
+        override.install()
+        self.addCleanup(override.restore)
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 

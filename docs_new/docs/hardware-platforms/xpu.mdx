@@ -149,6 +149,7 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
 | Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
+| Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
 
 ### Enable Decode Graph
 
@@ -161,8 +162,13 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 
 ### Enable Prefill Graph
 
-Prefill graph capture is **opt-in** on XPU and requires `torch.compile`
-and must be enabled explicitly:
+Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
+Two backends are available: `tc_piecewise` and `breakable`.
+
+#### tc_piecewise
+
+Uses `torch.compile` plus an XPU graph, one graph segment per token-length
+bucket:
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
@@ -176,6 +182,16 @@ By default the prefill subgraphs are compiled with `eager` mode. Switch to
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --cuda-graph-backend-prefill tc_piecewise \
     --cuda-graph-tc-compiler inductor
+```
+
+#### breakable
+
+Captures the transformer stack as segmented `XPUGraph`s with eager break points
+at attention / MoE boundaries, without `torch.compile`:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill breakable
 ```
 
 You can also configure both phases together with a single `--cuda-graph-config` JSON argument:
@@ -246,7 +262,7 @@ python -m sglang.launch_server \
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
 | `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
-| `--cuda-graph-backend-prefill` | `tc_piecewise`, `disabled` | `disabled`* | Backend for the prefill phase. Must be set to `tc_piecewise` explicitly to enable. |
+| `--cuda-graph-backend-prefill` | `tc_piecewise`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `tc_piecewise` or `breakable` explicitly to enable. |
 | `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
@@ -265,7 +281,6 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 |---|---|
 | Memory saver (`--enable-memory-saver`) | Not yet supported |
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Breakable CUDA graph | Not yet supported |
 | Speculative decoding | Not yet implemented |
 
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
