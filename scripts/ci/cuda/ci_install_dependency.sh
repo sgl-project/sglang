@@ -179,6 +179,42 @@ clean_site_packages() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+configure_rust_toolchain() {
+    # setuptools-rust launches Cargo from python/, outside the directory scope
+    # of rust/rust-toolchain.toml. Force that repository pin into the process
+    # environment so a runner's mutable default toolchain cannot win instead.
+    local toolchain_file pinned_channel selected_rustc selected_cargo
+    toolchain_file="${REPO_ROOT}/rust/rust-toolchain.toml"
+    pinned_channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${toolchain_file}")
+    if [ -z "${pinned_channel}" ]; then
+        echo "ERROR: Could not read a Rust channel from ${toolchain_file}"
+        exit 1
+    fi
+    if ! command -v rustup >/dev/null 2>&1; then
+        echo "ERROR: rustup is required to enforce the repository Rust toolchain (${pinned_channel})"
+        exit 1
+    fi
+
+    # install_rustup.sh normally installed this already. Repeat idempotently so
+    # a partial or stale runner setup cannot silently fall back to its default.
+    rustup toolchain install --profile minimal "${pinned_channel}"
+    export RUSTUP_TOOLCHAIN="${pinned_channel}"
+
+    selected_rustc=$(rustup which rustc)
+    selected_cargo=$(rustup which cargo)
+    if [ "${selected_rustc}" != "$(rustup which --toolchain "${pinned_channel}" rustc)" ] \
+        || [ "${selected_cargo}" != "$(rustup which --toolchain "${pinned_channel}" cargo)" ]; then
+        echo "ERROR: Active Rust tools do not resolve to repository toolchain ${pinned_channel}"
+        exit 1
+    fi
+
+    echo "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN}"
+    rustc --version --verbose
+    cargo --version --verbose
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 configure_rust_build_store() {
     # Native extensions are compiled while preparing the editable Python
     # package. Preserve reusable compiler output outside the checkout because
@@ -675,6 +711,7 @@ main() {
     cleanup_stale_shm
     install_apt_packages
     clean_site_packages
+    configure_rust_toolchain
     configure_rust_build_store
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
