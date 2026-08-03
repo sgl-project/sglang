@@ -383,6 +383,9 @@ class Scheduler(
         moe_dp_rank: int,
         dp_rank: Optional[int],
     ):
+        # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
+        # with minimal glue. Move substantial component-specific logic into
+        # dedicated methods instead of adding inline blocks here.
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
@@ -527,22 +530,7 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         self.emit_metrics_constants()
-
-        if _is_npu and is_deepseek_v4(
-            self.tp_worker.model_runner.model_config.hf_config
-        ):
-            rank = (
-                self.ps.dp_rank
-                if self.ps.dp_rank is not None
-                else self.tp_group.rank_in_group
-            )
-            logger.info("HCCL DP prewarm start: rank=%s", rank)
-            _prewarm_hccl_group(
-                device=self.tp_group.device,
-                group=self.tp_group.device_group,
-                device_module=self.tp_group.device_module,
-            )
-            logger.info("HCCL DP prewarm done: rank=%s", rank)
+        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -651,6 +639,26 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+
+    def maybe_init_hccl_dp_prewarm(self) -> None:
+        if not (
+            _is_npu
+            and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
+        ):
+            return
+
+        rank = (
+            self.ps.dp_rank
+            if self.ps.dp_rank is not None
+            else self.tp_group.rank_in_group
+        )
+        logger.info("HCCL DP prewarm start: rank=%s", rank)
+        _prewarm_hccl_group(
+            device=self.tp_group.device,
+            group=self.tp_group.device_group,
+            device_module=self.tp_group.device_module,
+        )
+        logger.info("HCCL DP prewarm done: rank=%s", rank)
 
     def init_zbal_on_npu(self):
         if _is_npu:
