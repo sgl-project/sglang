@@ -566,12 +566,6 @@ def patch_merger(
     return outputs
 
 
-def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    """Concatenate multiple tensors without copying a singleton input."""
-
-    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
-
-
 def tpool_patch_merger(
     x: torch.Tensor,
     grid_thws: torch.Tensor,

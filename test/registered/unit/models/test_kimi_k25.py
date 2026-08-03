@@ -272,11 +272,23 @@ def test_kimi_multi_frame_pool_still_averages_across_frames():
     torch.testing.assert_close(merged, reference.view(4, 4, 8))
 
 
+class _IdentityProjector(nn.Module):
+    """Stands in for K2VLMultiModalProjector, which is never None in production."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, x):
+        self.seen = x
+        return x
+
+
 def test_kimi_projection_returns_one_flattened_feature_tensor():
     torch.manual_seed(0)
     per_image = [torch.randn(4, 2, 8), torch.randn(6, 2, 8)]
 
-    packed = mm_projection_auto(None, per_image)
+    packed = mm_projection_auto(_IdentityProjector(), per_image)
 
     assert packed.shape == (20, 8)
     torch.testing.assert_close(packed, torch.cat(per_image, dim=0).reshape(-1, 8))
@@ -284,10 +296,12 @@ def test_kimi_projection_returns_one_flattened_feature_tensor():
 
 def test_kimi_projection_does_not_copy_a_single_image():
     single = torch.randn(4, 2, 8)
+    projector = _IdentityProjector()
 
-    packed = mm_projection_auto(None, [single])
+    packed = mm_projection_auto(projector, [single])
 
-    # reshape keeps the storage; a torch.cat of one tensor would not.
+    # The projector must receive the tensor itself, not a one-element cat of it.
+    assert projector.seen.data_ptr() == single.data_ptr()
     assert packed.data_ptr() == single.data_ptr()
 
 
@@ -445,6 +459,30 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     assert grid_thws == [[1, 2, 2]]
     assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
     assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
+
+
+def test_kimi_non_dp_keeps_grid_thws_on_the_host():
+    model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = False
+    model.vision_tower = _MoonViT3dTower()
+    # A device that is not the host, so a stray .to(tower.device) is visible
+    # without needing a GPU.
+    model.vision_tower.device = torch.device("meta")
+    model.mm_projector = _IdentityProjector()
+    items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
+
+    with get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ), patch(
+        "sglang.srt.models.kimi_k25.get_server_args",
+        return_value=SimpleNamespace(tp_size=1),
+    ):
+        model.get_image_feature(items)
+
+    # MoonViT3d only reads grid_thws via .tolist(); on CUDA each of those reads
+    # would synchronize. The encoder-DP path already passes it on the host.
+    assert model.vision_tower.grid_thws.device.type == "cpu"
 
 
 def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():

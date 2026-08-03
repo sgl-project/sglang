@@ -38,13 +38,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import (
-    MLP2,
-    concat_or_single,
-    tpool_patch_merger,
-)
+from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
+    concat_or_single,
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
@@ -621,19 +618,11 @@ class K2VLMultiModalProjector(nn.Module):
 
 @torch.inference_mode()
 def mm_projection_auto(
-    mm_projector: torch.nn.Module | None,
-    vt_output: torch.Tensor | Sequence[torch.Tensor],
+    mm_projector: torch.nn.Module,
+    vt_output: Sequence[torch.Tensor],
 ) -> torch.Tensor:
     """Project MoonViT's per-image outputs into one flattened (tokens, dim) feature."""
-    batched = (
-        vt_output
-        if isinstance(vt_output, torch.Tensor)
-        else concat_or_single(vt_output, dim=0)
-    )
-    if mm_projector is None:
-        return batched.reshape(-1, batched.shape[-1])
-
-    projected = mm_projector(batched)
+    projected = mm_projector(concat_or_single(vt_output, dim=0))
     return projected.reshape(-1, projected.shape[-1])
 
 
@@ -767,7 +756,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return image_features
 
         pixel_values = materialize_item_features(list(range(len(items))))
-        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
+        # grid_thws stays on the host: MoonViT3d only ever reads it as shape
+        # metadata (.tolist() in the pos-emb, RoPE and merger), so moving it to
+        # CUDA would just buy a device sync per read. Same contract the encoder
+        # -DP path above relies on.
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
