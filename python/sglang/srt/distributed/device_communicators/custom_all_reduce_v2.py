@@ -211,6 +211,12 @@ class CustomAllReduceV2:
 
         multicast_ptr = int(symm_mem.multicast_ptr)
         can_multicast = multicast_ptr != 0
+        # multicast VA of the slab base (== the push workspace, at offset 0);
+        # consumed by the K3 all_reduce push kernel
+        self.mc_base_ptr = multicast_ptr if can_multicast else 0
+        # multicast VA of the pull-semaphore region; the K3 pull kernels reuse
+        # these semaphores (same reservation protocol, multicast-signaled)
+        self.pull_sem_mc_ptr = multicast_ptr + pull_sem_offset if can_multicast else 0
         pull_mc_workspace = multicast_ptr + pull_ws_offset if can_multicast else None
         if not can_multicast or cfg.num_mc_blocks is None:
             self.config = self.config._replace(num_mc_blocks=None)
