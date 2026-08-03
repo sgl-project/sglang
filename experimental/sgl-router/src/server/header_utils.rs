@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Header forwarding whitelist — mirrors SMG semantics.
+//! Header forwarding rules — mirrors SMG semantics.
 
-use axum::http::HeaderName;
+use axum::http::{header, HeaderMap, HeaderName};
 
 /// True if a request header from the inbound client should be forwarded
 /// to the upstream worker. Mirrors SMG's whitelist semantics.
@@ -14,6 +14,44 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
         "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
+}
+
+/// Copy end-to-end response headers while removing fields that apply only to
+/// the worker connection or must be regenerated for the client connection.
+pub fn copy_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut connection_options = Vec::new();
+    for value in headers.get_all(header::CONNECTION) {
+        connection_options.extend(
+            value
+                .as_bytes()
+                .split(|byte| *byte == b',')
+                .filter_map(|name| HeaderName::from_bytes(name.trim_ascii()).ok()),
+        );
+    }
+
+    let mut copied = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if should_forward_response_header(name) && !connection_options.contains(name) {
+            copied.append(name.clone(), value.clone());
+        }
+    }
+    copied
+}
+
+fn should_forward_response_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 #[cfg(test)]
@@ -113,5 +151,26 @@ mod tests {
             !should_forward_request_header(&HeaderName::from_static("foo-x-sgl-bar")),
             "foo-x-sgl-bar (substring, not prefix) must not forward",
         );
+    }
+
+    #[test]
+    fn response_headers_strip_connection_fields_and_preserve_multiple_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "keep-alive, x-worker-hop".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("x-worker-hop", "private".parse().unwrap());
+        headers.insert("content-length", "123".parse().unwrap());
+        headers.insert("retry-after", "7".parse().unwrap());
+        headers.append("set-cookie", "a=1".parse().unwrap());
+        headers.append("set-cookie", "b=2".parse().unwrap());
+
+        let copied = copy_response_headers(&headers);
+
+        assert!(!copied.contains_key("connection"));
+        assert!(!copied.contains_key("keep-alive"));
+        assert!(!copied.contains_key("x-worker-hop"));
+        assert!(!copied.contains_key("content-length"));
+        assert_eq!(copied.get("retry-after").unwrap(), "7");
+        assert_eq!(copied.get_all("set-cookie").iter().count(), 2);
     }
 }
