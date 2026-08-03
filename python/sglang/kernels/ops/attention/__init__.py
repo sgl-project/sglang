@@ -32,6 +32,7 @@ _TRITON_KERNELS = [
     ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
+    ("dsv4.metadata_kernel", "init_c4_sparse_metadata"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

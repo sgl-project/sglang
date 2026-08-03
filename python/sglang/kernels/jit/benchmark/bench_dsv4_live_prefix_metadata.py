@@ -8,8 +8,9 @@ live-prefix path from the same checkout across request batch sizes:
 
 The comparison is conservative because the retained compressed-metadata
 kernel already includes the new live-length mask on its page-table loads.
-Timings include the production C128 alignment pad and CUDA-graph replay
-overhead. Each request contributes ``VERIFY_WIDTH`` causal metadata rows.
+The compressed-metadata producer emits the final aligned C128 storage in both
+paths. Timings include CUDA-graph replay overhead. Each request contributes
+``VERIFY_WIDTH`` causal metadata rows.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildPageTablePositions,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import _pad_last_dim
 
 PAGE_SIZE = 256
 SWA_WINDOW = 128
@@ -106,7 +106,6 @@ def run_metadata(inputs: Inputs, *, live_prefix_only: bool):
         compute_page_indices=True,
         live_prefix_only=live_prefix_only,
     )
-    compressed = (*compressed[:-1], _pad_last_dim(compressed[-1]))
     return page, compressed
 
 

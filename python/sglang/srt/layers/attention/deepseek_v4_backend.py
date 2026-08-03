@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+    init_c4_sparse_metadata,
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
@@ -307,7 +308,8 @@ class DSV4AttnMetadata:
             live_prefix_only=live_prefix_only,
         )
 
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
+        assert self.c128_page_indices is not None
+        assert self.c128_page_indices.shape[-1] % PAGE_INDEX_ALIGNED_SIZE == 0
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
     _CP_REINDEX_FIELDS = [
@@ -368,16 +370,13 @@ class DSV4AttnMetadata:
             "supported: 512 (small) or 1024 (large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
-        self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+        (
+            self.c4_sparse_topk_lengths,
+            self.c4_sparse_page_indices,
+        ) = init_c4_sparse_metadata(
+            self.c4_topk_lengths_clamp1,
+            self.c4_sparse_topk,
         )
-        self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
-            -1,
-            dtype=torch.int32,
-            device=self.c4_topk_lengths_clamp1.device,
-        )
-        self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
         if is_prefill:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c1_flashmla_metadata = _create_flashmla_metadata()
