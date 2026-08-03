@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsa_state_page_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -334,6 +335,7 @@ class PrefillBootstrapQueue:
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
+        req.disagg_decode_prefix_len = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
             num_kv_indices_to_send,
@@ -1169,10 +1171,13 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return get_dsa_state_page_indices(
+                    self.req_to_token_pool,
+                    req.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    seq_len,
+                    page_size,
+                )
 
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
@@ -1259,6 +1264,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        req.disagg_decode_prefix_len = 0
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None

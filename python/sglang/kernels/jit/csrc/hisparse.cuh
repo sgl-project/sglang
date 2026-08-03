@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <type_traits>
 
 namespace {
 
@@ -174,7 +175,7 @@ struct SmemLayout {
 };
 
 // Each block processes one request
-// req_pool_indices and seq_lens can each be int32_t or int64_t
+// host_cache_locs, req_pool_indices, and seq_lens can each be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
 //
@@ -187,12 +188,13 @@ template <
     int HOT_BUFFER_SIZE,
     bool IsMLA,
     bool IsDsv4Layout,
+    typename HostCacheLocsT,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
-    const int64_t* __restrict__ host_cache_locs,
+    const HostCacheLocsT* __restrict__ host_cache_locs,
     const int32_t* __restrict__ device_buffer_locs,
     const void* __restrict__ host_cache_k,
     const void* __restrict__ host_cache_v,
@@ -242,7 +244,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int64_t buffer_offset = rid * buffer_stride_0;
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
-  const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  const HostCacheLocsT* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
 
   // Fast path: short sequences have all tokens in the device buffer in order.
@@ -513,7 +515,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int32_t miss_token = s_top_k_tokens[miss_idx];
     const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
 
-    const int64_t src_loc = req_host_cache_locs[miss_token];
+    // Keep address arithmetic in int64 even when the request table uses the
+    // native int32 ReqToTokenPool representation.
+    const int64_t src_loc = static_cast<int64_t>(req_host_cache_locs[miss_token]);
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
     if constexpr (IsDsv4Layout) {
@@ -554,7 +558,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout, typename HostCacheLocsT>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -572,6 +576,9 @@ void load_cache_to_device_buffer(
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
+  static_assert(
+      std::is_same_v<HostCacheLocsT, int32_t> || std::is_same_v<HostCacheLocsT, int64_t>,
+      "host_cache_locs must use int32_t or int64_t");
 
   const int64_t bs = top_k_tokens.shape()[0];
   const int64_t host_stride = host_cache_locs.shape()[1];
@@ -581,8 +588,8 @@ void load_cache_to_device_buffer(
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
-  // Generic lambda: int32/int64 kernel variants are compiled for both
-  // seq_lens and req_pool_indices; the correct combo is selected at runtime.
+  // HostCacheLocsT is fixed by the Python JIT cache key. int32/int64 kernel
+  // variants for seq_lens and req_pool_indices are selected at runtime.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr, const auto* req_pool_indices_ptr) {
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
 #ifndef USE_ROCM
@@ -594,7 +601,7 @@ void load_cache_to_device_buffer(
         kernel_fn,
         static_cast<const int32_t*>(top_k_tokens.data_ptr()),
         static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const HostCacheLocsT*>(host_cache_locs.data_ptr()),
         static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
         host_cache_k.data_ptr(),
         (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
@@ -627,6 +634,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HostCacheLocsT,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -639,6 +647,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HostCacheLocsT,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -651,6 +660,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HostCacheLocsT,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -663,6 +673,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HostCacheLocsT,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),

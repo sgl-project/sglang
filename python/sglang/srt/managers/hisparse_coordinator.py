@@ -14,6 +14,10 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.radix_hisparse import (
+    RadixHiSparseTokenToKVPoolAllocator,
+    is_radix_hisparse_allocator,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
@@ -49,6 +53,7 @@ class HiSparseCoordinator:
         token_to_kv_pool_allocator: Union[
             HiSparseTokenToKVPoolAllocator,
             DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            RadixHiSparseTokenToKVPoolAllocator,
         ],
         top_k: int,
         device_buffer_size: int,
@@ -68,6 +73,11 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self.is_radix_hisparse = is_radix_hisparse_allocator(
+            self.token_to_kv_pool_allocator
+        )
+        if self.is_radix_hisparse:
+            assert self.compress_ratio == 1
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -88,6 +98,12 @@ class HiSparseCoordinator:
                 self.mem_pool_device.kv_cache_total_dim
                 * self.mem_pool_device.store_dtype.itemsize
             )
+        elif self.is_radix_hisparse:
+            # The facade owns the identity-indexed CPU L1 pool. The coordinator
+            # borrows it and continues to own only L0 scheduling/data movement.
+            self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+            self.mem_pool_host = self.token_to_kv_pool_allocator.get_l1_host_pool()
+            self.item_size_bytes = self.mem_pool_host.token_stride_size
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -134,6 +150,13 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        # Select once so the CUDA-graph hot path has neither a dtype conversion
+        # nor a Radix/legacy branch.
+        self._swap_host_cache_locs = (
+            self.req_to_token_pool.req_to_token
+            if self.is_radix_hisparse
+            else self.req_to_host_pool
+        )
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
@@ -141,6 +164,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._radix_decode_backup_event = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -194,7 +218,11 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
-        self.mem_pool_host.destroy()
+        if self.is_radix_hisparse:
+            self.synchronize_radix_decode_backup()
+            self.token_to_kv_pool_allocator.destroy()
+        else:
+            self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -213,6 +241,58 @@ class HiSparseCoordinator:
             ),
         )
 
+    def bind_l1_host_locs(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        l1_locs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Bind request positions to identity-addressed CPU L1 rows.
+
+        Radix owns the L1 rows, so this only publishes request-local lookup
+        metadata for transfer paths that still consume the int64 host table.
+        It never allocates host slots.
+        """
+        end_pos = start_pos + l1_locs.numel()
+        host_locs = self.token_to_kv_pool_allocator.full_kv_host_locs(l1_locs)
+        self.req_to_host_pool[req_pool_idx, start_pos:end_pos] = host_locs
+        allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
+        if end_pos > allocated_len:
+            self.req_to_host_pool_allocated_len[req_pool_idx] = end_pos
+        return self.req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def _alloc_or_bind_host_locs(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        length: int,
+    ) -> torch.Tensor:
+        if self.is_radix_hisparse:
+            l1_locs = self.req_to_token_pool.req_to_token[
+                req_pool_idx, start_pos : start_pos + length
+            ]
+            return self.bind_l1_host_locs(req_pool_idx, start_pos, l1_locs)
+        return self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_pool_idx,
+            start_pos,
+            length,
+        )
+
+    def _clear_request_host_locs(self, req_pool_idx: int) -> None:
+        if not self.is_radix_hisparse:
+            host_indices = self.mem_pool_host.allocated_host_indices(
+                self.req_to_host_pool,
+                req_pool_idx,
+                self.req_to_host_pool_allocated_len[req_pool_idx],
+            )
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+
+        self.req_to_host_pool[req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req_pool_idx] = 0
+
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
 
@@ -226,13 +306,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        host_indices = self.mem_pool_host.alloc_paged_token_slots(
-            self.req_to_host_pool,
-            self.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
-            0,
-            prefill_len,
-        )
+        host_indices = self._alloc_or_bind_host_locs(req.req_pool_idx, 0, prefill_len)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -266,9 +340,16 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
+        if self.is_radix_hisparse:
+            # Radix canonicalization may replace a transferred duplicate's L1
+            # suffix. Rebuild the int64 compatibility row from the canonical
+            # request table before L0 preload paths consume it.
+            l1_locs = self.req_to_token_pool.req_to_token[req.req_pool_idx, :host_len]
+            self.bind_l1_host_locs(req.req_pool_idx, 0, l1_locs)
+
         self.alloc_device_buffer(req)
 
-        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
@@ -466,9 +547,10 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        self._eager_backup_previous_token(
-            seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
-        )
+        if not self.is_radix_hisparse:
+            self._eager_backup_previous_token(
+                seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
 
         if not self.is_dsv4_hisparse:
             # Grow device buffers if needed and resolve the latest-token slot.
@@ -585,13 +667,7 @@ class HiSparseCoordinator:
         for i in backup_indices:
             req_idx = int(req_pool_indices_cpu[i])
             start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
-            host_locs = self.mem_pool_host.alloc_paged_token_slots(
-                self.req_to_host_pool,
-                self.req_to_host_pool_allocated_len,
-                req_idx,
-                start_pos,
-                1,
-            )
+            host_locs = self._alloc_or_bind_host_locs(req_idx, start_pos, 1)
             host_locs_list.append(host_locs)
         host_locs = torch.cat(host_locs_list)
 
@@ -619,10 +695,58 @@ class HiSparseCoordinator:
         self._has_pending_backup = True
 
     def wait_for_pending_backup(self) -> None:
+        if self.is_radix_hisparse:
+            # Keep L0 growth/remapping overlapped with the all-layer D2H. The
+            # existing ModelRunner call places this dependency immediately
+            # before decode graph replay/eager forward can reuse the L0 row.
+            self.wait_for_radix_decode_backup()
+            return
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+
+    def backup_radix_decode_batch(self, l1_locs: torch.Tensor):
+        """Write the current decode rows through from L0 to CPU L1.
+
+        The caller submits this after the decode forward on a stream ordered
+        behind that forward. The returned event can be used as the result-copy
+        fence; the coordinator also retains it so L0 reuse and a one-batch-ahead
+        overlap finish can wait for the newest committed rows.
+        """
+        host_locs = self.token_to_kv_pool_allocator.full_kv_host_locs(l1_locs)
+        device_locs = self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
+            l1_locs
+        )
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_locs,
+            device_locs,
+            io_backend="kernel",
+        )
+
+        done_event = device_module.Event()
+        done_event.record()
+        # The batch owns l1_locs on the scheduling/forward stream, while this
+        # backup may consume it on copy_stream. host_locs aliases l1_locs in the
+        # identity L1 design, and device_locs is created on the current stream.
+        if l1_locs.is_cuda:
+            l1_locs.record_stream(device_module.current_stream())
+        self._radix_decode_backup_event = done_event
+        return done_event
+
+    def wait_for_radix_decode_backup(self) -> None:
+        """Order the current device stream after the latest Radix write-back."""
+        if self._radix_decode_backup_event is not None:
+            self._radix_decode_backup_event.wait(device_module.current_stream())
+
+    def synchronize_radix_decode_backup(self) -> None:
+        """Fence CPU publication on the latest Radix write-back."""
+        done_event = self._radix_decode_backup_event
+        if done_event is not None:
+            done_event.synchronize()
+            if self._radix_decode_backup_event is done_event:
+                self._radix_decode_backup_event = None
 
     def naive_load_topk(
         self,
@@ -735,16 +859,8 @@ class HiSparseCoordinator:
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
-        # Free host memory that was allocated during admit_request_into_staging
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+        # Radix L1 rows remain owned by RadixCache; legacy host rows are freed.
+        self._clear_request_host_locs(req.req_pool_idx)
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -758,7 +874,13 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        self.wait_for_pending_backup()
+        if self.is_radix_hisparse:
+            # Result processing can lag one forward under overlap scheduling.
+            # Host-synchronize the newest write-back before CPU Radix insertion
+            # makes any of this request's L1 rows matchable.
+            self.synchronize_radix_decode_backup()
+        else:
+            self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -784,21 +906,15 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        host_indices = self.mem_pool_host.allocated_host_indices(
-            self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
-        )
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+        # Radix L1 rows remain alive for prefix insertion/rematching. Only the
+        # request-local host lookup metadata is cleared here.
+        self._clear_request_host_locs(req.req_pool_idx)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
@@ -822,7 +938,7 @@ class HiSparseCoordinator:
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.req_to_host_pool,
+            host_cache_locs=self._swap_host_cache_locs,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
             host_cache=self.mem_pool_host.kv_buffer[layer_id],
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],

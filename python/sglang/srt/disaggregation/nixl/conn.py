@@ -2881,11 +2881,11 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
 
-        # Mark that we expect state data if state_indices was provided.
-        # Match the prefill-side truthy check: an empty list means the
-        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
-        # won't send state notifs, so we must not expect them.
-        if state_indices:
+        # A full decode-side hit can produce one empty list per state type.
+        # Prefill sends no state notification when every component is empty.
+        if state_indices and any(
+            indices is not None and len(indices) > 0 for indices in state_indices
+        ):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True

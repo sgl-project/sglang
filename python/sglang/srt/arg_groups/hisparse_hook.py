@@ -86,19 +86,53 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
         is_deepseek_v4,
+        is_hybrid_swa_model,
     )
 
-    hf_config = server_args.get_model_config().hf_config
+    model_config = server_args.get_model_config()
+    hf_config = model_config.hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
+    is_radix_hisparse_decode = (
+        server_args.disaggregation_mode == "decode"
+        and server_args.disaggregation_decode_enable_radix_cache
+    )
     is_hip = _is_hip()
+
+    if is_radix_hisparse_decode:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        if is_v4_hisparse:
+            raise ValueError(
+                "Radix HiSparse decode supports ordinary DSA models only; "
+                "DeepSeek-V4 is not supported"
+            )
+        if not is_deepseek_dsa(hf_config):
+            raise ValueError(
+                "Radix HiSparse decode requires an ordinary DSA "
+                "(DeepSeek Sparse Attention) model"
+            )
+        if model_config.is_hybrid_swa or is_hybrid_swa_model(
+            getattr(hf_config, "architectures", []),
+            getattr(model_config, "hf_text_config", None),
+        ):
+            raise ValueError(
+                "Radix HiSparse decode is incompatible with hybrid sliding "
+                "window attention (SWA) models"
+            )
+        if mambaish_config(model_config) is not None:
+            raise ValueError(
+                "Radix HiSparse decode is incompatible with hybrid Mamba/SSM models"
+            )
+
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert is_radix_hisparse_decode or server_args.disable_radix_cache, (
+        "Hierarchical sparse attention requires --disable-radix-cache outside "
+        "PD decode Radix mode."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

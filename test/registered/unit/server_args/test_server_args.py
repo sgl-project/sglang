@@ -309,7 +309,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
             server_args._handle_pd_disaggregation()
 
-    def test_pd_decode_radix_cache_rejects_hisparse(self):
+    def test_pd_decode_radix_cache_allows_hisparse_target(self):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
@@ -317,14 +317,48 @@ class TestLoadBalanceMethod(unittest.TestCase):
             disaggregation_transfer_backend="nixl",
             enable_hisparse=True,
         )
-        with self.assertRaises(ValueError) as context:
-            server_args._handle_pd_disaggregation()
+        server_args._handle_pd_disaggregation()
 
-        self.assertIn(
-            "--disaggregation-decode-enable-radix-cache is incompatible with "
-            "--enable-hisparse",
-            str(context.exception),
-        )
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_hisparse_rejects_incompatible_features(self):
+        cases = [
+            (
+                "pipeline parallelism",
+                {"pp_size": 2},
+                "--pp-size > 1",
+            ),
+            (
+                "speculative decoding",
+                {"speculative_algorithm": "EAGLE"},
+                "speculative decoding",
+            ),
+            (
+                "HiCache",
+                {"enable_hierarchical_cache": True},
+                "--enable-hierarchical-cache",
+            ),
+            (
+                "decode KV offload",
+                {"disaggregation_decode_enable_offload_kvcache": True},
+                "--disaggregation-decode-enable-offload-kvcache",
+            ),
+        ]
+
+        for name, extra_args, expected_message in cases:
+            with self.subTest(name=name):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    enable_hisparse=True,
+                    **extra_args,
+                )
+                with self.assertRaises(ValueError) as context:
+                    server_args._handle_pd_disaggregation()
+
+                self.assertIn(expected_message, str(context.exception))
 
     def test_pd_decode_radix_cache_rejects_fake_backend(self):
         server_args = ServerArgs(
@@ -504,6 +538,67 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestRadixHiSparseModelGate(unittest.TestCase):
+    @staticmethod
+    def _make_args(
+        *,
+        architecture="DeepseekV32ForCausalLM",
+        is_hybrid_swa=False,
+        is_hybrid_ssm=False,
+        disaggregation_mode="decode",
+    ):
+        hf_config = SimpleNamespace(
+            architectures=[architecture],
+            index_topk=2048,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        model_config = SimpleNamespace(
+            hf_config=hf_config,
+            is_hybrid_swa=is_hybrid_swa,
+            linear_attn_registry_result=(None, object()) if is_hybrid_ssm else None,
+        )
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disaggregation_mode=disaggregation_mode,
+            disaggregation_decode_enable_radix_cache=True,
+            disable_radix_cache=False,
+            kv_cache_dtype="auto",
+        )
+        server_args.get_model_config = lambda: model_config
+        return server_args
+
+    @staticmethod
+    def _validate(server_args):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+        with patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False):
+            validate_hisparse(server_args)
+
+    def test_allows_pd_decode_radix_with_ordinary_dsa(self):
+        self._validate(self._make_args())
+
+    def test_rejects_radix_hisparse_outside_pd_decode(self):
+        with self.assertRaisesRegex(AssertionError, "outside PD decode Radix mode"):
+            self._validate(self._make_args(disaggregation_mode="prefill"))
+
+    def test_rejects_deepseek_v4(self):
+        with self.assertRaisesRegex(ValueError, "DeepSeek-V4"):
+            self._validate(self._make_args(architecture="DeepseekV4ForCausalLM"))
+
+    def test_rejects_non_dsa_model(self):
+        with self.assertRaisesRegex(ValueError, "ordinary DSA"):
+            self._validate(self._make_args(architecture="LlamaForCausalLM"))
+
+    def test_rejects_hybrid_swa(self):
+        with self.assertRaisesRegex(ValueError, "hybrid.*SWA"):
+            self._validate(self._make_args(is_hybrid_swa=True))
+
+    def test_rejects_hybrid_ssm(self):
+        with self.assertRaisesRegex(ValueError, "hybrid Mamba/SSM"):
+            self._validate(self._make_args(is_hybrid_ssm=True))
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

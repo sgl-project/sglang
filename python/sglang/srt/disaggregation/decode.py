@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    get_dsa_state_page_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -70,6 +71,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.radix_hisparse import (
+    is_radix_hisparse_allocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -973,17 +977,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
-        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
             hisparse_avail = (
                 self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
             )
+            pending_l0_reqs = len(self.transfer_queue.queue)
+            if self.scheduler.hisparse_coordinator.is_radix_hisparse:
+                # Radix canonicalizes transferred rows in process_prebuilt(), so
+                # waiting requests deliberately acquire L0 only after selection.
+                pending_l0_reqs += len(self.scheduler.waiting_queue)
             hisparse_req_budget = max(
                 0,
                 hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
+                - pending_l0_reqs,
             )
 
         # Then, preallocate the remaining requests if possible
@@ -1168,12 +1175,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
+                return get_dsa_state_page_indices(
+                    self.req_to_token_pool,
+                    decode_req.req.req_pool_idx,
+                    total_prefix_len,
+                    seq_len,
+                    device_page_size,
+                )
 
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
@@ -1392,6 +1402,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pre-alloc only allocates logical indices, so the
                 # logical pool is the binding constraint for admission control.
                 available_size = logical_allocator.available_size()
+            if is_radix_hisparse_allocator(self.token_to_kv_pool_allocator):
+                available_size += self.tree_cache.evictable_size()
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
@@ -1565,28 +1577,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
-            assert prefix_len == 0
-
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            kv_loc = alloc_for_decode_prealloc_hisparse(
-                allocator,
-                req=req,
-                fill_len=fill_len,
-                uses_swa_tail=self._uses_swa_tail_prealloc(),
-                swa_tail_len=self._swa_tail_len(fill_len),
-            )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            if is_radix_hisparse_allocator(allocator):
+                # This sibling allocator intentionally excludes HiCache: the
+                # complete decode hit is already resident in composite L1.
+                assert total_prefix_len == prefix_len
+                kv_loc = alloc_for_decode_prealloc_hisparse(
+                    allocator,
+                    req=req,
+                    fill_len=fill_len,
+                    uses_swa_tail=False,
+                    swa_tail_len=0,
+                    prefix_len=prefix_len,
+                    prefix_indices=prefix_indices,
+                )
+                host_indices = coordinator.bind_l1_host_locs(
+                    req.req_pool_idx,
+                    total_prefix_len,
+                    kv_loc,
+                )
+            else:
+                # Keep legacy HiSparse on its original full-allocation path.
+                assert prefix_len == 0
+                kv_loc = alloc_for_decode_prealloc_hisparse(
+                    allocator,
+                    req=req,
+                    fill_len=fill_len,
+                    uses_swa_tail=self._uses_swa_tail_prealloc(),
+                    swa_tail_len=self._swa_tail_len(fill_len),
+                )
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)
@@ -1647,17 +1675,25 @@ def alloc_for_decode_prealloc_hisparse(
     fill_len: int,
     uses_swa_tail: bool,
     swa_tail_len: int,
+    prefix_len: int = 0,
+    prefix_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = fill_len
     device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
     seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    # Radix node values already use the allocator device and int64 dtype.
+    last_loc = (
+        prefix_indices[-1:]
+        if prefix_len > 0
+        else torch.tensor([-1], dtype=torch.int64, device=device)
+    )
+    extend_num_tokens = fill_len - prefix_len
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -1665,7 +1701,7 @@ def alloc_for_decode_prealloc_hisparse(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
-            extend_num_tokens=fill_len,
+            extend_num_tokens=extend_num_tokens,
             swa_tail_len=swa_tail_len,
         )
         req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
@@ -1676,7 +1712,7 @@ def alloc_for_decode_prealloc_hisparse(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             last_loc=last_loc,
-            extend_num_tokens=fill_len,
+            extend_num_tokens=extend_num_tokens,
         )
     return kv_loc
 
@@ -2034,7 +2070,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                # Release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
@@ -2306,6 +2342,11 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
+        if self.enable_hisparse and self.hisparse_coordinator.is_radix_hisparse:
+            for req in can_run_list:
+                # cache_unfinished_req() above has replaced any duplicate
+                # suffix with canonical L1 IDs; attach L0 only after that.
+                self.hisparse_coordinator.admit_request_direct(req)
 
         return new_batch
 
@@ -2335,7 +2376,7 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            if self.enable_hisparse:
+            if self.enable_hisparse and not self.hisparse_coordinator.is_radix_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)

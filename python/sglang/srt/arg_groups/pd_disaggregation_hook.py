@@ -55,10 +55,21 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with --enable-hisparse"
-                )
+                if server_args.pp_size > 1:
+                    raise ValueError(
+                        "Radix HiSparse decode is incompatible with pipeline "
+                        "parallelism (--pp-size > 1)"
+                    )
+                if server_args.enable_hierarchical_cache:
+                    raise ValueError(
+                        "Radix HiSparse decode is incompatible with "
+                        "--enable-hierarchical-cache"
+                    )
+                if server_args.disaggregation_decode_enable_offload_kvcache:
+                    raise ValueError(
+                        "Radix HiSparse decode is incompatible with "
+                        "--disaggregation-decode-enable-offload-kvcache"
+                    )
             if server_args.disaggregation_transfer_backend == "fake":
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
