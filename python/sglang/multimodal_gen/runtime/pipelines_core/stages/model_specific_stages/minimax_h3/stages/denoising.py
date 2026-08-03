@@ -520,10 +520,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
 
         ctx = _resolve_full_loop_context(batch)
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        device = None
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.xpu.is_available():
+            device = torch.device("xpu")
+        else:
+            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or XPU")
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
