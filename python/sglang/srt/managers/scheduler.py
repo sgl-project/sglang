@@ -1087,9 +1087,7 @@ class Scheduler(
                 ),
             ),
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
-            max_running_requests_under_SLO=getattr(
-                self, "max_running_requests_under_SLO", None
-            ),
+            max_running_requests_under_SLO=None,
             page_size=self.page_size,
             num_pages=self.max_total_num_tokens // self.page_size,
             context_len=self.model_config.context_len,

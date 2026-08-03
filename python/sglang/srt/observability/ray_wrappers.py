@@ -284,7 +284,7 @@ class RayTokenizerMetricsCollector(TokenizerMetricsCollector):
     """``TokenizerMetricsCollector`` that emits via Ray's metric system."""
 
     _counter_cls = RayCounterWrapper
-    _startup_gauge_cls = RayGaugeWrapper
+    _gauge_cls = RayGaugeWrapper
     _histogram_cls = RayHistogramWrapper
 
 

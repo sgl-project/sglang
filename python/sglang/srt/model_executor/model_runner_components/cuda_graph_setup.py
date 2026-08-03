@@ -70,12 +70,12 @@ def should_skip_auto_prefill_cuda_graph_for_memory(
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
     memory_phase: str
-    graph_mem_usage: float
+    memory_usage_gb: float
     capture_time: float
 
     @property
     def memory_usage(self) -> dict[str, float]:
-        return {self.memory_phase: self.graph_mem_usage}
+        return {self.memory_phase: self.memory_usage_gb}
 
     @property
     def time_usage(self) -> dict[str, float]:
@@ -128,7 +128,7 @@ def capture_cuda_graphs(
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
-    prefill = capture_prefill_graph_with_usage(
+    prefill = capture_prefill_graph(
         model_runner=model_runner, eager_runner=eager_runner
     )
 
@@ -136,7 +136,7 @@ def capture_cuda_graphs(
     decode = GraphCapture(
         runner=None,
         memory_phase=decode_phase,
-        graph_mem_usage=0,
+        memory_usage_gb=0,
         capture_time=0,
     )
     if capture_decode_cuda_graph:
@@ -150,7 +150,7 @@ def capture_cuda_graphs(
         decode = GraphCapture(
             runner=eager_runner,
             memory_phase=decode_phase,
-            graph_mem_usage=0,
+            memory_usage_gb=0,
             capture_time=0,
         )
 
@@ -181,20 +181,6 @@ def capture_prefill_graph(
     model_runner: ModelRunner,
     eager_runner: EagerRunner,
     force_for_draft_worker: bool = False,
-) -> Optional[BaseRunner]:
-    """Initialize and return the prefill CUDA graph runner."""
-    return capture_prefill_graph_with_usage(
-        model_runner=model_runner,
-        eager_runner=eager_runner,
-        force_for_draft_worker=force_for_draft_worker,
-    ).runner
-
-
-def capture_prefill_graph_with_usage(
-    *,
-    model_runner: ModelRunner,
-    eager_runner: EagerRunner,
-    force_for_draft_worker: bool = False,
 ) -> GraphCapture:
     """Initialize a prefill graph and return its startup resource usage."""
 
@@ -202,13 +188,13 @@ def capture_prefill_graph_with_usage(
 
     def result(
         runner: Optional[BaseRunner],
-        graph_mem_usage: float = 0,
+        memory_usage_gb: float = 0,
         capture_time: float = 0,
     ) -> GraphCapture:
         return GraphCapture(
             runner=runner,
             memory_phase=memory_phase,
-            graph_mem_usage=graph_mem_usage,
+            memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
 
@@ -403,7 +389,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     no_capture = GraphCapture(
         runner=None,
         memory_phase=memory_phase,
-        graph_mem_usage=0,
+        memory_usage_gb=0,
         capture_time=0,
     )
 
@@ -465,16 +451,16 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         runner = graph_runners[model_runner.device](model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    graph_mem_usage = before_mem - after_mem
+    memory_usage_gb = before_mem - after_mem
     capture_time = time.perf_counter() - tic
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} end. "
         f"elapsed={capture_time:.2f} s, "
-        f"mem usage={graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
+        f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )
     return GraphCapture(
         runner=runner,
         memory_phase=memory_phase,
-        graph_mem_usage=graph_mem_usage,
+        memory_usage_gb=memory_usage_gb,
         capture_time=capture_time,
     )

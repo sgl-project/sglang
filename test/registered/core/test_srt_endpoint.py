@@ -41,6 +41,7 @@ class TestSRTEndpoint(CustomTestCase):
     # Extra server-launch env; subclasses override to run the same suite
     # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
+    expect_startup_observability = True
 
     @classmethod
     def setUpClass(cls):
@@ -562,6 +563,9 @@ class TestSRTEndpoint(CustomTestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+        if not self.expect_startup_observability:
+            return
+
         startup_time = response_json["startup_time"]
         for phase in ("load_weight", "kv_cache_allocation", "e2e"):
             self.assertIsInstance(startup_time[phase], float)
@@ -895,6 +899,7 @@ class TestTokenizeDetokenize(CustomTestCase):
 )
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}
+    expect_startup_observability = False
 
     _RUST_TODO = "not implemented by the embedded Rust server yet"
 

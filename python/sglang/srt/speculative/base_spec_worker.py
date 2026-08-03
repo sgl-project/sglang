@@ -25,6 +25,10 @@ class EagleDraftWorkerBase(ABC):
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
 
+    def __init__(self) -> None:
+        self._specialized_graph_memory_usage: dict[str, float] = {}
+        self._specialized_graph_time_usage: dict[str, float] = {}
+
     @abstractmethod
     def draft():
         pass
@@ -42,28 +46,20 @@ class EagleDraftWorkerBase(ABC):
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         return merge_graph_memory_usage(
-            *(
-                getattr(runner, "graph_memory_usage", None)
-                for runner in self.draft_runners
-            ),
-            getattr(self, "_specialized_graph_memory_usage", None),
+            *(runner.graph_memory_usage for runner in self.draft_runners),
+            self._specialized_graph_memory_usage,
         )
 
     @property
     def graph_time_usage(self) -> dict[str, float]:
         return merge_graph_time_usage(
-            *(
-                getattr(runner, "graph_time_usage", None)
-                for runner in self.draft_runners
-            ),
-            getattr(self, "_specialized_graph_time_usage", None),
+            *(runner.graph_time_usage for runner in self.draft_runners),
+            self._specialized_graph_time_usage,
         )
 
     @property
     def weight_load_time(self) -> float:
-        return sum(
-            getattr(runner, "weight_load_time", 0.0) for runner in self.draft_runners
-        )
+        return sum(runner.weight_load_time for runner in self.draft_runners)
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -115,6 +111,10 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    def __init__(self) -> None:
+        self._additional_graph_memory_usage: dict[str, float] = {}
+        self._additional_graph_time_usage: dict[str, float] = {}
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -133,7 +133,7 @@ class BaseSpecWorker(ABC):
             draft_memory_usage = self.draft_worker.graph_memory_usage
         return merge_graph_memory_usage(
             draft_memory_usage,
-            getattr(self, "_additional_graph_memory_usage", None),
+            self._additional_graph_memory_usage,
         )
 
     @property
@@ -144,7 +144,7 @@ class BaseSpecWorker(ABC):
             draft_time_usage = self.draft_worker.graph_time_usage
         return merge_graph_time_usage(
             draft_time_usage,
-            getattr(self, "_additional_graph_time_usage", None),
+            self._additional_graph_time_usage,
         )
 
     @property

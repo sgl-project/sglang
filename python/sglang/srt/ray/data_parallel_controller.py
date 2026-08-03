@@ -61,6 +61,7 @@ class RayDataParallelController(DataParallelController):
         self.rank0_node_ip = rank0_node_ip
         self.scheduler_actors: List = []
         self.event_loop_refs: List = []
+        self.startup_time = None
 
         # super().__init__ will call our overridden launch methods via MRO.
         # Pass run_scheduler_process_func=None since we don't spawn mp.Process.
@@ -272,7 +273,7 @@ class RayDataParallelController(DataParallelController):
             self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
             self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
             self.startup_time = aggregate_scheduler_startup_times(
-                [getattr(self, "startup_time", None)]
+                [self.startup_time]
                 + [info.get("startup_time") for info in scheduler_infos]
             )
 

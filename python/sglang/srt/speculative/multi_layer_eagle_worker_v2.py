@@ -112,6 +112,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -371,10 +373,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
-        if not hasattr(self, "_specialized_graph_memory_usage"):
-            self._specialized_graph_memory_usage = {}
-        if not hasattr(self, "_specialized_graph_time_usage"):
-            self._specialized_graph_time_usage = {}
+        self._specialized_graph_memory_usage = {}
+        self._specialized_graph_time_usage = {}
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
@@ -918,6 +918,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk

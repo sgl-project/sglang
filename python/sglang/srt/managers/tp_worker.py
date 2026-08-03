@@ -103,22 +103,20 @@ class BaseTpWorker(ABC):
 
     @property
     def graph_memory_usage(self) -> dict[str, float]:
-        runners = getattr(self, "model_runner_list", None) or [self.model_runner]
+        runners = self.model_runner_list or [self.model_runner]
         return merge_graph_memory_usage(
-            *(getattr(runner, "graph_memory_usage", None) for runner in runners)
+            *(runner.graph_memory_usage for runner in runners)
         )
 
     @property
     def graph_time_usage(self) -> dict[str, float]:
-        runners = getattr(self, "model_runner_list", None) or [self.model_runner]
-        return merge_graph_time_usage(
-            *(getattr(runner, "graph_time_usage", None) for runner in runners)
-        )
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
 
     @property
     def weight_load_time(self) -> float:
-        runners = getattr(self, "model_runner_list", None) or [self.model_runner]
-        return sum(getattr(runner, "weight_load_time", 0.0) for runner in runners)
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.weight_load_time for runner in runners)
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
