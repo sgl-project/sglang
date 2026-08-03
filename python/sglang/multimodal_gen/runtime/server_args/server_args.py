@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import Any, Literal
 
 import addict
 import yaml
@@ -202,7 +202,7 @@ class ServerArgs(DisaggServerArgsMixin):
     )
 
     # Distributed executor backend
-    nccl_port: Optional[int] = None
+    nccl_port: int | None = None
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -356,6 +356,10 @@ class ServerArgs(DisaggServerArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    # side channel for job cancel/status, reachable while a forward runs
+    scheduler_cancel_port: int = 0
+    # opt out of job cancel/status endpoints and the cancel-port reservation
+    disable_job_control: bool = False
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
@@ -427,7 +431,7 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
-    log_requests_target: Optional[List[str]] = None
+    log_requests_target: list[str] | None = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
@@ -477,6 +481,8 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_network_ports()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
+        # the cancel port gate reads resolved parallelism, so settle it after
+        self._settle_job_control_port()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_layerwise_offload_components()
@@ -1001,6 +1007,34 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
                 )
+
+    def _settle_job_control_port(self):
+        """Reserve the cancel side channel only when the resolved config can
+        enable job control; runs after parallelism adjustment because the
+        gate depends on resolved sp/tp/cfg-parallel values. Under
+        --strict-ports the port must not be required when job control is off.
+        """
+        if not self.job_control_enabled:
+            return
+        self.scheduler_cancel_port = (
+            self.scheduler_cancel_port or self.scheduler_port + 1
+        )
+        taken_ports = {
+            port
+            for port in (self.port, self.scheduler_port, self.master_port)
+            if port is not None
+        }
+        if self.strict_ports:
+            if self.scheduler_cancel_port in taken_ports:
+                raise RuntimeError(
+                    f"Job control port {self.scheduler_cancel_port} duplicates "
+                    "another server port and --strict-ports is enabled."
+                )
+            self._require_port(self.scheduler_cancel_port, "Job control")
+        else:
+            self.scheduler_cancel_port = self.settle_port(
+                self.scheduler_cancel_port, avoid=taken_ports
+            )
 
     def _adjust_parallelism(self):
         sp_unspecified = self.sp_degree is None
@@ -1803,6 +1837,21 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--scheduler-cancel-port",
+            type=int,
+            default=ServerArgs.scheduler_cancel_port,
+            help="Port for the job-control side channel (0 = scheduler port + 1).",
+        )
+        parser.add_argument(
+            "--disable-job-control",
+            action=StoreBoolean,
+            default=ServerArgs.disable_job_control,
+            help=(
+                "Disable the job cancel/status endpoints and skip reserving "
+                "the job-control side-channel port."
+            ),
+        )
+        parser.add_argument(
             "--batching-mode",
             type=str,
             default=ServerArgs.batching_mode,
@@ -2044,6 +2093,28 @@ class ServerArgs(DisaggServerArgsMixin):
         if scheduler_host is None or scheduler_host == "localhost":
             scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
+
+    @property
+    def scheduler_cancel_endpoint(self):
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
+        return f"tcp://{scheduler_host}:{self.scheduler_cancel_port}"
+
+    @property
+    def job_control_enabled(self) -> bool:
+        """Job cancel/status is single-rank only in v1: admission filtering
+        and queued-request drops must be identical on every rank. The cancel
+        port is settled if and only if this holds (see
+        ``_settle_job_control_port``)."""
+        return (
+            not self.disable_job_control
+            and self.disagg_role == RoleType.MONOLITHIC
+            and self.sp_degree == 1
+            and not self.enable_cfg_parallel
+            and self.tp_size == 1
+            and self.dp_size == 1
+        )
 
     def settle_port(
         self,
@@ -2537,7 +2608,7 @@ class PortArgs:
 
     @staticmethod
     def from_server_args(
-        server_args: ServerArgs, dp_rank: Optional[int] = None
+        server_args: ServerArgs, dp_rank: int | None = None
     ) -> "PortArgs":
         if server_args.nccl_port is None:
             nccl_port = server_args.scheduler_port + random.randint(100, 1000)

@@ -6,6 +6,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -100,6 +101,7 @@ class DmdDenoisingStage(DenoisingStage):
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
+                check_current_step(i, len(timesteps))
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
                     continue

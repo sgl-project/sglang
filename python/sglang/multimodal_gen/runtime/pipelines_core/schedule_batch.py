@@ -456,6 +456,8 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    # typed cancellation marker (job control); never inferred from error text
+    cancelled: bool = False
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings

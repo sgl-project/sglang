@@ -6,8 +6,9 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Generator, List, Optional, Union
+from typing import Any
 
 import httpx
 from fastapi import HTTPException, UploadFile
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.job_registry import RequestCancelledError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -39,11 +41,11 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
-    "SetLoraReq",
-    "MergeLoraWeightsReq",
-    "UnmergeLoraWeightsReq",
     "ListLorasReq",
+    "MergeLoraWeightsReq",
+    "SetLoraReq",
     "ShutdownReq",
+    "UnmergeLoraWeightsReq",
     "format_lora_message",
 ]
 
@@ -112,9 +114,7 @@ def temp_dir_if_disabled(
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def choose_output_image_ext(
-    output_format: Optional[str], background: Optional[str]
-) -> str:
+def choose_output_image_ext(output_format: str | None, background: str | None) -> str:
     fmt = (output_format or "").lower()
     if fmt in {"png", "webp", "jpeg", "jpg"}:
         return "jpg" if fmt == "jpeg" else fmt
@@ -180,7 +180,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
 
 async def save_image_to_path(
-    image: Union[UploadFile, bytes, str],
+    image: UploadFile | bytes | str,
     target_path: str,
     *,
     prefer_remote_source: bool = False,
@@ -194,9 +194,7 @@ async def save_image_to_path(
 
 
 # Helpers
-async def _save_upload_to_path(
-    upload: Union[UploadFile, bytes], target_path: str
-) -> str:
+async def _save_upload_to_path(upload: UploadFile | bytes, target_path: str) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if isinstance(upload, bytes):
         content = upload
@@ -334,7 +332,7 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     except Exception as e:
         final_error = last_error or e
         raise Exception(
-            f"Failed to download image from URL {image_url}: {str(final_error)}"
+            f"Failed to download image from URL {image_url}: {final_error!s}"
         )
 
 
@@ -356,6 +354,8 @@ async def process_generation_batch(
             and result.raw_frame_batches is None
         ):
             error_msg = result.error or "Unknown error"
+            if result.cancelled:
+                raise RequestCancelledError(error_msg)
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
@@ -397,7 +397,7 @@ async def process_generation_batch(
     return save_file_path_list, result
 
 
-def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
+def merge_image_input_list(*inputs: list | Any | None) -> list:
     """
     Merge multiple image input sources into a single list.
 
