@@ -9,7 +9,6 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -63,26 +62,6 @@ def _resolve_draft_attention_backend_fallback(
     return draft_backend
 
 
-def draft_server_args_overrides(draft_backend) -> dict:
-    """The fields a draft variant must carry: its attention backend.
-
-    Backend selection reads them off the config object the draft runner holds --
-    ``speculative_draft_attention_backend`` in ``_resolve_attention_backend_strs``
-    and ``configure_kv_cache_dtype``, ``attention_backend`` in the non-hybrid
-    branch of the backend build, and the split pair must not shadow either with
-    the target's. ``disable_chunked_prefix_cache`` is the target's resolved gate,
-    which lives in the bags only: publishing the variant re-projects the bags
-    from it, so the value has to travel on the variant.
-    """
-    return dict(
-        speculative_draft_attention_backend=draft_backend,
-        prefill_attention_backend=None,
-        decode_attention_backend=None,
-        attention_backend=draft_backend,
-        disable_chunked_prefix_cache=get_schedule().disable_chunked_prefix_cache,
-    )
-
-
 def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
@@ -101,22 +80,16 @@ def build_draft_tp_worker(
             server_args=server_args, algo_label=algo_label
         )
     )
-    draft_server_args = server_args.derive(
-        "draft_worker.build", **draft_server_args_overrides(draft_backend)
+    draft_worker = TpModelWorker(
+        server_args=server_args,
+        gpu_id=gpu_id,
+        ps=ps,
+        nccl_port=nccl_port,
+        is_draft_worker=True,
+        # The draft runs at absolute target positions.
+        context_length=target_model_config.context_len,
+        draft_attention_backend=draft_backend,
     )
-
-    # The draft's layers must resolve config from the draft's own bags.
-    with get_context().preserve_config():
-        get_context().set_server_args(draft_server_args)
-        draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            ps=ps,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            # The draft runs at absolute target positions.
-            context_length=target_model_config.context_len,
-        )
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
