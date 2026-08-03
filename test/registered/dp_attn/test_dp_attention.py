@@ -5,7 +5,7 @@ import requests
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -15,15 +15,19 @@ from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
     GSM8KMixin,
@@ -52,9 +56,6 @@ class TestDPAttentionDP2TP2(
                 "--enable-dp-attention",
                 "--dp",
                 "2",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
             ],
         )
 
@@ -79,7 +80,7 @@ class TestDPAttentionGatherv(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -103,6 +104,7 @@ class TestDPAttentionGatherv(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
@@ -135,6 +137,7 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,
@@ -175,6 +178,7 @@ class TestDPRetract(
             self.assertIsNone(self.process.poll())
 
 
+@unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):

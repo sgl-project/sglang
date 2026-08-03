@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,10 @@ class SpecProfilingSession:
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = req.origin_input_ids
-            req.fill_len = len(req.full_untruncated_fill_ids)
             req.logprob_start_len = -1
-            req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
 
         batch = ScheduleBatch.init_new(
@@ -128,8 +130,8 @@ class SpecProfilingSession:
         self._run_forward_isolated(batch)
 
     def _run_decode_timed(self, batch: ScheduleBatch) -> float:
-        start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt = self._device_mod.Event(enable_timing=True)
+        end_evt = self._device_mod.Event(enable_timing=True)
         start_evt.record()
         for _ in range(self._n_measure):
             self._run_decode(batch)
@@ -165,34 +167,31 @@ class SpecProfilingSession:
             batch.spec_info = result.next_draft_input
             if result.new_seq_lens is not None:
                 batch.seq_lens = result.new_seq_lens
-                if batch.seq_lens_cpu is not None:
-                    batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
-                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                new_seq_lens_cpu = result.new_seq_lens.to("cpu")
+                batch.seq_lens_cpu = new_seq_lens_cpu
+                batch.seq_lens_sum = int(new_seq_lens_cpu.sum())
+                # The normal scheduler advances this in its result processor.
+                # Profiling bypasses that processor, so keep request-level KV
+                # accounting aligned with the worker's committed sequence.
+                for req, seq_len in zip(batch.reqs, new_seq_lens_cpu.tolist()):
+                    req.kv_committed_len = int(seq_len)
             batch.input_ids = None
         else:
             if result.next_token_ids is not None:
                 batch.input_ids = result.next_token_ids.to(torch.int64)
 
     def _teardown(self, reqs: List[Req]) -> None:
-        pool = self._worker.req_to_token_pool
-        kv_alloc = self._worker.token_to_kv_pool_allocator
-
+        errors: list[Exception] = []
         for req in reqs:
-            if getattr(req, "req_pool_idx", None) is None:
-                continue
             try:
-                # free_mamba_cache needs req_pool_idx; call before pool.free().
-                if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
-                    pool, "free_mamba_cache"
-                ):
-                    pool.free_mamba_cache(req)
-                end = max(int(getattr(req, "kv_allocated_len", 0)), int(req.fill_len))
-                kv_indices = pool.req_to_token[req.req_pool_idx, :end]
-                kv_alloc.free(kv_indices)
-                pool.free(req)
+                release_kv_cache(req, self._tree_cache, is_insert=False)
             except Exception as e:
-                logger.error(
-                    "Failed to free request %s during profiling teardown: %s",
+                errors.append(e)
+                logger.exception(
+                    "Failed to free request %s during profiling teardown",
                     req.rid,
-                    e,
                 )
+        if errors:
+            raise RuntimeError(
+                f"Failed to free {len(errors)} profiling request(s)"
+            ) from errors[0]

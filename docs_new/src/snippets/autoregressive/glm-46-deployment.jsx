@@ -8,6 +8,7 @@ export const GLM46Deployment = () => {
         { id: 'h100', label: 'H100', default: true },
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: false },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false }
@@ -132,12 +133,14 @@ export const GLM46Deployment = () => {
     // Strategy-specific parameters
     if (strategyArray.includes('dp')) {
       cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
+      if (hardware === 'b300') {
+        cmd += ` \\\n  --cuda-graph-max-bs-decode 256`;
+      }
     }
     if (strategyArray.includes('ep')) {
       cmd += ` \\\n  --ep 8`;
     }
     if (strategyArray.includes('mtp')) {
-      cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
       cmd += ` \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
     }
 
@@ -149,6 +152,11 @@ export const GLM46Deployment = () => {
     // Add thinking parser if enabled
     if (thinking === 'enabled') {
       cmd += ` \\\n  --reasoning-parser glm45`;
+    }
+
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend flashinfer`;
+      cmd += ` \\\n  --enforce-disable-flashinfer-allreduce-fusion`;
     }
 
     return cmd;

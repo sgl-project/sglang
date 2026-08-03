@@ -26,6 +26,7 @@ from typing_extensions import Self
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
+    EncoderMetricsCollector,
     SchedulerMetricsCollector,
     TokenizerMetricsCollector,
 )
@@ -224,7 +225,11 @@ class RequestStage:
 class ReqTimeStatsBase:
     enable_metrics: bool = False
     metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ]
     ] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext
@@ -258,7 +263,12 @@ class ReqTimeStatsBase:
             return "unknown"
 
     def set_metrics_collector(
-        self, collector: Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        self,
+        collector: Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ],
     ):
         if collector:
             self.enable_metrics = True
@@ -613,15 +623,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
-    # Number of prefill retries for this request
-    prefill_retry_count: int = 0
+    has_timing_data: bool = False
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
+        if not (self.enable_metrics or self.has_timing_data):
             return {}
 
         state = {
+            "has_timing_data": True,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
@@ -1079,8 +1089,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f} MB, "
-                f"#retries={self.prefill_retry_count}"
+                f"transfer_total={self.transfer_total_mb:.2f} MB"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
@@ -1172,6 +1181,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 class EncoderReqTimeStats(ReqTimeStatsBase):
     mm_encode_start_time: float = 0.0
     mm_encode_end_time: float = 0.0
+    modality: str = "image"
 
     def set_mm_encode_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1193,6 +1203,10 @@ class EncoderReqTimeStats(ReqTimeStatsBase):
                 RequestStage.MM_ENCODE.level,
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
+            )
+        if self.enable_metrics:
+            self.metrics_collector.observe_request_e2e_latency(
+                ts - self.mm_encode_start_time, modality=self.modality
             )
 
 

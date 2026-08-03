@@ -57,6 +57,10 @@ class PipelineExecutor(ABC):
         batch: Any,
         server_args: ServerArgs,
     ) -> None:
+        if isinstance(batch, list):
+            if not batch:
+                return
+            batch = batch[0]
         self.component_residency_manager.begin_request(stages, batch, server_args)
 
     def before_stage(
@@ -70,9 +74,6 @@ class PipelineExecutor(ABC):
         self.component_residency_manager.before_stage(
             stage, stage_index, batch, server_args
         )
-
-    def after_stage(self, stage_index: int) -> None:
-        self.component_residency_manager.after_stage(stage_index)
 
     def finish_component_residency_request(self) -> None:
         self.component_residency_manager.finish_request()
@@ -118,7 +119,6 @@ class PipelineExecutor(ABC):
             payload = self.run_stage_with_context(
                 stage, payload, server_args, run_stage
             )
-        self.after_stage(stage_index)
         return payload
 
     @staticmethod

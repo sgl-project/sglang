@@ -2,6 +2,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
 
+import time
 import unittest
 
 import requests
@@ -19,7 +20,8 @@ class UpdateWeightsFromDiskBase:
     model = None
     base_url = DEFAULT_URL_FOR_TEST
     request_timeout = 120
-    update_timeout = 240
+    update_timeout = 120
+    idle_timeout = 30
     launch_env = None
     decode_payload = {
         "text": "The capital of France is",
@@ -73,6 +75,19 @@ class UpdateWeightsFromDiskBase:
 
     def _run_decode(self):
         return self._post_json("/generate", self.decode_payload)["text"]
+
+    def _wait_until_idle(self):
+        deadline = time.monotonic() + self.idle_timeout
+        last_loads = None
+        while time.monotonic() < deadline:
+            last_loads = self._get_json("/v1/loads?include=core")["loads"]
+            if last_loads and all(
+                load["num_running_reqs"] == 0 and load["num_waiting_reqs"] == 0
+                for load in last_loads
+            ):
+                return
+            time.sleep(0.1)
+        self.fail(f"Server did not become idle before weight update: {last_loads=}")
 
     def _assert_non_empty_decode(self):
         self.assertTrue(len(self._run_decode()) > 0)
@@ -138,6 +153,7 @@ class UpdateWeightsFromDiskBase:
 
                     for update_test_suite in self.update_test_suites:
                         with self.subTest(case_name=case_name, **update_test_suite):
+                            self._wait_until_idle()
                             ret = self._run_update_weights(
                                 self.model,
                                 flush_cache=update_test_suite["flush_cache"],
@@ -157,7 +173,8 @@ class UpdateWeightsFromDiskBase:
 
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
-    model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
+    model = "zianglih/JoyAI-LLM-Flash-MXFP8-last-6-BF16"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
     backend_test_suites = (
         {
             "name": "flashinfer_trtllm_routed_mxfp8",
@@ -166,10 +183,14 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
                 "0",
                 "--tp-size",
                 "4",
+                "--dp-size",
+                "4",
+                "--enable-dp-attention",
                 "--fp8-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
                 "flashinfer_trtllm_routed",
+                "--trust-remote-code",
             ),
         },
     )

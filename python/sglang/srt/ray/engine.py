@@ -234,7 +234,7 @@ class RayEngine(Engine):
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         server_args = ServerArgs(**kwargs)
-        server_args.placement_group = placement_group
+        server_args.override("ray.placement_group", placement_group=placement_group)
         super().__init__(server_args=server_args)
 
     def shutdown(self):
@@ -401,7 +401,7 @@ class RayEngine(Engine):
                 actor.run_event_loop.remote() for actor in scheduler_actors
             ]
 
-            def wait_for_completion():
+            def block_until_scheduler_exits():
                 try:
                     ray.get(event_loop_refs)
                 except Exception as e:
@@ -410,7 +410,7 @@ class RayEngine(Engine):
             return (
                 RaySchedulerInitResult(
                     scheduler_infos=scheduler_infos,
-                    wait_for_completion=wait_for_completion,
+                    block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
                 ),
                 None,
@@ -463,7 +463,9 @@ class RayEngine(Engine):
         )
         # dataclasses.replace only copies declared fields; placement_group is
         # a dynamic attribute that must be manually appended after the rebuild.
-        dp_server_args.placement_group = server_args.placement_group
+        dp_server_args.override(
+            "ray.placement_group", placement_group=server_args.placement_group
+        )
 
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
@@ -487,7 +489,7 @@ class RayEngine(Engine):
 
         event_loop_refs = controller.event_loop_refs
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             try:
                 ray.get(event_loop_refs)
             except Exception as e:
@@ -495,6 +497,6 @@ class RayEngine(Engine):
 
         return RaySchedulerInitResult(
             scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
+            block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
         )

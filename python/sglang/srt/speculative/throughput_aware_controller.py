@@ -62,6 +62,7 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -153,7 +154,9 @@ def _parse_bs_candidates(cfg: dict) -> tuple[list[int], dict[int, list[int]]]:
         if (
             not isinstance(steps, list)
             or not steps
-            or not all(isinstance(s, int) and s > 0 for s in steps)
+            or not all(
+                isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in steps
+            )
         ):
             raise ValueError(
                 f"throughput-aware config key '{key}': "
@@ -209,6 +212,10 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
 
         window_size: int = int(cfg.get("window_size", 20))
         self._update_interval: int = int(cfg.get("update_interval", 5))
+        if window_size <= 0:
+            raise ValueError("throughput-aware window_size must be positive")
+        if self._update_interval <= 0:
+            raise ValueError("throughput-aware update_interval must be positive")
         self._tracker = PositionAcceptanceTracker(
             max_steps=max(all_candidate_steps),
             window_size=window_size,
@@ -223,6 +230,42 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
         self._profile_n_measure: int = int(cfg.get("profile_run_n_measure", 10))
         self._profile_run_seq_len: Optional[int] = cfg.get("profile_run_seq_len")
         self._switch_hysteresis: float = float(cfg.get("switch_hysteresis", 0.1))
+        if self._profile_batch_sizes is not None and (
+            not isinstance(self._profile_batch_sizes, list)
+            or not self._profile_batch_sizes
+            or not all(
+                isinstance(bs, int) and not isinstance(bs, bool) and bs > 0
+                for bs in self._profile_batch_sizes
+            )
+        ):
+            raise ValueError(
+                "throughput-aware profile_run_batch_sizes must be a non-empty "
+                "list of positive ints or null"
+            )
+        if self._max_profile_bs is not None and (
+            not isinstance(self._max_profile_bs, int)
+            or isinstance(self._max_profile_bs, bool)
+            or self._max_profile_bs <= 0
+        ):
+            raise ValueError(
+                "throughput-aware max_profile_run_batch_size must be a positive int or null"
+            )
+        if self._profile_n_warmup < 0:
+            raise ValueError(
+                "throughput-aware profile_run_n_warmup must be non-negative"
+            )
+        if self._profile_n_measure <= 0:
+            raise ValueError("throughput-aware profile_run_n_measure must be positive")
+        if self._profile_run_seq_len is not None and (
+            not isinstance(self._profile_run_seq_len, int)
+            or isinstance(self._profile_run_seq_len, bool)
+            or self._profile_run_seq_len <= 0
+        ):
+            raise ValueError(
+                "throughput-aware profile_run_seq_len must be a positive int or null"
+            )
+        if self._switch_hysteresis < 0:
+            raise ValueError("throughput-aware switch_hysteresis must be non-negative")
 
         first_candidates = self._bs_candidates[self._bs_list[0]]
         self._current_steps: int = worker.speculative_num_steps
@@ -327,32 +370,38 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
             f"n_warmup={self._profile_n_warmup}, n_measure={self._profile_n_measure}",
         )
 
-        for steps, bs in all_points:
-            self._current_steps = steps  # pin step during profiling
-            self._activate(steps)
+        try:
+            for steps, bs in all_points:
+                self._current_steps = steps  # pin step during profiling
+                self._activate(steps)
 
-            avg_ms = SpecProfilingSession(
-                worker=self.worker,
-                tree_cache=tree_cache,
-                batch_size=bs,
-                num_steps=steps,
-                seq_len=seq_len,
-                n_warmup=self._profile_n_warmup,
-                n_measure=self._profile_n_measure,
-            ).measure()
+                avg_ms = SpecProfilingSession(
+                    worker=self.worker,
+                    tree_cache=tree_cache,
+                    batch_size=bs,
+                    num_steps=steps,
+                    seq_len=seq_len,
+                    n_warmup=self._profile_n_warmup,
+                    n_measure=self._profile_n_measure,
+                ).measure()
 
-            # Sync cost across TP ranks so all ranks make identical step decisions.
-            avg_ms = _broadcast_float_from_rank0(avg_ms)
+                # Sync cost across TP ranks so all ranks make identical step decisions.
+                avg_ms = _broadcast_float_from_rank0(avg_ms)
+                if not math.isfinite(avg_ms) or avg_ms <= 0:
+                    raise RuntimeError(
+                        "Invalid speculative profiling latency: "
+                        f"steps={steps}, batch_size={bs}, avg_ms={avg_ms}"
+                    )
 
-            self._cost_table.set(bs, steps, avg_ms)
-            log_info_on_rank0(
-                logger,
-                f"[ThroughputAware] steps={steps:2d}  bs={bs:4d}  "
-                f"seq_len={seq_len}  decode_avg={avg_ms:.3f}ms",
-            )
-
-        self._current_steps = original_steps
-        self._activate(original_steps)
+                self._cost_table.set(bs, steps, avg_ms)
+                log_info_on_rank0(
+                    logger,
+                    f"[ThroughputAware] steps={steps:2d}  bs={bs:4d}  "
+                    f"seq_len={seq_len}  decode_avg={avg_ms:.3f}ms",
+                )
+        finally:
+            self._current_steps = original_steps
+            self._activate(original_steps)
 
         log_info_on_rank0(
             logger,
@@ -361,22 +410,23 @@ class ThroughputAwareAdaptiveController(_SpecAdaptiveBase):
 
     def _build_profile_grid(self) -> dict[int, list[int]]:
         """Map num_steps -> batch sizes to profile."""
-        if self._cuda_graph_bs is None:
-            return {}
-        pool = (
-            sorted(set(self._profile_batch_sizes) & set(self._cuda_graph_bs))
-            if self._profile_batch_sizes is not None
-            else list(self._cuda_graph_bs)
-        )
+        if self._profile_batch_sizes is not None:
+            pool = sorted(set(self._profile_batch_sizes))
+        elif self._cuda_graph_bs is not None:
+            pool = list(self._cuda_graph_bs)
+        else:
+            # Eager decode has no CUDA-graph buckets. Profile the configured
+            # batch-size breakpoints so throughput-aware mode remains usable.
+            pool = list(self._bs_list)
         if self._max_profile_bs is not None:
             pool = [b for b in pool if b <= self._max_profile_bs]
         return {
-            steps: profiled
+            steps: batch_sizes
             for steps in self._all_candidate_steps
             if (
-                profiled := sorted(
-                    set(pool) & set(self._cuda_graph_bs_for_step(steps) or [])
-                )
+                batch_sizes := [
+                    bs for bs in pool if steps in self._candidates_for_batch(bs)
+                ]
             )
         }
 

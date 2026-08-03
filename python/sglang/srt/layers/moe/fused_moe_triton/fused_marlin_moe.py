@@ -11,8 +11,8 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
-    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 def get_scalar_type(
@@ -53,6 +53,18 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def swiglu_gpt_oss_sigmoid_alpha_contiguous(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    gemm1_alpha: float,
+    gemm1_limit: float,
+) -> None:
+    d = input.shape[1] // 2
+    gate = input[:, :d].clamp(max=gemm1_limit)
+    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
+    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -73,12 +85,15 @@ def fused_marlin_moe(
     w2_zeros: Optional[torch.Tensor] = None,
     w1_global_scale: Optional[torch.Tensor] = None,
     w2_global_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
 ) -> torch.Tensor:
@@ -189,7 +204,8 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache13 = torch.empty(
+    # Marlin skips masked expert rows, so their shared cache must start at zero.
+    intermediate_cache13 = torch.zeros(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -208,7 +224,7 @@ def fused_marlin_moe(
         hidden_states,
         intermediate_cache1,
         w1,
-        None,  # b_bias_or_none
+        w1_bias,
         w1_scale,
         w1_global_scale,
         w1_zeros,
@@ -233,7 +249,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and clamp_limit is not None:
+    if activation == "silu" and is_gated and gemm1_alpha is not None:
+        if clamp_limit is None:
+            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        swiglu_gpt_oss_sigmoid_alpha_contiguous(
+            intermediate_cache2,
+            intermediate_cache1.view(-1, gemm1_n),
+            gemm1_alpha,
+            clamp_limit,
+        )
+    elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
@@ -255,7 +280,7 @@ def fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        None,  # b_bias_or_none
+        w2_bias,
         w2_scale,
         w2_global_scale,
         w2_zeros,

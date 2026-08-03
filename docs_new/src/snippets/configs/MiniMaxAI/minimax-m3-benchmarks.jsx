@@ -39,9 +39,9 @@ export const benchmarks = [
     speed: [
       // bench_serving --flush-cache, MSA path, tp8; warm steady-state (3-run, identical).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1580, tpot_ms: 24.1, tokens_per_sec_per_gpu: 265 },
+        ttft_ms: 1580, tpot_ms: 24.1, tokens_per_sec_per_gpu: 2385 },
     ],
-    accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%).
+    accuracy: { gpqa_pct: 89.1, gsm8k_pct: 96.5, mmmu_pro_pct: 72.7 }, // 2026-06-15, sgl-eval --thinking, recommended sampling (temp 1.0/top_p 0.95), tp8. GSM8K full 1319 = 96.51% (greedy 96.89%). GPQA Diamond 198, n-repeats 4 = pass@1[avg-of-4] 89.14% +/-1.73% (pass@4 95.45%, majority@4 93.52%). MMMU-Pro 2026-06-18, sgl-eval "standard (10 options)" test split, full 1730, single-shot 72.66% (thinking, temp 1.0/top_p 0.95).
   },
   {
     // Hopper H200: bf16 build (MXFP8 is Blackwell-only) at tp8, built-in Triton
@@ -51,7 +51,7 @@ export const benchmarks = [
     speed: [
       // bench_serving --flush-cache, bf16 Triton path; warm steady-state (3-run, cold-start run-1 excluded).
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64, num_prompts: 128 },
-        ttft_ms: 1054, tpot_ms: 70.8, tokens_per_sec_per_gpu: 116 },
+        ttft_ms: 1054, tpot_ms: 70.8, tokens_per_sec_per_gpu: 1044 },
     ],
     accuracy: { gsm8k_pct: 97.0 }, // #27944, sgl-eval --thinking, full 1319, recommended sampling (temp 1.0/top_p 0.95/top_k 40); stable 97.04% across all 3 runs (std 0.0)
   },
@@ -60,7 +60,7 @@ export const benchmarks = [
     sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: null, tpot_ms: 32.8, tokens_per_sec_per_gpu: 365 },
+        ttft_ms: null, tpot_ms: 32.8, tokens_per_sec_per_gpu: 3285 },
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on B300 (legacy few_shot 200: 87.5)
   },
@@ -71,21 +71,21 @@ export const benchmarks = [
     sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 2048, osl: 256, max_concurrency: 64 },
-        ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 277 },
+        ttft_ms: 4746, tpot_ms: 39.3, tokens_per_sec_per_gpu: 2493 },
       { workload: { dataset: "random", isl: 8192, osl: 256, max_concurrency: 24 },
-        ttft_ms: 3324, tpot_ms: 32.9, tokens_per_sec_per_gpu: 131 },
+        ttft_ms: 3324, tpot_ms: 32.9, tokens_per_sec_per_gpu: 4323 },
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on GB300 (legacy few_shot 200: 87.5)
   },
   // MI355X (gfx950): native MXFP8. Speed: bench_serving 1024/1024 @ conc 64, tp8
-  // -> 1678 output tok/s (3355 total incl. input); 1678 / 8 = ~210 tokens/sec/GPU.
+  // -> 1678 output tok/s (3355 total incl. input); 3355 / 8 = ~420 tokens/sec/GPU (total, in+out).
   // No TTFT/TPOT reported for this run.
   {
     match: { hw: "mi355x", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
     sglang_version: "PR #27944",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 64, num_prompts: 640 },
-        ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: 210 },
+        ttft_ms: null, tpot_ms: null, tokens_per_sec_per_gpu: 420 },
     ],
     accuracy: { gsm8k_pct: null }, // TODO: pending sgl-eval re-measure on MI355X (legacy run_eval 1319: 92.2)
   },

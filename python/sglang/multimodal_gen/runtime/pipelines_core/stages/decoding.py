@@ -8,6 +8,7 @@ Decoding stage for diffusion pipelines.
 import weakref
 
 import torch
+import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
@@ -31,9 +32,15 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled,
-    resolve_precision,
+    resolve_decode_precision,
     temporary_module_dtype,
+)
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    ActiveTargetCompiledCallable,
+    build_torch_compile_kwargs,
+    resolve_torch_compile_mode,
 )
 
 logger = init_logger(__name__)
@@ -105,13 +112,12 @@ class DecodingStage(PipelineStage):
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
+        self._compiled_vae_decode = ActiveTargetCompiledCallable()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        vae_dtype = resolve_precision(
-            server_args, self.component_name, precision_attr="vae_precision"
-        )
+        vae_dtype = resolve_decode_precision(server_args, self.component_name)
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
@@ -155,6 +161,42 @@ class DecodingStage(PipelineStage):
     def scale_and_shift(self, latents: torch.Tensor, server_args):
         return scale_and_shift_latents(latents, server_args, self.vae)
 
+    def _get_vae_decode_fn(
+        self,
+        vae,
+        server_args: ServerArgs,
+        *,
+        decode_fn=None,
+        compiled_callable: ActiveTargetCompiledCallable | None = None,
+    ):
+        decode_fn = decode_fn or vae.decode
+        if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
+            return decode_fn
+
+        compiled_callable = compiled_callable or self._compiled_vae_decode
+
+        will_compile = (
+            compiled_callable.target_id != id(vae)
+            or compiled_callable.compiled_module is None
+        )
+        if current_platform.is_npu():
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
+            if will_compile:
+                logger.info("Compiling VAE decode with torchair backend on NPU")
+        else:
+            mode = resolve_torch_compile_mode(
+                "SGLANG_VAE_TORCH_COMPILE_MODE",
+                "SGLANG_TORCH_COMPILE_MODE",
+                default="default",
+            )
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            if will_compile:
+                logger.info("Compiling VAE decode with mode: %s", mode)
+
+        return compiled_callable.get_or_compile(
+            vae, decode_fn, compile_kwargs=compile_kwargs
+        )
+
     @torch.no_grad()
     def decode(
         self,
@@ -170,7 +212,9 @@ class DecodingStage(PipelineStage):
             latents: Input latent tensor with shape (batch, channels, frames, height_latents, width_latents)
             server_args: Configuration containing:
                 - disable_autocast: Whether to disable automatic mixed precision (default: False)
-                - pipeline_config.vae_precision: VAE computation precision ("fp32", "fp16", "bf16")
+                - pipeline_config.vae_decode_precision: optional decode-only
+                  VAE precision ("fp32", "fp16", "bf16")
+                - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
 
         Returns:
@@ -178,10 +222,8 @@ class DecodingStage(PipelineStage):
             normalized to [0, 1] range and moved to CPU as float32
         """
         latents = latents.to(get_local_torch_device())
-        # Setup VAE precision from user policy.
-        vae_dtype = resolve_precision(
-            server_args, self.component_name, precision_attr="vae_precision"
-        )
+        # The caller resolves the decode-only override before component use so
+        # residency and execution agree on the target dtype.
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
 
         # scale and shift
@@ -190,13 +232,12 @@ class DecodingStage(PipelineStage):
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )
+        if latents.device.type == "mps":
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
         # Decode latents
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
+        with autocast_context(vae_dtype, server_args.disable_autocast):
             try:
                 # TODO: make it more specific
                 if server_args.pipeline_config.vae_tiling:
@@ -209,7 +250,7 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
-                decode_output = vae.decode(latents)
+                decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
@@ -248,9 +289,7 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        vae_dtype = resolve_precision(
-            server_args, self.component_name, precision_attr="vae_precision"
-        )
+        vae_dtype = resolve_decode_precision(server_args, self.component_name)
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,

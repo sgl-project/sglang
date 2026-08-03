@@ -4,7 +4,10 @@ metatags:
     description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 ---
 
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "turbo", "8-step"]} />
 
 ## 1. Model Introduction
 
@@ -26,7 +29,7 @@ For more details, please refer to the [Z-Image-Turbo HuggingFace page](https://h
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md) for installation instructions.
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -42,7 +45,7 @@ Z-Image-Turbo is optimized for high-quality image generation with only 8 inferen
 
 ### 3.2 Configuration Tips
 
-Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
@@ -55,7 +58,7 @@ Current supported optimization all listed [here](https://github.com/sgl-project/
 
 ## 4. API Usage
 
-For complete API documentation, please refer to the [official API usage guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md).
+For complete API documentation, please refer to the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
 
 ### 4.1 Generate an Image
 
@@ -82,7 +85,7 @@ with open("output.png", "wb") as f:
 
 #### 4.2.1 Cache-DiT Acceleration
 
-SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache_dit.md).
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
 
 **Basic Usage**
 
@@ -209,73 +212,160 @@ Test Environment:
 
 #### 5.1.1 Generate an image
 
-**Server Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Server Command**:
 
-```shell Command
-sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
-    --ulysses-degree=1 --ring-degree=1 --port 30000
-```
+    ```shell Command
+    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
+        --ulysses-degree=1 --ring-degree=1 --port 30000
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Tongyi-MAI/Z-Image-Turbo
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  1.84
-Request rate:                            inf
-Max request concurrency:                 1
-Successful requests:                     1/1
---------------------------------------------------
-Request throughput (req/s):              0.54
-Latency Mean (s):                        1.8435
-Latency Median (s):                      1.8435
-Latency P99 (s):                         1.8435
---------------------------------------------------
-Peak Memory Max (MB):                    30689.20
-Peak Memory Mean (MB):                   30689.20
-Peak Memory Median (MB):                 30689.20
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Tongyi-MAI/Z-Image-Turbo
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  1.84
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.54
+    Latency Mean (s):                        1.8435
+    Latency Median (s):                      1.8435
+    Latency P99 (s):                         1.8435
+    --------------------------------------------------
+    Peak Memory Max (MB):                    30689.20
+    Peak Memory Mean (MB):                   30689.20
+    Peak Memory Median (MB):                 30689.20
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```shell Command
+    #One A3 card has 2 npu chips
+    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        Tongyi-MAI/Z-Image-Turbo
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       2.43
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             2.43
+    Latency Median (s):                           2.43
+    Latency P90 (s):                              2.43
+    Latency P95 (s):                              2.43
+    Latency P99 (s):                              2.43
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11052.00
+    Peak Memory Mean (MB):                        11052.00
+    Peak Memory Median (MB):                      11052.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>
 
 #### 5.1.2 Generate images with high concurrency
 
-**Benchmark Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Tongyi-MAI/Z-Image-Turbo
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  35.32
-Request rate:                            inf
-Max request concurrency:                 20
-Successful requests:                     20/20
---------------------------------------------------
-Request throughput (req/s):              0.57
-Latency Mean (s):                        18.5672
-Latency Median (s):                      18.5573
-Latency P99 (s):                         34.9880
---------------------------------------------------
-Peak Memory Max (MB):                    30689.26
-Peak Memory Mean (MB):                   30689.21
-Peak Memory Median (MB):                 30689.21
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Tongyi-MAI/Z-Image-Turbo
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  35.32
+    Request rate:                            inf
+    Max request concurrency:                 20
+    Successful requests:                     20/20
+    --------------------------------------------------
+    Request throughput (req/s):              0.57
+    Latency Mean (s):                        18.5672
+    Latency Median (s):                      18.5573
+    Latency P99 (s):                         34.9880
+    --------------------------------------------------
+    Peak Memory Max (MB):                    30689.26
+    Peak Memory Mean (MB):                   30689.21
+    Peak Memory Median (MB):                 30689.21
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Benchmark Command**:
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       49.08
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          20/20
+    Completed outputs:                            20
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             25.78
+    Latency Median (s):                           25.77
+    Latency P90 (s):                              44.42
+    Latency P95 (s):                              46.75
+    Latency P99 (s):                              48.61
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11054.00
+    Peak Memory Mean (MB):                        11054.00
+    Peak Memory Median (MB):                      11054.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>

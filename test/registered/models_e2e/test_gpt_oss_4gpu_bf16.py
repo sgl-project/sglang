@@ -15,7 +15,7 @@ class TestGptOss4GpuBf16(BaseTestGptOss):
             expected_score_of_reasoning_effort={
                 "low": 0.58,
             },
-            other_args=["--tp", "4", "--cuda-graph-max-bs", "200"],
+            other_args=["--tp", "4", "--cuda-graph-max-bs-decode", "200"],
         )
 
 
