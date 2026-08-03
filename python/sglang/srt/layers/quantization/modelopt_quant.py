@@ -643,10 +643,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
-        self.mxfp8_config = Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            use_mxfp8=True,
-        )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -745,7 +741,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
-        packed_modules_mapping = config.get("packed_modules_mapping")
+        packed_modules_mapping = config.get("packed_modules_mapping") or {}
         fp8_config = ModelOptFp8Config(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_algo,
