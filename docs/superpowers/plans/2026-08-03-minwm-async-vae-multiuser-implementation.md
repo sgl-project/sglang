@@ -458,7 +458,7 @@ Commit: `git commit -am "feat(realtime): trace async VAE critical path"`
 - Create: `benchmark/minwm_realtime_async_vae/README.md`
 - Test: `benchmark/minwm_realtime_async_vae/test_summarize.py`
 
-- [ ] **Step 1: Write failing percentile and concurrency tests**
+- [x] **Step 1: Write failing percentile and concurrency tests**
 
 ```python
 def test_report_selects_highest_concurrency_that_meets_slo():
@@ -467,17 +467,17 @@ def test_report_selects_highest_concurrency_that_meets_slo():
     assert report["async_improvement_pct"] == pytest.approx(25.0)
 ```
 
-- [ ] **Step 2: Run test and verify failure**
+- [x] **Step 2: Run test and verify failure**
 
 Run: `PYTHONPATH=python .venv/bin/python -m pytest benchmark/minwm_realtime_async_vae/test_summarize.py -q`
 
 Expected: FAIL because benchmark code does not exist.
 
-- [ ] **Step 3: Implement reproducible warm and load phases**
+- [x] **Step 3: Implement reproducible warm and load phases**
 
 `load_test.py` opens 1/2/4/8 concurrent WebSockets, performs two unmeasured warmup chunks, then 60 seconds measured T2V sessions with deterministic action changes. It writes JSONL with hardware inventory, generated/rendered FPS, action-to-visible, chunk and stage timings, failures, queue depth and memory. `summarize.py` reports P50/P95/P99, max concurrency meeting P95 < 1 s and >=16 FPS, overlap ratio, async critical path, sync baseline and `(sync-async)/sync` improvement.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `PYTHONPATH=python .venv/bin/python -m pytest benchmark/minwm_realtime_async_vae/test_summarize.py -q`
 
