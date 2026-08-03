@@ -450,11 +450,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         The signature is built from `SamplingParams` fields, excluding fields
         marked with `batch_sig_exclude`, plus generation-affecting
-        `extra.diffusers_kwargs`.
+        `extra.diffusers_kwargs` and profiling settings used by grouped
+        execution.
         """
         signature_items = self._sampling_param_signature_items(req)
         if signature_items is None:
             return None
+
+        profile_signature = (
+            (True, req.profile_all_stages, req.num_profiled_timesteps)
+            if req.profile
+            else (False,)
+        )
+        signature_items.append(("profiling", profile_signature))
 
         if req.extra:
             diffusers_kwargs = req.extra.get("diffusers_kwargs")
@@ -502,6 +510,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if base_diffusers_kwargs != candidate_diffusers_kwargs:
             return "extra.diffusers_kwargs"
 
+        base_profile = (
+            (True, base_req.profile_all_stages, base_req.num_profiled_timesteps)
+            if base_req.profile
+            else (False,)
+        )
+        candidate_profile = (
+            (
+                True,
+                candidate_req.profile_all_stages,
+                candidate_req.num_profiled_timesteps,
+            )
+            if candidate_req.profile
+            else (False,)
+        )
+        if base_profile != candidate_profile:
+            return "profiling"
+
         return None
 
     def _get_dynamic_batch_reject_reason(
@@ -526,6 +551,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             or getattr(candidate_req, "image_path", None) is not None
         ):
             return "image_conditioning"
+        if self.server_args.pipeline_config.supports_sequential_dit_inference() and (
+            base_req.num_outputs_per_prompt != 1
+            or candidate_req.num_outputs_per_prompt != 1
+        ):
+            return "num_outputs_per_prompt"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
 
@@ -561,6 +591,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if (
             getattr(base_req, "image_path", None) is not None
             or getattr(candidate_req, "image_path", None) is not None
+        ):
+            return False
+        if self.server_args.pipeline_config.supports_sequential_dit_inference() and (
+            base_req.num_outputs_per_prompt != 1
+            or candidate_req.num_outputs_per_prompt != 1
         ):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
@@ -704,30 +739,39 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         outputs: Iterator[OutputBatch],
     ) -> None:
         output_iter = iter(outputs)
-        for index, item in enumerate(items):
-            try:
-                output_batch = next(output_iter)
-            except StopIteration:
-                error = (
-                    "Grouped execution returned fewer outputs than requests "
-                    "while processing sequentially."
-                )
-                logger.error(error)
-                for remaining_item in items[index:]:
-                    self._return_item_result(remaining_item, OutputBatch(error=error))
-                return
-            except Exception as e:
-                logger.error(
-                    "Failed to execute grouped requests sequentially: %s",
-                    e,
-                    exc_info=True,
-                )
-                error = f"Failed to execute grouped requests sequentially: {e}"
-                for remaining_item in items[index:]:
-                    self._return_item_result(remaining_item, OutputBatch(error=error))
-                return
+        try:
+            for index, item in enumerate(items):
+                try:
+                    output_batch = next(output_iter)
+                except StopIteration:
+                    error = (
+                        "Grouped execution returned fewer outputs than requests "
+                        "while processing sequentially."
+                    )
+                    logger.error(error)
+                    for remaining_item in items[index:]:
+                        self._return_item_result(
+                            remaining_item, OutputBatch(error=error)
+                        )
+                    return
+                except Exception as e:
+                    logger.error(
+                        "Failed to execute grouped requests sequentially: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    error = f"Failed to execute grouped requests sequentially: {e}"
+                    for remaining_item in items[index:]:
+                        self._return_item_result(
+                            remaining_item, OutputBatch(error=error)
+                        )
+                    return
 
-            self._return_item_result(item, output_batch)
+                self._return_item_result(item, output_batch)
+        finally:
+            close = getattr(output_iter, "close", None)
+            if close is not None:
+                close()
 
     @contextmanager
     def _record_return_stage(

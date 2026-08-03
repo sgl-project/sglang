@@ -6,6 +6,7 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, List
 
@@ -270,7 +271,13 @@ class PipelineExecutor(ABC):
         batches = self.execute_group(stages[:1], batches, server_args)
 
         remaining_stages = stages[1:]
+        sequential_start_time = time.monotonic()
         for batch in batches:
+            if batch.metrics is not None:
+                batch.metrics.record_stage(
+                    "PipelineExecutor.sequential_wait",
+                    time.monotonic() - sequential_start_time,
+                )
             try:
                 yield self.execute(remaining_stages, batch, server_args)
             except Exception as e:

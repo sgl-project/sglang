@@ -377,20 +377,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
         group_start_time = time.monotonic()
 
-        for req in batch:
-            output_batch = self._execute_forward_common(
-                req,
-                forward_fn=lambda results=results: next(results),
-                log_reqs=[req],
-                return_req=False,
-                save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                    req, output_batch
-                ),
-                error_context=f"grouped request {req.request_id}",
-                execution_start_time=group_start_time,
-            )
-            assert isinstance(output_batch, OutputBatch)
-            yield output_batch
+        try:
+            for req in batch:
+                output_batch = self._execute_forward_common(
+                    req,
+                    forward_fn=lambda results=results: next(results),
+                    log_reqs=[req],
+                    return_req=False,
+                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                        req, output_batch
+                    ),
+                    error_context=f"grouped request {req.request_id}",
+                    execution_start_time=group_start_time,
+                    propagate_forward_errors=True,
+                )
+                assert isinstance(output_batch, OutputBatch)
+                yield output_batch
+        finally:
+            close = getattr(results, "close", None)
+            if close is not None:
+                close()
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
@@ -418,12 +424,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
         execution_start_time: float | None = None,
+        propagate_forward_errors: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        forward_failed = False
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
@@ -451,7 +459,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                except Exception:
+                    forward_failed = True
+                    raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -505,6 +517,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     tag="server_perf_dump",
                 )
         except Exception as e:
+            if propagate_forward_errors and forward_failed:
+                if isinstance(e, StopIteration):
+                    raise RuntimeError(
+                        "Grouped pipeline returned fewer outputs than requests."
+                    ) from e
+                raise
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
