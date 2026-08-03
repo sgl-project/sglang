@@ -5,7 +5,8 @@ runner's torch profiler into the capture loop:
 
   * When profiling is disabled, ``capture_one`` runs exactly two warmups + one
     capture and never touches a profiler (behavior-identical to before the PR).
-  * When the runner exposes an active ``_profiler`` (``--enable-profile-cuda-graph``),
+  * When the runner exposes an active ``_profiler`` (per-bs capture profiling,
+    ``--enable-profile-cuda-graph`` + ``SGLANG_GRAPH_BATCH_CAPTURE``),
     ``capture_one`` calls ``profiler.step()`` past the two warmups and once after
     the capture (schedule ``wait=2, warmup=0, active=1``). The captured forward is
     NOT wrapped in a ``record_function``; per-bs trace naming is handled by the

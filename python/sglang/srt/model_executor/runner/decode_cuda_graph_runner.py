@@ -101,6 +101,10 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.profile_utils import (
+    export_cuda_graph_capture_trace,
+    graph_capture_profile_dir,
+)
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -631,18 +635,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and capture_hidden_mode_matches
         )
 
-    def _init_profile_context_and_memory_record(self):
-        rank = get_parallel().tp_rank
-        runner_name = type(self).__name__
+    def _graph_batch_capture_active(self) -> bool:
+        """Whether the per-batch-size capture-trace feature is active.
 
-        # Per-bs capture traces are opt-in via SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
-        schedule = None
-        on_trace_ready = None
-        if envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
-            trace_dir = os.path.join(
-                os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"),
-                "graph_capture_traces",
-            )
+        Gated by SGLANG_GRAPH_BATCH_CAPTURE. The original single-trace export
+        (SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE) takes precedence: when both are
+        set we fall back to the original behavior.
+        """
+        return (
+            envs.SGLANG_GRAPH_BATCH_CAPTURE.get()
+            and not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get()
+        )
+
+    def _init_profile_context_and_memory_record(self):
+        if self._graph_batch_capture_active():
+            # Per-batch-size capture traces (SGLANG_GRAPH_BATCH_CAPTURE): a
+            # scheduled profiler is stepped once per batch size (see
+            # FullCudaGraphBackend.capture_one) and on_trace_ready writes one
+            # chrome trace per bs.
+            rank = get_parallel().tp_rank
+            runner_name = type(self).__name__
+            trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
             # Track which BS is currently being captured for trace file naming
@@ -658,19 +671,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 logger.info(f"Saved trace for bs={bs} to {trace_file}")
                 self._profile_bs_idx += 1
 
-            # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1 (capture run).
-            # repeat=0 repeats the cycle so each batch size gets its own trace.
-            schedule = torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0)
-
-        profile_context = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule,
-            record_shapes=True,
-            with_stack=True,
-            with_flops=True,
-            profile_memory=True,
-            on_trace_ready=on_trace_ready,
-        )
+            profile_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1
+                # (capture run); repeat=0 repeats the cycle so each batch size
+                # gets its own trace.
+                schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
+                record_shapes=True,
+                with_stack=True,
+                with_flops=True,
+                profile_memory=True,
+                on_trace_ready=on_trace_ready,
+            )
+        else:
+            # a single unscheduled pass over the whole
+            # capture. The combined trace (if any) is exported in
+            # _post_process_after_profile via export_cuda_graph_capture_trace,
+            # gated by SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
+            profile_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+            )
         torch.cuda.memory._record_memory_history()
         return profile_context
 
@@ -689,6 +710,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
         )
         logger.info(log_message)
+
+        # single-trace export for the whole capture pass; no-op unless
+        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE is set. In per-bs mode
+        # (SGLANG_GRAPH_BATCH_CAPTURE) that env is unset, so this stays a no-op
+        # and the per-bs on_trace_ready handles export instead.
+        export_cuda_graph_capture_trace(
+            prof_context,
+            runner_name=type(self).__name__,
+            tp_rank=get_parallel().tp_rank,
+        )
 
     def capture_prepare(
         self,
@@ -861,11 +892,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         profile_context = empty_context()
         # Holds the active torch profiler during capture so the backend can
-        # advance its schedule (profiler.step()) per batch size.
+        # advance its schedule (profiler.step()) per batch size. Only the
+        # scheduled per-bs profiler (SGLANG_GRAPH_BATCH_CAPTURE) needs stepping;
+        # the original unscheduled pass leaves this None.
         self._profiler = None
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
-            if envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
+            if self._graph_batch_capture_active():
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
