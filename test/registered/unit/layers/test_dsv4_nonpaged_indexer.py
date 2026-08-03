@@ -319,14 +319,13 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         self.assertEqual(plan.max_seq_len, 4)
         self.assertEqual(plan.max_seqlen_k, 64)
 
-    def test_round_robin_query_threshold_uses_local_rows(self):
+    def test_round_robin_query_threshold_uses_padded_rows_consistently(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
         c4_indexer = SimpleNamespace(use_fp4_indexer=False)
         metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
         cp_size = 4
-        cp_rank = 3
 
-        def build_plan(global_query_rows):
+        def build_plan(global_query_rows, cp_rank):
             padded_local_query_rows = (global_query_rows + cp_size - 1) // cp_size
             local_causal_seq_lens = torch.arange(
                 cp_rank + 1,
@@ -359,10 +358,23 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 query_rows=padded_local_query_rows,
             )
 
-        with get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=cp_rank):
-            self.assertIsNone(build_plan(8192 * cp_size - 1))
-            self.assertIsNotNone(build_plan(8192 * cp_size))
-            self.assertIsNotNone(build_plan(8193 * cp_size))
+        for cp_rank in range(cp_size):
+            with (
+                self.subTest(cp_rank=cp_rank),
+                get_parallel().override(attn_cp_size=cp_size, attn_cp_rank=cp_rank),
+            ):
+                # All ranks have 8191 physical rows and therefore use paged.
+                self.assertIsNone(build_plan(8191 * cp_size, cp_rank))
+
+                # All ranks have 8192 padded physical rows. Rank 3 has only 8191
+                # logical rows, but every rank must still choose non-paged.
+                global_query_rows = 8192 * cp_size - 1
+                plan = build_plan(global_query_rows, cp_rank)
+                self.assertIsNotNone(plan)
+                expected_logical_rows = len(
+                    range(cp_rank + 1, global_query_rows + 1, cp_size)
+                )
+                self.assertEqual(plan.query_rows, expected_logical_rows)
 
     def test_single_request_plan_contract(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)

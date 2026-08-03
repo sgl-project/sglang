@@ -583,11 +583,6 @@ class C4IndexerBackendMixin:
             selected_request_indices = list(range(len(extend_lens_cpu)))
 
         logical_query_rows = sum(local_extend_lens_cpu)
-        if (
-            logical_query_rows
-            < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get()
-        ):
-            return None
         global_query_rows = sum(extend_lens_cpu)
         if (
             logical_query_rows > query_rows
