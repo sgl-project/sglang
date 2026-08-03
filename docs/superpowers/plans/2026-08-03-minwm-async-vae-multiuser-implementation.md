@@ -37,7 +37,7 @@
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_protocol.py`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py`
 
-- [ ] **Step 1: Write failing protocol and lifecycle tests**
+- [x] **Step 1: Write failing protocol and lifecycle tests**
 
 ```python
 def test_latent_header_rejects_stale_generation():
@@ -56,13 +56,13 @@ def test_generate_session_allows_two_active_chunks_and_completes_in_order():
     assert session.generate_chunk_cnt == 2
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_protocol.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q`
 
 Expected: FAIL because protocol types and multi-inflight lifecycle do not exist.
 
-- [ ] **Step 3: Implement immutable identity and monotonic sequence validation**
+- [x] **Step 3: Implement immutable identity and monotonic sequence validation**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -94,7 +94,7 @@ class ChunkSequenceTracker:
 
 `GenerateSession` 生成独立 `generation_id`，维护 `next_chunk_index` 与 `active_chunks`，`RealtimeChunkContext` 同时携带四元 identity；Adapter 把 generation、action version、prompt version 写入 Req。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_async_vae_protocol.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q`
 
@@ -621,4 +621,3 @@ Run: `git add benchmark/minwm_realtime_async_vae/results && git commit -m "bench
 Run: `git status --short && git log -1 --oneline`
 
 Expected: worktree clean and final report commit present.
-

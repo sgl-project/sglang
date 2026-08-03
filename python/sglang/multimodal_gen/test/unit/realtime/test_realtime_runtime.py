@@ -446,6 +446,36 @@ def test_generate_session_tracks_active_chunk_context():
     assert next_chunk.request_id != chunk.request_id
 
 
+def test_generate_session_allows_two_active_chunks_and_completes_in_order():
+    session = GenerateSession(max_inflight_chunks=2)
+
+    first = session.new_chunk()
+    second = session.new_chunk()
+
+    assert first.generation_id == session.generation_id
+    assert second.index == 1
+    with pytest.raises(RuntimeError, match="in-flight limit"):
+        session.new_chunk()
+
+    session.generate_chunk_completed(first)
+    session.generate_chunk_completed(second)
+
+    assert session.generate_chunk_cnt == 2
+    assert session.active_chunks == {}
+
+
+def test_generate_session_does_not_advance_past_out_of_order_completion():
+    session = GenerateSession(max_inflight_chunks=2)
+    first = session.new_chunk()
+    second = session.new_chunk()
+
+    session.generate_chunk_completed(second)
+    assert session.generate_chunk_cnt == 0
+
+    session.generate_chunk_completed(first)
+    assert session.generate_chunk_cnt == 2
+
+
 def test_generate_session_respects_max_chunks():
     session = GenerateSession()
     session.set_request(

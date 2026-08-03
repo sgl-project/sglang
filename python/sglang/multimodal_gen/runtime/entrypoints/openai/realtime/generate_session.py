@@ -27,15 +27,21 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class RealtimeChunkContext:
     session_id: str
+    generation_id: str
     index: int
     request_id: str
+    action_version: int = 0
+    prompt_version: int = 0
 
 
 class GenerateSession:
     """A realtime generation session"""
 
-    def __init__(self):
+    def __init__(self, *, max_inflight_chunks: int = 1):
+        if max_inflight_chunks < 1:
+            raise ValueError("max_inflight_chunks must be positive")
         self.id = uuid4().hex
+        self.generation_id = uuid4().hex
         self.trace_id = self.id
         self.trace_started_at = time.perf_counter()
         self.trace_started_epoch_ms = int(time.time() * 1000)
@@ -43,7 +49,10 @@ class GenerateSession:
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
         self.generate_chunk_cnt = 0
-        self.current_chunk: RealtimeChunkContext | None = None
+        self.next_chunk_index = 0
+        self.max_inflight_chunks = max_inflight_chunks
+        self.active_chunks: dict[int, RealtimeChunkContext] = {}
+        self._completed_chunks: set[int] = set()
         self.realtime_session = RealtimeSession()
         self.adapter: BaseRealtimeModelAdapter | None = None
         self.adapter_state: Any = None
@@ -69,27 +78,66 @@ class GenerateSession:
         self.client_trace = None
         self.input_temp_dir = None
         self.generate_chunk_cnt = 0
-        self.current_chunk = None
+        self.next_chunk_index = 0
+        self.active_chunks.clear()
+        self._completed_chunks.clear()
         self.adapter = None
         self.adapter_state = None
         self.output_pace_next_send_at = None
         self.output_pace_last_event_id = None
         self.realtime_session.dispose()
 
-    def new_chunk(self) -> RealtimeChunkContext:
-        if self.current_chunk is not None:
-            raise RuntimeError("previous realtime chunk is still active")
+    @property
+    def current_chunk(self) -> RealtimeChunkContext | None:
+        if not self.active_chunks:
+            return None
+        return self.active_chunks[min(self.active_chunks)]
+
+    def can_schedule_chunk(self) -> bool:
+        if len(self.active_chunks) >= self.max_inflight_chunks:
+            return False
+        if self.request is None or self.request.max_chunks is None:
+            return True
+        return self.next_chunk_index < self.request.max_chunks
+
+    def new_chunk(
+        self,
+        *,
+        action_version: int = 0,
+        prompt_version: int = 0,
+    ) -> RealtimeChunkContext:
+        if len(self.active_chunks) >= self.max_inflight_chunks:
+            if self.max_inflight_chunks == 1:
+                raise RuntimeError("previous realtime chunk is still active")
+            raise RuntimeError("realtime chunk in-flight limit reached")
+        if not self.can_schedule_chunk():
+            raise RuntimeError("realtime session reached max chunks")
         chunk = RealtimeChunkContext(
             session_id=self.id,
-            index=self.generate_chunk_cnt,
+            generation_id=self.generation_id,
+            index=self.next_chunk_index,
             request_id=f"{self.id}_{uuid4().hex}",
+            action_version=action_version,
+            prompt_version=prompt_version,
         )
-        self.current_chunk = chunk
+        self.next_chunk_index += 1
+        self.active_chunks[chunk.index] = chunk
         return chunk
 
-    def generate_chunk_completed(self):
-        self.generate_chunk_cnt += 1
-        self.current_chunk = None
+    def generate_chunk_completed(
+        self, chunk: RealtimeChunkContext | None = None
+    ) -> None:
+        if chunk is None:
+            if not self.active_chunks:
+                raise RuntimeError("no active realtime chunk to complete")
+            chunk = self.active_chunks[min(self.active_chunks)]
+        active = self.active_chunks.pop(chunk.index, None)
+        if active != chunk:
+            raise RuntimeError(f"realtime chunk {chunk.index} is not active")
+        self._completed_chunks.add(chunk.index)
+        while self.generate_chunk_cnt in self._completed_chunks:
+            self._completed_chunks.remove(self.generate_chunk_cnt)
+            self.generate_chunk_cnt += 1
 
     def reached_max_chunks(self) -> bool:
         return (

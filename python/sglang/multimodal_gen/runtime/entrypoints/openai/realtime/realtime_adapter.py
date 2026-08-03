@@ -234,11 +234,14 @@ class BaseRealtimeModelAdapter:
         event_id: int | None,
     ) -> None:
         batch.realtime_session_id = session.id
+        batch.realtime_generation_id = session.generation_id
         batch.realtime_trace_id = session.trace_id
         batch.realtime_trace_started_at = session.trace_started_at
         batch.return_raw_frames = True
         batch.block_idx = chunk.index
         batch.realtime_event_id = event_id
+        batch.realtime_action_version = chunk.action_version
+        batch.realtime_prompt_version = chunk.prompt_version
         if session.request is None:
             return
         batch.realtime_output_format = normalize_realtime_output_format(

@@ -206,12 +206,15 @@ class Req:
 
     # realtime
     realtime_session_id: str | None = None
+    realtime_generation_id: str | None = None
     realtime_trace_id: str | None = None
     realtime_trace_started_at: float | None = None
     session: RealtimeSession | None = None
     block_idx: int = 0
     realtime_chunk_size: int | None = None
     realtime_event_id: int | None = None
+    realtime_action_version: int = 0
+    realtime_prompt_version: int = 0
     realtime_output_format: str | None = None
     realtime_preview_max_width: int | None = None
     realtime_output_pacing: bool = False
