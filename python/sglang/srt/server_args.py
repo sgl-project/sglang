@@ -6696,6 +6696,30 @@ class ServerArgs:
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
+
+            # The triton MoE runner only registers a deepep_normal<->triton
+            # permute, and that path is eager-only (data-dependent dense
+            # compaction cannot be graph-captured). Enforce both here when the
+            # runner is selected explicitly. NOTE: --moe-runner-backend
+            # defaults to "auto" and is resolved later by the quantization
+            # method (W4A16/compressed-tensors picks triton), so this cannot
+            # catch every case; the permute hook raises a descriptive error
+            # for the auto-resolved path.
+            if resolved_view(self).moe_runner_backend == "triton":
+                if self.deepep_mode == "low_latency":
+                    raise ValueError(
+                        "moe_runner_backend='triton' with MoRI EP requires "
+                        "deepep_mode='normal': only a deepep_normal<->triton "
+                        "permute is registered, so 'low_latency' would fail "
+                        "later during permute-method lookup."
+                    )
+                if not self.disable_cuda_graph:
+                    self.disable_cuda_graph = True
+                    logger.warning(
+                        "auto set disable_cuda_graph=True for MoRI EP with the "
+                        "triton MoE runner: the deepep_normal->triton permute "
+                        "is eager-only."
+                    )
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

@@ -272,6 +272,59 @@ class TestFusedMOE(CustomTestCase):
                     )
                     empty_gpu_cache()
 
+    def test_topk1_direct_write_guard_poisoned_buffer(self):
+        # Regression guard for the topk==1 / routed_scaling_factor==1.0 direct-
+        # write path. When the second GEMM writes straight into out_hidden_states
+        # the reduction over intermediate_cache3 must be skipped; otherwise
+        # moe_sum reads an uninitialized buffer and clobbers the output. A plain
+        # single-expert test cannot catch a missing guard because a fresh
+        # torch.empty happens to be benign.
+        #
+        # Deterministically poison intermediate_cache3: wrap torch.empty for the
+        # duration of the fused_moe call and pre-fill any allocation with the
+        # cache3 shape (num_tokens, topk, k) with a large constant. With the
+        # guard the poisoned buffer is never read; without it moe_sum reads it
+        # and the allclose fails.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        dtype = torch.bfloat16
+        rtol, atol = self.get_tolerance(dtype)
+        m, n, k, e, topk = 33, 128, 128, 8, 1
+        cache3_shape = (m, topk, k)
+
+        a = self.create_random_gpu_tensor((m, k), dtype)
+        w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
+        w2 = self.create_random_gpu_tensor((e, k, n), dtype)
+        score = self.create_random_gpu_tensor((m, e), dtype)
+
+        topk_output = select_experts(
+            hidden_states=a,
+            router_logits=score,
+            topk_config=TopKConfig(top_k=topk, renormalize=False),
+        )
+        moe_runner_config = MoeRunnerConfig(routed_scaling_factor=1.0)
+
+        _real_empty = torch.empty
+
+        def _poisoning_empty(*args, **kwargs):
+            t = _real_empty(*args, **kwargs)
+            if tuple(t.shape) == cache3_shape and t.dtype == dtype:
+                t.fill_(1.0e4)
+            return t
+
+        torch.empty = _poisoning_empty
+        try:
+            triton_output = fused_moe(
+                a, w1, w2, topk_output, moe_runner_config=moe_runner_config
+            )
+        finally:
+            torch.empty = _real_empty
+
+        torch_output = self.torch_naive_moe(
+            a, w1, w2, score, topk, routed_scaling_factor=1.0
+        )
+        torch.testing.assert_close(triton_output, torch_output, rtol=rtol, atol=atol)
+        empty_gpu_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

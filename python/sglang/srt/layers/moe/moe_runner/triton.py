@@ -34,6 +34,11 @@ class TritonRunnerInput(RunnerInput):
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
+    # deepep_normal/mori deliver hidden_states in a dispatcher-owned,
+    # possibly read-only buffer; the permute hook sets this so the core
+    # allocates a fresh output instead of writing in place (avoids
+    # mutating the shared runner config across forwards).
+    force_no_inplace: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -83,6 +88,33 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
+        # A dispatched-EP rank can receive zero tokens for its local experts
+        # (e.g. mori normal dispatch truncated to valid==0). moe_align then
+        # yields num_tokens_post_padded==0 and the fused_moe grid launches with
+        # zero blocks -> hipErrorInvalidConfiguration. Short-circuit to a
+        # correct empty output. shape[0] is host-side (no D2H sync); under
+        # cuda-graph capture the buffer is never truncated so this never fires.
+        if runner_input.hidden_states.shape[0] == 0:
+            # Output hidden dim == input hidden dim for MoE; read it from
+            # the input so it is independent of quant packing layout (int4
+            # packs along the contract dim, not the output dim).
+            hidden_size = runner_input.hidden_states.shape[1]
+            if self.config.no_combine:
+                # no_combine keeps the per-expert dimension: the kernel
+                # returns (num_tokens, topk, hidden_size), so the empty
+                # output has to carry topk too (matches AiterRunnerCore).
+                out = runner_input.hidden_states.new_empty(
+                    (0, runner_input.topk_ids.shape[-1], hidden_size)
+                )
+            else:
+                out = runner_input.hidden_states.new_empty((0, hidden_size))
+            return TritonRunnerOutput(hidden_states=out)
+
+        # deepep_normal/mori dispatch delivers hidden_states in a read-only
+        # dispatcher buffer; the permute hook flags force_no_inplace so we
+        # skip in-place writes without mutating the shared runner config.
+        effective_inplace = self.config.inplace and not runner_input.force_no_inplace
+
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
@@ -101,7 +133,7 @@ class TritonRunnerCore(MoeRunnerCore):
                 activation=self.config.activation,
                 is_gated=self.config.is_gated,
                 no_combine=self.config.no_combine,
-                inplace=self.config.inplace,
+                inplace=effective_inplace,
                 apply_router_weight_on_input=self.config.apply_router_weight_on_input,
                 routed_scaling_factor=self.config.routed_scaling_factor,
                 gemm1_alpha=self.config.gemm1_alpha,
@@ -125,6 +157,20 @@ class TritonRunnerCore(MoeRunnerCore):
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
         )
+        # Dense-compacted mori input (see pre_permute_deepep_normal_to_triton)
+        # carries no invalid (-1) expert ids, so the kernel's filter_expert
+        # guard (`off_experts == -1` -> write zeros and skip) can never fire.
+        # Forcing the unfiltered path is therefore numerically identical and
+        # just skips the per-block check.
+        #
+        # Exclude swiglu_limit models (DeepSeek-V4 style): with
+        # SGLANG_OPT_SWIGLU_CLAMP_FUSION enabled the unfiltered branch selects
+        # the fused silu_and_mul_clamp kernel, which is CUDA-only and asserts
+        # on HIP. filter_expert=True routes them to act_and_mul_triton, which
+        # applies the clamp, runs on HIP, and is equally correct here because
+        # the dense input has no invalid ids to filter.
+        if running_state.get("mori_dense", False) and self.config.swiglu_limit is None:
+            filter_expert = False
 
         out = _fused_moe_kernel_sequence(
             runner_input.hidden_states,
@@ -155,9 +201,19 @@ class TritonRunnerCore(MoeRunnerCore):
             activation=self.config.activation,
             is_gated=self.config.is_gated,
             no_combine=self.config.no_combine,
-            inplace=self.config.inplace,
+            inplace=effective_inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            # For int4/compressed-tensors experts routed_scaling_factor is NOT
+            # fused into topk_weights (should_fuse_routed_scaling_factor_in_topk
+            # is False); the model applies it post-experts (see deepseek_v2.py).
+            # So the kernel passes 1.0 -- both to avoid double-scaling and to let
+            # the topk==1 direct-write reduction guard fire instead of scaling a
+            # never-written intermediate buffer into output.
+            routed_scaling_factor=(
+                1.0
+                if running_state.get("mori_dense", False)
+                else self.config.routed_scaling_factor
+            ),
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
@@ -324,4 +380,234 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_pre_permute("deepep_normal", "triton")
+def pre_permute_deepep_normal_to_triton(
+    dispatch_output: Any,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    # DeepEP/Mori "normal" dispatch delivers tokens already routed to their
+    # expert-home rank; topk_ids index the local experts (invalid slots are
+    # skipped by moe_align + the kernel's filter_expert). The triton runner
+    # core needs the aligned (sorted_token_ids/expert_ids/num_tokens_post_padded)
+    # layout, so build it here from the same helper the standard path uses.
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+
+    # mori can dispatch FP8/FP4-quantized activations, in which case the
+    # payload is packed and carries a separate per-block scale in
+    # hidden_states_scale (and FP4 also packs the hidden dim). That scale is
+    # not plumbed through to the triton runner, so consuming the payload here
+    # would silently compute against the wrong scale. Only BF16 dispatch
+    # feeding W4A16 experts is validated; refuse anything else loudly.
+    if getattr(dispatch_output, "hidden_states_scale", None) is not None:
+        raise NotImplementedError(
+            "deepep_normal->triton MoE permute does not support quantized "
+            "mori dispatch (hidden_states_scale is not None). Only BF16 "
+            "activation dispatch is supported on this path; disable mori "
+            "dispatch quantization for this model."
+        )
+
+    # DeepEP/mori deliver hidden_states in a dispatcher-owned buffer (for mori
+    # an external, RDMA-registered, read-only-mapped region). The triton runner
+    # core writes MoE output in-place into hidden_states when config.inplace is
+    # True (the default), which faults on that buffer ("write to read-only
+    # page"). Flag the runner input so the core allocates a fresh output
+    # for this dispatch format, instead of mutating the shared runner
+    # config object (which persists across forwards).
+
+    # Mori packs origin routing (used by combine) and dispatches into a
+    # fixed-size buffer; cap it to the configured input budget so the kernel
+    # does not read padding rows past the valid tokens.
+    is_mori = hasattr(dispatch_output, "origin_topk_ids")
+
+    if is_mori:
+        from sglang.srt.runtime_context import get_parallel
+
+        # Mori normal dispatch delivers a fixed-size buffer with the valid
+        # received tokens front-packed at [0, totalRecvTokenNum) and zero
+        # padding after. This runs eager, so we truncate to the valid rows and
+        # remap ids with tensor ops. topk_ids carry GLOBAL expert ids in
+        # [0, num_experts); the triton runner's moe_align/kernel index this
+        # rank's LOCAL experts, so remap to [0, num_local_experts) and route
+        # non-local experts (and padding rows) to -1, the EP filtered-expert id
+        # (moe_align/kernel skip -1 slots; w1 only holds local experts 0..nle-1,
+        # so any out-of-range id like num_local_experts would index w1 OOB).
+        # Each rank thus computes only its local experts' weighted partial
+        # (padding rows have zero activations -> zero output); mori combine sums
+        # the partials across ranks and reads only [0, totalRecvTokenNum),
+        # discarding the padded tail.
+        nle = runner_config.num_local_experts
+        ep_rank = get_parallel().moe_ep_rank
+
+        # The triton fused_moe kernel (unlike aiter) has no valid-row mask and
+        # would run moe_align + both GEMMs over the whole fixed dispatch buffer,
+        # including the zero-padded tail past the valid front-packed tokens.
+        # num_recv_tokens_per_expert is a host python list, so sum() is a
+        # host-side count (no D2H sync). Both prefill and decode run eager here,
+        # so bound work to the valid rows by truncation.
+        nre = getattr(dispatch_output, "num_recv_tokens_per_expert", None)
+        # mori combine reads the expert output back through the same fixed-size
+        # dispatch buffer it built src_info against, so it expects hidden with
+        # the full pre-dispatch row count. Record it here so post_permute can
+        # zero-pad the (truncated) kernel output back to that shape before
+        # handing it to combine.
+        running_state["mori_full_rows"] = int(hidden_states.shape[0])
+        # This path runs eager on both prefill and decode: the dense-compaction
+        # below builds a data-dependent shape a HIP graph cannot capture, so the
+        # decode recipe sets --disable-cuda-graph. Assert the invariant instead
+        # of carrying a dead static-shape branch for cuda-graph capture.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mori wide-EP with the triton MoE runner cannot be captured "
+                "into a CUDA/HIP graph: the dense-compaction below builds a "
+                "data-dependent shape. Launch with --disable-cuda-graph "
+                "(the wide-EP decode recipe sets it). Note that "
+                "--moe-runner-backend defaults to 'auto' and resolves to the "
+                "triton runner for W4A16/compressed-tensors experts, so this "
+                "cannot always be rejected during argument resolution."
+            )
+        assert nre is not None
+        valid = int(sum(nre))
+        hidden_states = hidden_states[:valid]
+        topk_ids = topk_ids[:valid]
+        topk_weights = topk_weights[:valid]
+
+        local = topk_ids.to(torch.int64) - ep_rank * nle
+        topk_ids = torch.where(
+            (local >= 0) & (local < nle),
+            local,
+            torch.full_like(local, -1),
+        ).to(torch.int32)
+
+        # Dense-compaction: gather only the valid (row, local_expert) pairs into
+        # a dense topk=1 batch with no -1 ids, so the kernel runs the unfiltered
+        # path (filter_expert=False, identical to EP=1) and the down-GEMM writes
+        # each pair's weighted expert output directly to its output row. This
+        # avoids the HIP filter_expert reduction path; each pair's output is
+        # scatter-added back per token in post_permute.
+        valid_mask = topk_ids >= 0
+        pair_rows = valid_mask.nonzero(as_tuple=True)[0]
+        dense_experts = topk_ids[valid_mask].to(torch.int32).view(-1, 1)
+        dense_weights = topk_weights[valid_mask].view(-1, 1)
+        dense_hidden = hidden_states.index_select(0, pair_rows)
+        running_state["mori_dense"] = True
+        running_state["mori_dense_pair_rows"] = pair_rows
+        running_state["mori_dense_out_rows"] = int(hidden_states.shape[0])
+        hidden_states = dense_hidden
+        topk_ids = dense_experts
+        topk_weights = dense_weights
+
+        running_state["combine_topk_ids"] = dispatch_output.origin_topk_ids
+        running_state["combine_topk_weights"] = dispatch_output.origin_topk_weights
+    else:
+        running_state["combine_topk_ids"] = topk_ids
+        running_state["combine_topk_weights"] = topk_weights
+    running_state["combine_is_mori"] = is_mori
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+
+    return TritonRunnerInput(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        force_no_inplace=True,
+    )
+
+
+@register_post_permute("triton", "deepep_normal")
+def post_permute_triton_to_deepep_normal(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    if running_state["combine_is_mori"]:
+        from sglang.srt.layers.moe.token_dispatcher.moriep import (
+            MoriEPNormalCombineInput,
+        )
+
+        cls = MoriEPNormalCombineInput
+
+        hidden_states = runner_output.hidden_states
+        # Un-compact the dense topk=1 batch: each pair's weighted expert output
+        # (kernel already applied the routing weight) scatter-adds back to its
+        # token row, reproducing the per-token top-k reduction.
+        if running_state.get("mori_dense", False):
+            # The dense path reconstructs per-token output through combine via a
+            # 2-D scatter; a no_combine run would hand back a 3-D
+            # [pairs, topk, hidden] tensor that index_add_ cannot consume. This
+            # combination is not supported (mirrors the aiter runner rejecting
+            # unsupported no_combine), so fail loudly instead of dim-mismatching.
+            if runner_config.no_combine:
+                raise NotImplementedError(
+                    "deepep_normal<->triton mori dense-compaction does not "
+                    "support no_combine=True: the post-permute scatter path "
+                    "reconstructs per-token output through combine."
+                )
+            pair_rows = running_state["mori_dense_pair_rows"]
+            out_rows = running_state["mori_dense_out_rows"]
+            scattered = hidden_states.new_zeros((out_rows, hidden_states.shape[1]))
+            scattered.index_add_(0, pair_rows, hidden_states)
+            hidden_states = scattered
+        # The kernel ran over the truncated [valid, dim] buffer; mori combine
+        # reassembles through the full fixed-size dispatch buffer, so pad the
+        # output back to the original pre-dispatch row count (real rows front-
+        # packed, zero tail) to match combine's src_info addressing.
+        full_rows = running_state.get("mori_full_rows")
+        if full_rows is not None and hidden_states.shape[0] < full_rows:
+            padded = hidden_states.new_zeros((full_rows, hidden_states.shape[1]))
+            padded[: hidden_states.shape[0]] = hidden_states
+            hidden_states = padded
+
+        return cls(
+            hidden_states=hidden_states,
+            topk_ids=running_state["combine_topk_ids"],
+            topk_weights=running_state["combine_topk_weights"],
+        )
+    else:
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPNormalCombineInput,
+        )
+
+        cls = DeepEPNormalCombineInput
+
+    return cls(
+        hidden_states=runner_output.hidden_states,
+        topk_ids=running_state["combine_topk_ids"],
+        topk_weights=running_state["combine_topk_weights"],
     )
