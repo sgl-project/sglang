@@ -547,6 +547,10 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>HunyuanVideo</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax-H3 (T2VA, FL2VA, and Ref2VA)</td>
+    </tr>
   </tbody>
 </table>
 
@@ -562,7 +566,8 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 - **SGLang-native pipelines**: Distributed Cache-DiT paths exist for supported pipelines. Hybrid SP+TP configurations add communication and cache coordination overhead, so validate them on the target model and hardware before using them as production defaults.
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
-- **Model support**: Only models registered in Cache-DiT's BlockAdapterRegister are supported
+- **Model support**: The model must be registered in Cache-DiT's
+  `BlockAdapterRegister` or have an SGLang custom block adapter.
 
 ## Troubleshooting
 

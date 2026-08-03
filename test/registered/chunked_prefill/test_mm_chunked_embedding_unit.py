@@ -14,9 +14,28 @@ import torch
 
 from sglang.srt.managers import mm_utils
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def publish_config_and_parallel_state():
+    """Applied to every test in this module (``autouse``), named by none of them.
+
+    The embedding path reads the config namespaces and the attention-TP rank —
+    process state a served engine establishes at startup. Without this the
+    accessors raise instead of answering.
+    """
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    try:
+        with get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1):
+            yield
+    finally:
+        override.restore()
+
 
 HIDDEN = 16
 
