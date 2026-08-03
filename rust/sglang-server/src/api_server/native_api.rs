@@ -243,7 +243,7 @@ async fn drain_unary(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            EgressItem::Control(_) => continue, // never on `/generate`
+            EgressItem::Control(_) | EgressItem::Data(_) => continue, // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -376,7 +376,7 @@ fn generation_event_stream(
                         terminal = Some(out);
                     }
                     EgressItem::Error(e) => failed = Some(e),
-                    EgressItem::Control(_) => {} // never on /generate
+                    EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
                 }
             }
 
