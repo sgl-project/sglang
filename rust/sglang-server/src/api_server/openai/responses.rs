@@ -422,6 +422,19 @@ pub(super) fn responses_chat_request(
     })
 }
 
+fn insert_previous_response_history(
+    messages: &mut Vec<ChatCompletionRequestMessage>,
+    previous_messages: Vec<ChatCompletionRequestMessage>,
+    has_current_instructions: bool,
+) {
+    // `responses_chat_request` emits the current `instructions` as the first
+    // system message. Keep it first; the prior exchange belongs between that
+    // instruction and the current input. Without instructions, history remains
+    // at the beginning as before.
+    let insert_at = usize::from(has_current_instructions);
+    messages.splice(insert_at..insert_at, previous_messages);
+}
+
 async fn responses(
     State(state): State<AppState>,
     Extension(store): Extension<ResponseStore>,
@@ -511,9 +524,11 @@ async fn responses(
         Ok(request) => request,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message),
     };
-    if !previous_messages.is_empty() {
-        chat_request.messages.splice(0..0, previous_messages);
-    }
+    insert_previous_response_history(
+        &mut chat_request.messages,
+        previous_messages,
+        request.instructions.is_some(),
+    );
     let tools = chat_request.tools.as_ref().map(|tools| {
         tools
             .iter()
@@ -918,8 +933,8 @@ fn unary_response_value(response: OpenAIResponse) -> serde_json::Value {
 mod tests {
     use super::super::test_utils::{chunk, response_request, senders};
     use super::{
-        new_response_store, responses_chat_request, responses_event_stream, sse_frame,
-        unary_responses,
+        insert_previous_response_history, new_response_store, responses_chat_request,
+        responses_event_stream, sse_frame, unary_responses,
     };
     use crate::api_server::guard::AbortGuard;
     use dynamo_protocols::types::responses::CreateResponse;
@@ -1022,6 +1037,54 @@ mod tests {
         assert!(matches!(
             &chat.messages[3],
             ChatCompletionRequestMessage::Tool(tool) if tool.tool_call_id == "call_2"
+        ));
+    }
+
+    #[test]
+    fn current_instructions_precede_previous_response_history() {
+        let request: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "instructions": "Follow the new instruction",
+            "input": "current input"
+        }))
+        .unwrap();
+        let previous_request: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "input": "previous input"
+        }))
+        .unwrap();
+        let previous = responses_chat_request(&previous_request, "model")
+            .unwrap()
+            .messages;
+        let mut chat = responses_chat_request(&request, "model").unwrap();
+
+        insert_previous_response_history(
+            &mut chat.messages,
+            previous,
+            request.instructions.is_some(),
+        );
+
+        assert_eq!(chat.messages.len(), 3);
+        assert!(matches!(
+            &chat.messages[0],
+            ChatCompletionRequestMessage::System(message)
+                if matches!(&message.content,
+                    dynamo_protocols::types::ChatCompletionRequestSystemMessageContent::Text(text)
+                    if text == "Follow the new instruction")
+        ));
+        assert!(matches!(
+            &chat.messages[1],
+            ChatCompletionRequestMessage::User(message)
+                if matches!(&message.content,
+                    dynamo_protocols::types::ChatCompletionRequestUserMessageContent::Text(text)
+                    if text == "previous input")
+        ));
+        assert!(matches!(
+            &chat.messages[2],
+            ChatCompletionRequestMessage::User(message)
+                if matches!(&message.content,
+                    dynamo_protocols::types::ChatCompletionRequestUserMessageContent::Text(text)
+                    if text == "current input")
         ));
     }
 
