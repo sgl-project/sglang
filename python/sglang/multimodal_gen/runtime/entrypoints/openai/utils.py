@@ -430,6 +430,9 @@ def add_common_data_to_response(
     if result.metrics and result.metrics.total_duration_s > 0:
         response["inference_time_s"] = result.metrics.total_duration_s
 
+    if result.usage is not None:
+        response["usage"] = dict(result.usage)
+
     response["id"] = request_id
 
     if result.action_pred is not None:
