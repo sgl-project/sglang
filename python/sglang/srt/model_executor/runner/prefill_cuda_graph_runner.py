@@ -53,6 +53,16 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.bcg import (
+    PrefillCPBCGInput,
+)
+from sglang.srt.layers.cp.bcg import (
+    enable_cp_v2_bcg_capture as should_enable_cp_v2_bcg_capture,
+)
+from sglang.srt.layers.cp.bcg import (
+    execute_prefill_cp_bcg,
+    filter_prefill_cp_bcg_capture_num_tokens,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -103,7 +113,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -277,16 +287,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
         )
-        needs_full_hidden_states = (
-            model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash_family()
-        )
         if is_breakable_eagle and model_runner.is_draft_worker:
             self.capture_hidden_mode = CaptureHiddenMode.LAST
-        elif is_breakable_eagle or needs_full_hidden_states:
+        elif is_breakable_eagle or model_runner.spec_algorithm.is_dflash_family():
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         else:
-            self.capture_hidden_mode = CaptureHiddenMode.NULL
+            self.capture_hidden_mode = self.return_hidden_states_mode
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
@@ -335,7 +341,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
 
@@ -354,6 +360,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._is_full_backend = False
         # Same ordering requirement: capture_prepare reads this.
         self._capture_lora = False
+        self.enable_cp_v2_bcg_capture = False
+        self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -403,8 +411,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
         self._capture_chunked_prefix = (
-            self._is_full_backend
-            and not model_runner.server_args.disable_chunked_prefix_cache
+            self._is_full_backend and not get_schedule().disable_chunked_prefix_cache
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -451,6 +458,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
+
+        server_args = model_runner.server_args
+        self.enable_cp_v2_bcg_capture = isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ) and should_enable_cp_v2_bcg_capture(server_args)
+        if self.enable_cp_v2_bcg_capture:
+            self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
+                self.capture_num_tokens, server_args
+            )
+            self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -1056,7 +1073,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if (
             capture_hidden_mode is not None
-            and capture_hidden_mode != self.capture_hidden_mode
+            and self.capture_hidden_mode < capture_hidden_mode
         ):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
@@ -1295,6 +1312,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if self.enable_cp_v2_bcg_capture:
+            assert self.prefill_cp_bcg_input is not None
+            self.prefill_cp_bcg_input.prepare(
+                self,
+                forward_batch,
+                static_num_tokens=num_tokens,
+                capture=True,
+            )
         if forward_batch.lora_ids is not None:
             # Fill the static prefill LoRA batch info the captured kernels
             # will read (all-None ids: ranks stay 0, kernels no-op).
@@ -1531,8 +1556,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.spec_info.hidden_states
             )
 
+        metadata_forward_batch = forward_batch
+        if self.enable_cp_v2_bcg_capture:
+            assert self.prefill_cp_bcg_input is not None
+            self.prefill_cp_bcg_input.prepare(
+                self,
+                static_forward_batch,
+                static_num_tokens=static_num_tokens,
+                capture=False,
+            )
+            metadata_forward_batch = static_forward_batch
+
         self._prepare_forward_metadata_for_replay(
-            forward_batch, static_forward_batch, static_num_tokens
+            metadata_forward_batch, static_forward_batch, static_num_tokens
         )
 
         return static_forward_batch
@@ -1652,9 +1688,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
         )
 
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        self._validate_capture_hidden_mode(forward_batch)
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
@@ -1664,7 +1708,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
-            if self._uses_eager_prefill_tail():
+            if self.enable_cp_v2_bcg_capture:
+                output = execute_prefill_cp_bcg(
+                    self,
+                    forward_batch,
+                    static_forward_batch,
+                    static_num_tokens,
+                    raw_num_tokens,
+                    **kwargs,
+                )
+            elif self._uses_eager_prefill_tail():
                 output = self._execute_body_capture(
                     forward_batch,
                     static_forward_batch,

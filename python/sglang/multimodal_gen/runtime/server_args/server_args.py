@@ -139,6 +139,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "minimax-h3",
+        "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
@@ -155,6 +157,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -179,6 +182,8 @@ def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
+    model_subfolder: str | None = None
+    model_variant: str | None = None
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
@@ -503,6 +508,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self.pipeline_config.validate_server_args(self)
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
@@ -550,9 +556,10 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Qwen/Qwen-Image, "
-            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
-            "and zai-org/GLM-Image are currently supported.",
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
+            "currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
@@ -1287,6 +1294,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
@@ -1310,6 +1318,26 @@ class ServerArgs(DisaggServerArgsMixin):
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--model-subfolder",
+            type=str,
+            default=ServerArgs.model_subfolder,
+            help=(
+                "Advanced override for a Diffusers pipeline subfolder inside the "
+                "model repository. Prefer --model-variant when a model exposes "
+                "semantic variant-to-weights routing."
+            ),
+        )
+        parser.add_argument(
+            "--model-variant",
+            type=str,
+            default=ServerArgs.model_variant,
+            help=(
+                "Semantic checkpoint variant to serve. Models with partitioned "
+                "checkpoints use this value to select the compatible weights "
+                "without exposing repository subfolder layout."
+            ),
         )
         parser.add_argument(
             "--model-id",
@@ -1397,7 +1425,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Explicit offload/FSDP/parallelism flags take precedence."
             ),
         )
-
         # Parallelism
         parser.add_argument(
             "--num-gpus",
@@ -1454,13 +1481,11 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Text/image encoder parallelism across a multi-rank replica. "
                 "`auto` folds encoders wide enough to benefit (best "
-                "single-request latency) and data-parallels the rest at "
-                "batch>1; `fold` always tensor-parallels the encoder weights; "
-                "`dp` never folds and splits the batch across ranks (best "
-                "batched throughput; also raises --batching-max-size to the "
-                "replica size unless set explicitly); `replicate` disables "
-                "both. `sglang serve` defaults to `dp`; other entrypoints to "
-                "`auto`."
+                "single-request latency) and data-parallels eligible native "
+                "text encoders at batch>1; `fold` always tensor-parallels the "
+                "encoder weights; `dp` never folds and splits the batch across "
+                "ranks (best batched throughput; requires TP=1 and DP=1); "
+                "`replicate` disables both. The default is `auto`."
             ),
         )
         parser.add_argument(
@@ -2293,6 +2318,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        self._validate_disagg_capability()
+
+    def _validate_disagg_capability(self) -> None:
+        if self.pipeline_config is None:
+            return
+        if (
+            self.disagg_role != RoleType.MONOLITHIC
+            and not self.pipeline_config.supports_disaggregation()
+        ):
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} only supports monolithic "
+                f"deployment; disaggregation role {self.disagg_role.value!r} "
+                "is not supported"
+            )
 
     def _validate_offload(self):
         # validate dit_offload_prefetch_size
@@ -2443,7 +2482,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_cfg_parallel(self):
-        if self.enable_cfg_parallel and self.num_gpus == 1:
+        if not self.enable_cfg_parallel:
+            return
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if not deployment_config.supports_cfg_parallel:
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} does not support CFG parallelism"
+            )
+        if self.num_gpus == 1:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
@@ -2455,6 +2501,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.encoder_parallel == "dp" and (
+            (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
+        ):
+            raise ValueError("encoder_parallel=dp requires tp_size=1 and dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

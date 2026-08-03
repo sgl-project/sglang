@@ -19,6 +19,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -162,16 +166,17 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return None
 
-    # Skip prefill CG for EAGLE target on tc_piecewise: that backend
-    # captures CaptureHiddenMode.NULL while runtime requests FULL, so
-    # the captured graph is dead, and capturing it perturbs FP4 /
-    # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
-    # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
-    # (restored from #25795), so it does NOT need this skip.
+    # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
+    # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
+    # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
+    # state and corrupt decode replay (see #28386 and #28870). BCG captures
+    # FULL for EAGLE target in PrefillCudaGraphRunner.__init__, so it does not
+    # need this skip.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and not model_runner.server_args.enable_return_hidden_states
+        and get_server_return_hidden_states_mode(model_runner.server_args)
+        < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(

@@ -76,6 +76,7 @@ from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
+    is_cp_v2_active,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -234,6 +235,16 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+def _prefill_cuda_graph_allows_context_parallel(
+    prefill_runner, forward_batch: ForwardBatch
+) -> bool:
+    """Allow CP only through a runner that captured the validated CP-v2 body."""
+    return get_cp_strategy() is None or (
+        bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
+        and is_cp_v2_active(forward_batch)
+    )
+
+
 @dataclass
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
@@ -310,16 +321,15 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        misc_utils.maybe_disable_chunked_prefix_cache(
-            server_args=server_args,
-            use_mla_backend=self.use_mla_backend,
-            is_draft_worker=self.is_draft_worker,
-        )
-
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
+
+        misc_utils.maybe_disable_chunked_prefix_cache(
+            use_mla_backend=self.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
+        )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -408,19 +418,17 @@ class ModelRunner:
         ):
             return
 
-        join_effective_ep_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
-                self.server_args.ep_join_rank_offset,
+                get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
             )
         join_scale_process_group()
-        self.server_args.override(
-            "elastic_ep.scale_join", ep_size=join_effective_ep_size
-        )
+        get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
-        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -444,9 +452,7 @@ class ModelRunner:
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
         )
-        self.server_args.override(
-            "elastic_ep.scale_join", dp_size=join_effective_ep_size
-        )
+        get_context().override("elastic_ep.scale_join", dp_size=join_effective_ep_size)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled while elastic EP scale-up "
@@ -623,7 +629,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            self.server_args.ep_join_rank_offset
+            get_parallel().ep_join_rank_offset
             if self.server_args.is_ep_scale_joiner
             else 0
         )
@@ -803,7 +809,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if self.server_args.enable_dp_attention
+                if get_parallel().enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -834,7 +840,7 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -871,7 +877,7 @@ class ModelRunner:
         self.prefill_attention_backend_str = backends.prefill_attention_backend_str
         self.decode_attention_backend_str = backends.decode_attention_backend_str
 
-        if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
+        if self.server_args.dcp_size > 1 and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -1108,7 +1114,7 @@ class ModelRunner:
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
-        if self.server_args.dwdp_size <= 1:
+        if get_parallel().dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
@@ -1525,7 +1531,9 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
-                and get_cp_strategy() is None
+                and _prefill_cuda_graph_allows_context_parallel(
+                    self.prefill_cuda_graph_runner, forward_batch
+                )
             ):
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
@@ -1659,9 +1667,9 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = self.server_args.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         assert initial_ep_size is not None
-        self.server_args.override("elastic_ep.scale", ep_size=effective_size)
+        get_context().override("elastic_ep.scale", ep_size=effective_size)
 
         expanded_p2l = append_trivial_expert_slots(
             metadata.physical_to_logical_map,
@@ -1678,7 +1686,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
 
     def _rearm_eplb_after_elastic_scale(self) -> None:
         if self.eplb_manager is None:
@@ -1776,7 +1784,7 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
         )
-        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+        get_context().override("elastic_ep.scale", dp_size=target_size)
 
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
