@@ -1152,10 +1152,23 @@ class Engine(EngineScoreMixin, EngineBase):
                 info.get("startup_time")
                 for info in scheduler_init_result.scheduler_infos
             ),
-            e2e=time.perf_counter() - startup_tic,
+            tokenizer_e2e=time.perf_counter() - startup_tic,
         )
         tokenizer_manager.set_startup_time(startup_time)
-        logger.info("Engine startup timings: %s", startup_time)
+        cuda_graph_timings = ", ".join(
+            f"{phase}={duration:.2f}"
+            for phase, duration in startup_time["cuda_graph"].items()
+        )
+        logger.info(
+            "Engine startup timings (s): load_weight=%.2f, "
+            "kv_cache_allocation=%.2f, scheduler_e2e=%.2f, "
+            "cuda_graph={%s}, tokenizer_e2e=%.2f",
+            startup_time["load_weight"],
+            startup_time["kv_cache_allocation"],
+            startup_time["scheduler_e2e"],
+            cuda_graph_timings,
+            startup_time["tokenizer_e2e"],
+        )
 
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][

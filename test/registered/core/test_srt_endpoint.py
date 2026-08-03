@@ -567,7 +567,12 @@ class TestSRTEndpoint(CustomTestCase):
             return
 
         startup_time = response_json["startup_time"]
-        for phase in ("load_weight", "kv_cache_allocation", "scheduler_e2e", "e2e"):
+        for phase in (
+            "load_weight",
+            "kv_cache_allocation",
+            "scheduler_e2e",
+            "tokenizer_e2e",
+        ):
             self.assertIsInstance(startup_time[phase], float)
             self.assertGreater(startup_time[phase], 0)
 

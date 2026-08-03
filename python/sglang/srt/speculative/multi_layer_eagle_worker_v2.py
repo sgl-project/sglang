@@ -373,8 +373,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
-        self._specialized_graph_memory_usage = {}
-        self._specialized_graph_time_usage = {}
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return

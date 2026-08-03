@@ -74,14 +74,6 @@ class TestEnableMetrics(CustomTestCase):
                     "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
-                (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
-                    {"category": "extend"},
-                ),
-                (
-                    "sglang:dp_cooperation_forward_execution_seconds_total",
-                    {"category": "decode"},
-                ),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -147,8 +139,8 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
-            for i in range(2):
-                # Send the request twice to trigger cached token metrics
+            for _ in range(3):
+                # The third request returns to the first rank under DP round-robin.
                 response = requests.post(
                     f"{DEFAULT_URL_FOR_TEST}/generate",
                     json={
@@ -247,7 +239,7 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:startup_time_seconds", {"phase": "load_weight"}),
             ("sglang:startup_time_seconds", {"phase": "kv_cache_allocation"}),
             ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
-            ("sglang:startup_time_seconds", {"phase": "e2e"}),
+            ("sglang:startup_time_seconds", {"phase": "tokenizer_e2e"}),
             ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)

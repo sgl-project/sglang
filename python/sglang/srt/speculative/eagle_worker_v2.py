@@ -340,8 +340,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
-        self._specialized_graph_memory_usage = {}
-        self._specialized_graph_time_usage = {}
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
@@ -1072,10 +1070,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        self._additional_graph_memory_usage = {}
-        self._additional_graph_time_usage = {}
-        self._draft_worker._specialized_graph_memory_usage = {}
-        self._draft_worker._specialized_graph_time_usage = {}
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:

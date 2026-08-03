@@ -62,8 +62,8 @@ def aggregate_scheduler_startup_times(
 def build_engine_startup_time(
     scheduler_startup_times: Iterable[Mapping | None],
     *,
-    e2e: float,
+    tokenizer_e2e: float,
 ) -> dict:
     result = aggregate_scheduler_startup_times(scheduler_startup_times)
-    result["e2e"] = e2e
+    result["tokenizer_e2e"] = tokenizer_e2e
     return result
