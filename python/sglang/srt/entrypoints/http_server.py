@@ -175,6 +175,12 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.http_server_tuning import (
+    granian_http1_settings_kwargs,
+    granian_http2_settings_kwargs,
+    resolved_keep_alive_timeout,
+    uvicorn_tuning_kwargs,
+)
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -2394,6 +2400,8 @@ def _run_granian_server(
     ssl_verify=False,  # MTls is not supported
     backlog=2048,
     backpressure=2048,
+    http1_settings_kwargs=None,
+    http2_settings_kwargs=None,
 ):
     """Serve the in-process ASGI app with Granian (embedded mode) over HTTP/2.
 
@@ -2409,6 +2417,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP1Settings, HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2430,6 +2439,13 @@ def _run_granian_server(
         backlog=backlog,
         backpressure=backpressure,
     )
+    # Protocol-specific tunables go through Granian's HTTP{1,2}Settings, not
+    # as top-level kwargs. The kwargs dicts are built by the caller; we
+    # construct the settings here so the granian import stays lazy.
+    if http1_settings_kwargs:
+        granian_kwargs["http1_settings"] = HTTP1Settings(**http1_settings_kwargs)
+    if http2_settings_kwargs:
+        granian_kwargs["http2_settings"] = HTTP2Settings(**http2_settings_kwargs)
 
     if tokenizer_worker_num > 1:
         granian_kwargs["workers"] = tokenizer_worker_num
@@ -2524,6 +2540,9 @@ def _setup_and_run_http_server(
             port_args, server_args, scheduler_infos[0]
         )
 
+    keep_alive_timeout = resolved_keep_alive_timeout(server_args)
+    uvicorn_kwargs = uvicorn_tuning_kwargs(server_args)
+
     try:
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
@@ -2550,6 +2569,9 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
+                    backlog=server_args.http_backlog,
+                    http1_settings_kwargs=granian_http1_settings_kwargs(server_args),
+                    http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             elif server_args.enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2559,12 +2581,13 @@ def _setup_and_run_http_server(
                     port=server_args.port,
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_keep_alive=keep_alive_timeout,
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    **uvicorn_kwargs,
                 )
                 config.load()  # Creates the SSLContext
 
@@ -2596,12 +2619,13 @@ def _setup_and_run_http_server(
                     port=server_args.port,
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_keep_alive=keep_alive_timeout,
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    **uvicorn_kwargs,
                 )
         else:
             # Multiple tokenizer and http processes
@@ -2634,6 +2658,9 @@ def _setup_and_run_http_server(
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    backlog=server_args.http_backlog,
+                    http1_settings_kwargs=granian_http1_settings_kwargs(server_args),
+                    http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             else:
                 uvicorn.run(
@@ -2642,7 +2669,7 @@ def _setup_and_run_http_server(
                     port=server_args.port,
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_keep_alive=keep_alive_timeout,
                     timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                     loop="uvloop",
                     workers=server_args.tokenizer_worker_num,
@@ -2650,6 +2677,7 @@ def _setup_and_run_http_server(
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    **uvicorn_kwargs,
                 )
     finally:
         if server_args.tokenizer_worker_num > 1:
