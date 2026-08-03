@@ -285,6 +285,7 @@ def prepare_mlp_sync_batch_raw(
                     capture_hidden_mode=None,
                     return_logprob=local_batch.return_logprob,
                     lora_ineligible=prefill_graph_runner.enable_lora,
+                    extend_lens=local_batch.extend_lens,
                 )
             )
             and breakable_prefill
