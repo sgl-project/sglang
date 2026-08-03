@@ -244,6 +244,9 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
                 "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
                 "SGLANG_USE_ROCM700A": "0",
                 "AITER_BF16_FP8_MOE_BOUND": "0",
+                # Standard MI35x CI runners do not expose an RDMA device.
+                # Allow MoRI to use its same-node XGMI-only transport fallback.
+                "MORI_DISABLE_AUTO_XGMI": "0",
                 # Correctness does not depend on pre-reserved hugepages, and
                 # disabling them makes the E2E portable across MI35x runners.
                 "SGLANG_HICACHE_HOST_HUGEPAGE": "0",
