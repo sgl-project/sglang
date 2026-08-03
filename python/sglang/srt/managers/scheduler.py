@@ -99,6 +99,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -590,6 +591,15 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
+        # Start the embedded Rust frontend (rank 0). Must precede
+        # init_disaggregation: on PD prefill the rust api listener also serves
+        # the KV bootstrap registry, and the KVManagers built there register to
+        # it synchronously. (The listener is bound synchronously inside launch,
+        # so the registry is accepting once this returns.) Must also precede
+        # the request receiver, which reads self.recv_from_tokenizer to pick
+        # its ingress transport.
+        self.maybe_init_rust_server()
+
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
@@ -617,10 +627,6 @@ class Scheduler(
         self.init_grammar_manager()
 
         self.maybe_init_scripted_scheduler_hook()
-
-        # Start the embedded Rust frontend (rank 0) before the request receiver,
-        # which reads self.rust_ring_recv to pick its ingress transport.
-        self.maybe_init_rust_server()
 
         self.init_request_receiver()
 
@@ -1213,6 +1219,21 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
+
+        # In rust-server mode the KV bootstrap registry is already serving on
+        # the rust api listener (maybe_init_rust_server runs before this
+        # method — the PrefillBootstrapQueue's KVManager below registers to it
+        # synchronously, and a failed registration only retries ~60s then logs,
+        # leaving every PD request unroutable). Only the ascend config store,
+        # which start_disagg_service would otherwise create, is left to do.
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self._hosts_rust_server()
+        ):
+            maybe_create_ascend_config_store(
+                server_args=self.server_args,
+                transfer_backend=self.transfer_backend,
+            )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
@@ -1844,17 +1865,22 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def _hosts_rust_server(self) -> bool:
+        """Whether this scheduler rank embeds the Rust server (rank 0 only) —
+        and with it the server-process duties a Python ``TokenizerManager``
+        would otherwise own (e.g. serving the PD KV bootstrap registry)."""
+        return envs.SGLANG_RUST_SERVER.get() and (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+
     def maybe_init_rust_server(self) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
-        is_rank_zero = (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        )
-        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+        if not self._hosts_rust_server():
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
@@ -2303,9 +2329,10 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    recv_req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": error_msg}
-                    )
+                    if not envs.SGLANG_RUST_SERVER.get():
+                        recv_req.time_stats.trace_ctx.abort(
+                            abort_info={"reason": error_msg}
+                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
