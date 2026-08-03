@@ -407,8 +407,9 @@ class TpModelWorker(BaseTpWorker):
             mr.ensure_decode_cuda_graphs(capture_bs)
 
     def get_decode_cuda_graph_bs(self) -> List[int]:
-        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill)."""
-        return list(self.model_runner.decode_cuda_graph_capture_bs)
+        """Decode bs captured as CUDA graphs (empty on a not-yet-flipped prefill,
+        or on a runner that never allocates a KV pool, e.g. the MLX stub)."""
+        return list(getattr(self.model_runner, "decode_cuda_graph_capture_bs", []))
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
