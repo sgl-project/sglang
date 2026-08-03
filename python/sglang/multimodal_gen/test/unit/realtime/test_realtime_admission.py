@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.realtime.admission import (
     InMemorySessionLeaseStore,
     RealtimeAdmissionController,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
+)
 
 
 def test_one_active_session_per_user_and_idempotent_release():
@@ -61,3 +64,30 @@ def test_controller_waits_for_capacity_but_not_same_user_limit():
         await controller.release(second)
 
     asyncio.run(scenario())
+
+
+def test_different_users_run_concurrently_but_same_user_is_rejected():
+    async def scenario():
+        controller = RealtimeAdmissionController(
+            InMemorySessionLeaseStore(max_active_sessions=2, ttl_s=60)
+        )
+        first = await controller.admit("u1", "s1", "g1")
+        second = await controller.admit("u2", "s2", "g2")
+        with pytest.raises(AdmissionRejected, match="USER_SESSION_LIMIT"):
+            await controller.admit("u1", "s3", "g3")
+        await controller.release(first)
+        await controller.release(second)
+
+    asyncio.run(scenario())
+
+
+def test_chunk_snapshots_latest_action_and_prompt_versions():
+    session = GenerateSession(max_inflight_chunks=2)
+    session.mark_event_version("camera_actions")
+    first = session.new_chunk()
+    session.mark_event_version("prompt")
+    session.mark_event_version("camera_actions")
+    second = session.new_chunk()
+
+    assert (first.action_version, first.prompt_version) == (1, 0)
+    assert (second.action_version, second.prompt_version) == (2, 1)

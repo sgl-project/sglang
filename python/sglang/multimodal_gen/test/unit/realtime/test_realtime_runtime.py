@@ -687,59 +687,48 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
-def test_wait_for_active_session_slot_observes_release(monkeypatch):
+def test_session_watchdog_closes_idle_session():
     async def run():
-        realtime_video_api._ACTIVE_SESSION_IDS.clear()
-        realtime_video_api._ACTIVE_SESSION_IDS.add("old-session")
-
-        async def fake_sleep(_seconds):
-            realtime_video_api._ACTIVE_SESSION_IDS.clear()
-
-        monkeypatch.setattr(realtime_video_api.asyncio, "sleep", fake_sleep)
+        store = realtime_video_api.InMemorySessionLeaseStore(1, 0.03)
+        controller = realtime_video_api.RealtimeAdmissionController(store)
+        session = GenerateSession()
+        lease = await controller.admit("u1", session.id, session.generation_id)
         try:
-            return await realtime_video_api._wait_for_active_session_slot(
-                timeout_s=1.0,
-                interval_s=0.1,
+            return await realtime_video_api._session_watchdog(
+                session,
+                controller,
+                lease,
+                idle_timeout_s=0.01,
+                max_lifetime_s=1,
+                lease_ttl_s=0.03,
             )
         finally:
-            realtime_video_api._ACTIVE_SESSION_IDS.clear()
+            await controller.release(lease)
 
-    assert asyncio.run(run())
+    assert asyncio.run(run()) == "session idle timeout"
 
 
-def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
+def test_cleanup_realtime_session_releases_scheduler_state(
     monkeypatch,
 ):
     async def run():
         session = GenerateSession()
-        realtime_video_api._ACTIVE_SESSION_IDS.clear()
-        realtime_video_api._ACTIVE_SESSION_IDS.add(session.id)
         release_seen = []
 
         async def fake_forward(req):
-            release_seen.append(
-                (req.session_id, session.id in realtime_video_api._ACTIVE_SESSION_IDS)
-            )
+            release_seen.append(req.session_id)
 
         monkeypatch.setattr(
             realtime_video_api.async_scheduler_client,
             "forward",
             fake_forward,
         )
-        try:
-            await realtime_video_api._cleanup_realtime_session(session, None, None)
-            still_active_after_cleanup = (
-                session.id in realtime_video_api._ACTIVE_SESSION_IDS
-            )
-        finally:
-            realtime_video_api._ACTIVE_SESSION_IDS.clear()
+        await realtime_video_api._cleanup_realtime_session(session, None, None)
+        return session.id, release_seen
 
-        return session.id, release_seen, still_active_after_cleanup
+    session_id, release_seen = asyncio.run(run())
 
-    session_id, release_seen, still_active_after_cleanup = asyncio.run(run())
-
-    assert release_seen == [(session_id, True)]
-    assert still_active_after_cleanup
+    assert release_seen == [session_id]
 
 
 def test_lingbot_realtime_adapter_prepares_chunk_request(monkeypatch):

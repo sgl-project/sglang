@@ -284,6 +284,7 @@ class ServerArgs(DisaggServerArgsMixin):
     realtime_max_sessions: int = 8
     realtime_max_sessions_per_worker: int = 8
     realtime_session_lease_ttl_s: float = 60.0
+    realtime_session_idle_timeout_s: float = 60.0
     realtime_session_max_lifetime_s: float = 600.0
     realtime_admission_wait_s: float = 10.0
     realtime_session_lease_table: str | None = None
@@ -1601,6 +1602,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Lease TTL renewed by valid realtime client activity.",
         )
         parser.add_argument(
+            "--realtime-session-idle-timeout-s",
+            type=float,
+            default=ServerArgs.realtime_session_idle_timeout_s,
+            help="Close a realtime session after this many seconds without valid client activity.",
+        )
+        parser.add_argument(
             "--realtime-session-max-lifetime-s",
             type=float,
             default=ServerArgs.realtime_session_max_lifetime_s,
@@ -2228,6 +2235,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("realtime_max_sessions_per_worker must be >= 1")
         if self.realtime_session_lease_ttl_s <= 0:
             raise ValueError("realtime_session_lease_ttl_s must be > 0")
+        if self.realtime_session_idle_timeout_s <= 0:
+            raise ValueError("realtime_session_idle_timeout_s must be > 0")
         if self.realtime_session_max_lifetime_s <= 0:
             raise ValueError("realtime_session_max_lifetime_s must be > 0")
         if self.realtime_admission_wait_s < 0:

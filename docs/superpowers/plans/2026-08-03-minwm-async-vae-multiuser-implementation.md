@@ -373,7 +373,7 @@ Commit: `git commit -am "feat(realtime): overlap MinWM denoise and remote VAE"`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py`
 - Test: `python/sglang/multimodal_gen/apps/realtime_webui/realtime_low_latency_test.js`
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 ```python
 @pytest.mark.asyncio
@@ -390,17 +390,17 @@ def test_held_key_heartbeat_sends_complete_state():
     assert cameraHeartbeatPayload(new Set(["w", "a"])).actions == ["a", "w"]
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py -q && node python/sglang/multimodal_gen/apps/realtime_webui/realtime_low_latency_test.js`
 
 Expected: FAIL because global single-session gate remains.
 
-- [ ] **Step 3: Replace global gate and add lifecycle watchdog**
+- [x] **Step 3: Replace global gate and add lifecycle watchdog**
 
 Resolve `user_id` from signed auth subject, then `user_id` query/header for test deployments; WebUI stores a random stable browser ID in localStorage and adds it to the WS query. `generate()` waits at most 10 seconds for admission, starts a watchdog that terminates at 60 seconds without client heartbeat/Action/Prompt or 10 minutes total, renews Lease only on valid client activity, and always releases Lease in `finally`. 持续按键每 100 ms 发送完整 key state，GPU dispatch 前 Adapter 对最新状态再快照并记录 superseded version。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q && for f in python/sglang/multimodal_gen/apps/realtime_webui/*test.js; do node "$f"; done`
 

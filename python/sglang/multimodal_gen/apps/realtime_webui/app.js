@@ -66,6 +66,9 @@ const STARTUP_DECODE_QUEUE_SECONDS = 0.75;
 const RECENT_DROP_DISPLAY_MS = 1800;
 const CONTROL_BUFFERED_AMOUNT_LIMIT = 1 << 20;
 const CONTROL_TRANSITION_FLUSH_DELAY_MS = 50;
+const CONTROL_HELD_STATE_HEARTBEAT_MS = 100;
+const SESSION_HEARTBEAT_MS = 15000;
+const BROWSER_USER_ID_STORAGE_KEY = "sglang-realtime-user-id";
 const MIN_RENDER_TIMER_FPS = 30;
 const MAX_RENDER_TIMER_FPS = 60;
 const CONTROL_KEY_ACTIONS = new Map([
@@ -477,6 +480,21 @@ function createTraceId() {
   return Array.from(random, (part) => part.toString(16).padStart(8, "0")).join("");
 }
 
+function stableBrowserUserId() {
+  try {
+    let value = localStorage.getItem(BROWSER_USER_ID_STORAGE_KEY);
+    if (!value) {
+      value = createTraceId();
+      localStorage.setItem(BROWSER_USER_ID_STORAGE_KEY, value);
+    }
+    return value;
+  } catch {
+    return createTraceId();
+  }
+}
+
+const browserUserId = stableBrowserUserId();
+
 function currentTracePayload() {
   if (!currentTrace) return undefined;
   return {
@@ -491,14 +509,17 @@ function currentTracePayload() {
 }
 
 function traceWebSocketUrl(baseUrl) {
-  if (!currentTrace) return baseUrl;
   try {
     const url = new URL(baseUrl, window.location.href);
-    url.searchParams.set("trace_id", currentTrace.traceId);
+    if (currentTrace) url.searchParams.set("trace_id", currentTrace.traceId);
+    url.searchParams.set("user_id", browserUserId);
     return url.toString();
   } catch {
     const separator = baseUrl.includes("?") ? "&" : "?";
-    return `${baseUrl}${separator}trace_id=${encodeURIComponent(currentTrace.traceId)}`;
+    const trace = currentTrace
+      ? `trace_id=${encodeURIComponent(currentTrace.traceId)}&`
+      : "";
+    return `${baseUrl}${separator}${trace}user_id=${encodeURIComponent(browserUserId)}`;
   }
 }
 
@@ -4135,6 +4156,7 @@ class ControlStateController {
     this.activeActions = new Set();
     this.pendingTransitions = [];
     this.flushTimer = 0;
+    this.stateHeartbeatTimer = 0;
   }
 
   reset({ sendRelease = false } = {}) {
@@ -4142,6 +4164,7 @@ class ControlStateController {
     this.activeActions.clear();
     this.pendingTransitions = [];
     this.clearFlushTimer();
+    this.clearStateHeartbeatTimer();
     this.updateButtons();
     if (sendRelease && hadActions) {
       this.enqueueTransition();
@@ -4158,6 +4181,8 @@ class ControlStateController {
     }
     this.updateButtons();
     this.enqueueTransition();
+    if (this.activeActions.size) this.scheduleStateHeartbeat();
+    else this.clearStateHeartbeatTimer();
     return true;
   }
 
@@ -4183,6 +4208,19 @@ class ControlStateController {
       this.flushTimer = 0;
       this.flush();
     }, CONTROL_TRANSITION_FLUSH_DELAY_MS);
+  }
+
+  scheduleStateHeartbeat() {
+    if (this.stateHeartbeatTimer || !this.activeActions.size) return;
+    this.stateHeartbeatTimer = window.setTimeout(() => {
+      this.stateHeartbeatTimer = 0;
+      if (!this.activeActions.size) return;
+      sendCameraControlTransitions([{
+        actions: Array.from(this.activeActions).sort(),
+        clientTsMs: Math.round(performance.now()),
+      }]);
+      this.scheduleStateHeartbeat();
+    }, CONTROL_HELD_STATE_HEARTBEAT_MS);
   }
 
   flush() {
@@ -4229,11 +4267,32 @@ class ControlStateController {
     window.clearTimeout(this.flushTimer);
     this.flushTimer = 0;
   }
+
+  clearStateHeartbeatTimer() {
+    if (!this.stateHeartbeatTimer) return;
+    window.clearTimeout(this.stateHeartbeatTimer);
+    this.stateHeartbeatTimer = 0;
+  }
 }
 
 const CONTROL_ACTION_META_KEYS = Object.keys(CONTROL_ACTION_META);
 controlStateController = new ControlStateController();
 updateControlDebugText();
+window.setInterval(() => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const eventId = nextEventId++;
+  ws.send(pack({
+    type: "event",
+    kind: "heartbeat",
+    payload: {
+      active_actions: Array.from(controlStateController.activeActions).sort(),
+    },
+    event_id: eventId,
+    trace_id: currentTrace?.traceId,
+    client_sent_perf_ms: roundTraceNumber(performance.now()),
+    client_sent_epoch_ms: Date.now(),
+  }));
+}, SESSION_HEARTBEAT_MS);
 
 document.addEventListener("keydown", (event) => {
   if (isTypingTarget(event.target)) return;

@@ -45,6 +45,11 @@ class GenerateSession:
         self.trace_id = self.id
         self.trace_started_at = time.perf_counter()
         self.trace_started_epoch_ms = int(time.time() * 1000)
+        self.created_at = time.monotonic()
+        self.last_client_activity_at = self.created_at
+        self.client_activity_version = 0
+        self.action_version = 0
+        self.prompt_version = 0
         self.client_trace: dict[str, Any] | None = None
         self.request: RealtimeVideoGenerationsRequest | None = None
         self.input_temp_dir: str | None = None
@@ -89,6 +94,16 @@ class GenerateSession:
         self.vae_client = None
         self.realtime_session.dispose()
 
+    def mark_client_activity(self) -> None:
+        self.last_client_activity_at = time.monotonic()
+        self.client_activity_version += 1
+
+    def mark_event_version(self, kind: str) -> None:
+        if kind in {"camera_actions", "action_labels", "action_weights"}:
+            self.action_version += 1
+        elif kind in {"prompt", "scene_cut"}:
+            self.prompt_version += 1
+
     @property
     def current_chunk(self) -> RealtimeChunkContext | None:
         if not self.active_chunks:
@@ -105,8 +120,8 @@ class GenerateSession:
     def new_chunk(
         self,
         *,
-        action_version: int = 0,
-        prompt_version: int = 0,
+        action_version: int | None = None,
+        prompt_version: int | None = None,
     ) -> RealtimeChunkContext:
         if len(self.active_chunks) >= self.max_inflight_chunks:
             if self.max_inflight_chunks == 1:
@@ -119,8 +134,12 @@ class GenerateSession:
             generation_id=self.generation_id,
             index=self.next_chunk_index,
             request_id=f"{self.id}_{uuid4().hex}",
-            action_version=action_version,
-            prompt_version=prompt_version,
+            action_version=(
+                self.action_version if action_version is None else action_version
+            ),
+            prompt_version=(
+                self.prompt_version if prompt_version is None else prompt_version
+            ),
         )
         self.next_chunk_index += 1
         self.active_chunks[chunk.index] = chunk

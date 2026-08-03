@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import hashlib
 import shutil
 import time
 from typing import TYPE_CHECKING, Any
@@ -46,6 +47,13 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_client import (
     RemoteDecodeHandle,
     RemoteFrameBatch,
 )
+from sglang.multimodal_gen.runtime.realtime.admission import (
+    AdmissionRejected,
+    DynamoDBSessionLeaseStore,
+    InMemorySessionLeaseStore,
+    RealtimeAdmissionController,
+    SessionLease,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -55,11 +63,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
-_ACTIVE_SESSION_IDS: set[str] = set()
-_ACTIVE_SESSION_WAIT_SECONDS = 1.0
-_ACTIVE_SESSION_WAIT_INTERVAL_SECONDS = 0.1
 _TRACE_EVENT_QUEUE_LIMIT = 256
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
+_ADMISSION_CONTROLLER: RealtimeAdmissionController | None = None
+_ADMISSION_CONFIG: tuple | None = None
 
 
 class _OrderedDecodeCoordinator:
@@ -223,15 +230,81 @@ async def _send_realtime_trace_events(
         )
 
 
-async def _wait_for_active_session_slot(
+def _get_admission_controller(server_args) -> RealtimeAdmissionController:
+    global _ADMISSION_CONFIG, _ADMISSION_CONTROLLER
+    config = (
+        int(server_args.realtime_max_sessions),
+        float(server_args.realtime_session_lease_ttl_s),
+        float(server_args.realtime_admission_wait_s),
+        server_args.realtime_session_lease_table,
+    )
+    if _ADMISSION_CONTROLLER is not None and _ADMISSION_CONFIG == config:
+        return _ADMISSION_CONTROLLER
+    if server_args.realtime_session_lease_table:
+        store = DynamoDBSessionLeaseStore(
+            server_args.realtime_session_lease_table,
+            max_active_sessions=server_args.realtime_max_sessions,
+            ttl_s=server_args.realtime_session_lease_ttl_s,
+        )
+    else:
+        store = InMemorySessionLeaseStore(
+            max_active_sessions=server_args.realtime_max_sessions,
+            ttl_s=server_args.realtime_session_lease_ttl_s,
+        )
+    _ADMISSION_CONTROLLER = RealtimeAdmissionController(
+        store,
+        wait_timeout_s=server_args.realtime_admission_wait_s,
+    )
+    _ADMISSION_CONFIG = config
+    return _ADMISSION_CONTROLLER
+
+
+def _resolve_realtime_user_id(websocket: WebSocket) -> str:
+    principal = websocket.scope.get("user")
+    if principal is not None:
+        for name in ("sub", "id", "username"):
+            value = (
+                principal.get(name)
+                if isinstance(principal, dict)
+                else getattr(principal, name, None)
+            )
+            if value:
+                return f"auth:{str(value)[:240]}"
+    query_user = websocket.query_params.get("user_id")
+    if query_user:
+        return f"query:{query_user[:240]}"
+    header_user = websocket.headers.get("x-user-id")
+    if header_user:
+        return f"header:{header_user[:240]}"
+    client_host = websocket.client.host if websocket.client else "unknown"
+    return f"client:{client_host}"
+
+
+def _user_id_fingerprint(user_id: str) -> str:
+    return hashlib.blake2s(user_id.encode("utf-8"), digest_size=8).hexdigest()
+
+
+async def _session_watchdog(
+    session: GenerateSession,
+    controller: RealtimeAdmissionController,
+    lease: SessionLease,
     *,
-    timeout_s: float = _ACTIVE_SESSION_WAIT_SECONDS,
-    interval_s: float = _ACTIVE_SESSION_WAIT_INTERVAL_SECONDS,
-) -> bool:
-    deadline = time.monotonic() + timeout_s
-    while _ACTIVE_SESSION_IDS and time.monotonic() < deadline:
+    idle_timeout_s: float,
+    max_lifetime_s: float,
+    lease_ttl_s: float,
+) -> str:
+    interval_s = min(5.0, max(0.1, lease_ttl_s / 3.0))
+    while True:
         await asyncio.sleep(interval_s)
-    return not _ACTIVE_SESSION_IDS
+        now = time.monotonic()
+        if now - session.created_at >= max_lifetime_s:
+            return "maximum session lifetime reached"
+        if now - session.last_client_activity_at >= idle_timeout_s:
+            return "session idle timeout"
+        try:
+            await controller.renew(lease)
+        except AdmissionRejected:
+            return "session lease lost"
 
 
 def _coerce_metric_ms(value: Any) -> float | None:
@@ -938,6 +1011,10 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                 client_event = compact_client_trace_event(realtime_event.payload)
                 event_name = str(client_event.pop("name", "client_trace"))
                 log_realtime_trace(logger, session, event_name, **client_event)
+                session.mark_client_activity()
+                continue
+            if realtime_event.kind == "heartbeat":
+                session.mark_client_activity()
                 continue
             if session.adapter is None:
                 raise ValueError("realtime adapter is not initialized")
@@ -952,6 +1029,8 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                 payload_bytes=_safe_len(message),
             )
             event_log = session.adapter.ingest_event(session, realtime_event)
+            session.mark_event_version(realtime_event.kind)
+            session.mark_client_activity()
             log_realtime_trace(
                 logger,
                 session,
@@ -1103,6 +1182,7 @@ async def generate(websocket: WebSocket):
     await websocket.accept()
     ws = _LockedRealtimeWebSocket(websocket)
     session = GenerateSession()
+    user_id = _resolve_realtime_user_id(websocket)
     session.trace_id = normalize_trace_id(
         websocket.query_params.get("trace_id"), fallback=session.trace_id
     )
@@ -1126,42 +1206,56 @@ async def generate(websocket: WebSocket):
             "server.warmup_wait_done",
             wait_ms=round(warmup_wait_ms, 3),
         )
-    if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
-        logger.warning(
-            "reject realtime session because another session is active: %s",
-            sorted(_ACTIVE_SESSION_IDS),
-        )
-        log_realtime_trace(
-            logger,
-            session,
-            "server.session_rejected",
-            reason="another realtime session is already active",
-            active_sessions=sorted(_ACTIVE_SESSION_IDS),
-        )
-        try:
-            await write_error_msg(
-                "another realtime session is already active", ws
-            )
-        finally:
-            await ws.close(code=1008)
-            trace_task.cancel()
-            await _await_realtime_task(trace_task)
-            _uninstall_realtime_trace_sink(session, trace_sink)
-        return
-
-    _ACTIVE_SESSION_IDS.add(session.id)
+    server_args = get_global_server_args()
+    controller = _get_admission_controller(server_args)
+    lease = None
     generate_task = None
     listen_task = None
+    watchdog_task = None
     try:
         # receive new generate request
         await _listen_generate_request(ws, session, trace_sink)
+
+        try:
+            lease = await controller.admit(user_id, session.id, session.generation_id)
+        except AdmissionRejected as exc:
+            log_realtime_trace(
+                logger,
+                session,
+                "server.session_rejected",
+                reason=exc.reason,
+                retry_after_s=exc.retry_after_s,
+            )
+            await write_error_msg(f"realtime admission rejected: {exc.reason}", ws)
+            await _close_realtime_websocket(
+                ws,
+                code=1008,
+                reason=exc.reason,
+            )
+            return
+        log_realtime_trace(
+            logger,
+            session,
+            "server.session_admitted",
+            user_key_hash=_user_id_fingerprint(user_id),
+        )
 
         # continuously generate video chunk
         generate_task = asyncio.create_task(_generate_loop(ws, session))
         # continuously listen for user events
         listen_task = asyncio.create_task(_listen_events(ws, session))
+        watchdog_task = asyncio.create_task(
+            _session_watchdog(
+                session,
+                controller,
+                lease,
+                idle_timeout_s=server_args.realtime_session_idle_timeout_s,
+                max_lifetime_s=server_args.realtime_session_max_lifetime_s,
+                lease_ttl_s=server_args.realtime_session_lease_ttl_s,
+            )
+        )
 
-        wait_tasks = [generate_task, listen_task]
+        wait_tasks = [generate_task, listen_task, watchdog_task]
         await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
         if generate_task.done() and session.reached_max_chunks():
             await _close_realtime_websocket(
@@ -1169,18 +1263,31 @@ async def generate(websocket: WebSocket):
                 code=1000,
                 reason="generation complete",
             )
+        elif watchdog_task.done():
+            reason = await watchdog_task
+            log_realtime_trace(
+                logger,
+                session,
+                "server.session_watchdog_closed",
+                reason=reason,
+            )
+            await _close_realtime_websocket(ws, code=1000, reason=reason)
 
     except WebSocketDisconnect:
         log_realtime_trace(logger, session, "server.client_disconnected")
         logger.info("client disconnected, session_id=%s", session.id)
     finally:
         try:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                await _await_realtime_task(watchdog_task)
             await _cleanup_realtime_session(session, generate_task, listen_task)
         finally:
+            if lease is not None:
+                await controller.release(lease)
             trace_task.cancel()
             await _await_realtime_task(trace_task)
             _uninstall_realtime_trace_sink(session, trace_sink)
-            _ACTIVE_SESSION_IDS.discard(session.id)
 
 
 async def write_error_msg(error_msg: str, websocket: WebSocket):
