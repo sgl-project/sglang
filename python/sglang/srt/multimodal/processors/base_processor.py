@@ -498,7 +498,6 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
-        defer_feature_cpu_transfer = kwargs.pop("_defer_feature_cpu_transfer", False)
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
@@ -576,7 +575,9 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.use_cuda_ipc and not defer_feature_cpu_transfer:
+        # Deferred: the hash is computed on the GPU tensor first, and
+        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
+        if not self.use_cuda_ipc and not self.precompute_hash_before_cpu_transfer:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(
@@ -1324,7 +1325,6 @@ class BaseMultimodalProcessor(ABC):
             images=images,
             audios=audios,
             videos=videos,
-            _defer_feature_cpu_transfer=self.precompute_hash_before_cpu_transfer,
             **kwargs,
         )
 
@@ -1611,7 +1611,8 @@ class BaseMultimodalProcessor(ABC):
 
         self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
-        # Wrap GPU features in the bounded IPC pool; pool misses fall back to CPU.
+        # Wrap GPU features in the bounded IPC pool; pool misses fall back to a
+        # plain CPU tensor. The scheduler copies out and releases each slice.
         if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:

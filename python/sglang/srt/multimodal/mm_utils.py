@@ -759,13 +759,8 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=input_dtype,
             )
 
-    # Single-image fast path: exactly one owner rank computed the embedding
-    # and the other tp_size-1 ranks are empty. The symmetric all-gather below
-    # would move tp_size x max_len_per_rank rows (i.e. (tp_size-1)/tp_size of
-    # it is padding) and allocate a tp_size-times-larger padded buffer. A
-    # broadcast from the owner delivers the identical embedding to every rank
-    # while moving one copy. Bit-identical to the all-gather path, which for a
-    # single image just reconstructs the owner's own rows.
+    # Single-image fast path. Bit-identical to the all-gather below, which for
+    # one image just pads the owner's rows and slices them back out.
     if len(grid_thw_list) == 1:
         owner_local = image_to_tp_rank[0]
         n_tok = output_tokens_per_image[0]
