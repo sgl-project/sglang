@@ -979,6 +979,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         self._recovery_stream: Optional[torch.cuda.Stream] = None
         self._recovery_event: Optional[torch.cuda.Event] = None
         self._recovery_event_pending: bool = False
+        # Created with _recovery_stream and reused every step, because
+        # _no_cache_mtp_recompute runs on the bs=1 host-latency critical path:
+        # a bare Event.record() resolves the current stream in C++, where
+        # torch.cuda.current_stream() costs ~40us of interpreter time
+        # (_get_device_index -> _cuda_getDevice plus a fresh Stream wrapper),
+        # and torch.cuda.stream() allocates a new StreamContext per call.
+        self._recovery_join_event: Optional[torch.cuda.Event] = None
+        self._recovery_stream_ctx: Optional[torch.cuda.StreamContext] = None
         # CUDA graph for FlashInfer recovery: replace the per-layer kernel
         # launches (their CPU dispatch cost) with a single graph replay. Captured
         # AND replayed on _recovery_stream so it still overlaps draft_extend + next
@@ -1026,13 +1034,30 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
+    def _ensure_recovery_stream(self):
+        """Lazily create the recovery side stream and its per-step helpers.
+
+        Both the warmup capture and the serving path enter through here so the
+        cached join event / stream context can never be left unset by whichever
+        one runs first.
+        """
+        if self._recovery_stream is not None:
+            return
+        self._recovery_stream = torch.cuda.Stream()
+        self._recovery_event = torch.cuda.Event()
+        self._recovery_join_event = torch.cuda.Event()
+        self._recovery_stream_ctx = torch.cuda.stream(self._recovery_stream)
+
     def _wait_recovery_if_pending(self):
         """Join the side-stream gdn_mtp_cache_mode=none SSM recovery before a
         target forward reads the SSM pool. The wait also prevents the upcoming
         forward from overwriting the per-layer recovery stash while the
         side-stream recovery is still reading it."""
         if self._recovery_event_pending:
-            torch.cuda.current_stream().wait_event(self._recovery_event)
+            # Event.wait() with no stream defaults to the current stream inside
+            # C++ — same ordering as current_stream().wait_event(event), without
+            # building the Python Stream wrapper.
+            self._recovery_event.wait()
             self._recovery_event_pending = False
 
     def init_forward_metadata_out_graph(
@@ -1488,9 +1513,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # once here; batches that carry no track indices simply skip the replay.
         capture_boundary = get_server_args().enable_mamba_extra_buffer()
 
-        if self._recovery_stream is None:
-            self._recovery_stream = torch.cuda.Stream()
-            self._recovery_event = torch.cuda.Event()
+        self._ensure_recovery_stream()
 
         buckets = sorted({int(b) for b in capture_bs if 0 < int(b) <= pool.size})
         if not buckets:
@@ -1616,9 +1639,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         actual_seq_len = batch_size * draft_token_num
         cache_steps = draft_token_num
-        # The kernel expects int32 state indices.
-        state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
-        accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
 
         # On SM100+ with a bf16 state pool, recover via the FlashInfer MTP kernel
         # (PR #3502) — the cuda-graph path, reading k/v as strided views of the
@@ -1629,6 +1649,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
         use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
+
+        # The Triton recover kernel takes these as kernel arguments, so it needs
+        # materialized int32 tensors (and keeps them alive for record_stream
+        # below). The FlashInfer path only ever copies them into the stable
+        # _rec_* int32 buffers, and Tensor.copy_ narrows on the way in — so the
+        # conversion there is two eager dispatches of pure overhead, which a
+        # host-latency-bound bs=1 decode pays in wall clock.
+        state_idx_i32 = None
+        accepted_steps_i32 = None
+        if not use_fi_recovery:
+            state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+            accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
 
         # Interval-checkpoint boundary pass runs on both recovery paths. FI uses
         # native output_state_indices; the Triton recover kernel takes a separate
@@ -1666,31 +1698,50 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
             # Smallest warmup-captured bucket >= B (None → eager, no graph).
             B_bucket = self._rec_pad_to_bucket(B)
-            logger.debug("[gdn_recovery] FI recovery B=%d bucket=%s", B, B_bucket)
             # Refresh stable buffers on the main stream before the side-stream
-            # read (recovery_stream.wait_stream below orders after these copies).
-            self._rec_state_idx_buf[:B].copy_(state_idx_i32)
-            self._rec_acc_steps_buf[:B].copy_(accepted_steps_i32)
-            if B_bucket is not None and B_bucket > B:
-                # Pad rows [B:bucket] → reserved slot 0 (never a real request, so
-                # their recovery output is discarded harmlessly).
-                self._rec_state_idx_buf[B:B_bucket].fill_(0)
-                self._rec_acc_steps_buf[B:B_bucket].fill_(0)
+            # read (the join event recorded below orders after these copies).
+            # Batched into one grouped _foreach_copy_: the buffers are int32 and
+            # copy_ narrows the int64 sources itself, so no .to()/.contiguous()
+            # temporaries are needed and the whole refresh is one dispatch.
+            # Destinations are distinct buffers over disjoint rows, so the
+            # regrouping _grouped_foreach_copy_ does by dtype pair is order-safe.
+            from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+                _grouped_foreach_copy_,
+            )
+
+            refresh_dsts = [self._rec_state_idx_buf[:B], self._rec_acc_steps_buf[:B]]
+            refresh_srcs = [state_indices_tensor, accepted_steps]
+            crossed = None
             if do_boundary:
                 # Boundary pass output slots come from mamba_track_indices, its
                 # fold count from mamba_steps_to_track. Requests crossing no
                 # boundary carry step == -1 → redirect to reserved slot 0 / step 0
                 # (folds 0 steps, writing h_0 to the discard slot).
-                _fi_track_idx_i32 = mamba_track_indices.to(torch.int32).contiguous()
-                _fi_track_steps_i32 = mamba_steps_to_track.to(torch.int32).contiguous()
-                crossed = _fi_track_steps_i32 >= 0
-                self._rec_track_idx_buf[:B].copy_(
-                    torch.where(crossed, _fi_track_idx_i32, 0)
-                )
-                self._rec_track_steps_buf[:B].copy_(
-                    torch.where(crossed, _fi_track_steps_i32, 0)
-                )
-                if B_bucket is not None and B_bucket > B:
+                #
+                # clamp(min=0) is exactly where(steps >= 0, steps, 0) for every
+                # integer input, so the fold count needs no explicit mask. The
+                # output slot still does — leaving a non-crossing request pointed
+                # at its real track slot would clobber a live ping-pong
+                # checkpoint with h_0 — but that mask applies in place on the
+                # stable buffer below, which avoids torch.where's output alloc.
+                crossed = mamba_steps_to_track >= 0
+                refresh_dsts += [
+                    self._rec_track_idx_buf[:B],
+                    self._rec_track_steps_buf[:B],
+                ]
+                refresh_srcs += [
+                    mamba_track_indices,
+                    mamba_steps_to_track.clamp(min=0),
+                ]
+            _grouped_foreach_copy_(refresh_dsts, refresh_srcs)
+            if do_boundary:
+                self._rec_track_idx_buf[:B].mul_(crossed)
+            if B_bucket is not None and B_bucket > B:
+                # Pad rows [B:bucket] → reserved slot 0 (never a real request, so
+                # their recovery output is discarded harmlessly).
+                self._rec_state_idx_buf[B:B_bucket].fill_(0)
+                self._rec_acc_steps_buf[B:B_bucket].fill_(0)
+                if do_boundary:
                     # The boundary graph is captured at bucket size, so its pad
                     # rows need a destination too → reserved slot 0.
                     self._rec_track_idx_buf[B:B_bucket].fill_(0)
@@ -1784,12 +1835,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         # touch the SSM pool). The next target forward joins on _recovery_event
         # (see _wait_recovery_if_pending) before reading / overwriting the SSM
         # pool & stash.
-        if self._recovery_stream is None:
-            self._recovery_stream = torch.cuda.Stream()
-            self._recovery_event = torch.cuda.Event()
+        self._ensure_recovery_stream()
         # Recovery must observe the stash writes and (FI) stable-buffer copies
         # issued on the current stream during this step's verify forward.
-        self._recovery_stream.wait_stream(torch.cuda.current_stream())
+        # record() with no argument resolves the current stream in C++, so this
+        # pair is wait_stream(current_stream()) without the Python round trip.
+        self._recovery_join_event.record()
+        self._recovery_stream.wait_event(self._recovery_join_event)
 
         if use_fi_recovery and B_bucket is not None:
             # Replay the warmup-captured graph for this bucket on the side stream
@@ -1798,7 +1850,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             # captured graph (falling back to eager launches if it was not
             # captured) BEFORE the working replay, so it reads h_0 before the
             # working graph overwrites it with h_K.
-            with torch.cuda.stream(self._recovery_stream):
+            with self._recovery_stream_ctx:
                 if do_boundary:
                     boundary_graph = self._rec_boundary_graphs.get(B_bucket)
                     if boundary_graph is not None:
@@ -1810,7 +1862,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             # No warmup graph (Triton fallback, B beyond the largest captured
             # bucket, or capture disabled/failed): eager recovery on the side
             # stream — the known-good overlap path.
-            with torch.cuda.stream(self._recovery_stream):
+            with self._recovery_stream_ctx:
                 if do_boundary:
                     _run_boundary()
                 _run_recovery()
