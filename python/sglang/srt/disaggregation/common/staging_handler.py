@@ -152,16 +152,6 @@ class DecodeStagingHandler:
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
         # Called once per room from pop_preallocated, before send_metadata.
-        # Scatter offsets shift suffix-relative page_start by the decode
-        # prefix, which is only exact when the prefix is page-aligned.
-        page_size = self.kv_buffer_info["page_size"]
-        if decode_req.req.cache_protected_len % page_size != 0:
-            raise RuntimeError(
-                f"[STAGING] decode prefix length "
-                f"{decode_req.req.cache_protected_len} is not page-aligned "
-                f"(page_size={page_size}); staging scatter offsets would be "
-                f"wrong for room={room}."
-            )
         decode_req._staging_all_success = False
         decode_req._staging_success_ts = 0.0
         decode_req._staging_failed = False
@@ -169,6 +159,20 @@ class DecodeStagingHandler:
         decode_req._chunk_events = []
         self._room_to_decode_req[room] = decode_req
         self._room_to_receiver[room] = decode_req.kv_receiver
+        # Scatter offsets shift suffix-relative page_start by the decode prefix,
+        # exact only when the prefix is page-aligned. Fail just this request on a
+        # mismatch instead of raising, which would kill the prefill scheduler.
+        page_size = self.kv_buffer_info["page_size"]
+        if decode_req.req.cache_protected_len % page_size != 0:
+            logger.error(
+                "[STAGING] decode prefix length %s is not page-aligned "
+                "(page_size=%s); failing room=%s (staging scatter offsets "
+                "would be wrong).",
+                decode_req.req.cache_protected_len,
+                page_size,
+                room,
+            )
+            decode_req._staging_failed = True
 
     def unregister_decode_req(self, room: int) -> None:
         # Pop before release_room so no new arrival can start consuming the slots.
