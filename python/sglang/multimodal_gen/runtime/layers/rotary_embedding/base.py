@@ -1,6 +1,6 @@
 """RotaryEmbedding base class and LinearScalingRotaryEmbedding variant."""
 
-import Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -21,10 +21,12 @@ class RotaryEmbedding(CustomOp):
         self,
         head_size: int,
         rotary_dim: int,
-        max_position_embeddings: int,
-        base: int | float,
-        is_neox_style: bool,
-        dtype: torch.dtype,
+        max_position_embeddings: Optional[int] = 4096,
+        base: Optional[int | float] = 10000,
+        is_neox_style: bool = False,
+        is_interleaved: bool = True,
+        dtype: Optional[torch.dtype] = torch.float16,
+        use_precomputed_cache: bool = False,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -32,12 +34,14 @@ class RotaryEmbedding(CustomOp):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.is_neox_style = is_neox_style
+        self.interleaved = is_interleaved
         self.dtype = dtype
 
-        cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
-        self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        if use_precomputed_cache:
+            cache = self._compute_cos_sin_cache()
+            cache = cache.to(dtype)
+            self.cos_sin_cache: torch.Tensor
+            self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -182,6 +186,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
@@ -195,14 +200,14 @@ class RotaryEmbedding(CustomOp):
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style, self.interleaved)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style, self.interleaved)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
