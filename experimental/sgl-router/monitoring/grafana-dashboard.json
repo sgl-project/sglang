@@ -1922,8 +1922,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Cache-aware lookup health",
-      "description": "Match is the weighted matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level.",
+      "title": "Cache-aware lookup health (all replicas)",
+      "description": "Traffic-weighted fleet lookup health, summed across router replicas and kept per model because ratios are not additive across models. Match is the matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level. Split to \"Cache-aware lookup health by replica\" only to test whether a single replica is responsible.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1931,6 +1931,152 @@
       "gridPos": {
         "x": 0,
         "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "id": 52,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "min"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model_id) (rate(sgl_router_overlap_blocks_sum{model_id=~\"$model_id\"}[$__rate_interval])) / (sum by (model_id) (rate(sgl_router_cache_aware_query_blocks_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model_id}} match",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible\"}[$__rate_interval])) or 0 * sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "{{model_id}} lookup coverage",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache-aware routing decisions (all replicas)",
+      "description": "Fleet-wide terminal cache-aware routing decisions summed across router replicas, one outcome per policy evaluation rather than per request: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Read this for the outcome mix and its trend; drop to \"Cache-aware policy evaluations by replica\" only to test whether a single replica is responsible. cache_hit falling while below_threshold or matched_workers_ineligible rises is the signature of locality loss.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "id": 53,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:evals/s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (decision) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{decision}}",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache-aware lookup health by replica",
+      "description": "Per-replica lookup health; use \"Cache-aware lookup health (all replicas)\" for the fleet ratio. Match is the weighted matched/query block ratio among tree lookups; coverage is the fraction of policy evaluations that reached a tree lookup. Low match with a healthy tree points to a token/render/hash parity mismatch. Low coverage exposes early exits such as hash_config_unknown. Admission races can repeat evaluations, while parked hand-offs skip them, so neither series is request-level.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
         "w": 6,
         "h": 8
       },
@@ -1992,33 +2138,34 @@
     },
     {
       "type": "timeseries",
-      "title": "Cache-aware policy evaluations",
-      "description": "Terminal policy-evaluation outcomes, not request counts: admission races can evaluate repeatedly and parked hand-offs skip evaluation. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; matched_workers_ineligible commonly means cached owners were at capacity; hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
+      "title": "Cache-aware policy evaluations by replica",
+      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; matched_workers_ineligible commonly means cached owners were at capacity; hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "x": 6,
-        "y": 57,
+        "y": 65,
         "w": 6,
         "h": 8
       },
       "id": 43,
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "suffix:evals/s",
+          "min": 0,
           "color": {
             "mode": "palette-classic"
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
+            "fillOpacity": 0,
             "lineWidth": 1,
             "showPoints": "never",
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             }
           }
         },
@@ -2026,9 +2173,16 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "mean",
+            "max"
+          ],
+          "sortBy": "Last *",
+          "sortDesc": true
         },
         "tooltip": {
           "mode": "multi",
@@ -2061,7 +2215,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 57,
+        "y": 65,
         "w": 6,
         "h": 8
       },
@@ -2118,7 +2272,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 57,
+        "y": 65,
         "w": 6,
         "h": 8
       },
@@ -2186,7 +2340,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 73,
         "w": 24,
         "h": 1
       },
@@ -2203,7 +2357,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 66,
+        "y": 74,
         "w": 8,
         "h": 8
       },
@@ -2296,7 +2450,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 66,
+        "y": 74,
         "w": 8,
         "h": 8
       },
@@ -2389,7 +2543,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 66,
+        "y": 74,
         "w": 8,
         "h": 8
       },
