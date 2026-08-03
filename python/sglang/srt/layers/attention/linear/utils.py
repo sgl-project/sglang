@@ -43,13 +43,15 @@ LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
 LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
-def initialize_linear_attn_config(server_args: ServerArgs):
+def initialize_linear_attn_config(
+    server_args: ServerArgs, prefill_default: Optional[str] = None
+):
     global LINEAR_ATTN_DECODE_BACKEND
     global LINEAR_ATTN_PREFILL_BACKEND
 
     base = server_args.linear_attn_backend
     decode = server_args.linear_attn_decode_backend or base
-    prefill = server_args.linear_attn_prefill_backend or base
+    prefill = server_args.linear_attn_prefill_backend or prefill_default or base
 
     LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
     LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
