@@ -178,9 +178,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
-        # Job control (single-rank only in v1: admission filtering and
-        # queued-request drops must be identical on every rank, which needs
-        # the decisions broadcast alongside the requests)
         self.jobs: JobRegistry | None = None
         self._job_control_thread: threading.Thread | None = None
         self._job_control_socket: zmq.Socket | None = None
@@ -1058,14 +1055,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output = OutputBatch(
                     error="request cancelled before dispatch", cancelled=True
                 )
-                # retain the typed tombstone so later duplicates replay a
-                # cancel (409) instead of a bare not-replayable failure
                 self.jobs.finish(req.request_id, output)
                 self._try_return(output, identity)
             elif verdict == "replay":
                 if payload is None or contains_file_refs(payload.output):
-                    # spilled arrays are single-consumer; a second read would
-                    # hand out dead refs
                     payload = OutputBatch(
                         error=(
                             f"request {req.request_id} already finished; "
@@ -1156,7 +1149,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
-            # admission runs before the broadcast so every rank sees one list
             recv_reqs = self._admit_new_reqs(recv_reqs)
         else:
             recv_reqs = None
@@ -1287,16 +1279,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     for _ in items
                 ]
 
-            # 3. return results; registry transitions happen before replies so
-            # a failed send cannot lose a terminal state or strand waiters
             for (identity, processed_req), output_batch in zip(
                 items, output_batches, strict=True
             ):
                 is_warmup = is_warmup_req(processed_req)
                 self._log_warmup_result(output_batch, processed_req, is_warmup)
                 waiters = self._job_waiters(processed_req, output_batch, is_warmup)
-                # the primary reply spills arrays to single-consumer file refs
-                # in place; waiters need their own spill from the raw output
                 pre_spill_output = output_batch.output
 
                 should_return_lightweight_warmup_result = (
@@ -1328,8 +1316,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._log_batch_metrics_summary()
 
         if self._job_control_thread is not None:
-            # _running is already False; let the side channel exit before the
-            # context is destroyed under its socket
             self._job_control_thread.join(timeout=2.0)
         if self.receiver is not None:
             self.receiver.close()

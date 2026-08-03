@@ -774,7 +774,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attn_metadata = None
 
         for i, timestep in enumerate(timesteps):
-            # between-step cancellation and progress point (job control)
             check_current_step(i, len(timesteps))
             noise_latents = noise_latents_btchw
             latent_model_input = prepare_model_input(current_latents).to(target_dtype)

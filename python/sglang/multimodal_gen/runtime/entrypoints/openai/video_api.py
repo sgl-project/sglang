@@ -883,8 +883,6 @@ async def delete_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # DELETE-as-cancel: reach queued work immediately and running denoise
-    # work at the next step boundary (job control). best-effort for finished jobs
     from sglang.multimodal_gen.runtime.managers.job_registry import CancelReq
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 

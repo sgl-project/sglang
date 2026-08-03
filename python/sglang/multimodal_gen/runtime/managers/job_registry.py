@@ -1,15 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scheduler-side job control: identity, idempotency, cancel, status.
-
-The registry is the authority on request lifecycle. Admission dedupes on the
-client-supplied request id before dispatch, cancellation reaches GPU work
-through a between-step check in the denoise loop, and a side-channel socket
-serves cancel/status while the event loop is blocked inside a forward.
-Job control is active on single-rank schedulers only in v1: admission
-filtering and queued-request drops must be identical on every rank, which
-requires broadcasting the decisions alongside the requests (documented
-follow-up, mirroring the TP>1 scoping of realtime job control).
-"""
+"""Scheduler-side job control: identity, idempotency, cancel, status."""
 
 from __future__ import annotations
 
@@ -22,10 +12,8 @@ import msgspec
 from sglang.multimodal_gen.runtime.ipc_array import NumpyArrayFileRef
 
 _FINISHED_RETENTION = 64
-# terminal jobs stay replayable for at least this long even past the cap
 _FINISHED_TTL_S = 300.0
 _PRECANCEL_CAP = 1024
-# absolute bound on retained finished jobs, TTL notwithstanding
 _FINISHED_HARD_CAP = 4 * _FINISHED_RETENTION
 
 QUEUED = "queued"
@@ -41,8 +29,7 @@ class RequestCancelledError(Exception):
 
 
 def contains_file_refs(value: Any) -> bool:
-    """Spilled arrays are single-consumer; a payload holding refs to them
-    cannot be replayed to a second reader."""
+    """True if the payload holds single-consumer spilled array refs."""
     if isinstance(value, NumpyArrayFileRef):
         return True
     if isinstance(value, (list, tuple)):
@@ -96,19 +83,13 @@ class JobRegistry:
     def __init__(self) -> None:
         self._jobs: dict[str, JobHandle] = {}
         self._finished: list[str] = []
-        # cancels for ids the event loop has not received yet (it may be
-        # blocked inside a forward); honored at admission, TTL-bounded so a
-        # cancel for an id that never arrives cannot poison a future reuse
         self._precancelled: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def admit(
         self, request_id: str, identity: bytes | None
     ) -> tuple[str, JobHandle | Any | None]:
-        """Idempotency before dispatch: ("new", handle) for a fresh id,
-        ("wait", handle) after attaching the duplicate as a waiter,
-        ("replay", output) for a finished job with its cached result, or
-        ("cancelled", None) when the id was cancelled before arrival."""
+        """Return ("new"|"wait"|"replay"|"cancelled", handle_or_output)."""
         with self._lock:
             handle = self._jobs.get(request_id)
             if handle is None:
@@ -140,19 +121,12 @@ class JobRegistry:
             return handle
 
     def finish(self, request_id: str, output: Any) -> list[bytes]:
-        """Terminal transition; returns waiter identities owed a reply.
-
-        Waiters attached before the transition still receive the live payload
-        (the caller replies from its own reference); only the retained replay
-        copy is dropped when the payload is not replayable.
-        """
+        """Mark terminal and return waiter identities owed a reply."""
         with self._lock:
             handle = self._jobs.get(request_id)
             if handle is None:
                 return []
             if handle.status not in _TERMINAL:
-                # classify from what actually happened: a cancel that arrived
-                # too late to abort the forward is a completion, not a cancel
                 if output.cancelled:
                     handle.status = CANCELLED
                 elif output.error:
@@ -184,8 +158,6 @@ class JobRegistry:
                 and now - oldest.finished_ts < _FINISHED_TTL_S
                 and len(self._finished) <= _FINISHED_HARD_CAP
             ):
-                # young entries stay for idempotent replay, up to a hard cap
-                # that bounds retained output payloads under sustained load
                 break
             self._jobs.pop(self._finished.pop(0), None)
 
@@ -193,7 +165,6 @@ class JobRegistry:
         with self._lock:
             handle = self._jobs.get(request_id)
             if handle is None:
-                # not received yet (the loop may be mid-forward); honor later
                 self._expire_precancelled()
                 if len(self._precancelled) >= _PRECANCEL_CAP:
                     self._precancelled.pop(next(iter(self._precancelled)), None)
@@ -242,7 +213,6 @@ def check_current_step(step_index: int, total_steps: int) -> None:
     for handle in jobs:
         handle.step = step_index
         handle.total_steps = total_steps
-    # a merged dynamic batch aborts only when every member is cancelled
     if not all(handle.cancel_event.is_set() for handle in jobs):
         return
     raise RequestCancelledError(f"cancelled at denoise step {step_index}/{total_steps}")

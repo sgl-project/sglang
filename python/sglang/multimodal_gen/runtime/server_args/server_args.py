@@ -356,9 +356,7 @@ class ServerArgs(DisaggServerArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
-    # side channel for job cancel/status, reachable while a forward runs
     scheduler_cancel_port: int = 0
-    # opt out of job cancel/status endpoints and the cancel-port reservation
     disable_job_control: bool = False
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
@@ -481,7 +479,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_network_ports()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
-        # the cancel port gate reads resolved parallelism, so settle it after
         self._settle_job_control_port()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
@@ -1009,11 +1006,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _settle_job_control_port(self):
-        """Reserve the cancel side channel only when the resolved config can
-        enable job control; runs after parallelism adjustment because the
-        gate depends on resolved sp/tp/cfg-parallel values. Under
-        --strict-ports the port must not be required when job control is off.
-        """
+        """Reserve the cancel port when job control is enabled."""
         if not self.job_control_enabled:
             return
         self.scheduler_cancel_port = (
@@ -2103,10 +2096,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @property
     def job_control_enabled(self) -> bool:
-        """Job cancel/status is single-rank only in v1: admission filtering
-        and queued-request drops must be identical on every rank. The cancel
-        port is settled if and only if this holds (see
-        ``_settle_job_control_port``)."""
+        """True when single-rank job cancel/status is enabled."""
         return (
             not self.disable_job_control
             and self.disagg_role == RoleType.MONOLITHIC

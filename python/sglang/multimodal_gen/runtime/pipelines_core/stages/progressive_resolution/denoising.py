@@ -439,7 +439,6 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> None:
         """Run denoising steps [start_step, end_step) using the parent infrastructure."""
         for step_index in range(start_step, end_step):
-            # between-step cancellation and progress point (job control)
             check_current_step(step_index, ctx.num_inference_steps)
             t_host = timesteps_cpu[step_index]
             step = self._prepare_step_state(

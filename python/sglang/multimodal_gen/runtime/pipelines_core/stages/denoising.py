@@ -18,9 +18,9 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-from torch import nn
+import torch.nn as nn
 
-from sglang.multimodal_gen import envs
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
@@ -1629,7 +1629,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ) as progress_bar,
         ):
             for step_index, t_host in enumerate(timesteps_cpu):
-                # between-step cancellation and progress point (job control)
                 check_current_step(step_index, ctx.num_inference_steps)
                 # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                 # use non-integer timesteps keep their precision in markers.
@@ -2247,7 +2246,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 timesteps=timesteps_num,
             )
         elif STA_mode == STA_Mode.STA_INFERENCE:
-            from sglang.multimodal_gen import envs
+            import sglang.multimodal_gen.envs as envs
 
             config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:

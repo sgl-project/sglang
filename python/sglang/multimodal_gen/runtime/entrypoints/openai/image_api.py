@@ -311,7 +311,6 @@ async def generations(
                 async_scheduler_client, batch
             )
         except RequestCancelledError as e:
-            # surface job cancellation as a structured conflict, not a bare 500
             raise HTTPException(status_code=409, detail=str(e))
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
@@ -469,7 +468,6 @@ async def edits(
                 async_scheduler_client, batch
             )
         except RequestCancelledError as e:
-            # surface job cancellation as a structured conflict, not a bare 500
             raise HTTPException(status_code=409, detail=str(e))
         save_file_path = save_file_path_list[0]
         resp_format = (response_format or "b64_json").lower()
@@ -582,7 +580,6 @@ async def job_status(request_id: str):
 
 @router.delete("/jobs/{request_id}")
 async def cancel_job(request_id: str):
-    """DELETE-as-cancel: reaches queued jobs immediately and running denoise
-    work at the next step boundary."""
+    """Cancel a job by request id."""
     _require_job_control()
     return await async_scheduler_client.job_control(CancelReq(request_id=request_id))

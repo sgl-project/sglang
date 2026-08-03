@@ -607,7 +607,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
-            # between-step cancellation and progress point (job control)
             check_current_step(current_timestep, len(timesteps))
             with self._denoise_step_profiler(batch, start_frame, current_timestep):
                 if clamp_latent is not None:
@@ -706,7 +705,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
-            # between-step cancellation and progress point (job control)
             check_current_step(current_timestep, len(timesteps))
             with self._denoise_step_profiler(batch, start_frame, current_timestep):
                 if clamp_latent is not None:

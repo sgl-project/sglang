@@ -194,8 +194,7 @@ class AsyncSchedulerClient:
             socket.close()
 
     async def job_control(self, request: Any) -> Any:
-        """Round trip on the scheduler's job-control side channel, which
-        stays responsive while a forward runs (cancel/status)."""
+        """Cancel/status round trip on the job-control side channel."""
         if self.context is None:
             raise RuntimeError(
                 "AsyncSchedulerClient is not initialized. Call initialize() first."

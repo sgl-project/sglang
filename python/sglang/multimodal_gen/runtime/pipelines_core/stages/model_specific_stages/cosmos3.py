@@ -986,7 +986,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         )
 
         for i, t in progress_bar:
-            # between-step cancellation and progress point (job control)
             check_current_step(i, len(timesteps))
             timestep = t.unsqueeze(0) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,

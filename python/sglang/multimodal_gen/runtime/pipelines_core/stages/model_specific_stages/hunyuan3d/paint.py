@@ -875,7 +875,6 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             extra_step_kwargs["generator"] = generator
 
         for step_idx, t in enumerate(timesteps):
-            # between-step cancellation and progress point (job control)
             check_current_step(step_idx, len(timesteps))
             latents = rearrange(latents, "(b n) c h w -> b n c h w", n=num_in_batch)
             latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
