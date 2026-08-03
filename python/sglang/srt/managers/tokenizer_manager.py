@@ -1490,6 +1490,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             finish_reason.get("type") == "abort"
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
+            self._release_req_state(state.obj.rid)
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1502,12 +1503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
-                del self.rid_to_state[state.obj.rid]
-
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            self._release_req_state(state.obj.rid)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2217,11 +2213,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
-                del self.rid_to_state[rid]
-
-                # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._release_req_state(rid)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -2879,7 +2871,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-        del self.rid_to_state[recv_obj.rid]
+        self._release_req_state(recv_obj.rid)
 
         state.out_list.append(out)
         state.event.set()
@@ -3080,6 +3072,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
+    def _release_req_state(self, rid: str) -> None:
+        """Drop the request's rid_to_state entry and release its LoRA reference.
+
+        Removal and release belong together: popping first keeps the release at
+        exactly one per request when several cleanup paths race for the same
+        rid, and a reference that is never handed back leaves
+        ``/unload_lora_adapter`` waiting on the registry counter forever.
+        """
+        state = self.rid_to_state.pop(rid, None)
+        if state is None:
+            return
+        if self.enable_lora and state.obj.lora_path:
+            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
@@ -3092,7 +3098,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            self._release_req_state(rid)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
