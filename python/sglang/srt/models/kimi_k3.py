@@ -105,7 +105,7 @@ from sglang.srt.models.kimi_k3_vl import (
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -790,7 +790,7 @@ class KimiK3MoE(nn.Module):
         # if that ever stops holding rather than silently dropping the remap.
         if not precomputed_topk_postprocess_is_noop(cfg):
             return False
-        if get_server_args().enable_deterministic_inference:
+        if get_exec().deterministic.enable_deterministic_inference:
             return False
         try:
             from sglang.kernels.ops.moe import moe_front
@@ -2639,7 +2639,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()

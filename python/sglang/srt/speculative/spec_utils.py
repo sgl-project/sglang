@@ -978,7 +978,7 @@ def commit_mamba_states_after_verify(
         mamba_track_indices = batch.mamba_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
-            ti = get_server_args().mamba_track_interval
+            ti = get_exec().mamba.mamba_track_interval
             seq_pre = batch.seq_lens
             seq_post = batch.seq_lens + accept_lens
             to_track_mask = seq_pre // ti != seq_post // ti
