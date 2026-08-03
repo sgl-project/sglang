@@ -1,0 +1,133 @@
+name: PR Test - Build SGLang Wheel
+
+on:
+  workflow_call:
+    inputs:
+      git_ref:
+        type: string
+        default: ''
+      skip_pr_test_health_check:
+        type: boolean
+        default: false
+    outputs:
+      artifact_name:
+        description: 'Run-local artifact containing a verified regular SGLang wheel.'
+        value: ${{ jobs.build.outputs.artifact_name }}
+
+env:
+  SGLANG_IS_IN_CI: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    name: Build SGLang Wheel
+    outputs:
+      artifact_name: ${{ steps.publish.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Set up Python 3.10
+        id: python
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install native build tools
+        id: tools
+        if: steps.python.outcome == 'success'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Build regular wheel
+        id: wheel
+        if: steps.tools.outcome == 'success'
+        continue-on-error: true
+        env:
+          # The dependency installer is not sourced here: keep this build cold
+          # and source-correct, then amortize it across every compatible shard.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/sglang-wheel-cargo
+          SGLANG_BUILD_RUST_EXTS: all
+        run: |
+          set -euxo pipefail
+          mapfile -t rust_channels < <(
+            sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+              rust/rust-toolchain.toml
+          )
+          if [ "${#rust_channels[@]}" -ne 1 ] || [ -z "${rust_channels[0]}" ]; then
+            echo '::error::Expected exactly one Rust channel in rust/rust-toolchain.toml'
+            exit 1
+          fi
+          pinned_channel="${rust_channels[0]}"
+          export RUSTUP_TOOLCHAIN="${pinned_channel}"
+          export PYO3_PYTHON="$(command -v python3)"
+          export PYTHONDONTWRITEBYTECODE=1
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo '::error::rustup is required to verify the selected Rust toolchain'
+            exit 1
+          fi
+          selected_rustc=$(rustup which rustc)
+          selected_cargo=$(rustup which cargo)
+          expected_rustc=$(rustup which --toolchain "${pinned_channel}" rustc)
+          expected_cargo=$(rustup which --toolchain "${pinned_channel}" cargo)
+          if [ "${selected_rustc}" != "${expected_rustc}" ] \
+              || [ "${selected_cargo}" != "${expected_cargo}" ]; then
+            echo "::error::Active Rust tools do not resolve to ${pinned_channel}"
+            exit 1
+          fi
+          actual_rustc_identity=$(rustc --version --verbose)
+          actual_cargo_identity=$(cargo --version --verbose)
+          expected_rustc_identity=$("${expected_rustc}" --version --verbose)
+          expected_cargo_identity=$("${expected_cargo}" --version --verbose)
+          if [ "${actual_rustc_identity}" != "${expected_rustc_identity}" ] \
+              || [ "${actual_cargo_identity}" != "${expected_cargo_identity}" ]; then
+            echo "::error::Rust commands on PATH do not match ${pinned_channel}"
+            exit 1
+          fi
+          echo "Verified rustc: ${selected_rustc}"
+          echo "Verified cargo: ${selected_cargo}"
+          printf '%s\n' "${actual_rustc_identity}"
+          printf '%s\n' "${actual_cargo_identity}"
+          python3 -m pip install --upgrade pip build
+          python3 -m build --wheel --outdir wheelhouse python
+          wheel=$(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print)
+          [ "$(printf '%s\n' "${wheel}" | sed '/^$/d' | wc -l)" -eq 1 ]
+          python3 scripts/ci/sglang_wheel_artifact.py create \
+            --wheel "${wheel}" \
+            --repo-root . \
+            --output "wheelhouse/sglang-wheel-manifest.json" \
+            --max-glibc 2.35
+
+      - name: Upload verified wheel
+        id: upload
+        if: steps.wheel.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: wheelhouse/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Publish artifact name
+        id: publish
+        if: steps.upload.outcome == 'success'
+        run: echo 'artifact_name=sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+
+      - name: Report source-build fallback
+        if: steps.publish.outcome != 'success'
+        run: |
+          echo '::warning::Prebuilt SGLang wheel unavailable; test stages will build from source.'
+          echo '### Prebuilt SGLang wheel unavailable' >> "$GITHUB_STEP_SUMMARY"
+          echo 'CUDA stages will use the existing source-build fallback.' >> "$GITHUB_STEP_SUMMARY"

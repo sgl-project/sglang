@@ -296,6 +296,9 @@ class Envs:
     # Optional root for compatibility-keyed Rust build artifacts in CUDA CI.
     # The dependency bootstrap shell reads this raw before sglang is importable.
     SGLANG_RUST_BUILD_STORE = EnvStr(None)
+    # Optional verified regular wheel used by CI dependency bootstrap. The
+    # bootstrap shell reads this raw before sglang is importable.
+    SGLANG_CI_PREBUILT_WHEEL = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)

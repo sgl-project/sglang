@@ -172,7 +172,12 @@ clean_site_packages() {
         set -x
     fi
 
-    # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+install_rust_build_dependencies() {
+    # Needed only for a source install. A verified regular wheel already
+    # contains the native extension modules.
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
@@ -408,7 +413,25 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # Bootstrap exception: sglang is not importable until this command
+    # completes, so the registered descriptor must be read by the shell.
+    if [ -n "${SGLANG_CI_PREBUILT_WHEEL:-}" ]; then
+        if [ ! -f "${SGLANG_CI_PREBUILT_WHEEL}" ]; then
+            echo "ERROR: Prebuilt SGLang wheel does not exist: ${SGLANG_CI_PREBUILT_WHEEL}"
+            exit 1
+        fi
+        echo "Installing verified prebuilt SGLang wheel: ${SGLANG_CI_PREBUILT_WHEEL}"
+        $PIP_CMD install "${SGLANG_CI_PREBUILT_WHEEL}[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+        python3 - <<'PY'
+import sglang.srt.grpc._core
+import sglang.srt.multimodal._core
+import sglang.srt.server._core
+
+print("Verified imports for prebuilt SGLang Rust extensions")
+PY
+    else
+        $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    fi
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -711,8 +734,13 @@ main() {
     cleanup_stale_shm
     install_apt_packages
     clean_site_packages
-    configure_rust_toolchain
-    configure_rust_build_store
+    if [ -z "${SGLANG_CI_PREBUILT_WHEEL:-}" ]; then
+        install_rust_build_dependencies
+        configure_rust_toolchain
+        configure_rust_build_store
+    else
+        echo "Prebuilt SGLang wheel selected; skipping Rust build setup"
+    fi
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer

@@ -54,6 +54,10 @@ on:
         description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
         type: string
         default: ''
+      sglang_wheel_artifact:
+        description: 'Run-local artifact containing a verified x86_64 CPython 3.10 SGLang wheel. Empty uses the source-build fallback.'
+        type: string
+        default: ''
 
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
@@ -120,10 +124,42 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download prebuilt SGLang wheel (v4)
+        id: sglang-wheel-v4
+        if: inputs.sglang_wheel_artifact != '' && steps.rc.outputs.artifact_version == 'v4'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.sglang_wheel_artifact }}
+          path: ${{ runner.temp }}/sglang-wheel
+
+      - name: Download prebuilt SGLang wheel (v6)
+        id: sglang-wheel-v6
+        if: inputs.sglang_wheel_artifact != '' && steps.rc.outputs.artifact_version == 'v6'
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.sglang_wheel_artifact }}
+          path: ${{ runner.temp }}/sglang-wheel
+
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        if: inputs.sglang_wheel_artifact != ''
+        run: |
+          if wheel=$(python3 scripts/ci/sglang_wheel_artifact.py verify \
+              --artifact-dir '${{ runner.temp }}/sglang-wheel' \
+              --repo-root .); then
+            echo "path=${wheel}" >> "$GITHUB_OUTPUT"
+            echo "Using prebuilt SGLang wheel: ${wheel}"
+          else
+            echo '::warning::Prebuilt wheel unavailable or incompatible; falling back to a source build.'
+          fi
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         env:
           GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.path || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 

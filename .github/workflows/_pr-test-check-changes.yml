@@ -78,15 +78,23 @@ jobs:
         with:
           filters: |
             main_package:
+              - ".github/workflows/_pr-test-check-changes.yml"
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-stage.yml"
+              - ".github/workflows/_pr-test-sglang-wheel-build.yml"
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
+              - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "scripts/ci/cuda/*"
+              - "scripts/ci/sglang_wheel_artifact.py"
+              - "scripts/ci/test_sglang_wheel_artifact.py"
               - "scripts/ci/utils/*"
+              - "rust/**"
+              - "proto/**"
               - "test/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
