@@ -150,7 +150,8 @@ def can_fuse_shared_expert(
         get_exec().moe.disable_shared_experts_fusion is True
         or getattr(config, "shared_expert_intermediate_size", 0) <= 0
         or config.shared_expert_intermediate_size != config.moe_intermediate_size
-        or is_deepep_class_backend()
+        or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mori()
     ):
         return False
 
@@ -325,7 +326,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if (
-                        is_deepep_class_backend()
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_flashinfer()
                     )
                     else {}
@@ -344,7 +346,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if is_deepep_class_backend():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -560,7 +562,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if is_deepep_class_backend():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (
