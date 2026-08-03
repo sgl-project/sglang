@@ -185,7 +185,8 @@ def test_realtime_webui_exports_replayable_recording_artifacts_on_t2v_branch():
     assert "function recordTrajectoryEvent" in app_js
     assert "function saveRecordingArtifactFiles" in app_js
     assert "function buildReplayHtml" in app_js
-    assert "function drawRecordingInputOverlay" in app_js
+    assert "function drawRecordingStageFrame" in app_js
+    assert "function drawRecordingControls" in app_js
     assert "MediaRecorder" in app_js
     assert "mediarecorder-webm" in app_js
     assert "generation_mode: generationMode" in app_js

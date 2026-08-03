@@ -531,19 +531,19 @@ Commit: `git commit -am "deploy(minwm): add H100 and low-cost VAE spot topology"
 **Files:**
 - Modify only files required by failures found in this task.
 
-- [ ] **Step 1: Run focused Python suite**
+- [x] **Step 1: Run focused Python suite**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime benchmark/minwm_realtime_async_vae -q`
 
 Expected: PASS; GPU-only tests SKIP with an explicit reason.
 
-- [ ] **Step 2: Run WebUI tests**
+- [x] **Step 2: Run WebUI tests**
 
 Run: `for f in python/sglang/multimodal_gen/apps/realtime_webui/*test.js; do node "$f"; done`
 
 Expected: every test exits 0.
 
-- [ ] **Step 3: Run formatting and static validation**
+- [x] **Step 3: Run formatting and static validation**
 
 Run: `.venv/bin/python -m compileall -q python/sglang/multimodal_gen/runtime/realtime benchmark/minwm_realtime_async_vae`
 
@@ -551,7 +551,7 @@ Run: `git diff --check`
 
 Expected: both exit 0.
 
-- [ ] **Step 4: Commit verification fixes**
+- [x] **Step 4: Commit verification fixes**
 
 Commit: `git commit -am "test(minwm): verify async VAE multi-user path"`
 
