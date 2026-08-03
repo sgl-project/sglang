@@ -1857,6 +1857,23 @@ class ServingChatTestCase(unittest.TestCase):
         prompt = tm.tokenizer.encode.call_args.args[0]
         self.assertIn("Reasoning Effort: Beyond maximum", prompt)
 
+    def test_dsv4_invalid_profile_override_fails_at_construction(self):
+        """An invalid DSV4 profile override is rejected at construction, not deferred to the first request.
+
+        Guards fail-fast boot validation: a misconfigured
+        ``dsv4_reasoning_effort_profile`` should prevent the server from starting,
+        not surface as an HTTP 400 on every request.
+        """
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "invalid"
+        }
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            OpenAIServingChat(tm, TemplateManager())
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"

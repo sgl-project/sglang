@@ -252,12 +252,25 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        # DeepSeek-V4 reasoning-effort profile resolver. Built lazily on first dsv4
-        # request: ``chat_encoding_spec`` may be assigned after construction (tests,
-        # subclasses), so the resolver is not gated on its value here.
+        # Resolve the DeepSeek-V4 reasoning-effort profile eagerly when the spec is
+        # already "dsv4": an invalid dsv4_reasoning_effort_profile override should
+        # fail the server at boot, not surface as an HTTP 400 on every request
+        # (same rationale as the Inkling block below). The request path constructs
+        # this lazily as a fallback when chat_encoding_spec is assigned after
+        # construction.
         self._dsv4_reasoning_effort_profile_resolver: Optional[
             chat_encoding.Dsv4ReasoningEffortProfileResolver
-        ] = None
+        ] = (
+            chat_encoding.Dsv4ReasoningEffortProfileResolver(
+                model_path=self.tokenizer_manager.model_path,
+                revision=self.tokenizer_manager.server_args.revision,
+                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+                ),
+            )
+            if self.chat_encoding_spec == "dsv4"
+            else None
+        )
 
         # Resolve the env-configured Inkling effort default once: the env var is
         # frozen for the server's lifetime, and a misconfigured value should
@@ -353,9 +366,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _resolve_dsv4_reasoning_effort_profile(self) -> str:
         """Resolve the DeepSeek-V4 reasoning-effort profile, cached per model path.
 
-        The resolver is built lazily because ``chat_encoding_spec`` may be
-        assigned after construction; it caches the resolved profile keyed on
-        ``model_path`` so a weight update that changes the path re-detects.
+        The resolver is normally built eagerly in ``__init__`` when the spec is
+        "dsv4"; this constructs it lazily as a fallback for the case where
+        ``chat_encoding_spec`` is assigned after construction. It caches the
+        resolved profile keyed on ``model_path`` so a weight update that changes
+        the path re-detects.
         """
         if self._dsv4_reasoning_effort_profile_resolver is None:
             self._dsv4_reasoning_effort_profile_resolver = chat_encoding.Dsv4ReasoningEffortProfileResolver(
