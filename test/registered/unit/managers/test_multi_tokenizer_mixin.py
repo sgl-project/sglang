@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -10,6 +12,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
+    write_data_for_multi_tokenizer,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -80,6 +83,34 @@ def _make_batch_str_output() -> BatchStrOutput:
 
 
 class TestMultiTokenizerMixin(unittest.TestCase):
+    @patch("sglang.srt.managers.multi_tokenizer_mixin.get_main_process_id")
+    @patch("sglang.srt.managers.multi_tokenizer_mixin.os.getpid", return_value=123)
+    @patch("sglang.srt.managers.multi_tokenizer_mixin.write_to_shared_memory")
+    def test_worker_payload_includes_aggregate_startup_time(
+        self,
+        write_to_shared_memory,
+        _getpid,
+        get_main_process_id,
+    ):
+        get_main_process_id.return_value = 123
+        shared_memory = Mock()
+        write_to_shared_memory.return_value = shared_memory
+        scheduler_info = {"max_req_input_len": 1024}
+        startup_time = {"load_weight": 1.0, "e2e": 2.0}
+
+        write_data_for_multi_tokenizer(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            scheduler_info,
+            startup_time,
+        )
+
+        payload, name = write_to_shared_memory.call_args.args
+        self.assertEqual(name, "multi_tokenizer_args_123")
+        self.assertEqual(payload[2]["startup_time"], startup_time)
+        self.assertNotIn("startup_time", scheduler_info)
+        shared_memory.close.assert_called_once_with()
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 

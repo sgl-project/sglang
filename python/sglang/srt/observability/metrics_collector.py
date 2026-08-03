@@ -21,7 +21,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -995,21 +995,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.max_total_num_tokens_swa = Gauge(
+            name="sglang:max_total_num_tokens_swa",
+            documentation="Maximum total number of tokens in the SWA KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.weight_memory_usage_gb = Gauge(
+            name="sglang:weight_memory_usage_gb",
+            documentation="Memory used by model weights in GB.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_memory_usage_gb = Gauge(
+            name="sglang:kv_cache_memory_usage_gb",
+            documentation="Memory used by the KV cache pools in GB.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.graph_memory_usage_gb = Gauge(
+            name="sglang:graph_memory_usage_gb",
+            documentation="Memory used by captured device graphs in GB.",
+            labelnames=list(labels.keys()) + ["phase"],
+            multiprocess_mode="mostrecent",
+        )
         self.max_running_requests_under_SLO = Gauge(
             name="sglang:max_running_requests_under_SLO",
             documentation="The maximum number of running requests under SLO.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.engine_startup_time = Gauge(
-            name="sglang:engine_startup_time",
-            documentation="The time taken for the engine to start up.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.engine_load_weights_time = Gauge(
-            name="sglang:engine_load_weights_time",
-            documentation="The time taken for the engine to load weights.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1401,21 +1413,30 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def emit_constants(
         self,
         max_total_num_tokens: int,
+        max_total_num_tokens_swa: Optional[int],
+        weight_memory_usage_gb: float,
+        kv_cache_memory_usage_gb: float,
+        graph_memory_usage_gb: Mapping[str, float],
         max_running_requests_under_SLO: Optional[int],
-        engine_startup_time: float,
-        engine_load_weights_time: float,
         page_size: int,
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        if max_total_num_tokens_swa is not None:
+            self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
+        self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
+        self._log_gauge(self.kv_cache_memory_usage_gb, kv_cache_memory_usage_gb)
+        for phase, memory_usage_gb in graph_memory_usage_gb.items():
+            self.graph_memory_usage_gb.labels(
+                **self.labels,
+                phase=phase,
+            ).set(memory_usage_gb)
         if max_running_requests_under_SLO is not None:
             self._log_gauge(
                 self.max_running_requests_under_SLO, max_running_requests_under_SLO
             )
-        self._log_gauge(self.engine_startup_time, engine_startup_time)
-        self._log_gauge(self.engine_load_weights_time, engine_load_weights_time)
         self._log_gauge(self.page_size, page_size)
         self._log_gauge(self.num_pages, num_pages)
         self._log_gauge(self.context_len, context_len)
@@ -1435,12 +1456,27 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+
+        self.startup_time_seconds = Gauge(
+            name="sglang:startup_time_seconds",
+            documentation="Engine startup duration by phase in seconds.",
+            labelnames=[*labels.keys(), "phase"],
+            multiprocess_mode="mostrecent",
+        )
+        self.startup_cuda_graph_time_seconds = Gauge(
+            name="sglang:startup_cuda_graph_time_seconds",
+            documentation="CUDA graph capture duration by phase in seconds.",
+            labelnames=[*labels.keys(), "phase"],
+            multiprocess_mode="mostrecent",
+        )
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1648,6 +1684,19 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=bucket_e2e_request_latency,
         )
+
+    def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
+        for phase in ("load_weight", "kv_cache_allocation", "e2e"):
+            self.startup_time_seconds.labels(
+                **self.labels,
+                phase=phase,
+            ).set(float(startup_time[phase]))
+
+        for phase, duration in startup_time["cuda_graph"].items():
+            self.startup_cuda_graph_time_seconds.labels(
+                **self.labels,
+                phase=phase,
+            ).set(float(duration))
 
     def observe_one_finished_request(
         self,

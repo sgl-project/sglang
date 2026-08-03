@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.model_executor.graph_memory_usage import (
+    merge_graph_memory_usage,
+    merge_graph_time_usage,
+)
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 if TYPE_CHECKING:
@@ -34,6 +38,32 @@ class EagleDraftWorkerBase(ABC):
         """All draft model runners; multi-layer eagle overrides with its
         per-step runner list."""
         return [self.draft_runner]
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        return merge_graph_memory_usage(
+            *(
+                getattr(runner, "graph_memory_usage", None)
+                for runner in self.draft_runners
+            ),
+            getattr(self, "_specialized_graph_memory_usage", None),
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        return merge_graph_time_usage(
+            *(
+                getattr(runner, "graph_time_usage", None)
+                for runner in self.draft_runners
+            ),
+            getattr(self, "_specialized_graph_time_usage", None),
+        )
+
+    @property
+    def weight_load_time(self) -> float:
+        return sum(
+            getattr(runner, "weight_load_time", 0.0) for runner in self.draft_runners
+        )
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -94,6 +124,34 @@ class BaseSpecWorker(ABC):
         # dflash / dspark drive the draft model through a plain TpModelWorker;
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        if self.draft_worker is None:
+            draft_memory_usage = None
+        else:
+            draft_memory_usage = self.draft_worker.graph_memory_usage
+        return merge_graph_memory_usage(
+            draft_memory_usage,
+            getattr(self, "_additional_graph_memory_usage", None),
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        if self.draft_worker is None:
+            draft_time_usage = None
+        else:
+            draft_time_usage = self.draft_worker.graph_time_usage
+        return merge_graph_time_usage(
+            draft_time_usage,
+            getattr(self, "_additional_graph_time_usage", None),
+        )
+
+    @property
+    def weight_load_time(self) -> float:
+        if self.draft_worker is None:
+            return 0.0
+        return self.draft_worker.weight_load_time
 
     @property
     def war_fastpath_runner(self):

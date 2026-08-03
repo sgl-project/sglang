@@ -218,6 +218,10 @@ from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoad
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.memory_usage import (
+    build_memory_usage,
+    combine_graph_memory_usage,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -262,6 +266,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -521,6 +526,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.emit_metrics_constants()
 
         if _is_npu and is_deepseek_v4(
             self.tp_worker.model_runner.model_config.hf_config
@@ -941,14 +947,32 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
+        tic = time.perf_counter()
         self.init_memory_pools()
+        kv_cache_allocation_time = time.perf_counter() - tic
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
+            tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
+            kv_cache_allocation_time += time.perf_counter() - tic
+
+        self.startup_time = build_scheduler_startup_time(
+            target_load_weight=self.tp_worker.weight_load_time,
+            draft_load_weight=(
+                0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
+            ),
+            kv_cache_allocation=kv_cache_allocation_time,
+            target_cuda_graph=self.tp_worker.graph_time_usage,
+            draft_cuda_graph=(
+                None
+                if self.draft_worker is None
+                else self.draft_worker.graph_time_usage
+            ),
+        )
 
         if (
             get_exec().moe.elastic_ep_backend is not None
@@ -1021,7 +1045,7 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
-        avail_mem = get_available_gpu_memory(
+        self.startup_available_gpu_memory_gb = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )
         if self.ps.tp_rank == 0:
@@ -1031,23 +1055,38 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
+                f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
 
-        if get_observability().enable_metrics:
-            self.metrics_collector.emit_constants(
-                max_total_num_tokens=self.max_total_num_tokens,
-                # TODO: max_running_requests_under_SLO has no setter — dead chain.
-                max_running_requests_under_SLO=getattr(
-                    self, "max_running_requests_under_SLO", None
+    def emit_metrics_constants(self) -> None:
+        if not get_observability().enable_metrics:
+            return
+
+        self.metrics_collector.emit_constants(
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens_swa=self.swa_tokens_per_layer,
+            weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            kv_cache_memory_usage_gb=(
+                self.token_to_kv_pool_allocator.get_kvcache().mem_usage
+            ),
+            graph_memory_usage_gb=combine_graph_memory_usage(
+                self.tp_worker.graph_memory_usage,
+                (
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.graph_memory_usage
                 ),
-                engine_startup_time=0.0,
-                engine_load_weights_time=0.0,
-                page_size=self.page_size,
-                num_pages=self.max_total_num_tokens // self.page_size,
-                context_len=self.model_config.context_len,
-                startup_available_gpu_memory_gb=avail_mem,
-            )
+            ),
+            # TODO: max_running_requests_under_SLO has no setter — dead chain.
+            max_running_requests_under_SLO=getattr(
+                self, "max_running_requests_under_SLO", None
+            ),
+            page_size=self.page_size,
+            num_pages=self.max_total_num_tokens // self.page_size,
+            context_len=self.model_config.context_len,
+            startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
+        )
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -1561,6 +1600,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "startup_time": self.startup_time,
         }
 
         return result_dict
@@ -4116,14 +4156,19 @@ class Scheduler(
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
-        ret["memory_usage"] = {
-            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
-            "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
-        }
+        draft_graph_memory_usage = (
+            None if self.draft_worker is None else self.draft_worker.graph_memory_usage
+        )
+        ret["memory_usage"] = build_memory_usage(
+            weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
+            startup_available_gb=self.startup_available_gpu_memory_gb,
+            token_capacity=self.max_total_num_tokens,
+            token_capacity_swa=self.swa_tokens_per_layer,
+            target_graph_memory_usage=self.tp_worker.graph_memory_usage,
+            draft_graph_memory_usage=draft_graph_memory_usage,
+        )
+        ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if get_exec().moe.elastic_ep_backend is not None:

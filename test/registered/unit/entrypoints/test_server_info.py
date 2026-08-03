@@ -40,6 +40,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    startup_time: dict | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -60,6 +61,12 @@ def _call_server_info_with(
     tokenizer_manager._config_updates = (
         [("test", dict(config_updates))] if config_updates else []
     )
+    tokenizer_manager.startup_time = startup_time or {
+        "load_weight": 1.0,
+        "kv_cache_allocation": 2.0,
+        "cuda_graph": {"prefill": 3.0},
+        "e2e": 4.0,
+    }
     tokenizer_manager.get_internal_state = _fake_internal_state
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
@@ -251,6 +258,19 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
         )
         self.assertEqual(payload["weight_version"], "v2")
         self.assertEqual(server_args.weight_version, "v1")
+
+    def test_startup_time_uses_tokenizer_manager_aggregate(self):
+        startup_time = {
+            "load_weight": 11.0,
+            "kv_cache_allocation": 12.0,
+            "cuda_graph": {"decode": 13.0},
+            "e2e": 14.0,
+        }
+        payload = _call_server_info_with(
+            ServerArgs(model_path="dummy"),
+            startup_time=startup_time,
+        )
+        self.assertEqual(payload["startup_time"], startup_time)
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):

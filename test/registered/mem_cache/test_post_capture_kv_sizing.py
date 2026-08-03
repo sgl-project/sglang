@@ -6,7 +6,8 @@ This test launches a server with the feature enabled and asserts that:
   1. the post-capture sizing path actually ran (log line present, not a silent
      no-op skip via post_capture_kv_sizing_planned),
   2. the pool was sized to a positive max_total_num_tokens, and
-  3. gsm8k accuracy is unchanged vs. the default sizing path.
+  3. metrics initialize against the finalized pool capacities, and
+  4. gsm8k accuracy is unchanged vs. the default sizing path.
 """
 
 import os
@@ -45,6 +46,7 @@ class TestPostCaptureKVSizing(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--enable-metrics"],
             env={**os.environ, "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "1"},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )

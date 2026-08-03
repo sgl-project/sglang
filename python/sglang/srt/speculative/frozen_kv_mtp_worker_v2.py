@@ -22,6 +22,7 @@ start of the next draft.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from typing import Optional
 
@@ -70,7 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import empty_context
+from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -347,6 +348,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _capture_cuda_graphs(self) -> None:
+        if not hasattr(self, "_specialized_graph_memory_usage"):
+            self._specialized_graph_memory_usage = {}
+        if not hasattr(self, "_specialized_graph_time_usage"):
+            self._specialized_graph_time_usage = {}
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
@@ -362,7 +367,20 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
         logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._specialized_graph_memory_usage["draft_decode"] = (
+            self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_decode"] = (
+            self._specialized_graph_time_usage.get("draft_decode", 0.0)
+            + time.perf_counter()
+            - tic
+        )
         logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(

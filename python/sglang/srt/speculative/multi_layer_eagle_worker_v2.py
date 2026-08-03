@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, List
 
@@ -76,7 +77,12 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
 )
-from sglang.srt.utils import is_cpu, is_npu, require_gathered_buffer
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cpu,
+    is_npu,
+    require_gathered_buffer,
+)
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -365,12 +371,19 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+        if not hasattr(self, "_specialized_graph_memory_usage"):
+            self._specialized_graph_memory_usage = {}
+        if not hasattr(self, "_specialized_graph_time_usage"):
+            self._specialized_graph_time_usage = {}
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         if envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get():
             return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         if not _is_npu:
             # The single-CG runner replays with no Python between steps, so the
@@ -403,6 +416,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend = (
                 MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
             )
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._specialized_graph_memory_usage["draft_extend"] = (
+            self._specialized_graph_memory_usage.get("draft_extend", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_extend"] = (
+            self._specialized_graph_time_usage.get("draft_extend", 0.0)
+            + time.perf_counter()
+            - tic
+        )
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info

@@ -479,6 +479,9 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
+
     def _run_loop(self):
         self._loop.run_forever()
 
@@ -792,13 +795,17 @@ def read_from_shared_memory(name: str) -> Any:
 
 
 def write_data_for_multi_tokenizer(
-    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
+    port_args: PortArgs,
+    server_args: ServerArgs,
+    scheduler_info: Dict,
+    startup_time: Dict[str, Any],
 ):
     """Write args information to share memory for multi-tokenizer"""
     # get main process ID
     main_pid = get_main_process_id()
     current_pid = os.getpid()
     logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+    scheduler_info = {**scheduler_info, "startup_time": startup_time}
     args = (port_args, server_args, scheduler_info)
     args_shm = write_to_shared_memory(args, f"multi_tokenizer_args_{current_pid}")
     args_shm.close()

@@ -562,6 +562,35 @@ class TestSRTEndpoint(CustomTestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+        startup_time = response_json["startup_time"]
+        self.assertIsInstance(startup_time["load_weight"], float)
+        self.assertIsInstance(startup_time["kv_cache_allocation"], float)
+        self.assertIsInstance(startup_time["e2e"], float)
+        self.assertTrue(
+            {
+                "prefill",
+                "decode",
+                "target_verify",
+                "draft_prefill",
+                "draft_decode",
+                "draft_extend",
+            }.issubset(startup_time["cuda_graph"]),
+        )
+
+        memory_usage = response_json["internal_states"][0]["memory_usage"]
+        self.assertIn("token_capacity_swa", memory_usage)
+        self.assertIsInstance(memory_usage["startup_available"], float)
+        self.assertTrue(
+            {
+                "prefill",
+                "decode",
+                "target_verify",
+                "draft_prefill",
+                "draft_decode",
+                "draft_extend",
+            }.issubset(memory_usage["graph"]),
+        )
+
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
         # Choose a token ID to bias (using 5 as an example)

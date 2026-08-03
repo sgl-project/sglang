@@ -77,12 +77,13 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             "check_cuda_graph_backend",
             return_value=False,
         ):
-            runner = capture_prefill_graph(
+            capture = capture_prefill_graph(
                 model_runner=model_runner,
                 eager_runner=eager_runner,
             )
 
-        self.assertIs(runner, eager_runner)
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         model_runner = SimpleNamespace(
