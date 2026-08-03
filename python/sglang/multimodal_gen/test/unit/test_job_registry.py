@@ -105,7 +105,7 @@ class TestJobRegistry(unittest.TestCase):
 
     def test_waiters_receive_live_reply_even_when_payload_is_dropped(self):
         """Waiters attached before the terminal transition are owed the real
-        first reply; only the retained replay copy may be dropped."""
+        first reply. Only the retained replay copy may be dropped."""
         registry = JobRegistry()
         registry.admit("bulky", b"c1")
         registry.admit("bulky", b"c2")

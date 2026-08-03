@@ -1118,7 +1118,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _job_waiters(
         self, req: Any, output_batch: OutputBatch, is_warmup: bool
     ) -> list[bytes]:
-        """Terminal registry transition; returns waiter identities owed a reply."""
+        """Terminal registry transition. Returns waiter identities owed a reply."""
         if self.jobs is None or is_warmup or not isinstance(req, Req):
             return []
         if not req.request_id:
@@ -1302,7 +1302,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                             output_batch, identity, should_not_return=is_warmup
                         )
                 except zmq.ZMQError as e:
-                    # Reply failed; log and keep loop alive to accept future requests
+                    # Reply failed. Log and keep loop alive to accept future requests.
                     logger.error(f"ZMQ error sending reply: {e}")
                 for waiter in waiters:
                     try:

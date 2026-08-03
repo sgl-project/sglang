@@ -39,7 +39,7 @@ def contains_file_refs(value: Any) -> bool:
 
 def _is_replayable(output: Any) -> bool:
     """Only lightweight terminal payloads are worth retaining for idempotent
-    replay; bulk payloads (raw realtime frames, trajectory tensors) would pin
+    replay. Bulk payloads (raw realtime frames, trajectory tensors) would pin
     GPU-scale buffers for the whole retention window."""
     return (
         not contains_file_refs(output.output)
