@@ -61,7 +61,7 @@ pip install -e "python"
         --env "HF_TOKEN=<secret>" \
         --ipc=host \
         lmsysorg/sglang:latest \
-        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+        sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
     ```
 
     For production deployments, use the smaller **runtime** variant (~40% size reduction):
@@ -74,7 +74,7 @@ pip install -e "python"
         --env "HF_TOKEN=<secret>" \
         --ipc=host \
         lmsysorg/sglang:latest-runtime \
-        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+        sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
     ```
   </Tab>
 </Tabs>
@@ -93,7 +93,7 @@ export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
 Start the SGLang server with a model. Here we use `qwen/qwen2.5-0.5b-instruct` as a lightweight example:
 
 ```bash
-python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --port 30000
+sglang serve --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --port 30000
 ```
 
 Wait until you see `The server is fired up and ready to roll!` in the terminal output.
