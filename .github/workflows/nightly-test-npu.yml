@@ -103,6 +103,111 @@ jobs:
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
+  nightly-1-npu-a3:
+    name: nightly-1-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    runs-on: linux-aarch64-a3-2-
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly
+
+  nightly-2-npu-a3:
+    name: nightly-2-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    runs-on: linux-aarch64-a3-2-
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly
+
+  nightly-4-npu-a3:
+    name: nightly-4-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    runs-on: linux-aarch64-a3-4-
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly
+
+  nightly-8-npu-a3:
+    name: nightly-8-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    runs-on: linux-aarch64-a3-8-
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly
+
+  nightly-16-npu-a3:
+    name: nightly-16-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    runs-on: linux-aarch64-a3-16-
+    container:
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-16-npu-a3 --nightly
+
   nightly-poc-single-node-a2-tests:
     name: single-node-poc-a2
     if: ${{ !cancelled() }}
@@ -406,6 +511,11 @@ jobs:
   check-all-jobs:
     if: ${{ !cancelled() }}
     needs:
+      - nightly-1-npu-a3
+      - nightly-2-npu-a3
+      - nightly-4-npu-a3
+      - nightly-8-npu-a3
+      - nightly-16-npu-a3
       - nightly-poc-single-node-a2-tests
       - nightly-poc-single-node-tests
       - nightly-poc-multi-node-tests
