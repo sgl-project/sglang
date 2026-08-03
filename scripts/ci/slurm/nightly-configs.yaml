@@ -356,3 +356,146 @@ kimik26-fp8-mi355x-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
+
+# AMD 4-node disaggregation with narrow-prefill EP8 + WIDE-decode EP16 (Oren's
+# 2P1D config: two single-node prefill engines EP8 that the router fans across +
+# one decode engine EP16 spanning 2 nodes; 4 nodes total). Runs on the `mi355x`
+# amd-sglang cluster (bnxt RoCE), not spur: spur's ionic fabric could not cross-
+# rail the MORI MoE all-to-all, so EP16 was brought up and validated on mi355x
+# (job 13221, DSV4-Pro-FP4, GSM8K 0.927). Each recipe sets
+# runtime.moe_a2a_backend=mori + runtime.kv_transfer_backend=mori +
+# runtime.ib_devices=rdma0..7 + runtime.dist_socket_ifname=eno0; launch_mi355x.sh
+# derives nodes-per-engine = ceil(TP/8) (prefill 8->1, decode 16->2) and emits the
+# cross-node --nnodes/--node-rank/--dist-init-addr args for the decode engine.
+# DSV4-Pro MTP drops conc256 (SWA retract->get_cpu_copy NotImplementedError).
+dsv4flash-fp8-mi355x-ep16-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/2p1d-ep16.yaml
+
+dsv4flash-fp8-mi355x-ep16-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4flash/1k1k/2p1d-ep16-mtp.yaml
+
+dsv4pro-fp8-mi355x-ep16-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/2p1d-ep16.yaml
+
+dsv4pro-fp8-mi355x-ep16-mtp-sglang:
+  model: sgl-project/DeepSeek-V4-Pro-FP8
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
+  runner: mi355x
+  precision: fp8
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        # conc256 excluded: disagg-decode SWA hybrid pool retract->get_cpu_copy
+        # is an upstream NotImplementedError (crashes decode). See recipe.
+        - conc-list: [1, 8, 16, 32, 64, 128]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/2p1d-ep16-mtp.yaml
+
+dsv4flash-fp4-mi355x-ep16-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/2p1d-ep16.yaml
+
+dsv4flash-fp4-mi355x-ep16-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/2p1d-ep16-mtp.yaml
+
+dsv4pro-fp4-mi355x-ep16-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/2p1d-ep16.yaml
+
+dsv4pro-fp4-mi355x-ep16-mtp-sglang:
+  model: deepseek-ai/DeepSeek-V4-Pro
+  model-prefix: dsv4pro
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        # conc256 excluded: disagg-decode SWA hybrid pool retract->get_cpu_copy
+        # is an upstream NotImplementedError (crashes decode). See recipe.
+        - conc-list: [1, 8, 16, 32, 64, 128]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4pro/1k1k/2p1d-ep16-mtp.yaml
