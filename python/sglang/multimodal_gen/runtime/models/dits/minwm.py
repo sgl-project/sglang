@@ -1268,7 +1268,11 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
         dump_root = os.environ.get("MINWM_PARITY_DUMP_DIR")
         if not dump_root:
             return
-        dump_dir = Path(dump_root) / "sglang"
+        dump_dir = (
+            Path(dump_root)
+            / "sglang"
+            / f"sp_rank_{get_sp_parallel_rank():02d}"
+        )
         dump_dir.mkdir(parents=True, exist_ok=True)
         counters = {"patch": 0, "block0": 0}
 

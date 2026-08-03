@@ -18,7 +18,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_TOTAL_CHUNKS_CONDITION,
     MINWM_TOTAL_LATENT_FRAMES_CONDITION,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_parallel_rank,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
@@ -70,7 +73,12 @@ def _parity_dump(name: str, value) -> None:
     dump_dir = os.environ.get("MINWM_PARITY_DUMP_DIR")
     if not dump_dir:
         return
-    path = Path(dump_dir) / "sglang" / name
+    path = (
+        Path(dump_dir)
+        / "sglang"
+        / f"sp_rank_{get_sp_parallel_rank():02d}"
+        / name
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def to_cpu(item):
