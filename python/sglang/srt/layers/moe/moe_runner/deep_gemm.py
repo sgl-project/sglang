@@ -678,15 +678,14 @@ def pre_permute_standard_to_deep_gemm(
     )
     topk_weights, topk_ids, _ = topk_output
 
-    # The masked grouped GEMM is a capacity-style interface designed for
-    # CUDA-graph decode (fixed shapes, unknown m). For long eager prefills the
-    # contiguous grouped GEMM is the intended interface: tokens are compacted
-    # per expert, so no [E, m_max, ...] capacity buffers and far fewer kernels.
-    # It only pays off once the real rows (tokens * topk) dwarf the per-expert
-    # padding (num_local_experts * BLOCK_E) the compaction adds, hence the
-    # token floor. Quant configs whose activation recipe is not fp8 group 128
-    # stay on the masked path too -- that is the only recipe this pre-permute
-    # can produce (bf16 weights leave block_shape unset; mxfp8 pins [1, 32]).
+    # The masked grouped GEMM is a capacity interface for CUDA-graph decode
+    # (fixed shapes, unknown m); compacting tokens per expert drops the
+    # [E, m_max, ...] buffers and most of the kernels. It only pays off once
+    # the real rows (tokens * topk) dwarf the per-expert padding the
+    # compaction adds (num_local_experts * BLOCK_E), hence the token floor.
+    # The quant gate is exhaustive, not conservative: fp8 group 128 is the
+    # only recipe this pre-permute produces (bf16 leaves block_shape unset,
+    # mxfp8 pins [1, 32]).
     if (
         quant_info.use_fp8
         and quant_info.block_shape == [128, 128]
@@ -782,14 +781,13 @@ def _pre_permute_standard_contiguous(
     bound = ceil_div(topk_ids.numel(), BLOCK_E) * BLOCK_E + num_local * BLOCK_E
     running_state["all_tokens"] = bound
 
-    # fp8-quantize the tokens once, then scatter quantized rows + scales.
     hs_fp8, hs_scale = per_token_group_quant_fp8(hidden_states, 128)
 
     input_tensor = torch.empty((bound, K), device=device, dtype=hs_fp8.dtype)
-    # Scatter fp32 scales row-major, then do one e8m0 cast over the whole
-    # buffer (the GEMM1-proven pipeline). Zero-init: padding rows inside each
-    # aligned expert block keep scale == 0 (cast -> 2^-127), so their garbage
-    # payload contributes ~exact zeros.
+    # Scales scatter row-major as fp32, then one e8m0 cast over the whole
+    # buffer. Zero-init matters: padding rows inside an aligned expert block
+    # keep scale == 0 (cast -> 2^-127), so their garbage payload contributes
+    # ~exact zeros.
     input_tensor_scale = torch.zeros(
         (bound, K // 128), device=device, dtype=torch.float32
     )

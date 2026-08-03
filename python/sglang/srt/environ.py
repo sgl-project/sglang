@@ -730,9 +730,8 @@ class Envs:
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
-    # Token count at which standard-dispatch prefill switches from the masked
-    # grouped GEMM to the contiguous one. Below it the per-expert padding
-    # (num_local_experts * 128 rows) outweighs the compaction win.
+    # Token floor for the contiguous grouped GEMM on standard-dispatch prefill;
+    # below it the per-expert padding outweighs the compaction win.
     SGLANG_DEEPGEMM_CONTIGUOUS_PREFILL_MIN_TOKENS = EnvInt(16384)
 
     # DeepSeek MHA Optimization
