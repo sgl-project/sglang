@@ -58,10 +58,12 @@ _BACKENDS: Dict[str, Optional[LinearAttnKernelBackend]] = {
 }
 
 
-def initialize_linear_attn_config(server_args: ServerArgs):
+def initialize_linear_attn_config(
+    server_args: ServerArgs, prefill_default: Optional[str] = None
+):
     base = server_args.linear_attn_backend
     decode = server_args.linear_attn_decode_backend or base
-    prefill = server_args.linear_attn_prefill_backend or base
+    prefill = server_args.linear_attn_prefill_backend or prefill_default or base
 
     _BACKENDS["decode"] = LinearAttnKernelBackend(decode)
     _BACKENDS["prefill"] = LinearAttnKernelBackend(prefill)

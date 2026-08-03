@@ -100,6 +100,24 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
+def _should_use_masked_standard_layout(runner_config: MoeRunnerConfig) -> bool:
+    """Use masked GEMM when expert parallelism keeps its buffer small."""
+    return (
+        runner_config.num_experts > runner_config.num_local_experts
+        and runner_config.num_local_experts <= 32
+    )
+
+
+def _get_compact_all_tokens(
+    num_assignments: int, num_experts: int, block_e: int = 128
+) -> int:
+    """Return the maximum padded rows over all routings of the assignments."""
+    max_nonempty_experts = min(num_assignments, num_experts)
+    return block_e * (
+        max_nonempty_experts + (num_assignments - max_nonempty_experts) // block_e
+    )
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -738,24 +756,17 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import moe_ep_deepgemm_preprocess
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        ep_scatter,
+        fused_moe_dispatch_index,
+        moe_ep_deepgemm_preprocess,
+    )
 
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
-
-    # The masked grouped GEMM is a capacity-style interface designed for
-    # CUDA-graph decode (fixed shapes, unknown m). For prefill-sized eager
-    # forwards the contiguous grouped GEMM is the intended interface: tokens
-    # are compacted per expert, so no [E, m_max, ...] capacity buffers and
-    # far fewer kernels. Small batches (decode eager / graph warmup+capture)
-    # stay on the masked path.
-    if hidden_states.shape[0] >= 512 and not torch.cuda.is_current_stream_capturing():
-        return _pre_permute_standard_contiguous(
-            hidden_states, topk_ids, topk_weights, runner_config, running_state
-        )
 
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
@@ -764,25 +775,151 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    # PreReorder
+    if _should_use_masked_standard_layout(runner_config):
+        output_dtype = (
+            torch.bfloat16
+            if quant_info.w13_weight.dtype == torch.bfloat16
+            else torch.float8_e4m3fn
+        )
+        masked_m, _, src2dst, hidden_states, hidden_states_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+                output_dtype=output_dtype,
+                use_mxfp8=quant_info.use_mxfp8,
+            )
+        )
+        # Use the global expert count because expected_m is a tuning hint, not
+        # the per-rank buffer capacity.
+        expected_m = max(
+            1,
+            ceil_div(
+                hidden_states_shape[0] * runner_config.top_k,
+                runner_config.num_experts,
+            ),
+        )
+
+        if runner_config.inplace:
+            dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+        running_state["mxfp8_act_gran_k"] = (
+            quant_info.block_shape[1] if quant_info.block_shape else 128
+        )
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
+
+    # The compact layout avoids scaling masked buffers with the expert count.
+    # Scatter and post-permute skip non-local experts mapped to -1.
+    block_e = 128
+    num_experts = runner_config.num_local_experts
+    num_assignments = topk_ids.numel()
+    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
+
+    tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
+        topk_ids, num_experts, 1
+    )
+    dispose_tensor(unused_masked_dst)
+    valid_tokens_per_expert = tokens_per_expert
+    tokens_per_expert = (ceil_div(tokens_per_expert, block_e) * block_e).to(torch.int32)
+    # Keep graph-static shapes by appending padding to the final segment.
+    # Its m_indices stay -1, so DeepGEMM skips those rows.
+    tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
+
+    k = hidden_states.size(1)
     output_dtype = (
         torch.bfloat16
         if quant_info.w13_weight.dtype == torch.bfloat16
         else torch.float8_e4m3fn
     )
-    masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
-        moe_ep_deepgemm_preprocess(
-            topk_ids,
-            runner_config.num_local_experts,
-            hidden_states,
-            runner_config.top_k,
-            quant_info.block_shape,
-            output_dtype=output_dtype,
-            use_mxfp8=quant_info.use_mxfp8,
+    if output_dtype == torch.bfloat16:
+        packed_input_source = hidden_states
+        packed_input_source_scale = None
+        packed_input = torch.empty(
+            (all_tokens, k), device=hidden_states_device, dtype=torch.bfloat16
         )
-    )
+        # ep_scatter ignores scales for BF16, but a real tensor keeps its
+        # Triton signature uniform across the existing DeepEP caller.
+        packed_input_scale = torch.empty(
+            (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
+        )
+    else:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
-    dispose_tensor(hidden_states_ref)
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_input_source, packed_input_source_scale = (
+            sglang_per_token_group_quant_fp8(
+                hidden_states,
+                block_k,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        )
+        packed_input = torch.zeros(
+            (all_tokens, k),
+            device=hidden_states_device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scale_width = k // block_k
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            scale_width = ceil_div(scale_width, 4)
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            packed_input_scale = torch.zeros(
+                (scale_width, all_tokens),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            ).transpose(0, 1)
+        else:
+            packed_input_scale = torch.zeros(
+                (all_tokens, scale_width),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            )
+
+    expert_start_loc = torch.empty(
+        num_experts, device=hidden_states_device, dtype=torch.int32
+    )
+    m_indices = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    ep_scatter(
+        packed_input_source,
+        packed_input_source_scale,
+        topk_ids,
+        tokens_per_expert,
+        valid_tokens_per_expert,
+        expert_start_loc,
+        packed_input,
+        packed_input_scale,
+        m_indices,
+        src2dst,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+    )
+    if packed_input_source is not hidden_states:
+        dispose_tensor(packed_input_source)
+    if packed_input_source_scale is not None:
+        dispose_tensor(packed_input_source_scale)
+
+    # Preserve the input when a shared expert or its gate may still use it.
+    if runner_config.inplace:
+        dispose_tensor(hidden_states_ref)
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -790,93 +927,14 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
+    running_state["all_tokens"] = all_tokens
     running_state["mxfp8_act_gran_k"] = (
         quant_info.block_shape[1] if quant_info.block_shape else 128
     )
 
     return DeepGemmRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        use_masked_gemm=True,
-        masked_m=masked_m,
-        expected_m=expected_m,
-    )
-
-
-def _pre_permute_standard_contiguous(
-    hidden_states: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> DeepGemmRunnerInput:
-    """Standard-dispatch -> contiguous grouped GEMM layout.
-
-    Mirrors the deepep_normal pre-permute (ep_scatter + m_indices), except the
-    per-expert counts come from a GPU histogram instead of dispatch metadata.
-    To avoid a GPU->CPU sync per layer, buffers are sized to the worst-case
-    bound (topk_numel + E * BLOCK_E); rows beyond the real aligned total keep
-    m_indices == -1 and are skipped by the GEMM.
-    """
-    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
-    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
-
-    BLOCK_E = 128  # ep_scatter's per-expert alignment
-    num_local = runner_config.num_local_experts
-    device = hidden_states.device
-
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
-    running_state["hidden_states_shape"] = hidden_states.shape
-    running_state["hidden_states_dtype"] = hidden_states.dtype
-    running_state["hidden_states_device"] = device
-    running_state["contiguous"] = True
-
-    K = hidden_states.shape[1]
-    flat = topk_ids.view(-1)
-    cnt = torch.zeros(num_local, device=device, dtype=torch.int32)
-    cnt.scatter_add_(0, flat.clamp_min(0).to(torch.int64), (flat >= 0).to(torch.int32))
-    aligned_cnt = ((cnt + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-
-    bound = ceil_div(topk_ids.numel(), BLOCK_E) * BLOCK_E + num_local * BLOCK_E
-    running_state["all_tokens"] = bound
-
-    # fp8-quantize the tokens once, then scatter quantized rows + scales.
-    hs_fp8, hs_scale = per_token_group_quant_fp8(hidden_states, 128)
-
-    input_tensor = torch.empty((bound, K), device=device, dtype=hs_fp8.dtype)
-    # Scatter fp32 scales row-major, then do one e8m0 cast over the whole
-    # buffer (the GEMM1-proven pipeline). Zero-init: padding rows inside each
-    # aligned expert block keep scale == 0 (cast -> 2^-127), so their garbage
-    # payload contributes ~exact zeros.
-    input_tensor_scale = torch.zeros(
-        (bound, K // 128), device=device, dtype=torch.float32
-    )
-    m_indices = torch.full((bound,), -1, device=device, dtype=torch.int32)
-    output_index = torch.empty_like(topk_ids)
-    expert_start_loc = torch.empty_like(cnt)
-
-    ep_scatter(
-        hs_fp8,
-        hs_scale,
-        topk_ids,
-        aligned_cnt,
-        expert_start_loc,
-        input_tensor,
-        input_tensor_scale,
-        m_indices,
-        output_index,
-        scale_ue8m0=False,
-    )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        input_tensor_scale = _cast_to_e8m0_with_rounding_up(
-            input_tensor_scale.unsqueeze(0)
-        ).squeeze(0)
-    running_state["output_index"] = output_index
-
-    return DeepGemmRunnerInput(
-        hidden_states=input_tensor,
-        hidden_states_scale=input_tensor_scale,
+        hidden_states=packed_input,
+        hidden_states_scale=packed_input_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
     )
@@ -889,7 +947,7 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, post_reorder_deepgemm
+    from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
@@ -897,22 +955,6 @@ def post_permute_deep_gemm_to_standard(
     hidden_states_device = running_state["hidden_states_device"]
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
-
-    if running_state.get("contiguous", False):
-        gather_out = torch.zeros(
-            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-        )
-        ep_gather(
-            runner_output.hidden_states,
-            topk_ids,
-            topk_weights,
-            running_state["output_index"],
-            gather_out,
-        )
-        dispose_tensor(runner_output.hidden_states)
-        if runner_config.routed_scaling_factor is not None:
-            gather_out *= runner_config.routed_scaling_factor
-        return StandardCombineInput(hidden_states=gather_out)
 
     src2dst = running_state["src2dst"]
 
@@ -1065,6 +1107,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states,
         hidden_states_scale,
         topk_ids,
+        num_recv_tokens_per_expert_gpu,
         num_recv_tokens_per_expert_gpu,
         expert_start_loc,
         input_tensor,

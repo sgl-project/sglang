@@ -20,7 +20,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     envs,
@@ -485,6 +484,37 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, processor.tokenizer
 
+    def _fast_image_processor_device(self, processor) -> Optional[str]:
+        """The device for the fast image processor, or None to leave it unset.
+
+        Resolved from this processor's own ``server_args``: engines sharing a
+        tokenizer process each carry their own ``base_gpu_id``.
+        """
+        server_args = self.server_args
+        if _is_cpu or server_args.rl_on_policy_target is not None:
+            return "cpu"
+        if _is_xpu:
+            return "xpu"
+        if not _is_npu:
+            return f"cuda:{server_args.base_gpu_id}"
+        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+            # For qwen-vl, the processor hits a reshape issue from the Ascend
+            # dims restriction.
+            from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                npu_apply_qwen_image_preprocess_patch,
+            )
+
+            npu_apply_qwen_image_preprocess_patch()
+            return "npu"
+        if processor.__class__.__name__ == "Glm46VProcessor":
+            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+                npu_apply_glm46v_image_preprocess_patch,
+            )
+
+            npu_apply_glm46v_image_preprocess_patch()
+            return "npu"
+        return None
+
     def process_mm_data(
         self,
         input_text,
@@ -537,31 +567,9 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            if _is_cpu or get_server_args().rl_on_policy_target is not None:
-                kwargs["device"] = "cpu"
-            elif _is_xpu:
-                kwargs["device"] = "xpu"
-            elif not _is_npu:
-                base_gpu_id = get_server_args().base_gpu_id
-                kwargs["device"] = f"cuda:{base_gpu_id}"
-            elif processor.__class__.__name__ not in {
-                "Glm4vProcessor",
-                "Glm46VProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
-                    npu_apply_qwen_image_preprocess_patch,
-                )
-
-                npu_apply_qwen_image_preprocess_patch()
-                kwargs["device"] = "npu"
-            elif processor.__class__.__name__ == "Glm46VProcessor":
-                from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                    npu_apply_glm46v_image_preprocess_patch,
-                )
-
-                npu_apply_glm46v_image_preprocess_patch()
-                kwargs["device"] = "npu"
+            device = self._fast_image_processor_device(processor)
+            if device is not None:
+                kwargs["device"] = device
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
