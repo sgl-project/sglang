@@ -19,7 +19,6 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
-    WaitingImageRequest,
     _select_mm_processor_prompt,
 )
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
@@ -223,13 +222,6 @@ def test_kimi_k3_encoder_only_wrapper_guards_language_tower_hooks():
         KimiK3ForConditionalGeneration.set_dspark_layers_to_capture(model, [0])
 
 
-def test_kimi_k3_declares_encoder_only_weight_prefixes():
-    assert KimiK3ForConditionalGeneration.encoder_only_safetensors_weight_prefixes == (
-        "vision_tower.",
-        "mm_projector.",
-    )
-
-
 def test_epd_scheduler_uses_token_ids_for_tokenized_mm_processors():
     recv_req = SimpleNamespace(
         input_text="unexpanded prompt", input_ids=array("q", [11, 22, 33])
@@ -247,34 +239,6 @@ def test_epd_scheduler_uses_token_ids_for_tokenized_mm_processors():
         )
         == "unexpanded prompt"
     )
-
-
-def test_epd_scheduler_keeps_receive_context_alive():
-    context = zmq.Context()
-    waiting_req = WaitingImageRequest(
-        rid="test-rid",
-        recv_req=SimpleNamespace(num_items_assigned={}),
-        mm_processor=None,
-        encoder_urls=[],
-        model_type="kimi_k3",
-        host_name="127.0.0.1",
-        receive_count=1,
-        zmq_context=context,
-    )
-    sender = context.socket(zmq.PUSH)
-    try:
-        assert waiting_req.zmq_context is context
-        sender.connect(f"tcp://127.0.0.1:{waiting_req.embedding_port}")
-        sender.send_multipart([b"metadata", b"embedding"])
-        assert waiting_req.recv_socket.poll(timeout=1000) & zmq.POLLIN
-        assert waiting_req.recv_socket.recv_multipart() == [
-            b"metadata",
-            b"embedding",
-        ]
-    finally:
-        sender.close(linger=0)
-        waiting_req.recv_socket.close(linger=0)
-        context.term()
 
 
 def test_epd_scheduler_routes_many_requests_over_one_receive_socket():

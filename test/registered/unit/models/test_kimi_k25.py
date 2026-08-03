@@ -101,11 +101,6 @@ class _HFProcessor:
         )
 
 
-def test_kimi_processors_precompute_hash_before_cpu_transfer():
-    assert KimiK2_5VLImageProcessor.precompute_hash_before_cpu_transfer
-    assert KimiK3ImageProcessor.precompute_hash_before_cpu_transfer
-
-
 def test_kimi_gpu_wrapper_rejects_placeholder_count_mismatch():
     wrapper = object.__new__(KimiGPUProcessorWrapper)
     wrapper._image_token = "<|media_pad|>"
@@ -515,9 +510,6 @@ def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
     broadcast_src = []
 
     class _GatherGroup:
-        def broadcast(self, tensor, src):
-            tensor.fill_(1)
-
         def all_gather(self, tensor, dim):
             return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
 

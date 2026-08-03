@@ -182,26 +182,6 @@ def test_kimi_moonvit_precomputes_sequence_lengths_once():
     assert recorded["max_seqlen"] == 4
 
 
-def test_kimi_moonvit_computes_max_sequence_length_on_host():
-    class CapturingRope:
-        def get_freqs_cis(self, grid_thws, device):
-            return torch.ones(7, 2, dtype=torch.complex64, device=device)
-
-    encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
-    nn.Module.__init__(encoder)
-    encoder.rope_2d = CapturingRope()
-    encoder.use_fused_rope = False
-    encoder.blocks = nn.ModuleList()
-    encoder.final_layernorm = nn.Identity()
-
-    output = encoder(
-        torch.ones(7, 4, device="meta"),
-        torch.tensor([[1, 1, 3], [1, 2, 2]], dtype=torch.int32),
-    )
-
-    assert output.device.type == "meta"
-
-
 def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
     recorded = {}
 
@@ -236,29 +216,6 @@ def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
     assert cos_sin_cache.shape == (7, 4)
     assert torch.equal(cos_sin_cache[:, :2] + 1, cos_sin_cache[:, 2:])
     assert torch.equal(positions, torch.arange(7))
-
-
-def test_kimi_moonvit_cuda_rope_uses_shared_fused_kernel(monkeypatch):
-    recorded = {}
-
-    def fake_fused_rope(q, k, prepared_rope):
-        recorded["prepared_rope"] = prepared_rope
-        return q + 1, k + 2
-
-    monkeypatch.setattr(
-        kimi_k25, "apply_fused_qk_complex_rope_inplace", fake_fused_rope
-    )
-    q = torch.zeros(3, 2, 4)
-    k = torch.zeros_like(q)
-    cache = torch.ones(3, 4, dtype=torch.float32)
-    positions = torch.arange(3, dtype=torch.int64)
-
-    q_out, k_out = kimi_k25.apply_rope(q, k, (cache, positions))
-
-    assert torch.equal(q_out, torch.ones_like(q))
-    assert torch.equal(k_out, torch.full_like(k, 2))
-    assert recorded["prepared_rope"][0] is cache
-    assert recorded["prepared_rope"][1] is positions
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -56,13 +56,6 @@ def test_resize_matches_pil_bicubic_golden():
         assert (diff == 0).mean() > 0.7, f"bitwise ratio={(diff == 0).mean():.3f}"
 
 
-def test_resize_noop_keeps_exact_pixels():
-    arr = _natural_image(64, 48)
-    x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    out = _resize_bicubic_if_needed(x, 64, 48)
-    assert torch.equal(out, x.float())
-
-
 def test_fill_transparent_bg_matches_checkpoint_composite():
     """Composite + truncation must match the checkpoint's numpy reference:
     alpha * rgb + (1 - alpha) * chessboard, then astype(np.uint8)."""

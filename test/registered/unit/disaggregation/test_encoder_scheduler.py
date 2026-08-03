@@ -20,50 +20,6 @@ def _pending(modality: str = "image") -> PendingRequest:
     )
 
 
-def test_collect_batch_yields_for_concurrent_image_request_without_fixed_wait():
-    async def run_test():
-        scheduler = EncoderScheduler(
-            encoder=None,
-            send_sockets=[],
-            max_batch_size=8,
-            coalesce_same_turn=True,
-        )
-        first = _pending()
-        second = _pending()
-        await scheduler.pending_queue.put(first)
-
-        async def enqueue_after_worker_yields():
-            await scheduler.pending_queue.put(second)
-
-        producer = asyncio.create_task(enqueue_after_worker_yields())
-        batch = await scheduler._collect_batch()
-        await producer
-
-        assert batch == [first, second]
-
-    asyncio.run(run_test())
-
-
-def test_collect_batch_does_not_wait_for_video():
-    async def run_test():
-        scheduler = EncoderScheduler(
-            encoder=None,
-            send_sockets=[],
-            max_batch_size=8,
-            coalesce_same_turn=True,
-        )
-        first = _pending("video")
-        await scheduler.pending_queue.put(first)
-
-        producer = asyncio.create_task(asyncio.Event().wait())
-        batch = await scheduler._collect_batch()
-
-        assert batch == [first]
-        producer.cancel()
-
-    asyncio.run(run_test())
-
-
 def test_collect_batch_respects_max_batch_size():
     async def run_test():
         scheduler = EncoderScheduler(

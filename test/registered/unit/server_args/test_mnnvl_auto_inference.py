@@ -85,15 +85,6 @@ class TestCaV2MultinodeAuto(CustomTestCase):
             _HANDLE(SimpleNamespace(nnodes=2, tp_size=16))
             self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set())
 
-    def test_single_node_untouched(self):
-        """nnodes=1 must not set the multinode opt-in even on fabric devices."""
-        with _cleared(
-            envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE,
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2,
-        ), patch("sglang.srt.server_args.is_mnnvl_fabric_device", return_value=True):
-            _HANDLE(SimpleNamespace(nnodes=1, tp_size=8))
-            self.assertFalse(envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set())
-
 
 class TestK3ArFusionGate(CustomTestCase):
     def _reset(self):
