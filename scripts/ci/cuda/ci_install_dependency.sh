@@ -175,6 +175,19 @@ clean_site_packages() {
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
+    # Select the workspace's pinned toolchain for the cargo runs that
+    # setuptools-rust makes later in this same step. install_rustup.sh exports
+    # this too, but as a child process it can only reach subsequent steps - the
+    # same reason the PATH export above is repeated here. Runner images that ship
+    # an older rustc otherwise build with it and fail on crates requiring the
+    # pin, and rust-toolchain.toml does not cover this because setuptools-rust
+    # runs cargo from python/, outside the pin's cwd scope.
+    RUST_PINNED_CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${REPO_ROOT}/rust/rust-toolchain.toml" 2>/dev/null || true)
+    if [ -n "${RUST_PINNED_CHANNEL}" ]; then
+        export RUSTUP_TOOLCHAIN="${RUST_PINNED_CHANNEL}"
+        echo "Using pinned Rust toolchain ${RUST_PINNED_CHANNEL} for this install"
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
