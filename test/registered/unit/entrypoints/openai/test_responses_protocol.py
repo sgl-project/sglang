@@ -4,6 +4,7 @@ import unittest
 from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import (
+    PromptTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
     UsageInfo,
@@ -233,8 +234,6 @@ class ThinkingControlTestCase(CustomTestCase):
 
 class ResponsesResponseFromRequestTestCase(CustomTestCase):
     def test_requested_text_format_is_echoed(self):
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
-
         schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
         request = ResponsesRequest(
             model="x",
@@ -254,8 +253,6 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertEqual(response.text["format"]["type"], "json_schema")
 
     def test_parallel_tool_calls_false_preserved(self):
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
-
         request = ResponsesRequest(
             model="x", input="hi", parallel_tool_calls=False, store=False
         )
@@ -271,8 +268,6 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertFalse(response.parallel_tool_calls)
 
     def test_incomplete_status_sets_incomplete_details(self):
-        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
-
         request = ResponsesRequest(model="x", input="hi", store=False)
         incomplete = ResponsesResponse.from_request(
             request,
@@ -298,11 +293,6 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertIsNone(completed.incomplete_details)
 
     def test_usage_serialized_in_responses_shape(self):
-        from sglang.srt.entrypoints.openai.protocol import (
-            PromptTokensDetails,
-            ResponsesResponse,
-        )
-
         request = ResponsesRequest(model="x", input="hi", store=False)
         resp = ResponsesResponse.from_request(
             request,

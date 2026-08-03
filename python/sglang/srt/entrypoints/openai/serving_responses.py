@@ -481,7 +481,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             if request.store:
                 self.msg_store[request.request_id] = messages
 
-            # background+stream is handled by the stream path below.
             if request.background and not request.stream:
                 created_time = int(time.time())
                 response = ResponsesResponse.from_request(
@@ -593,7 +592,6 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
-        # carry the chat path's skip_special_tokens so create_responses reuses it.
         processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
         if is_multimodal:
@@ -2354,7 +2352,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
 
                 def _emit_normal_text():
-                    # whitespace while a call is open separates tool blocks, not content.
                     if normal_text and _should_emit_normal_text_as_message(
                         normal_text,
                         any_tool_call_in_progress=any(
