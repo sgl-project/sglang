@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     action_label_sequence,
     build_minwm_message,
+    is_realtime_trace_event,
     load_cases,
     materialize_first_frame,
 )
@@ -19,6 +20,11 @@ from common import (  # noqa: E402
 
 DRAGON_CASES = Path(__file__).with_name("cases_dragon_ride_60s_832x480.json")
 STEP1600_T2V_CASES = Path(__file__).with_name("cases_step1600_t2v_30s_832x480.json")
+
+
+def test_realtime_trace_events_are_out_of_band() -> None:
+    assert is_realtime_trace_event({"type": "trace_event", "trace": {}})
+    assert not is_realtime_trace_event({"type": "chunk_stats"})
 
 
 def test_dragon_ride_contract_is_exactly_sixty_generated_seconds() -> None:

@@ -17,6 +17,7 @@ import numpy as np
 from common import (
     action_label_sequence,
     action_weights,
+    is_realtime_trace_event,
     load_cases,
     materialize_first_frame,
     prompt_switch_event,
@@ -192,6 +193,8 @@ async def run_case(args, case, contract, first_frame: Path | None):
             packed = await asyncio.wait_for(websocket.recv(), timeout=args.timeout)
             header = msgspec.msgpack.decode(packed)
             message_type = header.get("type")
+            if is_realtime_trace_event(header):
+                continue
             if message_type == "error":
                 raise RuntimeError(header.get("content", "unknown realtime error"))
             if message_type == "chunk_stats":

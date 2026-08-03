@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from common import save_video, sha256_file, write_json
+from common import is_realtime_trace_event, save_video, sha256_file, write_json
 
 DEFAULT_ALIGNMENT_URL = (
     "https://leap-world-us-east-2.s3.us-east-2.amazonaws.com/world-model/sft/"
@@ -252,6 +252,8 @@ async def run_request(
             packed = await asyncio.wait_for(websocket.recv(), timeout=timeout)
             header = msgspec.msgpack.decode(packed)
             message_type = header.get("type")
+            if is_realtime_trace_event(header):
+                continue
             if message_type == "error":
                 raise RuntimeError(header.get("content", "unknown realtime error"))
             if message_type == "chunk_stats":

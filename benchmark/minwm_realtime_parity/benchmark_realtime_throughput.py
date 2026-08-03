@@ -21,7 +21,13 @@ from typing import Any
 
 import msgspec.msgpack
 
-from common import action_weights, load_cases, materialize_first_frame, write_json
+from common import (
+    action_weights,
+    is_realtime_trace_event,
+    load_cases,
+    materialize_first_frame,
+    write_json,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,6 +179,8 @@ async def receive_run(args: argparse.Namespace, contract: dict, case: dict) -> d
                 )
             header = msgspec.msgpack.decode(packed)
             message_type = header.get("type")
+            if is_realtime_trace_event(header):
+                continue
             if message_type == "error":
                 raise RuntimeError(header.get("content", "unknown realtime error"))
             if message_type == "chunk_stats":

@@ -39,6 +39,11 @@ ROT_BITS_TO_LABEL = {
 }
 
 
+def is_realtime_trace_event(message: dict) -> bool:
+    """Return whether an out-of-band trace message can be skipped by clients."""
+    return message.get("type") == "trace_event"
+
+
 def load_cases(path: str | Path) -> dict:
     with Path(path).open(encoding="utf-8") as source:
         manifest = json.load(source)
