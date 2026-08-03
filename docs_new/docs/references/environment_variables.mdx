@@ -894,6 +894,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Synchronize sampled token ids across tensor-parallel ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NCCL_RAS_ENABLE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the job-wide (world rank 0) NCCL RAS collector — pulls RAS <code>STATUS</code> and reports per-rank error states, dead/unresponsive ranks, and advisory divergence via Prometheus + logs. Detection-only (never aborts/removes ranks); needs NCCL ≥ 2.28.7 and <code>--enable-metrics</code> for Prometheus output (logs always emitted). Older/absent RAS support degrades to <code>poll_success=0</code> without crashing.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NCCL_RAS_POLL_INTERVAL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds between RAS <code>STATUS</code> polls. To avoid aliasing false-negatives in the advisory <code>collective_divergence</code> signal, set this <code>&gt;= N ×</code> the slowest collective period you care about; symmetric whole-collective hangs are not detected by RAS (forward watchdog covers them).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NCCL_RAS_STUCK_POLLS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Consecutive non-zero <code>collective_counts</code> samples a rank must fail to advance (with cross-rank spread <code>&gt; 0</code>) before the advisory <code>nccl_ras_stuck</code> signal fires.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>3</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NCCL_RAS_ADDR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>RAS <code>STATUS</code> socket endpoint (<code>"host:port"</code>). Falls back to <code>NCCL_RAS_ADDR</code> if that NCCL env is set; otherwise <code>localhost:28028</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"localhost:28028"</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -450,6 +450,14 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # NCCL RAS health collector — detection-only (never aborts/removes ranks).
+    # Job-wide singleton on world rank 0 pulls NCCL RAS STATUS and reports
+    # per-rank error states + dead/unresponsive ranks via Prometheus + logs.
+    SGLANG_NCCL_RAS_ENABLE = EnvBool(False)
+    SGLANG_NCCL_RAS_POLL_INTERVAL = EnvFloat(10.0)  # seconds between polls
+    SGLANG_NCCL_RAS_STUCK_POLLS = EnvInt(3)  # consecutive non-zero frozen samples for advisory stuck
+    # RAS STATUS socket endpoint ("host:port"); falls back to NCCL_RAS_ADDR.
+    SGLANG_NCCL_RAS_ADDR = EnvStr("localhost:28028")
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # For non-streaming requests, the scheduler still flushes intermediate

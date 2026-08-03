@@ -430,6 +430,7 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
                 is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
+                name=self.unique_name,
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None

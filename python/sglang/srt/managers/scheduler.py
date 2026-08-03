@@ -588,6 +588,9 @@ class Scheduler(
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
 
+        # Init NCCL RAS health collector (detection-only; world rank 0).
+        self.init_nccl_ras_collector()
+
         # Init profiler
         self.init_profiler()
 
@@ -1203,6 +1206,57 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def init_nccl_ras_collector(self):
+        """Construct (and start) the job-wide NCCL RAS collector daemon.
+
+        One collector per job, elected on world rank 0 (a dp/tp/pp all-zero
+        predicate would silently elect zero collectors under plain TP/PP where
+        ``dp_rank`` is None). The poll loop + logs run whenever RAS is enabled
+        and this rank is elected; Prometheus writes are additionally gated on
+        ``metrics_collector is not None`` (log-only fallback when
+        ``--enable-metrics`` is off).
+        """
+        self.ras_monitor = None
+        if not envs.SGLANG_NCCL_RAS_ENABLE.get():
+            return
+        # setdefault only — never override an explicit user setting.
+        os.environ.setdefault("NCCL_RAS_ENABLE", "1")
+
+        is_collector = get_world_group().rank_in_group == 0
+        if not is_collector:
+            return
+
+        metrics = self.metrics_collector
+        if metrics is None:
+            logger.warning(
+                "NCCL RAS enabled but --enable-metrics is off; RAS Prometheus "
+                "metrics disabled, structured logs still emitted."
+            )
+
+        endpoint = os.getenv("NCCL_RAS_ADDR") or envs.SGLANG_NCCL_RAS_ADDR.get()
+        from sglang.srt.distributed.nccl_ras import (
+            RasDetector,
+            RasMonitor,
+            RasSocketClient,
+        )
+
+        client = RasSocketClient.from_endpoint(endpoint)
+        detector = RasDetector()
+        self.ras_monitor = RasMonitor(
+            client=client,
+            detector=detector,
+            poll_interval=envs.SGLANG_NCCL_RAS_POLL_INTERVAL.get(),
+            metrics_collector=metrics,
+            is_initializing_fn=lambda: self.is_initializing,
+        )
+        logger.info("RAS collector elected on world rank 0 (endpoint=%s)", endpoint)
+        try:
+            self.ras_monitor.start()
+        except Exception:
+            # Stop a partially-created daemon thread if start() raises.
+            self.ras_monitor.stop()
+            raise
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -4884,6 +4938,10 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            # Stop the NCCL RAS collector daemon before tearing down FPM so the
+            # short-connection socket (≤1s timeout) is closed cleanly.
+            if getattr(scheduler, "ras_monitor", None) is not None:
+                scheduler.ras_monitor.stop()
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
