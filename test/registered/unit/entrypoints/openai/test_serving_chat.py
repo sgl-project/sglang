@@ -1705,6 +1705,48 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    def test_dsv4_reasoning_effort_preamble_mapping(self):
+        """Effort labels map to the DeepSeek-V4-Flash-0731 preambles.
+
+        The preamble strings are copied verbatim from the checkpoint's
+        `encoding_dsv4.py`; this pins that external spec so a silent drift
+        (e.g. reverting `high` back onto the old `max` text, or dropping the
+        `low`-default normalization) turns the case red. Only rendered in
+        thinking mode at the first turn.
+        """
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        HIGH = "Reasoning Effort: Absolute maximum"
+        MAX = "Reasoning Effort: Beyond maximum"
+        messages = [{"role": "user", "content": "hi"}]
+
+        def enc(effort, mode="thinking"):
+            return encoding_dsv4.encode_messages(
+                messages, thinking_mode=mode, reasoning_effort=effort
+            )
+
+        # low / None default -> no preamble.
+        for effort in (None, "low"):
+            out = enc(effort)
+            self.assertNotIn(HIGH, out)
+            self.assertNotIn(MAX, out)
+
+        # high -> former "max" text; max -> escalated text (mutually exclusive).
+        high_out = enc("high")
+        self.assertIn(HIGH, high_out)
+        self.assertNotIn(MAX, high_out)
+
+        max_out = enc("max")
+        self.assertIn(MAX, max_out)
+        self.assertNotIn(HIGH, max_out)
+
+        # Preamble is thinking-mode only: chat never emits it even with max.
+        self.assertNotIn(MAX, enc("max", mode="chat"))
+
+        # Unknown effort is rejected rather than silently dropped.
+        with self.assertRaises(AssertionError):
+            enc("bogus")
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
