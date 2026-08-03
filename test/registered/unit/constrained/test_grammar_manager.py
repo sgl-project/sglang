@@ -189,6 +189,21 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             ("structural_tag", '{"structures": [], "triggers": []}'),
         )
 
+    def test_falsy_structural_tag_still_resolves_a_key(self):
+        """The selection chain must cover every value the entry condition admits.
+        A falsy-but-set constraint used to match no branch and hit the key lookup
+        with nothing assigned.
+        """
+        mgr = self._make_mgr()
+        future = Future()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
+
+        req = _make_req(structural_tag="")
+        result = mgr.process_req_with_grammar(req)
+
+        self.assertTrue(result)
+        self.assertEqual(req.grammar_key, ("structural_tag", ""))
+
     def test_cache_hit_returns_false(self):
         """Cache hit should NOT add to grammar queue."""
         mgr = self._make_mgr()
