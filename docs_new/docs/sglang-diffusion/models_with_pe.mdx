@@ -1,5 +1,6 @@
 ---
 title: "Diffusion Models with Prompt Enhancement (PE)"
+description: "Run ERNIE-Image with built-in prompt enhancement or a separate SGLang-served PE model."
 ---
 
 ## Quick Start
@@ -34,7 +35,9 @@ sglang serve --model-path /path/to/baidu/ERNIE-Image/pe/ --port ${PE_PORT}
 ```
 ```bash
 # Terminal 2: launch diffusion model server with PE server
-sglang serve --model-path /path/to/baidu/ERNIE-Image/ --pe-server-url "http://${HOST}:${PE_PORT}"
+sglang serve --model-path /path/to/baidu/ERNIE-Image/ \
+  --pe-server-url "http://${HOST}:${PE_PORT}" \
+  --port ${PORT}
 ```
 ```bash
 # Terminal 3: launch client
@@ -58,4 +61,4 @@ curl -X POST http://${HOST}:${PORT}/v1/images/generations \
 
 ## Ascend NPU Environment
 
-<a href="https://github.com/sgl-project/sglang/tree/main/docs_new/docs/sglang-diffusion/models_with_ar.mdx#ascend-npu-env">Check here.</a>
+See [Diffusion models with AR stage like GLM-Image](/docs/sglang-diffusion/models_with_ar#ascend-npu-env).

@@ -15,8 +15,14 @@ mod request;
 mod sampling;
 mod types;
 
-pub use egress::{ChunkEvent, EgressSink};
-pub use request::{GenerateRequest, RequestKind};
+pub use egress::{
+    ChunkEvent, ChunkExtras, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, EgressItem,
+    EgressSink, SinkError, for_each_chunk, frame_egress_batch_cols, frame_egress_error,
+    frame_egress_result,
+};
+pub use finish_reason::Matched;
+pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
+pub use request::{GenerateBody, GenerateRequest, RequestKind};
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 

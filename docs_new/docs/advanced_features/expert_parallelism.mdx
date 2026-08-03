@@ -62,12 +62,17 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ascend NPU native fused all-to-all communication.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Ascend NPU deployments.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`pplx`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/perplexityai/pplx-kernels">pplx-kernels</a>, Perplexity's NVSHMEM-based all-to-all dispatch/combine kernels. Low-latency (masked) only; targets FP8 (DeepGEMM) MoE models on Hopper. Requires NVSHMEM 3.2.5, <code>nvshmem4py</code>, <code>cuda-python</code>, and a prebuilt <code>libpplx_kernels.so</code> (<code>sm_90a</code>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Low-latency decode EP on Hopper.</td>
+    </tr>
   </tbody>
 </table>
 
-DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. NIXL-EP currently operates in low-latency mode with CUDA Graph support. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
+DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. NIXL-EP and PPLX currently operate in low-latency mode with CUDA Graph support (PPLX reuses the DeepEP low-latency masked expert-compute path). Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
+Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported. Note that `pplx` additionally requires `--enable-dp-attention` with at least 2 DP groups (i.e., `tp_size / attention_tp_size > 1`); otherwise pplx-kernels' AllToAll cannot be constructed.
 
 ### Backends for MoE Computation
 

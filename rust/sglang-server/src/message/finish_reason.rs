@@ -68,7 +68,7 @@ pub enum FinishReason {
     /// This arm is why the outer enum is untagged: a finish reason added Python-side
     /// must not fail the header decode, which rejects the whole frame — every
     /// request in the batch, not just the one that carried it.
-    Unknown(serde_json::Map<String, serde_json::Value>),
+    Unknown(Box<serde_json::Map<String, serde_json::Value>>),
 }
 
 impl From<FinishKind> for FinishReason {

@@ -377,9 +377,9 @@ class RuntimeHandle:
         model_config = self.tokenizer_manager.model_config
         result = {
             "model_path": self.tokenizer_manager.model_path,
-            "tokenizer_path": self.server_args.tokenizer_path,
+            "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
-            "weight_version": self.server_args.weight_version,
+            "weight_version": self.tokenizer_manager.server_args.weight_version,
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -432,7 +432,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.server_args.enable_lora and hasattr(
+        if self.tokenizer_manager.server_args.enable_lora and hasattr(
             self.tokenizer_manager, "lora_registry"
         ):
             lora_registry = self.tokenizer_manager.lora_registry
