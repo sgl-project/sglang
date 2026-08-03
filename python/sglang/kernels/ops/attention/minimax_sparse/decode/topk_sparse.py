@@ -89,6 +89,7 @@ def _gqa_share_sparse_decode_kernel(
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    ONE_PAGE_PER_BLOCK: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -165,14 +166,20 @@ def _gqa_share_sparse_decode_kernel(
         # Resolve slots from graph-owned page ids during replay.
         pos = c + off_n
         pos_mask = pos < seq_len
-        slots = load_token_slots(
-            page_table_ptr,
-            pid_b,
-            pos,
-            stride_pt_b,
-            pos_mask,
-            PAGE_SIZE,
-        )
+        if ONE_PAGE_PER_BLOCK:
+            physical_page = tl.load(
+                page_table_ptr + pid_b * stride_pt_b + c // BLOCK_SIZE_N
+            ).to(tl.int64)
+            slots = physical_page * BLOCK_SIZE_N + off_n
+        else:
+            slots = load_token_slots(
+                page_table_ptr,
+                pid_b,
+                pos,
+                stride_pt_b,
+                pos_mask,
+                PAGE_SIZE,
+            )
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
             slots[None, :] * stride_k_s
@@ -418,6 +425,7 @@ def flash_decode_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
+        ONE_PAGE_PER_BLOCK=page_size == block_size,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
