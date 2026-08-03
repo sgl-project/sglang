@@ -112,7 +112,7 @@ Commit: `git commit -am "feat(realtime): add generation-aware chunk protocol"`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py`
 - Test: `python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py`
 
-- [ ] **Step 1: Write failing quota, TTL, and no-eviction tests**
+- [x] **Step 1: Write failing quota, TTL, and no-eviction tests**
 
 ```python
 @pytest.mark.asyncio
@@ -131,13 +131,13 @@ def test_active_realtime_sessions_are_never_lru_evicted():
         cache.attach(_Req(realtime_session_id="s2", realtime_generation_id="g2", block_idx=0))
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q`
 
 Expected: FAIL because admission and capacity errors do not exist.
 
-- [ ] **Step 3: Implement lease stores and explicit capacity**
+- [x] **Step 3: Implement lease stores and explicit capacity**
 
 ```python
 class SessionLeaseStore(Protocol):
@@ -160,7 +160,7 @@ class InMemorySessionLeaseStore:
 
 增加惰性导入 boto3 的 `DynamoDBSessionLeaseStore`，用 `attribute_not_exists(user_id)` 条件写、TTL 字段、token 条件续约/释放；默认部署不配置 table 时只使用内存实现。`RealtimeSessionCache.attach()` 容量满时拒绝新 block 0，不再调用 LRU 淘汰；GPU Worker 从 `--realtime-max-sessions-per-worker` 读取上限。
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `TORCHDYNAMO_DISABLE=1 PYTHONPATH=python .venv/bin/python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_realtime_admission.py python/sglang/multimodal_gen/test/unit/realtime/test_realtime_runtime.py -q`
 

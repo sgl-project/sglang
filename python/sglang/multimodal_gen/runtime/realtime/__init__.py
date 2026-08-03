@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.realtime.control_signals import (
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
     RealtimeSession,
+    RealtimeSessionCapacityError,
     RealtimeSessionCache,
 )
 from sglang.multimodal_gen.runtime.realtime.states import (
@@ -37,6 +38,7 @@ __all__ = [
     "RealtimeCausalDecodeState",
     "RealtimeCausalDiTState",
     "RealtimeSession",
+    "RealtimeSessionCapacityError",
     "RealtimeSessionCache",
     "get_realtime_causal_dit_state",
     "parse_control_event_payload",

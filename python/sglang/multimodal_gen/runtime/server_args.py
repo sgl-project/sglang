@@ -280,6 +280,14 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_config: str | None = None
     enable_batching_metrics: bool = False
 
+    # Realtime admission and worker-local state limits
+    realtime_max_sessions: int = 8
+    realtime_max_sessions_per_worker: int = 8
+    realtime_session_lease_ttl_s: float = 60.0
+    realtime_session_max_lifetime_s: float = 600.0
+    realtime_admission_wait_s: float = 10.0
+    realtime_session_lease_table: str | None = None
+
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
 
@@ -1572,6 +1580,42 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--realtime-max-sessions",
+            type=int,
+            default=ServerArgs.realtime_max_sessions,
+            help="Maximum active realtime sessions admitted by this Gateway.",
+        )
+        parser.add_argument(
+            "--realtime-max-sessions-per-worker",
+            type=int,
+            default=ServerArgs.realtime_max_sessions_per_worker,
+            help="Maximum persistent realtime session states on each GPU worker.",
+        )
+        parser.add_argument(
+            "--realtime-session-lease-ttl-s",
+            type=float,
+            default=ServerArgs.realtime_session_lease_ttl_s,
+            help="Lease TTL renewed by valid realtime client activity.",
+        )
+        parser.add_argument(
+            "--realtime-session-max-lifetime-s",
+            type=float,
+            default=ServerArgs.realtime_session_max_lifetime_s,
+            help="Hard maximum lifetime of one realtime generation session.",
+        )
+        parser.add_argument(
+            "--realtime-admission-wait-s",
+            type=float,
+            default=ServerArgs.realtime_admission_wait_s,
+            help="Maximum time to wait for a bounded realtime session slot.",
+        )
+        parser.add_argument(
+            "--realtime-session-lease-table",
+            type=str,
+            default=ServerArgs.realtime_session_lease_table,
+            help="Optional DynamoDB lease table for multiple Gateway replicas.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -2157,6 +2201,16 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.realtime_max_sessions < 1:
+            raise ValueError("realtime_max_sessions must be >= 1")
+        if self.realtime_max_sessions_per_worker < 1:
+            raise ValueError("realtime_max_sessions_per_worker must be >= 1")
+        if self.realtime_session_lease_ttl_s <= 0:
+            raise ValueError("realtime_session_lease_ttl_s must be > 0")
+        if self.realtime_session_max_lifetime_s <= 0:
+            raise ValueError("realtime_session_max_lifetime_s must be > 0")
+        if self.realtime_admission_wait_s < 0:
+            raise ValueError("realtime_admission_wait_s must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

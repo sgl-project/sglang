@@ -10,6 +10,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+class RealtimeSessionCapacityError(RuntimeError):
+    pass
+
+
 class BaseRealtimeState:
     """per-session state owned by pipeline stages"""
 
@@ -50,7 +54,7 @@ class RealtimeSession:
 
 
 class RealtimeSessionCache:
-    """lru cache that binds incoming chunks to persistent realtime sessions"""
+    """Binds incoming chunks to persistent realtime sessions without eviction."""
 
     def __init__(self, max_sessions: int = 64) -> None:
         self.max_sessions = max_sessions
@@ -92,6 +96,11 @@ class RealtimeSessionCache:
                     "Missing realtime session state for "
                     f"session_id={session_id} block_idx={req.block_idx}."
                 )
+            if len(self._sessions) >= self.max_sessions:
+                raise RealtimeSessionCapacityError(
+                    "Realtime session capacity exhausted: "
+                    f"active={len(self._sessions)} max={self.max_sessions}"
+                )
             self._sessions[session_id] = req.session or RealtimeSession()
         elif req.block_idx == 0:
             old_session = self._sessions[session_id]
@@ -103,10 +112,3 @@ class RealtimeSessionCache:
 
         req.session = self._sessions[session_id]
         self._sessions.move_to_end(session_id)
-        self._evict_stale_sessions()
-
-    def _evict_stale_sessions(self) -> None:
-        while len(self._sessions) > self.max_sessions:
-            stale_session_id, stale_session = self._sessions.popitem(last=False)
-            self._dispose_session(stale_session_id, stale_session)
-            logger.debug("Evicted stale realtime session cache: %s", stale_session_id)

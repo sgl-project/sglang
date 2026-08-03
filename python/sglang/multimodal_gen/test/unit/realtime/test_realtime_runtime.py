@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.realtime.control_signals import (
 )
 from sglang.multimodal_gen.runtime.realtime.session import (
     BaseRealtimeState,
+    RealtimeSessionCapacityError,
     RealtimeSessionCache,
 )
 from sglang.multimodal_gen.runtime.realtime.states import (
@@ -154,6 +155,20 @@ def test_realtime_session_cache_rejects_missing_nonzero_chunk():
         assert "Missing realtime session state" in str(exc)
     else:
         raise AssertionError("expected missing realtime session to fail")
+
+
+def test_active_realtime_sessions_are_never_lru_evicted():
+    cache = RealtimeSessionCache(max_sessions=1)
+    first = _Req(realtime_session_id="session-a", block_idx=0, session=None)
+    second = _Req(realtime_session_id="session-b", block_idx=0, session=None)
+    cache.attach(first)
+
+    with pytest.raises(RealtimeSessionCapacityError):
+        cache.attach(second)
+
+    followup = _Req(realtime_session_id="session-a", block_idx=1, session=None)
+    cache.attach(followup)
+    assert followup.session is first.session
 
 
 def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():

@@ -131,7 +131,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
-        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        self._realtime_sessions = RealtimeSessionCache(
+            max_sessions=server_args.realtime_max_sessions_per_worker
+        )
         self.memory_occupation: MemoryOccupationController | None = None
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
