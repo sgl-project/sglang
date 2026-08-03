@@ -38,11 +38,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTimeTextImageEmbedding
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 _MODULATION_FACTOR = 6

@@ -36,50 +36,37 @@ def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     )
 
 
-def apply_hisparse_dsa_backend_defaults(
-    server_args: ServerArgs,
-    user_set_prefill: bool,
-    user_set_decode: bool,
-    kv_cache_dtype: str,
-) -> bool:
-    """Pick DSA backends for --enable-hisparse based on KV dtype.
-
-    CUDA uses dtype-specific FlashMLA backends; ROCm uses TileLang. Returns
-    True if hisparse handled backend selection.
-    """
-    if not server_args.enable_hisparse:
-        return False
-
-    backend = _hisparse_default_backend(kv_cache_dtype)
-    if not user_set_prefill:
-        server_args.dsa_prefill_backend = backend
-    if not user_set_decode:
-        server_args.dsa_decode_backend = backend
-    logger.warning(
-        f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
-        f"prefill={server_args.dsa_prefill_backend}, decode={server_args.dsa_decode_backend}."
-    )
-    return True
+# The hisparse DSA backend defaults moved to the resolution pipeline
+# (arg_groups/overrides.py: _dsa_split_backend_resolution, hisparse arm).
 
 
 def validate_hisparse_dsa_backend(
     server_args: ServerArgs, attr: str, label: str
 ) -> None:
-    backend = getattr(server_args, attr)
-    allowed_backends = _hisparse_allowed_backends(server_args.kv_cache_dtype)
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    # Invoked after the DSA kv-cache-dtype / split-backend declarations:
+    # read the resolving state through the view.
+    view = resolved_view(server_args)
+    backend = getattr(view, attr)
+    kv_cache_dtype = view.kv_cache_dtype
+    allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
     if backend is not None and backend not in allowed_backends:
         raise ValueError(
             f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
-            f"on this platform with --kv-cache-dtype={server_args.kv_cache_dtype}, "
+            f"on this platform with --kv-cache-dtype={kv_cache_dtype}, "
             f"but got --dsa-{label}-backend={backend}. "
             f"Please use --dsa-{label}-backend="
-            f"{_hisparse_default_backend(server_args.kv_cache_dtype)} "
+            f"{_hisparse_default_backend(kv_cache_dtype)} "
             "or omit it."
         )
 
 
 def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
-    if server_args.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    kv_cache_dtype = resolved_view(server_args).kv_cache_dtype
+    if kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
         return
 
     choices = " or ".join(
@@ -87,7 +74,7 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
     )
     raise ValueError(
         f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
-        f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. Please use {choices}."
+        f"but got --kv-cache-dtype={kv_cache_dtype}. Please use {choices}."
     )
 
 
@@ -120,7 +107,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
         # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -134,7 +121,13 @@ def validate_hisparse(server_args: ServerArgs) -> None:
             )
         return
 
-    if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).kv_cache_dtype not in (
+        "bfloat16",
+        "auto",
+        "fp8_e4m3",
+    ):
         validate_hisparse_kv_cache_dtype(server_args)
 
     for attr, label in [

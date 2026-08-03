@@ -21,13 +21,13 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
 if TYPE_CHECKING:
@@ -38,8 +38,24 @@ import logging
 
 import numpy as np
 
+from sglang.srt.runtime_context import get_parallel
+
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+    )
+
+
+def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
 
 
 def _reshape_kv_for_fia_nz(
@@ -319,10 +335,8 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.enable_torch_compile = get_flags().capture.enable_torch_compile
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -350,7 +364,8 @@ class AscendAttnBackend(AttentionBackend):
         self.q_head_num_padding = None
         if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
             self.tp_q_head_num = (
-                model_runner.model_config.num_attention_heads // get_attention_tp_size()
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:
@@ -364,7 +379,7 @@ class AscendAttnBackend(AttentionBackend):
             self.is_dllm_model = True
             self.dllm_block_size = self.dllm_config.block_size
 
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -379,14 +394,6 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
-
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -470,13 +477,40 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify():
+        if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
+            forward_batch.spec_info
+        ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
+        # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
+        # indexer reads a value consistent with actual_seq_lengths_kv /
+        # block_tables (which are also built from the pre-pad batch here).
+        # Without this, eager decode under DP attention pads q to the global
+        # max while kv stays local, causing a shape mismatch in
+        # npu_lightning_indexer.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            self.forward_metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i for i in range(forward_batch.seq_lens.shape[0])],
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         if (
             self.use_mla
@@ -657,7 +691,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify():
+        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
@@ -674,11 +708,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens_cpu[:bs].int()
+            seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1).to(self.device)
-            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            start_exp = starts.unsqueeze(1)
+            seq_exp = seq_lens_int.unsqueeze(1)
             mask = (indices.unsqueeze(0) < start_exp) | (
                 indices.unsqueeze(0) >= seq_exp
             )
@@ -701,6 +735,27 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
@@ -839,7 +894,10 @@ class AscendAttnBackend(AttentionBackend):
         q_nope_next = q_nope_next.contiguous()
         q_rope_prev = q_rope_prev.contiguous()
         q_rope_next = q_rope_next.contiguous()
-        topk_indices_prev, topk_indices_next = topk_indices
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        topk_indices_prev, topk_indices_next = torch.split(
+            topk_indices, split_len, dim=0
+        )
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
@@ -1050,6 +1108,9 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+            topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,

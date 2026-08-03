@@ -33,11 +33,9 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         def on_select_experts(self, *, topk_ids):
             recorded["topk_ids"] = topk_ids.clone()
 
-    monkeypatch.setattr(
-        hash_topk_module,
-        "get_global_expert_distribution_recorder",
-        lambda: FakeRecorder(),
-    )
+    from sglang.srt.runtime_context import get_resources
+
+    monkeypatch.setattr(get_resources(), "expert_distribution_recorder", FakeRecorder())
 
     topk = HashTopK(
         topk=3,

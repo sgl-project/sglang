@@ -23,14 +23,13 @@ export const Qwen36Deployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      // NVFP4 is a Blackwell-only, 27B-only checkpoint (nvidia/Qwen3.6-27B-NVFP4);
-      // only surface it when both conditions hold so we never emit an unrunnable command.
+      // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
       getDynamicItems: (values) => {
         const items = [
           { id: 'fp8', label: 'FP8', default: true },
           { id: 'bf16', label: 'BF16', default: false },
         ];
-        const nvfp4Supported = values.modelSize === '27b' && (values.hardware === 'b200' || values.hardware === 'b300');
+        const nvfp4Supported = values.hardware === 'b200' || values.hardware === 'b300';
         if (nvfp4Supported) {
           items.push({ id: 'nvfp4', label: 'NVFP4', default: false });
         }
@@ -85,7 +84,7 @@ export const Qwen36Deployment = () => {
           { id: 'v2', label: 'V2', default: false },
         ];
       },
-      commandRule: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer' : null,
+      commandRule: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
     },
   };
 
@@ -94,8 +93,8 @@ export const Qwen36Deployment = () => {
       baseName: '35B-A3B',
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
+      b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
     },
     '27b': {
@@ -175,10 +174,10 @@ export const Qwen36Deployment = () => {
       mambaCache: speculative === 'enabled' ? 'v2' : values.mambaCache,
     };
 
-    // NVFP4: nvidia/Qwen3.6-27B-NVFP4 on Blackwell (B200/B300). Follows the exact command
+    // NVFP4: nvidia/Qwen3.6-{35B-A3B,27B}-NVFP4 on Blackwell (B200/B300). Follows the exact command
     // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
-    // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no --mem-fraction-static
-    // or SGLANG_ENABLE_SPEC_V2 prefix). Reasoning / tool-call parsers still follow their toggles.
+    // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no
+    // --mem-fraction-static). Reasoning / tool-call parsers still follow their toggles.
     if (quantization === 'nvfp4') {
       let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
       cmd += ` \\\n  --tp-size ${hwConfig.tp} --attention-backend trtllm_mha`;
@@ -199,12 +198,7 @@ export const Qwen36Deployment = () => {
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}${quantSuffix}`;
 
-    let cmd = '';
-    if (speculative === 'enabled') {
-      cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
-    }
-
-    cmd += `sglang serve --model-path ${modelName}`;
+    let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     }
@@ -222,11 +216,8 @@ export const Qwen36Deployment = () => {
       }
     }
 
-    if (hardware === 'b200') {
+    if (hardware === 'b200' || hardware === 'b300') {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
-    }
-    if (hardware === 'b300') {
-      cmd += ` \\\n  --attention-backend flashinfer`;
     }
     if (hwConfig.mem !== undefined) {
       cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;

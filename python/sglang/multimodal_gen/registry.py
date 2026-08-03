@@ -36,6 +36,8 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
+    MiniMaxH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -58,6 +60,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
@@ -67,6 +70,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -75,6 +79,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -116,7 +121,11 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import (
+    Ideogram4FastSamplingParams,
+    Ideogram4InstantSamplingParams,
+    Ideogram4SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
@@ -127,15 +136,18 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -628,6 +640,20 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # Pi0.5 / OpenPI / LeRobot action policies.
+    register_configs(
+        sampling_param_cls=Pi05SamplingParams,
+        pipeline_config_cls=Pi05PipelineConfig,
+        hf_model_paths=[
+            "lerobot/pi05_base",
+            "lerobot/pi05_libero_base",
+        ],
+        model_detectors=[
+            lambda hf_id: "pi05" in hf_id.lower(),
+            lambda hf_id: "pi0.5" in hf_id.lower(),
+        ],
+    )
+
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
@@ -765,6 +791,22 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            # Since LongLive-2.0-5B does not have official diffusers release
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -784,6 +826,18 @@ def _register_configs():
         pipeline_config_cls=MOVA720PConfig,
         model_detectors=[
             lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
         ],
     )
     # FLUX
@@ -995,7 +1049,7 @@ def _register_configs():
 
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # Both Nano (16B) and Super (64B) share the same pipeline; arch dimensions
     # come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
@@ -1077,6 +1131,16 @@ def _register_configs():
     )
 
     # Ideogram 4
+    register_configs(
+        sampling_param_cls=Ideogram4FastSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-fast"],
+    )
+    register_configs(
+        sampling_param_cls=Ideogram4InstantSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-instant"],
+    )
     register_configs(
         sampling_param_cls=Ideogram4SamplingParams,
         pipeline_config_cls=Ideogram4PipelineConfig,

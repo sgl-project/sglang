@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -443,3 +443,28 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        output = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            ver=fa_ver,
+        )
+        return output[0] if isinstance(output, tuple) else output

@@ -7,7 +7,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()

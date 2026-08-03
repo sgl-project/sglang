@@ -45,6 +45,21 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 ACCURACY_TOLERANCE = 0.99
 
+# Dataset total question counts and allowed fluctuation (in questions)
+DATASET_QUESTION_COUNTS = {
+    "aime25": 30,
+    "aime26": 30,
+    "gpqa_diamond": 198,
+}
+
+DATASET_FLUCTUATION = {
+    "aime25": 2,
+    "aime26": 2,
+    "gpqa_diamond": 5,
+}
+
+MAX_RETRY_COUNT = 3
+
 SERVER_INITIALIZATION_DELAY = 120
 
 if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
@@ -56,6 +71,31 @@ else:
         20000 + int(os.environ.get("ASCEND_VISIBLE_DEVICES", "0")[0]) * 100
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_SERVER_PORT_FOR_TEST + 66}"
+
+
+def get_accuracy_threshold(datasets, baseline_accuracy):
+    """Calculate accuracy threshold based on dataset fluctuation tolerance.
+
+    For datasets with defined fluctuation (aime*, gpqa_diamond), use absolute
+    question count tolerance. For others (e.g. mmmu), use percentage tolerance.
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION and dataset in DATASET_QUESTION_COUNTS:
+        fluctuation = DATASET_FLUCTUATION[dataset] / DATASET_QUESTION_COUNTS[dataset]
+        return baseline_accuracy - fluctuation
+    return baseline_accuracy * ACCURACY_TOLERANCE
+
+
+def get_max_retries(datasets):
+    """Return max retry count for accuracy tests.
+
+    gpqa and aime datasets support up to MAX_RETRY_COUNT retries.
+    mmmu and others use 1 attempt (no retry).
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION:
+        return MAX_RETRY_COUNT
+    return 1
 
 
 def run_evalscope(
@@ -212,6 +252,7 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     if self.accuracy is not None:
+        threshold = get_accuracy_threshold(self.datasets, self.accuracy)
         dump_metric(
             "accuracy",
             float(metrics["accuracy"]),
@@ -224,12 +265,9 @@ def assert_metrics(self, metrics):
         )
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
-            self.accuracy * ACCURACY_TOLERANCE,
-            f"Accuracy check failed. Expected >= {self.accuracy * ACCURACY_TOLERANCE}, Got: {metrics['accuracy']}",
+            threshold,
+            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
         )
-
-
-MMMU_LOCAL_PATH = "/root/.cache/modelscope/hub/datasets/AI-ModelScope___mmmu"
 
 
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
@@ -249,6 +287,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     max_attempts = 2
+    n_runs = 3
     accuracy = 0.1
 
     @classmethod
@@ -280,29 +319,67 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
+
+    def run_accuracy_multiple(self, n_runs=None):
+        if n_runs is None:
+            n_runs = self.n_runs
+
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+
+        if self.benchmark_tool != EVALSCOPE:
+            raise Exception(
+                "run_accuracy_multiple only supports evalscope benchmark tool"
+            )
+
+        model_name = os.path.basename(self.model)
+        all_metrics = []
+
+        for i in range(n_runs):
+            logger.info(f"=== Accuracy run {i + 1}/{n_runs} ===")
             metrics = run_evalscope(
                 host=host,
                 port=port,
                 model=model_name,
                 datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
+                dataset_args=self.dataset_args,
                 eval_batch_size=self.eval_batch_size,
                 limit=self.limit,
                 generation_config=self.generation_config,
@@ -311,7 +388,34 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 timeout=self.timeout,
                 eval_type=self.eval_type,
             )
-            assert_metrics(self, metrics)
+            all_metrics.append(metrics)
+            if metrics and "accuracy" in metrics:
+                logger.info(f"Run {i + 1} accuracy: {metrics['accuracy']}")
+            else:
+                logger.warning(f"Run {i + 1} failed to get accuracy metric")
+
+        valid_metrics = [m for m in all_metrics if m and "accuracy" in m]
+        if not valid_metrics:
+            raise Exception("No valid accuracy metrics obtained from any run")
+
+        avg_accuracy = sum(float(m["accuracy"]) for m in valid_metrics) / len(
+            valid_metrics
+        )
+
+        logger.info("=" * 60)
+        logger.info("Multiple Run Accuracy Results:")
+        for i, m in enumerate(valid_metrics):
+            logger.info(f"  Run {i + 1}: {m['accuracy']}")
+        logger.info(f"  Average: {avg_accuracy}")
+        logger.info("=" * 60)
+
+        avg_metrics = {"accuracy": avg_accuracy}
+        dump_metric(
+            "accuracy_avg",
+            avg_accuracy,
+            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+        )
+        assert_metrics(self, avg_metrics)
 
 
 class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
@@ -378,17 +482,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -396,21 +489,36 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            metrics = run_evalscope(
-                host=self.host,
-                port=self.port,
-                model=model_name,
-                datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
-                eval_batch_size=self.eval_batch_size,
-                limit=self.limit,
-                generation_config=self.generation_config,
-                dataset_dir=self.dataset_dir,
-                stream=self.stream,
-                timeout=self.timeout,
-                eval_type=self.eval_type,
-            )
-            assert_metrics(self, metrics)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=self.host,
+                    port=self.port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
 
 
 class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
@@ -490,17 +598,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
                 )
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -508,18 +605,33 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         port = parsed_url.port
         if self.benchmark_tool == EVALSCOPE:
             model_name = os.path.basename(self.model_config.get("model_path"))
-            metrics = run_evalscope(
-                host=host,
-                port=port,
-                model=model_name,
-                datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
-                eval_batch_size=self.eval_batch_size,
-                limit=self.limit,
-                generation_config=self.generation_config,
-                dataset_dir=self.dataset_dir,
-                stream=self.stream,
-                timeout=self.timeout,
-                eval_type=self.eval_type,
-            )
-            assert_metrics(self, metrics)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)

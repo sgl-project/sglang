@@ -23,8 +23,15 @@ Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
 Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
 ``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
 ``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
-``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
+``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally.
 
+``dcp_enabled`` / ``get_attention_dcp_*`` remain compatibility exports for
+out-of-tree callers; in-tree code should use ``get_parallel().dcp_enabled`` and
+``get_parallel().attn_dcp_*``."""
+
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_triton_kv_indices_for_dcp_triton,
+)
 from sglang.srt.layers.dcp.comm import (
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
@@ -33,11 +40,12 @@ from sglang.srt.layers.dcp.comm import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
+    init_fi_a2a_workspace,
 )
-from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -46,7 +54,7 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
-# (get_global_server_args), whereas this package-init executes at module-load time
+# (get_server_args), whereas this package-init executes at module-load time
 # for every eager importer of the DCP primitives — triton_backend,
 # mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
 # the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping
@@ -55,6 +63,8 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "dcp_a2a_lse_reduce",
+    "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",

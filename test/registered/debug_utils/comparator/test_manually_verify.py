@@ -234,7 +234,6 @@ class TestPerTokenHeatmapManualVerify:
                 x_baseline=baseline,
                 x_target=target,
                 name=f"layer_{i}_hidden_states",
-                diff_threshold=1e-3,
                 seq_dim=0,
             )
             records.append(ComparisonTensorRecord(**info.model_dump()))
@@ -278,7 +277,6 @@ class TestPerTokenHeatmapManualVerify:
                 x_baseline=baseline,
                 x_target=target,
                 name=f"layer_{i}_attn_output",
-                diff_threshold=1e-3,
                 seq_dim=0,
             )
             records.append(ComparisonTensorRecord(**info.model_dump()))
