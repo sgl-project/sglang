@@ -125,7 +125,6 @@ def inplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
-    gemm1_clamp_before_silu: bool = False,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
@@ -159,7 +158,6 @@ def inplace_fused_experts(
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
-        gemm1_clamp_before_silu,
         filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
@@ -195,7 +193,6 @@ def outplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
-    gemm1_clamp_before_silu: bool = False,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
@@ -229,7 +226,6 @@ def outplace_fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
-        gemm1_clamp_before_silu=gemm1_clamp_before_silu,
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
@@ -292,7 +288,6 @@ def fused_experts(
             moe_runner_config.routed_scaling_factor,
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
-            moe_runner_config.gemm1_clamp_before_silu,
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
@@ -327,7 +322,6 @@ def fused_experts(
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
-            gemm1_clamp_before_silu=moe_runner_config.gemm1_clamp_before_silu,
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
@@ -348,14 +342,6 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * up
-
-
-@torch.compile
-def _swiglu_clamp_silu_mul(x, gemm1_limit):
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(min=None, max=gemm1_limit)
-    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return F.silu(gate) * up
 
 
 @torch.compile
@@ -478,7 +464,6 @@ def _fused_moe_kernel_sequence(
     routed_scaling_factor: Optional[float],
     gemm1_alpha: Optional[float],
     gemm1_limit: Optional[float],
-    gemm1_clamp_before_silu: bool,
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
@@ -624,21 +609,16 @@ def _fused_moe_kernel_sequence(
                     gemm1_limit,
                 )
         elif gemm1_limit is not None:
-            swiglu_fn = (
-                _swiglu_clamp_silu_mul
-                if gemm1_clamp_before_silu
-                else _swiglu_silu_clamp_mul
-            )
-            intermediate_cache2 = swiglu_fn(
+            intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif swiglu_limit is not None:
-            # SWiGLU clamp before silu_and_mul.
+            # DeepSeek V4: swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip, "swiglu_limit only supports CUDA/HIP downstream"
+            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -907,7 +887,6 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
-    gemm1_clamp_before_silu: bool = False,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
@@ -984,7 +963,6 @@ def fused_experts_impl(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
-        gemm1_clamp_before_silu=gemm1_clamp_before_silu,
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
