@@ -26,14 +26,15 @@ def tree_mask_numel(
     return bs * per_req
 
 
-class VerifyMask(msgspec.Struct):
+class VerifyMask(msgspec.Struct, frozen=True):
     """The target-verify mask.
 
     ``build_tree_kernel_efficient`` writes the buffer in place after draft, which
-    is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep the three
+    is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep them
     together: taking the buffer without its layout has the kernel write a shape
     the reader does not expect. The kernel writes every cell even when unread, so
-    the buffer is always allocated.
+    the buffer is always allocated. Frozen -- resize by swapping the whole struct,
+    never a field, so ``max_bs`` cannot go stale against ``buffer``.
 
     Temporary home -- a phase-level buffer with no owner today (``spec_info`` is a
     per-phase union the graph registry cannot slot).
@@ -41,19 +42,16 @@ class VerifyMask(msgspec.Struct):
 
     buffer: torch.Tensor
     mode: TreeMaskMode
+    max_bs: int
     is_read: bool = True
 
-    def fits(self, bs: int, num_draft_tokens: int) -> bool:
+    def fits(self, bs: int) -> bool:
         """Whether this batch's writes stay inside the buffer.
 
-        Only the compact layout is checked. FULL_MASK keeps its pre-existing
-        unconditional reuse -- its bound needs a max_context_len that composite
-        backends do not carry -- so a batch past max_bs can still overflow it
-        when draft * sum(seq_len) exceeds the buffer, as it could before.
+        ``tree_mask_numel`` is ``bs * per_req`` and per_req is fixed at
+        allocation (FULL_MASK's spans max_context_len), so max_bs bounds it.
         """
-        if self.mode != TreeMaskMode.QLEN_ONLY:
-            return True
-        return self.buffer.numel() >= bs * num_draft_tokens * num_draft_tokens
+        return bs <= self.max_bs
 
 
 def maybe_create_verify_mask(
@@ -78,5 +76,6 @@ def maybe_create_verify_mask(
             device=device,
         ),
         mode=mode,
+        max_bs=max_bs,
         is_read=is_read,
     )

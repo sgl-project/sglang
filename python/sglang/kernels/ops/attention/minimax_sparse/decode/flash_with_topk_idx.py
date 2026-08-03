@@ -8,7 +8,14 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 
-from ..common.utils import _bitonic_merge, robust_allocator
+from ..common.utils import (
+    _bitonic_merge,
+    _sort_ids_ascending,
+    check_sparse_kv_fp8,
+    robust_allocator,
+    sparse_out_dtype,
+    unit_scale,
+)
 
 
 @triton.heuristics(
@@ -53,6 +60,8 @@ def _decode_score_kernel(
     topk: tl.constexpr,
     # sm_scale
     sm_scale,
+    # per-tensor K dequant scale (1.0 when the cache is unit-scaled)
+    k_scale,
     # init and local blocks
     init_blocks,
     local_blocks,
@@ -75,6 +84,7 @@ def _decode_score_kernel(
     NUM_KV_CHUNKS: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -160,11 +170,15 @@ def _decode_score_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
+            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
+            k = k.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale_log2e
+        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
         # save qk to score
         score = tl.reshape(
             qk,
@@ -237,6 +251,9 @@ def _decode_score_attn_kernel(
     topk: tl.constexpr,
     # sm_scale
     sm_scale,
+    # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
+    k_scale,
+    v_scale,
     # init and local blocks
     init_blocks,
     local_blocks,
@@ -271,6 +288,7 @@ def _decode_score_attn_kernel(
     HAS_SINK: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -367,6 +385,10 @@ def _decode_score_attn_kernel(
             mask=dim_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
+            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
+            k = k.to(q.dtype)
         # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
         v_off = (
             slots[:, None] * stride_v_s
@@ -378,11 +400,15 @@ def _decode_score_attn_kernel(
             mask=pos_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
+        if IS_FP8:
+            # Cast V to the compute dtype (widening for bf16/fp16 Q; no-op for
+            # fp8 Q where P is quantized to e4m3 for the fp8 PV MMA).
+            v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
         qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * sm_scale_log2e
+        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
         # save qk to score
         score = tl.reshape(
             qk,
@@ -426,7 +452,7 @@ def _decode_score_attn_kernel(
         acc_o_scale = tl.exp2(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
         m_i = m_ij
         l_i = l_i * acc_o_scale + l_ij
         # update ptrs
@@ -744,8 +770,14 @@ def _topk_index_merge_kernel(
         + pid_b * stride_tif_b
         + off_t * stride_tif_t
     )
-    topk_idx_final = tl.where(off_t < tl.minimum(topk, num_blocks), topk_idx_final, -1)
-    tl.store(tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty))
+    # Ascending by block id, -1 tail: the MSA fmha_sm100 consumer requires
+    # sorted kv_block_indexes (the bitonic pass above orders by score).
+    topk_idx_final = _sort_ids_ascending(
+        topk_idx_final, tl.minimum(topk, num_blocks), BLOCK_SIZE_T
+    )
+    tl.store(
+        tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=off_t < topk
+    )
 
 
 @torch.no_grad()
@@ -768,18 +800,21 @@ def flash_decode_with_topk_idx(
     disable_index_value: bool = False,
     use_dense_main_attn: bool = False,  # NOTE: need transform idx in this case
     page_size: int = 1,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     assert score_type in (
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check
-    assert (
-        q.dtype == torch.bfloat16
-        or q.dtype == torch.float16
-        and k_cache.dtype == q.dtype
+    # dtype check (v_cache is None under disable_index_value)
+    is_fp8 = check_sparse_kv_fp8(
+        q, k_cache, None if disable_index_value else v_cache, label="decode indexer"
     )
+    k_scale = unit_scale(k_scale)
+    v_scale = unit_scale(v_scale)
     if not disable_index_value:
         assert v_cache is not None
     # shape
@@ -793,6 +828,10 @@ def flash_decode_with_topk_idx(
     # sm scale
     if sm_scale is None:
         sm_scale = head_dim**-0.5
+    # q_scale folds exactly into sm_scale: it multiplies every Q-side logit —
+    # the QK dot AND the sink logit — unlike k_scale, which must not touch the
+    # sink term and therefore stays a separate kernel argument.
+    sm_scale = sm_scale * unit_scale(q_scale)
     # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
     # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
     # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
@@ -848,6 +887,7 @@ def flash_decode_with_topk_idx(
             block_size,
             topk,
             sm_scale,
+            k_scale,
             init_blocks,
             local_blocks,
             q.stride(0),
@@ -863,6 +903,7 @@ def flash_decode_with_topk_idx(
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
         )
     else:
         assert v_cache is not None
@@ -871,7 +912,7 @@ def flash_decode_with_topk_idx(
             batch_size,
             num_q_heads,
             head_dim,
-            dtype=q.dtype,
+            dtype=sparse_out_dtype(q),
             device=q.device,
         )
         lse = torch.empty(
@@ -895,6 +936,8 @@ def flash_decode_with_topk_idx(
             block_size,
             topk,
             sm_scale,
+            k_scale,
+            v_scale,
             init_blocks,
             local_blocks,
             q.stride(0),
@@ -922,6 +965,7 @@ def flash_decode_with_topk_idx(
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+            IS_FP8=is_fp8,
         )
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.

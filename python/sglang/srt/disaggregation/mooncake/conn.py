@@ -60,6 +60,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -327,7 +328,7 @@ class MooncakeKVManager(CommonKVManager):
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
             count,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
         )
         self.kv_buffer_tensors = None
 
@@ -498,7 +499,7 @@ class MooncakeKVManager(CommonKVManager):
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
-            self.server_args.chunked_prefill_size,
+            get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )
@@ -1098,7 +1099,7 @@ class MooncakeKVManager(CommonKVManager):
         if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
-            and not self.server_args.enable_dsa_cache_layer_split
+            and not get_parallel().enable_dsa_cache_layer_split
         ):
             skip_state = True
 
