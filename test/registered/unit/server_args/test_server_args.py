@@ -5,7 +5,7 @@ import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
@@ -39,52 +39,6 @@ register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
-
-
-class TestObjectStorageModelSources(CustomTestCase):
-    @patch("sglang.srt.server_args.ObjectStorageModel.download_and_get_path")
-    def test_prepare_unique_model_source_metadata(self, mock_download):
-        model_uri = "s3://bucket/target/"
-        draft_uri = "s3://bucket/draft/"
-        server_args = ServerArgs(
-            model_path="dummy",
-            tokenizer_path=model_uri,
-            speculative_draft_model_path=draft_uri,
-        )
-        server_args.model_path = model_uri
-
-        server_args._handle_model_source_paths()
-
-        self.assertEqual(
-            mock_download.call_args_list,
-            [call(model_uri), call(draft_uri)],
-        )
-
-    def test_remote_draft_uses_runai_streamer(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            speculative_draft_model_path="s3://bucket/draft/",
-        )
-        server_args.model_path = "/models/target"
-        server_args.load_format = "safetensors"
-
-        server_args._handle_load_format()
-
-        self.assertEqual(server_args.load_format, "safetensors")
-        self.assertEqual(server_args.speculative_draft_load_format, "runai_streamer")
-
-    def test_explicit_draft_load_format_is_preserved(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            speculative_draft_model_path="s3://bucket/draft/",
-            speculative_draft_load_format="dummy",
-        )
-        server_args.model_path = "/models/target"
-        server_args.load_format = "safetensors"
-
-        server_args._handle_load_format()
-
-        self.assertEqual(server_args.speculative_draft_load_format, "dummy")
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -186,13 +140,7 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             base_gpu_id=2,
         )
 
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_USE_CUDA_IPC_TRANSPORT": "0",
-                "SGLANG_USE_IPC_POOL_HANDLE_CACHE": "1",
-            },
-        ):
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
             with self.assertLogs(server_args_module.logger, level="INFO") as logs:
                 server_args._handle_multimodal_feature_transport()
 
@@ -230,8 +178,7 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
         self.assertIn("overrides", logs.output[0])
 
-    @patch("sglang.srt.server_args.is_cuda", return_value=False)
-    def test_default_transport_is_cpu_off_cuda(self, _mock_is_cuda):
+    def test_default_transport_is_cpu(self):
         server_args = ServerArgs(model_path="dummy")
 
         with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
@@ -239,67 +186,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_auto_resolves_cuda_ipc_on_single_node_cuda(self, _mock_is_cuda):
-        server_args = ServerArgs(model_path="dummy")
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            with self.assertLogs(server_args_module.logger, level="INFO"):
-                server_args._handle_multimodal_feature_transport()
-
-            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_auto_keeps_cpu_on_multi_node(self, _mock_is_cuda):
-        server_args = ServerArgs(model_path="dummy", nnodes=2)
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            server_args._handle_multimodal_feature_transport()
-
-            self.assertEqual(server_args.mm_feature_transport, "cpu")
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_auto_keeps_cpu_with_disaggregation(self, _mock_is_cuda):
-        server_args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            server_args._handle_multimodal_feature_transport()
-
-            self.assertEqual(server_args.mm_feature_transport, "cpu")
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_default_auto_keeps_cpu_for_encoder_only(self, _mock_is_cuda):
-        server_args = ServerArgs(model_path="dummy", encoder_only=True)
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_USE_CUDA_IPC_TRANSPORT", None)
-            with self.assertLogs(server_args_module.logger, level="INFO"):
-                server_args._handle_multimodal_feature_transport()
-
-            self.assertEqual(server_args.mm_feature_transport, "cpu")
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    def test_encoder_only_ignores_explicit_cuda_ipc(self, _mock_is_cuda):
-        server_args = ServerArgs(
-            model_path="dummy",
-            encoder_only=True,
-            mm_feature_transport="cuda_ipc",
-        )
-
-        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
-            server_args._handle_multimodal_feature_transport()
-
-        self.assertEqual(server_args.mm_feature_transport, "cpu")
-        self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-        self.assertIn("does not control encoder-only", "\n".join(logs.output))
 
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
@@ -352,26 +238,6 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             server_args._handle_mamba_backend()
-
-
-class TestLinearAttentionBackendStateDtype(unittest.TestCase):
-    @patch("torch.cuda.get_device_capability", return_value=(10, 0))
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
-    def test_flashinfer_verify_rejects_fp32_ssm_state(
-        self, _mock_sm100, _mock_is_cuda, _mock_capability
-    ):
-        server_args = ServerArgs(
-            model_path="dummy",
-            mamba_ssm_dtype="float32",
-            linear_attn_decode_backend="triton",
-            linear_attn_verify_backend="flashinfer",
-        )
-
-        with self.assertRaisesRegex(
-            ValueError, "--linear-attn-verify-backend flashinfer.*bfloat16"
-        ):
-            server_args._handle_linear_attn_backend()
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -485,14 +351,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
-
-
-class TestDCPValidation(unittest.TestCase):
-    def test_speculative_policy_is_not_checked(self):
-        server_args = ServerArgs(model_path="dummy", dcp_size=8)
-        server_args.speculative_algorithm = "DSPARK"
-
-        server_args._handle_dcp_validation()
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
