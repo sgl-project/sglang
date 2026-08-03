@@ -21,6 +21,9 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai.chat_encoding import (
+    resolve_dsv4_reasoning_effort_profile,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
@@ -1764,7 +1767,7 @@ class ServingChatTestCase(unittest.TestCase):
             encode("legacy", "low")
 
     def test_dsv4_reasoning_effort_profile_resolution(self):
-        resolve = OpenAIServingChat._resolve_dsv4_reasoning_effort_profile
+        resolve = resolve_dsv4_reasoning_effort_profile
         self.assertEqual(
             resolve(model_path="deepseek-ai/DeepSeek-V4-Flash"),
             "legacy",
