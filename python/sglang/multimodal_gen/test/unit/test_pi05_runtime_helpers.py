@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05PolicyModel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.pi05_preprocess import (
+    _preprocess_image,
     _resize_with_pad_image_tensor,
 )
 from sglang.multimodal_gen.runtime.vla.denoise_cuda_graph import (
@@ -221,3 +223,19 @@ def test_uint8_resize_rounds_before_normalization():
         / 255.0
     )
     torch.testing.assert_close(resized, expected, rtol=0.0, atol=0.0)
+
+
+def test_normalized_float_image_is_not_normalized_twice():
+    image = np.full((2, 4, 3), -0.5, dtype=np.float32)
+
+    preprocessed = _preprocess_image(image, (4, 4))
+
+    assert preprocessed.shape == (3, 4, 4)
+    torch.testing.assert_close(
+        preprocessed[:, 1:3],
+        torch.full((3, 2, 4), -0.5),
+    )
+    torch.testing.assert_close(
+        preprocessed[:, (0, 3)],
+        torch.full((3, 2, 4), -1.0),
+    )
