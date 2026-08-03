@@ -1,4 +1,6 @@
+import re
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
@@ -78,13 +80,24 @@ def test_missing_kernel_package_reports_actionable_error():
 
 
 def test_incompatible_kernel_package_reports_actionable_error():
+    """A wheel that imports but lacks the symbol must name the module it lacks.
+
+    Covers the AttributeError branch (the test above covers ImportError), and
+    pins each op to its own module so the message cannot drift into a
+    copy-pasted sibling name.
+    """
     modules = _fake_sgl_kernel_npu(MagicMock(), MagicMock())
     del modules["sgl_kernel_npu.norm.gemma_rmsnorm"].npu_gemma_rms_norm
+    del modules["sgl_kernel_npu.norm.add_rmsnorm_bias"].add_gemma_rms_norm
 
     with patch.dict(sys.modules, modules):
-        with pytest.raises(RuntimeError, match="requires a target-specific"):
+        with pytest.raises(RuntimeError, match=r"norm\.gemma_rmsnorm\."):
             GemmaRMSNormOp().forward_sgl_kernel_npu(
                 torch.randn(2, 4), torch.randn(4), 1e-5
+            )
+        with pytest.raises(RuntimeError, match=r"norm\.add_rmsnorm_bias\."):
+            GemmaFusedAddRMSNormOp().forward_sgl_kernel_npu(
+                torch.randn(2, 4), torch.randn(2, 4), torch.randn(4), 1e-5
             )
 
 
@@ -127,12 +140,14 @@ def test_sgl_kernel_npu_fused_in_place_contract():
     assert args[3] == 1e-5
 
 
-@pytest.mark.parametrize("layer_name", ["GemmaRMSNorm", "Gemma3RMSNorm"])
-def test_srt_gemma_layers_delegate_plain_npu_path(layer_name):
+@pytest.mark.parametrize(
+    ("layer_name", "eps_attr"),
+    [("GemmaRMSNorm", "variance_epsilon"), ("Gemma3RMSNorm", "eps")],
+)
+def test_srt_gemma_layers_delegate_plain_npu_path(layer_name, eps_attr):
     from sglang.srt.layers import layernorm as layernorm_module
 
-    layer_cls = getattr(layernorm_module, layer_name)
-    layer = layer_cls(4)
+    layer = getattr(layernorm_module, layer_name)(4)
     x = torch.randn(2, 4)
     unified_op = MagicMock(return_value=(x, "rstd"))
 
@@ -140,31 +155,29 @@ def test_srt_gemma_layers_delegate_plain_npu_path(layer_name):
         result = layer.forward_npu(x)
 
     assert result is x
-    eps = layer.variance_epsilon if hasattr(layer, "variance_epsilon") else layer.eps
-    unified_op.assert_called_once_with(x, layer.weight, eps)
+    unified_op.assert_called_once_with(x, layer.weight, getattr(layer, eps_attr))
 
 
-@pytest.mark.parametrize("layer_name", ["GemmaRMSNorm", "Gemma3RMSNorm"])
-def test_srt_gemma_layers_delegate_residual_npu_path(layer_name):
+def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():
+    """The srt-layer provider import must stay guarded, with a torch_npu fallback.
+
+    ``srt/layers/layernorm.py`` imports the provider at module scope under
+    ``if _is_npu``, which CPU CI never executes -- hence a source-shape check.
+    Turning it back into a hard import would break every NPU deployment running
+    an sgl-kernel-npu wheel from before the staged Gemma provider, at
+    ``import sglang.srt.layers.layernorm`` time and for all models, not just
+    Gemma ones.
+    """
     from sglang.srt.layers import layernorm as layernorm_module
 
-    layer_cls = getattr(layernorm_module, layer_name)
-    layer = layer_cls(4)
-    x = torch.randn(2, 4)
-    residual = torch.randn(2, 4)
-    norm_output = torch.randn_like(x)
-    residual_sum = torch.randn_like(residual)
-    fused_op = MagicMock(return_value=(norm_output, residual_sum))
+    source = Path(layernorm_module.__file__).read_text(encoding="utf-8")
+    guarded_import = re.search(
+        r"try:\s*\n"
+        r"\s*from sgl_kernel_npu\.norm\.gemma_rmsnorm import npu_gemma_rms_norm\s*\n"
+        r"\s*except ImportError:\s*\n"
+        r"(?:\s*#.*\n)*"
+        r"\s*npu_gemma_rms_norm = torch_npu\.npu_gemma_rms_norm\s*\n",
+        source,
+    )
 
-    with patch.object(
-        layernorm_module,
-        "add_gemma_rms_norm",
-        fused_op,
-        create=True,
-    ):
-        result = layer.forward_npu(x, residual)
-
-    assert result[0] is norm_output
-    assert result[1] is residual_sum
-    eps = layer.variance_epsilon if hasattr(layer, "variance_epsilon") else layer.eps
-    fused_op.assert_called_once_with(x, layer.weight, residual, eps)
+    assert guarded_import is not None
