@@ -367,11 +367,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
-        if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
+        is_gdn = hybrid_gdn_config(runner.model_config) is not None
+        if is_gdn and not is_npu():
             maybe_set_default_flashinfer_gdn_prefill(runner)
-        initialize_linear_attn_config(runner.server_args)
+        initialize_linear_attn_config(runner.server_args, is_gdn=is_gdn)
         hybrid_backend_cls = HybridLinearAttnBackend
-        if hybrid_gdn_config(runner.model_config) is not None:
+        if is_gdn:
             if is_blackwell():
                 if is_sm120_supported():
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
