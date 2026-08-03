@@ -1219,6 +1219,7 @@ def test_minwm_explicit_parallel_vae_lane_uses_sglang_vae(monkeypatch):
     config = MinWMCausalDMDConfig()
 
     assert config.native_component_names == ("text_encoder",)
+    assert config.vae_config.use_parallel_encode is False
 
 
 def test_minwm_explicit_parity_vae_lane_uses_native_vae(monkeypatch):

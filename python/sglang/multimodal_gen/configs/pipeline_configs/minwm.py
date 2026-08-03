@@ -306,3 +306,9 @@ class MinWMCausalDMDConfig(Wan2_2_TI2V_5B_Config):
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+        # The condition image is encoded once per session, so sharding encode
+        # does not improve steady-state FPS.  It does, however, select spatial
+        # kernels with different BF16 rounding and changes the I2V condition
+        # latent at SP > 1.  Keep encode replicated and spend SP only on the
+        # per-chunk decode hot path.
+        self.vae_config.use_parallel_encode = False
