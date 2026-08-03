@@ -8,13 +8,13 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestMmProcessConfigValidation(unittest.TestCase):
+class TestMmProcessConfigValidation(CustomTestCase):
     """Server-args validation for mm_process_config."""
 
     def _validate_config(self, mm_process_config):
@@ -66,7 +66,7 @@ class TestMmProcessConfigValidation(unittest.TestCase):
         self.assertEqual(args.mm_process_config, config)
 
 
-class TestBaseProcessorConfigExtraction(unittest.TestCase):
+class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
     def _make_processor(
@@ -162,7 +162,7 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.mm_io_worker_num, 6)
 
 
-class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
+class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     @staticmethod
     def _server_args(mm_feature_transport):
         return SimpleNamespace(
@@ -238,7 +238,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         memory_pool.assert_not_called()
 
 
-class TestPrecomputeHashBeforeCpuTransfer(unittest.TestCase):
+class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod
     def _processor(enabled):
         from sglang.srt.multimodal.processors.base_processor import (
@@ -373,7 +373,7 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deepcopy.call_count, 3)
 
 
-class TestProcessMmDataKwargs(unittest.TestCase):
+class TestProcessMmDataKwargs(CustomTestCase):
     """Verify process_mm_data injects per-modality kwargs correctly."""
 
     def _make_base_processor(self, mm_process_config):
@@ -512,7 +512,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         self.assertEqual(audio_kw.get("sample_rate"), 16000)
 
 
-class TestOverrideProcessorsConfigInjection(unittest.TestCase):
+class TestOverrideProcessorsConfigInjection(CustomTestCase):
     """Regression tests for processors that override process_mm_data."""
 
     def _make_override_processor(self, processor_cls, mm_process_config):
@@ -601,7 +601,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         self.assertTrue(audio_kw.get("truncation"))
 
 
-class TestQwenVideoConfigRouting(unittest.TestCase):
+class TestQwenVideoConfigRouting(CustomTestCase):
     def test_preprocessed_video_drops_sglang_owned_config(self):
         from sglang.srt.multimodal.processors.qwen_vl import (
             _get_processor_video_config,
@@ -630,7 +630,7 @@ class TestQwenVideoConfigRouting(unittest.TestCase):
         self.assertIsNone(_get_processor_video_config(video_config, [None]))
 
 
-class TestDoubleBosGuard(unittest.TestCase):
+class TestDoubleBosGuard(CustomTestCase):
     """Regression test for the multimodal double-BOS bug.
 
     Repro condition (Cohere2 / Llama3-LLaVA-Next family):
