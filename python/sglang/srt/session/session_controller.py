@@ -216,9 +216,7 @@ class Session:
         abort = False
         abort_message = ""
         if req.query_attention is not None or req.input_embeds is not None:
-            # v1 context forwards are sessionless normal-queue requests:
-            # streaming slots would double-free scratch spans, and session
-            # reqs bypass the scheduler's shm-ref resolution
+            # Context forwards are sessionless in v1.
             abort = True
             abort_message = "Sessions do not support context forwards."
         elif self.streaming:

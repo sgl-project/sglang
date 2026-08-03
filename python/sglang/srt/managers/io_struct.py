@@ -172,19 +172,13 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    # A single request may instead pass a shm TensorRef dict (see
-    # utils/shm_transport_utils.py); it requires input_ids and resolves in the
-    # scheduler process.
+    # Embeddings for input_ids, or a shm TensorRef dict (requires input_ids).
     input_embeds: Optional[
         Union[List[List[List[float]]], List[List[float]], Dict[str, Any]]
     ] = None
-    # Attention within the extend span: None (causal) or "bidirectional"
-    # (extend tokens attend to each other and to the whole prefix). Used by
-    # session context forwards, e.g. in-context denoise steps.
+    # None (causal) or "bidirectional" for the extend span.
     query_attention: Optional[str] = None
-    # Explicit positions for the extend span, [n] or [dims][n] for
-    # multi-dimensional rope schemes. Overrides the computed positions.
+    # Explicit extend-span positions: [n] or [dims][n].
     token_positions: Optional[List] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
@@ -238,9 +232,7 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
-    # None ships hidden states inline in meta_info; "shm" ships them as a
-    # TensorRef the caller reads and unlinks. Prefill-only requests
-    # (max_new_tokens=0), single requests only.
+    # None (inline) or "shm" TensorRef. Prefill-only, single request.
     hidden_states_transport: Optional[str] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -434,8 +426,6 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
             if self.query_attention is None:
-                # ids win over embeds, except context forwards which carry
-                # both (ids for radix matching, embeds for the query span)
                 self.input_embeds = None
         else:
             if isinstance(self.input_embeds, dict):
@@ -451,7 +441,6 @@ class GenerateReqInput:
         if not self.is_single and (
             self.query_attention is not None or self.token_positions is not None
         ):
-            # batch fan-out would copy one span layout into every sub-request
             raise ValueError(
                 "query_attention and token_positions support single requests only"
             )
@@ -868,12 +857,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]
-    # The input embeds: inline rows or a shm TensorRef dict resolved in the
-    # scheduler process
+    # Inline rows or shm TensorRef dict.
     input_embeds: Optional[Union[List[List[float]], Dict[str, Any]]]
-    # Attention within the extend span: None (causal) or "bidirectional"
     query_attention: Optional[str] = None
-    # Explicit positions for the extend span, [n] or [dims][n]
     token_positions: Optional[List] = None
     # The multimodal inputs
     mm_inputs: Optional[PickleWrapper]  # Pickled Optional[MultimodalProcessorOutput]
@@ -899,7 +885,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
-    # None (inline) or "shm" (hidden states ship as a TensorRef)
     hidden_states_transport: Optional[str] = None
 
     # Whether to return captured routed experts
@@ -1290,8 +1275,7 @@ TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
-# Per-request entry: inline chunk list, or a shm TensorRef dict when the
-# request set hidden_states_transport="shm"
+# Inline chunks, or shm TensorRef when hidden_states_transport="shm".
 OutputHiddenStates = Optional[
     List[Optional[Union[List[HiddenStateChunk], Dict[str, Any]]]]
 ]

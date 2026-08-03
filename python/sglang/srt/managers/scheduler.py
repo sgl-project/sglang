@@ -321,7 +321,7 @@ logger = logging.getLogger(__name__)
 
 
 def _tail_coverage_intact(req: Req) -> bool:
-    """Tail-covering input_embeds require the uncovered head to be cached."""
+    """True if the uncovered head of a tail-embed request is still cached."""
     if req.input_embeds is None or req.query_attention is None:
         return True
     embeds_start = len(req.origin_input_ids) - len(req.input_embeds)
@@ -329,7 +329,7 @@ def _tail_coverage_intact(req: Req) -> bool:
 
 
 def _token_positions_dims(req: Req) -> Optional[int]:
-    """Dimensionality of a req's explicit positions (None when unset)."""
+    """Explicit token_positions dimensionality, or None."""
     if req.token_positions is None:
         return None
     return (
@@ -2313,10 +2313,7 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
-           
             if is_shm_ref(req.input_embeds):
-                # copy out of the client's segment now; the client unlinks it
-                # once the response arrives
                 try:
                     req.input_embeds = read_shm_tensor(req.input_embeds).astype(
                         np.float32, copy=False
@@ -3162,8 +3159,6 @@ class Scheduler(
                 or _token_positions_dims(req)
                 != _token_positions_dims(adder.can_run_list[0])
             ):
-                # extend-span attention mode and position dimensionality are
-                # batch-wide; keep incompatible reqs separate
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3194,9 +3189,6 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
             if not _tail_coverage_intact(req):
-                # the cached prefix backing a context forward was evicted;
-                # fail this request instead of tripping the scheduler-fatal
-                # invariant in prepare_for_extend
                 req.input_embeds = None
                 req.token_positions = None
                 req.set_finish_with_abort(

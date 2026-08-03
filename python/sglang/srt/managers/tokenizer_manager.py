@@ -1001,8 +1001,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             embeds_len = _input_embeds_len(obj.input_embeds)
             if embeds_len > self.server_args.chunked_prefill_size > 0:
-                # a chunk-split bidirectional span would degrade to
-                # block-causal attention; the scheduler also refuses to split
+                # Bidirectional spans must not be chunk-split.
                 raise ValueError(
                     f"query span of {embeds_len} exceeds chunked_prefill_size "
                     f"{self.server_args.chunked_prefill_size}"
@@ -1056,16 +1055,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
-        # context-forward fields exist on GenerateReqInput only
+        # Context-forward fields are on GenerateReqInput only.
         is_context_forward = (
             isinstance(obj, GenerateReqInput) and obj.query_attention is not None
         )
         if isinstance(obj, GenerateReqInput):
             self._validate_context_forward_fields(obj)
         if obj.input_embeds is not None:
-            # Context forwards never enter the radix tree, so they may coexist
-            # with it; plain embeds requests still require the cache to be off
-            # (no token ids to key the tree).
+            # Context forwards skip radix insert; plain embeds still need cache off.
             if not self.server_args.disable_radix_cache and not is_context_forward:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
@@ -1083,8 +1080,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             embeds_width = _input_embeds_width(obj.input_embeds)
             hidden_size = self.model_config.hidden_size
             if embeds_width is not None and embeds_width != hidden_size:
-                # a wrong-width row would reach the model's first layer and
-                # kill the scheduler inside a kernel
+                # Reject wrong-width rows before they hit the model.
                 raise ValueError(
                     f"input_embeds width {embeds_width} does not match the "
                     f"model hidden size {hidden_size}"

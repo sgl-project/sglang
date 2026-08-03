@@ -451,11 +451,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
-    # Extend-span attention mode: None (causal) or "bidirectional" (extend
-    # tokens attend to each other and to the whole prefix)
+    # None (causal) or "bidirectional".
     query_attention: Optional[str] = None
-    # Multi-dim explicit positions for the extend span ([dims, n]); models with
-    # multi-axis rope read this, `positions` stays 1D for the runtime
+    # Multi-dim positions [dims, n]; `positions` stays 1D for the runtime.
     token_positions: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
@@ -931,8 +929,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_num_tokens,
             )
             if batch.token_positions is not None and batch.token_positions.dim() == 1:
-                # Explicit 1D positions win; multi-dim schemes stay off the
-                # runtime's 1D `positions` and are read from `token_positions`
                 ret.positions = batch.token_positions
             elif ret.positions is None:
                 ret.positions = positions

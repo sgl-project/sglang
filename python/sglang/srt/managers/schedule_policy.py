@@ -1212,8 +1212,7 @@ class PrefillAdder:
                 )
             else:
                 if req.query_attention is not None:
-                    # a chunk-split bidirectional span would silently degrade
-                    # to block-causal attention; wait for budget instead
+                    # Bidirectional spans must not be chunk-split.
                     return AddReqResult.OTHER
 
                 # Make sure at least one page is available

@@ -522,8 +522,7 @@ class SchedulerBatchResultProcessor:
 
             continuation = req.extend_batch_idx > 1 and req.hidden_states
             if req.hidden_states_transport is not None:
-                # shm transport keeps chunks as tensors until the output
-                # streamer packages them into one segment
+                # shm transport keeps chunks as tensors until stream time.
                 if continuation:
                     req.hidden_states[-1] = torch.cat(
                         [req.hidden_states[-1], span.clone()]

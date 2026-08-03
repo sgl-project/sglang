@@ -885,8 +885,7 @@ class Req(ReqDllmMixin):
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
         )
-        # None ships hidden states inline; "shm" packages them as a TensorRef
-        # at stream time (chunks stay tensors until then)
+        # None (inline) or "shm" at stream time.
         self.hidden_states_transport = hidden_states_transport
 
         # extra key for classifying the request (e.g. cache_salt)
@@ -1121,8 +1120,7 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        # Context forwards never enter the radix tree; their scratch KV is
-        # freed on finish while the session prefix stays pinned.
+        # Context-forward scratch KV is not radix-inserted.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST or query_attention is not None
         )
@@ -1304,8 +1302,7 @@ class Req(ReqDllmMixin):
             token_ids_to_match = array("q")
             key_limit = None
 
-        # Tail-covering embeds: the query span must never radix-match (same
-        # placeholder ids, different injected values).
+        # Tail embeds must not radix-match (same ids, different values).
         if self.input_embeds is not None and self.query_attention is not None:
             embeds_start = max(0, len(self.origin_input_ids) - len(self.input_embeds))
             key_limit = (
@@ -2075,10 +2072,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
-    # Extend-span attention mode shared by all reqs (None or "bidirectional")
+    # None or "bidirectional"; shared by all reqs in the batch.
     query_attention: Optional[str] = None
 
-    # Explicit extend-span positions, [n] or [dims, n] (set by prepare_for_extend)
+    # Explicit positions [n] or [dims, n] from prepare_for_extend.
     token_positions: Optional[torch.Tensor] = None
 
     # Speculative decoding
@@ -2390,8 +2387,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # fill_len/extend_input_len on chunk overflow but not input_embeds.
-                # The embeds may cover only the tail of the sequence (session
-                # context forwards: prefix tokens + embeds for the query span).
+                # Embeds may cover only the sequence tail.
                 embeds_start = len(req.origin_input_ids) - len(req.input_embeds)
                 if pre_len < embeds_start:
                     raise ValueError(
@@ -2408,7 +2404,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             if req.token_positions is not None:
-                # Same tail-coverage convention as input_embeds; [n] or [dims][n]
+                # Same tail-coverage as input_embeds; [n] or [dims][n].
                 dims = (
                     req.token_positions
                     if isinstance(req.token_positions[0], list)
@@ -2556,9 +2552,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         if input_embeds:
-            # np.asarray flattens both nested lists and shm-resolved ndarray
-            # rows into one buffer; torch.tensor on a row list is quadratic.
-            # Tensors from numpy cannot pin at construction, so pin after.
+            # np.asarray handles list/ndarray rows; pin after (numpy tensors).
             embeds_tensor = torch.from_numpy(np.asarray(input_embeds, dtype=np.float32))
             if _pin:
                 embeds_tensor = embeds_tensor.pin_memory()

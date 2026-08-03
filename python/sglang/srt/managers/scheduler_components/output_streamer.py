@@ -579,7 +579,7 @@ class _GenerationStreamAccumulator:
                     if req.finished_len is not None and not req.is_prefill_only:
                         hs = hs[: req.finished_len]
                     if req.hidden_states_transport is not None and hs:
-                        # prefill-only by validation; the client reads and unlinks
+                        # Prefill-only; client reads and unlinks.
                         hs = package_hidden_states(hs, kind="hs")
                     self.output_hidden_states.append(hs)
             else:

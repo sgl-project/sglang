@@ -1232,8 +1232,6 @@ class FlashAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         if forward_batch.query_attention == "bidirectional":
-            # Extend tokens attend to each other and to the whole prefix;
-            # prefix KV is read-only so no prefix-internal attention occurs
             causal = False
             window_size = (-1, -1)
         fa_k_descale, fa_v_descale = None, None
