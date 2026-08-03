@@ -77,9 +77,10 @@ pub fn process(
         ));
     }
     // Stage 1 (fetch) is blocking I/O and runs inline, sequentially — never on
-    // the CPU pool, where a slow URL would starve decode/resize for other
-    // requests. Contract: callers on a fixed worker pool (the server) must
-    // resolve network sources on their own I/O layer and pass `Bytes`.
+    // the CPU pool, where a slow URL or file read would starve decode/resize
+    // for other requests. Contract: callers on a fixed worker pool (the
+    // server) must resolve I/O-backed string sources — URLs and file paths —
+    // on their own I/O layer and pass `Bytes`.
     let mut fetched: Vec<std::borrow::Cow<'_, [u8]>> = Vec::with_capacity(input.images.len());
     let mut total: u64 = 0;
     for source in &input.images {

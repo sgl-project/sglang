@@ -196,8 +196,10 @@ impl ImageProcessorSpec for MyModelProcessor {
   caller and would serialize every concurrent request in the process.
 - Media fetch is blocking I/O and deliberately never enters the CPU pool; it
   runs inline and sequentially in `driver::process`. Contract: callers on a
-  fixed worker pool (sglang-server) must resolve network sources on their own
-  I/O layer and pass bytes, so a slow remote host never blocks a worker.
+  fixed worker pool (sglang-server) must resolve I/O-backed string sources —
+  URLs *and* file paths (a network mount can hang far longer than any HTTP
+  timeout) — on their own I/O layer and pass bytes, so workers never block on
+  I/O. `data:`/base64 sources are pure CPU and stay on the worker.
 - PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB. WebP/GIF/BMP also
   decode (GIF: first frame); their parity is not bit-audited. Samples deeper
   than 8 bits are rejected rather than rescaled (PIL clips instead).
