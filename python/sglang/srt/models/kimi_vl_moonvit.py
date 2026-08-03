@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/modeling_kimi_vl.py
-# This file is meant to be used in kimi_vl.py only
+# Shared MoonViT building blocks for the Kimi-VL model family (kimi_vl.py,
+# kimi_k25.py)
 # Copyright 2025 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc. team. All rights reserved.
 #
 # The code is based on llava (llava/modeling_llava.py) and DeepSeek-V3 (DeepSeek-V3/modeling_deepseek.py), but modified for KimiVL.

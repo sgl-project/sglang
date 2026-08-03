@@ -234,16 +234,15 @@ def test_kimi_refuses_already_normalized_float_pixels():
         _ensure_chw_rgb(torch.rand(3, 8, 8))
 
 
-def test_kimi_placeholder_validation_only_claims_real_token_ids():
-    validate = KimiGridMMDataMixin.validate_tokenized_image_placeholders
+def test_kimi_placeholder_count_only_reads_real_token_ids():
+    count = KimiGridMMDataMixin.count_image_placeholders
 
-    assert validate([1, 7, 2, 7], 7, 2) is True
-    assert validate(torch.tensor([[1, 7, 2]]), 7, 1) is True
+    assert count([1, 7, 2, 7], 7) == 2
+    assert count(torch.tensor([[1, 7, 2]]), 7) == 1
+    assert count([1, 2, 3], 7) == 0
     # A prompt string carries no token IDs, so the caller must not take the
     # tokenized fast path.
-    assert validate("<|media_pad|>", 7, 1) is False
-    with pytest.raises(ValueError, match="one-to-one"):
-        validate([1, 7, 2], 7, 2)
+    assert count("<|media_pad|>", 7) is None
 
 
 def test_kimi_single_frame_pool_matches_the_temporal_mean():

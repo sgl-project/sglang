@@ -149,12 +149,16 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
 def _resize_bicubic_if_needed(
     image: torch.Tensor, target_height: int, target_width: int
 ) -> torch.Tensor:
-    """Match the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
+    """Track the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
 
     NaViT only ever downscales, and PIL's bicubic widens its kernel support by
     the scale factor -- it always antialiases, which ``F.interpolate`` only does
     under ``antialias=True``. PIL also returns uint8, so round and clip back to
     integer pixels; the bicubic overshoot would otherwise survive normalization.
+
+    Close but not exact: PIL evaluates uint8 resizes in fixed point while this
+    stays in fp32, leaving a few 8-bit levels of residual. Against PIL's own
+    float path the two agree to ~5e-3.
     """
     image = image.float()
     if image.shape[-2:] == (target_height, target_width):
@@ -529,9 +533,15 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         **kwargs,
     ):
         expected_image_count = len(image_data or [])
-        if self.validate_tokenized_image_placeholders(
-            input_text, self.mm_tokens.image_token_id, expected_image_count
-        ):
+        placeholder_count = self.count_image_placeholders(
+            input_text, self.mm_tokens.image_token_id
+        )
+        if placeholder_count is not None:
+            if placeholder_count != expected_image_count:
+                raise ValueError(
+                    "Kimi image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                )
             base_output = await self.fast_load_mm_data(
                 prompt=input_text,
                 image_data=image_data,
@@ -547,12 +557,13 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
             )
-
-        if len(base_output.images) != expected_image_count:
-            raise ValueError(
-                "Kimi image placeholders must map one-to-one to image data: "
-                f"expected {expected_image_count}, loaded {len(base_output.images)}"
-            )
+            # Only the text-scanning loader can come back with a different
+            # count; fast_load_mm_data fills one slot per image_data entry.
+            if len(base_output.images) != expected_image_count:
+                raise ValueError(
+                    "Kimi image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, loaded {len(base_output.images)}"
+                )
 
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
