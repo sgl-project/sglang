@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -8,6 +9,9 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
+
+logger = logging.getLogger(__name__)
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -92,6 +96,24 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
     return tensor_gpu
+
+
+def _should_use_masked_standard_layout(runner_config: MoeRunnerConfig) -> bool:
+    """Use masked GEMM when expert parallelism keeps its buffer small."""
+    return (
+        runner_config.num_experts > runner_config.num_local_experts
+        and runner_config.num_local_experts <= 32
+    )
+
+
+def _get_compact_all_tokens(
+    num_assignments: int, num_experts: int, block_e: int = 128
+) -> int:
+    """Return the maximum padded rows over all routings of the assignments."""
+    max_nonempty_experts = min(num_assignments, num_experts)
+    return block_e * (
+        max_nonempty_experts + (num_assignments - max_nonempty_experts) // block_e
+    )
 
 
 @dataclass
@@ -448,9 +470,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
+        try:
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+        except torch.OutOfMemoryError:
+            logger.error(
+                "Masked grouped-GEMM workspace allocation failed "
+                "(num_groups=%d m=%d n=%d). If this happens under saturated "
+                "dp-attention prefill, try SGLANG_OPT_DG_MASKED_M_CAP=1.",
+                num_groups,
+                m,
+                n,
+            )
+            raise
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
@@ -655,7 +688,11 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import moe_ep_deepgemm_preprocess
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        ep_scatter,
+        fused_moe_dispatch_index,
+        moe_ep_deepgemm_preprocess,
+    )
 
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
@@ -670,25 +707,151 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    # PreReorder
+    if _should_use_masked_standard_layout(runner_config):
+        output_dtype = (
+            torch.bfloat16
+            if quant_info.w13_weight.dtype == torch.bfloat16
+            else torch.float8_e4m3fn
+        )
+        masked_m, _, src2dst, hidden_states, hidden_states_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+                output_dtype=output_dtype,
+                use_mxfp8=quant_info.use_mxfp8,
+            )
+        )
+        # Use the global expert count because expected_m is a tuning hint, not
+        # the per-rank buffer capacity.
+        expected_m = max(
+            1,
+            ceil_div(
+                hidden_states_shape[0] * runner_config.top_k,
+                runner_config.num_experts,
+            ),
+        )
+
+        if runner_config.inplace:
+            dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+        running_state["mxfp8_act_gran_k"] = (
+            quant_info.block_shape[1] if quant_info.block_shape else 128
+        )
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
+
+    # The compact layout avoids scaling masked buffers with the expert count.
+    # Scatter and post-permute skip non-local experts mapped to -1.
+    block_e = 128
+    num_experts = runner_config.num_local_experts
+    num_assignments = topk_ids.numel()
+    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
+
+    tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
+        topk_ids, num_experts, 1
+    )
+    dispose_tensor(unused_masked_dst)
+    valid_tokens_per_expert = tokens_per_expert
+    tokens_per_expert = (ceil_div(tokens_per_expert, block_e) * block_e).to(torch.int32)
+    # Keep graph-static shapes by appending padding to the final segment.
+    # Its m_indices stay -1, so DeepGEMM skips those rows.
+    tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
+
+    k = hidden_states.size(1)
     output_dtype = (
         torch.bfloat16
         if quant_info.w13_weight.dtype == torch.bfloat16
         else torch.float8_e4m3fn
     )
-    masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
-        moe_ep_deepgemm_preprocess(
-            topk_ids,
-            runner_config.num_local_experts,
-            hidden_states,
-            runner_config.top_k,
-            quant_info.block_shape,
-            output_dtype=output_dtype,
-            use_mxfp8=quant_info.use_mxfp8,
+    if output_dtype == torch.bfloat16:
+        packed_input_source = hidden_states
+        packed_input_source_scale = None
+        packed_input = torch.empty(
+            (all_tokens, k), device=hidden_states_device, dtype=torch.bfloat16
         )
-    )
+        # ep_scatter ignores scales for BF16, but a real tensor keeps its
+        # Triton signature uniform across the existing DeepEP caller.
+        packed_input_scale = torch.empty(
+            (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
+        )
+    else:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
 
-    dispose_tensor(hidden_states_ref)
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_input_source, packed_input_source_scale = (
+            sglang_per_token_group_quant_fp8(
+                hidden_states,
+                block_k,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        )
+        packed_input = torch.zeros(
+            (all_tokens, k),
+            device=hidden_states_device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scale_width = k // block_k
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            scale_width = ceil_div(scale_width, 4)
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            packed_input_scale = torch.zeros(
+                (scale_width, all_tokens),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            ).transpose(0, 1)
+        else:
+            packed_input_scale = torch.zeros(
+                (all_tokens, scale_width),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            )
+
+    expert_start_loc = torch.empty(
+        num_experts, device=hidden_states_device, dtype=torch.int32
+    )
+    m_indices = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    ep_scatter(
+        packed_input_source,
+        packed_input_source_scale,
+        topk_ids,
+        tokens_per_expert,
+        valid_tokens_per_expert,
+        expert_start_loc,
+        packed_input,
+        packed_input_scale,
+        m_indices,
+        src2dst,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+    )
+    if packed_input_source is not hidden_states:
+        dispose_tensor(packed_input_source)
+    if packed_input_source_scale is not None:
+        dispose_tensor(packed_input_source_scale)
+
+    # Preserve the input when a shared expert or its gate may still use it.
+    if runner_config.inplace:
+        dispose_tensor(hidden_states_ref)
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -696,16 +859,16 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
+    running_state["all_tokens"] = all_tokens
     running_state["mxfp8_act_gran_k"] = (
         quant_info.block_shape[1] if quant_info.block_shape else 128
     )
 
     return DeepGemmRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        use_masked_gemm=True,
-        masked_m=masked_m,
-        expected_m=expected_m,
+        hidden_states=packed_input,
+        hidden_states_scale=packed_input_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
     )
 
 
@@ -875,6 +1038,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states,
         hidden_states_scale,
         topk_ids,
+        num_recv_tokens_per_expert_gpu,
         num_recv_tokens_per_expert_gpu,
         expert_start_loc,
         input_tensor,

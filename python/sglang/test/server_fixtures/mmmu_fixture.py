@@ -2,12 +2,12 @@ import logging
 import os
 import time
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class MMMUServerBase(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None and cls.process.poll() is None:
             try:
-                kill_process_tree(cls.process.pid, wait_timeout=60)
+                terminate_and_kill_process_tree(cls.process, wait_timeout=60)
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)

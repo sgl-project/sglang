@@ -82,6 +82,22 @@ checkpoint repos; the FLUX.2 NVFP4 raw export remains
 `black-forest-labs/FLUX.2-dev-NVFP4`. Do not use older `BBuf/*` examples unless
 you are explicitly testing a historical branch.
 
+### MiniMax-H3 boundary
+
+MiniMax-H3 is current-main evidence for the separate online FP8 path, not a
+validated ModelOpt PTQ/export family. Its verified B200/B300 serving recipe
+loads the unquantized root checkpoint with `--quantization fp8` and preserves
+the video/audio patch projections, timestep MLP, and final video/audio heads in
+FP32. Do not add H3 to the ModelOpt support matrix or run the generic ModelOpt
+converter until an exact H3 export, loader mapping, accuracy check, and
+benchmark scope have been validated.
+
+If the user asks for current H3 online quantization, route the command and
+quality caveats through `sglang-diffusion-performance` and the MiniMax-H3
+cookbook. Online FP8 is approximate and must be compared against eager
+BF16/FP32 for both video and audio; combining it with Cache-DiT compounds two
+approximations.
+
 ## Related PR Watchlist
 
 These related SGLang PRs are useful as ModelOpt diffusion support history.
@@ -403,5 +419,5 @@ When documenting results:
 | `tools/build_modelopt_nvfp4_transformer.py` | Build mixed BF16+NVFP4 transformer directories when a family needs preserved BF16 layers |
 | `tools/compare_diffusion_trajectory_similarity.py` | reduced deterministic BF16-vs-quantized validation |
 | `docs_new/docs/sglang-diffusion/quantization.mdx` | public ModelOpt support matrix and CLI examples |
-| `test/server/testcase_configs.py` | reusable ModelOpt testcase constants, thresholds, and helpers |
-| `test/server/gpu_cases.py` | concrete GPU and B200 ModelOpt CI case lists |
+| `python/sglang/multimodal_gen/test/server/testcase_configs.py` | reusable ModelOpt testcase constants, thresholds, and helpers |
+| `python/sglang/multimodal_gen/test/server/gpu_cases.py` | concrete GPU and B200 ModelOpt CI case lists |

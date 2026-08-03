@@ -23,7 +23,8 @@ def fused_moe_forward_native(
     dispatch_output: StandardDispatchOutput,
 ) -> StandardCombineInput:
 
-    x, x_scale, topk_output = dispatch_output
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
     moe_runner_config = layer.moe_runner_config
 
     if moe_runner_config.apply_router_weight_on_input:
