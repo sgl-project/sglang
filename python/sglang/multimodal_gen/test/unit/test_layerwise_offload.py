@@ -91,6 +91,13 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.encoder = _DummyModel()
 
 
+class _NestedSameNamedBlocksModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_refiner = _DummyModel()
+        self.blocks = torch.nn.ModuleList([_DummyBlock()])
+
+
 class _SharedBuffer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -229,6 +236,31 @@ def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch)
 
     assert model.blocks[0].weight._version >= 0
     assert model.blocks[0].bias._version >= 0
+
+
+def test_layerwise_offload_does_not_capture_nested_same_named_layers(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _NestedSameNamedBlocksModel()
+    refiner_weight = model.token_refiner.blocks[0].weight.detach().clone()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    managed_names = {
+        name for metadata in manager._weight_metadata.values() for name in metadata
+    }
+    assert managed_names
+    assert all(name.startswith("blocks.") for name in managed_names)
+    assert torch.equal(model.token_refiner.blocks[0].weight, refiner_weight)
 
 
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
@@ -578,6 +610,10 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
 
 
+class _AuxiliaryResidentComponent(_ResidentComponent):
+    layerwise_offload_dit_group_enabled = False
+
+
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -689,6 +725,21 @@ def test_configure_resolves_resident_layers_ratio(monkeypatch):
     comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
     # 0.5 * 8 = 4 leading layers resident
     assert comp.layerwise_offload_managers[0].resident_layers == 4
+
+
+def test_auxiliary_layerwise_components_ignore_dit_tuning(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _AuxiliaryResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=3,
+            dit_layerwise_resident_layers=0.5,
+        )
+    )
+
+    manager = comp.layerwise_offload_managers[0]
+    assert manager.prefetch_size == 1
+    assert manager.resident_layers == 0
 
 
 class _MixinBlock(torch.nn.Module):
