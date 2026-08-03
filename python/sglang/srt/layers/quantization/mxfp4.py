@@ -304,6 +304,14 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            # An MXFP4 checkpoint only serializes the MoE experts in fp4;
+            # every other linear carries plain bf16 tensors. A linear that is
+            # not on the ignore list used to fall through to `return None`,
+            # which the layer asserts against -- so one missing ignore entry
+            # (fused projections like wqkv_a are easy to miss) killed the
+            # server at load. Default them to unquantized instead: that is
+            # what the checkpoint actually holds for them.
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
