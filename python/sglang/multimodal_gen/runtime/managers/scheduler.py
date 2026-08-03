@@ -436,10 +436,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         except Exception:
             return None
 
+        exclude_num_outputs = (
+            self.server_args.pipeline_config.supports_sequential_dit_inference()
+        )
         return [
             (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
             for f in sp_fields
             if not f.metadata.get("batch_sig_exclude", False)
+            and not (exclude_num_outputs and f.name == "num_outputs_per_prompt")
         ]
 
     def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
@@ -448,10 +452,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
         """Build the request compatibility signature for dynamic batching.
 
-        The signature is built from `SamplingParams` fields, excluding fields
-        marked with `batch_sig_exclude`, plus generation-affecting
-        `extra.diffusers_kwargs` and profiling settings used by grouped
-        execution.
+        The signature is built from batch-shared `SamplingParams` fields, plus
+        generation-affecting `extra.diffusers_kwargs` and profiling settings
+        used by grouped execution.
         """
         signature_items = self._sampling_param_signature_items(req)
         if signature_items is None:
@@ -551,11 +554,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             or getattr(candidate_req, "image_path", None) is not None
         ):
             return "image_conditioning"
-        if self.server_args.pipeline_config.supports_sequential_dit_inference() and (
-            base_req.num_outputs_per_prompt != 1
-            or candidate_req.num_outputs_per_prompt != 1
-        ):
-            return "num_outputs_per_prompt"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
 
@@ -591,11 +589,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if (
             getattr(base_req, "image_path", None) is not None
             or getattr(candidate_req, "image_path", None) is not None
-        ):
-            return False
-        if self.server_args.pipeline_config.supports_sequential_dit_inference() and (
-            base_req.num_outputs_per_prompt != 1
-            or candidate_req.num_outputs_per_prompt != 1
         ):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
