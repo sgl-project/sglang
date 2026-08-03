@@ -247,24 +247,36 @@ pub(super) fn responses_chat_request(
                         ));
                     }
                     InputItem::Item(Item::FunctionCall(call)) => {
-                        messages.push(ChatCompletionRequestMessage::Assistant(
-                            ChatCompletionRequestAssistantMessage {
-                                content: None,
-                                reasoning_content: None,
-                                refusal: None,
-                                name: None,
-                                audio: None,
-                                tool_calls: Some(vec![ChatCompletionMessageToolCall {
-                                    id: call.call_id.clone(),
-                                    r#type: FunctionType::Function,
-                                    function: FunctionCall {
-                                        name: call.name.clone(),
-                                        arguments: call.arguments.clone(),
-                                    },
-                                }]),
-                                function_call: None,
+                        let tool_call = ChatCompletionMessageToolCall {
+                            id: call.call_id.clone(),
+                            r#type: FunctionType::Function,
+                            function: FunctionCall {
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
                             },
-                        ));
+                        };
+                        if let Some(ChatCompletionRequestMessage::Assistant(message)) =
+                            messages.last_mut()
+                            && message.content.is_none()
+                            && let Some(tool_calls) = message.tool_calls.as_mut()
+                        {
+                            // Parallel Responses calls are consecutive items from one
+                            // assistant turn. Keep them together so all following tool
+                            // outputs refer to the same assistant message.
+                            tool_calls.push(tool_call);
+                        } else {
+                            messages.push(ChatCompletionRequestMessage::Assistant(
+                                ChatCompletionRequestAssistantMessage {
+                                    content: None,
+                                    reasoning_content: None,
+                                    refusal: None,
+                                    name: None,
+                                    audio: None,
+                                    tool_calls: Some(vec![tool_call]),
+                                    function_call: None,
+                                },
+                            ));
+                        }
                     }
                     InputItem::Item(Item::FunctionCallOutput(output)) => {
                         let text = match &output.output {
@@ -959,6 +971,57 @@ mod tests {
         assert!(matches!(
             chat.tool_choice,
             Some(ChatCompletionToolChoiceOption::Required)
+        ));
+    }
+
+    #[test]
+    fn parallel_function_calls_share_one_assistant_turn() {
+        let request: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "input": [
+                {"role": "user", "content": "Compare Paris and Tokyo weather"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "sunny"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_2",
+                    "output": "rainy"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let chat = responses_chat_request(&request, "model").unwrap();
+        assert_eq!(chat.messages.len(), 4);
+        let ChatCompletionRequestMessage::Assistant(assistant) = &chat.messages[1] else {
+            panic!("parallel calls must produce one assistant message");
+        };
+        let calls = assistant.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[1].id, "call_2");
+        assert!(matches!(
+            &chat.messages[2],
+            ChatCompletionRequestMessage::Tool(tool) if tool.tool_call_id == "call_1"
+        ));
+        assert!(matches!(
+            &chat.messages[3],
+            ChatCompletionRequestMessage::Tool(tool) if tool.tool_call_id == "call_2"
         ));
     }
 
