@@ -11,8 +11,10 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     moe_ep_deepgemm_preprocess,
 )
 from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
-    per_token_quant_fp8_ue8m0,
     per_token_quant_fp8_ue8m0_scatter,
+)
+from sglang.kernels.ops.quantization.per_token_group_quant import (
+    per_token_group_quant,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
@@ -61,7 +63,9 @@ def test_quant_scatter_matches_quant_plus_fill(num_tokens, topk, hidden, group):
     tids.copy_(tids_cpu)
     s2d = torch.tensor(s2d, dtype=torch.int32, device=dev)
 
-    x_q, x_sf = per_token_quant_fp8_ue8m0(x, group)
+    x_q, x_sf = per_token_group_quant(
+        x, group_size=group, scale_ue8m0=True, column_major_scales=False
+    )
     gi_ref = torch.zeros(E, m_max, hidden, device=dev, dtype=torch.float8_e4m3fn)
     gs_ref = torch.zeros(E, G4, m_max, device=dev, dtype=torch.int32)
     fill_gateup_input_triton_kernel[(num_tokens,)](
@@ -121,7 +125,9 @@ def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
         output_dtype=torch.float8_e4m3fn,
         use_mxfp8=False,
     )
-    direct_x, direct_scale = per_token_quant_fp8_ue8m0(x, group)
+    direct_x, direct_scale = per_token_group_quant(
+        x, group_size=group, scale_ue8m0=True, column_major_scales=False
+    )
 
     assert grouped_scale.dtype == torch.int32
     for token in range(num_tokens):
