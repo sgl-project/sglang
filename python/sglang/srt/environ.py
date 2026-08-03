@@ -717,6 +717,16 @@ class Envs:
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
+    # JIT / Precompilation Cache
+    SGLANG_JIT_CACHE_ROOT = EnvStr(
+        lambda: os.environ.get(
+            "SGLANG_JIT_CACHE_ROOT",
+            os.path.join(
+                os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sglang"
+            ),
+        )
+    )
+
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -735,7 +745,12 @@ class Envs:
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
-    SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    SGLANG_DG_CACHE_DIR = EnvStr(
+        lambda: os.environ.get(
+            "SGLANG_DG_CACHE_DIR",
+            os.path.join(Envs.SGLANG_JIT_CACHE_ROOT.get(), "deep_gemm"),
+        )
+    )
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
@@ -1516,6 +1531,43 @@ def examples():
     example_with_exit_stack()
     example_with_subprocess()
     example_with_implicit_bool_avoidance()
+
+
+def _configure_jit_cache_roots():
+    cache_root = os.getenv(
+        "SGLANG_JIT_CACHE_ROOT",
+        os.path.join(
+            os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sglang"
+        ),
+    )
+    os.environ["SGLANG_JIT_CACHE_ROOT"] = cache_root
+
+    if "TRITON_CACHE_DIR" not in os.environ:
+        triton_cache = os.getenv(
+            "SGLANG_TRITON_CACHE_DIR", os.path.join(cache_root, "triton")
+        )
+        os.environ["TRITON_CACHE_DIR"] = triton_cache
+        os.environ["SGLANG_TRITON_CACHE_DIR"] = triton_cache
+
+    if "TORCHINDUCTOR_CACHE_DIR" not in os.environ:
+        inductor_cache = os.getenv(
+            "SGLANG_TORCHINDUCTOR_CACHE_DIR", os.path.join(cache_root, "inductor")
+        )
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+        os.environ["SGLANG_TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+
+    dg_cache = os.getenv("SGLANG_DG_CACHE_DIR", os.path.join(cache_root, "deep_gemm"))
+    os.environ["SGLANG_DG_CACHE_DIR"] = dg_cache
+    if "DG_JIT_CACHE_DIR" not in os.environ:
+        os.environ["DG_JIT_CACHE_DIR"] = dg_cache
+
+    torch_compile_cache = os.getenv(
+        "SGLANG_CACHE_DIR", os.path.join(cache_root, "torch_compile")
+    )
+    os.environ["SGLANG_CACHE_DIR"] = torch_compile_cache
+
+
+_configure_jit_cache_roots()
 
 
 if __name__ == "__main__":
