@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -75,6 +76,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def war_fastpath_runner(self):
@@ -349,6 +356,24 @@ class TpModelWorker(BaseTpWorker):
         # Elastic joiners cannot enter the launch-time WORLD broadcast.
         if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
+        elif (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and is_draft_worker
+            and server_args.pp_size > 1
+        ):
+            # PP+spec: the draft worker exists only on the last PP stage, so a
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead — that is exactly
+            # the set of ranks holding a draft worker. The draft worker is
+            # constructed with pp_rank=0, so derive the caller's global rank
+            # from the TP group rather than tp_size * pp_rank + tp_rank.
+            tp_group = self.model_runner.tp_group
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                tp_group.ranks[self.ps.tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
