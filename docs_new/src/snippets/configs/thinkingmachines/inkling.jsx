@@ -26,6 +26,7 @@ export const config = {
   strategies: [
     { id: "balanced",     label: "Balanced"                  },
     { id: "mtp",          label: "MTP"                        },
+    { id: "dspark",       label: "DSpark"                     },
     { id: "long_context", label: "Long Context (MXFP8 KV)"    },
   ],
   nodesOptions: [
@@ -71,16 +72,18 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
-  // NVIDIA: two multi-arch CUDA builds (inkling-cu12 / inkling-cu13) — pick by your
-  // CUDA version, not by GPU. AMD: inkling-rocm700-mi35x. Panel defaults to cu13.
+  // NVIDIA: two multi-arch CUDA builds (dev-inkling-dspark for CUDA 13,
+  // dev-cu12-inkling-dspark for CUDA 12) — pick by your CUDA version, not by GPU.
+  // Panel defaults to cu13. AMD: dev-rocm720-mi35x-inkling-dspark (sglang-rocm repo).
+  // All tiers ship from the same images, DSpark included.
   dockerImages: {
-    h200:  "lmsysorg/sglang:inkling-cu13",
-    b200:  "lmsysorg/sglang:inkling-cu13",
-    b300:  "lmsysorg/sglang:inkling-cu13",
-    gb200: "lmsysorg/sglang:inkling-cu13",
-    gb300: "lmsysorg/sglang:inkling-cu13",
-    mi350x: "lmsysorg/sglang:inkling-rocm700-mi35x",
-    mi355x: "lmsysorg/sglang:inkling-rocm700-mi35x",
+    h200:  "lmsysorg/sglang:dev-inkling-dspark",
+    b200:  "lmsysorg/sglang:dev-inkling-dspark",
+    b300:  "lmsysorg/sglang:dev-inkling-dspark",
+    gb200: "lmsysorg/sglang:dev-inkling-dspark",
+    gb300: "lmsysorg/sglang:dev-inkling-dspark",
+    mi350x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
+    mi355x: "lmsysorg/sglang-rocm:dev-rocm720-mi35x-inkling-dspark",
   },
 
   github: {
@@ -682,6 +685,49 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    // ====================================================================
+    // DSpark (speculative decoding) — separate draft checkpoint
+    // (RadixArk/Inkling-DSpark-Preview, served unquantized) instead of Inkling's
+    // own MTP head. The draft weights sit outside the FP4 target, hence
+    // mem-fraction 0.68.
+    // B200 verified end-to-end.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
+      verified: true,
+      env: [
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--attention-backend fa4",
+        "--page-size 128",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--enable-torch-symm-mem",
+        "--mamba-radix-cache-strategy extra_buffer",
+        "--mem-fraction-static 0.68",
+        "--swa-full-tokens-ratio 0.1",
+        "--mamba-full-memory-ratio 0.1",
+        "--enable-multimodal",
+        "--max-running-requests 68",
+        "--reasoning-parser inkling",
+        "--tool-call-parser inkling",
+        "--skip-server-warmup",
+        "--speculative-algorithm DSPARK",
+        "--speculative-draft-model-path RadixArk/Inkling-DSpark-Preview",
+        "--speculative-draft-model-quantization unquant",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-max-bs-prefill 8192",
+        "--disable-flashinfer-autotune",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
     // ====================================================================
     // GB300 BF16 — 2x GB300 nodes (4 GPUs each) over MNNVL. The NCCL_MNNVL /
     // NVLS / CUMEM envs are required: 2-node NCCL init hangs without them.
