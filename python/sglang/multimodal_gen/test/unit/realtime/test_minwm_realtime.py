@@ -1462,10 +1462,38 @@ def test_minwm_output_projection_rejects_mismatched_shard():
         )
 
 
+def test_minwm_output_projection_matches_global_linear_for_nonuniform_sp8():
+    torch.manual_seed(7)
+    seq_splits = (3, 3, 2, 2, 2, 2, 2, 2)
+    projection = torch.nn.Linear(4, 3, bias=True)
+    global_hidden_states = torch.randn(2, sum(seq_splits), 4)
+    expected = projection(global_hidden_states)
+
+    local_outputs = []
+    row_start = 0
+    for rank, local_seq_len in enumerate(seq_splits):
+        local_hidden_states = global_hidden_states.narrow(1, row_start, local_seq_len)
+        local_outputs.append(
+            _minwm_project_output_in_reference_row_bucket(
+                projection,
+                local_hidden_states,
+                seq_splits,
+                rank,
+            )
+        )
+        row_start += local_seq_len
+
+    actual = torch.cat(local_outputs, dim=1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     ("is_cuda", "dtype", "splits", "capability", "hip", "expected"),
     [
         (True, torch.bfloat16, (1,) * 8, (9, 0), None, True),
+        (True, torch.bfloat16, (3, 3, 2, 2, 2, 2, 2, 2), (9, 0), None, True),
+        (True, torch.bfloat16, None, (9, 0), None, False),
+        (True, torch.bfloat16, (4, 4), (9, 0), None, False),
         (True, torch.bfloat16, (2,) * 4, (9, 0), None, False),
         (True, torch.bfloat16, (1,) * 8, (10, 0), None, False),
         (True, torch.bfloat16, (1,) * 8, (9, 4), "6.3", False),
