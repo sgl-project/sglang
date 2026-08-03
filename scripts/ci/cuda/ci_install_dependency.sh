@@ -187,8 +187,10 @@ configure_rust_build_store() {
     # Each slot represents a compatible compiler, interpreter, architecture,
     # and dependency graph. Cargo remains responsible for detecting ordinary
     # source changes inside a slot.
-    local dependency_digest interpreter_signature compiler_signature slot_id
-    dependency_digest=$(sha256sum "${REPO_ROOT}/rust/Cargo.lock" | awk '{print $1}')
+    local source_identity interpreter_signature compiler_signature slot_id
+    source_identity=$(
+        python3 "${SCRIPT_DIR}/rust_build_inputs.py" --repo-root "${REPO_ROOT}"
+    )
     interpreter_signature=$(
         python3 - <<'PY'
 import sys
@@ -203,15 +205,19 @@ print(
 PY
     )
     compiler_signature=$(
-        cd "${REPO_ROOT}/rust"
+        # setuptools-rust invokes Cargo from the Python build context, which is
+        # outside rust/rust-toolchain.toml's directory-based override.
+        cd "${REPO_ROOT}/python"
         rustc -vV
         cargo -vV
     )
     slot_id=$(
-        printf '%s\n' "$(uname -m)" "${interpreter_signature}" "${dependency_digest}" "${compiler_signature}" \
+        printf '%s\n' "$(uname -m)" "${interpreter_signature}" "${source_identity}" "${compiler_signature}" \
             | sha256sum | awk '{print $1}'
     )
 
+    # Bootstrap exception: sglang is not importable yet, so this descriptor is
+    # registered in sglang.srt.environ but must be read directly by the shell.
     RUST_BUILD_STORE="${SGLANG_RUST_BUILD_STORE:-${HOME}/.cache/sglang-ci/rust-builds}"
     RUST_BUILD_SLOT="${RUST_BUILD_STORE}/${slot_id}"
     export CARGO_TARGET_DIR="${RUST_BUILD_SLOT}/artifacts"
@@ -245,7 +251,7 @@ PY
     done
 
     echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
-    echo "Rust build slot inputs: arch=$(uname -m), python=${interpreter_signature}, dependency=${dependency_digest:0:12}"
+    echo "Rust build slot inputs: arch=$(uname -m), python=${interpreter_signature}, source=${source_identity:0:12}"
     echo "Retired ${retired_slots} unused Rust build slot(s)"
     du -sh "${RUST_BUILD_SLOT}" 2>/dev/null || true
 

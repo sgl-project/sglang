@@ -293,6 +293,9 @@ class Envs:
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
+    # Optional root for compatibility-keyed Rust build artifacts in CUDA CI.
+    # The dependency bootstrap shell reads this raw before sglang is importable.
+    SGLANG_RUST_BUILD_STORE = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
