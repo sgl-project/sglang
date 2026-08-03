@@ -531,8 +531,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if not is_sm90_supported() and not is_sm120_supported():
-                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+            # Marlin itself targets SM80+, and its fp4 (e2m1) decode is
+            # plain bit manipulation -- the dense-path hint in this file
+            # already tells SM80-SM90 users to pick the marlin backend, and
+            # the same kernel family runs MXFP4 experts on SM8x elsewhere.
+            # Gate on the Marlin floor instead of SM90/SM120.
+            if not torch.cuda.get_device_capability()[0] >= 8:
+                raise RuntimeError("MXFP4 Marlin requires SM80 or newer.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
