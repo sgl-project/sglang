@@ -925,6 +925,7 @@
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",
+              "docs/advanced_features/dspark",
               "docs/advanced_features/adaptive_speculative_decoding",
               "docs/advanced_features/structured_outputs",
               "docs/advanced_features/structured_outputs_for_reasoning_models",
