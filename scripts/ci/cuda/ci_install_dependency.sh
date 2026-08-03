@@ -175,6 +175,17 @@ clean_site_packages() {
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
+    # Same-step counterpart of the PATH export above: install_rustup.sh exports
+    # RUSTUP_TOOLCHAIN too, but as a child process only reaches later steps.
+    # rust-toolchain.toml does not cover it either - setuptools-rust runs cargo
+    # from python/, outside the pin's cwd scope - so without this an image's own
+    # older rustc builds the crates and fails their MSRV.
+    RUST_PINNED_CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${REPO_ROOT}/rust/rust-toolchain.toml" 2>/dev/null || true)
+    if [ -n "${RUST_PINNED_CHANNEL}" ]; then
+        export RUSTUP_TOOLCHAIN="${RUST_PINNED_CHANNEL}"
+        echo "Using pinned Rust toolchain ${RUST_PINNED_CHANNEL} for this install"
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
