@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
@@ -461,6 +462,8 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config, hf_config, **kwargs)
         cfg = config.arch_config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
+        if get_global_server_args().original_dtype == "bfloat16":
+            use_weight_only_fp8_linears = False
         self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
