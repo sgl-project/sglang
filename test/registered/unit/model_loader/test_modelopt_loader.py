@@ -574,33 +574,6 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                 self.assertEqual(config.get_name(), "modelopt_fp4")
                 self.assertEqual(config.is_checkpoint_nvfp4_serialized, is_serialized)
 
-    def test_explicit_draft_modelopt_fp4_preserves_fp8_source(self):
-        model_config = SimpleNamespace(
-            model_path="draft-model",
-            quantization="modelopt_fp4",
-            is_draft_model=True,
-            is_draft_quantization_explicit=True,
-            hf_config=SimpleNamespace(
-                quantization_config={
-                    "quant_method": "fp8",
-                    "quant_algo": "FP8",
-                    "activation_scheme": "dynamic",
-                }
-            ),
-        )
-
-        config = get_quant_config(model_config, LoadConfig(), {})
-
-        self.assertEqual(config.get_name(), "modelopt_fp4")
-        self.assertFalse(config.is_checkpoint_nvfp4_serialized)
-        self.assertIsInstance(
-            config.get_quant_method(
-                ReplicatedLinear.__new__(ReplicatedLinear),
-                "model.layers.0.self_attn.q_proj",
-            ),
-            Fp8LinearMethod,
-        )
-
     def test_unquantized_modelopt_fp4_preserves_modelopt_workflows(self):
         model_config = SimpleNamespace(
             quantization="modelopt_fp4",

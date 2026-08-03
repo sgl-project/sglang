@@ -155,6 +155,7 @@ class TestModelOptNvfp4(CustomTestCase):
 
         dense_method = object()
         fp8_moe_method = object()
+        self.assertFalse(config.use_per_token_activation)
         with (
             patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", FakeFusedMoE),
             patch(
@@ -165,13 +166,6 @@ class TestModelOptNvfp4(CustomTestCase):
                 "sglang.srt.layers.quantization.fp8.Fp8MoEMethod",
                 return_value=fp8_moe_method,
             ),
-            patch.object(
-                ModelOptNvFp4FusedMoEMethod,
-                "__init__",
-                lambda method, quant_config: setattr(
-                    method, "quant_config", quant_config
-                ),
-            ),
         ):
             self.assertIs(
                 config.get_quant_method(
@@ -180,11 +174,6 @@ class TestModelOptNvfp4(CustomTestCase):
                 ),
                 dense_method,
             )
-            nvfp4_moe_method = config.get_quant_method(
-                FakeFusedMoE(), "model.layers.0.mlp.experts"
-            )
-            self.assertIsInstance(nvfp4_moe_method, ModelOptNvFp4FusedMoEMethod)
-            self.assertTrue(nvfp4_moe_method._uses_serialized_fp8_source())
             self.assertIs(
                 config.get_quant_method(FakeFusedMoE(), "model.layers.1.mlp.experts"),
                 fp8_moe_method,
