@@ -4009,7 +4009,7 @@ class Scheduler(
                 )
             if recv_req.hicache_write_policy is not None:
                 hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
-            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
+            get_context().override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -4050,7 +4050,7 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.override(
+            get_context().override(
                 "scheduler.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
