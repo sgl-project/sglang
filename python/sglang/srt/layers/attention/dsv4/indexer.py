@@ -63,6 +63,16 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 
+# deep_gemm's indexer kernels assert `arch_major in {9, 10}` inside the kernel
+# (csrc/apis/attention.hpp), so every other CUDA architecture has to take the
+# paged fallback. Naming the architectures that *do* have the kernel keeps the
+# polarity right: anything not enumerated degrades instead of dying.
+_DEEP_GEMM_INDEXER_CAPABILITIES = (9, 10)
+_has_deep_gemm_indexer = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] in _DEEP_GEMM_INDEXER_CAPABILITIES
+)
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -569,6 +579,11 @@ class C4IndexerBackendMixin:
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
+            return False
+        # ... and architectures whose deep_gemm build has no indexer kernel:
+        # the assertion lives inside the kernel, so reaching it kills the
+        # scheduler rather than raising something a fallback could catch.
+        if not _has_deep_gemm_indexer:
             return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
