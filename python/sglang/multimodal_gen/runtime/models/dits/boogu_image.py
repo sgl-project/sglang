@@ -933,9 +933,7 @@ class BooguRopeEmbedder(nn.Module):
                     position_ids[i, pe_shift_len:end, 0] = pe_shift
                     position_ids[i, pe_shift_len:end, 1] = rows
                     position_ids[i, pe_shift_len:end, 2] = cols
-                    pe_shift += max(
-                        height // self.patch_size, width // self.patch_size
-                    )
+                    pe_shift += max(height // self.patch_size, width // self.patch_size)
                     pe_shift_len += ref_len
 
             height, width = img_sizes[i]
