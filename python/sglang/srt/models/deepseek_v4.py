@@ -193,7 +193,7 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_xpu
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -2778,7 +2778,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not _FP8_WO_A_GEMM:
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
