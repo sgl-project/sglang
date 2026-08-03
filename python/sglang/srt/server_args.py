@@ -9005,6 +9005,14 @@ class ServerArgs:
         else:
             return False
 
+    def to_dict_redacted(self) -> dict:
+        """Return the server arguments with configured secrets masked."""
+        redacted = dataclasses.asdict(self)
+        for field in ("api_key", "admin_api_key", "ssl_keyfile_password"):
+            if redacted.get(field) is not None:
+                redacted[field] = "[REDACTED]"
+        return redacted
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.

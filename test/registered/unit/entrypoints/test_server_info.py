@@ -321,5 +321,49 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         json.dumps(info)
 
 
+class TestServerInfoRedactsSecrets(CustomTestCase):
+    """Test that server-info responses do not disclose configured secrets."""
+
+    SECRET_FIELDS = ("api_key", "admin_api_key", "ssl_keyfile_password")
+
+    def test_configured_secrets_are_masked(self):
+        args = ServerArgs(
+            model_path="dummy",
+            api_key="sk-normal-secret",
+            admin_api_key="sk-admin-secret",
+            ssl_keyfile_password="tls-password",
+        )
+
+        info = _call_server_info_with(args)
+
+        for field in self.SECRET_FIELDS:
+            self.assertIn(field, info)
+            self.assertEqual(
+                info[field],
+                "[REDACTED]",
+                f"secret field '{field}' must be masked in /server_info",
+            )
+        serialized = json.dumps(info)
+        for secret in ("sk-normal-secret", "sk-admin-secret", "tls-password"):
+            self.assertNotIn(secret, serialized)
+
+    def test_unset_secrets_stay_none(self):
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(args)
+
+        for field in self.SECRET_FIELDS:
+            self.assertIn(field, info)
+            self.assertIsNone(info[field])
+
+    def test_non_secret_fields_are_untouched(self):
+        args = ServerArgs(model_path="dummy", api_key="sk-secret", port=31234)
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["model_path"], "dummy")
+        self.assertEqual(info["port"], 31234)
+
+
 if __name__ == "__main__":
     unittest.main()
