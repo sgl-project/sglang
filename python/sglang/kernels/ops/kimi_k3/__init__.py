@@ -9,9 +9,7 @@ _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
     (896, 7168): 8,
 }
-_K3_K_GEMM_DISPATCH_MAP = {
-    (1536, 128): 12,
-}
+_K3_K_GEMM_DISPATCH_MAP: dict = {}  # tiny_k_gemm is 2.5x slower than torch.linear on gfx950
 
 
 def situ_and_mul(
