@@ -237,7 +237,7 @@ logger = logging.getLogger(__name__)
 def _prefill_cuda_graph_allows_context_parallel(prefill_runner) -> bool:
     """Allow CP only through a runner that captured the validated CP-v2 body."""
     return get_cp_strategy() is None or bool(
-        getattr(prefill_runner, "enable_cp_v2_body_capture", False)
+        getattr(prefill_runner, "enable_cp_v2_bcg_capture", False)
     )
 
 

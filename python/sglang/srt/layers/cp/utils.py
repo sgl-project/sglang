@@ -135,6 +135,16 @@ def enable_cp_v2() -> bool:
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
 
 
+def enable_cp_v2_bcg_capture(server_args) -> bool:
+    """Return whether CP-v2 breakable prefill capture is enabled."""
+    if not enable_cp_v2():
+        return False
+
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+    return supports_prefill_cp_bcg(server_args)
+
+
 def is_cp_v2_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP-v2."""
     if not enable_cp_v2():
@@ -290,6 +300,7 @@ __all__ = [
     "ZigzagContextParallelMetadata",
     "CP_V2_DEFAULT_MODEL_CLASSES",
     "enable_cp_v2",
+    "enable_cp_v2_bcg_capture",
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",

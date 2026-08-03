@@ -4446,18 +4446,6 @@ class ServerArgs:
             if predicate():
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-    def _supports_breakable_prefill_cp(self) -> bool:
-        resolved = self._resolved()
-        prefill_attention_backend, _ = self._resolved_attention_backends()
-        return (
-            self.enable_prefill_cp
-            and resolved.attn_cp_size == self.tp_size
-            and self.cp_strategy == "zigzag"
-            and prefill_attention_backend == "trtllm_mha"
-            and self.get_model_config().hf_config.architectures == ["GptOssForCausalLM"]
-        )
-
-
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
         memory-saver rejection in its own __init__; config-time rules can be
@@ -4468,6 +4456,7 @@ class ServerArgs:
             is_deepseek_v4,
             is_nemotron_h,
         )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4495,7 +4484,7 @@ class ServerArgs:
             (
                 "context parallel (attn_cp_size > 1)",
                 lambda: self._resolved().attn_cp_size > 1
-                and not self._supports_breakable_prefill_cp(),
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
