@@ -22,6 +22,9 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    # Keep the masked/unmasked block split independent of seqlen_q; see
+    # get_n_block_min_causal_local_mask.
+    batch_invariant: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_idx_left_right(
@@ -158,7 +161,19 @@ class BlockInfo:
         m_block: Int32,
         n_block_min: Int32,
     ) -> Int32:
-        """If we have separate iterations with causal or local masking at the start, where do we stop"""
+        """If we have separate iterations with causal or local masking at the start, where do we stop
+
+        The boundary carries a ``- seqlen_q`` term, so the same KV block takes the
+        masked path for one query-tile alignment and the unmasked path for
+        another. Since the two paths round differently, a row's output then
+        depends on how many query tokens share the forward pass (a prefill and a
+        cache-hit extend covering the same row disagree). Under
+        ``batch_invariant`` every block takes the masked path instead: masking is
+        the identity for blocks fully below the diagonal, so the result is
+        unchanged while the split no longer depends on ``seqlen_q``.
+        """
+        if const_expr(self.batch_invariant):
+            return n_block_min
         m_idx_min = m_block * self.tile_m
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa

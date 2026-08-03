@@ -261,6 +261,16 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             self._get_scheduler_metadata = None
+            if model_runner.server_args.enable_deterministic_inference:
+                # The fa4 forward derives its masked/unmasked KV-block split from
+                # seqlen_q, so a row scored in a long prefill and the same row
+                # scored in a short cache-hit extend take differently-rounding
+                # paths. Must be set before the first kernel compile.
+                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                    set_batch_invariant,
+                )
+
+                set_batch_invariant(True)
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
