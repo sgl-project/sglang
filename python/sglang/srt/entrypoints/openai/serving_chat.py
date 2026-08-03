@@ -252,18 +252,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
-        self._dsv4_reasoning_effort_profile_resolver = (
-            chat_encoding.Dsv4ReasoningEffortProfileResolver(
-                model_path=(
-                    self.tokenizer_manager.model_path
-                    if self.chat_encoding_spec == "dsv4"
-                    else None
-                ),
+        self._dsv4_reasoning_effort_profile = (
+            chat_encoding.resolve_dsv4_reasoning_effort_profile(
+                model_path=self.tokenizer_manager.model_path,
                 revision=self.tokenizer_manager.server_args.revision,
                 override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
                     chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
                 ),
             )
+            if self.chat_encoding_spec == "dsv4"
+            else None
         )
 
         # Resolve the env-configured Inkling effort default once: the env var is
@@ -1221,12 +1219,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
-                reasoning_effort_profile = (
-                    self._dsv4_reasoning_effort_profile_resolver.resolve(
-                        model_path=self.tokenizer_manager.model_path,
-                        revision=self.tokenizer_manager.server_args.revision,
-                    )
-                )
+                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
+                assert reasoning_effort_profile is not None
                 accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
                     reasoning_effort_profile
                 ]

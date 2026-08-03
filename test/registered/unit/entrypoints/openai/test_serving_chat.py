@@ -77,9 +77,7 @@ class _MockTokenizerManager:
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
-        mock_hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "legacy"
-        }
+        mock_hf_config.to_dict.return_value = {}
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -1026,6 +1024,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders should reject history tool call scalars as BadRequest."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "legacy"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1063,6 +1062,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "legacy"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1561,6 +1561,9 @@ class ServingChatTestCase(unittest.TestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        mock_hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "legacy"
+        }
         tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
@@ -1797,17 +1800,16 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             resolve(model_path="renamed/model", override="auto")
 
-    def test_dsv4_reasoning_effort_profile_refreshes_after_weight_update(self):
+    def test_dsv4_reasoning_effort_profile_from_checkpoint(self):
         from sglang.srt.parser.template_manager import TemplateManager
 
-        legacy_model_path = _create_dsv4_checkpoint(self, _DSV4_LEGACY_ENCODER)
         release_model_path = _create_dsv4_checkpoint(self, _DSV4_0731_ENCODER)
         tm = _MockTokenizerManager()
         tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
         tm.model_config.hf_config.to_dict.return_value = {}
         tm.model_config.hf_config.dspark_block_size = 5
         tm.model_config.hf_config.dspark_markov_rank = 256
-        tm.model_path = legacy_model_path
+        tm.model_path = release_model_path
         tm.server_args.model_path = tm.model_path
         serving_chat = OpenAIServingChat(tm, TemplateManager())
 
@@ -1817,19 +1819,8 @@ class ServingChatTestCase(unittest.TestCase):
             reasoning_effort="max",
         )
         serving_chat._process_messages(request, is_multimodal=False)
-        legacy_prompt = tm.tokenizer.encode.call_args.args[0]
-        self.assertIn("Reasoning Effort: Absolute maximum", legacy_prompt)
-        self.assertNotIn("Reasoning Effort: Beyond maximum", legacy_prompt)
-
-        tm.model_path = release_model_path
-        tm.server_args.model_path = tm.model_path
-        serving_chat._process_messages(request, is_multimodal=False)
-        release_prompt = tm.tokenizer.encode.call_args.args[0]
-        self.assertIn("Reasoning Effort: Beyond maximum", release_prompt)
-
-        request.reasoning_effort = "low"
-        serving_chat._process_messages(request, is_multimodal=False)
-        self.assertNotIn("Reasoning Effort:", tm.tokenizer.encode.call_args.args[0])
+        prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
 
     def test_dsv4_reasoning_effort_profile_override_from_model_config(self):
         from sglang.srt.parser.template_manager import TemplateManager

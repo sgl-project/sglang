@@ -105,44 +105,6 @@ def resolve_dsv4_reasoning_effort_profile(
     )
 
 
-class Dsv4ReasoningEffortProfileResolver:
-    def __init__(
-        self,
-        *,
-        model_path: Optional[str] = None,
-        revision: Optional[str] = None,
-        override: Optional[str] = None,
-    ):
-        self._override = (
-            _validate_dsv4_reasoning_effort_profile(override)
-            if override is not None
-            else None
-        )
-        self._model_path = None
-        self._revision = None
-        self._profile = None
-        if model_path is not None:
-            self.resolve(model_path=model_path, revision=revision)
-
-    def resolve(self, *, model_path: str, revision: Optional[str] = None) -> str:
-        if (model_path, revision) != (self._model_path, self._revision):
-            self._profile = resolve_dsv4_reasoning_effort_profile(
-                model_path=model_path,
-                revision=revision,
-                override=self._override,
-            )
-            self._model_path = model_path
-            self._revision = revision
-            logger.info(
-                "Resolved DeepSeek-V4 reasoning effort profile %r for %s",
-                self._profile,
-                model_path,
-            )
-        if self._profile is None:
-            raise RuntimeError("DeepSeek-V4 reasoning effort profile was not resolved")
-        return self._profile
-
-
 def resolve_chat_encoding_spec(
     *,
     hf_config: Any,
