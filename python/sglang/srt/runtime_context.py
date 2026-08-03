@@ -47,6 +47,8 @@ test-only ``override(**kw)``.
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -125,12 +127,19 @@ class ParallelContext:
 
     def __getattr__(self, name):
         # Reached only for names that are neither a live @property nor a slot:
-        # serve parallel config leaves from the published bag.
-        try:
-            config = object.__getattribute__(self, "_config")
-        except AttributeError:
-            config = None
-        if config is not None and name in config:
+        # serve parallel config leaves from the published bag. The body must
+        # stay dynamo-traceable — config-leaf reads such as
+        # ``get_parallel().moe_dense_tp_size`` run inside compiled model
+        # forwards, and ``object.__getattribute__`` graph-breaks.
+        if name.startswith("_"):
+            # No config leaf is underscored; this also breaks the recursion
+            # when the ``_config`` slot itself is still unset (pickle/copy
+            # protocols probe attributes before __init__ runs).
+            raise AttributeError(name)
+        config = self._config
+        # ``_fields`` is a plain ``__dict__`` entry on the bag; ``in`` on the
+        # dict avoids ``_ConfigBag.__contains__`` (not traceable).
+        if config is not None and name in config._fields:
             return getattr(config, name)
         detail = (
             "not a published parallel config leaf"
@@ -819,7 +828,33 @@ class RuntimeContext:
         bags = self._config_bags
         if not bags or name not in bags:
             raise ValueError(f"config namespace {name!r} not published")
+        if _ROLE_NS_MODE != "off":
+            self._check_role_namespace(name)
         return bags[name]
+
+    def _check_role_namespace(self, name: str) -> None:
+        # Out of line so the mode gate above stays one dead-branch-prunable
+        # check under dynamo in the default "off" mode (config_bag runs inside
+        # compiled model forwards).
+        role = self._publish_role
+        if _ROLE_NS_MODE == "record":
+            if not _is_compiling():
+                _record_namespace_read(role, name)
+        elif _ROLE_NS_MODE == "enforce" and role is not None:
+            if role not in ROLE_NAMESPACE_SETS:
+                raise ValueError(
+                    f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; "
+                    "declare its namespace set (None for the full tree)."
+                )
+            allowed = ROLE_NAMESPACE_SETS[role]
+            if allowed is not None and name not in allowed:
+                raise ValueError(
+                    f"config namespace {name!r} is outside the declared set "
+                    f"for publish role {role!r} ({sorted(allowed)}). If this "
+                    "read is legitimate for the process type, extend "
+                    "ROLE_NAMESPACE_SETS; if not, the read belongs in a "
+                    "different process or behind a per-instance boundary."
+                )
 
     def override(self, source: str, **fields) -> None:
         """The business mutation entry: write resolved config
@@ -1095,6 +1130,138 @@ def get_observability() -> _ConfigBag:
     return _CONTEXT.config_bag("observability")
 
 
+# --- Per-role namespace sets (2c) -------------------------------------------
+#
+# ``publish(role=...)`` records which process type installed the config; this
+# table declares which top-level config namespaces each role reads. ``None``
+# means the full tree — either the role genuinely needs everything (scheduler)
+# or its deployment shape has not been audited yet (restrict only what smoke
+# coverage can verify). ``parallel`` is served by ``get_parallel()`` and every
+# process legitimately reads topology config, so it is not part of this table.
+#
+# ``SGLANG_ROLE_NAMESPACES`` selects the mode (read once at import):
+#   off      (default) no bookkeeping, zero overhead;
+#   record   audit mode — collect (role, namespace) reads per process and dump
+#            them at exit (the data that seeds this table). Reads made inside
+#            torch.compile-traced code are NOT observed (recording is pruned
+#            under tracing to keep capture legal) — run audits with
+#            compilation disabled before restricting a role.
+#   enforce  fail closed — a bag read outside the role's declared set raises.
+ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
+    # Reads (almost) everything by design — the model-executing process.
+    "scheduler": None,
+    "launcher": None,
+    "test": None,
+    # Audited (record-mode smokes, plain + DP-attention): the DP controller
+    # reads only the elastic-EP gate; its module's static read set agrees.
+    "dp_controller": frozenset({"exec"}),
+    # Zero bag reads observed (per-instance managers read self.server_args by
+    # design). Keep full: it may need namespaces (e.g. disagg) once tokenizer
+    # paths migrate off self.server_args, and restricting on a zero-read
+    # audit would be guesswork.
+    "tokenizer": None,
+    # Deployment shapes not exercised locally; audit before restricting.
+    "encoder": None,
+    "expert_backup": None,
+    "weight_cache_daemon": None,
+}
+
+
+def _validated_role_ns_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in ("off", "record", "enforce"):
+        raise ValueError(
+            f"SGLANG_ROLE_NAMESPACES={value!r} is not one of off / record / "
+            "enforce — refusing to guess (a typo here would silently disable "
+            "enforcement)."
+        )
+    return mode
+
+
+def _role_ns_mode_from_env() -> str:
+    # Resolved once at import so the config_bag gate stays a dynamo-prunable
+    # constant; validated fail-loud here (EnvField's warn-and-default parse
+    # would silently turn a typo into "off").
+    from sglang.srt.environ import envs
+
+    return _validated_role_ns_mode(envs.SGLANG_ROLE_NAMESPACES.get())
+
+
+_ROLE_NS_MODE = _role_ns_mode_from_env()
+_RECORDED_NS_READS: set[tuple[str | None, str]] = set()
+_RECORD_DUMP_REGISTERED = False
+
+
+def _is_compiling() -> bool:
+    # Recording has Python side effects (set mutation, file I/O, atexit) that
+    # must never run under tracing; torch.compiler.is_compiling() is dynamo's
+    # sanctioned probe. The lazy lookup keeps this module import-light.
+    torch = sys.modules.get("torch")
+    return torch is not None and torch.compiler.is_compiling()
+
+
+def _ensure_record_dump_registered() -> None:
+    global _RECORD_DUMP_REGISTERED
+    if not _RECORD_DUMP_REGISTERED:
+        _RECORD_DUMP_REGISTERED = True
+        import atexit
+
+        atexit.register(_dump_recorded_namespace_reads)
+
+
+def _append_role_ns_out(role: str | None, name: str) -> None:
+    # Persist immediately: worker processes are routinely torn down with
+    # signals that skip atexit, and the audit must survive that.
+    from sglang.srt.environ import envs
+
+    out = envs.SGLANG_ROLE_NAMESPACES_OUT.get()
+    if not out:
+        return
+    try:
+        with open(out, "a") as f:
+            f.write(f"{role} {name}\n")
+    except OSError as e:
+        # The entry stays in the in-memory set; the exit summary still covers it.
+        print(
+            f"[role-namespaces] pid={os.getpid()} failed to append "
+            f"({role}, {name}) to {out!r}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _record_namespace_read(role: str | None, name: str) -> None:
+    if (role, name) in _RECORDED_NS_READS:
+        return
+    _RECORDED_NS_READS.add((role, name))
+    _append_role_ns_out(role, name)
+    _ensure_record_dump_registered()
+
+
+def _dump_recorded_namespace_reads() -> None:
+    """Emit the record-mode audit: one line per role with the namespaces its
+    process actually read (multi-process runs dump once per process). The
+    process's own publish role is always included, so a zero-read role emits
+    an (empty) line rather than being indistinguishable from a process where
+    recording never ran."""
+    by_role: dict = {}
+    own_role = _CONTEXT._publish_role
+    if own_role is not None:
+        by_role.setdefault(own_role, set())
+    for role, name in _RECORDED_NS_READS:
+        if name == "-":  # publish-time marker, not a namespace read
+            by_role.setdefault(role, set())
+            continue
+        by_role.setdefault(role, set()).add(name)
+    for role in sorted(by_role, key=str):
+        print(
+            f"[role-namespaces] pid={os.getpid()} role={role} "
+            f"read={','.join(sorted(by_role[role]))}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
@@ -1102,9 +1269,10 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     ``dp_controller`` / ``encoder`` / ``expert_backup`` /
     ``weight_cache_daemon`` / ``launcher`` / ``test``) and
     projects the config bags. Draft workers skip publish (they must not clobber
-    the target). ``role`` is provenance today — per-role namespace projection
-    and fail-closed enforcement is a later unit. ``hf_config`` is accepted for
-    forward-compat and currently unused.
+    the target). ``role`` is provenance, and — when ``SGLANG_ROLE_NAMESPACES``
+    is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
+    namespace-read enforcement (``record`` audits the reads instead).
+    ``hf_config`` is accepted for forward-compat and currently unused.
 
     Normally one call per process, but re-publish is allowed and is
     **last-publish-wins** (bags re-projected, provenance reset, role
@@ -1115,8 +1283,25 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     must read ``self.server_args`` for anything engine-specific rather than
     the process-global bags.
     """
+    if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
+        # Fail closed at publish time, not at the first stray read.
+        raise ValueError(
+            f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
+            "its namespace set (None for the full tree)."
+        )
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
+    if _ROLE_NS_MODE == "record":
+        # The '-' marker distinguishes a zero-read role from a process where
+        # recording never ran (signal teardown skips atexit).
+        _record_namespace_read(role, "-")
+        print(
+            f"[role-namespaces] pid={os.getpid()} role={role} recording; note: "
+            "reads inside torch.compile-traced code are not observed — audit "
+            "with compilation disabled before restricting a role.",
+            file=sys.stderr,
+            flush=True,
+        )
     return _CONTEXT
 
 

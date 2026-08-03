@@ -12,6 +12,7 @@
 //                      vendor picks the selector group: blackwell | hopper | amd.
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
+//   groupHardware      optional — set false to show one flat hardware row
 //   variants/quantizations/strategies/nodesOptions  LEGACY 4-dim option lists,
 //                      used when `matchDims` is absent (nodesOptions id is
 //                      `single` or `multi-N` → --nnodes N)
@@ -40,7 +41,9 @@
 //                      whose verification round is open rather than absent.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
-//   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
+//   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
+//                      `(selection, cell) => template` when the request payload
+//                      depends on a custom match/overlay dimension
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
 //                      per-eval accuracy templates)
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
@@ -56,8 +59,14 @@
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
+//   dockerMounts       optional — additional `-v` mount specs
+//   dockerRunCommand   optional — command placed after the image and before
+//                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
-//                      `docker`); defaults to both, in that order
+//                      `docker`), as an array or `(selection) => array`;
+//                      defaults to both, in that order
+//   showPlaygroundLink optional — false hides the "Open the Playground" footer
+//                      for cookbooks that only expose the deployment matrix
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -689,6 +698,9 @@ export const Deployment = ({ config, benchmarks }) => {
       const di = config.dockerImages || {};
       const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
@@ -728,13 +740,14 @@ export const Deployment = ({ config, benchmarks }) => {
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...flags.map((f) => "    " + f),
       ];
       cmd = dockerLines.join(" \\\n");
@@ -1030,6 +1043,9 @@ export const Deployment = ({ config, benchmarks }) => {
         .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
       if (items.length) groups.push({ label: vendor.toUpperCase(), items });
     }
+    if (config.groupHardware === false) {
+      return [{ label: null, items: groups.flatMap((group) => group.items) }];
+    }
     return groups;
   };
 
@@ -1161,8 +1177,17 @@ export const Deployment = ({ config, benchmarks }) => {
   const [benchConc, setBenchConc] = useState(null);
   const [benchAcc, setBenchAcc] = useState(null);
   const [benchCopied, setBenchCopied] = useState(null);
-  const runModes = config.runModes || ["python", "docker"];
+  const configuredRunModes = typeof config.runModes === "function"
+    ? config.runModes(sel)
+    : config.runModes;
+  const runModes = configuredRunModes || ["python", "docker"];
   const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
+  const hasRunMode = runModes.includes(runMode);
+  const fallbackRunMode = runModes[0];
+  const activeRunMode = hasRunMode ? runMode : fallbackRunMode;
+  useEffect(() => {
+    if (!hasRunMode) setRunMode(fallbackRunMode);
+  }, [hasRunMode, fallbackRunMode]);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // Live --mamba-full-memory-ratio from the ratio calculator (K3 pages):
@@ -1194,7 +1219,7 @@ export const Deployment = ({ config, benchmarks }) => {
     else flags.push(line);
     return { ...cell, flags };
   })();
-  const command = renderCommand(cellWithRatio, sel, env, runMode);
+  const command = renderCommand(cellWithRatio, sel, env, activeRunMode);
   // Speculative-decoding hint on the EFFECTIVE flags — speculation can arrive via
   // the Spec Decode overlay as well as the cell. SGLang resets
   // --max-running-requests to 48 when spec is on and it's unset; verified for both
@@ -1263,7 +1288,9 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
   const modelName = resolveModelName(sel);
-  const curlText = interpolate(config.curl || "", env, modelName);
+  const curlTemplate =
+    typeof config.curl === "function" ? config.curl(sel, cell) : config.curl;
+  const curlText = interpolate(curlTemplate || "", env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
@@ -1385,8 +1412,8 @@ export const Deployment = ({ config, benchmarks }) => {
       <div style={s.cardColumn}>
         <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
         {hwGroups.map((g) => (
-          <div key={g.label} style={s.vendorRow}>
-            <div style={s.vendorLabel}>{g.label}</div>
+          <div key={g.label || "hardware"} style={s.vendorRow}>
+            {g.label && <div style={s.vendorLabel}>{g.label}</div>}
             <div style={s.itemsGrid(maxHwCols)}>
               {g.items.map((item) => renderButton(item, "hw", sel.hw))}
               {Array.from({ length: maxHwCols - g.items.length }).map((_, i) => (
@@ -1431,13 +1458,13 @@ export const Deployment = ({ config, benchmarks }) => {
                       key={mode}
                       style={{
                         ...(index === runModes.length - 1
-                          ? s.runModeChipLast(runMode === mode)
-                          : s.runModeChip(runMode === mode)),
+                          ? s.runModeChipLast(activeRunMode === mode)
+                          : s.runModeChip(activeRunMode === mode)),
                         ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
                       }}
                       onClick={() => setRunMode(mode)}
                       role="tab"
-                      aria-selected={runMode === mode}
+                      aria-selected={activeRunMode === mode}
                     >
                       {mode === "docker" ? "Docker" : "Python"}
                     </span>
@@ -1473,38 +1500,40 @@ export const Deployment = ({ config, benchmarks }) => {
 
       {/* Playground link — scrollIntoView, not an href, so the hash (which
           carries the selection) isn't overwritten. */}
-      <div
-        style={{
-          padding: "6px 12px",
-          fontSize: "12px",
-          color: isDark ? "#9ca3af" : "#6b7280",
-          display: "flex",
-          alignItems: "center",
-          gap: "6px",
-        }}
-      >
-        <span>Need to go beyond the verified matrix?</span>
-        <button
-          type="button"
-          onClick={() => {
-            const el = document.getElementById("playground");
-            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-          }}
+      {config.showPlaygroundLink !== false && (
+        <div
           style={{
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            color: isDark ? "#FDBA74" : "#C2410C",
-            cursor: "pointer",
+            padding: "6px 12px",
             fontSize: "12px",
-            fontWeight: 600,
-            textDecoration: "underline",
-            textUnderlineOffset: "2px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
           }}
         >
-          Open the Playground →
-        </button>
-      </div>
+          <span>Need to go beyond the verified matrix?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById("playground");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+            }}
+          >
+            Open the Playground →
+          </button>
+        </div>
+      )}
 
       {/* cURL modal */}
       {modal === "curl" && (

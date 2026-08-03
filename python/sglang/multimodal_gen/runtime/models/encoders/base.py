@@ -123,11 +123,11 @@ def encoder_dp_worthwhile(
 
 
 def finalize_encoder_folding(
-    config: EncoderConfig, policy: str = "auto", batched: bool = False
+    config: EncoderConfig, policy: str = "auto", prefer_dp: bool = False
 ) -> None:
     """resolve fold-vs-replicate once real dims are known (post update_model_arch,
     pre construction); folding shards the weights, so it rules out dp for the
-    lifetime of the loaded model. `batched` is the batching ceiling being > 1."""
+    lifetime of the loaded model. `prefer_dp` means the runtime can engage dp."""
     if config.parallel_folding_mode is None:
         return
     group = get_folding_tp_group(config)
@@ -138,7 +138,7 @@ def finalize_encoder_folding(
         # a batched encode prefers dp (one all_gather) over folding (an
         # all_reduce per layer), so leave a dp-capable encoder unsharded
         keep = (
-            not (batched and encoder_dp_capable(config))
+            not (prefer_dp and encoder_dp_capable(config))
             and encoder_folding_worthwhile(config, group.world_size)
             and group_has_measured_topology(group)
         )
