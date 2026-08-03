@@ -15,6 +15,11 @@ When your code crashes with CUDA errors such as illegal memory access, device-si
 - Track tensor shapes, dtypes, and values through the call boundary that triggered the crash
 - Detect numerical issues such as NaN, Inf, or obviously wrong shapes
 
+If the failure is a plain **Python** exception during a forward pass rather than a CUDA
+fault, see [`debug-serving-fault`](../debug-serving-fault/SKILL.md) instead: `--debug-mode`
+keeps the process (and its weights and captured graphs) alive across the exception, so
+each reproduction costs seconds instead of a full restart.
+
 ## Why Use Kernel API Logging?
 
 **Problem**: CUDA errors often crash the program before normal debugging output is flushed.
