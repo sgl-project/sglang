@@ -553,6 +553,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     num_token_non_padded_cpu: int = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # Preallocated piecewise-graph attention output, set by RadixAttention.
+    _attn_output: Optional[torch.Tensor] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
