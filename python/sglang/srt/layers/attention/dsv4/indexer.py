@@ -229,16 +229,11 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert clean_logits == False
 
     max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
 
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
     page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
-
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
 
     # Chunk along the sequence axis. The unchunked form materialises a
     # [B, S, num_heads] score tensor -- num_heads times larger than the [B, S]
