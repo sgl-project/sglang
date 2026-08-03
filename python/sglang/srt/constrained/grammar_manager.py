@@ -14,7 +14,6 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -29,13 +28,13 @@ class GrammarManager:
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
         self.grammar_queue: List[Req] = []
-        if not get_serving().skip_tokenizer_init:
+        if not self.server_args.skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,
                 scheduler.tokenizer,
                 scheduler.model_config.vocab_size,
                 scheduler.model_config.hf_eos_token_id,
-                think_end_id=scheduler.model_config.think_end_id,
+                think_end_ids=scheduler.model_config.think_end_ids,
             )
         else:
             self.grammar_backend = None

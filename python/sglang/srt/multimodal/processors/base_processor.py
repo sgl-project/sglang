@@ -20,8 +20,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.runtime_context import get_device, get_exec, get_mm, get_serving
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     envs,
     is_cpu,
     is_npu,
@@ -205,7 +206,7 @@ class BaseMultimodalProcessor(ABC):
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
-        mm_process_config = get_mm().mm_process_config
+        mm_process_config = self.server_args.mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
@@ -337,7 +338,7 @@ class BaseMultimodalProcessor(ABC):
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
-            worker_num = get_serving().tokenizer_worker_num
+            worker_num = self.server_args.tokenizer_worker_num
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
                 MM_FEATURE_CACHE_SIZE, worker_num
             )
@@ -347,7 +348,7 @@ class BaseMultimodalProcessor(ABC):
                 "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
                 "budget %.0f MiB).",
                 total_pool_size / (1024 * 1024),
-                get_device().base_gpu_id,
+                self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
@@ -355,7 +356,7 @@ class BaseMultimodalProcessor(ABC):
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                get_device().base_gpu_id,
+                self.server_args.base_gpu_id,
             )
 
     def compute_mrope_positions(self, input_ids, mm_items):
@@ -489,6 +490,7 @@ class BaseMultimodalProcessor(ABC):
         videos=None,
         audios=None,
         processor=None,
+        processor_video_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -502,8 +504,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            video_config = (
+                self.video_config
+                if processor_video_config is None
+                else processor_video_config
+            )
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -528,12 +535,12 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+            if _is_cpu or get_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                base_gpu_id = get_device().base_gpu_id
+                base_gpu_id = get_server_args().base_gpu_id
                 kwargs["device"] = f"cuda:{base_gpu_id}"
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",
@@ -646,8 +653,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except CLIENT_MEDIA_EXCEPTIONS as e:
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
@@ -1013,6 +1019,13 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
+            except ValueError:
+                logger.exception(
+                    "[load_mm_data(simple)] error loading %s data at index=%d",
+                    modality.name,
+                    idx,
+                )
+                raise
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",

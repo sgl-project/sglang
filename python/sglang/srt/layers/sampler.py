@@ -8,21 +8,34 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import OutputLogprobProcessor
+from sglang.srt.layers.logprob_processor import (
+    OutputLogprobProcessor,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.common import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+    from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
 
 if is_musa():
     from sgl_kernel import (
@@ -174,6 +187,21 @@ class Sampler(nn.Module):
             else:
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
+
+                # Deterministic inference must derive the returned logprobs
+                # from F.log_softmax — the same kernel prefill rescoring uses —
+                # not log(softmax(x)) below: the two disagree at ~1e-6 despite
+                # being mathematically equivalent, which breaks bitwise
+                # prefill/decode logprob alignment.
+                if (
+                    return_logprob
+                    and self.enable_deterministic
+                    and logprobs_via_logsoftmax_kernel is None
+                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                ):
+                    logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
+                        logits, dim=-1
+                    )
 
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
@@ -514,7 +542,7 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
     server_args = get_server_args()
-    backend = backend or (server_args.sampling_backend if server_args else None)
+    backend = backend or (get_exec().kernel.sampling_backend if server_args else None)
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()

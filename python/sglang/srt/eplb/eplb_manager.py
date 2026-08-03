@@ -5,8 +5,10 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch.cuda
+import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
@@ -81,6 +83,11 @@ class EPLBManager:
         self._rebalance_disabled_logged = False
         self.reset_generator()
 
+    def enable_rebalance(self):
+        self._rebalance_disabled_reason = None
+        self._rebalance_disabled_logged = False
+        self.reset_generator()
+
     # can be more complex if needed
     def _entrypoint(self):
         while True:
@@ -97,6 +104,15 @@ class EPLBManager:
                     self._rebalance_disabled_reason,
                 )
                 self._rebalance_disabled_logged = True
+            return
+
+        elastic_state = ElasticEPStateManager.instance()
+        is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
+        # A failed later scale leaves the previously committed world serving.
+        if is_post_scale_rebalance and (
+            elastic_state.pending_ep_size is not None
+            or elastic_state.scale_phase not in ("serving_expanded", "failed")
+        ):
             return
 
         logger.info("[EPLBManager] rebalance start")
@@ -119,8 +135,9 @@ class EPLBManager:
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
             return
 
-        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
-            self._server_args, self._model_config, logical_count
+        expert_location_metadata = self._compute_expert_location_metadata(
+            logical_count,
+            broadcast_over_world=is_post_scale_rebalance,
         )
 
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
@@ -144,7 +161,12 @@ class EPLBManager:
                 new_expert_location_metadata=expert_location_metadata,
                 update_layer_ids=chunk_layer_ids,
                 nnodes=self._server_args.nnodes,
-                tp_rank=self._ps.tp_rank,
+                tp_rank=(
+                    self._elastic_global_rank()
+                    if is_post_scale_rebalance
+                    else self._ps.tp_rank
+                ),
+                use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
                 ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
@@ -152,6 +174,10 @@ class EPLBManager:
                     model_config=self._model_config
                 ),
             )
+            if is_post_scale_rebalance:
+                # P2P waits only synchronize participating peers. Ranks without
+                # moves must also install this chunk before NIXL resumes.
+                dist.barrier()
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
@@ -161,6 +187,47 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def _compute_expert_location_metadata(
+        self, logical_count, *, broadcast_over_world: bool
+    ) -> ExpertLocationMetadata:
+        if not broadcast_over_world:
+            return ExpertLocationMetadata.init_by_eplb(
+                self._server_args,
+                self._model_config,
+                logical_count,
+            )
+
+        current_metadata = get_global_expert_location_metadata()
+        assert current_metadata is not None
+        # One owner prevents process-local launch topology from influencing
+        # the mapping chosen for the expanded world.
+        if dist.get_rank() == 0:
+            computed_metadata = ExpertLocationMetadata.init_by_eplb(
+                self._server_args,
+                self._model_config,
+                logical_count,
+                # Arbitrary append topologies may not preserve node divisibility.
+                use_flat_topology=True,
+            )
+            physical_to_logical_map = (
+                computed_metadata.physical_to_logical_map.contiguous()
+            )
+        else:
+            physical_to_logical_map = torch.empty_like(
+                current_metadata.physical_to_logical_map
+            )
+
+        dist.broadcast(physical_to_logical_map, src=0)
+        return ExpertLocationMetadata.init_by_mapping(
+            self._server_args,
+            self._model_config,
+            physical_to_logical_map,
+            moe_ep_rank=self._elastic_global_rank(),
+        )
+
+    def _elastic_global_rank(self) -> int:
+        return self._ps.tp_rank + self._server_args.ep_join_rank_offset
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:
@@ -240,6 +307,7 @@ def update_expert_location_with_recovery(
     update_layer_ids: List[int],
     nnodes: int,
     tp_rank: int,
+    use_flat_topology: bool = False,
     expert_backup_client,
     update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
@@ -251,6 +319,7 @@ def update_expert_location_with_recovery(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=tp_rank,
+        use_flat_topology=use_flat_topology,
     )
 
     if len(p2p_missing_logical_experts) > 0:

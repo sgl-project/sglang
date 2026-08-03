@@ -48,7 +48,9 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
 )
 from sglang.srt.layers.cp.padding import pad_local_rows
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -359,8 +361,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return result
 
     def materialize_full_kv(
-        self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
-    ) -> None:
+        self,
+        forward_batch,
+        layer: Any = None,
+        k: Any = None,
+        v: Any = None,
+        swa_loc: Optional[Any] = None,
+    ) -> Any:
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention

@@ -27,6 +27,21 @@ from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_exec,
+    get_lora,
+    get_memory,
+    get_mm,
+    get_model,
+    get_observability,
+    get_parallel,
+    get_schedule,
+    get_serving,
+    get_spec,
+)
+
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -41,7 +56,12 @@ from torch.distributed import barrier
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    is_deepseek_v4,
+    is_minimax_sparse,
+)
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -162,6 +182,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -180,7 +201,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+from sglang.srt.managers.scheduler_components.idle_sleeper import (
+    IdleSleeper,
+    RustServerIdleSleeper,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
@@ -210,7 +234,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
+from sglang.srt.managers.scheduler_components.recv_skipper import (
+    SchedulerRecvSkipper,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -239,24 +265,12 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import (
-    get_context,
-    get_device,
-    get_disagg,
-    get_exec,
-    get_lora,
-    get_memory,
-    get_mm,
-    get_observability,
-    get_parallel,
-    get_schedule,
-    get_serving,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_context, get_parallel, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -302,10 +316,40 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _prewarm_hccl_group(device, group, device_module):
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=group)
+    device_module.synchronize()
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+
+DECODE_STEP_MAX_US = 2_000_000
+
+
+def _accumulate_decode_moment(
+    totals: list[float],
+    batch_size: int,
+    step_us: int,
+    generated: int,
+) -> None:
+    if batch_size <= 0 or step_us <= 0:
+        return
+    b = float(batch_size)
+    t = float(step_us)
+    g = float(generated)
+    totals[0] += 1.0
+    totals[1] += b
+    totals[2] += t
+    totals[3] += b * b
+    totals[4] += b * t
+    totals[5] += g
+
 
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -366,6 +410,7 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_session_radix_cache = server_args.enable_session_radix_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -476,6 +521,22 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        if _is_npu and is_deepseek_v4(
+            self.tp_worker.model_runner.model_config.hf_config
+        ):
+            rank = (
+                self.ps.dp_rank
+                if self.ps.dp_rank is not None
+                else self.tp_group.rank_in_group
+            )
+            logger.info("HCCL DP prewarm start: rank=%s", rank)
+            _prewarm_hccl_group(
+                device=self.tp_group.device,
+                group=self.tp_group.device_group,
+                device_module=self.tp_group.device_module,
+            )
+            logger.info("HCCL DP prewarm done: rank=%s", rank)
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -557,6 +618,10 @@ class Scheduler(
 
         self.maybe_init_scripted_scheduler_hook()
 
+        # Start the embedded Rust frontend (rank 0) before the request receiver,
+        # which reads self.rust_ring_recv to pick its ingress transport.
+        self.maybe_init_rust_server()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -622,7 +687,7 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            skip_tokenizer_init=get_serving().skip_tokenizer_init,
+            skip_tokenizer_init=self.server_args.skip_tokenizer_init,
             metrics_enabled=get_observability().enable_metrics
             and (
                 self.ps.attn_tp_rank == 0
@@ -632,9 +697,12 @@ class Scheduler(
         )
 
         self.load_snapshot_writer = None
+        self.recv_from_tokenizer = None
+
         if not is_rank_zero:
             return
 
+        self.recv_from_tokenizer = self.ipc_channels.recv_from_tokenizer
         dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         try:
             self.load_snapshot_writer = create_load_snapshot_writer(
@@ -686,22 +754,22 @@ class Scheduler(
         else:
             if self.model_config.is_multimodal:
                 self.processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=not server_args.disable_fast_image_processor,
-                    tokenizer_backend=server_args.tokenizer_backend,
-                    model_name=server_args.model_path,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    use_fast=not get_mm().disable_fast_image_processor,
+                    tokenizer_backend=get_serving().tokenizer_backend,
+                    model_name=get_model().model_path,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
+                    get_serving().tokenizer_path,
+                    tokenizer_mode=get_serving().tokenizer_mode,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    tokenizer_backend=get_serving().tokenizer_backend,
                 )
 
         # Load multimodal processor for M-RoPE fallback computation.
@@ -722,16 +790,23 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if think_end_ids:
+                self.model_config.think_end_ids = think_end_ids
+            else:
+                logger.warning(
+                    "Reasoning parser think_end_token %r could not be encoded; "
+                    "grammar-gated reasoning is disabled.",
+                    reasoning_parser.detector.think_end_token,
+                )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
@@ -872,6 +947,12 @@ class Scheduler(
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
+
+        if (
+            get_exec().moe.elastic_ep_backend is not None
+            and get_exec().moe.ep_join_mode == "recover"
+        ):
+            model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -1336,7 +1417,7 @@ class Scheduler(
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
         env_var, default_size = backend_sizes.get(
-            get_exec().kernel.attention_backend, (None, None)
+            self.server_args.attention_backend, (None, None)
         )
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
@@ -1472,11 +1553,9 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
-        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
-        # pool; unregister it here too, else the kernel unpins it during reclaim.
-        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
-        if host_pool is not None:
-            host_pool.destroy()
+        self.tree_cache.release_host_resources()
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.release_host_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1658,14 +1737,12 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Spec algorithms that don't advance the grammar FSM inside verify() (see
-        # supports_grammar_overlap) still need overlap forced off for grammar decode
-        # batches, so the FSM is advanced before the next batch's bitmask.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
@@ -1702,11 +1779,16 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if self.rust_server is not None:
+                    # Embedded Rust server: every control-request response goes
+                    # back through the egress ring (the zmq tokenizer socket is
+                    # not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
+                elif isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                else:
+                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -1762,9 +1844,33 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def maybe_init_rust_server(self) -> None:
+        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
+        set, and point the ingress receiver at it. All the plumbing lives in
+        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
+
+        is_rank_zero = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+            # Always define the attribute: init_output_streamer and the
+            # process_input_requests hook read self.rust_server unconditionally.
+            self.rust_server = None
+            return
+
+        rust_server = RustServer.launch(self)
+        self.rust_server = rust_server
+        # The rust server *is* the ingress source: SchedulerRequestReceiver
+        # drains its request ring (rust_server_mode) instead of a zmq socket.
+        self.recv_from_tokenizer = rust_server
+        # Park the idle loop on the request ring within the rank-0 rust-server
+        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
+            recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
@@ -1786,7 +1892,15 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
+        # Spec workers have no .model_runner of their own; the prefill graph
+        # runner that votes belongs to the target model.
+        target_worker = (
+            self.tp_worker.target_worker
+            if isinstance(self.tp_worker, BaseSpecWorker)
+            else self.tp_worker
+        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            model_runner=target_worker.model_runner,
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1851,6 +1965,10 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
+        self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -1871,6 +1989,9 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
     def init_output_streamer(self) -> None:
@@ -1883,6 +2004,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            rust_server=self.rust_server,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -1903,7 +2025,7 @@ class Scheduler(
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
-                server_args=self.server_args, model_config=self.model_config
+                model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
@@ -2106,7 +2228,7 @@ class Scheduler(
         )
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
-            recv_req.session_id is not None and get_memory().enable_session_radix_cache
+            recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
         if session_id is None or radix_native_session:
@@ -2129,6 +2251,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
+                return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
@@ -2164,6 +2287,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if radix_native_session:
+                req.session_generation = self.tree_cache.ensure_session_generation(
+                    recv_req.session_id
+                )
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -2194,6 +2322,10 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
+            if self.enable_session_radix_cache:
+                req.session_generation = self.tree_cache.ensure_session_generation(
+                    session_id
+                )
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
@@ -2392,25 +2524,25 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
+            tree_cache = self.tree_cache
+            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
+                req.last_host_node
+            ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    tree_cache.get_prefix_hash_values(req.last_host_node)
+                    if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                tree_cache.prefetch_from_storage(
                     req.rid,
-                    last_host_node,
+                    req.last_host_node,
                     new_input_tokens,
-                    last_hash,
+                    tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
 
@@ -3172,11 +3304,6 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Eagerly release lock_ref on completed write-through nodes so they
-        # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
-            self.tree_cache.flush_write_through_acks()
-
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
@@ -3321,6 +3448,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3483,16 +3611,19 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob:
+            if batch.return_logprob or batch.return_hidden_states:
                 batch_result.extend_input_len_per_req = [
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
+            else:
+                batch_result.extend_input_len_per_req = None
+
+            if batch.return_logprob:
                 batch_result.extend_logprob_start_len_per_req = (
                     batch.extend_logprob_start_lens
                 )
             else:
-                batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
@@ -3502,18 +3633,24 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
-                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                    pooler_output, can_run_cuda_graph = (
+                        self.tp_worker.forward_batch_embedding(batch)
+                    )
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
+                        can_run_cuda_graph=can_run_cuda_graph,
                     )
                     ret.copy_to_cpu()
             else:
                 resolve_forward_inputs(batch, self.future_map)
-                pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                pooler_output, can_run_cuda_graph = (
+                    self.tp_worker.forward_batch_embedding(batch)
+                )
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
+                    can_run_cuda_graph=can_run_cuda_graph,
                 )
 
         self._maybe_report_active_ranks()
@@ -3610,6 +3747,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._record_step_counters(batch, result)
+
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3619,6 +3758,33 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _record_step_counters(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        mode = batch.forward_mode
+        is_prefill = mode.is_extend_without_speculative()
+        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+            return
+        if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill:
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
+        else:
+            batch_size = len(batch.reqs)
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -4139,6 +4305,8 @@ class Scheduler(
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4153,6 +4321,8 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if self.ps.pp_size > 1:
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
@@ -4368,6 +4538,8 @@ class Scheduler(
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
+        if (eplb_manager := self.tp_worker.model_runner.eplb_manager) is not None:
+            eplb_manager.disable_rebalance("elastic EP scale-up is pending")
         logger.debug(
             "[Elastic EP][scale] scale requested: target_ep_size=%d; "
             "waiting for a joining cohort",
@@ -4446,15 +4618,18 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
+        if output.success and self.enable_session_radix_cache:
+            self.tree_cache.open_radix_session(recv_req.session_id)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if get_memory().enable_session_radix_cache:
+        if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
-        if recv_req.session_id in self.session_controller or not (
-            get_memory().enable_session_radix_cache
+        if (
+            recv_req.session_id in self.session_controller
+            or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
 
@@ -4633,12 +4808,8 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
-    # Publish the resolved config at scheduler process entry so the config
-    # namespaces (get_serving()/get_device()/get_exec()/...) are available to
-    # Scheduler.__init__ and its init_* helpers, which read them before the
-    # model worker's own publish. ModelRunner re-publishes idempotently.
-    from sglang.srt.runtime_context import publish
-
+    # Scheduler.__init__ reads the config namespaces before the model
+    # worker's own publish.
     publish(server_args, role="scheduler")
     parent_process = psutil.Process().parent()
 

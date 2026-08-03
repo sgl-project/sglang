@@ -32,7 +32,10 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_fused_parallel_qknorm_max_occupancy,
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import (
@@ -40,7 +43,10 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -78,6 +84,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_schedule,
     get_server_args,
 )
 
@@ -425,10 +432,10 @@ class MiniMaxM2QKRMSNorm:
         props = torch.cuda.get_device_properties(device)
         # probe the maximum tokens for one prefill
         server_args = get_server_args()
-        max_tokens = server_args.chunked_prefill_size
+        max_tokens = get_schedule().chunked_prefill_size
         if max_tokens is None:
             max_tokens = server_args.model_config.context_len
-        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+        max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
         logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384

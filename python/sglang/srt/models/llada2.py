@@ -41,7 +41,9 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -74,12 +76,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,

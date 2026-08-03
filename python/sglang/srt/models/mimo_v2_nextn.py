@@ -26,7 +26,9 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

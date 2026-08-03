@@ -32,11 +32,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)

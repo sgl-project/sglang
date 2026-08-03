@@ -83,12 +83,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,

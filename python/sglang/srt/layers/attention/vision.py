@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
+)
 from sglang.srt.environ import envs
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
@@ -46,11 +48,11 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
                 flash_attn_varlen_func as flash_attn_varlen_func_fa4,
             )
 
@@ -69,7 +71,9 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
+from sglang.kernels.ops.attention.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -780,6 +784,9 @@ class VisionAscendAttention(nn.Module):
         if not _is_npu:
             raise Exception("VisionAscendAttention is only available for ascend npu")
         super().__init__()
+        # Ascend fused attention does not support SGLang's additive masks, so
+        # masked inputs must stay on SDPA.
+        self.sdpa_fallback = VisionSdpaAttention(**kwargs)
 
     def forward(
         self,
@@ -791,6 +798,7 @@ class VisionAscendAttention(nn.Module):
         seq_len: int,
         softmax_scale: Optional[float] = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -799,6 +807,19 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if attention_mask is not None:
+            return self.sdpa_fallback(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens,
+                bsz=bsz,
+                seq_len=seq_len,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                **kwargs,
+            )
+
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
@@ -1046,6 +1067,8 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        self.qkv_backend_name: str = qkv_backend
+
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
@@ -1147,7 +1170,8 @@ class VisionAttention(nn.Module):
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
-        - Non-CUDA: "sdpa"
+        - Ascend NPU: "ascend_attn"
+        - Other platforms: device-specific optimized backend or "sdpa"
         """
         override_backend = get_mm().mm_attention_backend
         if override_backend is not None:
@@ -1162,6 +1186,8 @@ class VisionAttention(nn.Module):
                 backend = "fa4"
             else:
                 backend = "triton_attn"
+        elif _is_npu:
+            backend = "ascend_attn"
         elif _is_musa:
             if get_device_capability() >= (3, 1):
                 backend = "fa3"

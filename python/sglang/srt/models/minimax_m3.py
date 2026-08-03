@@ -28,7 +28,10 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -76,6 +79,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     add_prefix,
@@ -104,7 +108,7 @@ _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
-        from sglang.jit_kernel.minimax_m3.qk_norm_rope import (
+        from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope_cache,
@@ -1000,7 +1004,7 @@ class MiniMaxM3Attention(nn.Module):
             qkv = fused_out[:, : self._fused_main_size]
 
             if self._combined_qknorm_ok:
-                from sglang.jit_kernel.minimax_qknorm_rope import (
+                from sglang.kernels.ops.attention.minimax_qknorm_rope import (
                     minimax_qknorm_rope_grouped,
                 )
 
@@ -1020,7 +1024,9 @@ class MiniMaxM3Attention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
 
         if self._use_fused_qknorm_rope:
-            from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
+            from sglang.kernels.ops.attention.minimax_qknorm_rope import (
+                minimax_qknorm_rope,
+            )
 
             minimax_qknorm_rope(
                 qkv,
@@ -1052,7 +1058,7 @@ class MiniMaxM3Attention(nn.Module):
                     and self.index_rotary_emb.cos_sin_cache.dtype == torch.float32
                 )
                 if use_fused_index_norm_rope:
-                    from sglang.jit_kernel.minimax_qknorm_rope import (
+                    from sglang.kernels.ops.attention.minimax_qknorm_rope import (
                         minimax_qknorm_rope,
                     )
 
@@ -1413,6 +1419,15 @@ class MiniMaxM3Model(nn.Module):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1457,6 +1472,14 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         disable_reason = None
         if not getattr(self.config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
+        elif (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_mixed"
+        ):
+            disable_reason = (
+                "Shared and routed experts may use different quantization formats "
+                "in ModelOpt mixed-precision checkpoints."
+            )
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):

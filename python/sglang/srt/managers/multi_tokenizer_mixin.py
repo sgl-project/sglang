@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_disagg
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +36,7 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -213,6 +211,15 @@ def _handle_output_by_index(output, i):
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
             ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
             ),
@@ -320,6 +327,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
@@ -636,26 +652,18 @@ class TokenizerWorker(TokenizerManager):
         import torch
 
         torch.set_num_threads(1)
-        # prevent init prefill bootstrapserver again
-        disaggregation_mode = server_args.disaggregation_mode
-        server_args.override(
-            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        super().__init__(
+            server_args,
+            port_args,
+            start_pd_bootstrap_service=False,
         )
-        super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-        # For PD disaggregtion
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override(
-            "tokenizer_worker.restore_disaggregation_mode",
-            disaggregation_mode=disaggregation_mode,
-        )
-        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            get_disagg().disaggregation_transfer_backend
+            self.server_args.disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting

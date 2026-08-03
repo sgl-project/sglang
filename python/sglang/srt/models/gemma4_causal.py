@@ -18,7 +18,11 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import Gemma4TextConfig, PretrainedConfig, PreTrainedModel
+from transformers import (
+    Gemma4TextConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
@@ -27,7 +31,9 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
 )
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+)
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -49,7 +55,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
-from sglang.srt.models.utils import create_fused_set_kv_buffer_arg
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -780,7 +788,7 @@ class Gemma4TextModel(PreTrainedModel):
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
             sa = get_server_args()
-            if sa is not None and not sa.disable_cuda_graph:
+            if sa is not None and not get_exec().graph.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "

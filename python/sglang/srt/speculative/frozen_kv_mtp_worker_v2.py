@@ -42,7 +42,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -224,9 +223,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def _resolve_draft_backend_type(self) -> str:
         return (
-            get_spec().speculative_draft_attention_backend
-            or get_exec().kernel.decode_attention_backend
-            or get_exec().kernel.attention_backend
+            self.server_args.speculative_draft_attention_backend
+            or self.server_args.decode_attention_backend
+            or self.server_args.attention_backend
         )
 
     def _init_draft_attn_backend(self):
@@ -234,12 +233,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             return self.draft_model_runner.attn_backend
 
         backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+        if backend_type == "triton":
+            return self._init_triton_draft_attn_backend()
+        if backend_type == "trtllm_mha":
+            return self._init_trtllm_mha_draft_attn_backend()
+        raise ValueError(
+            "Frozen-KV MTP topk > 1 currently supports triton and trtllm_mha "
+            f"attention backends, got {backend_type}."
+        )
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -253,6 +254,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
+
+    def _init_trtllm_mha_draft_attn_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
 
     def _bind_kv_context(self) -> None:
         draft_model = self.draft_model_runner.model

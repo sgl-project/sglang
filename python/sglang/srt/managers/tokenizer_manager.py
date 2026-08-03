@@ -37,6 +37,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
+import numpy as np
 import pybase64
 import torch
 import uvloop
@@ -83,17 +84,27 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
     async_sock_send,
+    build_flat_input_top_logprobs_arrays,
     sock_send,
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    get_request_return_hidden_states_mode,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import (
+    compute_num_reserved_tokens,
+    is_health_check_generate_req,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -110,22 +121,12 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.runtime_context import (
-    get_device,
-    get_disagg,
-    get_lora,
-    get_model,
-    get_observability,
-    get_parallel,
-    get_serving,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -235,6 +236,17 @@ class ReqState:
     output_token_sampling_mask: List = dataclasses.field(default_factory=list)
     output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
 
+    # Cached flat-format prompt top logprob fields; rebuilt only when more
+    # prefill chunks arrive, so streaming decode chunks reuse the payload.
+    input_top_logprobs_flat_fields: Optional[Dict[str, Any]] = None
+    input_top_logprobs_flat_num_rows: int = -1
+    # Scheduler-assembled flat arrays (val float32 [rows, k], idx int32
+    # [rows, k], null_prefix), sent once at prefill completion. When present,
+    # the nested input_top_logprobs_val/idx above stay empty.
+    input_top_logprobs_scheduler_flat: Optional[Tuple[np.ndarray, np.ndarray, int]] = (
+        None
+    )
+
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -263,6 +275,70 @@ def _slice_streaming_output_meta_info(
         meta_info[key] = meta_info[key][last_output_offset:]
 
 
+def _build_flat_input_top_logprobs_fields(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat raw prompt top logprob response fields.
+
+    `input_top_logprobs_shape` is the literal [rows, k] shape of the flat
+    arrays. The leading null positions (counted by
+    `input_top_logprobs_null_prefix`) precede the arrays, so covered position
+    i, entry j lives at flat[(i - null_prefix) * k + j] and the covered range
+    spans null_prefix + rows positions. With ``return_b64``, the arrays are
+    base64 contiguous little-endian binary; the dtype marker fields let the
+    widths change later without a wire break.
+    """
+    val_arr, idx_arr, null_prefix = build_flat_input_top_logprobs_arrays(
+        input_top_logprobs_val, input_top_logprobs_idx, top_logprobs_num
+    )
+    if return_b64:
+        return _build_flat_input_top_logprobs_fields_from_arrays(
+            val_arr, idx_arr, null_prefix, return_b64=True
+        )
+    # Flatten the original python rows so the JSON numbers keep their full
+    # (float64) precision, matching the pre-scheduler-flat output.
+    return {
+        "input_top_logprobs_val_flat": [
+            v for row in input_top_logprobs_val[null_prefix:] for v in row
+        ],
+        "input_top_logprobs_idx_flat": [
+            i for row in input_top_logprobs_idx[null_prefix:] for i in row
+        ],
+        "input_top_logprobs_shape": [val_arr.shape[0], val_arr.shape[1]],
+        "input_top_logprobs_null_prefix": null_prefix,
+    }
+
+
+def _build_flat_input_top_logprobs_fields_from_arrays(
+    val_arr: np.ndarray,
+    idx_arr: np.ndarray,
+    null_prefix: int,
+    return_b64: bool = False,
+) -> Dict[str, Any]:
+    """Build the flat response fields from scheduler-assembled [rows, k]
+    arrays (see `_build_flat_input_top_logprobs_fields` for the field
+    semantics)."""
+    fields: Dict[str, Any] = {}
+    if return_b64:
+        fields["input_top_logprobs_val_flat_b64"] = pybase64.b64encode(
+            val_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_idx_flat_b64"] = pybase64.b64encode(
+            idx_arr.tobytes()
+        ).decode("utf-8")
+        fields["input_top_logprobs_val_flat_b64_dtype"] = "float32"
+        fields["input_top_logprobs_idx_flat_b64_dtype"] = "int32"
+    else:
+        fields["input_top_logprobs_val_flat"] = val_arr.reshape(-1).tolist()
+        fields["input_top_logprobs_idx_flat"] = idx_arr.reshape(-1).tolist()
+    fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
+    fields["input_top_logprobs_null_prefix"] = null_prefix
+    return fields
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -288,6 +364,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        *,
+        start_pd_bootstrap_service: bool = True,
     ):
         # Parse args
         self.server_args = server_args
@@ -327,7 +405,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.init_lora()
 
         # Init PD disaggregation and encoder disaggregation
-        self.init_disaggregation()
+        self.init_disaggregation(start_pd_bootstrap_service=start_pd_bootstrap_service)
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
@@ -349,18 +427,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
-        speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        if speculative_algorithm.is_eagle():
-            # In the current eagle implementation, we store the draft tokens in the output token slots,
-            # so we need to reserve the space for the draft tokens.
-            self.num_reserved_tokens = max(
-                server_args.speculative_eagle_topk * server_args.speculative_num_steps,
-                server_args.max_speculative_num_draft_tokens,
-            )
-        else:
-            self.num_reserved_tokens = 0
+        self.num_reserved_tokens = compute_num_reserved_tokens(server_args)
         self.validate_total_tokens = True
 
     def init_tokenizer_and_processor(self):
@@ -472,10 +539,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # TODO: Refactor and organize the log export code.
         # Request logging
         self.request_logger = RequestLogger(
-            log_requests=get_observability().log_requests,
-            log_requests_level=get_observability().log_requests_level,
-            log_requests_format=get_observability().log_requests_format,
-            log_requests_target=get_observability().log_requests_target,
+            log_requests=self.server_args.log_requests,
+            log_requests_level=self.server_args.log_requests_level,
+            log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
         )
 
         # Dumping
@@ -498,7 +565,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_weight_update(self):
         # Initial weights status
         self.initial_weights_loaded = True
-        if get_model().checkpoint_engine_wait_weights_before_ready:
+        if self.server_args.checkpoint_engine_wait_weights_before_ready:
             self.initial_weights_loaded = False
 
         # Weight updates
@@ -518,7 +585,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
         # serves as the source of truth for available adapters and maps user-friendly LoRA names
         # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(get_lora().lora_paths)
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
         # Lock to serialize LoRA update operations.
         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
         # LoRA updates and inference to overlap.
@@ -527,31 +594,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
-        if get_lora().lora_paths is not None:
-            for lora_ref in get_lora().lora_paths:
+        if self.server_args.lora_paths is not None:
+            for lora_ref in self.server_args.lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref
 
-    def init_disaggregation(self):
+    def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
-        self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
         # Keep a reference so the bootstrap server is not garbage-collected.
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        self.bootstrap_server = (
+            start_disagg_service(self.server_args)
+            if start_pd_bootstrap_service
+            else None
+        )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encode_receiver import EncoderBootstrapServer
+            from sglang.srt.disaggregation.encode_receiver import (
+                EncoderBootstrapServer,
+            )
 
             # Shared mutable URL list: the bootstrap server appends / removes
             # entries as encoders register, the receiver reads from the same
             # list.  Pre-populated with static --encoder-urls so the legacy
             # CLI flag still works (alongside dynamic registrations).
-            self.encoder_urls: List[str] = list(get_disagg().encoder_urls)
+            self.encoder_urls: List[str] = list(self.server_args.encoder_urls)
             self.encoder_bootstrap_server = EncoderBootstrapServer(
-                host=get_serving().host,
-                port=get_disagg().encoder_bootstrap_port,
+                host=self.server_args.host,
+                port=self.server_args.encoder_bootstrap_port,
                 urls=self.encoder_urls,
             )
             self.mm_receiver = create_mm_receiver(
@@ -565,22 +640,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Metrics
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+                self.server_args.disaggregation_mode
             )
 
             labels = {
-                "model_name": get_serving().served_model_name,
+                "model_name": self.server_args.served_model_name,
                 "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
-            if get_observability().tokenizer_metrics_allowed_custom_labels:
-                for (
-                    label
-                ) in get_observability().tokenizer_metrics_allowed_custom_labels:
+            if self.server_args.tokenizer_metrics_allowed_custom_labels:
+                for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
-            if get_observability().extra_metric_labels:
-                labels.update(get_observability().extra_metric_labels)
+            if self.server_args.extra_metric_labels:
+                labels.update(self.server_args.extra_metric_labels)
             tokenizer_collector_cls = resolve_collector_class(
                 self.server_args,
                 STAT_LOGGER_ROLE_TOKENIZER,
@@ -589,18 +662,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector = tokenizer_collector_cls(
                 server_args=self.server_args,
                 labels=labels,
-                bucket_time_to_first_token=get_observability().bucket_time_to_first_token,
-                bucket_e2e_request_latency=get_observability().bucket_e2e_request_latency,
-                bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
+                bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
             )
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
-            watchdog_timeout=get_device().soft_watchdog_timeout,
+            watchdog_timeout=self.server_args.soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
@@ -826,6 +899,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
                 )
+
+        # vLLM's OpenAI embeddings endpoint includes special tokens for
+        # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
+        # but, by its checkpoint default, omits EOS. Add EOS explicitly here
+        # rather than mutating tokenizer-global post-processing state.
+        if (
+            self.model_config.is_embedding_gemma
+            and self.tokenizer.eos_token_id is not None
+        ):
+            input_ids = [
+                (
+                    ids
+                    if ids and ids[-1] == self.tokenizer.eos_token_id
+                    else [*ids, self.tokenizer.eos_token_id]
+                )
+                for ids in input_ids
+            ]
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
@@ -1053,13 +1143,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
-            if (
+            requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
-                and not self.server_args.enable_return_hidden_states
-            ):
+            )
+            server_hidden_mode = get_server_return_hidden_states_mode(self.server_args)
+            if requested_hidden_mode > server_hidden_mode:
+                if server_hidden_mode.need_capture():
+                    raise ValueError(
+                        "The requested return_hidden_states mode exceeds the "
+                        f"server maximum `{self.server_args.return_hidden_states_mode}`. "
+                        "Please launch with `--return-hidden-states-mode full` "
+                        "to allow return_hidden_states=True."
+                    )
                 raise ValueError(
-                    "The server is not configured to return the hidden states. "
-                    "Please set `--enable-return-hidden-states` to enable this feature."
+                    "The server is not configured to return hidden states. "
+                    "Please set `--return-hidden-states-mode last`, "
+                    "`--return-hidden-states-mode full`, or the legacy "
+                    "`--enable-return-hidden-states` flag."
                 )
             if (
                 obj.custom_logit_processor
@@ -1199,6 +1299,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
+                return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1366,7 +1467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
             or (
-                (not get_parallel().enable_dp_attention)
+                (not self.server_args.enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -1764,7 +1865,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # default the load format to the server_args
         if obj.load_format is None:
-            obj.load_format = get_model().load_format
+            obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
         if obj.abort_all_requests:
@@ -1790,9 +1891,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        from sglang.srt.runtime_context import get_context
-
-        get_context().override(
+        self.server_args.override(
             "tokenizer.update_weights", model_path=model_path, load_format=load_format
         )
         self.model_path = model_path
@@ -1936,7 +2035,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": get_serving().weight_version,
+                "weight_version": self.server_args.weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
@@ -2231,14 +2330,70 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:
-            if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
-                state.input_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
-                        state.input_top_logprobs_val[len(state.input_top_logprobs) :],
-                        state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
-                        return_text_in_logprobs,
+            # Guarded by the caller's return_logprob check, so obj is a
+            # GenerateReqInput here.
+            use_flat = state.obj.return_flat_raw_top_logprobs
+            if use_flat and state.input_top_logprobs_scheduler_flat is not None:
+                # The scheduler already assembled the flat arrays (sent once
+                # at prefill completion); encode them directly.
+                if state.input_top_logprobs_flat_fields is None:
+                    val_arr, idx_arr, null_prefix = (
+                        state.input_top_logprobs_scheduler_flat
                     )
-                )
+                    state.input_top_logprobs_flat_fields = (
+                        _build_flat_input_top_logprobs_fields_from_arrays(
+                            val_arr,
+                            idx_arr,
+                            null_prefix,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
+                    )
+                meta_info.update(state.input_top_logprobs_flat_fields)
+            elif use_flat:
+                # Flat replaces nested for the input side only.
+                if state.input_top_logprobs_flat_num_rows != len(
+                    state.input_top_logprobs_val
+                ):
+                    try:
+                        state.input_top_logprobs_flat_fields = (
+                            _build_flat_input_top_logprobs_fields(
+                                state.input_top_logprobs_val,
+                                state.input_top_logprobs_idx,
+                                top_logprobs_num,
+                                return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                            )
+                        )
+                    except ValueError as e:
+                        # A raise here would disrupt unrelated requests in the
+                        # shared batch-output loop; degrade to nested instead.
+                        state.input_top_logprobs_flat_fields = None
+                        logger.error(
+                            "Falling back to nested input top logprobs for "
+                            "rid=%s: %s",
+                            meta_info.get("id"),
+                            e,
+                        )
+                    state.input_top_logprobs_flat_num_rows = len(
+                        state.input_top_logprobs_val
+                    )
+                if state.input_top_logprobs_flat_fields is not None:
+                    meta_info.update(state.input_top_logprobs_flat_fields)
+                else:
+                    use_flat = False
+            if not use_flat:
+                if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
+                    state.input_top_logprobs.extend(
+                        self.detokenize_top_logprobs_tokens(
+                            state.input_top_logprobs_val[
+                                len(state.input_top_logprobs) :
+                            ],
+                            state.input_top_logprobs_idx[
+                                len(state.input_top_logprobs) :
+                            ],
+                            return_text_in_logprobs,
+                        )
+                    )
+                meta_info["input_top_logprobs"] = state.input_top_logprobs
             if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
                 state.output_top_logprobs.extend(
                     self.detokenize_top_logprobs_tokens(
@@ -2247,8 +2402,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         return_text_in_logprobs,
                     )
                 )
-
-            meta_info["input_top_logprobs"] = state.input_top_logprobs
             meta_info["output_top_logprobs"] = state.output_top_logprobs
 
         # 3. Handle token_ids_logprob
@@ -2322,6 +2475,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 state.input_top_logprobs_idx.extend(
                     recv_obj.input_top_logprobs_idx[recv_obj_index]
+                )
+            if (
+                recv_obj.input_top_logprobs_val_flat is not None
+                and recv_obj.input_top_logprobs_val_flat[recv_obj_index] is not None
+            ):
+                state.input_top_logprobs_scheduler_flat = (
+                    recv_obj.input_top_logprobs_val_flat[recv_obj_index],
+                    recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
+                    recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
             state.output_top_logprobs_val.extend(
                 recv_obj.output_top_logprobs_val[recv_obj_index]
@@ -2504,7 +2666,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
-                labels, state.time_stats.get_first_token_latency()
+                labels,
+                state.time_stats.get_first_token_latency(),
+                stream=getattr(state.obj, "stream", False),
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
@@ -2810,7 +2974,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
-            "weight_version": get_serving().weight_version,
+            "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
         is_stream = getattr(state.obj, "stream", False)

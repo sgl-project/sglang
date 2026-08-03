@@ -21,7 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

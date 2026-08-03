@@ -19,7 +19,10 @@ from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor

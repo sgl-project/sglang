@@ -59,10 +59,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_context,
     get_disagg,
     get_exec,
     get_memory,
-    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -105,11 +105,17 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
-# the ratio of mamba cache pool size to max_running_requests
+# base ratio of mamba pool size to max_running_requests. Under
+# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
+# per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
+# stays at effective 3 either way: its binding limit is the prefill->decode peak,
+# which the decode-time drop does not shrink.
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -123,7 +129,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -184,6 +192,7 @@ class KVCacheConfigurator:
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
+    kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
@@ -211,7 +220,7 @@ class KVCacheConfigurator:
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
             return None
-        quant_name = resolve_kv_cache_quant(get_model().kv_cache_dtype)
+        quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
         if quant_name is None:
             return None
         quant_method = get_kv_cache_quant_method(
@@ -265,6 +274,16 @@ class KVCacheConfigurator:
         if self.is_hybrid_swa:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+        # Draft pools are replicated, not DCP-sharded, yet consume the shared
+        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        dcp_size = self.server_args.dcp_size
+        if self.is_draft_worker and dcp_size > 1:
+            max_total_num_tokens *= dcp_size
+            if full_max_total_num_tokens is not None:
+                full_max_total_num_tokens *= dcp_size
+            if swa_max_total_num_tokens is not None:
+                swa_max_total_num_tokens *= dcp_size
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
@@ -430,9 +449,6 @@ class KVCacheConfigurator:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -462,6 +478,12 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             is_draft_worker=self.is_draft_worker,
             use_mla_backend=self.use_mla_backend,
+            kv_lora_rank=(
+                self.model_config.kv_lora_rank if self.use_mla_backend else None
+            ),
+            qk_rope_head_dim=(
+                self.model_config.qk_rope_head_dim if self.use_mla_backend else None
+            ),
             mamba_layer_ids=mamba_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             mamba2_cache_params=config.mamba2_cache_params,
@@ -594,7 +616,7 @@ class KVCacheConfigurator:
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
-            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -654,7 +676,9 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+        from sglang.srt.disaggregation.decode import (
+            HybridMambaDecodeReqToTokenPool,
+        )
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -676,6 +700,12 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
+            mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
+            enable_gdn_replayssm_spec=(
+                get_exec().mamba.enable_gdn_replayssm_spec
+                and self.hybrid_gdn_config is not None
+            ),
         )
         return req_to_token_pool
 
@@ -686,7 +716,12 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUDecodeReqToTokenPool as DecodeReqToTokenPool,
+            )
+        else:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
@@ -727,10 +762,6 @@ class KVCacheConfigurator:
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            # ReplaySSM spec-verify is GDN-only: activate the pool machinery
-            # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
-            # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
-            # ...) run with the flag set stays byte-identical to flag-off.
             enable_gdn_replayssm_spec=(
                 get_exec().mamba.enable_gdn_replayssm_spec
                 and self.hybrid_gdn_config is not None
@@ -806,7 +837,7 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif (
-            get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
@@ -887,7 +918,9 @@ class KVCacheConfigurator:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
@@ -1022,7 +1055,9 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -1055,7 +1090,9 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
 
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
@@ -1073,7 +1110,9 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
 
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
@@ -1187,7 +1226,7 @@ class KVCacheConfigurator:
             }
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
-            if get_model().kv_cache_dtype == "mxfp8"
+            if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
         swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
@@ -1232,6 +1271,8 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
         dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
@@ -1242,7 +1283,15 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
-            index_dtype=self.model_dtype,
+            # fp8 attn-GEMM mode opts the lightning-indexer cache into
+            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
+            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
+            # with the widening-dequant contract.
+            index_dtype=(
+                self.kv_cache_dtype
+                if m3_fp8_attn_gemm_enabled(self.server_args)
+                else self.model_dtype
+            ),
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],
@@ -1285,7 +1334,7 @@ class KVCacheConfigurator:
         # buffers) for the full-attention layers, same as the SWA branch.
         full_pool_class = (
             MHATokenToKVPoolMXFP8
-            if get_model().kv_cache_dtype == "mxfp8" and not self.use_mla_backend
+            if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
         token_to_kv_pool = HybridLinearKVPool(
@@ -1330,7 +1379,7 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        if get_model().kv_cache_dtype == "mxfp8":
+        if self.kv_cache_dtype_str == "mxfp8":
             pool_cls = MHATokenToKVPoolMXFP8
         else:
             pool_cls = (
@@ -1384,7 +1433,7 @@ class KVCacheConfigurator:
                     need_sort=need_sort,
                 )
             elif _is_npu and (
-                get_exec().kernel.attention_backend == "ascend"
+                self.server_args.attention_backend == "ascend"
                 or is_dsv4_model
                 or self.hybrid_gdn_config is not None
             ):
@@ -1443,7 +1492,9 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
@@ -1533,7 +1584,7 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
+                self.server_args.pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
@@ -1566,6 +1617,11 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+        base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
+            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
+        )
+
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
@@ -1580,8 +1636,13 @@ class KVCacheConfigurator:
                     not self.server_args.enable_mamba_extra_buffer_lazy()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+        elif skip_decode_lock:
+            # no_buffer under skip: add the base drop back so effective stays 3,
+            # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
+            # has no ping-pong to absorb it.
+            additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        return base + additional_ratio
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
@@ -1694,16 +1755,33 @@ class KVCacheConfigurator:
         return config
 
     def _handle_max_mamba_cache(self, total_rest_memory):
-        from sglang.srt.runtime_context import get_context
-
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # The ring is allocated per slot but is not part of mamba_cache_per_req;
+        # the solve must charge it too or num_slots is over-provisioned.
+        replayssm_active = (
+            get_exec().mamba.enable_gdn_replayssm_spec
+            and self.hybrid_gdn_config is not None
+        )
+        if replayssm_active:
+            record_len = (
+                server_args.max_speculative_num_draft_tokens
+                if server_args.max_speculative_num_draft_tokens is not None
+                else get_exec().mamba.linear_replayssm_cache_len
+            )
+            replayssm_ring_per_req = (
+                config.mamba2_cache_params.replayssm_ring_bytes_per_req(
+                    record_len=record_len
+                )
+            )
+        else:
+            replayssm_ring_per_req = 0
         if has_spec_dec:
-            assert server_args.speculative_num_draft_tokens is not None
-            assert server_args.max_running_requests is not None
+            assert get_spec().speculative_num_draft_tokens is not None
+            assert get_schedule().max_running_requests is not None
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -1712,35 +1790,35 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    server_args.max_running_requests // self.ps.attn_dp_size,
+                    get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    * (capped_reqs + 1)
+                    * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            server_args.disable_radix_cache
-            and server_args.max_running_requests is not None
+            get_memory().disable_radix_cache
+            and get_schedule().max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
             get_context().override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=server_args.max_running_requests
+                max_mamba_cache_size=get_schedule().max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
+            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
+            if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * get_schedule().max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * (get_schedule().max_mamba_cache_size + 1)
+                    * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -1748,40 +1826,42 @@ class KVCacheConfigurator:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            # Solve jointly for max_mamba_cache_size (K), including the pool's
+            # +1 padding slot on both buffers (see memory_pool.py):
+            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
-                * server_args.mamba_full_memory_ratio
-                / (1 + server_args.mamba_full_memory_ratio)
+                * get_schedule().mamba_full_memory_ratio
+                / (1 + get_schedule().mamba_full_memory_ratio)
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec:
+            if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
+                D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                        (mamba_budget_bytes - per_req * (1 + D))
+                        // (per_req * (1 + D / ratio))
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    server_args.max_running_requests // self.ps.attn_dp_size,
+                    get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
+                per_slot = per_req + replayssm_ring_per_req
                 get_context().override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                    max_mamba_cache_size=int(
+                        (mamba_budget_bytes - per_slot) // per_slot
+                    ),
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -1800,9 +1880,10 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
+        # +1: the pool's padding slot
         mamba_state_memory = (
-            get_schedule().max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
+            (get_schedule().max_mamba_cache_size + 1)
+            * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory

@@ -20,7 +20,9 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+)
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (

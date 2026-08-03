@@ -1,4 +1,4 @@
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -8,6 +8,21 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
+
+
+def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
+    """Refuse a multi-step draft decode backend for a draft with conv layers."""
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(
+        draft_model_runner.model_config.hf_config,
+        (InklingModelConfig, InklingMMConfig),
+    ):
+        raise NotImplementedError(
+            "Inkling's draft model runs its own short convs, which need the "
+            "conv-state sidecar the multi-step draft decode backend cannot carry. "
+            "Use --enable-multi-layer-eagle."
+        )
 
 
 class DraftBackendFactory:
@@ -35,7 +50,7 @@ class DraftBackendFactory:
             else getattr(self.server_args, backend_name)
         )
         if backend_type is None:
-            backend_type = get_exec().kernel.attention_backend
+            backend_type = self.server_args.attention_backend
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
@@ -46,6 +61,10 @@ class DraftBackendFactory:
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
         if self.speculative_num_steps <= 1:
             return None
+
+        # Returns a per-step CONTAINER, not an AttentionBackend, so
+        # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
+        _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
@@ -97,11 +116,17 @@ class DraftBackendFactory:
             if get_spec().speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
-        return self._create_backend(
+        backend = self._create_backend(
             backend_name,
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
         )
+        # A draft with conv layers of its own (Inkling) needs its sidecar here too.
+        from sglang.srt.layers.attention.attention_registry import (
+            attn_backend_wrapper_for_draft_extend,
+        )
+
+        return attn_backend_wrapper_for_draft_extend(self.draft_model_runner, backend)
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (
@@ -240,7 +265,18 @@ class DraftBackendFactory:
         )
 
     def _create_cutedsl_mla_decode_backend(self):
-        return self._create_trtllm_mla_decode_backend(backend="cute-dsl")
+        if not self.draft_model_runner.use_mla_backend:
+            raise ValueError(
+                "cutedsl_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.cutedsl_mla_backend import (
+            CuteDslMLAMultiStepDraftBackend,
+        )
+
+        return CuteDslMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
 
     def _create_tokenspeed_mla_decode_backend(self):
         if not self.draft_model_runner.use_mla_backend:

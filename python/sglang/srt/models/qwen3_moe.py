@@ -72,12 +72,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -91,7 +86,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_qknorm_rope import (
+    from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
@@ -271,11 +266,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
+        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
+        # offline ModelSlim path (which carries a per-layer quant_model_description)
+        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # and dequantised correctly instead of cast to bf16 without its block scale.
+        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
+        gate_quant_config = (
+            quant_config
+            if (quant_config is not None and quant_config.get_name() == "modelslim")
+            else None
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=gate_quant_config,
             prefix=add_prefix("gate", prefix),
         )
 

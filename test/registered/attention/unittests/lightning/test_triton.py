@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -155,6 +156,82 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
                     continue
                 with self.subTest(case=case.name, layout=layout):
                     run_lightning_attention_case(self, case, loc_layout=layout)
+
+    def test_seg_la_prefill_tracks_extra_buffer_state(self):
+        torch.manual_seed(20260703)
+        device = "cuda"
+        dtype = torch.float32
+        batch_size = 1
+        num_heads = 2
+        head_dim = 128
+        extend_len = 96
+        track_len = 64
+        active_slot = 0
+        track_slot = 1
+        untouched_slot = 2
+
+        q = torch.randn(extend_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(extend_len, num_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(extend_len, num_heads, head_dim, dtype=dtype, device=device)
+        slopes = torch.tensor([0.5, 0.25], dtype=torch.float32, device=device)
+
+        s = torch.empty(
+            3, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
+        )
+        s[active_slot] = torch.randn_like(s[active_slot]) * 0.05
+        s[track_slot].fill_(12345.0)
+        s[untouched_slot].fill_(54321.0)
+        initial_state = s[active_slot].clone()
+        untouched_state = s[untouched_slot].clone()
+
+        meta = SegLaMeta(
+            batch_size=batch_size,
+            max_q_length=None,
+            q_offsets=torch.tensor([0, extend_len], dtype=torch.int32, device=device),
+            s_offsets=torch.tensor([active_slot], dtype=torch.int32, device=device),
+            q_lengths=torch.tensor([extend_len], dtype=torch.int32, device=device),
+            s_scales=torch.tensor([True], dtype=torch.bool, device=device),
+            mask=None,
+        )
+
+        seg_la_fwd(
+            q=q,
+            k=k,
+            v=v,
+            s=s,
+            decay_scales=slopes,
+            meta=meta,
+            track_lens=torch.tensor([track_len], dtype=torch.int32, device=device),
+            track_state_indices=torch.tensor(
+                [track_slot], dtype=torch.int64, device=device
+            ),
+            decouple=True,
+        )
+
+        expected = initial_state.float()
+        expected_at_track = None
+        decay = torch.exp(-slopes)
+        for token_idx in range(extend_len):
+            for head_idx in range(num_heads):
+                expected[head_idx] = expected[head_idx] * decay[head_idx] + torch.outer(
+                    k[token_idx, head_idx], v[token_idx, head_idx]
+                )
+            if token_idx + 1 == track_len:
+                expected_at_track = expected.clone()
+
+        torch.testing.assert_close(
+            s[track_slot],
+            expected_at_track,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(
+            s[active_slot],
+            expected,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(s[untouched_slot], untouched_state)
 
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case in self.CUDA_GRAPH_CASES:

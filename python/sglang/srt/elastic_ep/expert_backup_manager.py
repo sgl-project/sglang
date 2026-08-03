@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -158,8 +159,6 @@ def run_expert_backup_manager_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
-    from sglang.srt.runtime_context import publish
-
     publish(server_args, role="expert_backup")
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         init_mooncake_transfer_engine,

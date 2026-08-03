@@ -13,7 +13,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -22,7 +25,9 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -80,7 +85,7 @@ if _is_cuda:
     try:
         from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
         from sglang.kernels.ops.gemm import bmm_fp8
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 

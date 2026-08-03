@@ -359,14 +359,17 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
 class _ProfilerMemory(_ProfilerConcreteBase):
     def start(self):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        torch.cuda.memory._record_memory_history(
+            max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+        )
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         memory_profile_path = os.path.join(
             self.output_dir,
-            str(time.time())
+            (self.output_prefix + "-" if self.output_prefix else "")
+            + str(time.time())
             + f"-TP-{self.ps.tp_rank}-memory"
             + self.output_suffix
             + ".pickle",

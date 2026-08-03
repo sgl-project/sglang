@@ -54,7 +54,7 @@ Before calling a diffusion hotspot "new", first classify it with `existing-fast-
 Always rule out these existing families first:
 - HunyuanVideo VAE GroupNorm+SiLU
 - LTX upsampler GroupNorm+SiLU
-- Z-Image residual-form modulation
+- Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE

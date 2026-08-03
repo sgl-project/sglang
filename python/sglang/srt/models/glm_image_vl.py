@@ -34,7 +34,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
