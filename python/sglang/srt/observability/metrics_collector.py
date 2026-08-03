@@ -1869,9 +1869,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1950,8 +1952,83 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.load_back_group_veto = Counter(
+            name="sglang:load_back_group_veto_total",
+            documentation=(
+                "Load-backs skipped because the group's worst-case device headroom "
+                "could not cover them. Conservative: the minimum free and the "
+                "minimum evictable are reduced independently and may come from "
+                "different ranks, so this can fire when no single rank was short."
+            ),
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_alloc_failed = Counter(
+            name="sglang:load_back_alloc_failed_total",
+            documentation=(
+                "Load-backs abandoned because this rank could not allocate device "
+                "slots after the group had granted capacity. This is rank-local, "
+                "and a rise on one rank of a TP group precedes a hang -- but these "
+                "labels carry no rank, and multiprocess mode sums the ranks of a "
+                "group into one series, so use the matching 'load_back allocation "
+                "failed' log line for per-rank attribution."
+            ),
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_evict_shortfall_num_tokens = Counter(
+            name="sglang:load_back_evict_shortfall_tokens_total",
+            documentation=(
+                "Tokens an eviction was asked to free for a load-back and did not. "
+                "The group snapshot overstates this rank by that much until the "
+                "next refresh, which usually surfaces as load_back_alloc_failed."
+            ),
+            labelnames=labels.keys(),
+        )
+
+        # A level, not a flow: a Counter here would make rate() meaningless.
+        self.hicache_group_capacity_skew = Gauge(
+            name="sglang:hicache_group_capacity_skew_tokens",
+            documentation=(
+                "Free device capacity this rank gave up to match the tightest rank, "
+                "sampled once per scheduler step when the group snapshot is "
+                "refreshed (not per load-back). Stays near zero on whichever rank "
+                "is chronically tightest. Emitted only by the rank that runs the "
+                "reduction; later pipeline stages report capacity overgrant instead."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.hicache_pp_capacity_overgrant = Gauge(
+            name="sglang:hicache_pp_capacity_overgrant_tokens",
+            documentation=(
+                "Capacity a later pipeline stage was granted beyond what its own "
+                "pool holds. The group minimum is reduced over the first stage's "
+                "TP ranks only, so a persistently positive value here explains "
+                "load_back_alloc_failed on that stage."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_group_veto(self) -> None:
+        self.load_back_group_veto.labels(**self.labels).inc()
+
+    def increment_load_back_alloc_failed(self) -> None:
+        self.load_back_alloc_failed.labels(**self.labels).inc()
+
+    def increment_load_back_evict_shortfall_num_tokens(self, num_tokens: int) -> None:
+        self.load_back_evict_shortfall_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def set_hicache_group_capacity_skew(self, num_tokens: int) -> None:
+        self.hicache_group_capacity_skew.labels(**self.labels).set(num_tokens)
+
+    def set_hicache_pp_capacity_overgrant(self, num_tokens: int) -> None:
+        self.hicache_pp_capacity_overgrant.labels(**self.labels).set(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)

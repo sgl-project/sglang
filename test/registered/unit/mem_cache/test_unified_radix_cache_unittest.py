@@ -537,6 +537,10 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
+        # Mirror the scheduler, which refreshes the group capacity snapshot
+        # before the prefill adder can reach init_load_back. Single-rank here,
+        # so the reduce is a no-op; without it load-back always skips.
+        cache._sync_hicache_ready_counts()
 
     def _backup_node(self, cache, node):
         backed_up = _write_backup(cache, node, write_back=True)
@@ -544,6 +548,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.writing_check(write_back=True)
 
     def _load_back_node(self, cache, node):
+        # Refresh the group capacity snapshot against the pool as the test has
+        # left it, the way a scheduler step would before admitting a request.
+        cache._sync_hicache_ready_counts()
         loaded = cache.load_back(node.id)
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
@@ -2882,6 +2889,10 @@ class UnifiedRadixCacheSuite:
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
+        # Mirror the scheduler, which refreshes the group capacity snapshot
+        # before the prefill adder can reach init_load_back. Single-rank here,
+        # so the reduce is a no-op; without it load-back always skips.
+        cache._sync_hicache_ready_counts()
         if storage_backend is not None:
             # Unit fixtures size host/device pools equally, which makes the
             # production prefetch capacity limit (host - device) zero.  Keep the
@@ -2928,6 +2939,9 @@ class UnifiedRadixCacheSuite:
                 self._backup_node(cache, node)
 
     def _load_back_node(self, cache, node):
+        # Refresh the group capacity snapshot against the pool as the test has
+        # left it, the way a scheduler step would before admitting a request.
+        cache._sync_hicache_ready_counts()
         loaded = cache.load_back(node.id)
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
@@ -3348,6 +3362,7 @@ class UnifiedRadixCacheSuite:
             m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
             anchor = cache.resolve_node_handle(m.best_match_node)
             if anchor is not cache.root_node and anchor.evicted:
+                cache._sync_hicache_ready_counts()
                 if cache.load_back(anchor.id):
                     self._finish_pending_loads(cache)
                     self._release_ongoing_load_back_locks(cache)
@@ -3870,6 +3885,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
+        cache._sync_hicache_ready_counts()
         new_indices, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
@@ -3911,6 +3927,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
+        cache._sync_hicache_ready_counts()
         new_indices, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
@@ -3953,6 +3970,7 @@ class UnifiedRadixCacheSuite:
         # (that allocation is what a called-off load-back must free + not publish).
         req.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
+        cache._sync_hicache_ready_counts()
         new_indices, new_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
@@ -3999,6 +4017,7 @@ class UnifiedRadixCacheSuite:
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
+            cache._sync_hicache_ready_counts()
             new_indices, _ = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
@@ -4036,16 +4055,17 @@ class UnifiedRadixCacheSuite:
         # Simulate a request without its own mamba slot so load-back allocates one.
         req.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        # No device room and eviction frees nothing -> load-back bails after the
-        # mamba pre-alloc, which must still be freed.
+        # No device room and nothing evictable -> the group vetoes load-back,
+        # which must still free the mamba pre-alloc. Load-back now decides from
+        # the group capacity snapshot, so the mocked pool has to be reduced into
+        # it rather than read directly.
         with (
             mock.patch.object(
                 cache.token_to_kv_pool_allocator, "available_size", return_value=0
             ),
-            mock.patch.object(
-                cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
-            ),
+            mock.patch.object(cache, "evictable_size", return_value=0),
         ):
+            cache._sync_hicache_ready_counts()
             new_indices, _ = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
@@ -4113,6 +4133,7 @@ class UnifiedRadixCacheSuite:
         # cache_controller.load() failing (device alloc / transfer resolution)
         # must also return the slot this call allocated.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
+            cache._sync_hicache_ready_counts()
             loaded = cache.load_back(leaf.id, req=req)
 
         self.assertFalse(loaded)
@@ -4168,6 +4189,7 @@ class UnifiedRadixCacheSuite:
         req.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
+        cache._sync_hicache_ready_counts()
         loaded = cache.load_back(leaf.id, req=req)
 
         self.assertTrue(loaded)
@@ -4205,6 +4227,7 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
         req.mamba_pool_idx = None
 
+        cache._sync_hicache_ready_counts()
         loaded = cache.load_back(leaf.id, req=req)
         self.assertTrue(loaded)
         self.assertIsNotNone(req.mamba_pool_idx)
@@ -4748,6 +4771,9 @@ class UnifiedRadixCacheSuite:
             int(swa_xfer.host_indices.numel()),
         )
 
+        # Snapshot the pool as configured above, so the gate below is decided by
+        # the real Full-pool capacity rather than a reading from fixture setup.
+        cache._sync_hicache_ready_counts()
         with mock.patch.object(cache, "evict", wraps=cache.evict) as evict_mock:
             self.assertTrue(cache.load_back(leaf.id))
 
@@ -6241,6 +6267,10 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
+        # Mirror the scheduler, which refreshes the group capacity snapshot
+        # before the prefill adder can reach init_load_back. Single-rank here,
+        # so the reduce is a no-op; without it load-back always skips.
+        cache._sync_hicache_ready_counts()
 
     def _insert_device(self, cache, allocator, ids):
         """Insert a device-only chain (no auto-backup) and return its leaf id."""

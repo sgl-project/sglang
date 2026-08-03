@@ -203,6 +203,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
 
+        self._init_group_capacity()
+
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
@@ -297,6 +299,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # The tree is gone, so the snapshot describes a pool that no longer
+        # exists; wait for the next sync rather than carry it across. This is a
+        # new epoch, so re-arm reporting too: a load-back arriving before the
+        # next sync is a different occurrence than any already reported.
+        self._init_group_capacity()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -1021,17 +1028,62 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+        # WHY THIS READS A SNAPSHOT INSTEAD OF THE POOL.
+        # Device pool state drifts between TP ranks under load. Load-back sets
+        # how much of a request's prefix counts as cached, so a rank deciding
+        # from its own pool can disagree with its peers, and the ranks then
+        # enter the per-layer TP all_reduce with differently-sized tensors and
+        # both GPU streams deadlock. check_hicache_events reduces capacity to a
+        # group minimum (over the first pipeline stage's TP ranks) and hands
+        # every rank the same starting numbers.
+        #
+        # The snapshot below is a running budget, so it stays rank-identical
+        # only while ranks walk the same request sequence. PrefillAdder does
+        # guarantee that: a rank that rejects a request also breaks out of the
+        # admission loop, so an unequal number of load-backs implies an already
+        # divergent batch. Keep this path collective-free anyway -- a collective
+        # here would convert that divergence into an immediate scheduler-thread
+        # hang, and it would be wrong outright for any future caller whose
+        # reach is genuinely rank-local.
+        if self._group_avail is None:
+            self._warn_missing_group_capacity()
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            return False
+
+        if self._group_avail < kv_tokens:
+            if self._group_avail + self._group_evictable < kv_tokens:
+                if self.metrics_collector is not None:
+                    self.metrics_collector.increment_load_back_group_veto()
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
+            # `needed` is a function of kv_tokens and the group snapshot, so it
+            # is identical on every rank. How many tokens evict() actually
+            # frees is not: it is deliberately not consulted, because branching
+            # on a rank-local measurement is what deadlocked TP.
+            needed = kv_tokens - self._group_avail
+            evicted = self.evict(EvictParams(num_tokens=needed)).num_tokens_evicted
+            # Credit only what was asked for. evict() usually over-delivers --
+            # it frees whole nodes -- but crediting the surplus would need
+            # another collective to agree on it, so the budget lands on exactly
+            # zero and a second load-back this step will evict again even when
+            # the pool already has room. Costs cache hits under pressure; the
+            # next refresh recovers it.
+            self._group_avail += needed
+            self._group_evictable -= needed
+            if evicted < needed:
+                self._evict_shortfall_this_step += 1
+                self._evict_shortfall_tokens_this_step += needed - evicted
+                if self.metrics_collector is not None:
+                    self.metrics_collector.increment_load_back_evict_shortfall_num_tokens(
+                        needed - evicted
+                    )
+
+        # Spend the budget before attempting the load, so both outcomes move the
+        # snapshot by the same group-agreed amount. Refunding only on success
+        # would let one rank's allocation failure desync the snapshot itself.
+        self._group_avail -= kv_tokens
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1044,6 +1096,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
+            # The group granted capacity and this rank still could not allocate.
+            # Sole rank-local verdict left in this function: aux (SWA/mamba/
+            # sidecar) pools are outside the group snapshot. Reported once per
+            # scheduler step by _flush_load_back_step_report -- this condition
+            # persists across steps, so logging it per request would flood.
+            self._alloc_failures_this_step += 1
+            self._alloc_failure_context = (
+                node_id,
+                kv_tokens,
+                self._group_avail,
+                self._group_evictable,
+                len(aux_xfers),
+            )
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_alloc_failed()
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
@@ -1794,8 +1861,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        # Capacity rides along on this reduce; see _load_back_transfers.
+        local_avail = self._local_available_size()
         ready_counts = torch.tensor(
             [
+                local_avail,
+                self.evictable_size(),
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
@@ -1806,12 +1877,139 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        self._set_group_capacity(count_values[0], count_values[1], local_avail)
         return (
-            count_values[0],
-            count_values[1],
-            tuple(count_values[2:]),
+            count_values[2],
+            count_values[3],
+            tuple(count_values[4:]),
             extra_pool_names,
         )
+
+    def _init_group_capacity(self) -> None:
+        """Seed the group-agreed device capacity that load-back decides from.
+
+        Refreshed by check_hicache_events; see _load_back_transfers for why
+        load-back may not consult rank-local pool state directly. Both fields
+        move together and stay None until the first refresh, so load-back skips
+        until the group has spoken. Also (re-)arms the per-epoch reporting, so
+        a flush starts a fresh epoch rather than inheriting a latched warning.
+        """
+        self._group_avail: Optional[int] = None
+        self._group_evictable: Optional[int] = None
+        self._warned_missing_group_capacity = False
+        self._alloc_failures_this_step = 0
+        self._alloc_failure_context: Optional[tuple] = None
+        self._evict_shortfall_this_step = 0
+        self._evict_shortfall_tokens_this_step = 0
+
+    def _flush_load_back_step_report(self) -> None:
+        """Emit one line per scheduler step for the per-request failure paths.
+
+        Both conditions are pool states that persist across steps, so logging
+        them per request would put unbounded synchronous stderr writes on the
+        scheduler thread -- and the volume is rank-asymmetric by construction,
+        which is the one shape this subsystem must not add. Aggregating per
+        step keeps the rate (the actual diagnostic content) without the flood.
+        """
+        if self._evict_shortfall_this_step:
+            logger.warning(
+                "evict under-delivered on %d load-back(s) this scheduler step, "
+                "%d tokens short in total; the group capacity snapshot overstated "
+                "this rank by that much until now",
+                self._evict_shortfall_this_step,
+                self._evict_shortfall_tokens_this_step,
+            )
+            self._evict_shortfall_this_step = 0
+            self._evict_shortfall_tokens_this_step = 0
+
+        if self._alloc_failures_this_step:
+            node_id, kv_tokens, group_avail, group_evictable, aux_pools = (
+                self._alloc_failure_context
+            )
+            logger.error(
+                "load_back allocation failed %d time(s) this scheduler step after "
+                "the group granted capacity; last: node=%s kv_tokens=%d "
+                "group_avail=%d group_evictable=%d aux_pools=%d. Aux (SWA/mamba/"
+                "sidecar) pools are outside the group snapshot; an uneven count "
+                "across a TP group is the fingerprint of an imminent hang",
+                self._alloc_failures_this_step,
+                node_id,
+                kv_tokens,
+                group_avail,
+                group_evictable,
+                aux_pools,
+            )
+            self._alloc_failures_this_step = 0
+            self._alloc_failure_context = None
+
+    def _warn_missing_group_capacity(self) -> None:
+        """Announce a load-back path that never saw a capacity sync.
+
+        Reachable from scheduler loops that build a PrefillAdder without
+        running check_hicache_events. Failing closed is right, but doing it
+        silently would collapse the cache hit rate with no other signal.
+        """
+        if self._warned_missing_group_capacity:
+            return
+        self._warned_missing_group_capacity = True
+        logger.error(
+            "load_back reached before the first group capacity sync; load-back "
+            "stays disabled on this scheduler loop until check_hicache_events "
+            "runs. Expect degraded cache hit rate."
+        )
+
+    def _local_available_size(self) -> int:
+        """This rank's free device capacity.
+
+        SWA-hybrid allocators report full-KV availability through a separate
+        accessor; load-back only ever draws on the full-KV pool.
+        """
+        if self.supports_swa():
+            return self.token_to_kv_pool_allocator.full_available_size()
+        return self.token_to_kv_pool_allocator.available_size()
+
+    def _set_group_capacity(self, avail: int, evictable: int, local_avail: int) -> None:
+        # One refresh == one scheduler step, so this is the natural epoch
+        # boundary for the per-request failure paths.
+        self._flush_load_back_step_report()
+        self._group_avail = avail
+        self._group_evictable = evictable
+        if self.metrics_collector is None:
+            return
+
+        if self.pp_rank != 0:
+            # Later stages receive stage 0's value measured against a different
+            # pool, so the interesting quantity is the overgrant, not a skew:
+            # it is what precedes an allocation failure on this stage.
+            self.metrics_collector.set_hicache_pp_capacity_overgrant(
+                max(0, avail - local_avail)
+            )
+            return
+
+        if avail > local_avail:
+            # MIN over a group that includes this rank cannot exceed it. Do not
+            # clamp: zero reads as "this rank is the tightest", i.e. healthy.
+            logger.error(
+                "group capacity reduction returned more than this rank holds "
+                "(group=%d local=%d); the reduce did not include this rank and "
+                "load-back budgets are no longer group-agreed",
+                avail,
+                local_avail,
+            )
+            return
+        self.metrics_collector.set_hicache_group_capacity_skew(local_avail - avail)
+
+    def _refresh_group_capacity(self) -> None:
+        """Reduce device capacity by itself, where no merged reduce is available."""
+        local_avail = self._local_available_size()
+        capacity = torch.tensor(
+            [local_avail, self.evictable_size()],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(capacity, torch.distributed.ReduceOp.MIN)
+        avail, evictable = (int(v) for v in capacity.tolist())
+        self._set_group_capacity(avail, evictable, local_avail)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
@@ -1937,6 +2135,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._drain_async_work()
 
         if self.pp_size != 1:
+            self._refresh_group_capacity()
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
