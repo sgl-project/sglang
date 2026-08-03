@@ -91,6 +91,13 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.encoder = _DummyModel()
 
 
+class _NestedSameNamedBlocksModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_refiner = _DummyModel()
+        self.blocks = torch.nn.ModuleList([_DummyBlock()])
+
+
 class _SharedBuffer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -229,6 +236,31 @@ def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch)
 
     assert model.blocks[0].weight._version >= 0
     assert model.blocks[0].bias._version >= 0
+
+
+def test_layerwise_offload_does_not_capture_nested_same_named_layers(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _NestedSameNamedBlocksModel()
+    refiner_weight = model.token_refiner.blocks[0].weight.detach().clone()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    managed_names = {
+        name for metadata in manager._weight_metadata.values() for name in metadata
+    }
+    assert managed_names
+    assert all(name.startswith("blocks.") for name in managed_names)
+    assert torch.equal(model.token_refiner.blocks[0].weight, refiner_weight)
 
 
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
@@ -578,6 +610,10 @@ class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
 
 
+class _AuxiliaryResidentComponent(_ResidentComponent):
+    layerwise_offload_dit_group_enabled = False
+
+
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -689,3 +725,86 @@ def test_configure_resolves_resident_layers_ratio(monkeypatch):
     comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
     # 0.5 * 8 = 4 leading layers resident
     assert comp.layerwise_offload_managers[0].resident_layers == 4
+
+
+def test_auxiliary_layerwise_components_ignore_dit_tuning(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _AuxiliaryResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=3,
+            dit_layerwise_resident_layers=0.5,
+        )
+    )
+
+    manager = comp.layerwise_offload_managers[0]
+    assert manager.prefetch_size == 1
+    assert manager.resident_layers == 0
+
+
+class _MixinBlock(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.arange(9, dtype=torch.float32).reshape(3, 3)
+        )
+        self.bias = torch.nn.Parameter(torch.arange(3, dtype=torch.float32))
+
+
+class _MixinModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_MixinBlock() for _ in range(3)])
+
+
+def _configure_mixin_model(monkeypatch) -> _MixinModel:
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(_server_args())
+    assert is_layerwise_offloaded_module(model)
+    return model
+
+
+def test_disable_offload_short_circuits_residency_release(monkeypatch):
+    """disable_offload() must make later layerwise calls no-ops.
+
+    Regression test: a ComponentResidencyManager strategy built while the
+    module was offloaded (the offload_during_compile window) keeps calling
+    release_all() on use-site switches. After disable_offload() removed the
+    hooks, those releases replaced restored weights with (1,) placeholders
+    that nothing ever swapped back in, crashing dual-DiT models (Wan2.2-A14B
+    boundary experts, Ideogram-4 paired towers) on the first real request.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    model.disable_offload()
+
+    assert not is_layerwise_offloaded_module(model)
+    for name, param in model.named_parameters():
+        assert tuple(param.shape) != (1,), name
+
+    # The exact call path the residency strategy takes on use-site switches.
+    LayerwiseOffloadStrategy().exit(model)
+    model.prepare_for_next_req()
+    for name, param in model.named_parameters():
+        assert tuple(param.shape) != (1,), name
+
+
+def test_enable_offload_rearms_after_disable(monkeypatch):
+    model = _configure_mixin_model(monkeypatch)
+    # blocks[2] holds a placeholder right after configure; the real values are
+    # what _MixinBlock was constructed with.
+    original = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    model.disable_offload()
+    assert not is_layerwise_offloaded_module(model)
+
+    model.enable_offload()
+    assert is_layerwise_offloaded_module(model)
+
+    manager = model.layerwise_offload_managers[0]
+    manager.release_layer(2)
+    assert tuple(model.blocks[2].weight.shape) == (1,)
+    manager.prefetch_layer(2, non_blocking=False)
+    assert torch.equal(model.blocks[2].weight.data, original)

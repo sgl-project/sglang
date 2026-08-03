@@ -55,7 +55,10 @@ class LayerwiseOffloadManager:
         # Armed on the first denoise forward, so that the load-time prefetch below
         # does not pin the whole resident set before the DiT is the active component.
         self._residency_active = False
-
+        # True once _initialize builds the CPU buffers; unlike `enabled` it
+        # never flips back, so disable_offload/enable_offload can toggle
+        # `enabled` without losing track of which managers can be re-armed.
+        self._configured = False
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
@@ -64,8 +67,12 @@ class LayerwiseOffloadManager:
         )
         self.copy_stream = torch.get_device_module().Stream()
 
+        # ``named_parameters()`` is relative to ``model``, just like the path in
+        # ``layers_attr_str``. Anchor the match so a manager for top-level
+        # ``blocks`` cannot also capture an unrelated nested list such as
+        # ``token_refiner.blocks`` whose forward hooks run at a different time.
         self._layer_name_re = re.compile(
-            rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
+            rf"^{re.escape(layers_attr_str)}\.(?P<layer_idx>\d+)(\.|$)"
         )
 
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
@@ -96,7 +103,7 @@ class LayerwiseOffloadManager:
         if not m:
             return None
         try:
-            return int(m.group(2))
+            return int(m.group("layer_idx"))
         except Exception:
             return None
 
@@ -254,6 +261,7 @@ class LayerwiseOffloadManager:
         self.prepare_for_next_req(non_blocking=False)
 
         self.register_forward_hooks()
+        self._configured = True
         logger.info(
             f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}"
         )
@@ -608,6 +616,10 @@ class LayerwiseOffloadableModuleMixin:
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
+        # These legacy tuning knobs are explicitly DiT-scoped. Auxiliary
+        # components still support layerwise streaming, but their layers run
+        # once per component use and get no reuse benefit from DiT residency.
+        dit_tuning_enabled = self.layerwise_offload_dit_group_enabled
         for layer_name in self.layer_names:
             module_list = named_modules.get(layer_name)
             if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
@@ -616,14 +628,17 @@ class LayerwiseOffloadableModuleMixin:
                 continue
 
             num_layers = len(module_list)
-            if server_args.dit_offload_prefetch_size < 1.0:
-                prefetch_size = 1 + int(
-                    round(server_args.dit_offload_prefetch_size * (num_layers - 1))
-                )
+            prefetch_value = (
+                server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
+            )
+            if prefetch_value < 1.0:
+                prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))
             else:
-                prefetch_size = int(server_args.dit_offload_prefetch_size)
+                prefetch_size = int(prefetch_value)
 
-            resident_value = server_args.dit_layerwise_resident_layers
+            resident_value = (
+                server_args.dit_layerwise_resident_layers if dit_tuning_enabled else 0.0
+            )
             if resident_value <= 0:
                 resident_layers = 0
             elif resident_value < 1.0:
@@ -663,20 +678,31 @@ class LayerwiseOffloadableModuleMixin:
             manager.prepare_for_next_req(non_blocking=True)
 
     def disable_offload(self) -> None:
-        """Disable layerwise offload: load all layers to GPU and remove hooks."""
+        """Disable layerwise offload: load all layers to GPU and remove hooks.
+
+        Also flips `manager.enabled` off so every layerwise path —
+        is_layerwise_offloaded_module(), release_all(), prepare_for_next_req()
+        — short-circuits until enable_offload() re-arms it. Without this, a
+        residency strategy built while the module was offloaded (e.g. the
+        temporary offload_during_compile window) keeps calling release_all()
+        on use-site switches after the hooks are gone, replacing restored
+        weights with (1,) placeholders that nothing swaps back in.
+        """
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
             if manager.enabled:
                 manager.remove_forward_hooks()
                 manager.load_all_layers()
+                manager.enabled = False
 
     def enable_offload(self) -> None:
         """Re-enable layerwise offload: sync weights to CPU, release layers, and restore hooks."""
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
-            if manager.enabled:
+            if manager._configured:
+                manager.enabled = True
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
