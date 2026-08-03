@@ -244,8 +244,13 @@ def fp8_paged_mqa_logits_torch_sm120(
         dtype=torch.float32,
         device=q_fp8.device,
     )
-    # Peak is roughly B * chunk * (head_dim + num_heads) * 2 bytes; sized for ~512 MB.
-    _per = max(1, batch_size * (head_dim + num_heads) * 2)
+    # Peak per gathered KV token: bf16 values (head_dim * 2) + bf16 scores
+    # (num_heads * 2) + the fp32 product the weighted head sum materialises
+    # (num_heads * 4). That last term was missing from the budget: the cap
+    # held the score tensor to ~512 MB but not the score-times-weight product,
+    # which is twice its size -- at 1M context with B=8192 all eight ranks
+    # OOMed on exactly that line while the budget believed it had headroom.
+    _per = max(1, batch_size * (head_dim * 2 + num_heads * 6))
     pages_per_chunk = max(1, min(max_pages, (512 << 20) // (_per * block_size)))
 
     # Single-sequence prefill has an identical page_table on every row: all B
