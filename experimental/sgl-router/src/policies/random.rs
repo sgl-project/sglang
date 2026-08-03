@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::{scoring::ScoringPolicy, SelectionContext};
+use crate::policies::{
+    scoring::{Criterion, Verdict},
+    SelectionContext,
+};
 use crate::workers::Worker;
 use rand::Rng;
 use std::sync::Arc;
@@ -15,11 +18,14 @@ impl RandomPolicy {
     }
 }
 
-impl ScoringPolicy for RandomPolicy {
+impl Criterion for RandomPolicy {
     /// Argmax of n iid uniforms IS a uniform choice: exactly the old `choose`.
-    fn scores(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<f32> {
+    /// Never rejects: a coin toss is not an eligibility rule.
+    fn judge(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<Verdict> {
         let mut rng = rand::thread_rng();
-        (0..workers.len()).map(|_| rng.gen()).collect()
+        (0..workers.len())
+            .map(|_| Verdict::Score(rng.gen()))
+            .collect()
     }
 }
 

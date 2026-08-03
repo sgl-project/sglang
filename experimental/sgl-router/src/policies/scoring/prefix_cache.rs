@@ -9,7 +9,7 @@
 //! weighted sum needs. Usable standalone via `--policy prefix_cache`, or as a
 //! fused term alongside load.
 
-use super::ScoringPolicy;
+use super::{Criterion, Verdict};
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
@@ -40,12 +40,20 @@ pub struct PrefixCachePolicy {
     /// the way the workers did, so every score would be a false miss.
     block_size_oracle: Arc<BlockSizeOracle>,
     weight: f32,
+    /// Share of the prompt a worker must already hold to stay ELIGIBLE. `0.0`
+    /// is off, and off is the default: the term is then a pure preference and
+    /// can never reject anyone. Above zero it turns cache affinity into a
+    /// constraint, which is the thing a weight cannot buy — no fixed weight
+    /// out-ranks load at every prompt length, because prompt length is a
+    /// per-request quantity.
+    min_share: f32,
 }
 
 impl std::fmt::Debug for PrefixCachePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCachePolicy")
             .field("weight", &self.weight)
+            .field("min_share", &self.min_share)
             .field("tree_nodes", &self.tree.node_count())
             .finish()
     }
@@ -57,13 +65,26 @@ impl PrefixCachePolicy {
             tree,
             block_size_oracle,
             weight,
+            min_share: 0.0,
         }
+    }
+
+    /// Make affinity a constraint above `share` of the prompt: anyone holding
+    /// less is rejected outright rather than merely out-scored. See
+    /// [`Self::min_share`]; `0.0` restores the pure-preference behaviour.
+    pub fn with_min_share(mut self, share: f32) -> Self {
+        self.min_share = share;
+        self
     }
 }
 
-impl ScoringPolicy for PrefixCachePolicy {
-    fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
-        let flat = || vec![NO_HOLDING; workers.len()];
+impl Criterion for PrefixCachePolicy {
+    fn judge(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<Verdict> {
+        // Every no-signal path ABSTAINS rather than rejecting. "We cannot tell"
+        // is not "nobody is fit": a term that vetoed the fleet here would make
+        // an unhashable prompt unroutable, and under a fused chain would drag
+        // every lower-priority term down with it.
+        let flat = || vec![Verdict::Score(NO_HOLDING); workers.len()];
 
         // Only the ingress-computed ids. Those are the chat-templated tokens
         // the engine itself cached; re-deriving them from the raw joined
@@ -99,12 +120,18 @@ impl ScoringPolicy for PrefixCachePolicy {
                 // ranks appears once per rank: take its BEST. Taking the first
                 // match read an arbitrary rank in HashMap order, which moved
                 // the score run to run. O(workers x ranks), nil at fleet size.
-                depths
+                let share = depths
                     .iter()
                     .filter(|(kw, _)| kw.url == w.url)
                     .map(|(_, &d)| d)
                     .max()
-                    .map_or(NO_HOLDING, |d| d as f32 / total)
+                    .map_or(NO_HOLDING, |d| d as f32 / total);
+                // `>` and not `>=`, so the off default of 0.0 cannot reject
+                // the worker holding nothing — off must mean off.
+                match self.min_share > 0.0 && share < self.min_share {
+                    true => Verdict::Reject,
+                    false => Verdict::Score(share),
+                }
             })
             .collect()
     }
@@ -163,6 +190,19 @@ mod tests {
         PrefixCachePolicy::new(tree, oracle, 1.0)
     }
 
+    /// The held shares as plain numbers, so a case can state the fraction it
+    /// expects. Panics on a rejection: none of these fixtures sets a floor, so
+    /// one appearing would be the default silently turning into a constraint.
+    fn shares(p: &PrefixCachePolicy, ws: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        p.judge(ws, ctx)
+            .into_iter()
+            .map(|v| match v {
+                Verdict::Score(s) => s,
+                Verdict::Reject => panic!("no floor configured, so nothing may be rejected"),
+            })
+            .collect()
+    }
+
     /// The two failure modes that matter together, in one call: a deep holder
     /// must score its real fraction (not a neutral 1.0), and a worker holding
     /// a TAIL without block 0 must score the miss value — `prefix_depths`
@@ -179,7 +219,7 @@ mod tests {
         let ids = tokens();
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
 
-        let scores = policy(tree).scores(&ws, &ctx);
+        let scores = shares(&policy(tree), &ws, &ctx);
         assert_eq!(scores[0], 0.75, "3 of 4 blocks held, not a neutral 1.0");
         // Literal 0.0, NOT the NO_HOLDING constant: asserting against the
         // constant the code uses makes the test move with the bug, and a
@@ -202,7 +242,11 @@ mod tests {
         let model = ModelId("tiny".into());
         let ids = tokens();
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
-        assert_eq!(policy(tree).scores(&ws, &ctx), vec![0.75], "3 of 4, not 1");
+        assert_eq!(
+            shares(&policy(tree), &ws, &ctx),
+            vec![0.75],
+            "3 of 4, not 1"
+        );
     }
 
     /// No ingress tokens is the common case for `/generate` on a model with no
@@ -223,11 +267,15 @@ mod tests {
 
         let ids = tokens();
         let with = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
-        assert_eq!(policy.scores(&ws, &with), vec![0.75, 0.0], "signal is live");
+        assert_eq!(
+            shares(&policy, &ws, &with),
+            vec![0.75, 0.0],
+            "signal is live"
+        );
 
         let without = SelectionContext::new(&model, None);
         assert_eq!(
-            policy.scores(&ws, &without),
+            shares(&policy, &ws, &without),
             vec![0.0, 0.0],
             "and inert here"
         );
@@ -250,7 +298,7 @@ mod tests {
         // difference is the unset oracle, so a pass here cannot be the tree
         // being empty.
         let cold = PrefixCachePolicy::new(tree, BlockSizeOracle::new(), 1.0);
-        assert_eq!(cold.scores(&ws, &ctx), vec![0.0, 0.0]);
+        assert_eq!(shares(&cold, &ws, &ctx), vec![0.0, 0.0]);
     }
 
     /// EAGLE-family workers hash over token BIGRAMS. The two hashers must not
@@ -277,10 +325,14 @@ mod tests {
         oracle.try_set(BLOCK as u32).unwrap();
         oracle.set_bigram(true);
         let p = PrefixCachePolicy::new(Arc::clone(&tree), oracle, 1.0);
-        assert_eq!(p.scores(&ws, &ctx), vec![0.0], "bigram query, unigram tree");
+        assert_eq!(
+            shares(&p, &ws, &ctx),
+            vec![0.0],
+            "bigram query, unigram tree"
+        );
         // The control: same tree, same tokens, unigram oracle -> full hit. It
         // is what proves the 0.0 above is the hashing scheme and not a broken
         // fixture.
-        assert_eq!(policy(tree).scores(&ws, &ctx), vec![1.0]);
+        assert_eq!(shares(&policy(tree), &ws, &ctx), vec![1.0]);
     }
 }

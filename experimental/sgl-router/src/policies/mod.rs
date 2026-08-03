@@ -14,7 +14,7 @@ pub mod scoring;
 pub mod sticky;
 
 use crate::discovery::ModelId;
-use crate::policies::scoring::ScoringPolicy;
+use crate::policies::scoring::Criterion;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -258,16 +258,18 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// policies, so it is injected here rather than passed to the constructor.
     fn attach_metrics(&self, _metrics: Arc<MetricsRegistry>) {}
 
-    /// Per-worker preference view, `None` when the decision cannot reduce to
-    /// one (rotation, sampling, a veto); opt in by implementing [`ScoringPolicy`].
-    fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
+    /// Per-worker judgement view, `None` when the decision cannot reduce to
+    /// one (rotation, sampling); opt in by implementing [`Criterion`]. A veto
+    /// no longer disqualifies a policy from this view — `Verdict::Reject` is
+    /// how a judgement expresses one.
+    fn as_criterion(&self) -> Option<&dyn Criterion> {
         None
     }
 
     /// Whether this policy can be a term of a fused sum. DERIVED and never
     /// hand-written, so it cannot claim a capability the policy lacks.
     fn can_fuse(&self) -> bool {
-        self.as_scoring().is_some()
+        self.as_criterion().is_some()
     }
 }
 

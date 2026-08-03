@@ -199,7 +199,7 @@ pub const DEFAULT_FUSE: [PolicyKind; 2] = [PolicyKind::PrefixCache, PolicyKind::
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FusedTerm {
     pub kind: PolicyKind,
-    /// Weight override; `None` keeps the term's own `ScoringPolicy::weight()`.
+    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
     pub weight: Option<f32>,
 }
 
