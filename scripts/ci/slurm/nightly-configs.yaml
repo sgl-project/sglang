@@ -547,7 +547,7 @@ kimik26-fp8-mi355x-ep16-mtp-sglang:
 kimik26-mxfp4-mi355x-ep16-sglang:
   model: amd/Kimi-K2.6-MXFP4
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4/snapshots/main
   runner: mi355x
   precision: mxfp4
   framework: sglang
@@ -563,7 +563,7 @@ kimik26-mxfp4-mi355x-ep16-sglang:
 kimik26-mxfp4-mi355x-ep16-mtp-sglang:
   model: amd/Kimi-K2.6-MXFP4
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4/snapshots/main
   runner: mi355x
   precision: mxfp4
   framework: sglang
