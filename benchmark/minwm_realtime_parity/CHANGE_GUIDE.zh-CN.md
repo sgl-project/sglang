@@ -24,9 +24,11 @@ Ring、TP+SP、FSDP+SP 和 whole-DiT compile+SP 仍会被显式拒绝。
 
 本地单测覆盖了 uniform/varlen shard、帧内 shard 边界、packed QKV collective 和
 local-head KV ownership；`us-east-1-atl-2a` Local Zone 的 8×B300 Spot 正式矩阵
-也已完成。SP2/SP4/SP8 相对 SP1 的 generated uint8 frame 全部逐字节相同，但这个
-720p workload 的单流吞吐没有提升：SP2 约慢 4.30%，SP4 约慢 4.40%，SP8 约慢
-4.92%。
+也已完成。该历史 B300 矩阵的 SP2/SP4/SP8 generated uint8 frame 全部逐字节相同，
+但尚未做 layout 与 VAE 优化，因此单流吞吐分别慢 4.30%/4.40%/4.92%。后续 H200
+Spot 复测清掉重复 layout/launch，并加入 Parallel VAE 后，SP2/SP4 达到
+`1.45x/1.68x`；SP8 修复 output-projection GEMM row bucket 后也恢复 bitwise exact，
+端到端为 `1.13x`，但因 VAE 自动回退串行而不是推荐吞吐档位。
 
 ## 2. 背景和真正的兼容性目标
 
@@ -192,6 +194,9 @@ manifest 中标注这些值来自转换参数。
 | H200 triptych bitwise | 1248x704 | 10.822 client FPS | 同 case、warm full-clip exact lane |
 | H200 optimized eager | 1248x704 | 10.853 client FPS | 与下一行只差 whole-DiT compile |
 | H200 optimized compiled | 1248x704 | 12.711 client FPS | 非 parity、组合性能 lane |
+| H200 optimized SP2 | 1248x704 | 14.605 client FPS | 1.450x；Parallel VAE fast lane |
+| H200 optimized SP4 | 1248x704 | 16.951 client FPS | 1.683x；当前吞吐最佳点 |
+| H200 fixed SP8 | 1248x704 | 11.424 client FPS | 1.134x；fast/parity 均恢复 bitwise |
 | B300 SP1 exact | 1248x704 | 15.891 client FPS | Local Zone Spot SP reference |
 | B300 SP2 exact | 1248x704 | 15.207 client FPS | bitwise；相对 SP1 为 0.957x |
 | B300 SP4 exact | 1248x704 | 15.191 client FPS | bitwise；相对 SP1 为 0.956x |
@@ -212,6 +217,20 @@ optimized eager control 为 `10.853 FPS`，compiled speed lane 为 `12.711 FPS`�
 optimized generated frames 为 `RMSE=29.466、SSIM=0.838568、PSNR=18.744 dB`，所以
 性能 lane 明确不是 tolerance-parity lane。bitwise/optimized 峰值显存分别为
 `53,159/51,269 MiB`。
+
+2026-08-03 的 H200 SP follow-up 固定同一 720p case 与 step-3200 checkpoint。
+SP2 的串行/并行 VAE 对照把 client FPS 从 `11.668` 提到 `14.605`（`+25.2%`），
+VAE CUDA 从 `695.6 ms` 降到 `419.9 ms`；SP4 进一步达到 `16.951 FPS`。
+Ulysses peer-first QKV fused pack 在 SP2 Nsight 中减少 7,380 次
+`cudaLaunchKernel`（`-3.10%`），NCCL SendRecv 仍是算法下限 4,920 次。
+
+Hopper SP8 的首差不在通信或 30 个 transformer block：逐 block dump 证明它们和
+output-head normalized input 均与 SP1 bitwise exact。首差来自最后的
+`Linear(3072, 192)`，local 短行数触发不同 BF16 GEMM reduction，最大初始差为
+`0.0078125`，随后被 causal rollout 放大。修复把每个 local shard 放回 SP1 的全局
+row 位置，只对这层小 projection 补零、计算、裁剪。最终 129 帧 SP8 parity 与 fast
+lane 都恢复到 SP1 的 frame/video SHA，paired parity client FPS 为 `11.540`，最终
+fast lane 为 `11.424`，DiT 没有可测回退。
 
 页面所列 minWM baseline 是一次完整 clip 的端到端计时，当前复测为 `6.138 output
 FPS`；同一哈希的前一次 H200 重跑为 `8.612 FPS`。这个单次整体计时包含 encode、

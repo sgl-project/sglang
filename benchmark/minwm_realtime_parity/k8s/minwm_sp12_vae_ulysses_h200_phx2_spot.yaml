@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: minwm-sp12-nsys-fused-h200-results-v2-20260803
+  name: minwm-sp12-vae-fused-results-v5-20260803
   namespace: default
   labels:
     seedleap.ai/owner: chenshengdong
-    seedleap.ai/purpose: minwm-sp-nsys
+    seedleap.ai/purpose: minwm-sp-vae-perf
 spec:
   accessModes:
     - ReadWriteOnce
@@ -17,14 +17,14 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-sp12-720p-nsys-fused-h200-phx2-v2-20260803
+  name: minwm-sp12-vae-fused-sp12-h200-phx2-v17-20260803
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-sp12-720p-nsys-fused-h200-phx2-v2-20260803
+    app.kubernetes.io/name: minwm-sp12-vae-fused-sp12-h200-phx2-v17-20260803
     seedleap.ai/owner: chenshengdong
-    seedleap.ai/purpose: minwm-sp-nsys
+    seedleap.ai/purpose: minwm-sp-vae-perf
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: minwm-sp12-nsys-fused-720p-h200-phx2-20260803-v2
+    seedleap.ai/run-id: minwm-sp12-vae-ulysses-720p-h200-phx2-20260803-fused-v5
   annotations:
     seedleap.ai/capacity-type: spot
     seedleap.ai/repo: seedleap/sglang
@@ -36,15 +36,15 @@ metadata:
     seedleap.ai/ttl: 24h
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 10800
+  activeDeadlineSeconds: 14400
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-sp12-720p-nsys-fused-h200-phx2-v2-20260803
+        app.kubernetes.io/name: minwm-sp12-vae-fused-sp12-h200-phx2-v17-20260803
         seedleap.ai/owner: chenshengdong
-        seedleap.ai/purpose: minwm-sp-nsys
+        seedleap.ai/purpose: minwm-sp-vae-perf
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: minwm-sp12-nsys-fused-720p-h200-phx2-20260803-v2
+        seedleap.ai/run-id: minwm-sp12-vae-ulysses-720p-h200-phx2-20260803-fused-v5
       annotations:
         seedleap.ai/repo: seedleap/sglang
         seedleap.ai/branch: codex/minwm-realtime-api
@@ -65,12 +65,9 @@ spec:
         - name: benchmark
           image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace
           securityContext:
             runAsUser: 0
-            capabilities:
-              add:
-                - SYS_ADMIN
+          workingDir: /workspace
           env:
             - name: GITHUB_TOKEN
               valueFrom:
@@ -83,15 +80,17 @@ spec:
             - name: MINWM_GIT_REF
               value: "2efc6485f65e8fcab506665efde79bc41406385e"
             - name: MINWM_BENCHMARK_MODE
-              value: setup_only
-            - name: MINWM_RUN_ID
-              value: minwm-sp12-nsys-fused-720p-h200-phx2-20260803-v2
-            - name: MINWM_SP_DEGREES
-              value: "1 2"
-            - name: MINWM_NSYS_VAE_LANE
-              value: parity
+              value: spmatrix720p
+            - name: MINWM_SP_WARMUP_RUNS
+              value: "1"
+            - name: MINWM_SP_LOCATION
+              value: us-west-2-phx-2a
+            - name: MINWM_CUDA_LAUNCH_BLOCKING
+              value: "0"
             - name: MINWM_STAGE_FROM_MOUNT
               value: "1"
+            - name: MINWM_S3_MOUNT
+              value: /s3
             - name: MINWM_CHECKPOINT_MOUNT_PATH
               value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200/ema_student/model.pt
             - name: MINWM_PRETRAINED_MOUNT_PATH
@@ -134,8 +133,12 @@ spec:
               clone_at minWM /workspace/minWM "${MINWM_GIT_REF}"
               clone_at sglang /workspace/sglang "${SGLANG_GIT_REF}"
               git -C /workspace/sglang rev-parse HEAD
-              bash /workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
-              exec bash /workspace/sglang/benchmark/minwm_realtime_parity/run_sp_nsys.sh
+
+              MINWM_RUN_ID=minwm-sp12-vae-ulysses-720p-h200-phx2-20260803-fused-v5 \
+              MINWM_SP_DEGREES="1 2" \
+              MINWM_SP_VAE_LANE=parallel \
+              MINWM_SP_VAE_PARALLEL_DECODE=true \
+                bash /workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
           resources:
             limits:
               nvidia.com/gpu: "2"
@@ -159,7 +162,7 @@ spec:
           emptyDir: {}
         - name: results
           persistentVolumeClaim:
-            claimName: minwm-sp12-nsys-fused-h200-results-v2-20260803
+            claimName: minwm-sp12-vae-fused-results-v5-20260803
         - name: shm
           emptyDir:
             medium: Memory

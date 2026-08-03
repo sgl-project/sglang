@@ -219,6 +219,46 @@ the right-hand video to SP4 or SP8. It works through `file://` and has also been
 browser-tested through a local HTTP server: one click started both 5.375-second
 videos with less than 0.1 ms observed start-time skew.
 
+### H200 SP, Parallel VAE, and fused-layout follow-up
+
+The 2026-08-03 follow-up used Local Zone Spot `p5e.48xlarge` nodes in
+`us-west-2-phx-2a` (8x H200, NV18), the same step-3200 checkpoint, 1248x704,
+129 frames, and one full warmup. Unlike the historical B300 result above, the
+optimized H200 path removes repeated Ulysses layout work and parallelizes the
+causal VAE decode at the useful SP2/SP4 degrees:
+
+| SP | Client FPS | vs SP1 | DiT CUDA | VAE CUDA | Result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 10.072 | 1.000x | 761.0 ms | 703.4 ms | reference |
+| 2 | 14.605 | 1.450x | 611.0 ms | 419.9 ms | fast-lane PSNR 64.46 dB; parity lane exact |
+| 4 | 16.951 | 1.683x | 610.4 ms | 232.7 ms | fast-lane PSNR 68.60 dB; parity lane exact |
+| 8 | 11.424 | 1.134x | 602.2 ms | 707.6 ms | fast and parity lanes bitwise exact |
+
+SP4 is the throughput optimum for this workload. SP8 no longer reduces DiT
+meaningfully and its 4-frame decode shard falls below the Parallel VAE work
+threshold, so VAE decode intentionally falls back to the serial path. It is a
+correct scaling option, but not the recommended low-latency degree.
+
+The isolated SP2 serial-versus-parallel VAE comparison improves client FPS from
+`11.668` to `14.605` (`+25.2%`) and reduces VAE CUDA time from `695.6` to
+`419.9 ms` (`1.657x`). The fused peer-first Ulysses QKV pack reuses one workspace
+and removes 7,380 `cudaLaunchKernel` calls (`-3.10%`) in the SP2 Nsight run;
+NCCL SendRecv remains 4,920 calls, the algorithmic collective floor.
+
+On Hopper SP8, the 30 transformer blocks and the normalized output-head input
+were already bitwise identical to SP1. The first difference was the final
+`Linear(3072, 192)`: the short local BF16 row bucket selected a different GEMM
+reduction (`max_abs=0.0078125`), which causal rollout amplified. The fix pads
+each local shard into its exact SP1 global row position for this small output
+projection, projects once, then crops before the existing gather. The final
+H200 jobs restore both the 129-frame array and MP4 to the SP1 SHA-256 values
+`b2a2f333...12a87` and `63c14d45...ec32c`, without a measurable DiT regression.
+
+Run provenance is pinned in
+`k8s/minwm_sp12_vae_ulysses_h200_phx2_spot.yaml` and
+`k8s/minwm_sp12_720p_nsys_h200_phx2_spot.yaml`. The local self-contained
+SP1/SP2 player is under `results/h200-sp12-vae-final-20260803/player/index.html`.
+
 ## Latest-checkpoint formal run
 
 The 2026-07-22 Spot B200 formal result for the requested latest checkpoint is:
