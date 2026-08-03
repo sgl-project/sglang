@@ -10,7 +10,10 @@ use crate::policies::{
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
-    scoring::{prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy},
+    scoring::{
+        admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
+        Pipeline,
+    },
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -30,6 +33,7 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq
+        | PolicyKind::Overloaded
         | PolicyKind::Sticky
         | PolicyKind::PrefixCache
         | PolicyKind::FusedScore => {
@@ -66,7 +70,40 @@ pub fn build_policy(
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
 ) -> Result<Arc<dyn Policy>> {
-    Ok(match model.policy {
+    let inner = build_kind(model.policy, model, &tree, &tokenizers, &block_size_oracle)?;
+    let Some(elig) = model.eligibility.as_ref().filter(|e| !e.filters.is_empty()) else {
+        return Ok(inner);
+    };
+    // Built by the SAME constructor a `--policy` would use, so a filter gets
+    // the real dependencies and there is no second name table. Whether it can
+    // constrain at all is asked of the BUILT policy, never matched on the kind.
+    let mut filters = Vec::with_capacity(elig.filters.len());
+    for &kind in &elig.filters {
+        let f = build_kind(kind, model, &tree, &tokenizers, &block_size_oracle)?;
+        if !f.can_filter() {
+            return Err(anyhow!("--filter: `{kind}` imposes no eligibility rule"));
+        }
+        filters.push(f);
+    }
+    Ok(Arc::new(Pipeline::new(filters, inner)?))
+}
+
+/// One policy of the named kind, so a `--filter` entry and a `--policy` of the
+/// same name are built the same way off the same config -- `prefix_cache` reads
+/// its floor here whichever list named it.
+fn build_kind(
+    kind: PolicyKind,
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    tokenizers: &Arc<TokenizerRegistry>,
+    block_size_oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    let (tree, tokenizers, block_size_oracle) = (
+        Arc::clone(tree),
+        Arc::clone(tokenizers),
+        Arc::clone(block_size_oracle),
+    );
+    Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
@@ -82,11 +119,24 @@ pub fn build_policy(
         }
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
-        PolicyKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
-            tree,
-            block_size_oracle,
-            prefix_cache::DEFAULT_WEIGHT,
-        )),
+        PolicyKind::PrefixCache => {
+            let p = PrefixCachePolicy::new(tree, block_size_oracle, prefix_cache::DEFAULT_WEIGHT);
+            // From the eligibility config even for a `--fuse` term, so the two
+            // halves of one signal cannot be configured apart.
+            let share = (model.eligibility.as_ref()).and_then(|e| e.min_prefix_share);
+            Arc::new(match share {
+                Some(s) => p.with_min_share(s),
+                None => p,
+            })
+        }
+        PolicyKind::Overloaded => {
+            // Unreachable in production: the CLI rejects the filter and the
+            // flag without each other. It keeps the test shim constructible.
+            let cap = (model.eligibility.as_ref())
+                .and_then(|e| e.max_in_flight)
+                .unwrap_or(usize::MAX);
+            Arc::new(Overloaded::new(cap))
+        }
     })
 }
 
@@ -161,6 +211,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
+        PolicyKind::Overloaded => Arc::new(Overloaded::new(usize::MAX)),
         PolicyKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
             Arc::new(HashTree::new()),
             BlockSizeOracle::new(),
@@ -219,7 +270,91 @@ mod tests {
         StaticUrlsDiscoveryConfig,
     };
 
-    use crate::config::PolicyKind;
+    use crate::config::{EligibilityConfig, PolicyKind};
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::SelectionContext;
+    use crate::workers::Worker;
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("modelA".into())],
+            bootstrap_port: None,
+        }))
+    }
+
+    /// End to end through the factory -- the in-crate tests build a
+    /// `Pipeline` by hand, so an arm that assembled one out of the wrong parts
+    /// would pass every one of them. Both directions asserted: under the cap
+    /// the inner policy still ranks, over it the Hold surfaces as "did not
+    /// route" rather than the least-bad worker.
+    #[test]
+    fn filter_overloaded_wires_through_the_factory() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![PolicyKind::Overloaded],
+            max_in_flight: Some(2),
+            min_prefix_share: None,
+        });
+        let reg = build_registry_with_defaults(&cfg).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+
+        let ws = vec![worker("w0"), worker("w1")];
+        let model = ModelId("modelA".into());
+        let ctx = SelectionContext::new(&model, None);
+        let _one = ws[1].load_guard();
+        assert_eq!(
+            p.select(&ws, &ctx).unwrap().id,
+            ws[0].id,
+            "load still ranks"
+        );
+
+        let _fill: Vec<_> = (ws.iter())
+            .flat_map(|w| (0..2).map(|_| w.load_guard()))
+            .collect();
+        assert!(
+            p.select(&ws, &ctx).is_none(),
+            "every worker is over the cap"
+        );
+    }
+
+    /// The floor is what makes `prefix_cache` a filter at all, and a named
+    /// filter that constrains nothing must fail at STARTUP rather than install
+    /// a stage that admits everybody.
+    #[test]
+    fn a_filter_must_actually_constrain() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::PrefixCache);
+        let built = |c: &Config| {
+            build_registry_with_defaults(c).map(|r| r.get(&ModelId("modelA".into())).unwrap())
+        };
+        assert!(
+            !built(&cfg).unwrap().can_filter(),
+            "no floor, so the term stays a pure preference",
+        );
+
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![PolicyKind::PrefixCache],
+            max_in_flight: None,
+            min_prefix_share: Some(0.6),
+        });
+        assert!(
+            built(&cfg).unwrap().needs_request_tokens(),
+            "the floor reads the prompt"
+        );
+
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![PolicyKind::RoundRobin],
+            max_in_flight: None,
+            min_prefix_share: None,
+        });
+        let err = built(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("round_robin") && err.contains("no eligibility rule"),
+            "{err}"
+        );
+    }
 
     fn cfg_with_model(id: &str, policy: PolicyKind) -> Config {
         Config {
@@ -236,6 +371,7 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 fused: None,
+                eligibility: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],

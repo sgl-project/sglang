@@ -12,8 +12,9 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, FusedTerm, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, DEFAULT_FUSE,
+    DiscoveryBackend, EligibilityConfig, FusedTerm, K8sDiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig, DEFAULT_FUSE,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -78,6 +79,24 @@ pub struct Cli {
     /// terms default to `prefix_cache,load_based`.
     #[arg(long, value_delimiter = ',')]
     pub fuse: Vec<FusedTerm>,
+
+    // ---- eligibility (`--filter`), applied before any scoring ----
+    /// Hard constraints applied before scoring, spelled as `--policy` spells
+    /// them: `--filter overloaded,prefix_cache`. A rejected worker cannot be
+    /// scored back in, which no `--fuse` weight can promise. Works with ANY
+    /// `--policy`. Order is priority: when two cannot both be satisfied the
+    /// LATER one yields.
+    #[arg(long, value_delimiter = ',')]
+    pub filter: Vec<PolicyKind>,
+    /// In-flight count at which `--filter overloaded` stops admitting a
+    /// worker. Router-local, so N replicas make the effective cap N times it.
+    #[arg(long)]
+    pub max_in_flight: Option<usize>,
+    /// Share of the prompt (0, 1] a worker must hold for
+    /// `--filter prefix_cache` to admit it. The `--fuse prefix_cache` term
+    /// scores the depth either way.
+    #[arg(long)]
+    pub prefix_cache_min_share: Option<f32>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -208,6 +227,41 @@ impl Cli {
             None
         };
 
+        // Deliberately NOT gated on `--policy`: a constraint is orthogonal to
+        // how the survivors are ranked, so it composes with every policy.
+        for (i, kind) in self.filter.iter().enumerate() {
+            if self.filter[..i].contains(kind) {
+                return Err(anyhow!("--filter: `{kind}` is listed more than once"));
+            }
+        }
+        // Each parameter is paired with its filter in BOTH directions: a knob
+        // with no reader is as much a misconfiguration as a reader with no
+        // knob, and both are silent at runtime.
+        let has = |k: PolicyKind| self.filter.contains(&k);
+        if self.max_in_flight.is_some() != has(PolicyKind::Overloaded) {
+            return Err(anyhow!(
+                "--max-in-flight and `--filter overloaded` require each other"
+            ));
+        }
+        if self.prefix_cache_min_share.is_some() != has(PolicyKind::PrefixCache) {
+            return Err(anyhow!(
+                "--prefix-cache-min-share and `--filter prefix_cache` require each other"
+            ));
+        }
+        // `0.0` would build a filter that admits everyone, which reads as
+        // "constrained" in the config and is not.
+        if self
+            .prefix_cache_min_share
+            .is_some_and(|s| !(s > 0.0 && s <= 1.0))
+        {
+            return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
+        }
+        let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
+            filters: self.filter.clone(),
+            max_in_flight: self.max_in_flight,
+            min_prefix_share: self.prefix_cache_min_share,
+        });
+
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -318,6 +372,7 @@ impl Cli {
                 cache_aware,
                 sticky,
                 fused,
+                eligibility,
             },
             discovery,
             proxy: ProxyConfig {
@@ -894,6 +949,75 @@ mod tests {
         assert_eq!(s.fallback_policy, PolicyKind::LoadBased);
         assert_eq!(s.idle_secs, 120);
         assert_eq!(s.eviction_interval_secs, 15);
+    }
+
+    /// `--filter` composes with ANY policy, keeps its order (which is
+    /// priority), and leaves the layer OFF when unused -- otherwise every
+    /// existing deployment silently grows a constraint stage.
+    #[test]
+    fn filter_builds_the_eligibility_config_in_order_and_is_off_by_default() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "round_robin",
+            "--filter",
+            "overloaded,prefix_cache",
+            "--max-in-flight",
+            "64",
+            "--prefix-cache-min-share",
+            "0.6",
+        ]))
+        .unwrap();
+        let e = c.model.eligibility.expect("--filter must build the config");
+        assert_eq!(
+            e.filters,
+            vec![PolicyKind::Overloaded, PolicyKind::PrefixCache],
+            "order is priority, so it must survive parsing",
+        );
+        assert_eq!((e.max_in_flight, e.min_prefix_share), (Some(64), Some(0.6)));
+        assert_eq!(
+            c.model.policy,
+            PolicyKind::RoundRobin,
+            "not gated on --policy"
+        );
+
+        let bare = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(bare.model.eligibility.is_none(), "no --filter, no layer");
+    }
+
+    /// Every way to misconfigure the layer, each of which is SILENT at
+    /// runtime: a knob with no reader, a reader with no knob, a repeat that
+    /// would need two configs of one filter, and a floor that admits all.
+    #[test]
+    fn filter_misconfigurations_fail_at_startup() {
+        let cases: [(&[&str], &str); 6] = [
+            (&["--filter", "overloaded"], "require each other"),
+            (&["--max-in-flight", "64"], "require each other"),
+            (&["--filter", "prefix_cache"], "require each other"),
+            (&["--prefix-cache-min-share", "0.6"], "require each other"),
+            (
+                &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
+                "listed more than once",
+            ),
+            (
+                &[
+                    "--filter",
+                    "prefix_cache",
+                    "--prefix-cache-min-share",
+                    "0.0",
+                ],
+                "must be in (0, 1]",
+            ),
+        ];
+        for (extra, want) in cases {
+            let mut args = vec!["--worker-urls", "http://x:30000"];
+            args.extend_from_slice(extra);
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "for {extra:?} got: {err}");
+        }
     }
 
     #[test]

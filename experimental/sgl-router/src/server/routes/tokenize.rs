@@ -122,6 +122,7 @@ mod tests {
                 cache_aware: None,
                 sticky: None,
                 fused: None,
+                eligibility: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {

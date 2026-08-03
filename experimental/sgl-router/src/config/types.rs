@@ -95,6 +95,11 @@ pub enum PolicyKind {
     /// contributes, so the terms trade off continuously.
     #[value(name = "fused_score")]
     FusedScore,
+    /// Capacity as a hard constraint: reject any worker already carrying
+    /// `--max-in-flight` requests. A `--filter` entry, not a `--policy`:
+    /// standalone it can only fall back on the selector's load tiebreak.
+    #[value(name = "overloaded")]
+    Overloaded,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
@@ -183,6 +188,29 @@ pub struct ModelConfig {
     /// [`crate::config::cli::Cli::into_config`]), defaulting to
     /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
     pub fused: Option<Vec<FusedTerm>>,
+    /// Hard constraints applied before scoring. `Some` exactly when
+    /// `--filter` is given (built by [`crate::config::cli::Cli::into_config`]).
+    pub eligibility: Option<EligibilityConfig>,
+}
+
+/// The `--filter` layer: which constraints run, in priority order, and the
+/// parameters the ones that need them read.
+///
+/// Parameters live here rather than on each filter's own config struct because
+/// a filter is also reachable as a `--fuse` term (`prefix_cache` is both), and
+/// two config homes for one policy is how the two halves drift apart.
+#[derive(Debug, Clone, Default)]
+pub struct EligibilityConfig {
+    /// Filters in priority order, spelled as `--policy` spells them. When two
+    /// cannot both be satisfied the LATER one yields; see
+    /// `crate::policies::scoring::admit`.
+    pub filters: Vec<PolicyKind>,
+    /// `overloaded`: in-flight count at which a worker stops being eligible.
+    pub max_in_flight: Option<usize>,
+    /// `prefix_cache`: share of the prompt a worker must already hold to stay
+    /// eligible. Also what makes `prefix_cache` report itself as a filter at
+    /// all -- without it the term is a pure preference.
+    pub min_prefix_share: Option<f32>,
 }
 
 /// The pair `--policy fused_score` composes when `--fuse` is omitted, so the

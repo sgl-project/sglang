@@ -89,7 +89,7 @@ pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
     ///
     /// Rust cannot derive this from `Self: EligibilityFilter` — a second
     /// blanket `impl Policy` would collide with the one below — so it is one
-    /// explicit line in the implementor rather than magic.
+    /// explicit line in the implementer rather than magic.
     fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
         None
     }
