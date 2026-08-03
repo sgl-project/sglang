@@ -868,31 +868,27 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        from sglang.srt.speculative.draft_worker_common import (
+            draft_server_args_copy,
+        )
+
         # Launch a draft worker for speculative decoding
-        draft_worker_kwargs = dict(
+        draft_server_args = draft_server_args_copy(
             server_args=self.server_args,
+            target_model_config=self.tp_worker.model_runner.model_config,
+        )
+        draft_worker_kwargs = dict(
+            server_args=draft_server_args,
             gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
 
-        if get_spec().speculative_draft_load_format is not None:
-            # Write the draft load_format onto server_args (not just the bag):
-            # the draft worker is built from a copy of self.server_args and
-            # build_load_config reads server_args.load_format, so a bag-only
-            # override would be ignored and the draft would load in the target's
-            # format.
-            self.server_args.override(
-                "scheduler.draft_load_format",
-                load_format=get_spec().speculative_draft_load_format,
-            )
-            logger.info(
-                f"Using draft model load_format: '{get_spec().speculative_draft_load_format}'"
-            )
-
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
+        with get_context().preserve_config():
+            get_context().set_server_args(draft_server_args)
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -4013,7 +4009,7 @@ class Scheduler(
                 )
             if recv_req.hicache_write_policy is not None:
                 hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
-            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
+            get_context().override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -4054,7 +4050,7 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.override(
+            get_context().override(
                 "scheduler.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
