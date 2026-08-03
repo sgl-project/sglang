@@ -3,6 +3,7 @@
 
 Text-encoding flow from ``batch.prompt`` to tokenizer and text encoder, with branch-specific prompt caching for CFG.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence

@@ -5,6 +5,7 @@ The denoising stage runs the first-frame/video prefill, cached video/action
 rollout, CFG branch combination, and session-cache updates used by the generic
 action endpoint.
 """
+
 from __future__ import annotations
 
 import inspect

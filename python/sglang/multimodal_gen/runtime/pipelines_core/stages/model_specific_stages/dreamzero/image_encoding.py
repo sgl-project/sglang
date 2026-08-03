@@ -5,6 +5,7 @@ The action endpoint sends normalized observation tensors through msgpack. These
 stages materialize tensor inputs, encode the CLIP anchor frame, encode Wan VAE
 conditioning latents, and keep visual state in the DreamZero session cache.
 """
+
 from __future__ import annotations
 
 import time

@@ -5,6 +5,7 @@ The cache maps HTTP logical session IDs to dense physical slots and stores
 prompt, visual, self-attention KV, and cross-attention branch state across
 streaming action requests.
 """
+
 from __future__ import annotations
 
 import hashlib
