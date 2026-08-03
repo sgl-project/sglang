@@ -62,6 +62,8 @@ export const Qwen35Deployment = () => {
           { id: 'h200',   label: 'H200',   default: false,     disabled: isNvfp4 },
           { id: 'b200',   label: 'B200',   default: false,     disabled: false },
           { id: 'b300',   label: 'B300',   default: isNvfp4,   disabled: false },
+          { id: 'gb300',  label: 'GB300',  default: false,     disabled: !isNvfp4,
+            disabledReason: 'GB300 disaggregated serving requires FP4 (Qwen3.5-397B-A17B-NVFP4)' },
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
@@ -85,6 +87,16 @@ export const Qwen35Deployment = () => {
         ];
       }
     },
+    servingMode: {
+      name: 'servingMode',
+      title: 'Serving Mode',
+      condition: (values) => values.hardware === 'gb300',
+      items: [
+        { id: 'low_latency',     label: 'Low Latency',     subtitle: '1P1D · TP4',     default: true  },
+        { id: 'balanced',        label: 'Balanced',        subtitle: '5P1D wide-EP',   default: false },
+        { id: 'high_throughput', label: 'High Throughput', subtitle: '7P1D wide-EP',   default: false }
+      ]
+    },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
@@ -104,7 +116,7 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'gb300',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -113,7 +125,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon',
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'gb300',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -293,10 +305,84 @@ export const Qwen35Deployment = () => {
     `#   <node0-ip>  = IP of the head node (reachable from all others)\n` +
     cmd;
 
+  // GB300 disaggregated multinode topologies (NVFP4, 397B only). Each mode maps to
+  // a SemiAnalysis benchmark recipe, distilled to the server-defining flags
+  // (sizing / port / log / env knobs omitted). Prefill and decode run as separate
+  // role-scoped launchers (--disaggregation-mode), one per worker.
+  const gb300Modes = {
+    low_latency: {
+      title: 'Low Latency — 1 prefill + 1 decode worker',
+      prefill: { tp: 4 },
+      decode:  { tp: 4, moeRunner: 'flashinfer_trtllm' }
+    },
+    balanced: {
+      title: 'Balanced — 5 prefill workers (DEP4) + 1 decode worker (DEP16)',
+      transfer: 'nixl',
+      prefill: { tp: 4, dp: 4, ep: 4, dpAttn: true },
+      decode:  { tp: 16, dp: 16, ep: 16, dpAttn: true, tbo: true, moeRunner: 'flashinfer_cutedsl', wideEp: true }
+    },
+    high_throughput: {
+      title: 'High Throughput — 7 prefill workers (DEP4) + 1 decode worker (DEP16)',
+      transfer: 'mooncake',
+      prefill: { tp: 4, dp: 4, ep: 4, dpAttn: true },
+      decode:  { tp: 16, dp: 16, ep: 16, dpAttn: true, tbo: true, moeRunner: 'flashinfer_cutedsl', wideEp: true }
+    }
+  };
+
+  const generateGB300Command = (mode, reasoning, toolcall) => {
+    const m = gb300Modes[mode] || gb300Modes.low_latency;
+    const modelName = 'nvidia/Qwen3.5-397B-A17B-NVFP4';
+
+    const parsers = [];
+    if (reasoning === 'enabled') parsers.push('--reasoning-parser qwen3');
+    if (toolcall === 'enabled') parsers.push('--tool-call-parser qwen3_coder');
+
+    const buildRole = (role, cfg) => {
+      const lines = [`sglang serve --model-path ${modelName}`];
+      lines.push(`--disaggregation-mode ${role}`);
+      lines.push(`--tp ${cfg.tp}`);
+      if (cfg.dp) lines.push(`--data-parallel-size ${cfg.dp}`);
+      if (cfg.ep) lines.push(`--expert-parallel-size ${cfg.ep}`);
+      if (cfg.dpAttn) {
+        lines.push('--enable-dp-attention');
+        lines.push('--enable-dp-lm-head');
+      }
+      if (cfg.tbo) lines.push('--enable-two-batch-overlap');
+      lines.push('--quantization modelopt_fp4');
+      lines.push('--fp4-gemm-backend flashinfer_cutlass');
+      lines.push('--kv-cache-dtype fp8_e4m3');
+      lines.push('--attention-backend trtllm_mha');
+      lines.push(`--moe-runner-backend ${cfg.moeRunner || 'flashinfer_trtllm'}`);
+      if (cfg.wideEp) {
+        lines.push('--moe-a2a-backend flashinfer');
+        lines.push('--disable-shared-experts-fusion');
+      }
+      lines.push('--linear-attn-decode-backend flashinfer');
+      lines.push('--mamba-scheduler-strategy no_buffer');
+      lines.push('--mamba-ssm-dtype bfloat16');
+      for (const p of parsers) lines.push(p);
+      if (m.transfer) lines.push(`--disaggregation-transfer-backend ${m.transfer}`);
+      lines.push('--disable-radix-cache');
+      lines.push('--trust-remote-code');
+      lines.push('--mem-fraction-static 0.8');
+      return lines.join(' \\\n  ');
+    };
+
+    return `# ${m.title}\n\n# Prefill worker\n${buildRole('prefill', m.prefill)}\n\n# Decode worker\n${buildRole('decode', m.decode)}`;
+  };
+
   // Generate command — must produce byte-identical output to sgl-cookbook's
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
-    const { model, hardware, quantization, speculative, mambaCache } = values;
+    const { model, hardware, quantization, speculative, mambaCache, servingMode, reasoning, toolcall } = values;
+
+    // GB300 disaggregated multinode (NVFP4, 397B only) — three serving modes.
+    if (hardware === 'gb300') {
+      if (model !== '397b' || quantization !== 'fp4') {
+        return '# GB300 disaggregated serving is only available for Qwen3.5-397B-A17B-NVFP4 (FP4)';
+      }
+      return generateGB300Command(servingMode || 'low_latency', reasoning, toolcall);
+    }
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
