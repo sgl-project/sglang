@@ -15,20 +15,22 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
 - `python/sglang/kernels/ops/diffusion/triton/norm.py`
 - `python/sglang/kernels/ops/diffusion/triton/rmsnorm_onepass.py`
+- `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
 - `python/sglang/kernels/ops/diffusion/triton/rotary.py`
 - `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
 - `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
 - `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
 - `python/sglang/kernels/ops/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
-- `test/registered/jit/diffusion/test_qwen_image_modulation.py`
-- `test/registered/jit/diffusion/test_group_norm_silu.py`
-- `test/registered/jit/diffusion/test_residual_gate_add.py`
-- `test/registered/jit/diffusion/test_varlen_pack_pad.py`
-- `test/registered/jit/diffusion/test_varlen_uspattn_equivalence.py`
-- `test/registered/jit/benchmark/diffusion/bench_qwen_image_modulation.py`
-- `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`
-- `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`
+- `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`
+- `test/registered/kernels/ops/diffusion/test_group_norm_silu.py`
+- `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`
+- `test/registered/kernels/ops/diffusion/test_varlen_pack_pad.py`
+- `test/registered/kernels/ops/diffusion/test_varlen_uspattn_equivalence.py`
+- `test/registered/kernels/ops/diffusion/test_zimage_native_norm.py`
+- `test/registered/kernels/benchmark/diffusion/bench_qwen_image_modulation.py`
+- `test/registered/kernels/benchmark/diffusion/bench_group_norm_silu.py`
+- `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`
 - `python/sglang/kernels/ops/layernorm/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
@@ -42,7 +44,7 @@ framework-specific optimization workflow.
 - Use cases: `x * (1 + scale) + shift`, `a * (k + b) + c`, and Qwen-style `(layernorm/residual layernorm) + scale/shift + gate select`.
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
-- Validation: `test/registered/jit/diffusion/test_qwen_image_modulation.py`.
+- Validation: `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`.
 
 2. Norm + Scale/Shift fusion (CuTe DSL)
 - Kernels: `fused_norm_scale_shift`, `fused_scale_residual_norm_scale_shift`
@@ -53,22 +55,25 @@ framework-specific optimization workflow.
 - Constraints: `D % 256 == 0` and `D <= 8192`. `x/residual/gate/scale/shift` must pass shape and stride validation. Dtypes limited to fp16/bf16/fp32.
 - Behavior: CuTe DSL compilation cached by `(dtype, ndim, D, norm_type)`. `None` tensors replaced by scalar placeholders. If constraints fail, `layernorm.py` warns and falls back to native PyTorch.
 
-3. Z-Image fused tanh/gate modulation
-- Kernels: `fused_norm_tanh_mul_add`, `fused_norm_tanh_mul_add_norm_scale`
-- Locations: `layernorm.py`, `cutedsl/norm_tanh_mul_add_norm_scale.py`, `zimage.py`
+3. Z-Image bf16-native RMSNorm modulation (Triton)
+- Kernels: `zimage_rmsnorm_scale`, `zimage_rmsnorm_tanh_residual`
+- Locations: `triton/zimage_native_norm.py`, `zimage.py`
 - Use cases:
-  - `y = tanh(gate) * norm(x) + shift`
-  - `y, y2 = tanh(gate) * norm(x) + shift`, then `y2 = norm(y) * (1 + scale)`
-- Constraints: same CuTe DSL envelope as the norm+scale/shift family in practice: contiguous last dim, fp16/bf16/fp32, and `D % 256 == 0`, `D <= 8192`.
-- Validation: `test/registered/jit/diffusion/test_norm_tanh_mul_add_norm_scale.py`
-- Behavior: this is already a mainline fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
+  - `y = rmsnorm(x) * scale`
+  - `y = residual + tanh(gate) * rmsnorm(x)`
+- Constraints: CUDA bf16 tensors, contiguous weights, flattenable row strides,
+  compatible modulation row counts, and `D <= 8192`.
+- Validation: `test/registered/kernels/ops/diffusion/test_zimage_native_norm.py`
+- Behavior: the kernels preserve Z-Image's native bf16 arithmetic. They return
+  `None` when an eligibility guard fails, and the runtime wrapper executes the
+  native PyTorch formula.
 
 4. Triton LayerNorm/RMSNorm fusion
 - Kernels: `rms_norm_fn`, `layer_norm_fn`, `norm_infer`
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
-- Validation: `test/registered/jit/test_rmsnorm.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_rmsnorm.py`.
 
 5. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
@@ -82,7 +87,7 @@ framework-specific optimization workflow.
 - Use case: GPT-J style RoPE when not Neox.
 - Constraints: `head_size` must be even.
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
-- Validation: `test/registered/jit/test_rope.py`.
+- Validation: `test/registered/kernels/ops/attention/test_rope.py`.
 
 7. LTX2 split RoPE fusion
 - Kernel: `apply_ltx2_split_rotary_emb`
@@ -97,8 +102,8 @@ framework-specific optimization workflow.
 - Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
 - Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
 - Behavior: `_ltx2_residual_gate_add(...)` uses the CUDA custom op while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
-- Validation: `test/registered/jit/diffusion/test_residual_gate_add.py`.
-- Microbench: `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`.
+- Validation: `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`.
+- Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
 - Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
 
 9. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
@@ -107,8 +112,8 @@ framework-specific optimization workflow.
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
 - Enablement: mainline uses `apply_group_norm_silu(...)` in HunyuanVideo VAE paths and LTX latent upsampler paths by default; there is no env toggle. The wrapper dispatches to Triton only when guards pass.
 - Constraints: CUDA inference path only; no grad, `x.requires_grad == False`, `nn.GroupNorm`, `nn.SiLU(inplace=False)`, affine norm with weight and bias. Unsupported cases fall back to native `activation(norm(x))`.
-- Validation: `test/registered/jit/diffusion/test_group_norm_silu.py`.
-- Microbench: `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`.
+- Validation: `test/registered/kernels/ops/diffusion/test_group_norm_silu.py`.
+- Microbench: `test/registered/kernels/benchmark/diffusion/bench_group_norm_silu.py`.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -116,7 +121,8 @@ framework-specific optimization workflow.
 - Location: `layernorm.py`
 - Behavior:
 - Standard `bf16`/`fp16` CUDA paths use `sgl_kernel.fused_add_rmsnorm` and `sgl_kernel.rmsnorm`.
-- The Z-Image `fp32` `32x2560` path under `torch.compile` avoids `wrap_triton` and uses the native fp32 path.
+- Z-Image keeps bf16 arithmetic and uses its dedicated Triton native-norm
+  kernels when their guards pass.
 - `hidden_size <= 128` uses Triton one-pass.
 - ROCm falls back to native.
 
@@ -131,7 +137,7 @@ framework-specific optimization workflow.
 4. Varlen USP attention pack/scatter
 - Locations: `runtime/layers/attention/layer.py`, `triton/varlen_pack_pad.py`
 - Behavior: masked `USPAttention.forward` can gather dense Q/K/V into packed `[total_valid, H, D]` rows with `fused_pack_qkv`, run varlen attention, then scatter back with `fused_scatter_to_padded`.
-- Validation: `test/registered/jit/diffusion/test_varlen_pack_pad.py` and `test_varlen_uspattn_equivalence.py`.
+- Validation: `test/registered/kernels/ops/diffusion/test_varlen_pack_pad.py` and `test/registered/kernels/ops/diffusion/test_varlen_uspattn_equivalence.py`.
 - Workflow rule: if a masked attention trace spends time in Python/advanced indexing pack or scatter, first check whether this fused varlen path should have engaged.
 
 **QK Norm Optimization**
@@ -144,7 +150,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `test/registered/jit/test_qknorm.py` and `test/registered/jit/test_qknorm_across_heads.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py` and `test/registered/kernels/ops/layernorm/test_qknorm_across_heads.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -159,7 +165,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, dtype)` returns true.
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
-- Validation: `test/registered/jit/diffusion/test_qknorm_rope.py`.
+- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_rope.py`.
 - Workflow rule: treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, and check the separate LTX2 split-RoPE path before proposing new attention-prep kernels.
 
 **Nunchaku Fused GELU MLP**
@@ -187,7 +193,9 @@ framework-specific optimization workflow.
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_layernorm_scale_shift_gate_select01_kernel` and `fuse_residual_layernorm_scale_shift_gate_select01_kernel` through `fused_scale_shift_gate.py` and `qwen_image.py`.
-- Z-Image residual-form modulation: `fused_norm_tanh_mul_add` and `fused_norm_tanh_mul_add_norm_scale` in `zimage.py`.
+- Z-Image native norm modulation: `zimage_rmsnorm_scale` and
+  `zimage_rmsnorm_tanh_mul_add` in `zimage.py`, backed by
+  `triton/zimage_native_norm.py`.
 - HunyuanVideo VAE and LTX upsampler GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py` and `latent_upsampler.py`; default-eligible when wrapper guards pass.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.

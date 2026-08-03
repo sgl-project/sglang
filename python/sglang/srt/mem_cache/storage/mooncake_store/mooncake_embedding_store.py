@@ -1,7 +1,10 @@
 import logging
 from typing import Any, List
 
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeBaseStore
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+    DEFAULT_TENANT_ID,
+    MooncakeBaseStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,15 +19,28 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
         MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
         self.config = self._load_config(storage_config)
-        ret_code = self.store.setup(
-            self.config.local_hostname,
-            self.config.metadata_server,
-            self.config.global_segment_size,
-            16 * 1024 * 1024,  # Internal local buffer size
-            self.config.protocol,
-            self.config.device_name,
-            self.config.master_server_address,
-        )
+        setup_kwargs = {}
+        if self.config.tenant_id != DEFAULT_TENANT_ID:
+            setup_kwargs["tenant_id"] = self.config.tenant_id
+        try:
+            ret_code = self.store.setup(
+                self.config.local_hostname,
+                self.config.metadata_server,
+                self.config.global_segment_size,
+                16 * 1024 * 1024,  # Internal local buffer size
+                self.config.protocol,
+                self.config.device_name,
+                self.config.master_server_address,
+                **setup_kwargs,
+            )
+        except TypeError as e:
+            if "tenant_id" in setup_kwargs and "tenant_id" in str(e):
+                raise RuntimeError(
+                    "The installed Mooncake version does not support tenant_id "
+                    "in MooncakeDistributedStore.setup(). Please upgrade "
+                    "Mooncake to use non-default Mooncake tenants with SGLang."
+                ) from e
+            raise
         if ret_code != 0:
             raise RuntimeError(f"Failed to setup Mooncake Embedding Store: {ret_code}")
 
