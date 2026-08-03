@@ -99,7 +99,7 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.skip_install_flag }}" ]; then
-            echo "skip_install_flag=false" >> $GITHUB_OUTPUT
+            echo "skip_install_flag=true" >> $GITHUB_OUTPUT
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
           fi
