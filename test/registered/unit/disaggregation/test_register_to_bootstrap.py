@@ -17,7 +17,7 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     def setUp(self):
         # register_to_bootstrap reads get_parallel().load_balance_method /
-        # .enable_dsa_cache_layer_split and get_serving().port from the
+        # .enable_cp_cache_layer_split and get_serving().port from the
         # published config.
         override = get_context().override_server_args(
             load_balance_method="follow_bootstrap_room", port=30000

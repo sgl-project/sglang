@@ -31,6 +31,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    should_use_cp_cache_layer_split_pool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -185,13 +188,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
-        from sglang.srt.layers.cp.utils import (
-            get_glm_dsa_layer_split_effective_num_layers,
-        )
+        effective_num_layers = num_layers
+        if (
+            should_use_cp_cache_layer_split_pool(kvc)
+            and kvc.use_mla_backend
+            and is_deepseek_dsa(model_config.hf_config)
+        ):
+            from sglang.srt.mem_cache.cp_cache_layer_split.dsa import (
+                get_dsa_layer_split_effective_num_layers,
+            )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
-        )
+            effective_num_layers = get_dsa_layer_split_effective_num_layers(
+                num_layers, get_parallel().attn_cp_size
+            )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size

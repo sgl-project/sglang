@@ -183,7 +183,7 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend or get_parallel().enable_cp_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -704,7 +704,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
-            "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "enable_dsa_cache_layer_split": get_parallel().enable_cp_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1165,7 +1165,7 @@ class CommonKVSender(BaseKVSender):
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().enable_cp_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,

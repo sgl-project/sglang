@@ -59,7 +59,7 @@ def _run(rank: int, world: int, port: int):
         attention_context_model_parallel_size=world,
     )
 
-    from sglang.srt.mem_cache.dsa_cache_layer_split import (
+    from sglang.srt.mem_cache.cp_cache_layer_split.dsa import (
         LayerSplitDSATokenToKVPool,
     )
 
