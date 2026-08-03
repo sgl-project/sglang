@@ -14,11 +14,20 @@ from sglang.kernels.ops.attention.helion.kda_decode import (
     helion_fused_recurrent_kda_packed_decode,
 )
 from sglang.kernels.ops.attention.helion.kda_prefill import (
+    _intra_matrices_wide,
+)
+from sglang.kernels.ops.attention.helion.kda_prefill import (
     chunk_kda as helion_chunk_kda,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+_DECODE_STATE_ATOL = {
+    torch.float32: 1e-5,
+    torch.bfloat16: 2e-3,
+    torch.float16: 5e-4,
+}
 
 
 def test_public_signatures_match_triton() -> None:
@@ -113,8 +122,13 @@ def test_packed_decode_contract(state_dtype: torch.dtype) -> None:
 
     assert result.data_ptr() == helion_out.data_ptr()
     assert result_state.data_ptr() == helion_state.data_ptr()
-    torch.testing.assert_close(helion_out, triton_out, atol=2e-2, rtol=1e-2)
-    torch.testing.assert_close(helion_state, triton_state, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(helion_out, triton_out, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        helion_state,
+        triton_state,
+        atol=_DECODE_STATE_ATOL[state_dtype],
+        rtol=1e-4,
+    )
     assert torch.count_nonzero(helion_out[1]).item() == 0
     untouched = torch.tensor([0, 1, 3, 4, 6], device="cuda")
     assert torch.equal(helion_state[untouched], state[untouched])
@@ -199,8 +213,13 @@ def test_packed_decode_lower_bound_contract(state_dtype: torch.dtype) -> None:
 
     assert result.data_ptr() == helion_out.data_ptr()
     assert result_state.data_ptr() == helion_state.data_ptr()
-    torch.testing.assert_close(helion_out, reference_out, atol=2e-2, rtol=1e-2)
-    torch.testing.assert_close(helion_state, reference_state, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(helion_out, reference_out, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        helion_state,
+        reference_state,
+        atol=_DECODE_STATE_ATOL[state_dtype],
+        rtol=1e-4,
+    )
     assert torch.count_nonzero(helion_out[1]).item() == 0
 
 
@@ -397,6 +416,51 @@ def test_prefill_uses_stable_subchunk_gates() -> None:
     assert torch.isfinite(output).all()
     assert torch.isfinite(chunks).all()
     assert torch.isfinite(final_state).all()
+
+
+@pytest.mark.parametrize("is_varlen", [False, True])
+def test_prefill_diagonal_uses_midpoint_gate_anchor(is_varlen: bool) -> None:
+    """Prevent leading-edge anchoring from saturating the +/-126 gate clamp."""
+    tokens, heads, key_dim = 16, 1, 32
+    q = torch.full(
+        (1, tokens, heads, key_dim),
+        key_dim**-0.5,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = q.clone()
+    cumulative_gate = -10.0 * torch.arange(tokens, device="cuda", dtype=torch.float32)
+    gate = cumulative_gate.view(1, tokens, 1, 1).expand_as(q).float()
+    beta = torch.ones(1, tokens, heads, device="cuda")
+    if is_varlen:
+        metadata = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+        chunk_indices = torch.tensor([[0, 0]], device="cuda", dtype=torch.int32)
+    else:
+        metadata = torch.empty(0, device="cuda", dtype=torch.int32)
+        chunk_indices = torch.empty(0, 2, device="cuda", dtype=torch.int32)
+
+    aqk, _ = _intra_matrices_wide(
+        q,
+        k,
+        gate,
+        beta,
+        metadata,
+        chunk_indices,
+        1.0,
+        is_varlen=is_varlen,
+    )
+
+    qk = q[0, :, 0].float() @ k[0, :, 0].float().T
+    gate_delta = cumulative_gate[:, None] - cumulative_gate[None, :]
+    causal = (
+        torch.arange(tokens, device="cuda")[:, None]
+        >= torch.arange(tokens, device="cuda")[None, :]
+    )
+    expected = torch.where(causal, qk * torch.exp2(gate_delta), 0.0)
+    actual = aqk[0, :, 0, :tokens].float()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
 
 
 def test_fp16_preactivated_gate_with_bf16_state_contract() -> None:
