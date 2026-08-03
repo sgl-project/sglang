@@ -23,12 +23,15 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
+)
+from sglang.kernels.ops.quantization.quant_format import (
+    create_group_quant_outputs,
+    create_group_quant_scale,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -106,13 +109,14 @@ def _packed_exp_to_dequant_scale(x_s, ng) -> torch.Tensor:
 
 
 def _alloc_scale(x_shape, *, column_major, scale_ue8m0):
-    s = create_per_token_group_quant_fp8_output_scale(
+    s = create_group_quant_scale(
         x_shape=x_shape,
         device="cuda",
         group_size=G,
         column_major_scales=column_major,
         scale_tma_aligned=column_major,
         scale_ue8m0=scale_ue8m0,
+        pack_ue8m0=column_major,
     )
     s.zero_()
     return s
@@ -206,15 +210,16 @@ def test_ue8m0_group_sizes(group_size):
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     q_ref, exp_ref = ref_fp8_ue8m0(x, group_size)
 
-    x_q = torch.zeros_like(x, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=(num_tokens, hidden),
         device="cuda",
         group_size=group_size,
         column_major_scales=True,
         scale_tma_aligned=True,
         scale_ue8m0=True,
+        pack_ue8m0=True,
     )
+    x_q.zero_()
     x_s.zero_()
     per_token_group_quant(x, x_q, x_s, group_size, scale_ue8m0=True)
     torch.cuda.synchronize()

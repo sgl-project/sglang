@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.quantization.quant_format import create_group_quant_outputs
 from sglang.srt.utils import is_xpu
 
 from .utils import make_name
@@ -216,15 +217,21 @@ def silu_and_mul_masked_post_quant(
 
 def silu_and_mul_contig_post_quant(
     input: torch.Tensor,
-    output: torch.Tensor,
-    output_scale: torch.Tensor,
     quant_group_size: int,
     scale_ue8m0: bool = False,
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     apply_swiglu_limit = swiglu_limit is not None
+    output, output_scale = create_group_quant_outputs(
+        x_shape=(input.shape[0], input.shape[1] // 2),
+        device=input.device,
+        group_size=quant_group_size,
+        column_major_scales=transposed,
+        scale_tma_aligned=transposed,
+        scale_ue8m0=scale_ue8m0,
+    )
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )
@@ -235,3 +242,4 @@ def silu_and_mul_contig_post_quant(
         transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )
+    return output, output_scale

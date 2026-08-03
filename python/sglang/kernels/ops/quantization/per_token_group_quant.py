@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.quantization.quant_format import create_group_quant_outputs
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -117,47 +118,6 @@ def _per_token_group_quant_custom_op(
         module.per_token_group_quant(input, output_q, output_s)
 
 
-def _allocate_outputs(
-    input: torch.Tensor,
-    group_size: int,
-    out_dtype: torch.dtype,
-    scale_ue8m0: bool,
-    column_major_scales: bool,
-    fuse_silu_and_mul: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate ``(output_q, output_s)`` in the requested major mode / scale
-    format, selected by ``(column_major_scales, scale_ue8m0)``."""
-    hidden = input.shape[-1] // (2 if fuse_silu_and_mul else 1)
-    out_shape = (*input.shape[:-1], hidden)
-    output_q = torch.empty(out_shape, device=input.device, dtype=out_dtype)
-
-    num_groups = hidden // group_size
-    if scale_ue8m0 and not column_major_scales:
-        # Row-major packed UE8M0: int32 [..., ceil(ng/4)] contiguous (an
-        # unaligned ng leaves a partially-used last int32 that the kernel zero-
-        # pads). The shared create_*_output_scale helper does not produce this
-        # layout.
-        output_s = torch.empty(
-            (*out_shape[:-1], (num_groups + 3) // 4),
-            device=input.device,
-            dtype=torch.int32,
-        )
-    else:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            create_per_token_group_quant_fp8_output_scale,
-        )
-
-        output_s = create_per_token_group_quant_fp8_output_scale(
-            x_shape=out_shape,
-            device=input.device,
-            group_size=group_size,
-            column_major_scales=column_major_scales,
-            scale_tma_aligned=column_major_scales,
-            scale_ue8m0=scale_ue8m0,
-        )
-    return output_q, output_s
-
-
 @debug_kernel_api
 def per_token_group_quant(
     input: torch.Tensor,
@@ -199,13 +159,17 @@ def per_token_group_quant(
     """
     if output_q is None:
         assert output_s is None
-        output_q, output_s = _allocate_outputs(
-            input,
-            group_size,
-            out_dtype or torch.float8_e4m3fn,
-            scale_ue8m0,
-            column_major_scales,
-            fuse_silu_and_mul,
+        hidden = input.shape[-1] // (2 if fuse_silu_and_mul else 1)
+        out_shape = (*input.shape[:-1], hidden)
+        output_q, output_s = create_group_quant_outputs(
+            x_shape=out_shape,
+            device=input.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=column_major_scales,
+            scale_ue8m0=scale_ue8m0,
+            pack_ue8m0=True,
+            out_dtype=out_dtype,
         )
     else:
         assert output_s is not None

@@ -210,9 +210,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            create_per_token_group_quant_fp8_output_scale,
-        )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -259,23 +256,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
-            down_input_fp8 = torch.empty(
-                (all_tokens, N // 2),
-                device=gateup_output.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            down_input_scale = create_per_token_group_quant_fp8_output_scale(
-                x_shape=(all_tokens, N // 2),
-                device=gateup_output.device,
-                group_size=scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
-            silu_and_mul_contig_post_quant(
+            down_input_fp8, down_input_scale = silu_and_mul_contig_post_quant(
                 input=gateup_output,
-                output=down_input_fp8,
-                output_scale=down_input_scale,
                 quant_group_size=scale_block_size,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
