@@ -114,6 +114,24 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
         self.assertIs(item.feature, feature)
 
+    def test_pickle_transport_reuses_materialized_shared_tensor(self):
+        parent = torch.arange(128, dtype=torch.float32).view(32, 4)
+        shared_view = parent[4:8]
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(0, 0)],
+                feature=shared_view,
+            )
+            for _ in range(2)
+        ]
+        output = MultimodalProcessorOutput(mm_items=items)
+
+        wrap_as_pickle(output)
+
+        self.assertIs(items[0].feature, items[1].feature)
+        self.assertIsNot(items[0].feature, shared_view)
+
     def test_image_grid_hws_splits_per_image(self):
         # grid rows [[2,3],[4,1]] -> prod = [6, 4] patches -> feature_len 10.
         item = _bundled_item(

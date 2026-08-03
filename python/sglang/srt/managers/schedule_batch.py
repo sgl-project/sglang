@@ -422,9 +422,10 @@ class MultimodalDataItem:
     def is_precomputed_embedding(self):
         return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
-    def materialize_cpu_views_for_pickle(self):
+    def materialize_cpu_views_for_pickle(self, memo=None):
         """Detach sliced CPU tensors from oversized parent pickle storages."""
-        memo = {}
+        if memo is None:
+            memo = {}
         self.feature = _materialize_cpu_tensor_views(self.feature, memo)
         self.precomputed_embeddings = _materialize_cpu_tensor_views(
             self.precomputed_embeddings, memo
@@ -540,9 +541,11 @@ class MultimodalProcessorOutput:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
-    def materialize_cpu_views_for_pickle(self):
+    def materialize_cpu_views_for_pickle(self, memo=None):
+        if memo is None:
+            memo = {}
         for item in self.mm_items:
-            item.materialize_cpu_views_for_pickle()
+            item.materialize_cpu_views_for_pickle(memo)
 
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
@@ -625,9 +628,11 @@ class MultimodalInputs:
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
 
-    def materialize_cpu_views_for_pickle(self):
+    def materialize_cpu_views_for_pickle(self, memo=None):
+        if memo is None:
+            memo = {}
         for item in self.mm_items:
-            item.materialize_cpu_views_for_pickle()
+            item.materialize_cpu_views_for_pickle(memo)
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
