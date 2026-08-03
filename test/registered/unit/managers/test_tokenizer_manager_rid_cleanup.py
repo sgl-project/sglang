@@ -135,7 +135,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     return tm
 
 
-def _make_req_state(rid: str = "test_rid") -> ReqState:
+def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqState:
     """Create a minimal ReqState for testing."""
     obj = Mock(spec=GenerateReqInput)
     obj.rid = rid
@@ -149,6 +149,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
+        dispatched=dispatched,
     )
 
 
@@ -468,7 +469,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
     def test_discard_single_aborts_scheduler_before_cleanup(self):
         tm = _make_tokenizer_manager()
         rid = "d_single"
-        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm.rid_to_state[rid] = _make_req_state(rid, dispatched=True)
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid
@@ -478,7 +479,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         self.assertEqual(abort_req.rid, rid)
         self.assertFalse(abort_req.abort_all)
 
-    def test_discard_batch_removes_all(self):
+    def test_discard_unsent_batch_without_scheduler_abort(self):
         tm = _make_tokenizer_manager()
         rids = ["d0", "d1", "d2"]
         for r in rids:
@@ -489,6 +490,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         tm._discard_pending_req_states(obj)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_not_called()
 
     def test_discard_ignores_already_removed(self):
         """Popping a rid that is no longer present must not raise."""
@@ -509,6 +511,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         for child_rid in child_rids:
             child = _make_generate_obj(child_rid, is_single=True)
             tm._init_child_req_state("parent", child)
+            tm.rid_to_state[child_rid].dispatched = True
         tm._remove_req_state("parent")
 
         tm._discard_pending_req_states(parent, lifecycle_ids)
@@ -670,6 +673,7 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # Got past _init_req_state (which created the entry) ...
         tm._tokenize_one_request.assert_awaited_once()
         tm._send_one_request.assert_not_called()
+        tm._dispatch_to_scheduler.assert_not_called()
         # ... and the entry was cleaned up rather than leaked.
         self.assertNotIn(rid, tm.rid_to_state)
 
@@ -694,42 +698,49 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_not_called()
 
-    def test_parallel_abort_during_tokenization_prevents_child_dispatch(self):
-        tm = _make_tm_for_generate()
-        tm._send_one_request = Mock()
-        obj = GenerateReqInput(
-            text="hello",
-            rid="abort-during-tokenization",
-            sampling_params={"n": 2},
-        )
+    def test_interrupted_parallel_tokenization_prevents_child_dispatch(self):
+        for remove_state in (False, True):
+            with self.subTest(remove_state=remove_state):
+                tm = _make_tm_for_generate()
+                tm._send_one_request = Mock()
+                obj = GenerateReqInput(
+                    text="hello",
+                    rid="interrupted-during-tokenization",
+                    sampling_params={"n": 2},
+                )
 
-        async def drive():
-            tokenization_started = asyncio.Event()
-            allow_tokenization = asyncio.Event()
+                async def drive():
+                    tokenization_started = asyncio.Event()
+                    allow_tokenization = asyncio.Event()
 
-            async def blocked_tokenization(_obj):
-                tokenization_started.set()
-                await allow_tokenization.wait()
-                return MagicMock()
+                    async def blocked_tokenization(_obj):
+                        tokenization_started.set()
+                        await allow_tokenization.wait()
+                        return MagicMock()
 
-            tm._tokenize_one_request = blocked_tokenization
-            response = tm.generate_request(obj)
-            task = asyncio.create_task(response.__anext__())
-            await tokenization_started.wait()
-            tm.abort_request("abort-during-tokenization")
-            allow_tokenization.set()
-            with self.assertRaisesRegex(
-                RequestAbortedError, "abort-during-tokenization"
-            ):
-                await task
+                    tm._tokenize_one_request = blocked_tokenization
+                    response = tm.generate_request(obj)
+                    task = asyncio.create_task(response.__anext__())
+                    await tokenization_started.wait()
+                    if remove_state:
+                        tm._remove_req_state("interrupted-during-tokenization")
+                    else:
+                        tm.abort_request("interrupted-during-tokenization")
+                    allow_tokenization.set()
+                    with self.assertRaisesRegex(
+                        RequestAbortedError, "interrupted-during-tokenization"
+                    ):
+                        await task
 
-        asyncio.run(drive())
+                asyncio.run(drive())
 
-        tm._send_one_request.assert_not_called()
-        self.assertFalse(tm.rid_to_state)
-        self.assertFalse(tm.logical_rid_to_child_rids)
-        self.assertFalse(tm.child_rid_to_logical_rid)
+                tm._send_one_request.assert_not_called()
+                tm._dispatch_to_scheduler.assert_not_called()
+                self.assertFalse(tm.rid_to_state)
+                self.assertFalse(tm.logical_rid_to_child_rids)
+                self.assertFalse(tm.child_rid_to_logical_rid)
 
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate()

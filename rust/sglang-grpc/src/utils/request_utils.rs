@@ -109,15 +109,44 @@ fn sampling_params_to_map(
                 }
             } else {
                 if let Some(value) = p.json_schema.as_ref() {
+                    if value.is_empty() {
+                        return Err("legacy json_schema must not be empty".into());
+                    }
                     map.insert("json_schema".into(), serde_json::json!(value));
                 }
                 if let Some(value) = p.regex.as_ref() {
+                    if value.is_empty() {
+                        return Err("legacy regex must not be empty".into());
+                    }
                     map.insert("regex".into(), serde_json::json!(value));
                 }
             }
             Ok(serde_json::Value::Object(map))
         }
         None => Ok(serde_json::Value::Object(serde_json::Map::new())),
+    }
+}
+
+fn insert_generation_controls(
+    d: &mut HashMap<String, serde_json::Value>,
+    priority: Option<i32>,
+    require_reasoning: Option<bool>,
+    max_thinking_tokens: Option<u32>,
+) {
+    if let Some(priority) = priority {
+        d.insert("priority".into(), serde_json::json!(priority));
+    }
+    if let Some(require_reasoning) = require_reasoning {
+        d.insert(
+            "require_reasoning".into(),
+            serde_json::json!(require_reasoning),
+        );
+    }
+    if let Some(max_thinking_tokens) = max_thinking_tokens {
+        d.insert(
+            "max_thinking_tokens".into(),
+            serde_json::json!(max_thinking_tokens),
+        );
     }
 }
 
@@ -214,18 +243,12 @@ pub(crate) fn build_text_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
-    if let Some(params) = req.sampling_params.as_ref() {
-        d.insert(
-            "require_reasoning".into(),
-            serde_json::json!(params.require_reasoning.unwrap_or(false)),
-        );
-        if let Some(max_thinking_tokens) = params.max_thinking_tokens {
-            d.insert(
-                "max_thinking_tokens".into(),
-                serde_json::json!(max_thinking_tokens),
-            );
-        }
-    }
+    insert_generation_controls(
+        &mut d,
+        req.priority,
+        req.require_reasoning,
+        req.max_thinking_tokens,
+    );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
@@ -274,21 +297,12 @@ pub(crate) fn build_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
-    if let Some(priority) = req.priority {
-        d.insert("priority".into(), serde_json::json!(priority));
-    }
-    if let Some(params) = req.sampling_params.as_ref() {
-        d.insert(
-            "require_reasoning".into(),
-            serde_json::json!(params.require_reasoning.unwrap_or(false)),
-        );
-        if let Some(max_thinking_tokens) = params.max_thinking_tokens {
-            d.insert(
-                "max_thinking_tokens".into(),
-                serde_json::json!(max_thinking_tokens),
-            );
-        }
-    }
+    insert_generation_controls(
+        &mut d,
+        req.priority,
+        req.require_reasoning,
+        req.max_thinking_tokens,
+    );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
@@ -438,23 +452,50 @@ mod tests {
     }
 
     #[test]
-    fn generate_maps_nested_generation_controls() {
-        let request = proto::GenerateRequest {
-            sampling_params: Some(proto::SamplingParams {
-                seed: Some(42),
-                require_reasoning: Some(true),
-                max_thinking_tokens: Some(128),
-                ..Default::default()
-            }),
+    fn generate_dicts_preserve_optional_generation_controls() {
+        let sampling_params = proto::SamplingParams {
+            seed: Some(42),
             ..Default::default()
         };
-        let mapped = build_generate_dict("request", &request).unwrap();
-        assert_eq!(mapped["require_reasoning"], serde_json::json!(true));
-        assert_eq!(
-            mapped["sampling_params"]["sampling_seed"],
-            serde_json::json!(42)
-        );
-        assert_eq!(mapped["max_thinking_tokens"], serde_json::json!(128));
+        let text_request = proto::TextGenerateRequest {
+            sampling_params: Some(sampling_params.clone()),
+            priority: Some(3),
+            require_reasoning: Some(false),
+            max_thinking_tokens: Some(128),
+            ..Default::default()
+        };
+        let token_request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                seed: Some(42),
+                ..Default::default()
+            }),
+            priority: Some(3),
+            require_reasoning: Some(false),
+            max_thinking_tokens: Some(128),
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("text-request", &text_request).unwrap(),
+            build_generate_dict("token-request", &token_request).unwrap(),
+        ] {
+            assert_eq!(mapped["priority"], serde_json::json!(3));
+            assert_eq!(mapped["require_reasoning"], serde_json::json!(false));
+            assert_eq!(mapped["max_thinking_tokens"], serde_json::json!(128));
+            assert_eq!(
+                mapped["sampling_params"]["sampling_seed"],
+                serde_json::json!(42)
+            );
+        }
+
+        for mapped in [
+            build_text_generate_dict("text-request", &Default::default()).unwrap(),
+            build_generate_dict("token-request", &Default::default()).unwrap(),
+        ] {
+            assert!(!mapped.contains_key("priority"));
+            assert!(!mapped.contains_key("require_reasoning"));
+            assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
     }
 
     #[test]
@@ -504,7 +545,15 @@ mod tests {
             ..Default::default()
         };
 
-        for request in [conflicting, empty_choice] {
+        let empty_legacy_regex = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                regex: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for request in [conflicting, empty_choice, empty_legacy_regex] {
             assert!(build_generate_dict("request", &request).is_err());
         }
     }

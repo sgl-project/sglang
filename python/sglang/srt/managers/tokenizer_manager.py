@@ -169,7 +169,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
-class RequestAbortedError(RuntimeError):
+class RequestAbortedError(ValueError):
     status_code = 499
 
 
@@ -186,6 +186,7 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     abort_requested: bool = False
     lifecycle_id: object = dataclasses.field(default_factory=object)
+    dispatched: bool = False
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1481,6 +1482,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         time_stats = tokenized_obj.time_stats
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.dispatched = True
         tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
@@ -1502,6 +1506,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         self._dispatch_to_scheduler(batch_req)
+        for tokenized_obj in tokenized_objs:
+            state = self.rid_to_state.get(tokenized_obj.rid)
+            if state is not None:
+                state.dispatched = True
         for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
             tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -1860,7 +1868,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        self._ensure_rid_lifecycle_state()
         if abort_all:
             for state_rid, state in self.rid_to_state.items():
                 if state_rid not in self.child_rid_to_logical_rid:
@@ -3193,13 +3200,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
-    def _ensure_rid_lifecycle_state(self) -> None:
-        # Some unit tests construct TokenizerManager with __new__.
-        if not hasattr(self, "logical_rid_to_child_rids"):
-            self.logical_rid_to_child_rids = {}
-        if not hasattr(self, "child_rid_to_logical_rid"):
-            self.child_rid_to_logical_rid = {}
-
     @staticmethod
     def _logical_rids(obj) -> List[str]:
         if not hasattr(obj, "is_single") or obj.is_single:
@@ -3207,7 +3207,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return list(obj.rid)
 
     def _register_child_rid(self, logical_rid: str, child_rid: str) -> None:
-        self._ensure_rid_lifecycle_state()
         if child_rid == logical_rid:
             raise ValueError(
                 "Parallel-sampling child RID must differ from its logical RID"
@@ -3227,9 +3226,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ) -> None:
         self._raise_if_logical_rid_aborted(logical_rid)
-        logical_state = self.rid_to_state.get(logical_rid)
-        if logical_state is None:
-            raise RequestAbortedError(f"Request {logical_rid} was aborted")
+        logical_state = self.rid_to_state[logical_rid]
         self._init_req_state(
             obj,
             request,
@@ -3247,7 +3244,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         lifecycle_id: Optional[object] = None,
     ) -> Optional[ReqState]:
         """Remove a request state and its parallel-sampling ownership."""
-        self._ensure_rid_lifecycle_state()
         state = self.rid_to_state.get(rid)
         if state is None or (
             lifecycle_id is not None and state.lifecycle_id is not lifecycle_id
@@ -3265,7 +3261,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _raise_if_logical_rid_aborted(self, logical_rid: str) -> None:
         state = self.rid_to_state.get(logical_rid)
-        if state is not None and state.abort_requested:
+        if state is None or state.abort_requested:
             raise RequestAbortedError(f"Request {logical_rid} was aborted")
 
     def _raise_if_logical_request_aborted(self, obj) -> None:
@@ -3308,7 +3304,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(len(obj.rid))
             ]
 
-        self._ensure_rid_lifecycle_state()
         rids = [rid for rid, _, _ in items]
         seen_rids = set()
         for rid in rids:
@@ -3349,11 +3344,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         """Drop all logical and child state owned by *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Safe to call after a partial/failed dispatch: only requests known to have
+        reached the scheduler are aborted, all owned state is removed, and a later
+        output for a discarded RID is ignored by the scheduler-response path.
         """
-        self._ensure_rid_lifecycle_state()
         if lifecycle_ids is None:
             lifecycle_ids = {
                 logical_rid: state.lifecycle_id
@@ -3376,7 +3370,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             owns_logical_state = (
                 logical_state is not None and logical_state.lifecycle_id is lifecycle_id
             )
-            target_rids = child_rids or ((logical_rid,) if owns_logical_state else ())
+            target_rids = tuple(
+                rid for rid in child_rids if self.rid_to_state[rid].dispatched
+            )
+            if not child_rids and owns_logical_state and logical_state.dispatched:
+                target_rids = (logical_rid,)
             for target_rid in target_rids:
                 try:
                     self._dispatch_to_scheduler(

@@ -67,8 +67,6 @@ message SamplingParams {
   optional string regex = 15 [deprecated = true];
   optional int64 seed = 16;
   optional GuidedDecoding guided_decoding = 17;
-  optional bool require_reasoning = 18;
-  optional uint32 max_thinking_tokens = 19;
 }
 
 message GuidedDecoding {
@@ -102,6 +100,9 @@ message TextGenerateRequest {
   map<string, string> trace_headers = 12;
   optional string session_id = 13;
   optional DisaggregatedParams disaggregated_params = 14;
+  optional int32 priority = 15;
+  optional bool require_reasoning = 16;
+  optional uint32 max_thinking_tokens = 17;
 }
 
 message TextGenerateResponse {
@@ -127,6 +128,8 @@ message GenerateRequest {
   optional string session_id = 12;
   optional DisaggregatedParams disaggregated_params = 13;
   optional int32 priority = 14;
+  optional bool require_reasoning = 15;
+  optional uint32 max_thinking_tokens = 16;
 }
 
 message GenerateResponse {

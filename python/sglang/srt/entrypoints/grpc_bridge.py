@@ -299,6 +299,7 @@ class RuntimeHandle:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 completed_choices = set()
+                expected_choices = obj.batch_size * obj.parallel_sample_num
                 async for chunk in gen:
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
@@ -308,9 +309,6 @@ class RuntimeHandle:
                             "index", chunk.get("meta_info", {}).get("id")
                         )
                         completed_choices.add(choice_id)
-                    expected_choices = obj.batch_size * getattr(
-                        obj, "parallel_sample_num", 1
-                    )
                     finished = len(completed_choices) >= expected_choices
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -42,7 +43,7 @@ def _make_runtime_handle(responses):
     return handle
 
 
-class TestNativeGrpcParallelResponses(unittest.TestCase):
+class TestNativeGrpcParallelResponses(CustomTestCase):
     def test_non_streaming_returns_every_choice_before_finishing(self):
         callback = _RecordingCallback()
         responses = [

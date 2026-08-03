@@ -153,11 +153,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import (
-    RequestAbortedError,
-    ServerStatus,
-    TokenizerManager,
-)
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -854,7 +850,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
-            except (RequestAbortedError, ValueError) as e:
+            except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
                 # stop (the request was already aborted upstream) instead of
@@ -885,7 +881,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 obj, request
             ).__anext__()
             return orjson_response(ret)
-        except (RequestAbortedError, ValueError) as e:
+        except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
