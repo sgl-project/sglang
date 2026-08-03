@@ -3,7 +3,11 @@ import os
 from typing import Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
+from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+    _BUCKET_MASK,
+    BUCKET_HEX_CHARS,
+    route_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +228,7 @@ class NixlFileManager:
         else:
             for base in self.base_dirs:
                 os.makedirs(base, exist_ok=True)
+            self.ensure_all_bucket_dirs()
             logger.debug(
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
@@ -246,6 +251,19 @@ class NixlFileManager:
             except Exception as e:
                 logger.error(f"Failed to clear base directory {base}: {e}")
         logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
+
+    def ensure_all_bucket_dirs(self) -> None:
+        """Pre-create every possible bucket directory under each base dir.
+
+        Called once when path mode is active so NIXL O_CREAT writes never
+        fail due to a missing parent directory.
+        """
+        for base in self.base_dirs:
+            for i in range(_BUCKET_MASK + 1):
+                os.makedirs(
+                    os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}"),
+                    exist_ok=True,
+                )
 
     def iter_all_base_dirs(self) -> list[str]:
         """Return base directories that may contain NIXL FILE cache entries."""

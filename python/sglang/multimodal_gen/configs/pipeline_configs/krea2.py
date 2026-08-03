@@ -11,6 +11,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 
 # Resolution-interpolation endpoints for the time-shift `mu` (reference sampler):
 # mu is linear in image-token count between (min_res, 0.5) and (max_res, 1.15).
@@ -74,8 +78,22 @@ class Krea2PipelineConfig(ImagePipelineConfig):
         img_ids[..., 2] = torch.arange(w_tok, device=device)[None, :]
         img_pos = img_ids.reshape(h_tok * w_tok, 3).unsqueeze(0).expand(b, -1, -1)
         txt_pos = torch.zeros(b, txt_len, 3, device=device)
-        pos = torch.cat([txt_pos, img_pos], dim=1)
 
+        sp_world_size = get_sp_world_size()
+        if sp_world_size > 1:
+            # Shard the image RoPE positions to match the denoise stage's latent
+            # sharding; the text prefix stays replicated (kept out of the all-to-all
+            # via num_replicated_prefix). The masked path is incompatible with
+            # replicated-prefix, so ragged multi-prompt batches aren't supported.
+            if text_mask is not None and not bool(text_mask.all()):
+                raise ValueError(
+                    "Krea-2 sequence parallelism does not support ragged/padded "
+                    "multi-prompt batches; use a single prompt or --tp-size."
+                )
+            img_pos = self._shard_img_pos_for_sp(img_pos, sp_world_size)
+            return {"pos": torch.cat([txt_pos, img_pos], dim=1), "mask": None}
+
+        pos = torch.cat([txt_pos, img_pos], dim=1)
         img_mask = torch.ones(b, h_tok * w_tok, dtype=torch.bool, device=device)
         if text_mask is None:
             txt_mask = torch.ones(b, txt_len, dtype=torch.bool, device=device)
@@ -83,6 +101,18 @@ class Krea2PipelineConfig(ImagePipelineConfig):
             txt_mask = text_mask.to(device=device).bool()
         mask = torch.cat([txt_mask, img_mask], dim=1)
         return {"pos": pos, "mask": mask}
+
+    @staticmethod
+    def _shard_img_pos_for_sp(img_pos, sp_world_size):
+        # This rank's contiguous image-position slice, padded to a multiple of
+        # sp_world_size (mirrors the latent sharder).
+        s = img_pos.shape[1]
+        if s % sp_world_size != 0:
+            pad = img_pos[:, -1:].repeat(1, sp_world_size - (s % sp_world_size), 1)
+            img_pos = torch.cat([img_pos, pad], dim=1)
+        local = img_pos.shape[1] // sp_world_size
+        rank = get_sp_parallel_rank()
+        return img_pos[:, rank * local : (rank + 1) * local]
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         text_mask = batch.prompt_embeds_mask[0] if batch.prompt_embeds_mask else None

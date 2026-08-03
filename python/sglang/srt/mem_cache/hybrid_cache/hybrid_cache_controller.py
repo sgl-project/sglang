@@ -23,6 +23,9 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    make_timing_event_pair,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -119,7 +122,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -128,9 +130,10 @@ class PrefetchOperation(StorageOperation):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
         super().__init__(
-            host_indices,
+            None,
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
@@ -394,11 +397,18 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        # Page-first staged write-back kernels need CPU destination host indices.
+        # A HostPoolGroup may mix staged and non-staged child pools, so let it
+        # normalize indices per child instead of moving the whole operation here.
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and (
+                getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+                or getattr(
+                    self.mem_pool_host, "supports_per_pool_backup_indices", False
+                )
+            )
         ):
             host_indices = op.host_indices
             device_indices = op.device_indices
@@ -490,8 +500,12 @@ class HybridCacheController(BaseHiCacheController):
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            ack_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -514,6 +528,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.io_backend,
                     )
                 producer_event.complete(i)
+            ack_finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
@@ -522,9 +537,11 @@ class HybridCacheController(BaseHiCacheController):
             )
         self.ack_load_queue.append(
             HiCacheAck(
-                producer_event.start_event,
-                producer_event.finish_event,
+                ack_start_event,
+                ack_finish_event,
                 op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
             )
         )
         return producer_id
@@ -549,7 +566,6 @@ class HybridCacheController(BaseHiCacheController):
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -557,7 +573,6 @@ class HybridCacheController(BaseHiCacheController):
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
-            host_indices,
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
@@ -585,13 +600,9 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        last_hash = operation.last_hash
-        hash_value = []
-        for start in range(0, len(operation.token_ids), self.page_size):
-            last_hash = self.get_hash_str(
-                operation.token_ids[start : start + self.page_size], last_hash
-            )
-            hash_value.append(last_hash)
+        hash_value = self.get_hash_str(
+            operation.token_ids, operation.last_hash, page_size=self.page_size
+        )
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -650,7 +661,11 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+        if (
+            operation.pool_transfers
+            and not operation.is_terminated()
+            and kv_completed_pages == len(operation.hash_value)
+        ):
             self._sync_trailing_keys(
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )

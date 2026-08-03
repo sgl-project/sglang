@@ -45,7 +45,10 @@ than restating.
 - No `!(x in y)` anywhere (Mintlify AST walker crashes) — use `obj.key === undefined`.
 - `supportedHardware` ⊆ `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. A
   model-specific GPU the shared catalog lacks must be declared in `config.hardware`
-  (`{id,label,vram,vendor}`), **not** added to the engine catalog.
+  (`{id,label,vram,vendor}`), **not** added to the engine catalog — unless the platform is
+  genuinely shared, which is an engine change the PR body has to argue (and the
+  `cookbook-add-model` hardware table moves with it). A new catalog entry is inert for
+  other pages: each filters the catalog by its own `supportedHardware`.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
@@ -66,6 +69,9 @@ than restating.
   a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
+  Hints render above BOTH run modes, so flag one that reads as docker-only ("add these
+  docker run flags") — `docker run` flags belong in the hardware entry's
+  `multiNodeDockerFlags`, which the engine emits into the Docker command itself.
 - `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
   template's `model` field is a free-form input prefilled from this value; if the config
   omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
@@ -115,9 +121,19 @@ than restating.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
-  from the `sglang serve` deploy command.
+  from the `sglang serve` deploy command, and should carry `--flush-cache`: bench_serving's
+  `random` prompts are deterministic, so a warm rerun hits the radix cache and inflates
+  throughput — speed numbers are measured cache-cold.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
+  percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. A benchmarks
+  entry may carry its own `latencyPercentile` to override the page value per cell
+  (entry → config → `"P50"`): on a P50 page, kept legacy Mean cells must set it — a
+  `sglang_version` tag alone doesn't convey the percentile. (`"Mean"` is temporary — legacy
+  data is being re-measured to P50.)
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
 - **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
   column must be produced by the SAME harness — flag a page that, say, measures one
   platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with

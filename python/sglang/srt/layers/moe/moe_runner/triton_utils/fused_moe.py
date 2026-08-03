@@ -13,11 +13,22 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -31,12 +42,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -55,7 +60,7 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -123,6 +128,7 @@ def inplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -155,6 +161,7 @@ def inplace_fused_experts(
         filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 
@@ -189,6 +196,7 @@ def outplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -221,6 +229,7 @@ def outplace_fused_experts(
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 
@@ -244,6 +253,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    a1_q: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -281,6 +291,7 @@ def fused_experts(
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
         )
         return hidden_states
     else:
@@ -314,6 +325,7 @@ def fused_experts(
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
         )
 
 
@@ -456,17 +468,41 @@ def _fused_moe_kernel_sequence(
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
     Inputs are already aligned and the block-size config is already resolved.
     Supports optional LoRA hooks that fire between the two kernels and before
     combine. Returns ``out_hidden_states``.
+
+    ``a1_q`` (SGLANG_OPT_MOE_QUANT_ONCE): optional pre-quantized fp8 view of
+    ``hidden_states`` for the gate-up GEMM (per-token-group ``block_shape[1]``
+    quant, ``a1_scale`` holds the matching scales, rows may exceed
+    ``num_tokens`` due to 4-row padding). ``hidden_states`` stays bf16 and is
+    still used for output dtype/shape and the inplace combine.
     """
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+    # LoRA hooks consume and update route-major intermediate buffers. The TMA
+    # down path keeps those buffers in expert-sorted, block-padded order, which
+    # is incompatible with the hook contract.
+    if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
+        down_moe_use_tma = False
+
+    if a1_q is not None:
+        assert (
+            use_fp8_w8a8
+            and block_shape is not None
+            and a1_scale is not None
+            and a1_q.dtype == torch.float8_e4m3fn
+            and a1_q.is_contiguous()
+            and a1_q.shape[0] >= num_tokens
+            and a1_q.shape[1] == hidden_states.shape[1]
+        ), "a1_q requires block-wise fp8 with matching pre-quantized activation"
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -485,10 +521,17 @@ def _fused_moe_kernel_sequence(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        out_hidden_states = torch.empty_like(hidden_states)
+        # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
+        # allocation is required, so the downstream all-reduce takes the low-latency
+        # symmetric path. Only this output enters the pool; the intermediate caches
+        # below stay on the default allocator to bound pool occupancy.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_global_server_args().enable_fused_moe_sum_all_reduce
+        get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -502,7 +545,7 @@ def _fused_moe_kernel_sequence(
     )
 
     invoke_fused_moe_kernel(
-        hidden_states,
+        a1_q if a1_q is not None else hidden_states,
         w1,
         b1,
         intermediate_cache1,
@@ -598,7 +641,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),
@@ -790,11 +833,14 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        moe_sum_reduce(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            out_hidden_states,
-            routed_scaling_factor,
-        )
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        else:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(
@@ -845,6 +891,7 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    a1_q: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -921,6 +968,7 @@ def fused_experts_impl(
         hooks=None,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        a1_q=a1_q,
     )
 
 

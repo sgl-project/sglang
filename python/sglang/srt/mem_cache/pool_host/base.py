@@ -24,6 +24,8 @@ _is_hip = is_hip()
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+_WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     """Sync fixed-size HiCache token capacity across PP ranks.
@@ -77,6 +79,8 @@ def synchronized(func):
 
 
 class HostKVCache(abc.ABC):
+    dcp_size = 1
+    dcp_rank = 0
 
     def __init__(
         self,
@@ -88,9 +92,19 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         self.device_pool = device_pool
-        self.page_size = page_size
+        # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        assert page_size % dcp_size == 0, (
+            f"HiCache host pool page_size ({page_size}) must be a multiple of "
+            f"dcp_size ({dcp_size}); expected the widened page from the DCP "
+            "paged allocator."
+        )
+        self.page_size = page_size // dcp_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -137,6 +151,7 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+        self.fd = getattr(self.allocator, "fd", None)
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
@@ -165,6 +180,41 @@ class HostKVCache(abc.ABC):
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
+
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(device_pool.layer_shard_enabled)
+
+    def _device_owned_layer_range(self, device_pool=None) -> tuple[int, int]:
+        """Contiguous ``[start, end)`` local device layers this rank stores.
+
+        ``(0, layer_num)`` when the device pool is not layer-sharded.
+        """
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return 0, device_pool.layer_num
+        return device_pool._owned_local_layer_range()
+
+    def _effective_host_layer_num(self, device_pool=None) -> int:
+        """Number of layers the host pool allocates for this rank."""
+        device_pool = device_pool or self.device_pool
+        if not self._is_device_layer_sharded(device_pool):
+            return device_pool.layer_num
+        shard_size = device_pool.layer_shard_size
+        return (device_pool.layer_num + shard_size - 1) // shard_size
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        start, end = self._device_owned_layer_range(device_pool)
+        return start <= layer_id < end
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        """Map a full local device layer id to its compacted host-buffer slot."""
+        start, _ = self._device_owned_layer_range(device_pool)
+        return layer_id - start
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        start, end = self._device_owned_layer_range(device_pool)
+        return list(range(start, end))
 
     @abc.abstractmethod
     def init_kv_buffer(self):
@@ -227,27 +277,91 @@ class HostKVCache(abc.ABC):
     def clear(self):
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
+            (self.logical_size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
+        # Keep freed chunks aside and consume them lazily from alloc() to avoid
+        # concatenating a large free-list on every host-pool free.
+        self.release_slots = []
+        self.num_release_slots = 0
+        # Per-slot flag used to detect double-free.
+        # slot_used[k] is true if slot k is allocated.
+        self.slot_used = torch.zeros(self.logical_size, dtype=torch.bool)
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
+
+    @property
+    def logical_size(self) -> int:
+        """Slots the radix/controller layer sees: dcp_size of them share a row."""
+        return self.size * self.dcp_size
+
+    @property
+    def logical_page_size(self) -> int:
+        """Page size in that same logical space (the widened DCP page)."""
+        return self.page_size * self.dcp_size
+
+    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Transfer kernels index per-rank rows; callers hold widened logical slots.
+
+        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
+        """
+        if self.dcp_size == 1:
+            return indices
+        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
+        assert owned.numel() * self.dcp_size == indices.numel(), (
+            "HiCache DCP translation expects runs of whole widened pages "
+            f"(every residue class equally represented); got {indices.numel()} "
+            f"logical slots -> {owned.numel()} owned rows with dcp_size="
+            f"{self.dcp_size}."
+        )
+        return owned
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
-            need_size % self.page_size == 0
+            need_size % self.logical_page_size == 0
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None
 
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+
+        assert not self.slot_used[select_index].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{select_index[self.slot_used[select_index]].tolist()}."
+        )
+        self.slot_used[select_index] = True
 
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        indices_cpu = indices.cpu()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        assert self.slot_used[indices_cpu].all(), (
+            f"Double-free detected: slots not currently allocated: "
+            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+        )
+        self.slot_used[indices_cpu] = False
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)

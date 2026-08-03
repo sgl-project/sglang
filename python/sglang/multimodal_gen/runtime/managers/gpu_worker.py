@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -78,6 +81,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -101,6 +105,21 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
+
+
+def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
+    """CPU intra-op thread budget for one of `num_gpus` co-located workers.
+
+    torch defaults the intra-op pool to every host core in every worker, so
+    co-located workers oversubscribe the host num_gpus-fold and any CPU op
+    past the ~32k-element parallel grain pays pool wakeup contention instead
+    of microseconds (measured 500x on request-static packed layouts). An
+    explicit OMP_NUM_THREADS keeps deployer intent (returns None).
+    """
+    if "OMP_NUM_THREADS" in os.environ:
+        return None
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -194,6 +213,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         torch.get_device_module().set_device(self.local_rank)
+        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        if intra_op_threads is not None:
+            torch.set_num_threads(intra_op_threads)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -325,6 +347,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        # request boundary: the IPC watchdog flag is a device read, illegal
+        # inside a graph capture and too costly per exchange
+        IPC_A2A.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -479,7 +504,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -517,7 +542,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -691,7 +720,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(
@@ -999,6 +1028,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

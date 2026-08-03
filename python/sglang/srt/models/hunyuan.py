@@ -531,21 +531,14 @@ class HunYuanModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
 
-        prev_kv_states = None
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual, kv_states = layer(
+        for layer in self.layers:
+            hidden_states, residual, _ = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
-                prev_kv_states,
+                None,
             )
-
-            if False:  # (i - self.start_layer) % cla_factor == 0:
-                prev_kv_states = kv_states
-            else:
-                prev_kv_states = None
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

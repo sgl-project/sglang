@@ -42,7 +42,8 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Paths relative to repository root
-BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
+BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines"
+BASELINE_PLATFORM_ORDER = ("h100", "b200", "5090")
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
 
 USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
@@ -345,28 +346,43 @@ class RunSuiteVisitor(ast.NodeVisitor):
         return result
 
 
+def _iter_baseline_paths(baseline_path: Path) -> List[Path]:
+    if baseline_path.is_file():
+        return [baseline_path]
+    if not baseline_path.is_dir():
+        return []
+
+    ordered_paths = [
+        baseline_path / f"{platform}.json" for platform in BASELINE_PLATFORM_ORDER
+    ]
+    ordered_paths.extend(
+        path
+        for path in sorted(baseline_path.glob("*.json"))
+        if path not in ordered_paths
+    )
+    return [path for path in ordered_paths if path.exists()]
+
+
 def load_baselines(baseline_path: Path) -> Dict[str, float]:
     """
-    Load performance baselines from JSON file.
+    Load performance baselines from a JSON file or platform baseline directory.
 
     Returns:
         Dictionary mapping case_id to estimated time in seconds.
     """
-    if not baseline_path.exists():
-        return {}
-
-    with open(baseline_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
     baselines = {}
-    scenarios = data.get("scenarios", {})
+    for path in _iter_baseline_paths(baseline_path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    for case_id, scenario in scenarios.items():
-        if scenario.get("estimated_full_test_time_s") is not None:
-            baselines[case_id] = scenario["estimated_full_test_time_s"]
-        else:
-            expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
-            baselines[case_id] = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+        scenarios = data.get("scenarios", {})
+        for case_id, scenario in scenarios.items():
+            if scenario.get("estimated_full_test_time_s") is not None:
+                est_time = scenario["estimated_full_test_time_s"]
+            else:
+                expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
+                est_time = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+            baselines.setdefault(case_id, est_time)
 
     return baselines
 
@@ -443,7 +459,7 @@ def collect_diffusion_suites(
     Args:
         case_config_path: Path to case config (resolved from run_suite.py)
         run_suite_path: Path to run_suite.py
-        baseline_path: Path to perf_baselines.json
+        baseline_path: Path to perf_baselines/ or a single baseline JSON file
 
     Returns:
         Dictionary mapping suite name to DiffusionSuiteInfo.

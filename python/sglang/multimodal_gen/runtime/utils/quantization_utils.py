@@ -162,6 +162,7 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]] = {},
     reverse_param_names_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
+    quant_ignore_remap: Optional[Dict[str, str]] = None,
 ) -> QuantizationConfig:
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:
@@ -191,10 +192,18 @@ def get_quant_config(
         hf_quant_config = getattr(model_config, "compression_config", None)
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(hf_quant_config)
+        is_modelopt_fp8 = (
+            hf_quant_config.get("quant_method") == "modelopt"
+            and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
+        )
+        extra_kwargs = (
+            {"ignore_remap": quant_ignore_remap}
+            if quant_ignore_remap and is_modelopt_fp8
+            else {}
+        )
+        return quant_cls.from_config(hf_quant_config, **extra_kwargs)
 
     model_name_or_path = model_config["model_path"]
-    is_local = os.path.isdir(model_name_or_path)
     hf_folder = model_name_or_path
 
     possible_config_filenames = quant_cls.get_config_filenames()

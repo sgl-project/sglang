@@ -65,7 +65,7 @@ export const Qwen3NextDeployment = () => {
         { id: 'v1', label: 'V1', default: true },
         { id: 'v2', label: 'V2', default: false }
       ],
-      commandRule: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer \\\n  --page-size 64' : null
+      commandRule: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer \\\n  --page-size 64' : null
     }
   };
 

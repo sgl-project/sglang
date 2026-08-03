@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -25,6 +26,20 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+
+
+def _warn_if_expected_param_dtype_missing(
+    model: torch.nn.Module, expected_dtype: torch.dtype | None
+) -> None:
+    if expected_dtype is None:
+        return
+    param_dtypes = {param.dtype for param in model.parameters()}
+    if expected_dtype not in param_dtypes:
+        logger.warning(
+            "Model parameter dtypes do not include expected param dtype, %s vs %s",
+            param_dtypes,
+            expected_dtype,
+        )
 
 
 def _server_args_for_transformer_component(
@@ -85,7 +100,13 @@ class TransformerLoader(ComponentLoader):
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        return component_server_args.transformer_weights_path is not None
+        # Don't let a quantized load quietly fall back to the unquantized native
+        # model. That would drop the requested precision and bury the real error.
+        return (
+            super().should_raise_customized_load_error(server_args, component_name)
+            or component_server_args.transformer_weights_path is not None
+            or component_server_args.quantization is not None
+        )
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -150,12 +171,19 @@ class TransformerLoader(ComponentLoader):
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
 
+        local_torch_device = get_local_torch_device()
+        weight_load_plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=local_torch_device,
+            needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+        )
+
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
             weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
+            device=local_torch_device,
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
             cpu_offload=component_server_args.dit_cpu_offload,
@@ -165,21 +193,13 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            weight_load_plan=weight_load_plan,
         )
 
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
 
-        # considering the existent of mixed-precision models (e.g., nunchaku)
-        if (
-            next(model.parameters()).dtype != quant_spec.param_dtype
-            and quant_spec.param_dtype
-        ):
-            logger.warning(
-                "Model dtype does not match expected param dtype, %s vs %s",
-                next(model.parameters()).dtype,
-                quant_spec.param_dtype,
-            )
+        _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
 
         return model

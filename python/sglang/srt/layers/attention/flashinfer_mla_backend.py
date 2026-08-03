@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_schedule
 
 """
 Support attention backend for flashinfer MLA.
@@ -17,24 +17,23 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
+from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
-    dcp_enabled,
-    get_attention_dcp_world_size,
-    plan_dcp_decode_metadata,
     update_local_kv_lens_for_dcp,
 )
+from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -80,7 +79,6 @@ class PrefillMetadata:
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
-global_workspace_buffer = None
 
 
 class FlashInferMhaChunkKVRunner:
@@ -226,22 +224,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
-            and get_global_server_args().disaggregation_mode != "decode"
-            and not get_global_server_args().disable_chunked_prefix_cache
-            and not get_global_server_args().flashinfer_mla_disable_ragged
+            and get_disagg().disaggregation_mode != "decode"
+            and not get_schedule().disable_chunked_prefix_cache
+            and not get_exec().kernel.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
         # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_buffer = torch.empty(
+        # different from flashinfer zero_init_global_workspace_buffer
+        self.workspace_buffer = get_buffer(
+            "flashinfer_mla_workspace",
+            lambda: torch.empty(
                 envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
-        self.workspace_buffer = global_workspace_buffer
+            ),
+        )
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
@@ -404,7 +402,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not get_global_server_args().flashinfer_mla_disable_ragged
+                not get_exec().kernel.flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
                 and not is_in_tc_piecewise_cuda_graph()
@@ -648,7 +646,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
-            return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
+            return_lse=(
+                forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
+            ),
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -663,7 +663,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
-            * get_attention_dcp_world_size()
+            * get_parallel().attn_dcp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -676,6 +676,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.q_indptr = attn_backend.q_indptr_decode
+        # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
+        self._translate_kv_loc_dense = unified_mla_hooks(
+            model_runner.token_to_kv_pool_allocator
+        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -733,8 +737,23 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE, written back IN PLACE.
+            #
+            # On the cuda-graph replay path `kv_indices` IS the capture-stable
+            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
+            # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
+            # the kv_indices argument entirely -- rebinding the local name to a
+            # fresh tensor would leave the graph reading VIRTUAL ids. Only the
+            # [:paged_kernel_lens_sum] prefix the index kernel just filled is
+            # translated; the stale tail is left alone so it can never index the
+            # v2p table out of bounds. The int64 translate result narrows back to
+            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
+            # fit comfortably).
+            if self._translate_kv_loc_dense is not None:
+                valid = kv_indices[:paged_kernel_lens_sum]
+                valid.copy_(self._translate_kv_loc_dense(valid))
 
-            if dcp_enabled():
+            if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
@@ -798,6 +817,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
+        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
+        # token ids. None (identity) unless the unified MLA pool is active.
+        self._translate_kv_loc_dense = unified_mla_hooks(
+            model_runner.token_to_kv_pool_allocator
+        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -868,6 +893,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            # Unified pool: VIRTUAL -> DENSE token ids for the paged wrapper.
+            # Prefill is not cuda-graph captured under unified memory, so an eager
+            # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
+            # 1e7 << 2^31); the flashinfer wrapper requires int32.
+            if self._translate_kv_loc_dense is not None:
+                kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None

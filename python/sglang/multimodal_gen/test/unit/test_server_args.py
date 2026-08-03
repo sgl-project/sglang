@@ -15,9 +15,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -38,9 +42,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+    is_known_non_diffusers_multimodal_model,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
+)
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -189,23 +200,23 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=80 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=80,
             ),
         ):
@@ -365,11 +376,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                         return_value=None,
                     ),
                     patch(
-                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                        "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                         return_value=80 * 1024**3,
                     ),
                     patch(
-                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                        "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                         return_value=80,
                     ),
                 ):
@@ -509,6 +520,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         warmup=False,
         server_warmup=False,
         warmup_resolutions=None,
+        enable_torch_compile=False,
         disagg_role=None,
         explicit=(),
     ):
@@ -519,6 +531,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup = warmup
         sa.server_warmup = server_warmup
         sa.warmup_resolutions = warmup_resolutions
+        sa.enable_torch_compile = enable_torch_compile
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
         sa._explicit_arg_names = set(explicit)
         sa._adjust_warmup()
@@ -588,6 +601,57 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
+    def test_torch_compile_defaults_to_server_warmup(self):
+        sa = self._resolve(enable_torch_compile=True)
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_warmup_on_uses_defaulted_server_mode(self):
+        # `serve --warmup` (legacy ON, mode defaulted to "server" but not
+        # explicit) must resolve to server-based warmup, not silently downgrade
+        # to request mode.
+        sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_torch_compile_respects_explicit_warmup_off(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            enable_torch_compile=True,
+            explicit=("warmup_mode",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_torch_compile_uses_server_warmup_for_explicit_resolutions(self):
+        sa = self._resolve(
+            warmup_resolutions=["1024x1024"],
+            enable_torch_compile=True,
+            explicit=("warmup_resolutions",),
+        )
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_warmup_with_resolutions_runs_server_warmup(self):
+        # Dead-zone regression: `serve --warmup --warmup-resolutions X` must run
+        # server-based (synthetic) warmup, not end up with no warmup at all
+        # (request-based warmup bails out when warmup_resolutions is set).
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=True,
+            warmup_resolutions=["1024x1024"],
+            explicit=("warmup",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "server")
+
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
@@ -599,6 +663,14 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertTrue(sa.warmup)
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_torch_compile_server_warmup_disabled_for_disagg_role(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(enable_torch_compile=True, disagg_role=RoleType.DENOISER)
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
 
     def test_invalid_mode_raises(self):
         with self.assertRaises(ValueError):
@@ -625,7 +697,52 @@ class TestWarmupImageIsModelValid(unittest.TestCase):
         self.assertGreaterEqual(height, 64)
 
 
+class TestMiniMaxH3Routing(unittest.TestCase):
+    def test_semantic_variants_map_to_checkpoint_partitions(self):
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
+        )
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("ref2va"), "Ref2VA"
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported MiniMax H3 model variant"):
+            MiniMaxH3Pipeline.model_subfolder_for_variant("v2v")
+
+    def test_modelscope_id_resolves_to_the_huggingface_config(self):
+        expected = _get_config_info("MiniMaxAI/MiniMax-H3")
+        actual = _get_config_info("MiniMax/MiniMax-H3")
+        self.assertIsNotNone(expected)
+        self.assertIs(actual, expected)
+        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+
+
 class TestOffloadDefaults(unittest.TestCase):
+    def test_wan_decode_precision_defaults(self):
+        for pipeline_config in (
+            WanT2V480PConfig(),
+            WanI2V480PConfig(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "bf16")
+
+        for pipeline_config in (
+            FastWan2_2_TI2V_5B_Config(),
+            Wan2_2_T2V_A14B_Config(),
+            Wan2_2_I2V_A14B_Config(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "fp32")
+
+        generic_config = PipelineConfig()
+        self.assertEqual(generic_config.vae_precision, "fp32")
+        self.assertIsNone(generic_config.vae_decode_precision)
+
     def _from_dict_with_pipeline_config(
         self,
         pipeline_config,
@@ -644,27 +761,27 @@ class TestOffloadDefaults(unittest.TestCase):
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 side_effect=get_available_gpu_memory,
             ),
         ):
@@ -682,19 +799,19 @@ class TestOffloadDefaults(unittest.TestCase):
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=memory_gb,
             ),
         ):
@@ -814,12 +931,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
         self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
 
-        self.assertEqual(
-            ltx_deployment.auto_disable_component_offload_min_available_memory_gb, 70
-        )
-        self.assertEqual(
-            ltx_deployment.auto_disable_component_offload_components, ("dit",)
-        )
+        self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
         self.assertEqual(
             ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
         )
@@ -835,6 +948,15 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+        # fasthunyuan no longer pins 150gb -- falls back to the global video default
+        fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
+        self.assertIsNone(fast_hunyuan_deployment.keep_resident_min_available_gb)
+        self.assertEqual(fast_hunyuan_deployment.keep_resident_components, ("vae",))
+
+        # default keeps only vae resident (encoders are large, dit owned by FSDP)
+        self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
+        self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -925,7 +1047,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
 
-    def test_default_auto_replaces_text_encoder_cpu_offload_with_layerwise(self):
+    def test_default_auto_keeps_image_vae_resident_when_memory_allows(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={"model_path": "Qwen/Qwen-Image"},
@@ -933,10 +1055,25 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
+        # 80gb > image threshold (45gb): only vae kept resident, encoders stay
+        # offloaded layerwise, dit unchanged
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
+        )
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_image_offloads_aux_below_resident_threshold(self):
+        # 40gb < image threshold (45gb): aux incl. vae still offloaded to save vram
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            memory_gb=40,
+            kwargs={"model_path": "Qwen/Qwen-Image"},
+        )
+
+        self.assertEqual(args.performance_mode, "auto")
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
@@ -1273,7 +1410,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
-    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
+    def test_auto_multi_gpu_qwen_keeps_vae_resident_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -1285,14 +1422,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # 80gb > image threshold (45gb): only vae resident, encoders offloaded;
+        # cfg/dit unchanged
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder"],
         )
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -1334,11 +1471,12 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        # explicit use_fsdp_inference skips the residency pass, but the layerwise
+        # filter still drops vae (kept resident); encoders stay offloaded
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder"],
         )
 
     def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
@@ -1354,13 +1492,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # 50gb still > image threshold (45gb): vae resident, encoders offloaded;
+        # fsdp skipped (qwen does not opt into auto fsdp)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder"],
         )
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
         args = self._from_dict_with_pipeline_config(
@@ -1377,7 +1516,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_headroom(self):
+    def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -1391,13 +1530,81 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # min available across selected gpus is 72gb > image threshold (45gb):
+        # vae resident, encoders offloaded
         self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder"],
         )
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_minimax_h3_keeps_large_components_resident_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=141,
+            available_memory_gb=130,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
+
+    def test_auto_minimax_h3_keeps_memory_policy_below_residency_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=96,
+            available_memory_gb=90,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_memory_minimax_h3_combines_fsdp_with_aux_layerwise_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "memory",
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_minimax_h3_rejects_explicit_cfg_parallel(self):
+        with self.assertRaisesRegex(
+            ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
+        ):
+            self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "cfg_parallel_degree": 2,
+                },
+            )
 
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -1429,6 +1636,54 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_speed_mode_enables_torch_compile_by_default(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+            },
+        )
+
+        self.assertTrue(args.enable_torch_compile)
+
+    def test_speed_mode_preserves_explicit_torch_compile_off(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+                "enable_torch_compile": False,
+            },
+        )
+
+        self.assertFalse(args.enable_torch_compile)
+
+    def test_speed_mode_uses_minimax_h3_compile_policy(self):
+        for explicit, expected in ((None, False), (True, True)):
+            kwargs = {
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "performance_mode": "speed",
+            }
+            if explicit is not None:
+                kwargs["enable_torch_compile"] = explicit
+            with self.subTest(explicit=explicit):
+                args = self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=kwargs
+                )
+                self.assertEqual(args.enable_torch_compile, expected)
+
+    def test_auto_mode_leaves_torch_compile_off(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.enable_torch_compile)
 
     def test_memory_mode_wan_uses_layerwise_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -1494,23 +1749,23 @@ class TestOffloadDefaults(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=80 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=80,
             ),
         ):
@@ -1538,23 +1793,23 @@ class TestOffloadDefaults(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=140 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=134,
             ),
         ):
@@ -1736,9 +1991,9 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
-    def test_disagg_args_import_path_stays_compatible(self):
+    def test_disagg_args_import_path_matches_server_args_package(self):
         from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args_disagg import (
+        from sglang.multimodal_gen.runtime.server_args.disagg import (
             DisaggServerArgsMixin,
         )
 

@@ -255,7 +255,7 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         )
 
         self.assertEqual(
-            rank_generator.get_ranks("tp-sp-pp-cfg"),
+            parallel_state._get_vae_decode_group_ranks(rank_generator),
             [list(range(0, 8)), list(range(8, 16))],
         )
 

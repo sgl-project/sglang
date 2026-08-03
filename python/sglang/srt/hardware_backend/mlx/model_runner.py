@@ -49,7 +49,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     uses_sliding_window_attention,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +281,7 @@ class MlxModelRunner:
         ):
             return None
 
-        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        chunk_size = get_server_args().mamba_cache_chunk_size
         track_len = prefix_len + (new_token_count // chunk_size) * chunk_size
         branching_len = getattr(req, "mamba_branching_seqlen", None)
         if (
@@ -512,9 +512,17 @@ class MlxModelRunner:
         if hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
             dtype = sample_attn.k_proj.weight.dtype
         if dtype not in _MLX_KV_FLOAT_DTYPES:
-            # QuantizedLinear stores packed weights as integers, while the KV
-            # cache stores dequantized projection outputs.
-            dtype = mx.float32
+            # QuantizedLinear packs weights as integers, but the KV cache
+            # stores dequantized projection outputs, which are produced in
+            # the compute dtype carried by the quantization scales.  Storing
+            # at that dtype instead of float32 halves pool bytes per slot
+            # and keeps prefix-hit forwards in the same dtype as the no-hit
+            # path (a float32 pool promoted every post-hit concat).
+            scales = getattr(sample_attn.k_proj, "scales", None)
+            if scales is not None and scales.dtype in _MLX_KV_FLOAT_DTYPES:
+                dtype = scales.dtype
+            else:
+                dtype = mx.float32
         return n_kv_heads, head_dim, dtype
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
@@ -1197,10 +1205,6 @@ class MlxModelRunner:
           before step N+1's bookkeeping.
         """
         caches = prev.caches
-
-        # TODO (changminbark): Need to fix
-        # ContiguousAttentionKVCache.write_token to accommodate dynamic growing
-        # like ContiguousAttentionKVCache.update_and_fetch.
 
         # After prev's graph ran, each attention KV cache offset was
         # bumped by one per layer - attention wrapper's `write_token`

@@ -3,7 +3,7 @@
 export const config = {
   modelName: "Unlimited-OCR",
 
-  supportedHardware: ["h100", "h200", "b200", "b300", "gb200", "gb300"],
+  supportedHardware: ["h100"],
 
   variants: [{ id: "default", label: "Default" }],
   quantizations: [{ id: "default", label: "Default" }],
@@ -44,11 +44,6 @@ export const config = {
 
   dockerImages: {
     h100: "lmsysorg/sglang:dev",
-    h200: "lmsysorg/sglang:dev",
-    b200: "lmsysorg/sglang:dev",
-    b300: "lmsysorg/sglang:dev",
-    gb200: "lmsysorg/sglang:dev",
-    gb300: "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -72,106 +67,7 @@ export const config = {
         strategy: "balanced",
         nodes: "single",
       },
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--attention-backend fa3",
-        "--page-size 1",
-        "--context-length 32768",
-        "--enable-custom-logit-processor",
-        "--disable-radix-cache",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: {
-        hw: "h200",
-        variant: "default",
-        quant: "default",
-        strategy: "balanced",
-        nodes: "single",
-      },
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--attention-backend fa3",
-        "--page-size 1",
-        "--context-length 32768",
-        "--enable-custom-logit-processor",
-        "--disable-radix-cache",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: {
-        hw: "b200",
-        variant: "default",
-        quant: "default",
-        strategy: "balanced",
-        nodes: "single",
-      },
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--attention-backend fa3",
-        "--page-size 1",
-        "--context-length 32768",
-        "--enable-custom-logit-processor",
-        "--disable-radix-cache",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: {
-        hw: "b300",
-        variant: "default",
-        quant: "default",
-        strategy: "balanced",
-        nodes: "single",
-      },
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--attention-backend fa3",
-        "--page-size 1",
-        "--context-length 32768",
-        "--enable-custom-logit-processor",
-        "--disable-radix-cache",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: {
-        hw: "gb200",
-        variant: "default",
-        quant: "default",
-        strategy: "balanced",
-        nodes: "single",
-      },
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--attention-backend fa3",
-        "--page-size 1",
-        "--context-length 32768",
-        "--enable-custom-logit-processor",
-        "--disable-radix-cache",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: {
-        hw: "gb300",
-        variant: "default",
-        quant: "default",
-        strategy: "balanced",
-        nodes: "single",
-      },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

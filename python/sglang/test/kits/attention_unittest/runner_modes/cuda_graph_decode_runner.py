@@ -309,6 +309,7 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         seq_lens_sum=batch.seq_lens_sum,
         seq_lens_cpu=batch.seq_lens_cpu,
         encoder_lens=batch.encoder_lens,
+        extend_seq_lens=getattr(batch, "extend_seq_lens", None),
         out_cache_loc=getattr(batch, "out_cache_loc", None),
         spec_info=batch.spec_info,
     )

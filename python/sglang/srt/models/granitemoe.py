@@ -30,8 +30,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
 if is_cuda():
-    from sglang.jit_kernel.norm import fused_scaled_add_rmsnorm
-    from sglang.jit_kernel.norm import (
+    from sglang.kernels.ops.layernorm.norm import (
+        fused_scaled_add_rmsnorm,
         is_supported_jit_fused_add_rmsnorm_hidden_size,
     )
 else:
