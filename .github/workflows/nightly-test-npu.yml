@@ -113,16 +113,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
       - name: Run test
         timeout-minutes: 120
         run: |
+          pip install tabulate
           cd test
-          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly --timeout-per-file 3600
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
@@ -134,16 +130,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
       - name: Run test
         timeout-minutes: 120
         run: |
+          pip install tabulate
           cd test
-          python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly
+          python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly --timeout-per-file 3600
 
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
@@ -155,16 +147,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
       - name: Run test
         timeout-minutes: 120
         run: |
+          pip install tabulate sglang_router
           cd test
-          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly
+          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly --timeout-per-file 3600
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
@@ -176,16 +164,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
       - name: Run test
         timeout-minutes: 120
         run: |
+          pip install tabulate
           cd test
-          python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly
+          python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly --timeout-per-file 3600
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
@@ -197,16 +181,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
-          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
       - name: Run test
         timeout-minutes: 120
         run: |
+          apt-get install -y libssl-dev
+          pip install tabulate sglang_router
           cd test
-          python3 run_suite.py --hw npu --suite nightly-16-npu-a3 --nightly
+          python3 run_suite.py --hw npu --suite nightly-16-npu-a3 --nightly --timeout-per-file 3600
 
   nightly-poc-single-node-a2-tests:
     name: single-node-poc-a2
