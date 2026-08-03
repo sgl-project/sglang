@@ -1054,6 +1054,24 @@ class AscendAttnBackend(AttentionBackend):
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
+
+        num_token_padding = q.shape[0]
+        num_token_non_padded = (
+            forward_batch._original_num_tokens
+            if forward_batch._original_num_tokens is not None
+            else forward_batch.num_token_non_padded_cpu
+        )
+        trim_eager_padding = (
+            not is_prefill
+            and not self.graph_mode
+            and num_token_non_padded is not None
+            and num_token_non_padded > 0
+            and num_token_padding > num_token_non_padded
+        )
+        if trim_eager_padding:
+            q = q[:num_token_non_padded]
+            q_rope = q_rope[:num_token_non_padded]
+
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -1132,6 +1150,22 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode=3,
                 attention_mode=2,
                 return_softmax_lse=False,
+            )
+
+        if trim_eager_padding:
+            assert attn_out.shape[0] == num_token_non_padded, (
+                "NPU DSA attention output must match the unpadded query rows: "
+                f"{attn_out.shape[0]} != {num_token_non_padded}"
+            )
+            attn_out = torch.cat(
+                [
+                    attn_out,
+                    attn_out.new_zeros(
+                        num_token_padding - attn_out.shape[0],
+                        *attn_out.shape[1:],
+                    ),
+                ],
+                dim=0,
             )
 
         return attn_out

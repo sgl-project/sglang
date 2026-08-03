@@ -2254,6 +2254,23 @@ class Indexer(MultiPlatformOp):
         get_token_to_kv_pool().set_index_k_buffer(
             layer_id, forward_batch.out_cache_loc, k
         )
+
+        num_token_non_padded = (
+            forward_batch._original_num_tokens
+            if forward_batch._original_num_tokens is not None
+            else forward_batch.num_token_non_padded_cpu
+        )
+        trim_eager_padding = (
+            not is_prefill
+            and not get_attn_backend().graph_mode
+            and num_token_non_padded is not None
+            and num_token_non_padded > 0
+            and q.shape[0] > num_token_non_padded
+        )
+        if trim_eager_padding:
+            q = q[:num_token_non_padded]
+            bs = q.shape[0]
+
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -2327,6 +2344,8 @@ class Indexer(MultiPlatformOp):
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
+        if trim_eager_padding:
+            weights = weights[:num_token_non_padded]
         block_table = get_attn_backend().forward_metadata.block_tables
         if (
             is_prefill
