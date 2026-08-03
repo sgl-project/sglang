@@ -11,14 +11,16 @@ export const config = {
   modelName: "Kimi-K3",
 
   // B300 (1×8 TP8), GB300 (2×4 TP8 MNNVL), B200 (2×8 TP16, or TP8/PP2 for
-  // Long-Context), GB200 (4×4 TP16 MNNVL), H200 (2×8 TP16/EP16), H100
-  // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
+  // Long-Context), GB200 (4×4 TP16 MNNVL), H200 (2×8 TP16/EP16, or 4×8 TP32/EP32
+  // for High-Throughput), H100 (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have
+  // serving recipes.
   supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"],
 
   // Single checkpoint and a single shipped quantization (MXFP4), so neither is a
   // reader-facing axis. Node count is fixed by the hardware recipe (B200 2x8,
-  // H100 4x8, B300 1x8, H200 2x8, GB200 4x4, GB300 2x4,
-  // MI350X/MI355X 1x8), so it rides on the cell rather than on a selector.
+  // H100 4x8, B300 1x8, H200 2x8 — 4x8 on Unified High-Throughput, GB200 4x4,
+  // GB300 2x4, MI350X/MI355X 1x8), so it rides on the cell rather than on a
+  // selector.
   matchDims: [
     {
       id: "pdMode",
@@ -1004,26 +1006,35 @@ export const config = {
       ],
     },
     {
-      // Throughput-tuned (perf-command: mem-frac 0.90, graph-bs 256, extra_buffer_lazy → max_running 98).
+      // The one H200 cell that widens past a single pair of nodes. As run — with
+      // DSPARK and HiCache L1+L2 layered on, at ratio 0.058 — the static
+      // allocation leaves 12.54 GB free per GPU and 1940352 KV tokens.
       match: { hw: "h200", pdMode: "unified", strategy: "high-throughput" },
-      nnodes: 2,
+      nnodes: 4,
       verified: false,
       verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+        "SGLANG_K3_ATTN_RES_MODE=jit",
+        "SGLANG_MOE_FUSED_GATE_RADIX=1",
+        "SGLANG_HOST_IP={{LOCAL_IP}}",
+        "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
       ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp-size 16",
-        "--ep-size 16",
+        "--tp-size 32",
+        "--ep-size 32",
         "--moe-runner-backend marlin",
         "--decode-attention-backend flashmla",
         "--enable-symm-mem",
         "--mem-fraction-static 0.90",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--dist-timeout 3600",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
         "--host {{HOST_IP}}",
@@ -1912,7 +1923,8 @@ export const config = {
       "Set This node IP separately on each node; use the same cross-node NIC name on all four nodes.",
     ],
     h200: [
-      "Multi-node K3 needs the cross-node NIC pinned on BOTH ranks:",
+      "Low-Latency and Balanced run TP16/EP16 across 2 nodes; Unified High-Throughput widens to TP32/EP32 across 4.",
+      "Multi-node K3 needs the cross-node NIC pinned on EVERY node:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   # e.g. bond0",
       "  NCCL_SOCKET_IFNAME=<your-nic>   # force NCCL off kube-ipvs0",
       "  SGLANG_HOST_IP=<this-node-ip>",
