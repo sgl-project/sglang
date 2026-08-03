@@ -1231,6 +1231,11 @@ class FlashAttentionBackend(AttentionBackend):
             if is_swa_layer
             else (-1, -1)
         )
+        if forward_batch.query_attention == "bidirectional":
+            # Extend tokens attend to each other and to the whole prefix;
+            # prefix KV is read-only so no prefix-internal attention occurs
+            causal = False
+            window_size = (-1, -1)
         fa_k_descale, fa_v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1784,11 +1789,6 @@ class FlashAttentionBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
-        if forward_batch.query_attention == "bidirectional":
-            # Extend tokens attend to each other and to the whole prefix;
-            # prefix KV is read-only so no prefix-internal attention occurs
-            causal = False
-            window_size = (-1, -1)
 
         kwargs = {}
         if sinks is not None:

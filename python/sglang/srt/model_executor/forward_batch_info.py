@@ -75,11 +75,6 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 
-# Processors set this marker on mm items when their model computes decode
-# positions from mm inputs inside forward(); such image-bearing decode
-# batches must run eager instead of replaying a captured graph.
-EAGER_MM_DECODE_KEY = "eager_mm_decode"
-
 
 def _elastic_should_preserve_local_token_counts(
     *,
@@ -1096,20 +1091,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
-
-    def mm_decode_needs_eager(self) -> bool:
-        """True when any mm item carries EAGER_MM_DECODE_KEY: the model
-        derives decode positions from its mm inputs inside forward(), which
-        a captured graph replay would skip. Set by the model's processor."""
-        if self.mm_inputs is None:
-            return False
-        for mm_input in self.mm_inputs:
-            if mm_input is None:
-                continue
-            for item in mm_input.mm_items:
-                if item.model_specific_data.get(EAGER_MM_DECODE_KEY):
-                    return True
-        return False
 
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():

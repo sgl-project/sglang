@@ -502,12 +502,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
-        # Models that derive decode positions from mm inputs inside forward()
-        # (marker set by their processors) cannot replay captured graphs for
-        # image-bearing batches
-        if forward_batch.mm_decode_needs_eager():
-            return False
-
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
