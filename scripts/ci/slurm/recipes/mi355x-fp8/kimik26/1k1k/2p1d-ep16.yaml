@@ -1,0 +1,109 @@
+# MI355X Kimi-K2.6 (FP8) 4-node 2P1D disaggregation recipe — narrow-prefill EP8
+# + wide-decode EP16 (mirrors the DSV4-Pro Oren config: wide EP only helps decode).
+#
+# Two prefill engines (EP8, one node each; the router fans requests across both) +
+# one decode engine (EP16) spanning 2 nodes. Still one logical P/D pair per role
+# group, 4 nodes total. nodes-per-engine = ceil(TP/8): prefill 8->1, decode 16->2,
+# so the launcher emits cross-node --nnodes/--node-rank/--dist-init-addr for the
+# decode engine only. Prefill EP8 keeps MoE all-to-all INTRA-node (XGMI); decode
+# gets wide EP16 across nodes. KV (prefill TP8 -> decode TP16) is carried over mori.
+#
+# Kimi-specific bits vs the DSV4-Pro EP16 recipe: split attention backends
+# (aiter prefill / triton decode), the Kimi model env + parsers, and the Kimi
+# model path. Everything else (2P1D topology, mori a2a + KV, dist init) is shared.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime`, `bench`, `model`, `mtp`.
+
+resources:
+  prefill_workers: 2
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 8
+      data-parallel-size: 8
+    decode:
+      tensor-parallel-size: 16
+      expert-parallel-size: 16
+      data-parallel-size: 16
+
+# Model-specific docker env + sglang server args (written verbatim via
+# model_flags.sh). Each server arg + value is a SEPARATE list item.
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    SGLANG_ROCM_FUSED_DECODE_MLA: 0
+  server_args:
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true}'
+    - --reasoning-parser
+    - kimi_k2
+    - --tool-call-parser
+    - kimi_k2
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
+  # Kimi uses split attention backends (aiter prefill / triton decode), not a
+  # single --attention-backend.
+  prefill_attention_backend: aiter
+  decode_attention_backend: triton
+  # RoCE HCAs (8/node) for mori MoE all-to-all AND the P->D KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+  # Wide-EP MoE all-to-all backend (cross-node expert dispatch/combine).
+  moe_a2a_backend: mori
+  # KV P->D transfer backend (mori for both a2a and KV on this cluster).
+  kv_transfer_backend: mori
+  # Cross-node torch-distributed NIC for the wide decode engine's dist init.
+  dist_socket_ifname: eno0
+  # rocm720 0715 image needs the ROCm-7.0.0-alpha path OFF (validated).
+  rocm700a: 0
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  # Base defaults; the wide_ep block overrides mem-fraction / max-req per role.
+  mem_fraction_static: 0.90
+  page_size: 256
+  max_running_requests: 256
+  chunked_prefill_size: 131072
+  swa_full_tokens_ratio: 0.1
+  # Per-role wide-EP tuning (starting point cloned from the validated DSV4-Pro
+  # EP16 run; may need Kimi-specific retuning). Prefill and decode differ.
+  wide_ep:
+    kv_cache_dtype: fp8_e4m3
+    prefill_mem_fraction_static: 0.8
+    decode_mem_fraction_static: 0.85
+    prefill_chunked_prefill_size: 131072
+    prefill_max_running_requests: 1024
+    decode_max_running_requests: 1024
+    common_extra_flags: "--moe-dense-tp-size 1 --enable-dp-lm-head --decode-log-interval 100 --watchdog-timeout 3600 --load-balance-method round_robin"
+    prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144"
+    decode_extra_flags: "--disable-cuda-graph --prefill-round-robin-balance"
+    prefill_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_PREFILL: 8192
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 256
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 16384
+    decode_extra_env:
+      MORI_MAX_DISPATCH_TOKENS_DECODE: 64
+      MORI_MOE_MAX_INPUT_TOKENS_DECODE: 332
+      SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK: 128
+
+bench:
+  # bench_serving --max-concurrency sweep; one result JSON per concurrency.
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep (full GSM8K,
+  # 8-shot, accuracy > 0.92). Mirrors the single-node Kimi-K2.6 eval threshold.
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    threshold: 0.92
