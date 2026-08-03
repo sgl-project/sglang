@@ -1348,4 +1348,9 @@ def reset_context() -> None:
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
-    set_global_dwdp_manager(None)
+    manager = get_global_dwdp_manager()
+    try:
+        if manager is not None:
+            manager.cleanup()
+    finally:
+        set_global_dwdp_manager(None)

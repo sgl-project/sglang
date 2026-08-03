@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.moe.dwdp.vmm import align_down, align_up
+from sglang.srt.layers.moe.dwdp.common import align_down, align_up
 
 # one (start, end_capped) expert range per peer DWDP rank
 PeerRanges = List[Tuple[int, int]]
@@ -22,8 +22,20 @@ class DwdpExpertLayout:
         num_routed_experts: int,
         dwdp_size: int,
         dwdp_rank: int,
+        num_fused_shared_experts: int = 0,
     ):
+        if dwdp_size < 2:
+            raise ValueError(f"dwdp_size must be at least 2, got {dwdp_size}")
+        if not 0 <= dwdp_rank < dwdp_size:
+            raise ValueError(f"dwdp_rank must be in [0, {dwdp_size}), got {dwdp_rank}")
+        if num_fused_shared_experts < 0:
+            raise ValueError(
+                "num_fused_shared_experts must be non-negative, got "
+                f"{num_fused_shared_experts}"
+            )
         self.num_routed_experts = num_routed_experts
+        self.num_fused_shared_experts = num_fused_shared_experts
+        self.num_experts = num_routed_experts + num_fused_shared_experts
         self.dwdp_size = dwdp_size
         self.dwdp_rank = dwdp_rank
 
@@ -38,6 +50,8 @@ class DwdpExpertLayout:
             num_routed_experts - num_experts_per_worker,
         )
         self.local_expert_end = self.local_expert_start + num_experts_per_worker
+        if dwdp_rank == dwdp_size - 1:
+            self.local_expert_end += num_fused_shared_experts
 
         self.peer_ranges = compute_peer_ranges(
             dwdp_size=dwdp_size,
@@ -45,6 +59,12 @@ class DwdpExpertLayout:
             num_prefetch_experts=self.num_prefetch_experts,
             num_experts_total=num_routed_experts,
         )
+        if num_fused_shared_experts:
+            last_start, last_end = self.peer_ranges[-1]
+            self.peer_ranges[-1] = (
+                last_start,
+                last_end + num_fused_shared_experts,
+            )
 
 
 class WeightSpec:

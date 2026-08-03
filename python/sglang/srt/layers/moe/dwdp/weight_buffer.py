@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -15,15 +15,6 @@ from sglang.srt.layers.moe.dwdp.layout import (
     PageAlignedLayout,
 )
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
-from sglang.srt.layers.moe.dwdp.vmm import (
-    free_va,
-    get_allocation_granularity,
-    map_handle,
-    reserve_va,
-    set_access,
-    tensor_from_ptr,
-    unmap_va,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +28,30 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        vmm_ops: Any = None,
     ):
+        if vmm_ops is None:
+            from sglang.srt.layers.moe.dwdp import vmm as vmm_ops
+
+        self._vmm_ops = vmm_ops
         self._layer_weight_specs = layer_weight_specs
         self._handles = handles
         self._local_start = local_start
         self._local_end = local_end
         self._dwdp_size = dwdp_size
         self._device_id = device_id
-        self._granularity = get_allocation_granularity(device_id)
+        self._granularity = vmm_ops.get_allocation_granularity(device_id)
+        self._allocation_scoped_access = bool(
+            getattr(vmm_ops, "ACCESS_IS_ALLOCATION_SCOPED", False)
+        )
         self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
+        if self._allocation_scoped_access:
+            # HIP reports a 4 KiB VMM granularity on MI35x. The CUDA-oriented
+            # 8x multiplier would create tens of thousands of 32 KiB handles
+            # for real MoE weights, eventually making hipMemSetAccess fail.
+            # Coarse pages keep the double buffer to a manageable allocation
+            # count while staying within hipMemSetAccess's per-range limit.
+            self._pool_page_size = max(self._pool_page_size, 32 * 1024 * 1024)
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
         self._layouts: Dict[int, Dict[str, PageAlignedLayout]] = {}
@@ -66,9 +72,16 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        vmm_ops: Any = None,
     ) -> WeightBuffer:
         buf = cls(
-            layer_weight_specs, handles, local_start, local_end, dwdp_size, device_id
+            layer_weight_specs,
+            handles,
+            local_start,
+            local_end,
+            dwdp_size,
+            device_id,
+            vmm_ops,
         )
         for li, ws in layer_weight_specs.items():
             buf._layouts[li] = {}
@@ -86,7 +99,10 @@ class WeightBuffer:
         assignments = {li: buf.buffer_index_for_layer(li) for li in layer_weight_specs}
         slot_sizes = compute_slot_sizes(buf._layouts, assignments)
         buf._page_pool = PagePool.create(
-            slot_sizes, device_id, page_size=buf._pool_page_size
+            slot_sizes,
+            device_id,
+            page_size=buf._pool_page_size,
+            vmm_ops=buf._vmm_ops,
         )
 
         for li in buf._moe_layer_indices:
@@ -114,7 +130,7 @@ class WeightBuffer:
             spec = weight_specs[name]
             handle = self._handles.get_handle(layer_idx, name)
 
-            va_base = reserve_va(layout.total_size, self._granularity)
+            va_base = self._vmm_ops.reserve_va(layout.total_size, self._granularity)
             self._va_regions[layer_idx].append((va_base, layout.total_size))
             all_maps = self._mappings[layer_idx]
 
@@ -129,8 +145,18 @@ class WeightBuffer:
                 page_pool_offset += layout.pre_pages
 
             mnnvl_va = va_base + layout.pre_size
-            map_handle(mnnvl_va, layout.mnnvl_size, handle, offset=0)
+            self._vmm_ops.map_handle(mnnvl_va, layout.mnnvl_size, handle, offset=0)
             all_maps.append((mnnvl_va, layout.mnnvl_size))
+            try:
+                self._vmm_ops.set_access(
+                    mnnvl_va,
+                    layout.mnnvl_size,
+                    self._device_id,
+                )
+            except Exception:
+                self._vmm_ops.unmap_va(mnnvl_va, layout.mnnvl_size)
+                all_maps.pop()
+                raise
 
             if layout.post_size > 0:
                 post_va = mnnvl_va + layout.mnnvl_size
@@ -143,10 +169,8 @@ class WeightBuffer:
                 all_maps.extend(post_maps)
                 page_pool_offset += layout.post_pages
 
-            set_access(va_base, layout.total_size, self._device_id)
-
             tensor_start = va_base + layout.pre_padding
-            full_tensor = tensor_from_ptr(
+            full_tensor = self._vmm_ops.tensor_from_ptr(
                 ptr=tensor_start,
                 shape=spec.full_shape,
                 dtype=spec.dtype,
@@ -208,10 +232,10 @@ class WeightBuffer:
         self._released = True
         for li, maps in self._mappings.items():
             for va, sz in maps:
-                unmap_va(va, sz)
+                self._vmm_ops.unmap_va(va, sz)
         for li, regions in self._va_regions.items():
             for va, sz in regions:
-                free_va(va, sz)
+                self._vmm_ops.free_va(va, sz)
         self._mappings.clear()
         self._va_regions.clear()
         self._tensors.clear()

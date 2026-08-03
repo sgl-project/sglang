@@ -45,6 +45,8 @@ sources = [
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
+    "csrc/dwdp/hsa_copy.hip",
+    "csrc/dwdp/hip_vmm.hip",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
@@ -60,7 +62,14 @@ sources = [
 ]
 
 cxx_flags = ["-O3"]
-libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
+libraries = [
+    "hiprtc",
+    "amdhip64",
+    "hsa-runtime64",
+    "c10",
+    "torch",
+    "torch_python",
+]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 default_target = "gfx942"

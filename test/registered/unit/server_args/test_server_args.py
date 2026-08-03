@@ -1910,5 +1910,57 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestDwdpWeightBackend(CustomTestCase):
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.tp_size = 4
+        args.dwdp_size = 4
+        args.dwdp_weight_backend = "auto"
+        args.disaggregation_mode = "null"
+        args.enable_eplb = False
+        args.speculative_algorithm = None
+        args.pp_size = 1
+        args.enable_two_batch_overlap = False
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_rocm_auto_backend_forces_dwdp_topology(self, _is_hip, _is_cuda):
+        args = self._args()
+        args._handle_dwdp()
+        self.assertEqual(args.dwdp_weight_backend, "auto")
+        self.assertEqual(args.dp_size, 4)
+        self.assertEqual(args.moe_ep_size, 4)
+        self.assertEqual(args.moe_a2a_backend, "none")
+        self.assertTrue(args.disable_cuda_graph)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_cuda_rejects_ipc_backend(self, _is_hip, _is_cuda):
+        args = self._args(dwdp_weight_backend="ipc")
+        with self.assertRaisesRegex(AssertionError, "only supported on ROCm"):
+            args._handle_dwdp()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_rocm_rejects_unsupported_partition_count(self, _is_hip, _is_cuda):
+        args = self._args(tp_size=16, dwdp_size=16)
+        with self.assertRaisesRegex(AssertionError, r"\{2, 4, 8\}"):
+            args._handle_dwdp()
+
+        args = self._args(tp_size=3, dwdp_size=3)
+        with self.assertRaisesRegex(AssertionError, r"\{2, 4, 8\}"):
+            args._handle_dwdp()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_rocm_rejects_cross_node_dwdp(self, _is_hip, _is_cuda):
+        args = self._args(nnodes=2)
+        with self.assertRaisesRegex(AssertionError, "single node"):
+            args._handle_dwdp()
+
+
 if __name__ == "__main__":
     unittest.main()

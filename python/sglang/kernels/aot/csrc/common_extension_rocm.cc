@@ -16,6 +16,8 @@ limitations under the License.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
 
+#include "dwdp/hip_vmm.h"
+#include "dwdp/hsa_copy.h"
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
@@ -223,6 +225,38 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "
       "num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_ph_lf", torch::kCUDA, &transfer_kv_per_layer_ph_lf);
+
+  /*
+   * From csrc/dwdp
+   *
+   * These are catch-all registrations because most VMM primitives have no
+   * Tensor argument from which the dispatcher could infer a backend.
+   */
+  m.def("hip_vmm_is_supported(int device_id) -> bool", &hip_vmm_is_supported);
+  m.def(
+      "hip_vmm_get_allocation_granularity(int device_id, bool shareable, bool recommended) -> int",
+      &hip_vmm_get_allocation_granularity);
+  m.def("hip_vmm_create(int size, int device_id, bool shareable) -> int", &hip_vmm_create);
+  m.def("hip_vmm_release(int handle) -> ()", &hip_vmm_release);
+  m.def("hip_vmm_address_reserve(int size, int alignment, int requested_address) -> int", &hip_vmm_address_reserve);
+  m.def("hip_vmm_address_free(int address, int size) -> ()", &hip_vmm_address_free);
+  m.def("hip_vmm_map(int address, int size, int handle, int offset) -> ()", &hip_vmm_map);
+  m.def("hip_vmm_unmap(int address, int size) -> ()", &hip_vmm_unmap);
+  m.def("hip_vmm_set_access(int address, int size, int device_id) -> ()", &hip_vmm_set_access);
+  m.def("hip_vmm_export_fd(int handle) -> int", &hip_vmm_export_fd);
+  m.def("hip_vmm_import_fd(int fd) -> int", &hip_vmm_import_fd);
+  m.def(
+      "hip_vmm_tensor_from_address(int address, int[] shape, ScalarType dtype, int device_id) -> Tensor",
+      &hip_vmm_tensor_from_address);
+  m.def("dwdp_hsa_copy_is_available() -> bool", &dwdp_hsa_copy_is_available);
+  m.def(
+      "dwdp_hsa_copy_engine_for_devices(int destination_device, int source_device) -> int",
+      &dwdp_hsa_copy_engine_for_devices);
+  m.def(
+      "dwdp_hsa_copy_async(Tensor destination, Tensor source, int destination_device, int source_device) -> int",
+      &dwdp_hsa_copy_async);
+  m.def("dwdp_hsa_copy_wait(int ticket) -> int", &dwdp_hsa_copy_wait);
+  m.def("dwdp_hsa_copy_destroy(int ticket) -> ()", &dwdp_hsa_copy_destroy);
 
   /*
    * From csrc/grammar

@@ -1072,6 +1072,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
+    def get_dwdp_tensor_schema(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.dwdp.tensor_schema import (
+            DwdpTensorSchema,
+            existing_tensor_names,
+        )
+
+        scale_names = (
+            ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            if self.block_quant
+            else ("w13_weight_scale1", "w2_weight_scale1")
+        )
+        partitioned = existing_tensor_names(
+            layer,
+            ("w13_weight", "w2_weight") + scale_names,
+        )
+        replicated = existing_tensor_names(
+            layer,
+            (
+                "w13_weight_bias",
+                "w2_weight_bias",
+                "gemm1_alpha",
+                "gemm1_beta",
+                "gemm1_clamp_limit",
+            ),
+        )
+        schema = DwdpTensorSchema(
+            partitioned=partitioned,
+            replicated=replicated,
+        )
+        schema.validate(layer)
+        return schema
+
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""

@@ -9,11 +9,13 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.layers.moe.dwdp.common import restore_storage_rank
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
     lookup_owner,
 )
+from sglang.srt.layers.moe.dwdp.tensor_schema import DwdpTensorSchema
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
@@ -25,11 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_EXPERT_WEIGHT_NAMES = (
-    "w13_weight",
-    "w2_weight",
-)
-
 
 class DwdpManager:
     def __init__(self, server_args: ServerArgs):
@@ -40,20 +37,24 @@ class DwdpManager:
 
         self._weight_manager: Optional[DWDPWeightManager] = None
         self._moe_layer_indices: List[int] = []
+        self._moe_layers: List[Tuple[int, FusedMoE]] = []
+        self._schemas: Dict[int, DwdpTensorSchema] = {}
+        self._original_main_tensors: Dict[Tuple[int, str], torch.Tensor] = {}
+        self._original_side_tensors: Dict[Tuple[int, str], torch.Tensor] = {}
 
     def setup(self, model: nn.Module) -> None:
         if self._weight_manager is not None:
             return
 
-        moe_layers = self._collect_moe_layers(model)
-        if not moe_layers:
+        self._moe_layers = self._collect_moe_layers(model)
+        if not self._moe_layers:
             raise RuntimeError(
                 f"DWDP is enabled but no FusedMoE layers were found in "
                 f"{type(model).__name__}"
             )
-        self._moe_layer_indices = [li for li, _ in moe_layers]
+        self._moe_layer_indices = [li for li, _ in self._moe_layers]
 
-        expert_counts = {e.num_global_routed_experts for _, e in moe_layers}
+        expert_counts = {e.num_global_routed_experts for _, e in self._moe_layers}
         if len(expert_counts) != 1:
             raise RuntimeError(
                 f"DWDP requires a uniform routed expert count across MoE layers, "
@@ -65,10 +66,21 @@ class DwdpManager:
                 f"DWDP requires num_routed_experts ({num_routed}) to be divisible "
                 f"by dwdp_size ({self.dwdp_size})"
             )
+        shared_counts = {
+            int(getattr(experts, "num_fused_shared_experts", 0))
+            for _, experts in self._moe_layers
+        }
+        if len(shared_counts) != 1:
+            raise RuntimeError(
+                "DWDP requires a uniform fused shared expert count, got "
+                f"{sorted(shared_counts)}"
+            )
+        num_shared = shared_counts.pop()
         self.layout = DwdpExpertLayout(
             num_routed_experts=num_routed,
             dwdp_size=self.dwdp_size,
             dwdp_rank=self.dwdp_rank,
+            num_fused_shared_experts=num_shared,
         )
         logger.info(
             f"DWDP layout: {self.layout.num_routed_experts} experts, "
@@ -77,52 +89,99 @@ class DwdpManager:
         )
 
         local_params = {}
-        for li, experts in moe_layers:
-            local_params[(li, "w13_weight")] = experts.w13_weight.data
-            local_params[(li, "w2_weight")] = experts.w2_weight.data
+        local_routed = self.layout.num_experts_per_worker
+        local_count = self.layout.local_expert_end - self.layout.local_expert_start
+        main_weight_names = None
+        for li, experts in self._moe_layers:
+            if experts.quant_method is None:
+                raise RuntimeError(f"Layer {li} has no MoE quantization method")
+            schema = experts.quant_method.get_dwdp_tensor_schema(experts)
+            schema.validate(experts)
+            self._schemas[li] = schema
+            if main_weight_names is None:
+                main_weight_names = schema.main_weights
+            elif schema.main_weights != main_weight_names:
+                raise RuntimeError(
+                    "DWDP requires identical main weight names across layers"
+                )
+            for name in schema.main_weights:
+                storage_tensor = getattr(experts, name)
+                if isinstance(storage_tensor, torch.nn.Parameter):
+                    storage_tensor = storage_tensor.data
+                self._original_main_tensors[(li, name)] = storage_tensor
+                original = experts.quant_method.get_dwdp_tensor(experts, name)
+                required = local_routed + num_shared
+                if original.ndim == 0 or original.shape[0] < required:
+                    raise RuntimeError(
+                        f"Layer {li} tensor {name} has shape "
+                        f"{tuple(original.shape)}, expected at least {required} experts"
+                    )
+                local = original.narrow(0, 0, local_count)
+                if not local.is_contiguous():
+                    local = local.contiguous()
+                local_params[(li, name)] = local
         layer_weight_specs = build_layer_weight_specs(
-            local_params, self.layout.num_routed_experts
+            local_params, self.layout.num_experts
         )
 
         group = get_parallel().tp_group
-        transport = DWDPTransport.create(
-            layer_weight_specs=layer_weight_specs,
-            local_params=local_params,
-            group=group,
-            layout=self.layout,
-            device_id=self.device_id,
-        )
-
-        weight_buffer = WeightBuffer.create(
-            layer_weight_specs=layer_weight_specs,
-            handles=transport.handle_set,
-            local_start=self.layout.local_expert_start,
-            local_end=self.layout.local_expert_end,
-            dwdp_size=self.dwdp_size,
-            device_id=self.device_id,
-        )
-
-        self._fill_edge_bytes(weight_buffer, transport.peer_views)
-
-        self._weight_manager = DWDPWeightManager(
-            weight_buffer=weight_buffer,
-            peer_views=transport.peer_views,
-            peer_ranges=self.layout.peer_ranges,
-            moe_layer_indices=self._moe_layer_indices,
-            weight_names=list(_EXPERT_WEIGHT_NAMES),
-            dwdp_rank=self.dwdp_rank,
-            dwdp_size=self.dwdp_size,
-            transport=transport,
-        )
-
-        for li, experts in moe_layers:
-            experts.bind_full_expert_weights(
-                {
-                    name: weight_buffer.get_full_tensor(li, name)
-                    for name in weight_buffer.weight_names(li)
-                }
+        transport = None
+        weight_buffer = None
+        try:
+            transport = DWDPTransport.create(
+                layer_weight_specs=layer_weight_specs,
+                local_params=local_params,
+                group=group,
+                layout=self.layout,
+                device_id=self.device_id,
             )
-        self._allgather_small_params(moe_layers, group)
+            weight_buffer = WeightBuffer.create(
+                layer_weight_specs=layer_weight_specs,
+                handles=transport.handle_set,
+                local_start=self.layout.local_expert_start,
+                local_end=self.layout.local_expert_end,
+                dwdp_size=self.dwdp_size,
+                device_id=self.device_id,
+            )
+            self._fill_edge_bytes(weight_buffer, transport.peer_views)
+            self._allgather_small_params(self._moe_layers, self._schemas, group)
+
+            manager = DWDPWeightManager(
+                weight_buffer=weight_buffer,
+                peer_views=transport.peer_views,
+                peer_ranges=self.layout.peer_ranges,
+                moe_layer_indices=self._moe_layer_indices,
+                weight_names=list(main_weight_names),
+                dwdp_rank=self.dwdp_rank,
+                dwdp_size=self.dwdp_size,
+                transport=transport,
+            )
+            for li, experts in self._moe_layers:
+                experts.bind_full_expert_weights(
+                    {
+                        name: weight_buffer.get_full_tensor(li, name)
+                        for name in main_weight_names
+                    }
+                )
+            self._weight_manager = manager
+            for tensor in self._original_main_tensors.values():
+                tensor.untyped_storage().resize_(0)
+            torch.cuda.empty_cache()
+        except Exception:
+            layers = dict(self._moe_layers)
+            for (layer_idx, name), original in self._original_main_tensors.items():
+                layers[layer_idx].replace_expert_tensor(name, original)
+            for (layer_idx, name), original in self._original_side_tensors.items():
+                layers[layer_idx].replace_expert_tensor(name, original)
+            for _, experts in self._moe_layers:
+                experts.unbind_dwdp_weights()
+            if weight_buffer is not None:
+                weight_buffer.release()
+            if transport is not None:
+                transport.release()
+            self._original_main_tensors.clear()
+            self._original_side_tensors.clear()
+            raise
 
         logger.info("DWDP setup complete.")
 
@@ -139,9 +198,15 @@ class DwdpManager:
             self._weight_manager.record_compute_and_prefetch_next(layer_idx)
 
     def cleanup(self) -> None:
-        if self._weight_manager is not None:
-            self._weight_manager.release()
-            self._weight_manager = None
+        if self._weight_manager is None:
+            return
+        if dist.is_initialized():
+            get_parallel().tp_group.barrier()
+        self._weight_manager.release()
+        self._weight_manager = None
+        self._original_main_tensors.clear()
+        self._original_side_tensors.clear()
+        self._schemas.clear()
 
     @staticmethod
     def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:
@@ -191,21 +256,59 @@ class DwdpManager:
         torch.cuda.synchronize(weight_buffer.device_id)
 
     def _allgather_small_params(
-        self, moe_layers: List[Tuple[int, FusedMoE]], group
+        self,
+        moe_layers: List[Tuple[int, FusedMoE]],
+        schemas: Dict[int, DwdpTensorSchema],
+        group,
     ) -> None:
         local_experts = self.layout.num_experts_per_worker
-        num_total = self.layout.num_routed_experts
+        num_shared = self.layout.num_fused_shared_experts
 
         for li, experts in moe_layers:
-            for pname, data in experts.named_per_expert_tensors(local_experts):
-                shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]
-                dist.all_gather(shards, data, group=group.device_group)
-                full = torch.cat(shards, dim=0)[:num_total].contiguous()
+            schema = schemas[li]
+            names = tuple(
+                dict.fromkeys(
+                    tuple(
+                        name
+                        for name in schema.partitioned
+                        if name not in schema.main_weights
+                    )
+                    + schema.replicated
+                )
+            )
+            for pname in names:
+                storage_tensor = getattr(experts, pname)
+                if isinstance(storage_tensor, torch.nn.Parameter):
+                    storage_tensor = storage_tensor.data
+                self._original_side_tensors.setdefault(
+                    (li, pname),
+                    storage_tensor,
+                )
+                data = experts.quant_method.get_dwdp_tensor(experts, pname)
+                required = local_experts + num_shared
+                if data.ndim == 0 or data.shape[0] < required:
+                    raise RuntimeError(
+                        f"Layer {li} side tensor {pname} has shape "
+                        f"{tuple(data.shape)}, expected at least {required} experts"
+                    )
+                routed = data.narrow(0, 0, local_experts)
+                shards = [torch.empty_like(routed) for _ in range(self.dwdp_size)]
+                dist.all_gather(shards, routed, group=group.device_group)
+                full = torch.cat(shards, dim=0)
+                if num_shared:
+                    full = torch.cat(
+                        [
+                            full,
+                            data.narrow(0, local_experts, num_shared),
+                        ],
+                        dim=0,
+                    )
+                full = restore_storage_rank(storage_tensor, full)
                 experts.replace_expert_tensor(pname, full)
 
                 logger.debug(
                     f"Layer {li}: allgathered {pname} "
-                    f"({local_experts} -> {full.shape[0]}) "
+                    f"({data.shape[0]} -> {full.shape[0]}) "
                     f"shape={tuple(full.shape)} dtype={full.dtype} "
                     f"size={full.numel() * full.element_size() / 1e6:.1f}MB"
                 )
