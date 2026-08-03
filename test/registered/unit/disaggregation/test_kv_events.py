@@ -9,7 +9,11 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import unittest
 
+import msgspec
+
 from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
+    BlockStored,
     ZmqEventPublisher,
     select_kv_publisher_dp_rank,
 )
@@ -92,6 +96,44 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
                     for a in range(dp_size)
                 }
                 self.assertEqual(len(ranks), dp_size)
+
+
+class TestBlockStoredWireLayout(CustomTestCase):
+    """The encoded BlockStored tuple is a positional contract shared with other
+    engines' subscribers, so pin the slot layout rather than the field list."""
+
+    def _encode(self, **overrides) -> list:
+        event = BlockStored(
+            block_hashes=[11],
+            parent_block_hash=None,
+            token_ids=[10, 11],
+            block_size=2,
+            lora_id=None,
+            **overrides,
+        )
+        return msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+
+    def test_component_types_is_the_trailing_slot(self):
+        # array_like structs always encode every field, so an unset
+        # component_types is a trailing nil -- indistinguishable from an absent
+        # optional to a positional decoder. Anything else here would shift the
+        # slots a subscriber reads.
+        self.assertEqual(
+            self._encode(medium="GPU"),
+            ["BlockStored", [11], None, [10, 11], 2, None, "GPU", None],
+        )
+        self.assertEqual(
+            self._encode(medium="GPU", component_types=["full", "swa"]),
+            ["BlockStored", [11], None, [10, 11], 2, None, "GPU", ["full", "swa"]],
+        )
+
+    def test_block_removed_stays_whole_block(self):
+        # A removal always means the base component left the tier, so no
+        # component dimension is added here.
+        removed = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(BlockRemoved(block_hashes=[11], medium="GPU"))
+        )
+        self.assertEqual(removed, ["BlockRemoved", [11], "GPU"])
 
 
 if __name__ == "__main__":
