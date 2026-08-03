@@ -3,6 +3,22 @@ name: PR Test - Build SGLang Wheel
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: Runner label matching the wheel's target architecture.
+        type: string
+        default: ubuntu-22.04
+      job_display_name:
+        description: Architecture-specific job name shown in the Actions UI.
+        type: string
+        default: Build SGLang Wheel
+      arch_suffix:
+        description: Suffix that keeps artifacts for different architectures distinct.
+        type: string
+        default: ''
+      clean_persistent_workspace:
+        description: Remove files retained by a self-hosted runner before checkout.
+        type: boolean
+        default: false
       git_ref:
         type: string
         default: ''
@@ -21,12 +37,18 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 30
-    name: Build SGLang Wheel
+    name: ${{ inputs.job_display_name }}
     outputs:
       artifact_name: ${{ steps.publish.outputs.artifact_name }}
     steps:
+      - name: Clean persistent workspace
+        if: inputs.clean_persistent_workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.git_ref || github.sha }}
@@ -114,7 +136,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.arch_suffix }}
           path: wheelhouse/
           if-no-files-found: error
           retention-days: 3
@@ -123,7 +145,7 @@ jobs:
       - name: Publish artifact name
         id: publish
         if: steps.upload.outcome == 'success'
-        run: echo 'artifact_name=sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+        run: echo 'artifact_name=sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.arch_suffix }}' >> "$GITHUB_OUTPUT"
 
       - name: Report source-build fallback
         if: steps.publish.outcome != 'success'

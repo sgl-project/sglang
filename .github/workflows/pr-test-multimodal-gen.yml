@@ -35,6 +35,10 @@ on:
         required: false
         type: string
         default: 'false'
+      sglang_wheel_artifact:
+        required: false
+        type: string
+        default: ''
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 # The github context (including github.event_name) IS inherited from the caller.
@@ -102,8 +106,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
@@ -168,8 +180,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -231,8 +251,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -293,8 +321,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -360,8 +396,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -405,10 +449,17 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         env:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -458,8 +509,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -508,8 +567,16 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Resolve prebuilt SGLang wheel
+        id: sglang-wheel
+        uses: ./.github/actions/resolve-sglang-wheel
+        with:
+          artifact-name: ${{ inputs.sglang_wheel_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_CI_PREBUILT_WHEEL: ${{ steps.sglang-wheel.outputs.wheel-path }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 

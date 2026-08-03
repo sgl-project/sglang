@@ -91,7 +91,6 @@ jobs:
               - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/sglang_wheel_artifact.py"
-              - "scripts/ci/test_sglang_wheel_artifact.py"
               - "scripts/ci/utils/*"
               - "rust/**"
               - "proto/**"
@@ -99,6 +98,7 @@ jobs:
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
+              - ".github/actions/resolve-sglang-wheel/**"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
@@ -110,6 +110,7 @@ jobs:
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
+              - ".github/actions/resolve-sglang-wheel/**"
               - "python/pyproject.toml"
               - "test/registered/kernels/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the

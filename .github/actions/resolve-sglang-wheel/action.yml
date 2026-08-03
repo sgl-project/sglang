@@ -1,0 +1,40 @@
+name: Resolve prebuilt SGLang wheel
+description: Download and verify the run-local SGLang wheel, or return an empty path for source fallback.
+
+inputs:
+  artifact-name:
+    description: Run-local artifact produced by the SGLang wheel build job.
+    required: false
+    default: ''
+
+outputs:
+  wheel-path:
+    description: Absolute verified wheel path; empty when unavailable or incompatible.
+    value: ${{ steps.verify.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt SGLang wheel
+      if: inputs.artifact-name != ''
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ runner.name }}
+
+    - name: Verify prebuilt SGLang wheel
+      id: verify
+      if: inputs.artifact-name != ''
+      shell: bash
+      env:
+        SGLANG_WHEEL_DOWNLOAD_DIR: ${{ runner.temp }}/sglang-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ runner.name }}
+      run: |
+        if wheel=$(python3 scripts/ci/sglang_wheel_artifact.py verify \
+            --artifact-dir "${SGLANG_WHEEL_DOWNLOAD_DIR}" \
+            --repo-root .); then
+          echo "path=${wheel}" >> "${GITHUB_OUTPUT}"
+          echo "Using prebuilt SGLang wheel: ${wheel}"
+        else
+          echo '::warning::Prebuilt wheel unavailable or incompatible; falling back to a source build.'
+        fi

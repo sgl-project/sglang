@@ -102,7 +102,8 @@ jobs:
       needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.check-changes.outputs.main_package == 'true' ||
+       needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
@@ -131,7 +132,8 @@ jobs:
       needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.check-changes.outputs.main_package == 'true' ||
+       needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
@@ -218,10 +220,33 @@ jobs:
       always() &&
       !cancelled() &&
       needs.check-changes.result == 'success' &&
+      (needs.check-changes.outputs.main_package == 'true' ||
+       needs.check-changes.outputs.sgl_kernel == 'true' ||
+       needs.check-changes.outputs.jit_kernel == 'true' ||
+       needs.check-changes.outputs.multimodal_gen == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-sglang-wheel-build.yml
+    with:
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
+  # GB300 is ARM64, so it consumes a wheel built and verified on the same
+  # architecture rather than attempting to install the x86 artifact above.
+  sglang-build-wheel-arm:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-sglang-wheel-build.yml
     with:
+      runs_on: arm-kernel-build-node
+      job_display_name: Build SGLang Wheel Arm
+      arch_suffix: '-aarch64'
+      clean_persistent_workspace: true
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -244,7 +269,7 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sglang-build-wheel]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
     # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
@@ -264,6 +289,7 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      sglang_wheel_artifact: ${{ needs.sglang-build-wheel.outputs.artifact_name }}
     secrets: inherit
 
   # =============================================== primary ====================================================
@@ -460,7 +486,7 @@ jobs:
     secrets: inherit
 
   call-multimodal-gen-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sglang-build-wheel]
     if: |
       always() &&
       !cancelled() &&
@@ -477,6 +503,7 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
+      sglang_wheel_artifact: ${{ needs.sglang-build-wheel.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-h100:
@@ -590,7 +617,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels-arm, sglang-build-wheel-arm]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -601,6 +628,7 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
+      sglang_wheel_artifact: ${{ needs.sglang-build-wheel-arm.outputs.artifact_name }}
     secrets: inherit
 
   pr-test-finish:
@@ -612,6 +640,7 @@ jobs:
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
         sglang-build-wheel,
+        sglang-build-wheel-arm,
         call-sgl-kernel-tests,
 
         wait-for-base-a,
