@@ -1,5 +1,10 @@
 import sys
 from io import StringIO
+from pathlib import Path
+
+_TEST_ROOT: Path = Path(__file__).resolve().parents[3]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
 
 import pytest
 from registered.debug_utils.comparator.testing_helpers import (

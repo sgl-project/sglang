@@ -18,6 +18,8 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
@@ -55,6 +57,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     SchedulerWarmupMixin,
+    get_first_generation_req,
     is_warmup_req,
     should_return_warmup_result,
 )
@@ -138,6 +141,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
@@ -214,6 +219,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
 
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
+            )
+        return super()._handle_update_weights_from_disk(reqs)
+
     @staticmethod
     def _normalize_generation_reqs(reqs: list[Any]) -> list[Req]:
         if len(reqs) == 1 and isinstance(reqs[0], list):
@@ -249,6 +263,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Server is sleeping. Call resume_memory_occupation first."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
@@ -263,6 +281,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             if len(reqs) == 1 or not allow_dynamic_batching:
                 return self.worker.execute_forward(reqs)
+
+            if self.server_args.pipeline_config.supports_native_grouped_requests():
+                return self._execute_generation_grouped(reqs)
 
             merged_req = self._try_merge_generation_reqs(reqs)
             if merged_req is None:
@@ -308,6 +329,48 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     reqs=reqs,
                     error_msg=f"Dynamic batching failed: {e}",
                 )
+
+    def _execute_generation_grouped(self, reqs: List[Req]) -> List[OutputBatch]:
+        batch_size = len(reqs)
+        try:
+            output_batch = self.worker.execute_forward(reqs)
+            if output_batch.error:
+                logger.error(
+                    "Native grouped execution returned error. Returning per-request errors: %s",
+                    output_batch.error,
+                )
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs,
+                    error_msg=output_batch.error,
+                )
+
+            split_outputs = self._split_batched_output(output_batch, reqs)
+            if split_outputs is None:
+                logger.error(
+                    "Failed to split native grouped output cleanly. Returning per-request errors."
+                )
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs,
+                    error_msg="Native grouped execution failed: could not split output.",
+                )
+
+            logger.info(
+                "Processed native grouped batch of %d/%d request(s) with max_delay=%.2fms",
+                batch_size,
+                self._batching_max_size,
+                self._batching_delay_s * 1000.0,
+            )
+            return split_outputs
+        except Exception as e:
+            logger.error(
+                "Native grouped execution failed (%s). Returning per-request errors.",
+                e,
+                exc_info=True,
+            )
+            return self._build_dynamic_batch_error_outputs(
+                reqs=reqs,
+                error_msg=f"Native grouped execution failed: {e}",
+            )
 
     def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
@@ -434,7 +497,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req.prompt, str
         ):
             return "prompt_type"
-        if base_req.image_path is not None or candidate_req.image_path is not None:
+        if (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        ):
             return "image_conditioning"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
@@ -468,7 +534,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             return False
 
-        if base_req.image_path is not None or candidate_req.image_path is not None:
+        if (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        ):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return False
@@ -553,6 +622,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         error_msg: str,
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
+
+    def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
+        req = get_first_generation_req(processed_req)
+        return (req is not None and bool(req.extra.get("server_internal_prewarm"))) or (
+            is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
+        )
 
     def return_result(
         self,
@@ -698,8 +773,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         outputs: list[OutputBatch] = []
         start = 0
-        for req, req_count in zip(reqs, per_req_counts):
+        for req_index, (req, req_count) in enumerate(zip(reqs, per_req_counts)):
             end = start + req_count
+            metrics = (
+                deepcopy(output_batch.metrics_list[req_index])
+                if output_batch.metrics_list is not None
+                and req_index < len(output_batch.metrics_list)
+                else deepcopy(output_batch.metrics)
+            )
             split = OutputBatch(
                 output=self._slice_batched_value(
                     output_batch.output, start, end, total_items
@@ -708,6 +789,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.audio, start, end, total_items
                 ),
                 audio_sample_rate=output_batch.audio_sample_rate,
+                action_pred=self._slice_batched_value(
+                    output_batch.action_pred, start, end, total_items
+                ),
                 trajectory_timesteps=self._slice_batched_value(
                     output_batch.trajectory_timesteps, start, end, total_items
                 ),
@@ -721,7 +805,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
-                metrics=deepcopy(output_batch.metrics),
+                metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
                 ),
@@ -1031,8 +1115,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
-                    if is_warmup and should_return_warmup_result(processed_req):
-                        # only keep the necessary lightweight payloads
+                    should_return_lightweight_warmup_result = (
+                        self._should_return_lightweight_warmup_result(processed_req)
+                    )
+                    if should_return_lightweight_warmup_result:
+                        # internal prewarm is a real-path request; reply but drop payloads
                         output_batch.drop_payload_for_warmup()
                         self.return_result(
                             output_batch, identity, should_not_return=False
@@ -1067,3 +1154,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.release_memory_occupation())
+
+    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.resume_memory_occupation())

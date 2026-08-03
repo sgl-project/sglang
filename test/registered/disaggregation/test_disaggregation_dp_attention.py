@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval

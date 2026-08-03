@@ -21,7 +21,6 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
-import hashlib
 import heapq
 import logging
 import sys
@@ -47,7 +46,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+    get_hash_str,
+    split_node_hash_value,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -205,18 +208,9 @@ class RadixKey:
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
         """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hasher = hashlib.sha256()
-        if prior_hash:
-            hasher.update(bytes.fromhex(prior_hash))
-        t = self.token_ids
-        if self.is_bigram:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-                hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
-        else:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-        return hasher.hexdigest()
+        hash_value = get_hash_str(self[start:end], prior_hash)
+        assert isinstance(hash_value, str)
+        return hash_value
 
 
 class TreeNode:
@@ -432,24 +426,30 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
-        return InsertResult(prefix_len=prefix_len)
+        prefix_len, last_node = self._insert_helper(
+            self.root_node, key, value, priority, chunked
+        )
+        return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
+            # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.cache_protected_len
+            )
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -466,17 +466,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
-            )
+            freed_end = result.prefix_len
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
+            freed_end = key_len
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        # duplicates / uninserted range, then the unaligned tail
+        self.token_to_kv_pool_allocator.free_segments(
+            [
+                (
+                    kv_indices[req.cache_protected_len : freed_end],
+                    req.cache_protected_len,
+                ),
+                (kv_indices[key_len:], key_len),
+            ]
+        )
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -508,8 +511,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices[req.cache_protected_len : new_prefix_len],
+            start_pos=req.cache_protected_len,
         )
 
         # The prefix indices could be updated, reuse it
@@ -571,7 +575,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Tree values are page-aligned copies of a kv row: page-exact segment.
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -616,7 +621,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -712,7 +717,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = key.child_key(self.page_size)
 
@@ -748,7 +753,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""

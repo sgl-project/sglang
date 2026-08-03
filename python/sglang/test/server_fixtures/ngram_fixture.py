@@ -15,18 +15,18 @@ mixes in GSM8KMixin), so unittest discovery picks it up as empty.
 """
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_NGRAM,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 DEFAULT_NGRAM_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "8",
     "--speculative-algorithm",
     "NGRAM",
@@ -71,4 +71,4 @@ class NgramServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)

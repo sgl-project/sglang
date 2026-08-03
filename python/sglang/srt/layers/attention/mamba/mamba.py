@@ -4,6 +4,10 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.mamba.triton_ops import (
+    mamba_chunk_scan_combined,
+    selective_state_update,
+)
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
@@ -13,10 +17,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
-from sglang.srt.layers.attention.mamba.ops import (
-    mamba_chunk_scan_combined,
-    selective_state_update,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -42,15 +42,15 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn,
         causal_conv1d_update,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update_triton,
     )
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -63,16 +63,16 @@ elif is_xpu():
     # XPU has no native causal_conv1d kernel yet; use the portable Triton
     # implementation for both the "native" and the "_triton" entry points so
     # `causal_conv1d_fn` / `causal_conv1d_fn_triton` are always bound on XPU.
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn_triton,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update_triton,
     )
 

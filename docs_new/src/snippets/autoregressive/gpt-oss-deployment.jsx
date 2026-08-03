@@ -11,7 +11,8 @@ export const GPTOSSDeployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelsize: {
@@ -56,6 +57,18 @@ export const GPTOSSDeployment = () => {
     }
   };
 
+  const getDisplayOptions = (values) => ({
+    ...options,
+    quantization: options.quantization,
+    speculative: {
+      ...options.speculative,
+      items: options.speculative.items.map(item => ({
+        ...item,
+        disabled: values.hardware === 'xeon' && item.id === 'enabled'
+      }))
+    }
+  });
+
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
@@ -89,7 +102,13 @@ export const GPTOSSDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.speculative = 'disabled';
+      }
+      return next;
+    });
   };
 
   // Generate command
@@ -106,7 +125,8 @@ export const GPTOSSDeployment = () => {
         b300: { tp: 8 },
         mi300x: { tp: 8 },
         mi325x: { tp: 8 },
-        mi355x: { tp: 8 }
+        mi355x: { tp: 8 },
+        xeon: { tp: 3 }
       },
       '20b': {
         baseName: '20b',
@@ -116,7 +136,8 @@ export const GPTOSSDeployment = () => {
         b300: { tp: 1 },
         mi300x: { tp: 1 },
         mi325x: { tp: 1 },
-        mi355x: { tp: 1 }
+        mi355x: { tp: 1 },
+        xeon: { tp: 3 }
       }
     };
 
@@ -146,18 +167,25 @@ export const GPTOSSDeployment = () => {
       return '# MI300X/MI325X GPUs with MXFP4 quantization: Work In Progress';
     }
 
+
     // AMD MI30x requires SGLANG_USE_AITER=0 due to YaRN RoPE precision issues
     if (hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x') {
       cmd += 'SGLANG_USE_AITER=0 ';
     }
 
     if (speculative === 'enabled') {
-      cmd += 'SGLANG_ENABLE_SPEC_V2=1 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ';
+      cmd += 'SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ';
     }
 
     cmd += 'python -m sglang.launch_server \\\n';
 
     cmd += `  --model ${modelName}`;
+
+    if (hardware === 'xeon') {
+      cmd += ` \\
+  --device cpu \\
+  --disable-overlap-schedule`;
+    }
 
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
@@ -206,7 +234,7 @@ export const GPTOSSDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
@@ -225,9 +253,10 @@ export const GPTOSSDeployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled = Boolean(item.disabled);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>

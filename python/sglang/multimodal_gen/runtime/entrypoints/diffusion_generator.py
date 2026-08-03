@@ -54,7 +54,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context
@@ -221,6 +220,7 @@ class DiffGenerator:
         )
 
         request_groups: list[list[Req]] = []
+        parent_requests: list[tuple[Req, int]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(
             prompts, sampling_params_orig.image_path
         )
@@ -244,13 +244,32 @@ class DiffGenerator:
                 sampling_params=sampling_params,
                 external_trace_header=external_trace_header,
             )
-            request_groups.append(
-                expand_request_outputs(
-                    req,
-                    num_prompts=len(prompts),
-                    prompt_index=i,
+            parent_requests.append((req, i))
+
+        for req, prompt_index in parent_requests:
+            sampling_params = req.sampling_params
+            try:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.prepare_video_request_for_queue(req)
+                request_groups.append(
+                    expand_request_outputs(
+                        req,
+                        num_prompts=len(prompts),
+                        prompt_index=prompt_index,
+                    )
                 )
-            )
+            except Exception:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.cleanup_video_request(req)
+                for prepared_requests in request_groups:
+                    if (
+                        prepared_requests
+                        and prepared_requests[0].data_type == DataType.VIDEO
+                    ):
+                        prepared_requests[0].sampling_params.cleanup_video_request(
+                            prepared_requests[0]
+                        )
+                raise
 
         results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
@@ -286,6 +305,10 @@ class DiffGenerator:
                         )
                         for idx, path in enumerate(output_file_paths):
                             req = requests[idx]
+                            if req.data_type == DataType.VIDEO:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -347,6 +370,11 @@ class DiffGenerator:
 
                         for idx in range(len(samples_out)):
                             req = requests[idx]
+                            output_file_path = req.output_file_path(1, 0)
+                            if req.data_type == DataType.VIDEO and req.save_output:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [output_file_path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -356,12 +384,23 @@ class DiffGenerator:
                                     frames=frames_out[idx],
                                     audio=audios_out[idx],
                                     prompt_index=global_output_index + idx,
-                                    output_file_path=req.output_file_path(1, 0),
+                                    output_file_path=output_file_path,
                                 )
                             )
             except Exception as e:
                 logger.error("Generation failed: %s", e, exc_info=True)
             finally:
+                if requests and requests[0].data_type == DataType.VIDEO:
+                    try:
+                        # Pre-queue resources are shared by the shallow
+                        # per-output Req copies, so one idempotent cleanup is
+                        # sufficient for the whole parent request.
+                        requests[0].sampling_params.cleanup_video_request(requests[0])
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up model-owned video request resources",
+                            exc_info=True,
+                        )
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
@@ -376,6 +415,34 @@ class DiffGenerator:
         if not results:
             return None
         return results[0] if len(results) == 1 else results
+
+    def generate_action(
+        self,
+        sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        sampling_params_kwargs = sampling_params_kwargs or {}
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
+        )
+        if sampling_params.data_type != DataType.ACTION:
+            raise ValueError(
+                f"generate_action requires an ACTION pipeline, got {sampling_params.data_type}"
+            )
+
+        req = prepare_request(
+            server_args=self.server_args,
+            sampling_params=sampling_params,
+            external_trace_header=external_trace_header,
+        )
+        output_batch = self._send_to_scheduler_and_wait_for_response(req)
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        if output_batch.output is None:
+            raise RuntimeError("action policy returned no output")
+        return output_batch.output[0]
 
     def _resolve_prompts(
         self,
@@ -431,12 +498,17 @@ class DiffGenerator:
             and output_index < len(output_batch.metrics_list)
         ):
             metrics = output_batch.metrics_list[output_index]
+        if req.data_type == DataType.ACTION:
+            size = ("action",)
+        else:
+            size = (req.height, req.width, req.num_frames)
         return dict(
             prompt=req.prompt,
-            size=(req.height, req.width, req.num_frames),
+            size=size,
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,

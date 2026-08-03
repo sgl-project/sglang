@@ -11,6 +11,7 @@ those late safety-net aborts must not be miscounted.
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -23,13 +24,20 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _make_tm(tokenizer_worker_num: int, rid_to_state: dict) -> TokenizerManager:
     """A TokenizerManager with only the fields abort_request touches, built
-    via __new__ to bypass __init__ (mirrors test_tokenizer_manager_rid_cleanup)."""
+    via __new__ to bypass __init__ (mirrors test_tokenizer_manager_rid_cleanup).
+
+    `_dispatch_to_scheduler` is the seam abort_request forwards through. It is
+    stubbed rather than the underlying socket because the transport it picks
+    (send_pyobj vs msgpack send) depends on SGLANG_USE_PICKLE_IPC, which would
+    otherwise make these assertions env-dependent.
+    """
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
     tm.server_args.tokenizer_worker_num = tokenizer_worker_num
     tm.rid_to_state = rid_to_state
     tm.enable_metrics = True
-    tm.send_to_scheduler = MagicMock()
+    tm.tokenizer_ipc_name = None
+    tm._dispatch_to_scheduler = MagicMock()
     tm.metrics_collector = MagicMock()
     return tm
 
@@ -38,7 +46,11 @@ class TestAbortRequestMetric(CustomTestCase):
     def test_inflight_abort_is_counted(self):
         tm = _make_tm(tokenizer_worker_num=2, rid_to_state={"r1": object()})
         tm.abort_request(rid="r1")
-        tm.send_to_scheduler.send_pyobj.assert_called_once()
+        tm._dispatch_to_scheduler.assert_called_once()
+        (req,) = tm._dispatch_to_scheduler.call_args.args
+        self.assertIsInstance(req, AbortReq)
+        self.assertEqual(req.rid, "r1")
+        self.assertFalse(req.abort_all)
         tm.metrics_collector.observe_one_aborted_request.assert_called_once()
 
     def test_finished_request_not_counted_in_multi_tokenizer(self):
@@ -46,20 +58,22 @@ class TestAbortRequestMetric(CustomTestCase):
         # finished rid (already gone from rid_to_state) must not be counted.
         tm = _make_tm(tokenizer_worker_num=8, rid_to_state={})
         tm.abort_request(rid="already_finished")
-        tm.send_to_scheduler.send_pyobj.assert_called_once()
+        tm._dispatch_to_scheduler.assert_called_once()
         tm.metrics_collector.observe_one_aborted_request.assert_not_called()
 
     def test_finished_request_short_circuits_single_tokenizer(self):
         # Single-tokenizer: a finished rid early-returns before forward or count.
         tm = _make_tm(tokenizer_worker_num=1, rid_to_state={})
         tm.abort_request(rid="already_finished")
-        tm.send_to_scheduler.send_pyobj.assert_not_called()
+        tm._dispatch_to_scheduler.assert_not_called()
         tm.metrics_collector.observe_one_aborted_request.assert_not_called()
 
     def test_abort_all_is_counted(self):
         tm = _make_tm(tokenizer_worker_num=8, rid_to_state={})
         tm.abort_request(abort_all=True)
-        tm.send_to_scheduler.send_pyobj.assert_called_once()
+        tm._dispatch_to_scheduler.assert_called_once()
+        (req,) = tm._dispatch_to_scheduler.call_args.args
+        self.assertTrue(req.abort_all)
         tm.metrics_collector.observe_one_aborted_request.assert_called_once()
 
     def test_not_counted_when_metrics_disabled(self):
@@ -67,7 +81,7 @@ class TestAbortRequestMetric(CustomTestCase):
         tm = _make_tm(tokenizer_worker_num=2, rid_to_state={"r1": object()})
         tm.enable_metrics = False
         tm.abort_request(rid="r1")
-        tm.send_to_scheduler.send_pyobj.assert_called_once()
+        tm._dispatch_to_scheduler.assert_called_once()
         tm.metrics_collector.observe_one_aborted_request.assert_not_called()
 
 

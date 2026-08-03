@@ -55,7 +55,7 @@ Rows are grouped when a family shares the same runtime path or optimization supp
           </tr>
           <tr>
             <td>Other image pipelines</td>
-            <td><div className="sgd-id-list"><code>zai-org/GLM-Image</code><code>tencent/Hunyuan3D-2</code><code>baidu/ERNIE-Image</code><code>baidu/ERNIE-Image-Turbo</code><code>ideogram-ai/ideogram-4-fp8</code><code>ideogram-ai/ideogram-4-nf4</code><code>Comfy-Org/Ideogram-4</code></div></td>
+            <td><div className="sgd-id-list"><code>zai-org/GLM-Image</code><code>tencent/Hunyuan3D-2</code><code>baidu/ERNIE-Image</code><code>baidu/ERNIE-Image-Turbo</code><code>ideogram-ai/ideogram-4-fp8</code><code>ideogram-ai/ideogram-4-nf4</code><code>Comfy-Org/Ideogram-4</code><code>fal/ideogram-v4-fast</code><code>fal/ideogram-v4-instant</code></div></td>
           </tr>
         </tbody>
       </table>
@@ -86,6 +86,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><span className="sgd-chip">Sage</span><span className="sgd-chip">Laser</span><span className="sgd-chip">BSA</span><span className="sgd-chip">Rain Fusion</span></td>
           </tr>
           <tr>
+            <td>LongLive 2.0</td>
+            <td><div className="sgd-id-list"><code>Rabinovich/LongLive-2.0-5B-Diffusers</code></div></td>
+            <td>T2V / I2V, 480p / 720p</td>
+            <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
             <td>HunyuanVideo</td>
             <td><div className="sgd-id-list"><code>hunyuanvideo-community/HunyuanVideo</code><code>FastVideo/FastHunyuan-diffusers</code></div></td>
             <td>720×1280 / 544×960</td>
@@ -108,6 +114,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>OpenMOSS-Team/MOVA-360p</code><code>OpenMOSS-Team/MOVA-720p</code></div></td>
             <td>Video-audio, 360p / 720p; local MOVA detector aliases are also supported.</td>
             <td><span className="sgd-muted">No dedicated optimization listed</span></td>
+          </tr>
+          <tr>
+            <td>MiniMax-H3</td>
+            <td><div className="sgd-id-list"><code>MiniMaxAI/MiniMax-H3</code></div></td>
+            <td>T2VA / FL2VA / Ref2VA, 768p at 24 fps with synchronized audio</td>
+            <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Online FP8</span></td>
           </tr>
           <tr>
             <td>Wan2.1 Fun</td>
@@ -271,6 +283,21 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LongLive 2.0 5B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Rabinovich/LongLive-2.0-5B-Diffusers</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>480p<br />720p</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan2.2 T2V A14B</td>
@@ -528,6 +555,21 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 (T2VA / FL2VA / Ref2VA image, audio, video/V2V)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>MiniMaxAI/MiniMax-H3</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>768p · 24 fps</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2.3 (one/two-stage/TI2V/HQ)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Lightricks/LTX-2.3</code></td>
       <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>768×512<br />1536×1024<br />1920×1088 (HQ default)</td>
@@ -591,8 +633,8 @@ Optimization columns are abbreviated to keep the matrix readable:
    - `resident` usually provides the best latency/throughput but uses much more VRAM.
    - Default is auto: `resident` on H200/high-memory CUDA GPUs, otherwise `original`.
    - Deprecated compatibility: `snapshot` is accepted as an alias for `original` and may be removed after two release cycles.
-5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (8B) and
-   `nvidia/Cosmos3-Super` (32B). Both share the same pipeline; the only
+5. Cosmos3 ships in two sizes — `nvidia/Cosmos3-Nano` (16B) and
+   `nvidia/Cosmos3-Super` (64B). Both share the same pipeline; the only
    difference is transformer depth and width, picked up from
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).

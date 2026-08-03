@@ -1,4 +1,6 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -7,6 +9,10 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 class HybridAttnBackend(AttentionBackend):
@@ -24,6 +30,19 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.spec_attn_is_decode = (
+            model_runner.server_args.speculative_attention_mode == "decode"
+        )
+        self.spec_attn_is_prefill = (
+            model_runner.server_args.speculative_attention_mode == "prefill"
+        )
+        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
+        # delegation the base-class default (True) forces a per-step seq_lens
+        # D2H + host sync even when both sub-backends opted out.
+        self.needs_cpu_seq_lens = (
+            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        )
+        self.max_context_len = model_runner.model_config.context_len
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -45,11 +64,25 @@ class HybridAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             return (
                 self.decode_backend
-                if self.model_runner.server_args.speculative_attention_mode == "decode"
+                if self.spec_attn_is_decode
                 else self.prefill_backend
             )
         else:
             return self.prefill_backend
+
+    @property
+    def supports_full_cuda_graph_chunked_prefix(self) -> bool:
+        return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        self.prefill_backend.prepare_full_cuda_graph_chunked_prefix(
+            forward_batch, in_capture=in_capture
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -59,6 +92,10 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)
@@ -67,7 +104,7 @@ class HybridAttnBackend(AttentionBackend):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if (
             self.model_runner.server_args.speculative_algorithm is not None
-            and self.model_runner.server_args.speculative_attention_mode == "prefill"
+            and self.spec_attn_is_prefill
         ):
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.
@@ -75,6 +112,18 @@ class HybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._select_backend(ForwardMode.TARGET_VERIFY).verify_mask
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup goes to the same child that handed out the mask.
+        self._select_backend(
+            ForwardMode.TARGET_VERIFY
+        ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
     def forward(
         self,
@@ -140,7 +189,7 @@ class HybridAttnBackend(AttentionBackend):
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
-        if self.model_runner.server_args.speculative_attention_mode == "decode":
+        if self.spec_attn_is_decode:
             backend = self.decode_backend
         else:
             backend = self.prefill_backend

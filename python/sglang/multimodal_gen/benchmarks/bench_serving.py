@@ -111,6 +111,21 @@ def _infer_slo_base_time_ms_from_warmups(
     return float(np.median(candidates_ms)) if candidates_ms else None
 
 
+def _parse_extra_body(raw: Optional[str]) -> Dict[str, Any]:
+    """Parses --extra-body, which is merged over every generated payload."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--extra-body is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--extra-body must be a JSON object, got {type(parsed).__name__}."
+        )
+    return parsed
+
+
 def _populate_slo_ms_from_warmups(
     requests_list: List[RequestFuncInput], warmup_pairs: List[tuple], args
 ) -> List[RequestFuncInput]:
@@ -496,6 +511,10 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = NetworkAddress(args.host, args.port).to_url()
 
+    # Parsed before the service wait and the dataset download so a malformed
+    # value fails immediately instead of after minutes of setup.
+    extra_body = _parse_extra_body(args.extra_body)
+
     # Wait for service
     wait_for_service(args.base_url)
 
@@ -567,9 +586,16 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    logger.info(f"Loading requests...")
+    logger.info("Loading requests...")
     requests_list = dataset.get_requests()
     logger.info(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if extra_body:
+        logger.info(f"Merging --extra-body into every request: {extra_body}")
+        requests_list = [
+            replace(req, extra_body={**req.extra_body, **extra_body})
+            for req in requests_list
+        ]
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -588,10 +614,10 @@ async def benchmark(args):
         # Run warmup requests
         warmup_pairs: List[tuple] = []
         if args.warmup_requests and requests_list:
-            # The server always overrides warmup requests to use
-            # num_inference_steps=1 (see Req.set_as_warmup), so we match
-            # that here to keep the benchmark's SLO estimation consistent.
-            warmup_steps = 1
+            # Defaults to 1 to match the server's own boot warmup (see
+            # Req.set_as_warmup) and keep SLO estimation consistent. Raise it
+            # for models that reject a 1-step schedule, such as MiniMax-H3.
+            warmup_steps = args.warmup_inference_steps
             logger.info(
                 f"Running {args.warmup_requests} warmup request(s) with "
                 f"num_inference_steps={warmup_steps}..."
@@ -827,6 +853,22 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--warmup-inference-steps",
+        type=int,
+        default=1,
+        help="Denoise steps for warmup requests. Raise it for models that "
+        "reject a 1-step schedule.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="JSON object merged over each JSON request body, for contract "
+        'fields the generic payload omits (e.g. \'{"task": "t2va"}\' for '
+        "MiniMax-H3). Multipart image requests forward it as an extra_body "
+        "form field instead, which the server may not unpack.",
     )
     parser.add_argument(
         "--num-inference-steps",

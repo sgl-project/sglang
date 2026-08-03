@@ -103,7 +103,12 @@ class TestEnableMetrics(CustomTestCase):
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
             envs.SGLANG_TEST_RETRACT.override(True),
         ):
-            launch_args = ["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args]
+            launch_args = [
+                "--enable-metrics",
+                "--cuda-graph-max-bs-decode",
+                2,
+                *other_args,
+            ]
             if enable_mfu_metrics:
                 launch_args.insert(1, "--enable-mfu-metrics")
             process = popen_launch_server(
