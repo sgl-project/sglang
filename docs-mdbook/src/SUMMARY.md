@@ -45,3 +45,4 @@
 - [附录 A：术语表](appendix/appx-terms.md)
 - [附录 B：关键文件索引](appendix/appx-file-index.md)
 - [附录 C：SM89/L40S 生产部署实录](appendix/appx-sm89-l40s-deployment.md)
+- [附录 D：SM89/L40S 生产性能分析与优化建议](appendix/appx-sm89-l40s-performance-tuning.md)
