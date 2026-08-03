@@ -9,7 +9,10 @@
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
-//                      vendor picks the selector group: blackwell | hopper | amd
+//                      vendor picks the selector group: blackwell | hopper | amd.
+//                      `multiNodeDockerFlags: string[]` (either source) adds
+//                      `docker run` flags the platform's fabric needs
+//   groupHardware      optional — set false to show one flat hardware row
 //   variants/quantizations/strategies/nodesOptions  LEGACY 4-dim option lists,
 //                      used when `matchDims` is absent (nodesOptions id is
 //                      `single` or `multi-N` → --nnodes N)
@@ -38,7 +41,9 @@
 //                      whose verification round is open rather than absent.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
-//   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
+//   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
+//                      `(selection, cell) => template` when the request payload
+//                      depends on a custom match/overlay dimension
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
 //                      per-eval accuracy templates)
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
@@ -54,8 +59,14 @@
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
+//   dockerMounts       optional — additional `-v` mount specs
+//   dockerRunCommand   optional — command placed after the image and before
+//                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
-//                      `docker`); defaults to both, in that order
+//                      `docker`), as an array or `(selection) => array`;
+//                      defaults to both, in that order
+//   showPlaygroundLink optional — false hides the "Open the Playground" footer
+//                      for cookbooks that only expose the deployment matrix
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -79,6 +90,12 @@ export const Deployment = ({ config, benchmarks }) => {
       { id: "gb300", label: "GB300", vram: "288GB" },
       { id: "b200",  label: "B200",  vram: "192GB" },
       { id: "gb200", label: "GB200", vram: "192GB" },
+      // GB10 Grace Blackwell — 128 GB coherent unified system memory (not discrete VRAM).
+      // Multi-node runs over ConnectX-7 RDMA (pinned memory + IB passthrough).
+      { id: "dgx-spark", label: "DGX Spark", vram: "128GB",
+        multiNodeDockerFlags: [
+          "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
+        ] },
     ],
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
@@ -163,8 +180,8 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
     },
-    // Amber callout under the command when speculative decoding (MTP) is on
-    // but --max-running-requests isn't set (SGLang then caps it at 48).
+    // Amber callout under the command when speculative decoding (MTP, DSpark, ...)
+    // is on but --max-running-requests isn't set (SGLang then caps it at 48).
     mtpWarn: {
       margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
       fontSize: "12px", lineHeight: "1.45",
@@ -485,10 +502,34 @@ export const Deployment = ({ config, benchmarks }) => {
   // An overlay option may also REMOVE cell flags, declared as `stripPrefixes`
   // (a static list, or a function of the selection). L3 uses it to drop the
   // whole DCP operating point, which the server rejects with an L3 backend.
-  const overlayStrip = (cellFlags, sel) => {
+  //
+  // Overlay flags append, except a flag whose family the same overlay stripped:
+  // that one is spliced back where the stripped flag was, so a rewritten
+  // parallelism block (DSPARK folding a pipeline flat) stays put instead of
+  // landing past the --host/--port tail with the multi-node trio behind it.
+  const overlayCompose = (cellFlags, sel) => {
     const strip = overlayPart(sel, "stripPrefixes");
-    if (!strip.length) return [...(cellFlags || [])];
-    return (cellFlags || []).filter((f) => !strip.includes(f.split(/[\s=]/)[0]));
+    const add = overlayPart(sel, "flags");
+    if (!strip.length) return [...(cellFlags || []), ...add];
+    const used = new Set();
+    // Consumed once, so a family the cell carries twice is not emitted twice.
+    const replacementsFor = (tok) => {
+      const out = [];
+      add.forEach((f, i) => {
+        if (used.has(i) || f.split(/[\s=]/)[0] !== tok) return;
+        used.add(i);
+        out.push(f);
+      });
+      return out;
+    };
+    const out = [];
+    for (const f of (cellFlags || [])) {
+      const tok = f.split(/[\s=]/)[0];
+      if (!strip.includes(tok)) out.push(f);
+      else out.push(...replacementsFor(tok));
+    }
+    add.forEach((f, i) => { if (!used.has(i)) out.push(f); });
+    return out;
   };
   // ==== end MIRROR ====
   const findCell = (cells, sel) =>
@@ -636,7 +677,6 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // `flags` / `env` / `hints` may each be a function of the whole selection, so an
   // "Auto" option can resolve against another row (draft tokens per strategy).
-  const overlayFlags = (sel) => overlayPart(sel, "flags");
   const overlayEnv = (sel) => overlayPart(sel, "env");
   const overlayHints = (sel) => overlayPart(sel, "hints");
 
@@ -647,7 +687,7 @@ export const Deployment = ({ config, benchmarks }) => {
     const nnodes = cellNnodes(cell, sel);
     const multinode = nnodes > 1;
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
-    const flags = [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)];
+    const flags = overlayCompose(cell.flags, sel);
     if (multinode) {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
@@ -681,6 +721,9 @@ export const Deployment = ({ config, benchmarks }) => {
       const di = config.dockerImages || {};
       const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
@@ -689,6 +732,16 @@ export const Deployment = ({ config, benchmarks }) => {
         }
         const extra = (config.hardware || []).find((h) => h.id === hwId);
         return (extra && extra.vendor) || "nvidia";
+      };
+      // `config.hardware` overrides by id, as in buildHardwareGroups.
+      const fabricFlagsOf = (hwId) => {
+        const extra = (config.hardware || []).find((h) => h.id === hwId);
+        if (extra) return extra.multiNodeDockerFlags || [];
+        for (const list of Object.values(HARDWARE_CATALOG)) {
+          const hit = list.find((h) => h.id === hwId);
+          if (hit) return hit.multiNodeDockerFlags || [];
+        }
+        return [];
       };
       const gpuAccessLines = vendorOf(sel.hw) === "amd"
         ? [
@@ -708,14 +761,16 @@ export const Deployment = ({ config, benchmarks }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
+        ...(multinode ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...flags.map((f) => "    " + f),
       ];
       cmd = dockerLines.join(" \\\n");
@@ -1011,6 +1066,9 @@ export const Deployment = ({ config, benchmarks }) => {
         .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
       if (items.length) groups.push({ label: vendor.toUpperCase(), items });
     }
+    if (config.groupHardware === false) {
+      return [{ label: null, items: groups.flatMap((group) => group.items) }];
+    }
     return groups;
   };
 
@@ -1142,8 +1200,17 @@ export const Deployment = ({ config, benchmarks }) => {
   const [benchConc, setBenchConc] = useState(null);
   const [benchAcc, setBenchAcc] = useState(null);
   const [benchCopied, setBenchCopied] = useState(null);
-  const runModes = config.runModes || ["python", "docker"];
+  const configuredRunModes = typeof config.runModes === "function"
+    ? config.runModes(sel)
+    : config.runModes;
+  const runModes = configuredRunModes || ["python", "docker"];
   const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
+  const hasRunMode = runModes.includes(runMode);
+  const fallbackRunMode = runModes[0];
+  const activeRunMode = hasRunMode ? runMode : fallbackRunMode;
+  useEffect(() => {
+    if (!hasRunMode) setRunMode(fallbackRunMode);
+  }, [hasRunMode, fallbackRunMode]);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // Live --mamba-full-memory-ratio from the ratio calculator (K3 pages):
@@ -1175,14 +1242,38 @@ export const Deployment = ({ config, benchmarks }) => {
     else flags.push(line);
     return { ...cell, flags };
   })();
-  const command = renderCommand(cellWithRatio, sel, env, runMode);
-  // MTP hint on the EFFECTIVE flags — speculation arrives via the Spec Decode
-  // overlay, never the cell. SGLang resets --max-running-requests to 48 when
-  // spec is on and it's unset.
-  const effFlags = cell ? [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)] : [];
-  const mtpHint =
-    effFlags.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
-    !effFlags.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  const command = renderCommand(cellWithRatio, sel, env, activeRunMode);
+  // Speculative-decoding hint on the EFFECTIVE flags — speculation can arrive via
+  // the Spec Decode overlay as well as the cell. SGLang resets
+  // --max-running-requests to 48 when spec is on and it's unset; verified for both
+  // EAGLE/MTP and DSPARK (server_args reports max_running_requests=48 either way).
+  const effFlags = cell ? overlayCompose(cell.flags, sel) : [];
+  const specAlgoFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  const specMrrFlag = effFlags.find(
+    (f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  // Two cases, both worth surfacing when speculation is on:
+  //   mtpHint       — the flag is MISSING, so SGLang silently caps at 48 (a hazard)
+  //   specPinnedHint— the recipe PINS it, which is safe but is a fixed number the
+  //                   reader still has to match to their own concurrency
+  const mtpHint = !!specAlgoFlag && !specMrrFlag;
+  const specPinnedHint = !!specAlgoFlag && !!specMrrFlag;
+  const specMrrValue = specMrrFlag
+    ? (specMrrFlag.split(/[\s=]/).filter(Boolean)[1] || "")
+    : "";
+  // Name the algorithm in the banner rather than hardcoding "MTP" — the same reset
+  // applies to DSpark and friends, and a DSpark user reading "(MTP)" would be
+  // misled. The cookbook calls the EAGLE-based path MTP, so keep that mapping.
+  const SPEC_ALGO_LABEL = {
+    EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
+    DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
+    STANDALONE: "standalone draft",
+  };
+  const specAlgoName = (() => {
+    if (!specAlgoFlag) return "MTP";
+    const v = specAlgoFlag.split(/[\s=]/).filter(Boolean)[1] || "";
+    return SPEC_ALGO_LABEL[v.toUpperCase()] || v || "MTP";
+  })();
   // cell.warn may embed [label](#anchor) links — rendered as scrollIntoView
   // buttons, not hrefs, so the hash (which carries the selection) isn't overwritten.
   const renderWarn = (text) => {
@@ -1220,7 +1311,9 @@ export const Deployment = ({ config, benchmarks }) => {
     return out;
   };
   const modelName = resolveModelName(sel);
-  const curlText = interpolate(config.curl || "", env, modelName);
+  const curlTemplate =
+    typeof config.curl === "function" ? config.curl(sel, cell) : config.curl;
+  const curlText = interpolate(curlTemplate || "", env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
@@ -1342,8 +1435,8 @@ export const Deployment = ({ config, benchmarks }) => {
       <div style={s.cardColumn}>
         <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
         {hwGroups.map((g) => (
-          <div key={g.label} style={s.vendorRow}>
-            <div style={s.vendorLabel}>{g.label}</div>
+          <div key={g.label || "hardware"} style={s.vendorRow}>
+            {g.label && <div style={s.vendorLabel}>{g.label}</div>}
             <div style={s.itemsGrid(maxHwCols)}>
               {g.items.map((item) => renderButton(item, "hw", sel.hw))}
               {Array.from({ length: maxHwCols - g.items.length }).map((_, i) => (
@@ -1388,13 +1481,13 @@ export const Deployment = ({ config, benchmarks }) => {
                       key={mode}
                       style={{
                         ...(index === runModes.length - 1
-                          ? s.runModeChipLast(runMode === mode)
-                          : s.runModeChip(runMode === mode)),
+                          ? s.runModeChipLast(activeRunMode === mode)
+                          : s.runModeChip(activeRunMode === mode)),
                         ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
                       }}
                       onClick={() => setRunMode(mode)}
                       role="tab"
-                      aria-selected={runMode === mode}
+                      aria-selected={activeRunMode === mode}
                     >
                       {mode === "docker" ? "Docker" : "Python"}
                     </span>
@@ -1413,7 +1506,12 @@ export const Deployment = ({ config, benchmarks }) => {
             {cell && cell.warn && <div style={s.mtpWarn}>⚠️ {renderWarn(cell.warn)}</div>}
             {mtpHint && (
               <div style={s.mtpWarn}>
-                ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+                ⚠️ Speculative decoding ({specAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              </div>
+            )}
+            {specPinnedHint && (
+              <div style={s.mtpWarn}>
+                ℹ️ Speculative decoding ({specAlgoName}) is on and this recipe pins <code>--max-running-requests</code> to <strong>{specMrrValue}</strong>. Adjust it to match your target concurrency — if you remove the flag, SGLang falls back to <strong>48</strong>.
               </div>
             )}
           </>)}
@@ -1425,38 +1523,40 @@ export const Deployment = ({ config, benchmarks }) => {
 
       {/* Playground link — scrollIntoView, not an href, so the hash (which
           carries the selection) isn't overwritten. */}
-      <div
-        style={{
-          padding: "6px 12px",
-          fontSize: "12px",
-          color: isDark ? "#9ca3af" : "#6b7280",
-          display: "flex",
-          alignItems: "center",
-          gap: "6px",
-        }}
-      >
-        <span>Need to go beyond the verified matrix?</span>
-        <button
-          type="button"
-          onClick={() => {
-            const el = document.getElementById("playground");
-            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-          }}
+      {config.showPlaygroundLink !== false && (
+        <div
           style={{
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            color: isDark ? "#FDBA74" : "#C2410C",
-            cursor: "pointer",
+            padding: "6px 12px",
             fontSize: "12px",
-            fontWeight: 600,
-            textDecoration: "underline",
-            textUnderlineOffset: "2px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
           }}
         >
-          Open the Playground →
-        </button>
-      </div>
+          <span>Need to go beyond the verified matrix?</span>
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById("playground");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: isDark ? "#FDBA74" : "#C2410C",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+            }}
+          >
+            Open the Playground →
+          </button>
+        </div>
+      )}
 
       {/* cURL modal */}
       {modal === "curl" && (
