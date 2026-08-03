@@ -55,11 +55,7 @@ SGL_DEVICE packed_t rms(float2 valf, packed_t& weight, float rsqrt_square_sum) {
 
 template <bool kCastXBeforeOutMul, bool kScaleInput, typename T, int VEC_SIZE_IN_BYTE>
 __global__ void fused_add_rmsnorm_reg_kernel(
-    T* __restrict__ input,
-    T* __restrict__ residual,
-    const T* __restrict__ weight,
-    int vec_hidden_size,
-    float eps,
+    T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps,
     float input_scale) {
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
