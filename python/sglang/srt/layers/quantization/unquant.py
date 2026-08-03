@@ -6,16 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Shared, grow-only scratch-buffer cache for the SYCL `fused_experts` XPU
-# path (see sgl_kernel.moe._get_moe_ws). Reusing the same buffers across all
-# MoE layers/forward-calls (instead of each call doing several fresh
-# torch.empty allocations) avoids the XPU caching allocator accumulating many
-# differently-shaped cached blocks, which otherwise shows up as elevated
-# torch.xpu.memory_reserved() relative to torch.xpu.memory_allocated() and can
-# lead to OOM at larger batch sizes. Module-level (not per-instance) because
-# every MoE layer gets its own UnquantizedFusedMoEMethod instance.
-_MOE_WS: dict = {}
-
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -761,7 +751,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 activation=moe_runner_config.activation,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,
-                workspace=_MOE_WS,
             )
             return StandardCombineInput(hidden_states=output)
         else:
