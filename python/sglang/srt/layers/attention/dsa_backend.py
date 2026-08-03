@@ -15,7 +15,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -469,9 +469,7 @@ class DeepseekSparseAttnBackend(
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(
             model_runner.server_args, seed_dsa_topk_from_draft_extend
@@ -3215,9 +3213,14 @@ class DeepseekSparseAttnBackend(
 
             rope_positions = forward_batch.positions
             if dsa_use_prefill_cp(forward_batch):
-                rope_positions = cp_split_and_rebuild_position(
-                    forward_batch, rope_positions
-                )
+                if is_cp_v2_active(forward_batch):
+                    rope_positions = get_cp_strategy().shard_position_ids(
+                        rope_positions, forward_batch
+                    )
+                else:
+                    rope_positions = cp_split_and_rebuild_position(
+                        forward_batch, rope_positions
+                    )
 
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,

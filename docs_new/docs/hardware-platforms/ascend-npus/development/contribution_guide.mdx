@@ -42,7 +42,7 @@ pre-commit run --all-files
 ## Run and add tests
 
 All NPU tests are end-to-end (E2E) and require launching a server with real model weights.
-Tests live under [`test/registered/ascend/`](https://github.com/sgl-project/sglang/tree/main/test/registered/ascend), organized by model type and functionality:
+Tests live under [`test/registered/npu/`](https://github.com/sgl-project/sglang/tree/main/test/registered/npu), organized by model type and functionality:
 
 ```
 ascend/
@@ -58,9 +58,9 @@ ascend/
 
 ### Adding a test
 
-See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/main/test/registered/ascend/basic_function/backends/test_npu_sampling_backend.py) for a complete example. Key steps:
+See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/main/test/registered/npu/basic_function/backends/test_npu_sampling_backend.py) for a complete example. Key steps:
 
-1. Place your test file in the appropriate directory under `test/registered/ascend/`.
+1. Place your test file in the appropriate directory under `test/registered/npu/`.
 2. Extend `CustomTestCase` (from `sglang.test.test_utils`) for CI retry support.
 3. Launch server with `popen_launch_server()` in `setUpClass` and clean up with `kill_process_tree()` in `tearDownClass`.
 4. Register your test with `register_npu_ci()`:
@@ -73,7 +73,7 @@ See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/
 ### Running tests locally
 
 ```bash
-pytest test/registered/ascend/llm_models/test_npu_qwen3_0_6b.py -v
+pytest test/registered/npu/llm_models/test_npu_qwen3_0_6b.py -v
 ```
 
 For detailed instructions, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).

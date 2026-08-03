@@ -29,6 +29,7 @@ from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
@@ -71,6 +72,7 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
@@ -252,16 +254,31 @@ class FunctionCallParser:
         try:
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
-                    tools=self.tools
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
+                structural_tag_tools = self.tools
+                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
+                    structural_tag_tools = [
+                        tool.model_copy(
+                            update={
+                                "function": tool.function.model_copy(
+                                    update={"strict": True}
+                                )
+                            }
+                        )
+                        for tool in self.tools
+                    ]
                 structural_tag = self.detector.get_structural_tag(
-                    tools=self.tools,
+                    tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
                     tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
@@ -275,7 +292,9 @@ class FunctionCallParser:
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
 
-            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            if (
+                tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+            ) and not self.detector.parses_required_natively():
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
