@@ -63,8 +63,8 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
-def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
-    """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
+def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
+    """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
     args = model_runner.server_args
     if (
         args.linear_attn_prefill_backend is not None
@@ -73,7 +73,7 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
         or not is_cuda()
         or torch.cuda.get_device_capability()[0] != 10
     ):
-        return
+        return None
 
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
@@ -89,20 +89,17 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
         or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
         != torch.bfloat16
     ):
-        return
+        return None
 
     from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
         is_flashinfer_gdn_prefill_available,
     )
 
-    if is_flashinfer_gdn_prefill_available():
-        # server_args is resolved (read-only) by the time backends initialize;
-        # route this load-time default through the audited mutation entry.
-        args.override(
-            "gdn_backend.sm100_flashinfer_default",
-            linear_attn_prefill_backend="flashinfer",
-        )
-        rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+    if not is_flashinfer_gdn_prefill_available():
+        return None
+
+    rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+    return "flashinfer"
 
 
 class GDNKernelDispatcher:
