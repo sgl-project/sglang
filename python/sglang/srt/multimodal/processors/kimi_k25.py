@@ -366,7 +366,7 @@ class KimiGPUProcessorWrapper:
 
         if images and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
-        return self._cpu_call(text, images, **kwargs)
+        return self._cpu_call(text, images, original_input_ids, **kwargs)
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
         if original_input_ids is not None:
@@ -426,18 +426,23 @@ class KimiGPUProcessorWrapper:
             "image_grid_thw": grid_thws,
         }
 
-    def _cpu_call(self, text, images, **kwargs):
+    def _cpu_call(self, text, images, original_input_ids=None, **kwargs):
         """Fallback: token expansion + medias kwarg -> original HF processor."""
         input_text = text[0] if isinstance(text, list) else text
 
         if images:
             # Token expansion via media_tokens_calculator
+            image_token_counts = [
+                int(
+                    self._hf_processor.media_processor.media_tokens_calculator(
+                        {"type": "image", "image": image}
+                    )
+                )
+                for image in images
+            ]
             parts = input_text.split(self._image_token)
             result = [parts[0]]
-            for image, part in zip(images, parts[1:]):
-                num_tokens = self._hf_processor.media_processor.media_tokens_calculator(
-                    {"type": "image", "image": image}
-                )
+            for num_tokens, part in zip(image_token_counts, parts[1:]):
                 result.append(self._image_token * num_tokens + part)
             input_text = "".join(result)
 
@@ -445,6 +450,12 @@ class KimiGPUProcessorWrapper:
             kwargs["medias"] = [{"type": "image", "image": img} for img in images]
 
         out = self._hf_processor(text=[input_text], **kwargs)
+        if images and original_input_ids is not None:
+            # preserve_processor_input_ids turns off the base class rebuild, so
+            # this path has to keep the request's own tokens itself.
+            out["input_ids"] = _expand_image_token_ids(
+                original_input_ids, self._image_token_id, image_token_counts
+            )
         grid_thws = out.pop("grid_thws", None)
         if grid_thws is not None:
             out["image_grid_thw"] = grid_thws

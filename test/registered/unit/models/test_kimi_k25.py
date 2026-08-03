@@ -25,6 +25,7 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    KimiGPUProcessorWrapper,
     _ensure_chw_rgb,
     _expand_image_token_ids,
     _resize_bicubic_if_needed,
@@ -191,6 +192,41 @@ def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
             ids, image_token_id=7, image_token_counts=counts
         )
         assert wrapper.flatten().tolist() == expected
+
+
+def test_kimi_cpu_fallback_keeps_the_request_tokens():
+    # preserve_processor_input_ids disables the base class rebuild for every
+    # path, so the no-CUDA fallback has to preserve the tokens on its own.
+    hf_processor = Mock()
+    hf_processor.media_processor.media_tokens_calculator = Mock(return_value=3)
+    hf_processor.return_value = {"input_ids": torch.tensor([[99, 99, 99]])}
+
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._hf_processor = hf_processor
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 7
+
+    out = wrapper._cpu_call(
+        "a<|media_pad|>b", ["img"], original_input_ids=[1, 7, 2], medias=None
+    )
+
+    # Not the [99, 99, 99] the HF processor returned.
+    assert out["input_ids"].flatten().tolist() == [1, 7, 7, 7, 2]
+
+
+def test_kimi_cpu_fallback_falls_back_to_the_hf_tokens_without_request_ids():
+    hf_processor = Mock()
+    hf_processor.media_processor.media_tokens_calculator = Mock(return_value=3)
+    hf_processor.return_value = {"input_ids": torch.tensor([[99, 99, 99]])}
+
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._hf_processor = hf_processor
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 7
+
+    out = wrapper._cpu_call("a<|media_pad|>b", ["img"], medias=None)
+
+    assert out["input_ids"].flatten().tolist() == [99, 99, 99]
 
 
 def test_kimi_refuses_already_normalized_float_pixels():
