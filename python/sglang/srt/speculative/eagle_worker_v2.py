@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -164,9 +165,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                random_seed=target_worker.random_seed,
             )
 
         # Alias for better readability
@@ -1004,17 +1006,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            ps,
-            nccl_port,
-            target_worker,
+        # The draft runs where the target's last-layer hidden states and sampled
+        # tokens exist, i.e. only on the last pipeline stage. Other stages keep an
+        # EAGLEWorkerV2 that forwards the target and returns proxy tensors, so the
+        # scheduler's dispatch and run_batch branching stay rank-uniform.
+        self._hosts_draft = get_pp_group().is_last_rank
+        self._draft_worker = (
+            EagleDraftWorker(
+                server_args,
+                gpu_id,
+                ps,
+                nccl_port,
+                target_worker,
+            )
+            if self._hosts_draft
+            else None
         )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
-        if server_args.speculative_adaptive:
+        if server_args.speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
@@ -1077,7 +1088,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1087,7 +1102,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=target_capture_mode,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
@@ -1096,6 +1113,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # A rank that does not host the draft (prefill-side PP builds it only on
+            # the last stage) forwards the target's proxy tensors and stops here.
+            if self._draft_worker is None:
+                return batch_output
 
             # Draft prefill
             with (

@@ -8552,8 +8552,16 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            # A PD prefill engine runs speculative decoding as a single extend step
+            # (target forward + one draft extend); there is no accept length and no
+            # per-step hidden-state feedback, so it composes with the pipeline. The
+            # decode side still owns the draft loop and stays unsupported.
+            assert (
+                self.speculative_algorithm is None
+                or self.disaggregation_mode == "prefill"
+            ), "Pipeline parallelism is only compatible with speculative decoding on a PD prefill engine"
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

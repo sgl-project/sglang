@@ -62,7 +62,12 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
-    # V2 workers nest the draft runner under `.draft_worker`.
+    # V2 workers nest the draft runner under `.draft_worker`. That inner worker is
+    # None on ranks that do not host the draft (prefill-side PP builds it only on
+    # the last stage), and those ranks own no draft KV pool.
+    if draft_worker.draft_worker is None:
+        return None
+
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
