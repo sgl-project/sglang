@@ -746,8 +746,15 @@ class ModelConfig:
         attention.  Not every hybrid-SWA model uses them.
         """
         archs = self.hf_config.architectures or []
-        # GptOss always creates sinks unconditionally.
-        if "GptOssForCausalLM" in archs:
+        # GptOss and GraniteSWA/GraniteMoeSWA always create sinks unconditionally.
+        if any(
+            a in archs
+            for a in (
+                "GptOssForCausalLM",
+                "GraniteSWAForCausalLM",
+                "GraniteMoeSWAForCausalLM",
+            )
+        ):
             return True
 
         # MiMoV2 creates sinks only when the config flags are set.
@@ -1979,6 +1986,8 @@ def is_hybrid_swa_model(
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
         "GptOssForCausalLM",
+        "GraniteSWAForCausalLM",
+        "GraniteMoeSWAForCausalLM",
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
@@ -2021,7 +2030,14 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
-    elif "GptOssForCausalLM" in model_architectures:
+    elif any(
+        arch in model_architectures
+        for arch in (
+            "GptOssForCausalLM",
+            "GraniteSWAForCausalLM",
+            "GraniteMoeSWAForCausalLM",
+        )
+    ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"

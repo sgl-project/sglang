@@ -55,6 +55,7 @@ class ModelCase:
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
     attention_backend: Optional[str] = None
+    torch_dtype: Optional[torch.dtype] = None
 
 
 # Popular models that run on the CI
@@ -119,6 +120,20 @@ ALL_MODELS = [
         "ibm-granite/granite-4.0-h-micro",
         trust_remote_code=True,
     ),
+    ModelCase(
+        "ibm-granite/granite-swash-2b",
+        skip_long_prompt=True,
+    ),
+    ModelCase(
+        "ibm-granite/granite-swash-3b-a600m",
+        skip_long_prompt=True,
+        # fp16 causes HF and SGLang outputs to diverge at a near-tied token on
+        # one of the default prompts. Testing in bf16 fixes text mismatch, but
+        # worsens logit precision, hence the wider tolerances.
+        torch_dtype=torch.bfloat16,
+        prefill_tolerance=0.4,
+        decode_tolerance=0.6,
+    ),
 ]
 
 MAMBA_MODEL_PATHS = [
@@ -142,6 +157,7 @@ class TestGenerationModels(CustomTestCase):
     ) -> None:
         model_path = model_case.model_path
         max_new_tokens = 32
+        torch_dtype = model_case.torch_dtype or torch_dtype
 
         # Set conv dtype for hybrid models to match inference dtype
         dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
