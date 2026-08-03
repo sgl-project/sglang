@@ -73,13 +73,23 @@ pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) ->
     resolve_from_hub_cache(path, revision, filename)
 }
 
-/// Locate a file for an HF Hub repo id in the local cache (`HF_HOME`). Offline —
+/// Locate a file for an HF Hub repo id in the local cache. Offline —
 /// the scheduler pre-downloads the model. `None` if not cached.
 fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
     use hf_hub::{Cache, Repo, RepoType};
 
+    // Python resolves the cache dir as HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE >
+    // HF_HOME/hub > ~/.cache/huggingface/hub; the hf-hub crate only knows
+    // HF_HOME. Honor the explicit cache-dir overrides first, or the Rust
+    // server misses models the Python scheduler already downloaded.
+    let cache = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
+        .map(|dir| Cache::new(dir.into()))
+        .unwrap_or_else(Cache::from_env);
+
     let rev = revision.unwrap_or("main");
-    Cache::from_env()
+    cache
         .repo(Repo::with_revision(
             repo_id.to_string(),
             RepoType::Model,

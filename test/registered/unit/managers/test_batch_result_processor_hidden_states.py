@@ -29,7 +29,7 @@ def _make_processor(server_mode: str = "full") -> SchedulerBatchResultProcessor:
             enable_return_hidden_states=True,
             return_hidden_states_mode=server_mode,
         ),
-        model_config=SimpleNamespace(think_end_id=None),
+        model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,

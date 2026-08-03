@@ -1390,6 +1390,9 @@ export const Playground = ({ config }) => {
       const di = config.dockerImages || {};
       const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const dockerRunCommand = typeof config.dockerRunCommand === "function"
+        ? config.dockerRunCommand(sel)
+        : (config.dockerRunCommand || "sglang serve");
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
@@ -1406,11 +1409,12 @@ export const Playground = ({ config }) => {
         (multinode || pdMode) ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
-        "  sglang serve",
+        `  ${dockerRunCommand}`,
         ...f.map((x) => "    " + x),
       ];
       cmd = dockerLines.join(" \\\n");
