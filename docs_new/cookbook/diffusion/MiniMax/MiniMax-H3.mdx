@@ -99,6 +99,17 @@ sglang serve \
   --port 30010
 ```
 
+Pure Ulysses4 is also the faster measured topology on H200, not just a
+capacity default. The 4×H100 TP2 + Ulysses2 recipe below fits on 141 GB H200
+cards, but it replaces the Ulysses all-to-all exchange with two per-block
+tensor-parallel all-reduces and measured slower on the same 1344×768,
+5-second, 50-step T2VA request (fixed seed, back-to-back runs on an otherwise
+idle 4×H200 host): end-to-end 84.14 s for Ulysses4 versus 85.51 s for
+TP2 + Ulysses2 with a cold first request, and 74.38 s versus 78.33 s
+(denoise 71.73 s versus 75.52 s) once warmup covers the served resolution
+with `--warmup-resolutions 1344x768`. Treat TP2 + Ulysses2 on H200 as a
+deliberate memory trade, not a latency default.
+
 For 4×H100 80 GB, balance the large packed activation with resident weight
 sharding. TP2 + Ulysses2 was the fastest measured lossless topology while the
 Qwen encoder still folds across all four GPUs:
