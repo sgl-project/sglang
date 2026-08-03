@@ -73,6 +73,16 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_empty_grammar_constraint_becomes_none(self):
+        """An empty grammar string means "unset", not "constrain to nothing".
+        Left as "" it reads as set to the is-not-None checks downstream while
+        the constraint selection skips it.
+        """
+        for field in ("json_schema", "regex", "ebnf", "structural_tag"):
+            with self.subTest(field=field):
+                sp = SamplingParams(**{field: ""})
+                self.assertIsNone(getattr(sp, field))
+
 
 class TestSamplingParamsVerify(CustomTestCase):
 
