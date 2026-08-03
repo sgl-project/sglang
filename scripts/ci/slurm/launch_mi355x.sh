@@ -1000,9 +1000,7 @@ NODELIST_ARG=()
 EXCLUSIVE_ARG=()
 [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]] && EXCLUSIVE_ARG=(--exclusive)
 
-# Keep the scheduler off known-bad nodes (e.g. a host whose ionic RDMA driver
-# ABI mismatches the container, where MORI reports "no active RDMA device" and
-# the disagg server dies on init). Comma-separated node list.
+# Optional comma-separated nodes to keep the scheduler off.
 EXCLUDE_ARG=()
 [[ -n "${SLURM_EXCLUDE:-}" ]] && EXCLUDE_ARG=(--exclude="$SLURM_EXCLUDE")
 
@@ -1010,10 +1008,9 @@ EXCLUDE_ARG=()
 # original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
 TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
 
-# EP16 needs all four amd-sglang nodes. Keep g20 out of an engine-root position,
-# where its slower MORI bootstrap can miss the worker-connect timeout.
+# Keep g20 out of a wide engine's root position, where its slower MORI
+# bootstrap can miss the worker-connect timeout.
 if [[ "$MATRIX_CONFIG_NAME" == *-2p1d-ep16* ]]; then
-    EXCLUDE_ARG=()
     export SLURM_DIST_TAIL="${SLURM_DIST_TAIL:-mia1-p01-g20}"
 fi
 
