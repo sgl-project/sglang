@@ -51,9 +51,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
-        self._topk1_parents_prealloc = None
-        self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
         # Set constant
@@ -151,12 +148,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
         )
 
         # Create our custom draft worker that doesn't share embeddings/lm_head

@@ -42,10 +42,10 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as FLUX.2 Klein, Cosmos3, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3` one-stage/two-stage/HQ, HunyuanVideo, MOVA, Helios, JoyAI/FireRed image edit, and Hunyuan3D shape
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as MiniMax-H3 joint video/audio T2VA, FLUX.2 Klein, Cosmos3, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3` one-stage/two-stage/HQ, HunyuanVideo, MOVA, Helios, JoyAI/FireRed image edit, and Hunyuan3D shape
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; supports `--no-torch-compile`, validates nightly preset drift with `--validate-nightly-alignment`, and saves perf dumps by label for `compare_perf.py`
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; supports `--no-torch-compile`, forces the H3 preset to its eager consistency mode, validates nightly preset drift with `--validate-nightly-alignment`, and saves perf dumps by label for `compare_perf.py`
 
 ## Opportunity Discovery Rule
 
@@ -54,8 +54,10 @@ Before calling a diffusion hotspot "new", first classify it with `existing-fast-
 Always rule out these existing families first:
 - HunyuanVideo VAE GroupNorm+SiLU
 - LTX upsampler GroupNorm+SiLU
-- Z-Image residual-form modulation
+- Z-Image bf16-native Triton RMSNorm scale/tanh-residual modulation
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
+- MiniMax-H3 indexed modulation, fused QK norm + RoPE, packed Ulysses QKV,
+  USP relayout, and batched TP AdaLN collectives
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE
 - LTX2 residual-gate add
@@ -71,6 +73,10 @@ If the user explicitly requires `torch.compile` to stay off, do not use the
 default benchmark preset invocation unchanged. Either pass the checked-in
 benchmark helper its no-compile switch or run the equivalent manual command
 without `--enable-torch-compile`.
+
+MiniMax-H3 is always an eager consistency case on current main. Use
+`--model minimax-h3-t2va`; its preset writes the H3 request fields through a
+generated config and suppresses the helper's global compile default.
 
 For FLUX-family manual profiling runs with a quantized transformer override:
 - use `sglang generate` directly
