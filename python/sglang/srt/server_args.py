@@ -1851,6 +1851,20 @@ class ServerArgs:
         "Enable debug/eager mode for CUDA graph using breakable CUDA graph. When enabled, graph breaks are inserted so every operation runs eagerly while still going through the CUDA graph capture / replay path. Useful for debugging CUDA graph capture / replay issues.",
         NS("exec.graph"),
     ] = False
+    debug_mode: A[
+        bool,
+        "Dev-only debug mode (never use in production). Keeps the process alive when a "
+        "batch's forward pass raises inside the scheduler event loop: the failed batch "
+        "is discarded (its requests are aborted and their KV released) and the loop "
+        "resumes, so a serving-time bug can be reproduced repeatedly without paying "
+        "weight load + CUDA graph capture on every crash. The waiting queue, the memory "
+        "pools and the rest of the scheduler state are left untouched, so requests that "
+        "were not in the failed batch keep running. Exceptions outside the batch forward "
+        "(request intake, batch scheduling) still tear the process down as usual. Only "
+        "supported with tp_size=pp_size=dp_size=1 and the non-overlap scheduler "
+        "(overlap is force-disabled).",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Communication and kernels
@@ -8053,6 +8067,36 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
+
+        if self.debug_mode:
+            self._handle_debug_mode()
+
+    def _handle_debug_mode(self):
+        # Only the plain single-rank event_loop_normal handles a failed batch.
+        # Reject any configuration that resolves to a different event loop so the
+        # flag never silently does nothing.
+        if self.tp_size != 1 or self.pp_size != 1 or self.dp_size != 1:
+            raise ValueError(
+                "--debug-mode is only supported with tp_size=pp_size=dp_size=1 (a "
+                "single scheduler process with no cross-rank lockstep). Got "
+                f"tp_size={self.tp_size}, pp_size={self.pp_size}, "
+                f"dp_size={self.dp_size}."
+            )
+        if self.disaggregation_mode != "null" or self.enable_pdmux:
+            raise ValueError(
+                "--debug-mode is not supported with PD disaggregation or PD "
+                "multiplexing; those run different event loops. Got "
+                f"disaggregation_mode={self.disaggregation_mode!r}, "
+                f"enable_pdmux={self.enable_pdmux}."
+            )
+        if not self.disable_overlap_schedule:
+            # Nothing later in the pipeline re-enables overlap, so this write
+            # stands (the other writers only ever disable it too).
+            logger.warning(
+                "--debug-mode only handles failures in the non-overlap scheduler "
+                "loop; force-disabling overlap schedule."
+            )
+            self.disable_overlap_schedule = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

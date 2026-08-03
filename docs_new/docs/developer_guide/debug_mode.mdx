@@ -1,0 +1,109 @@
+---
+title: "Debug Mode: iterating on serving-time faults"
+metatags:
+    description: "Use SGLang's dev-only --debug-mode to keep the scheduler process alive across a serving-time exception, so a bug can be reproduced repeatedly without paying weight load and CUDA graph capture on every crash."
+---
+
+When a Python exception is raised while a batch runs — a NaN guard, a sampling
+assertion, an attention metadata mismatch, a batch-result bookkeeping bug — the
+scheduler process normally exits. On a large model, every reproduction then costs a full
+weight load plus CUDA graph capture, which is usually the slowest part of fixing the bug.
+
+`--debug-mode` turns that crash into a per-batch abort. The failed batch's requests are
+aborted, the event loop resumes, and the process keeps its loaded weights and captured
+graphs. You send the next request and get the next reproduction in seconds.
+
+<Warning>
+  `--debug-mode` is for development only. Never enable it on a production server: it
+  converts a loud crash into an aborted request, which suppresses exactly the signal you
+  want a restart and an alert for.
+</Warning>
+
+## Prerequisites
+
+The flag is rejected at startup unless all of the following hold, so it never silently
+does nothing:
+
+- `--tp-size 1`, `--pp-size 1`, `--dp-size 1`. Multi-rank runs advance in lockstep, so
+  one rank discarding a batch would desync the others.
+- No PD disaggregation and no PD multiplexing — those run different event loops.
+- The non-overlap scheduler. If overlap is enabled, `--debug-mode` force-disables it and
+  logs a warning.
+
+## Usage
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --debug-mode
+```
+
+Each failure logs the traceback and the request ids it aborted:
+
+```text
+Batch forward failed with 3 request(s) in flight. --debug-mode is on; aborting the
+batch's requests and resuming the event loop instead of tearing down the process.
+Traceback (most recent call last):
+  ...
+RuntimeError: <your bug>
+
+Discarded the failed batch (aborted rids: [...]); resuming the event loop.
+```
+
+Clients whose requests were in the failed batch receive a normal abort
+(`finish_reason.type == "abort"`), so a reproduction script loops instead of hanging.
+
+## What is and is not discarded
+
+The fault is scoped to the failed batch:
+
+| | Behavior on a failed batch |
+|---|---|
+| Requests in the batch | Aborted; their KV cache and request-pool slots are released |
+| Requests in the waiting queue | **Untouched** — they run as soon as the loop resumes |
+| Requests in other in-flight state | Untouched |
+| KV cache / memory pools | **Not** wiped; only the aborted requests' allocations are freed |
+| Weights, CUDA graphs | Kept — this is the point of the flag |
+
+Because the queue survives, you can keep a background load running while you narrow down
+a failing input.
+
+## What is not recovered
+
+Only the batch forward is guarded. Exceptions during request intake or batch scheduling
+still tear the process down: a half-built batch has no owner for the requests it already
+removed from the waiting queue, so there is no correct way to resume. If your bug lives
+in scheduling rather than in the forward pass, use the normal crash-and-restart loop.
+
+GPU-side faults — illegal memory access, device-side asserts — are also out of scope.
+They poison the CUDA context, so the process cannot continue regardless. See the
+kernel-API logging approach for those.
+
+Recovery is best-effort: if the teardown itself raises, the original exception is
+re-raised and the normal crash path takes over, so the worst case equals the behavior
+without the flag.
+
+## Verifying you are not chasing a leak
+
+The discard releases KV through the same path a normally finished request uses. To make
+any leak a hard failure rather than a warning, arm the scheduler's invariant checker:
+
+```bash
+SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=1 python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --debug-mode
+```
+
+That check runs when the scheduler goes idle, which is outside the guarded block, so a
+leak still crashes the process — the flag cannot hide it. For a quantitative check, read
+`token_capacity` from `/get_internal_state` while the server is idle, before and after a
+fault; the two values must match.
+
+## Related
+
+- [MSProbe debugging guide](/docs/developer_guide/msprobe_debugging_guide) — numerical
+  drift with no exception.
+- `--debug-cuda-graph` — run every operation eagerly through the CUDA graph
+  capture/replay path, to rule the graph in or out.
+- `--debug-tensor-dump-output-folder` / `--debug-tensor-dump-layers` — per-forward tensor
+  dumps.

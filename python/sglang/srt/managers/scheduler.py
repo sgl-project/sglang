@@ -200,6 +200,9 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.debug_fault_handler import (
+    SchedulerDebugFaultHandler,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
@@ -635,6 +638,8 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.maybe_init_debug_fault_handler()
 
         self.init_kv_events_publisher()
 
@@ -1647,8 +1652,16 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                try:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
+                except Exception as exc:
+                    # Re-raise so run_scheduler_process tears the process down.
+                    # --debug-mode instead discards this batch and keeps serving.
+                    if self.debug_fault_handler is None:
+                        raise
+                    self._discard_failed_batch(batch, exc)
+                    continue
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1969,6 +1982,17 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+        )
+
+    def maybe_init_debug_fault_handler(self) -> None:
+        self.debug_fault_handler: Optional[SchedulerDebugFaultHandler] = None
+        if not get_schedule().debug_mode:
+            return
+        self.debug_fault_handler = SchedulerDebugFaultHandler(
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+            ipc_channels=self.ipc_channels,
+            enable_hicache_storage=lambda: self.enable_hicache_storage,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -4102,6 +4126,51 @@ class Scheduler(
             )
             success = False
         return success
+
+    def _discard_failed_batch(self, batch: ScheduleBatch, exc: Exception) -> None:
+        """Debug-mode only: drop the batch whose forward pass raised, then keep serving.
+
+        Only the requests owned by ``batch`` are torn down. The waiting queue, the
+        memory pools and every other scheduler field are left alone, so the next
+        iteration rebuilds from them through the normal path: the aborted requests are
+        ``finished()``, so ``update_running_batch``'s ``filter_batch`` drops them from
+        ``running_batch`` the same way it drops any completed request.
+
+        Best-effort. If the teardown itself raises, the state is unknown (e.g. a
+        poisoned CUDA context after an illegal memory access), so the original
+        exception is re-raised and the normal crash path (SIGQUIT in
+        run_scheduler_process) takes over. Recovers CPU-side exceptions only.
+        """
+        logger.error(
+            f"Batch forward failed with {len(batch.reqs)} request(s) in flight. "
+            "--debug-mode is on; aborting the batch's requests and resuming the "
+            "event loop instead of tearing down the process.\n"
+            f"{get_exception_traceback()}"
+        )
+        try:
+            aborted_rids = self.debug_fault_handler.discard_batch(batch)
+        except Exception:
+            logger.error(
+                "Failed to discard the batch; the scheduler state is unrecoverable. "
+                f"Falling back to the normal crash path.\n{get_exception_traceback()}"
+            )
+            raise exc
+
+        # Drop the pointers to the discarded batch. `last_batch` is cleared rather than
+        # set to `batch`: get_next_batch_to_run would otherwise merge a batch whose
+        # requests no longer own any KV.
+        self.last_batch = None
+        self.cur_batch_for_debug = None
+        self.running_batch.batch_is_full = False
+        if self.chunked_req is not None and self.chunked_req in batch.reqs:
+            # Also drop the deferred-abort marker so process_pending_chunked_abort
+            # does not touch a released request on the next iteration.
+            self.chunked_req = None
+            self._pending_chunked_abort_req = None
+        logger.warning(
+            f"Discarded the failed batch (aborted rids: {aborted_rids}); "
+            "resuming the event loop."
+        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
