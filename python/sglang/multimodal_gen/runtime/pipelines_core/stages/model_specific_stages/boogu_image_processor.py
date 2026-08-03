@@ -1,14 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native port of the upstream ``BooguImageProcessor``.
-
-Ported from the Boogu-Image reference pipeline so the SGLang edit path can
-reproduce the reference-image / VLM preprocessing without depending on the
-external ``boogu`` package. Only the two Boogu-specific methods are ported:
-``get_new_height_width`` (the ``max_pixels`` / ``max_side_length`` aware
-downscale-only resize) and ``preprocess`` (which routes through it). Everything
-else is inherited from the stock diffusers ``VaeImageProcessor``.
-"""
-
 import warnings
 
 import numpy as np
@@ -22,12 +12,6 @@ from diffusers.image_processor import (
 
 
 class BooguImageProcessor(VaeImageProcessor):
-    """VaeImageProcessor variant with Boogu-Image pixel/side-length constraints.
-
-    Resizing never upscales (the ratio is clamped to ``<= 1``) and always aligns
-    the target height/width to multiples of ``vae_scale_factor``.
-    """
-
     def __init__(
         self,
         do_resize: bool = True,
@@ -60,10 +44,6 @@ class BooguImageProcessor(VaeImageProcessor):
         max_pixels: int | None = None,
         max_side_length: int | None = None,
     ) -> tuple[int, int]:
-        """Return target ``(height, width)`` after downscale + alignment.
-
-        Faithful port of upstream ``BooguImageProcessor.get_new_height_width``.
-        """
         if height is None:
             if isinstance(image, PIL.Image.Image):
                 height = image.height
@@ -102,7 +82,6 @@ class BooguImageProcessor(VaeImageProcessor):
         max_pixels_ratio = (
             (max_pixels / cur_pixels) ** 0.5 if max_pixels is not None else 1.0
         )
-        # Clamp ratio to <=1 to avoid upscaling input images in preprocessing.
         ratio = min(max_pixels_ratio, max_side_length_ratio, 1.0)
 
         new_height, new_width = (
@@ -125,12 +104,6 @@ class BooguImageProcessor(VaeImageProcessor):
         resize_mode: str = "default",
         crops_coords: tuple[int, int, int, int] | None = None,
     ) -> torch.Tensor:
-        """Preprocess an image into a normalized ``[B, C, H, W]`` tensor.
-
-        Faithful port of upstream ``BooguImageProcessor.preprocess`` (PixArt-style
-        downscale). Only the PIL branch is exercised by the native pipeline, but
-        the numpy/tensor branches are kept for parity.
-        """
         supported_formats = (PIL.Image.Image, np.ndarray, torch.Tensor)
 
         if (

@@ -149,10 +149,7 @@ class Req:
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
-    # Per-sample reference-image latents for models (e.g. Boogu-Image edit) that
-    # thread reference tokens through the DiT instead of concatenating them onto
-    # the noise latents. Outer list is per-sample, inner list is per-reference,
-    # each an un-patchified [C, h, w] latent. None => text-to-image (no ref).
+    # per-sample reference-image latents threaded through the DiT
     ref_image_hidden_states: list[list[torch.Tensor]] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None

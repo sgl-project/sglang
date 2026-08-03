@@ -46,18 +46,6 @@ class BooguImageArchConfig(DiTArchConfig):
                 2,
             ),
             r"(.*_feed_forward|.*\.feed_forward)\.linear_2\.weight$": r"\1.w2.weight",
-            # Packed QKV. `\.to_q\.` cannot match `.img_to_q.` / `.instruct_to_q.`
-            # (underscore, not dot, before `to_q`), so the three families are
-            # disjoint and each keeps its own q/k/v shard order.
-            r"(.*)\.to_q\.weight$": (r"\1.to_qkv.weight", 0, 3),
-            r"(.*)\.to_k\.weight$": (r"\1.to_qkv.weight", 1, 3),
-            r"(.*)\.to_v\.weight$": (r"\1.to_qkv.weight", 2, 3),
-            r"(.*)\.img_to_q\.weight$": (r"\1.img_to_qkv.weight", 0, 3),
-            r"(.*)\.img_to_k\.weight$": (r"\1.img_to_qkv.weight", 1, 3),
-            r"(.*)\.img_to_v\.weight$": (r"\1.img_to_qkv.weight", 2, 3),
-            r"(.*)\.instruct_to_q\.weight$": (r"\1.instruct_to_qkv.weight", 0, 3),
-            r"(.*)\.instruct_to_k\.weight$": (r"\1.instruct_to_qkv.weight", 1, 3),
-            r"(.*)\.instruct_to_v\.weight$": (r"\1.instruct_to_qkv.weight", 2, 3),
         }
     )
 

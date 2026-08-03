@@ -900,7 +900,6 @@ def _register_configs():
         ],
         model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
     )
-    # Boogu-Image (base T2I only)
     register_configs(
         sampling_param_cls=BooguImageSamplingParams,
         pipeline_config_cls=BooguImagePipelineConfig,

@@ -13,5 +13,6 @@ class BooguImageSamplingParams(SamplingParams):
     width: int = 1024
 
     guidance_scale: float = 4.0
+    guidance_scale_2: float = 1.0
     negative_prompt: str = ""
     max_sequence_length: int = 1280

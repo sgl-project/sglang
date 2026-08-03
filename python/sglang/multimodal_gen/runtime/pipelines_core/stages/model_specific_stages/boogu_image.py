@@ -1,22 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference-image (TI2I / I2I) encoding stage for Boogu-Image.
-
-Additive on top of the text-to-image path (PR #33182): the DiT already accepts
-per-sample ``ref_image_hidden_states``, so the edit path only needs a distinct
-encoding stage that, when a reference image is present, feeds that image to
-*both*
-
-* the Qwen3-VL text encoder (image-aware instruction embeddings), and
-* the VAE (reference latents threaded through the DiT).
-
-Faithful to the upstream ``pipeline_boogu_image`` preprocessing: two resolutions
-are derived from the raw reference PIL — a small 384px copy for the VLM and a
-larger 2048px copy for the VAE — the VAE copy's dimensions drive the output
-resolution (``align_res``), and the image-present positive branch always uses
-the TI2I system prompt. When no reference image is supplied the stage falls back
-to the plain text-to-image behaviour of :class:`TextEncodingStage`.
-"""
-
 from typing import Any
 
 import PIL.Image
@@ -46,9 +28,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 
 logger = init_logger(__name__)
 
-# Upstream dual-resolution preprocessing budgets. The VLM copy is capped small
-# (its features only condition the instruction embedding); the VAE copy is kept
-# large and its aligned dimensions become the generated image size.
 _MAX_VLM_INPUT_PIL_PIXELS = 384 * 384
 _MAX_VLM_INPUT_PIL_SIDE_LENGTH = 384 * 2
 _MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
@@ -70,30 +49,16 @@ def _retrieve_latents(
     raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class BooguImageEditEncodingStage(TextEncodingStage):
-    """Encode instruction text (+ optional reference image) for Boogu-Image edit.
-
-    Reuses all of :class:`TextEncodingStage`'s negative-prompt / caching /
-    output-appending machinery. Only two things are model-specific: the VLM
-    forward delegates to ``text_encoder.model`` (the multimodal wrapper, matching
-    ``BooguTextEncodingStage``), and — when a reference image is present — the
-    positive prompt is encoded with the image fused in and a reference latent is
-    produced for the DiT.
-    """
-
+class BooguImageEncodingStage(TextEncodingStage):
     def __init__(self, text_encoders, tokenizers, vae) -> None:
         super().__init__(text_encoders, tokenizers)
         self.vae = vae
-        # FLUX AutoencoderKL: /8 spatial. The image processor aligns to
-        # ``vae_scale_factor * 2`` (the DiT patch size), matching upstream.
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = BooguImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2, do_resize=True
         )
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        # Match BooguTextEncodingStage: the Qwen3-VL wrapper delegates to `.model`
-        # (the multimodal Qwen3VLModel), which accepts pixel_values/image_grid_thw.
         inner = text_encoder.model
         with set_forward_context(current_timestep=0, attn_metadata=None):
             return inner(**encoder_forward_kwargs)
@@ -118,29 +83,23 @@ class BooguImageEditEncodingStage(TextEncodingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         ref_images = batch.condition_image
         if not ref_images:
-            # No reference image => plain text-to-image; reuse the base stage.
             return super().forward(batch, server_args)
 
         raw_pil = ref_images[0].convert("RGB")
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
         device = get_local_torch_device()
 
-        # 1. Reference latent (VAE copy drives the output resolution).
         ref_latent = self._encode_reference_vae(raw_pil, batch, server_args, device)
 
-        # 2. Image-fused instruction embeddings (VLM copy, capped at 384px).
         feats, mask = self._encode_reference_vlm(raw_pil, prompts, batch, device)
         ref_latent = ref_latent.to(feats.dtype)
 
         batch.prompt_embeds = [feats]
         batch.prompt_attention_mask = [mask]
         batch.prompt_embeds_mask = [mask]
-        # Per-sample reference latents; image_latent left None so the denoising
-        # loop threads refs through the DiT rather than concatenating them.
         batch.ref_image_hidden_states = [[ref_latent] for _ in prompts]
         batch.image_latent = None
 
-        # 3. Negative (text-only) branch, identical to the base CFG path.
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
             (
@@ -165,13 +124,11 @@ class BooguImageEditEncodingStage(TextEncodingStage):
     def _encode_reference_vae(
         self, raw_pil: PIL.Image.Image, batch: Req, server_args: ServerArgs, device
     ) -> torch.Tensor:
-        """VAE-encode the reference and set the output resolution (align_res)."""
         preprocessed = self.image_processor.preprocess(
             raw_pil,
             max_pixels=_MAX_INPUT_IMAGE_PIXELS,
             max_side_length=_MAX_INPUT_IMAGE_SIDE_LENGTH,
         )
-        # Output resolution follows the VAE-preprocessed reference dimensions.
         batch.height = int(preprocessed.shape[-2])
         batch.width = int(preprocessed.shape[-1])
 
@@ -180,9 +137,6 @@ class BooguImageEditEncodingStage(TextEncodingStage):
                 device, None, self.vae
             )
         )
-        # Upstream falls back to an unseeded sample when the request carries a
-        # list of generators rather than a single one; mirror that (and avoid
-        # generator/device mismatches).
         gen = batch.generator
         vae_generator = gen if isinstance(gen, torch.Generator) else None
 
@@ -204,14 +158,6 @@ class BooguImageEditEncodingStage(TextEncodingStage):
         scaling_factor: float | torch.Tensor | None,
         shift_factor: float | torch.Tensor | None,
     ) -> torch.Tensor:
-        """Normalize a raw VAE sample into the DiT's latent space.
-
-        Inverse of the decode normalization (``decoding.py``: ``latent /
-        scaling_factor + shift_factor``), so encode must subtract the shift
-        *then* scale: ``(sample - shift) * scale``. The order matters —
-        scaling before shifting silently corrupts the reference latent, so this
-        is kept as a single named helper the edit tests pin.
-        """
         if shift_factor is not None:
             latent = latent - shift_factor
         if scaling_factor is not None:
@@ -221,7 +167,6 @@ class BooguImageEditEncodingStage(TextEncodingStage):
     def _encode_reference_vlm(
         self, raw_pil: PIL.Image.Image, prompts: list[str], batch: Req, device
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode instruction text with the reference image fused in."""
         new_h, new_w = self.image_processor.get_new_height_width(
             raw_pil,
             None,
@@ -250,9 +195,6 @@ class BooguImageEditEncodingStage(TextEncodingStage):
         vlm_inputs["return_dict"] = True
 
         outputs = self._forward_text_encoder(self.text_encoders[0], vlm_inputs)
-        # `.last_hidden_state` is the post-norm final state, matching the
-        # validated T2I path (sglang norm semantics differ from upstream's
-        # `hidden_states[-1]`, which is pre-norm here).
         feats = outputs.last_hidden_state
         mask = vlm_inputs["attention_mask"]
         return feats, mask
@@ -260,9 +202,6 @@ class BooguImageEditEncodingStage(TextEncodingStage):
     def _build_edit_messages(
         self, instruction: str, pil_image: PIL.Image.Image
     ) -> list[dict[str, Any]]:
-        # With an image present upstream always uses the unified TI2I system
-        # prompt (sglang's DROP prompt), regardless of whether the instruction is
-        # empty. Images are placed before the text in the user turn.
         return [
             {
                 "role": "system",

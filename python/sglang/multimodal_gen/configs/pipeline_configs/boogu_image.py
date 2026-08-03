@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.boogu_image import BooguImageDitConfig
@@ -13,6 +16,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGBranch,
+    CFGPolicy,
+    _apply_cfg_postprocess,
+    _unwrap,
+    _wrap,
+)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 BOOGU_SYSTEM_PROMPT_T2I = (
     "You are a helpful assistant that generates high-quality images based on user "
@@ -61,8 +74,99 @@ def _boogu_postprocess_text(outputs, _text_inputs):
 
 
 @dataclass
+class BooguImageCFGPolicy(CFGPolicy):
+    def build(
+        self,
+        batch: Req,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+    ) -> BooguImageCFGPolicy:
+        ref = batch.ref_image_hidden_states
+        text_on = batch.do_classifier_free_guidance and batch.guidance_scale > 1.0
+        image_on = ref is not None and batch.guidance_scale_2 > 1.0
+
+        cond = {**image_kwargs, **pos_cond_kwargs, "ref_image_hidden_states": ref}
+        branches = [CFGBranch("cond_ref", True, cond)]
+
+        if text_on and image_on:
+            branches.append(
+                CFGBranch(
+                    "drop_text",
+                    False,
+                    {**image_kwargs, **neg_cond_kwargs, "ref_image_hidden_states": ref},
+                )
+            )
+            branches.append(
+                CFGBranch(
+                    "drop_all",
+                    False,
+                    {
+                        **image_kwargs,
+                        **neg_cond_kwargs,
+                        "ref_image_hidden_states": None,
+                    },
+                )
+            )
+        elif text_on:
+            branches.append(
+                CFGBranch(
+                    "drop_text",
+                    False,
+                    {**image_kwargs, **neg_cond_kwargs, "ref_image_hidden_states": ref},
+                )
+            )
+        elif image_on:
+            branches.append(
+                CFGBranch(
+                    "drop_image",
+                    False,
+                    {
+                        **image_kwargs,
+                        **pos_cond_kwargs,
+                        "ref_image_hidden_states": None,
+                    },
+                )
+            )
+        return dataclasses.replace(self, branches=branches)
+
+    def combine(
+        self,
+        predictions: list[Any],
+        batch: Req,
+        cfg_scale: float,
+        pipeline_config: Any,
+        *,
+        cfg_parallel: bool = False,
+    ) -> Any:
+        if len(predictions) == 1:
+            return predictions[0]
+
+        text_gs = cfg_scale
+        image_gs = batch.guidance_scale_2
+        cond = _wrap(predictions[0])
+
+        if len(predictions) == 3:
+            drop_text = _wrap(predictions[1])
+            drop_all = _wrap(predictions[2])
+            results = [
+                c + (text_gs - 1.0) * (c - dt) + (image_gs - 1.0) * (dt - da)
+                for c, dt, da in zip(cond, drop_text, drop_all)
+            ]
+        else:
+            uncond = _wrap(predictions[1])
+            scale = text_gs if text_gs > 1.0 else image_gs
+            results = [c + (scale - 1.0) * (c - u) for c, u in zip(cond, uncond)]
+
+        results[0] = _apply_cfg_postprocess(results[0], cond[0], batch, pipeline_config)
+        return _unwrap(tuple(results))
+
+
+@dataclass
 class BooguImagePipelineConfig(ImagePipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
+
+    cfg_policy: CFGPolicy = field(default_factory=BooguImageCFGPolicy)
 
     should_use_guidance: bool = True
     enable_autocast: bool = False
@@ -125,3 +229,9 @@ class BooguImagePipelineConfig(ImagePipelineConfig):
         if latents.dim() == 5:
             latents = latents.squeeze(2)
         return latents
+
+    def calculate_condition_image_size(self, image, width, height):
+        return None
+
+    def prepare_calculated_size(self, image):
+        return None

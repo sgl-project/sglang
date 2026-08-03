@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -107,35 +108,6 @@ def compute_ffn_hidden_dim(
     if ffn_dim_multiplier is not None:
         inner_dim = int(ffn_dim_multiplier * inner_dim)
     return multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
-
-
-def qkv_split_sizes(
-    *, local_num_heads: int, local_num_kv_heads: int, head_dim: int
-) -> List[int]:
-    """Per-rank widths of the q / k / v slices inside a packed QKV projection."""
-    return [
-        local_num_heads * head_dim,
-        local_num_kv_heads * head_dim,
-        local_num_kv_heads * head_dim,
-    ]
-
-
-def split_packed_qkv(
-    qkv: torch.Tensor, split_sizes: List[int], *, make_contiguous: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Unpack a fused QKV projection into q, k, v.
-
-    `MergedColumnParallelLinear` lays the shards out contiguously along the last
-    dim in construction order, so a plain split recovers them -- but each slice
-    is then strided, and `.view()` to per-head shape rejects that. Callers that
-    reshape immediately pass `make_contiguous=True`; callers that first funnel
-    the slices through a copying op (`interleave_instruct_image` cats and stacks)
-    pass `False` and let that op absorb the gather.
-    """
-    q, k, v = qkv.split(split_sizes, dim=-1)
-    if make_contiguous:
-        return q.contiguous(), k.contiguous(), v.contiguous()
-    return q, k, v
 
 
 def interleave_instruct_image(
@@ -228,18 +200,29 @@ class BooguAttention(nn.Module):
         self.local_num_kv_heads = num_kv_heads // tp_size
         kv_dim = self.head_dim * num_kv_heads
 
-        self.to_qkv = MergedColumnParallelLinear(
+        self.to_q = ColumnParallelLinear(
             dim,
-            [dim, kv_dim, kv_dim],
+            dim,
             bias=False,
             gather_output=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.to_qkv",
+            prefix=f"{prefix}.to_q",
         )
-        self.qkv_split_sizes = qkv_split_sizes(
-            local_num_heads=self.local_num_heads,
-            local_num_kv_heads=self.local_num_kv_heads,
-            head_dim=self.head_dim,
+        self.to_k = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k",
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v",
         )
 
         if self.qk_norm:
@@ -275,10 +258,9 @@ class BooguAttention(nn.Module):
     def _qkv(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        qkv, _ = self.to_qkv(hidden_states)
-        q, k, v = split_packed_qkv(
-            qkv, split_sizes=self.qkv_split_sizes, make_contiguous=True
-        )
+        q, _ = self.to_q(hidden_states)
+        k, _ = self.to_k(hidden_states)
+        v, _ = self.to_v(hidden_states)
         return self._split_heads(q, k, v)
 
     def _split_heads(
@@ -338,13 +320,20 @@ class BooguJointAttnProjections(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        for name in ("img_to_qkv", "instruct_to_qkv"):
+        for name, out_dim in (
+            ("img_to_q", dim),
+            ("img_to_k", kv_dim),
+            ("img_to_v", kv_dim),
+            ("instruct_to_q", dim),
+            ("instruct_to_k", kv_dim),
+            ("instruct_to_v", kv_dim),
+        ):
             setattr(
                 self,
                 name,
-                MergedColumnParallelLinear(
+                ColumnParallelLinear(
                     dim,
-                    [dim, kv_dim, kv_dim],
+                    out_dim,
                     bias=False,
                     gather_output=False,
                     quant_config=quant_config,
@@ -401,11 +390,6 @@ class BooguJointAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.processor",
         )
-        self.qkv_split_sizes = qkv_split_sizes(
-            local_num_heads=self.local_num_heads,
-            local_num_kv_heads=self.local_num_kv_heads,
-            head_dim=self.head_dim,
-        )
 
         if self.qk_norm:
             self.norm_q = BooguRMSNorm(self.head_dim, eps=eps)
@@ -447,14 +431,12 @@ class BooguJointAttention(nn.Module):
         attn_mask_meta: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         p = self.processor
-        img_qkv, _ = p.img_to_qkv(img_hidden_states)
-        instruct_qkv, _ = p.instruct_to_qkv(instruct_hidden_states)
-        img_q, img_k, img_v = split_packed_qkv(
-            img_qkv, split_sizes=self.qkv_split_sizes, make_contiguous=False
-        )
-        instruct_q, instruct_k, instruct_v = split_packed_qkv(
-            instruct_qkv, split_sizes=self.qkv_split_sizes, make_contiguous=False
-        )
+        img_q, _ = p.img_to_q(img_hidden_states)
+        img_k, _ = p.img_to_k(img_hidden_states)
+        img_v, _ = p.img_to_v(img_hidden_states)
+        instruct_q, _ = p.instruct_to_q(instruct_hidden_states)
+        instruct_k, _ = p.instruct_to_k(instruct_hidden_states)
+        instruct_v, _ = p.instruct_to_v(instruct_hidden_states)
 
         query = interleave_instruct_image(
             instruct=instruct_q,
@@ -910,18 +892,6 @@ class BooguRopeEmbedder(nn.Module):
                 .unsqueeze(-1)
                 .repeat(1, self.num_pos_axes)
             )
-            # Two separate counters, as in the upstream reference:
-            #   pe_shift     - the value written on axis 0 (the image-index /
-            #                  stream axis); advances by the larger grid side so
-            #                  successive images occupy disjoint index bands.
-            #   pe_shift_len - the sequence position where each image's tokens
-            #                  are written; advances by the token count.
-            # Axes 1 and 2 (row / col) use the raw 0-based grid coordinates so a
-            # reference token and the noise token at the same (row, col) share a
-            # spatial position — that alignment is what lets the DiT copy
-            # structure from the reference. Offsetting the spatial axes by the
-            # index shift (as an earlier version did) desynchronizes the
-            # reference and noise grids and corrupts the edit.
             pe_shift = cap_len
             pe_shift_len = cap_len
             if ref_img_sizes[i] is not None:
@@ -933,7 +903,9 @@ class BooguRopeEmbedder(nn.Module):
                     position_ids[i, pe_shift_len:end, 0] = pe_shift
                     position_ids[i, pe_shift_len:end, 1] = rows
                     position_ids[i, pe_shift_len:end, 2] = cols
-                    pe_shift += max(height // self.patch_size, width // self.patch_size)
+                    pe_shift += max(
+                        height // self.patch_size, width // self.patch_size
+                    )
                     pe_shift_len += ref_len
 
             height, width = img_sizes[i]
@@ -1131,9 +1103,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
     )
     packed_modules_mapping = {
         "w13": ["linear_1", "linear_3"],
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "img_to_qkv": ["img_to_q", "img_to_k", "img_to_v"],
-        "instruct_to_qkv": ["instruct_to_q", "instruct_to_k", "instruct_to_v"],
     }
 
     def __init__(

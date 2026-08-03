@@ -298,7 +298,10 @@ def should_include_warmup_image(
         return False
     if task_type.requires_image_input():
         return True
-    if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
+    if type(server_args.pipeline_config).__name__ in (
+        "GlmImagePipelineConfig",
+        "BooguImagePipelineConfig",
+    ):
         return False
     if server_based_warmup:
         return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)

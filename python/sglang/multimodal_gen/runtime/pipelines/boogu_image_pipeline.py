@@ -2,27 +2,19 @@
 import os
 from typing import Any
 
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
-    TextEncodingStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.boogu_image import (
+    BooguImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-class BooguTextEncodingStage(TextEncodingStage):
-    def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        inner = text_encoder.model
-        with set_forward_context(current_timestep=0, attn_metadata=None):
-            return inner(**encoder_forward_kwargs)
 
 
 class BooguImagePipeline(ComposedPipelineBase):
@@ -55,9 +47,10 @@ class BooguImagePipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(InputValidationStage())
         self.add_stage(
-            BooguTextEncodingStage(
+            BooguImageEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
+                vae=self.get_module("vae"),
             )
         )
         self.add_standard_latent_preparation_stage()
