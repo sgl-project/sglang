@@ -1473,6 +1473,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         self.use_feature_cache = config.use_feature_cache
         self._causal_decode_initialized = False
+        self._causal_spatial_parallel_decode: bool | None = None
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
@@ -1499,6 +1500,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
     def reset_causal_decode_state(self) -> None:
         """Reset decoder feature cache before a new causal video session."""
         self._causal_decode_initialized = False
+        self._causal_spatial_parallel_decode = None
         if self.use_feature_cache:
             self.clear_cache()
 
@@ -1510,13 +1512,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
         is_first_chunk = not self._causal_decode_initialized
         if is_first_chunk:
             self.clear_cache()
+            # Feature-cache tensors carry the decoder's current height layout.
+            # Keep that layout stable for the entire causal session even when
+            # auto mode sees different temporal chunk lengths later on.
+            self._causal_spatial_parallel_decode = (
+                self._should_use_spatial_parallel_decode(z)
+            )
 
         iter_ = z.shape[2]
         x = self.post_quant_conv(z)
         outs = []
         spatial_context = (
             nullcontext()
-            if self._should_use_spatial_parallel_decode(z)
+            if self._causal_spatial_parallel_decode
             else disable_spatial_parallel_decode()
         )
         with spatial_context:

@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -473,6 +474,75 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         vae.reset_causal_decode_state()
         self.assertEqual(clear_calls, ["clear", "clear"])
         self.assertFalse(vae._causal_decode_initialized)
+        self.assertIsNone(vae._causal_spatial_parallel_decode)
+
+    def test_wan_causal_decode_keeps_spatial_layout_sticky_for_sp2_sp4_sp8(self):
+        for world_size in (2, 4, 8):
+            with self.subTest(world_size=world_size):
+
+                class _LayoutCheckingDecoder(torch.nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.cached_height = None
+                        self.heights = []
+
+                    def forward(self, x):
+                        if spatial_parallel_decode_disabled():
+                            height = x.shape[-2]
+                        else:
+                            height = (x.shape[-2] + world_size - 1) // world_size
+                        if self.cached_height is not None:
+                            self.assert_same_height(height)
+                        self.cached_height = height
+                        self.heights.append(height)
+                        return x
+
+                    def assert_same_height(self, height):
+                        if height != self.cached_height:
+                            raise RuntimeError(
+                                f"cache height changed from {self.cached_height} to {height}"
+                            )
+
+                vae = AutoencoderKLWan.__new__(AutoencoderKLWan)
+                torch.nn.Module.__init__(vae)
+                vae.use_feature_cache = True
+                vae._causal_decode_initialized = False
+                vae._causal_spatial_parallel_decode = None
+                vae.config = SimpleNamespace(patch_size=None)
+                vae.post_quant_conv = torch.nn.Identity()
+                vae.decoder = _LayoutCheckingDecoder()
+                decision_shapes = []
+
+                def clear_cache(self):
+                    self._feat_map = [None]
+                    self._conv_idx = 0
+                    self.decoder.cached_height = None
+
+                def should_use_parallel(self, z):
+                    decision_shapes.append(z.shape[2])
+                    latent_elements_per_rank = (
+                        z.shape[0] * z.shape[-3] * z.shape[-2] * z.shape[-1]
+                    ) // world_size
+                    return latent_elements_per_rank >= 4096
+
+                vae.clear_cache = MethodType(clear_cache, vae)
+                vae._should_use_spatial_parallel_decode = MethodType(
+                    should_use_parallel, vae
+                )
+
+                vae.causal_decode(torch.zeros(1, 1, 5, 44, 78))
+                vae.causal_decode(torch.zeros(1, 1, 4, 44, 78))
+
+                local_height = (44 + world_size - 1) // world_size
+                first_height = local_height if world_size in (2, 4) else 44
+                self.assertEqual(decision_shapes, [5])
+                self.assertEqual(vae.decoder.heights, [first_height] * 9)
+
+                vae.reset_causal_decode_state()
+                vae.causal_decode(torch.zeros(1, 1, 4, 44, 78))
+                self.assertEqual(decision_shapes, [5, 4])
+                reset_height = local_height if world_size == 2 else 44
+                self.assertEqual(vae.decoder.heights[-4:], [reset_height] * 4)
 
     def test_diffusers_2d_decoder_uses_spatial_parallel_components(self):
         config = StableDiffusion3VAEConfig()
