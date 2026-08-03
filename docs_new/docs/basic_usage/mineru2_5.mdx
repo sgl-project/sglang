@@ -1,0 +1,59 @@
+---
+title: "MinerU2.5 (Document Parsing)"
+metatags:
+    description: "Serve the MinerU2.5 document-parsing vision-language model with SGLang."
+---
+
+MinerU2.5-2509-1.2B is a 1.2B-parameter, Qwen2-VL-based document-parsing vision-language model. It extracts layout, tables, and formulas from document images and renders them to Markdown. Its architecture is `Qwen2VLForConditionalGeneration` (config `model_type: qwen2_vl`), which SGLang implements natively, so it runs with **no code changes** — the standard Qwen2-VL serving path handles it. Verified end-to-end on SGLang 0.5.12.post1.
+
+## Launch server
+
+```shell
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+python3 -m sglang.launch_server \
+  --model-path opendatalab/MinerU2.5-2509-1.2B \
+  --host 0.0.0.0 --port 30000
+```
+
+With newer SGLang releases you can use the `sglang serve` entrypoint alias (the env var works the same way):
+
+```shell
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 sglang serve opendatalab/MinerU2.5-2509-1.2B --host 0.0.0.0 --port 30000
+```
+
+> `SGLANG_USE_CUDA_IPC_TRANSPORT=1` passes the encoded image tensors from the tokenizer process to the scheduler over CUDA IPC instead of serializing them. For this document model — every page sends a layout image plus many block crops — it measured ~10% higher end-to-end throughput on a single H200 (OmniDocBench: ~153 vs ~135 pages/min) with numerically identical output. It is optional; omit it for the minimal correct command.
+
+> Neither `--trust-remote-code` nor `--chat-template` is required. This is a standard `qwen2_vl` architecture, and the tokenizer already ships the Qwen2-VL chat template (passing `--chat-template qwen2-vl` is harmless but unnecessary). `--mem-fraction-static 0.6` is optional tuning that frees VRAM when this small 1.2B model shares a large GPU or coexists with other processes; it is not needed for correctness. The default port `30000` matches MinerU's `vlm-http-client` examples.
+
+## Parse documents with mineru-vl-utils
+
+Point the [`mineru-vl-utils`](https://github.com/opendatalab/mineru-vl-utils) library at the running SGLang server via its `http-client` backend:
+
+```python
+from mineru_vl_utils import MinerUClient
+
+client = MinerUClient(backend="http-client", server_url="http://127.0.0.1:30000")
+blocks = client.two_step_extract(image)   # image is a PIL.Image
+```
+
+## Use with the MinerU pipeline CLI
+
+The [MinerU](https://github.com/opendatalab/MinerU) full pipeline can also call the SGLang server through its remote VLM client:
+
+```shell
+mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:30000
+```
+
+`vlm-http-client` is the lightweight remote client backend: it talks to the SGLang server over HTTP and does not require a local `torch` install.
+
+## Note on repetition control
+
+The vLLM serving path enforces anti-repetition with `MinerULogitsProcessor` (via `vllm serve --logits-processors mineru_vl_utils:MinerULogitsProcessor`), which implements the `no_repeat_ngram_size` sampling parameter. SGLang has no built-in `no_repeat_ngram_size` sampling param, so the value the `mineru-vl-utils` `http-client` backend sends inside `vllm_xargs` is ignored by the server.
+
+On clean documents this makes no difference — output matches the transformers/vLLM paths exactly. On pathological inputs (dense repeated table cells, heavy noise or blur) the absence of a hard n-gram block could in principle allow a repetition loop that the vLLM path would have prevented.
+
+SGLang's available anti-repetition knobs are `repetition_penalty`, `frequency_penalty`, `presence_penalty`, `min_p`, and `top_k`. In practice `mineru-vl-utils` already defaults `presence_penalty=1.0` and `frequency_penalty=0.05` for content, table, and equation extraction, which mitigates repetition. For a faithful equivalent of `no_repeat_ngram_size`, launch the server with `--enable-custom-logit-processor` and attach the `MinerUNoRepeatNGramLogitProcessor` custom logit processor.
+
+## Reference accuracy
+
+On a single NVIDIA H200 GPU with SGLang 0.5.12.post1, MinerU2.5-2509-1.2B scores on OmniDocBench v1.6 (full set, 1651 pages, official `pdf_validation.py` end2end `quick_match`): text-block edit distance 0.0453, Table TEDS 87.94 (structure-only 91.78), reading-order edit distance 0.1304, and display-formula edit distance ~0.49 (the CDM metric is skipped as it requires LaTeX/Ghostscript/ImageMagick). Throughput: all 1651 pages extracted in ~23 minutes at client concurrency 24 (`aio_concurrent_two_step_extract`), about 0.84 s/page for the two-step layout + content pass. These numbers are on par with MinerU2.5's published transformers/vLLM results, confirming SGLang serving parity.
