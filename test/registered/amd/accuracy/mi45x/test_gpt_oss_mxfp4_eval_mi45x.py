@@ -85,8 +85,16 @@ MI45X_GPT_OSS_MXFP4_MODELS = [
         ],
         env_vars={
             "SGLANG_USE_AITER": "1",
-            # gpt-oss MXFP4 fused-MoE uses the separated gate/up tile layout;
-            # other AITER MXFP4 callers default to interleaved, so opt in.
+            # Selects GateMode.INTERLEAVE (this is also the env default).
+            #
+            # UNVERIFIED ON gfx1250 — check this first if accuracy is bad.
+            # The matching weight interleave in QuarkW4A8MXFp4MoE is gated on
+            # is_gfx95_supported(), which matches only "gfx95" and so is False
+            # on gfx1250. The kernel is therefore told INTERLEAVE while the
+            # weights are left in the checkpoint's layout. If GSM8K comes back
+            # near-random on real hardware, try "0" (SEPARATED) before touching
+            # anything else, and extend is_gfx95_supported() if the shuffle is
+            # what's actually needed.
             "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
             "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
             # Route MXFP4 weights through the A8W4 GEMM path.

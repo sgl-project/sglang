@@ -41,6 +41,21 @@ ARG GPU_ARCH=gfx950
 # ROCm nightly wheel index.
 FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15
 
+# This stage runs its own apt-get before the final stage's UBUNTU_MIRROR block,
+# so it has to apply the mirror itself or a port-80-restricted builder fails
+# here. Ubuntu 24.04 uses deb822 sources.list.d/ubuntu.sources, not the legacy
+# sources.list.
+ARG UBUNTU_MIRROR=
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+            [ -f "$f" ] || continue; \
+            sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" "$f"; \
+            sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" "$f"; \
+        done; \
+    fi \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-net-hardening
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg build-essential \
         python3 python3-dev python3-pip python-is-python3 python3.12-venv \
@@ -233,9 +248,16 @@ ARG UBUNTU_CODENAME=jammy
 ARG UBUNTU_MIRROR=
 USER root
 
+# Ubuntu 24.04 (the gfx1250 base) ships deb822 sources in
+# /etc/apt/sources.list.d/ubuntu.sources and may not have the legacy
+# /etc/apt/sources.list at all, so rewrite whichever files actually exist
+# rather than assuming the legacy path.
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-        sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-        sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+            [ -f "$f" ] || continue; \
+            sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" "$f"; \
+            sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" "$f"; \
+        done; \
     fi && \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
         > /etc/apt/apt.conf.d/80-net-hardening

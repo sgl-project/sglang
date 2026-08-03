@@ -27,9 +27,11 @@ register_amd_ci(
 )
 
 # Server-side env for the gfx1250 MXFP4 path. Kept identical to the accuracy
-# test so the two measure the same configuration.
+# test so the two measure the same configuration — if you change one, change
+# both, or perf will be benchmarking a kernel path accuracy never validated.
 MI45X_GPT_OSS_ENV = {
     "SGLANG_USE_AITER": "1",
+    # See the accuracy test for why this is unverified on gfx1250.
     "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
     "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
     "AITER_FORCE_A8W4": "1",

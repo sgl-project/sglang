@@ -187,6 +187,25 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
+# Read `ENV <VAR>="<value>"` from a single docker/rocm.Dockerfile build stage.
+# Scoped from the stage's FROM line to the next FROM, so it does not depend on
+# how long the stage is — a fixed `grep -A<n>` window silently returned nothing
+# once the gfx1250 stage grew past it, and under `set -o pipefail` that aborts
+# the whole script.
+dockerfile_stage_var() {
+  local stage="$1" var="$2"
+  awk -v stage="$stage" -v var="$var" '
+    $0 ~ ("^FROM .* AS " stage "$") { in_stage = 1; next }
+    in_stage && /^FROM / { exit }
+    in_stage && $0 ~ ("^ENV[[:space:]]+" var "=") {
+      if (match($0, /"[^"]*"/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        exit
+      }
+    }
+  ' docker/rocm.Dockerfile
+}
+
 # -----------------------
 # MORI
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
@@ -205,13 +224,12 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   # gfx1250 needs a newer MORI than the gfx942/gfx950 pin, and the Dockerfile
   # carries that as MORI_COMMIT_DEFAULT on the gfx1250 stage.
   if [[ "${MORI_GPU_ARCHS}" == "gfx1250" ]]; then
-    MORI_STAGE_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15' docker/rocm.Dockerfile \
-                        | grep 'MORI_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*MORI_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-    if [[ -n "${MORI_STAGE_COMMIT}" ]]; then
-      MORI_COMMIT="${MORI_STAGE_COMMIT}"
+    MORI_STAGE_COMMIT=$(dockerfile_stage_var gfx1250-rocm7_15 MORI_COMMIT_DEFAULT)
+    if [[ -z "${MORI_STAGE_COMMIT}" ]]; then
+      echo "[MORI] ERROR: no MORI_COMMIT_DEFAULT on the gfx1250-rocm7_15 stage" >&2
+      exit 1
     fi
+    MORI_COMMIT="${MORI_STAGE_COMMIT}"
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
@@ -253,25 +271,13 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
-if [[ "${GPU_ARCH}" == "mi45x" || "${GPU_ARCH}" == "mi455x" ]]; then
-    echo "[CI-AITER-CHECK] Using gfx1250 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-elif [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-else
-    echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-fi
+case "${GPU_ARCH}" in
+  mi45x|mi455x) AITER_STAGE="gfx1250-rocm7_15" ;;
+  mi35x)        AITER_STAGE="gfx950" ;;
+  *)            AITER_STAGE="gfx942" ;;
+esac
+echo "[CI-AITER-CHECK] Using ${AITER_STAGE} block from Dockerfile..."
+REPO_AITER_COMMIT=$(dockerfile_stage_var "${AITER_STAGE}" AITER_COMMIT_DEFAULT)
 
 
 if [[ -z "${REPO_AITER_COMMIT}" ]]; then
