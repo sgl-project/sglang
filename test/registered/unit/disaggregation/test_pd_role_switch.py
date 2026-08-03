@@ -244,6 +244,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
+            dp_size=1,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -278,6 +279,11 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._run(self._sa(pp_size=2))
         self.assertIn("pipeline parallelism", str(ctx.exception))
+
+    def test_reject_data_parallelism(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(dp_size=2))
+        self.assertIn("data parallelism", str(ctx.exception))
 
     def test_no_role_switch_is_unaffected(self):
         # The same unsupported feature is fine when role switch is off.

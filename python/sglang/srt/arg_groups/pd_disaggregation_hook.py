@@ -107,6 +107,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
             if view.pp_size > 1:
                 unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
+            if view.dp_size > 1:
+                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
             if unsupported:
                 raise ValueError(
                     "--enable-pd-role-switch is only supported with pure tensor "
