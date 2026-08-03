@@ -393,8 +393,7 @@ class TestDSAIndexer(CustomTestCase):
 
         # Pool refs + attn_backend are now resolved via the ForwardContext;
         # publish ``self.backend`` for the duration of this fixture call so
-        # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` /
-        # ``get_req_to_token_pool()`` resolve correctly.
+        # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` resolve correctly.
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             set_forward_context,

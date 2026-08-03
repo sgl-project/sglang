@@ -110,9 +110,6 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self.attn_metadata.dsa_seqlens_expanded
 
-    def get_cu_seqlens_k(self) -> torch.Tensor:
-        return self.attn_metadata.cu_seqlens_k
-
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.attn_metadata.indexer_k_start_end
 

@@ -63,7 +63,6 @@ class DSANPUIndexerMixin:
                     q = self.wq_b(q_lora)[
                         0
                     ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    wq_b_event = self.alt_stream.record_event()
                     q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
                     q_pe, q_nope = torch.split(
                         q,

@@ -125,7 +125,6 @@ def pcg_dsa_indexer_prefill_split(
             forward_batch,
             layer_id,
             act_quant,
-            enable_dual_stream=False,
             metadata=metadata,
             return_indices=return_indices,
             num_tokens=extend_num_tokens,
