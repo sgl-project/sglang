@@ -665,6 +665,74 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+
+        if ElasticBuffer is not None and isinstance(buffer, ElasticBuffer):
+            # DeepEP V2 `ElasticBuffer.dispatch` infers the layout internally
+            # from `topk_idx` — there is no `get_dispatch_layout` on V2 (its
+            # absence crashes here otherwise). Returns a 5-tuple
+            # `(recv_x, recv_topk_idx, recv_topk_weights, EPHandle, event)`
+            # and carries `num_recv_tokens_per_expert_list` on the handle.
+            # `async_finish` is renamed `async_with_compute_stream`; the V2
+            # contract requires `allocate_on_comm_stream=True` whenever
+            # `previous_event` is set. Mirrors the proven Megatron
+            # fused_a2a.py V2 translation (Wave 27 measured on EFA).
+            #
+            # The incoming `previous_event` is a V1 `Buffer.capture()` product
+            # (python `EventOverlap`); V2's wrapper passes it RAW to pybind
+            # arg17 which requires `deep_ep._C.EventHandle | None` ->
+            # TypeError. Re-derive via the ElasticBuffer's own capture()
+            # (exactly what the Megatron translation does) and drop the V1 one.
+            _prev_evt = None
+            _alloc_on_comm = False
+            if self.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            previous_event = _prev_evt
+            _deepep_precompile_tp_barrier()
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                self.handle,
+                event,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=self.num_experts,
+                num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                expert_alignment=(
+                    128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+                ),
+                num_sms=0,
+                num_qps=0,
+                previous_event=previous_event,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+                do_expand=False,
+            )
+            num_recv_tokens_per_expert = getattr(
+                self.handle, "num_recv_tokens_per_expert_list", None
+            )
+            if isinstance(num_recv_tokens_per_expert, torch.Tensor):
+                num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                num_recv_tokens_per_expert,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
+            return (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                event,
+            )
+
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -744,6 +812,32 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        if ElasticBuffer is not None and isinstance(buffer, ElasticBuffer):
+            # V2 combine: `async_finish` -> `async_with_compute_stream`, no
+            # `config` kwarg (SM/QP auto-derived from the dispatch handle via
+            # num_sms=0 — a mismatch triggers CUDA 719 at csrc/jit/handle.hpp:86).
+            # Same event-type trap as dispatch (take-10): the incoming
+            # `previous_event` is a V1 `Buffer.capture()` EventOverlap; V2's
+            # pybind combine requires `deep_ep._C.EventHandle | None`.
+            # Re-derive via the ElasticBuffer's own capture().
+            _prev_evt = None
+            _alloc_on_comm = False
+            if self.async_finish:
+                try:
+                    _prev_evt = buffer.capture()
+                    _alloc_on_comm = True
+                except Exception:
+                    _prev_evt = None
+            combined_x, _, event = buffer.combine(
+                x,
+                self.handle,
+                num_sms=0,
+                num_qps=0,
+                previous_event=_prev_evt,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+            )
+            return combined_x, event
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
