@@ -170,10 +170,10 @@ class LMCRadixCache(RadixCache):
 
         self._in_flight_nodes: list[TreeNode] = []
         # MP stores complete via a per-request daemon future rather than the
-        # shared store_stream, so they need their own in-flight list carrying
-        # (node, future, request_id). request_id rides along because the
-        # deferred reconcile also owes end_session for that request.
-        self._in_flight_mp_stores: list[tuple[TreeNode, MessagingFuture, str]] = []
+        # shared store_stream, so they need their own in-flight list. Only the
+        # unpin is deferred: session teardown has no dependency on the copy and
+        # fires in cache_finished_req, so no request_id needs to ride along.
+        self._in_flight_mp_stores: list[tuple[TreeNode, "MessagingFuture"]] = []
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
@@ -181,6 +181,10 @@ class LMCRadixCache(RadixCache):
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
+                # Dropped without unpinning on purpose: super().reset() has
+                # already rebuilt the root and zeroed evictable_size_ /
+                # protected_size_, so the pinned nodes belong to a discarded
+                # tree and dec_lock_ref would walk a stale parent chain.
                 self._in_flight_nodes.clear()
                 self._in_flight_mp_stores.clear()
         if hasattr(self, "_mp_load_back_markers"):
@@ -486,13 +490,16 @@ class LMCRadixCache(RadixCache):
             request_id=req.rid,
         )
         if self._mode is LMCacheMode.MP:
-            # The daemon copies out of these slots in another process; defer the
-            # unlock to evict()'s reconcile so the node stays pinned until the
-            # copy lands. Nothing downstream consumes the store result, so there
-            # is no reason to block the scheduler on it here.
+            # The daemon copies out of these slots in another process, so the
+            # node stays pinned until the copy lands and the unpin is deferred.
+            # Session teardown is not deferred with it: end_session has no
+            # dependency on the store future, and holding it until the copy
+            # completes leaves sessions to expire in the daemon.
             future = self.lmcache_connector.store_kv_async(store_md)
+            self._mp_load_back_markers.pop(req.rid, None)
+            self.lmcache_connector.end_session(req.rid)
             with self._node_lock:
-                self._in_flight_mp_stores.append((new_last_node, future, req.rid))
+                self._in_flight_mp_stores.append((new_last_node, future))
         elif self._mode is LMCacheMode.IP:
             with device_stream_context(self.store_stream):
                 self.lmcache_connector.store_kv(store_md)
@@ -500,30 +507,71 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
 
-    def _reconcile_mp_stores(self) -> None:
-        """Settle the MP stores submitted since the last reconcile.
+    def _settle_mp_store(self, node: TreeNode, future: "MessagingFuture") -> None:
+        """Unpin one node, logging whether its daemon store succeeded.
 
-        Waits on each daemon future, then unpins the node so its KV slots
-        become evictable again. A failed store is logged rather than raised:
-        this runs on the eviction path, where raising would turn a
-        recoverable cache-tier failure into a serving outage. The unpin
-        happens regardless of outcome -- skipping it would pin those slots
-        for the lifetime of the process, precisely when memory is scarce.
+        A failed store is logged rather than raised: this runs on the
+        scheduling and eviction paths, where raising would turn a recoverable
+        cache-tier failure into a serving outage. The unpin happens regardless
+        of outcome -- skipping it would pin those slots for the lifetime of the
+        process, precisely when memory is scarce.
+        """
+        try:
+            if not future.result():
+                logger.error("LMCache MP store failed")
+        except Exception:
+            logger.exception("LMCache MP store errored")
+        finally:
+            self.dec_lock_ref(node)
+
+    def _reap_completed_mp_stores(self) -> None:
+        """Unpin nodes whose daemon store has already finished. Never blocks.
+
+        ``MessagingFuture.query()`` reports completion without waiting, so
+        stores still in flight are left pinned and retried on the next call.
+        This is what makes the reap safe to run from ``evictable_size()``,
+        which the scheduler reads while deciding whether a batch fits.
+        """
+        with self._node_lock:
+            pending = self._in_flight_mp_stores
+            # query() once per entry: calling it in two comprehensions races
+            # with the daemon and can drop an entry from both lists.
+            done, still_pending = [], []
+            for entry in pending:
+                (done if entry[1].query() else still_pending).append(entry)
+            self._in_flight_mp_stores = still_pending
+
+        for node, future in done:
+            self._settle_mp_store(node, future)
+
+    def _reconcile_mp_stores(self) -> None:
+        """Settle every outstanding MP store, blocking until each one lands.
+
+        The hard backstop for ``_reap_completed_mp_stores``: used on the
+        eviction path, where the caller needs the pins released before base
+        eviction chooses victims rather than on some later scheduler step.
         """
         with self._node_lock:
             in_flight = self._in_flight_mp_stores
             self._in_flight_mp_stores = []
 
-        for node, future, rid in in_flight:
-            try:
-                if not future.result():
-                    logger.error("LMCache MP store failed for request %s", rid)
-            except Exception:
-                logger.exception("LMCache MP store errored for request %s", rid)
-            finally:
-                self.dec_lock_ref(node)
-                self._mp_load_back_markers.pop(rid, None)
-                self.lmcache_connector.end_session(rid)
+        for node, future in in_flight:
+            self._settle_mp_store(node, future)
+
+    def evictable_size(self):
+        """Reap finished MP stores before reporting evictable bytes.
+
+        ``inc_lock_ref`` moves a pinned node's bytes out of ``evictable_size_``
+        and into ``protected_size_``, and the scheduler derives its token
+        budget from ``available_size() + evictable_size()``. Releasing pins
+        only from ``evict()`` is therefore circular: pinned bytes shrink the
+        budget, the shrunken budget means no allocation is attempted, and
+        ``evict()`` -- which only runs when an allocation falls short -- is
+        never reached to release them. Reaping here puts the release upstream
+        of the decision instead of downstream of it.
+        """
+        self._reap_completed_mp_stores()
+        return super().evictable_size()
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
@@ -537,7 +585,9 @@ class LMCRadixCache(RadixCache):
                 self.dec_lock_ref(node)
             self._in_flight_nodes.clear()
 
-        # MP: each store carries its own daemon future.
+        # MP: each store carries its own daemon future. Block here -- unlike the
+        # reap in evictable_size(), this caller is about to pick eviction
+        # victims and wants every pin settled first.
         self._reconcile_mp_stores()
 
         return super().evict(params)
