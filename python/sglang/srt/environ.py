@@ -1136,6 +1136,10 @@ class Envs:
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Opt-in lossy approximation of the DSV4 C4 indexer scoring (head fold).
+    # NOT an identity: the operator's per-head ReLU is dropped. Costs are
+    # documented at the implementation; default off.
+    SGLANG_DSV4_INDEXER_FOLD_APPROX = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
