@@ -273,9 +273,7 @@ class PipelineExecutor(ABC):
         remaining_stages = stages[1:]
         sequential_start_time = time.monotonic()
         for parent_batch in batches:
-            for batch in stages[0].iter_sequential_requests(
-                parent_batch, server_args
-            ):
+            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
                 if batch.metrics is not None:
                     batch.metrics.record_stage(
                         "PipelineExecutor.sequential_wait",

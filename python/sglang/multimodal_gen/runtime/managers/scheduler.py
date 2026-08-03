@@ -782,6 +782,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return
 
                 self._return_item_result(item, output_batch)
+                del output_batch
         finally:
             close = getattr(output_iter, "close", None)
             if close is not None:

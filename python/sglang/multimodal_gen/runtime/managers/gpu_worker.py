@@ -400,6 +400,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
                 assert isinstance(output_batch, OutputBatch)
                 yield output_batch
+                del output_batch
         finally:
             close = getattr(results, "close", None)
             if close is not None:
