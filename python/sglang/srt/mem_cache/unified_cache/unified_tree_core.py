@@ -904,36 +904,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        backup_due = (
-            self._inc_hit_count_and_check(
+        if state.is_new_leaf:
+            backup_due = self._inc_hit_count_and_check(
                 state.target_node, state.params.chunked
             )
-            if state.is_new_leaf
-            else self._needs_incremental_backup(state)
-        )
+        else:
+            backup_due = (
+                self.enable_hicache
+                and not self.is_write_back
+                and not state.params.chunked
+                and state.target_node.backuped
+                and state.target_node.write_through_pending_id is None
+                and state.params.mamba_value is not None
+                and not state.result.mamba_exist
+                and state.target_node.component_data[ComponentType.MAMBA].host_value
+                is None
+            )
         if backup_due:
             state.pending_actions.append(
                 self._build_backup_kv_action(state.target_node)
             )
-
-    def _needs_incremental_backup(self, state: _InsertWalkState) -> bool:
-        """Whether a Host-backed node has an unbacked Device Mamba state."""
-        if (
-            not self.enable_hicache
-            or self.is_write_back
-            or state.params.chunked
-            or ComponentType.MAMBA not in self.components_by_type
-        ):
-            return False
-
-        node = state.target_node
-        mamba_data = node.component_data[ComponentType.MAMBA]
-        return (
-            node.backuped
-            and node.write_through_pending_id is None
-            and mamba_data.value is not None
-            and mamba_data.host_value is None
-        )
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
@@ -1545,20 +1535,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Build transfers for data not already available in Host."""
-        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert device_value is not None
         if node.backuped:
-            device_value = (
-                full_value[:0]
-                if full_value is not None
-                else self._empty_match_result.device_indices
-            )
-        else:
-            assert full_value is not None
-            device_value = full_value
+            device_value = device_value[:0]
 
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if node.component_data[comp.component_type].host_value is not None:
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -1690,9 +1676,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cache_actions: list[CacheAction | ComponentAction] = []
         if host_indices.numel() > 0:
             kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-            self.components_by_type[
-                BASE_COMPONENT_TYPE
-            ].commit_hicache_transfer(
+            self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
                 node,
                 CacheTransferPhase.BACKUP_HOST,
                 transfers=[kv_xfer],

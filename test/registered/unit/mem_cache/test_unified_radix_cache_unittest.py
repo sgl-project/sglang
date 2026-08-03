@@ -3013,9 +3013,9 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
-    def _prepare_full_only_host_backup(self, write_policy):
+    def _prepare_full_only_host_backup(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_hicache(cache, write_policy=write_policy)
+        self._init_hicache(cache, write_policy="write_through")
 
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
@@ -3048,7 +3048,7 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(node.component_data[ComponentType.MAMBA].host_value)
         return cache, allocator, req_to_token_pool, seq, node, full_host_value
 
-    def _assert_hicache_mamba_incremental_write_through(self, write_policy):
+    def test_hicache_mamba_incremental_write_through(self):
         if not self.cfg.has_mamba or self.cfg.has_swa:
             self.skipTest("requires Full+Mamba")
 
@@ -3059,7 +3059,7 @@ class UnifiedRadixCacheSuite:
             seq,
             node,
             full_host_value,
-        ) = self._prepare_full_only_host_backup(write_policy)
+        ) = self._prepare_full_only_host_backup()
 
         self._insert(cache, allocator, req_to_token_pool, seq)
         cache.writing_check(write_back=True)
@@ -3073,14 +3073,6 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(node.component_data[ComponentType.MAMBA].host_value)
         self.assertIsNone(node.write_through_pending_id)
         cache.sanity_check()
-
-    def test_hicache_mamba_incremental_write_through(self):
-        self._assert_hicache_mamba_incremental_write_through("write_through")
-
-    def test_hicache_mamba_incremental_write_through_selective(self):
-        self._assert_hicache_mamba_incremental_write_through(
-            "write_through_selective"
-        )
 
     def test_hicache_shorter_prefix_mamba_incremental_backup(self):
         """A shorter shared prefix gains Mamba in both L1 and L2 after a split."""

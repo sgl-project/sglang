@@ -841,13 +841,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
             written = len(host_indices)
-            if written == 0:
-                written = sum(
-                    len(xfer.host_indices)
-                    for xfers in comp_xfers.values()
-                    for xfer in xfers
-                    if xfer.host_indices is not None
-                )
         return written
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
