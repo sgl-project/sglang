@@ -21,12 +21,18 @@ namespace {
 namespace details {
 
 SGL_DEVICE float silu(const float val) {
-  // silu(x) = x * sigmoid(x)
+  // silu(x) = x * sigmoid(x). Keep the plain divide: under --use_fast_math it is
+  // MUFU.RCP + FMUL, whereas an explicit __frcp_rn(1 + exp) is a Newton
+  // refinement (MUFU.RCP + 2 FFMA + FADD) behind a branch into an out-of-line
+  // special-value fixup. This runs per ELEMENT (not once per group like the
+  // quant multiplier), so on the fused masked path it dominated: 608 -> 384
+  // SASS instructions and 1.23x on the EP-MoE decode shapes when switched back.
+  // The divide also keeps the fused output bit-identical to the AOT v2 op.
 #if SGL_ARCH_BLACKWELL_OR_GREATER
   const float half = 0.5f * val;
   return half * (1.0f + __tanhf(half));
 #else
-  return val * __frcp_rn(1.0f + __expf(-val));
+  return val / (1.0f + __expf(-val));
 #endif
 }
 
@@ -231,6 +237,10 @@ struct QuantTrait {
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
+  // Group-absmax floor, baked in here (the host rejects a caller eps != this).
+  // It bounds the quant multiplier at kMaxValue / kAmaxFloor, which is what
+  // decides whether the multiplier is representable in InputType below.
+  static constexpr float kAmaxFloor = 1e-10f;
   static_assert(sizeof(InputType) == 2, "only 16-bit inputs (bf16/fp16) are supported");
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
@@ -280,27 +290,43 @@ struct QuantTrait {
       local_amax2 = math::max(local_amax2, math::abs(in[i]));
     }
     const auto amax2 = cast<float2>(warp::reduce_max<kNumLanes>(local_amax2));
-    const auto amax = math::max(math::max(amax2.x, amax2.y), 1e-10f);
+    const auto amax = math::max(math::max(amax2.x, amax2.y), kAmaxFloor);
     const float raw_scale = amax * kMaxValueInv;  // the dequant scale the GEMM consumes
 
     out_vec_t out;
     details::scale_t<kUe8m0> scale_inv;
     if constexpr (kUe8m0) {
-      // ue8m0 scale: pow-2 quant multiplier is exact in float16/bfloat16 type
       static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
       const auto exp = cast_to_ue8m0(raw_scale);
       scale_inv = static_cast<uint8_t>(exp);
       const float quant_scale = inv_scale_ue8m0(exp);
-      const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
-      // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
-      // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
-      // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
-      // WeightTrait<fp8_e4m3_t>).
-      const auto max_clip = cast<T>(kMaxValue);
-      const auto max_clip2 = T2{max_clip, max_clip};
+      // The pow-2 multiplier is exact in the packed 16-bit domain, so scaling
+      // there costs one __hmul2 per pair and loses nothing -- but only if the
+      // multiplier itself is representable in InputType. It reaches
+      // kMaxValue / kAmaxFloor (4.5e12), which fits bfloat16 (fp32's exponent
+      // range) and NOT float16 (max 65504): an fp16 group whose absmax falls
+      // below kMaxValue / 65504 = 6.8e-3 would narrow the multiplier to inf and
+      // quantize the whole group to +-448 (0 * inf even yields NaN). Scale in
+      // fp32 there, matching the fp32-scale path below.
+      constexpr bool kScaleFitsInInput = kMaxValue / kAmaxFloor <= DTypeTrait<T>::kFloatMax;
+      if constexpr (kScaleFitsInInput) {
+        const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
+        // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
+        // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
+        // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
+        // WeightTrait<fp8_e4m3_t>).
+        const auto max_clip = cast<T>(kMaxValue);
+        const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        }
+      } else {
+        const float2 quant_scale2 = {quant_scale, quant_scale};
+#pragma unroll
+        for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+          out[i] = WTrait::quant(details::mul2(cast<float2>(in[i]), quant_scale2));
+        }
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)

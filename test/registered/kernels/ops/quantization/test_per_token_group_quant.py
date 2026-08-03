@@ -159,6 +159,43 @@ def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     assert torch.equal(exp, exp_ref), "exponent bytes differ"
 
 
+# fp16 tops out at 65504, so these absmax scales need a quant multiplier
+# (448/absmax rounded up to a power of two) that fp16 cannot represent:
+# 1e-3/1e-4 sit below the 448/65504 = 6.8e-3 threshold, and the all-zero row
+# floors absmax to eps and demands the largest multiplier the kernel can make.
+SMALL_MAGNITUDE_SCALES = [1e-3, 1e-4, 0.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale", SMALL_MAGNITUDE_SCALES)
+def test_ue8m0_small_magnitude_bitexact(scale, dtype):
+    """UE8M0 rows whose group absmax is far below 1, bit-exact vs the torch
+    reference.
+
+    The pow-2 quant multiplier was narrowed to the input dtype to do the scaling
+    as one packed 16-bit multiply. For fp16 that overflows: a group this small
+    needs a multiplier above fp16's 65504 max, so the multiplier became ``inf``
+    and every element in the group quantized to +-448 -- an all-zero row went
+    through ``0 * inf`` to NaN, which the sanitizing clamp also turned into
+    +448. bfloat16 carries fp32's exponent range and was never affected, which
+    is why the unit-variance fp16 case in test_ue8m0_bitexact never caught it.
+    """
+    torch.manual_seed(int(dtype == torch.float16))
+    num_tokens, hidden = 8, 512
+    x32 = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.float32)
+    x = (x32 * scale).to(dtype)
+    q_ref, exp_ref = ref_fp8_ue8m0(x, G)
+
+    x_q = torch.zeros_like(x, dtype=fp8_dtype)
+    x_s = _alloc_scale((num_tokens, hidden), column_major=True, scale_ue8m0=True)
+    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
+    torch.cuda.synchronize()
+
+    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), "codes differ"
+    exp = _decode_packed_exp(x_s, hidden // G)
+    assert torch.equal(exp, exp_ref), "exponent bytes differ"
+
+
 @pytest.mark.parametrize("group_size", get_ci_test_range([16, 32, 64, 128], [16, 64]))
 def test_ue8m0_group_sizes(group_size):
     """Group size is a template axis (v2 dispatched a runtime switch). Each size
@@ -271,10 +308,13 @@ def test_int8_scale(column_major):
 
 
 def test_group_size_256_roundtrip():
-    """Group 256 (32 lanes on H100, 16 on Blackwell) is above v2's old cap of
-    128. Pin the derived property: the fp32 scale equals absmax/FMAX and dequant
-    round-trips. A mis-mapped wide subwarp would fold the wrong elements into
-    the group absmax and move the scale."""
+    """Group 256 is above v2's old cap of 128 and gives the kernel its widest
+    subwarp. Each lane owns a fixed 32B (16 bf16 elements) on every arch, so a
+    256-group spans 16 lanes on both Hopper and Blackwell -- only the load width
+    underneath differs (2x128-bit vs 1x256-bit). Pin the derived property: the
+    fp32 scale equals absmax/FMAX and dequant round-trips. A mis-mapped wide
+    subwarp would fold the wrong elements into the group absmax and move the
+    scale."""
     torch.manual_seed(256)
     num_tokens, hidden, gs = 9, 4096, 256
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
