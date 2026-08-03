@@ -284,6 +284,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             DiffStage.SCHEDULER_DISPATCH,
             thread_finish_flag=True,
         ):
+            if (
+                len(reqs) == 1
+                and self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and max(1, int(req.num_outputs_per_prompt or 1)) > 1
+            ):
+                return _SequentiallyReturnedOutputs(
+                    self._iter_grouped_outputs_sequentially(reqs)
+                )
+
             if len(reqs) == 1 or not allow_dynamic_batching:
                 return self.worker.execute_forward(reqs)
 

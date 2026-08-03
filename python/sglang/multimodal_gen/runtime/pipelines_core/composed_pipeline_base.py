@@ -1073,7 +1073,13 @@ class ComposedPipelineBase(ABC):
         server_args: ServerArgs,
     ) -> Iterator[OutputBatch]:
         """Yield grouped outputs as each terminal-stage invocation completes."""
-        if len(batches) == 1:
+        if (
+            len(batches) == 1
+            and (
+                not server_args.pipeline_config.supports_sequential_multi_output_inference()
+                or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
+            )
+        ):
             yield self.forward(batches[0], server_args)
             return
 

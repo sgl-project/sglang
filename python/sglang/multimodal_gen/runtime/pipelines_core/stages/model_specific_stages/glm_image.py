@@ -1,7 +1,8 @@
 import inspect
 import re
 import time
-from typing import Any, List, Optional, Tuple, Union
+from copy import copy, deepcopy
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -538,6 +539,57 @@ class GlmImageAR(PipelineStage):
                 batch.metrics.record_stage(stage_name, duration)
             output_offset += output_count
         return batches
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        output_count = _num_outputs_per_prompt(batch)
+        if output_count == 1:
+            return iter((batch,))
+
+        prior_token_ids = batch.prior_token_id
+        if not isinstance(prior_token_ids, torch.Tensor) or (
+            prior_token_ids.shape[0] != output_count
+        ):
+            actual_count = (
+                prior_token_ids.shape[0]
+                if isinstance(prior_token_ids, torch.Tensor)
+                else type(prior_token_ids).__name__
+            )
+            raise RuntimeError(
+                "Cannot split GLM-Image AR output for sequential inference: "
+                f"expected {output_count} token rows, got {actual_count}."
+            )
+
+        return map(
+            lambda output_index: self._make_sequential_request(
+                batch, prior_token_ids, output_index
+            ),
+            range(output_count),
+        )
+
+    @staticmethod
+    def _make_sequential_request(
+        batch: Req, prior_token_ids: torch.Tensor, output_index: int
+    ) -> Req:
+        output_req = copy(batch)
+        output_req.sampling_params = copy(batch.sampling_params)
+        output_req.extra = dict(batch.extra)
+        output_req.condition_inputs = dict(batch.condition_inputs)
+        output_req.metrics = deepcopy(batch.metrics)
+        output_req.num_outputs_per_prompt = 1
+        output_req.seed = _seed_for_output(batch.seed, output_index)
+        output_req.seeds = None
+        output_req.generator = None
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        if batch.request_id is not None:
+            output_req.request_id = f"{batch.request_id}:{output_index}"
+            if output_req.metrics is not None:
+                output_req.metrics.request_id = output_req.request_id
+        return output_req
 
     @torch.no_grad()
     def forward(

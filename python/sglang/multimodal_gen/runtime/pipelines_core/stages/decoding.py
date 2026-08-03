@@ -216,7 +216,6 @@ class DecodingStage(PipelineStage):
                   VAE precision ("fp32", "fp16", "bf16")
                 - pipeline_config.vae_precision: fallback VAE precision
                 - pipeline_config.vae_tiling: Whether to enable VAE tiling for memory efficiency
-                - pipeline_config.vae_slicing: Whether to decode batch items sequentially
 
         Returns:
             Decoded video tensor with shape (batch, channels, frames, height, width),
@@ -245,14 +244,6 @@ class DecodingStage(PipelineStage):
                     self.vae.enable_tiling()
             except Exception:
                 pass
-            if server_args.pipeline_config.vae_slicing:
-                if hasattr(self.vae, "enable_slicing"):
-                    self.vae.enable_slicing()
-                else:
-                    logger.warning(
-                        "VAE slicing is not supported by %s.",
-                        type(self.vae).__name__,
-                    )
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
@@ -262,14 +253,18 @@ class DecodingStage(PipelineStage):
                 try:
                     decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 except Exception as error:
-                    if (
-                        not server_args.pipeline_config.vae_slicing
-                        and "out of memory" in str(error).lower()
-                    ):
-                        logger.warning(
-                            "OOM detected during VAE decoding. Please enable "
-                            "--vae-slicing to reduce peak memory usage."
-                        )
+                    if "out of memory" in str(error).lower():
+                        if not server_args.pipeline_config.vae_tiling:
+                            logger.warning(
+                                "OOM detected during VAE decoding. Please enable "
+                                "--vae-tiling to reduce peak memory usage."
+                            )
+                        else:
+                            logger.warning(
+                                "OOM detected during VAE decoding with tiling enabled. "
+                                "Please reduce the resolution or enable "
+                                "--vae-cpu-offload."
+                            )
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
 
