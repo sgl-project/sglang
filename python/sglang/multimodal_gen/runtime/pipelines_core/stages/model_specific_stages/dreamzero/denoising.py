@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""DreamZero causal denoising and action output stages.
+
+The denoising stage runs the first-frame/video prefill, cached video/action
+rollout, CFG branch combination, and session-cache updates used by the generic
+action endpoint.
+"""
 from __future__ import annotations
 
 import inspect
@@ -38,7 +44,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -153,17 +158,11 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
 
     @staticmethod
     def _module_dtype(module: torch.nn.Module) -> torch.dtype:
-        try:
-            return next(module.parameters()).dtype
-        except StopIteration:
-            return torch.bfloat16
+        return next(module.parameters()).dtype
 
     @staticmethod
     def _module_device(module: torch.nn.Module) -> torch.device:
-        try:
-            return next(module.parameters()).device
-        except StopIteration:
-            return torch.device(current_platform.device_type)
+        return next(module.parameters()).device
 
     @staticmethod
     def _make_noise(shape, *, seed: int, device: torch.device, dtype: torch.dtype):
@@ -179,11 +178,10 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         device: torch.device,
         local_heads: int | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Create empty cond/uncond video KV caches for each DiT block."""
         transformer = self.transformer
         num_heads = (
-            local_heads
-            if local_heads is not None
-            else getattr(transformer, "local_num_heads", transformer.num_heads)
+            local_heads if local_heads is not None else transformer.local_num_heads
         )
         head_dim = transformer.dim // transformer.num_heads
         num_layers = transformer.num_layers
@@ -203,6 +201,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
     def _create_crossattn_caches(
         self, *, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Create empty cond/uncond text/image cross-attention cache records."""
         num_layers = self.transformer.num_layers
         return (
             [{"is_init": False} for _ in range(num_layers)],
@@ -226,6 +225,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
     def _cfg_local_branch_indices(
         server_args: ServerArgs, branch_indices: list[int]
     ) -> tuple[list[int], int | None, int]:
+        """Map CFG branches to the local rank when CFG parallel is enabled."""
         if not DreamZeroCausalDenoisingStage._cfg_parallel_active(
             server_args,
             len(branch_indices),
@@ -250,6 +250,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         cfg_rank: int,
         cfg_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather CFG video predictions and broadcast rank-0 action prediction."""
         video, action = local_prediction
         if cfg_rank not in (0, 1):
             raise ValueError(
@@ -292,6 +293,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         current_start_frame: int,
         update_kv_cache: bool,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Run the transformer for each local CFG branch."""
         predictions = []
         for local_index, prompt_emb in enumerate(context):
             kv_cache = kv_caches[local_index]
@@ -310,9 +312,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
                     kv_cache=kv_cache,
                     crossattn_cache=crossattn_caches[local_index],
                     current_start_frame=current_start_frame,
-                    enable_sequence_parallel=(
-                        (getattr(self.server_args, "sp_degree", 1) or 1) > 1
-                    ),
+                    enable_sequence_parallel=(self.server_args.sp_degree > 1),
                 )
             if update_kv_cache:
                 for block_index, updated in enumerate(updated_kv_caches):
@@ -332,6 +332,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         dynamic_cache_schedule: bool,
         skip_state: dict[str, int],
     ) -> bool:
+        """Apply static or dynamic DiT step skipping."""
         if not dynamic_cache_schedule:
             if dit_step_mask is None:
                 return True
@@ -363,14 +364,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
     def _scheduler_train_timesteps(scheduler: Any | None) -> int:
         if scheduler is None:
             return 1000
-        value = getattr(scheduler, "num_train_timesteps", None)
-        if value is not None:
-            return int(value)
-        config = getattr(scheduler, "config", None)
-        value = getattr(config, "num_train_timesteps", None)
-        if value is None and isinstance(config, dict):
-            value = config.get("num_train_timesteps")
-        return int(value) if value is not None else 1000
+        return int(scheduler.config.num_train_timesteps)
 
     @staticmethod
     def _require_tensor(batch: Req, field_name: str) -> torch.Tensor:
@@ -383,6 +377,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         return value
 
     def _new_unipc_scheduler(self) -> Any:
+        """Create a fresh UniPC scheduler because it stores rollout state."""
         scheduler_cls = (
             self.scheduler.__class__
             if self.scheduler is not None
@@ -399,6 +394,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         cls,
         scheduler: Any | None,
     ) -> Callable[..., torch.Tensor]:
+        """Select the scheduler step adapter once at stage construction."""
         scheduler_cls = (
             scheduler.__class__
             if scheduler is not None
@@ -455,6 +451,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         dtype: torch.dtype,
         device: torch.device,
     ) -> DreamZeroInputContext:
+        """Move stage inputs to the transformer's device and dtype."""
         inputs: dict[str, Any] = batch.dreamzero_inputs
         clip_feature = self._require_tensor(batch, "dreamzero_clip_feature").to(
             device=device, dtype=dtype
@@ -488,6 +485,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         dtype: torch.dtype,
         device: torch.device,
     ) -> DreamZeroNoiseContext:
+        """Create deterministic video/action noise from the request seed."""
         arch_config = server_args.pipeline_config.dit_config.arch_config
         action_dim = arch_config.action_dim
         max_state_dim = arch_config.max_state_dim
@@ -532,6 +530,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> DreamZeroDenoisingContext:
+        """Assemble tensors, CFG branches, and session caches for one request."""
         dtype = self._module_dtype(self.transformer)
         device = self._module_device(self.transformer)
         input_ctx = self._materialize_input_tensors(batch, dtype=dtype, device=device)
@@ -592,6 +591,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> DreamZeroBranchContext:
+        """Choose the prompt branches executed by this rank."""
         cfg_parallel = server_args.enable_cfg_parallel
         source_prompt_embs = batch.dreamzero_prompt_embs
         prompt_embs = [emb.to(device=device, dtype=dtype) for emb in source_prompt_embs]
@@ -635,6 +635,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[list[list[torch.Tensor]], list[list[dict[str, Any]]]]:
+        """Create new branch caches for anchors or gather existing session caches."""
         if current_start_frame == 0:
             kv_cache_pair = list(
                 self._create_kv_caches(
@@ -665,6 +666,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         )
 
     def _scatter_active_branch_caches(self, ctx: DreamZeroDenoisingContext) -> None:
+        """Persist the branches executed by this rank back to the session pool."""
         for local_index, branch_index in enumerate(ctx.branches.local_branch_indices):
             ctx.cache.session_state.scatter_kv(
                 branch_index,
@@ -678,6 +680,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
             )
 
     def _run_prefill(self, ctx: DreamZeroDenoisingContext) -> None:
+        """Prime causal video KV/cross-attention caches before action rollout."""
         if ctx.cache.current_start_frame == 0:
             zero_timestep = torch.zeros(
                 [ctx.inputs.batch_size, 1],
@@ -757,6 +760,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         noisy_action: torch.Tensor,
         step_state: SchedulerStepState,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict one scheduler step and combine CFG branches when needed."""
         timestep = (
             torch.ones(
                 [ctx.inputs.batch_size, ctx.noise.num_frame_per_block],
@@ -843,6 +847,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         server_args: ServerArgs,
         ctx: DreamZeroDenoisingContext,
     ) -> None:
+        """Denoise video and action latents with separate stateful UniPC schedulers."""
         state = self._prepare_rollout_state(ctx)
         scheduler = self._new_unipc_scheduler()
         action_scheduler = self._new_unipc_scheduler()
@@ -907,6 +912,7 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
         batch: Req,
         ctx: DreamZeroDenoisingContext,
     ) -> Req:
+        """Advance session state and expose the action tensor as pipeline output."""
         ctx.cache.current_start_frame += ctx.noise.num_frame_per_block
         ctx.cache.request_cache.mark_current_start_frame(
             self.cache_manager,
@@ -954,6 +960,8 @@ class DreamZeroCausalDenoisingStage(PipelineStage):
 
 
 class DreamZeroActionOutputStage(PipelineStage):
+    """Serialize normalized DreamZero actions for the action endpoint."""
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(

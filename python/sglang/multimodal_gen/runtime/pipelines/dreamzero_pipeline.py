@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DreamZero DROID one-shot action pipeline."""
 
 from __future__ import annotations
 
@@ -77,8 +76,8 @@ def _is_sglang_dreamzero_checkpoint(model_path: str) -> bool:
 
 
 def _validate_dreamzero_parallel_config(server_args: ServerArgs) -> None:
-    configured_tp_size = int(getattr(server_args, "tp_size", 1) or 1)
-    configured_sp_size = int(getattr(server_args, "sp_degree", 1) or 1)
+    configured_tp_size = int(server_args.tp_size)
+    configured_sp_size = int(server_args.sp_degree)
     if model_parallel_is_initialized():
         actual_tp_size = get_tp_world_size()
         if configured_tp_size != actual_tp_size:
@@ -136,8 +135,8 @@ class DreamZeroPipeline(ComposedPipelineBase):
             )
 
         server_args.pipeline_config.dit_config.arch_config.use_tensor_parallel = (
-            getattr(server_args, "tp_size", 1) or 1
-        ) > 1
+            server_args.tp_size > 1
+        )
         modules["image_encoder"] = load_dreamzero_image_encoder(
             server_args,
             self._resolve_component_path(server_args, "image_encoder", "image_encoder"),

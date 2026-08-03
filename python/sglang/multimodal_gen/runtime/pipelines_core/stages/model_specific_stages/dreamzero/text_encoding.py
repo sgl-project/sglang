@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+"""DreamZero text encoding stage.
+
+Text-encoding flow from ``batch.prompt`` to tokenizer and text encoder, with branch-specific prompt caching for CFG.
+"""
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -29,6 +33,13 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class DreamZeroTextEncodingStage(TextEncodingStage):
+    """Encode and cache DreamZero prompt branches for a session batch.
+
+    The stage inherits ``TextEncodingStage.encode_text`` for tokenizer and
+    encoder execution, then stores cond/uncond embeddings in the DreamZero
+    session cache.
+    """
+
     def __init__(
         self,
         text_encoder: torch.nn.Module | None = None,
@@ -87,6 +98,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
     def _mask_prompt_padding(
         prompt_emb: torch.Tensor, attention_mask: torch.Tensor | None
     ) -> torch.Tensor:
+        """Zero out padded UMT5 positions to match DreamZero conditioning."""
         if attention_mask is None:
             return prompt_emb
         attention_mask = attention_mask.to(device=prompt_emb.device, dtype=torch.long)
@@ -129,19 +141,16 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         return texts
 
     def _ensure_prompt_extra(self, batch: Req, batch_size: int) -> None:
-        extra = getattr(batch, "extra", None)
-        if extra is None:
-            extra = {}
-            batch.extra = extra
+        extra = batch.extra
         if extra.get("dreamzero_prompts") is None:
             extra["dreamzero_prompts"] = self._batched_texts(
-                getattr(batch, "prompt", None),
+                batch.prompt,
                 batch_size,
                 "prompt",
             )
         if extra.get("dreamzero_negative_prompts") is None:
             extra["dreamzero_negative_prompts"] = self._batched_texts(
-                getattr(batch, "negative_prompt", ""),
+                batch.negative_prompt,
                 batch_size,
                 "negative_prompt",
                 default="",
@@ -164,6 +173,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         *,
         text_len: int,
     ) -> torch.Tensor:
+        """Tokenize and encode prompt texts through the native text stage helper."""
         if self.text_encoders[0] is None:
             raise ValueError("DreamZero text encoder module is not loaded")
         if self.tokenizers[0] is None:
@@ -191,7 +201,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
     @staticmethod
     def _local_attn_size(server_args: ServerArgs) -> int:
         arch = server_args.pipeline_config.dit_config.arch_config
-        max_chunk_size = int(getattr(arch, "max_chunk_size", -1))
+        max_chunk_size = int(arch.max_chunk_size)
         if max_chunk_size == -1:
             return -1
         return max_chunk_size * int(arch.num_frame_per_block) + 1
@@ -237,6 +247,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         server_args: ServerArgs,
         request_cache: DreamZeroRequestCache,
     ):
+        """Resolve prompt cache hits and apply language/window lifecycle resets."""
         if self.cache_manager is None:
             raise RuntimeError("DreamZero text stage requires a cache manager")
         state: DreamZeroCachePool = self.cache_manager.pool
@@ -261,6 +272,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
                 and state.prompt_hashes[BRANCH_UNCOND][slot] != neg_hash
             )
             if language_changed:
+                # Prompt changes invalidate text plus downstream visual/KV state.
                 lifecycle_reset_mask[index] = True
                 lifecycle_preserve_text[index] = False
                 reset_reasons[index] = "language_changed"
@@ -272,10 +284,12 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
                     and state.current_start_frames[slot] >= state.local_attn_size
                 )
                 if frame_count == 1:
+                    # New single-frame anchors reset visual/KV state but reuse text.
                     lifecycle_reset_mask[index] = True
                     lifecycle_preserve_text[index] = True
                     reset_reasons[index] = "single_frame"
                 elif window_full:
+                    # Full local-attention windows roll over without re-encoding text.
                     lifecycle_reset_mask[index] = True
                     lifecycle_preserve_text[index] = True
                     reset_reasons[index] = "local_attention_window_full"
@@ -311,6 +325,7 @@ class DreamZeroTextEncodingStage(TextEncodingStage):
         def get_branch_prompt(
             branch: int, *, texts: list[str], hashes, reusable
         ) -> torch.Tensor:
+            """Load one CFG branch from cache or encode and scatter it."""
             if all(reusable):
                 cached = state.gather_prompt(branch, slots)
                 if cached is not None:

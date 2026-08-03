@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""DreamZero observation preparation and visual encoding stages.
+
+The action endpoint sends normalized observation tensors through msgpack. These
+stages materialize tensor inputs, encode the CLIP anchor frame, encode Wan VAE
+conditioning latents, and keep visual state in the DreamZero session cache.
+"""
 from __future__ import annotations
 
 import time
@@ -32,10 +38,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.d
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -45,65 +47,21 @@ def _dreamzero_non_causal_clip_attention_forward(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
 ):
-    qkv_states, _ = self.qkv_proj(hidden_states)
-    query_states, key_states, value_states = qkv_states.chunk(3, dim=-1)
-    query_states = query_states.reshape(
-        query_states.shape[0],
-        query_states.shape[1],
-        self.num_heads_per_partition,
-        self.head_dim,
+    """Run native CLIP attention with a bidirectional vision mask."""
+    if attention_mask is None:
+        attention_mask = hidden_states.new_ones(hidden_states.shape[:2])
+    return self._dreamzero_original_forward(
+        hidden_states,
+        attention_mask=attention_mask,
     )
-    key_states = key_states.reshape(
-        key_states.shape[0],
-        key_states.shape[1],
-        self.num_heads_per_partition,
-        self.head_dim,
-    )
-    value_states = value_states.reshape(
-        value_states.shape[0],
-        value_states.shape[1],
-        self.num_heads_per_partition,
-        self.head_dim,
-    )
-
-    if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-        attn_mask = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                attn_mask = attention_mask[:, None, None, :].to(
-                    dtype=query_states.dtype
-                )
-                attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
-            else:
-                attn_mask = attention_mask
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attn_mask,
-            is_causal=False,
-            scale=self.scale,
-        )
-        attn_output = attn_output.transpose(1, 2)
-    else:
-        attn_output = self.attn(query_states, key_states, value_states)
-
-    attn_output = attn_output.reshape(
-        attn_output.shape[0],
-        attn_output.shape[1],
-        self.num_heads_per_partition * self.head_dim,
-    )
-    attn_output, _ = self.out_proj(attn_output)
-    return attn_output, None
 
 
 def _patch_dreamzero_clip_vision_attention(model: torch.nn.Module) -> None:
+    """Patch only DreamZero's CLIP instance instead of changing shared CLIP code."""
     for layer in model.vision_model.encoder.layers:
         attention = layer.self_attn
         attention.attn.attn_impl.causal = False
+        attention._dreamzero_original_forward = attention.forward
         attention.forward = types.MethodType(
             _dreamzero_non_causal_clip_attention_forward,
             attention,
@@ -114,6 +72,7 @@ def load_dreamzero_image_encoder(
     server_args: ServerArgs,
     component_model_path: str,
 ) -> torch.nn.Module:
+    """Load the image encoder through SGLang's component loader and patch attention."""
     image_encoder = ImageEncoderLoader().load_customized(
         component_model_path,
         server_args,
@@ -124,10 +83,7 @@ def load_dreamzero_image_encoder(
 
 
 def _module_device(module: torch.nn.Module) -> torch.device:
-    try:
-        return next(module.parameters()).device
-    except StopIteration:
-        return torch.device(current_platform.device_type)
+    return next(module.parameters()).device
 
 
 def _dit_dtype(server_args: ServerArgs) -> torch.dtype:
@@ -197,6 +153,12 @@ def _dreamzero_videos(batch: Req) -> torch.Tensor:
 
 
 class DreamZeroObsPrepStage(PipelineStage):
+    """Materialize normalized DreamZero action observations.
+
+    Writes ``batch.dreamzero_inputs`` plus normalized session IDs/reset masks for
+    downstream text, visual, and denoising stages.
+    """
+
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
@@ -208,6 +170,7 @@ class DreamZeroObsPrepStage(PipelineStage):
 
     @staticmethod
     def _to_tensor_tree(value: Any) -> Any:
+        """Convert msgpack-decoded numpy leaves to tensors."""
         if isinstance(value, np.ndarray):
             return torch.from_numpy(value)
         if isinstance(value, Mapping):
@@ -263,6 +226,13 @@ class DreamZeroObsPrepStage(PipelineStage):
 
 
 class DreamZeroVisualEncodingStage(ImageEncodingStage):
+    """Encode DreamZero visual conditioning and maintain visual session state.
+
+    Inherits SGLang ``ImageEncodingStage`` for declared component placement, then
+    writes ``dreamzero_clip_feature``, ``dreamzero_y``, and
+    ``dreamzero_latent_video``.
+    """
+
     deduplicated_output_fields = ()
 
     def __init__(
@@ -326,20 +296,17 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
 
     @staticmethod
     def _normalize_sglang_wan_latent(vae: torch.nn.Module, posterior) -> torch.Tensor:
+        """Normalize Wan VAE posterior outputs to the latent scale expected by DiT."""
         if torch.is_tensor(posterior):
             return posterior
         mean_tensor = posterior.mean
-        latents_mean = getattr(vae, "latents_mean", None)
-        latents_std = getattr(vae, "latents_std", None)
-        if latents_mean is None or latents_std is None:
-            return mean_tensor
         mean = torch.tensor(
-            latents_mean,
+            vae.latents_mean,
             device=mean_tensor.device,
             dtype=mean_tensor.dtype,
         ).view(1, mean_tensor.shape[1], 1, 1, 1)
         std = torch.tensor(
-            latents_std,
+            vae.latents_std,
             device=mean_tensor.device,
             dtype=mean_tensor.dtype,
         ).view(1, mean_tensor.shape[1], 1, 1, 1)
@@ -347,10 +314,11 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
 
     @staticmethod
     def _write_vae_outputs(batch: Req, server_args: ServerArgs, y: torch.Tensor) -> Req:
+        """Write VAE conditioning tensor and the current-frame latent to ``batch``."""
         dit_arch = server_args.pipeline_config.dit_config.arch_config
         vae_arch = server_args.pipeline_config.vae_config.arch_config
-        latent_channels = int(getattr(vae_arch, "z_dim", y.shape[1]))
-        in_dim = int(getattr(dit_arch, "in_dim", y.shape[1]))
+        latent_channels = int(vae_arch.z_dim)
+        in_dim = int(dit_arch.in_dim)
         batch_size = y.shape[0]
         num_t = y.shape[2]
         h_latent, w_latent = y.shape[3], y.shape[4]
@@ -371,7 +339,7 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         mask[:, :, 0:1] = 1
         conditioning_y = torch.cat([mask, y], dim=1)
         batch.dreamzero_latent_video = y[:, :, 0:1]
-        if not bool(getattr(dit_arch, "concat_first_frame_latent", True)):
+        if not dit_arch.concat_first_frame_latent:
             if in_dim != latent_channels:
                 raise ValueError(
                     "DreamZero TI2V in_dim must match VAE latent channels when "
@@ -401,11 +369,12 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Return normalized ``[B, C, T, H, W]`` video for CLIP/VAE encoding."""
         videos = _normalize_video_range(
             _dreamzero_videos(batch).to(device=device, dtype=dtype)
         )
-        target_h = int(getattr(server_args.pipeline_config, "synthetic_height", 0) or 0)
-        target_w = int(getattr(server_args.pipeline_config, "synthetic_width", 0) or 0)
+        target_h = int(server_args.pipeline_config.synthetic_height or 0)
+        target_w = int(server_args.pipeline_config.synthetic_width or 0)
         if (
             target_h > 0
             and target_w > 0
@@ -431,6 +400,7 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         *,
         image: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Encode the anchor image with the declared DreamZero image encoder."""
         with self.use_declared_component(
             component_name="image_encoder", module=self.image_encoder
         ) as image_encoder:
@@ -472,6 +442,7 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         image: torch.Tensor | None,
         videos: torch.Tensor | None,
     ) -> Req:
+        """Encode first-frame conditioning latents used by the causal DiT rollout."""
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             if vae is None:
                 raise ValueError("DreamZero VAE module is not loaded")
@@ -517,6 +488,7 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         *,
         videos: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Encode the streaming video block appended after the first anchor frame."""
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             if vae is None:
                 raise ValueError("DreamZero VAE module is not loaded")
@@ -572,6 +544,7 @@ class DreamZeroVisualEncodingStage(ImageEncodingStage):
         server_args: ServerArgs,
         request_cache: DreamZeroRequestCache,
     ):
+        """Reuse first-frame visual conditioning and update current video latents."""
         if self.cache_manager is None:
             raise RuntimeError("DreamZero visual stage requires a cache manager")
         state: DreamZeroCachePool = self.cache_manager.pool

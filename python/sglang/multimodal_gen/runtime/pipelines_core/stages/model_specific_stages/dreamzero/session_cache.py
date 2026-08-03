@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Session cache helpers for DreamZero action rollouts.
+
+The cache maps HTTP logical session IDs to dense physical slots and stores
+prompt, visual, self-attention KV, and cross-attention branch state across
+streaming action requests.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -402,6 +408,7 @@ class DreamZeroRequestCache:
 
 
 def record_session_timing(batch, key: str, elapsed_ms: float) -> None:
+    """Accumulate DreamZero cache timing fields on ``batch``."""
     timings = getattr(batch, "dreamzero_session_timing", None)
     if timings is None:
         timings = {}
@@ -415,6 +422,7 @@ def normalize_batched_session_fields(
     reset_mask: Any,
     batch_size: int,
 ) -> tuple[list[str], list[bool]]:
+    """Validate batched logical session IDs and reset masks."""
     if isinstance(session_ids, (list, tuple)):
         normalized_session_ids = [str(session_id) for session_id in session_ids]
     else:
@@ -451,6 +459,7 @@ def normalize_batched_session_fields(
 
 
 def normalize_batched_prompt_fields(value: Any, batch_size: int) -> list[str | None]:
+    """Normalize prompt-like fields to one optional string per batch item."""
     if value is None:
         return [None] * batch_size
     if isinstance(value, str):
@@ -587,6 +596,7 @@ def resolve_request_cache(
     local_attn_size: int,
     batch_size: int,
 ) -> DreamZeroRequestCache:
+    """Resolve logical sessions to physical slots and prompt-cache reuse flags."""
     if cache_manager is None:
         raise RuntimeError("DreamZero session cache requires a cache manager")
     logical_session_ids, reset_mask = _logical_session_fields(batch, batch_size)
@@ -649,6 +659,7 @@ def apply_request_lifecycle_resets(
     cache_manager: DreamZeroCachePoolManager | None,
     request_cache: DreamZeroRequestCache,
 ) -> None:
+    """Apply request and stage-derived resets to the physical session slots."""
     if cache_manager is None:
         raise RuntimeError("DreamZero session cache requires a cache manager")
     size = request_cache.batch_size
@@ -751,7 +762,7 @@ def _kv_seq_capacity(
 
 
 def _ensure_mutable_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if hasattr(torch, "is_inference") and torch.is_inference(tensor):
+    if torch.is_inference(tensor):
         return tensor.clone()
     return tensor
 

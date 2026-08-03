@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DreamZero causal Wan DiT pieces.
+"""DreamZero causal Wan DiT.
+
+Causal video/action DiT: each denoising step attends from the current
+video/action/state suffix to a sliding video KV prefix, then predicts both the
+next video block and normalized action chunk.
 
 Adapted from the official DreamZero causal Wan/action implementation:
 https://github.com/dreamzero0/dreamzero/blob/main/groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py
@@ -74,6 +78,8 @@ def _linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
 def _maybe_qk_norm(
     x: torch.Tensor, norm: nn.Module, *, tensor_parallel: bool
 ) -> torch.Tensor:
+    """Apply DreamZero full-hidden QK RMSNorm, using SGLang TP RMSNorm when sharded."""
+
     if isinstance(norm, nn.Identity):
         return x
     if tensor_parallel:
@@ -106,6 +112,8 @@ def _sp_shard_sequence(
     if get_ulysses_parallel_world_size() == 1:
         return seqs, freqs_cis, [seqs.shape[1]]
 
+    # DreamZero shards the already-concatenated local block sequence:
+    # [video tokens | action registers | state registers].
     seq_lens = _sp_shard_lengths(seqs.shape[1])
     local = _sp_local_slice(seq_lens)
     return seqs[:, local], (cos[local], sin[local]), seq_lens
@@ -140,6 +148,7 @@ def _sp_gather_tensor(tensor: torch.Tensor, seq_lens: list[int]) -> torch.Tensor
         )
         tensor = torch.cat([tensor, pad], dim=1)
 
+    # all_gather needs equal local lengths; trim the padding after concatenation.
     gathered = [torch.empty_like(tensor) for _ in range(sp_size)]
     torch.distributed.all_gather(
         gathered,
@@ -173,8 +182,15 @@ def _apply_rope_qk(
     k: torch.Tensor,
     freqs_cis: tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply SGLang RoPE helpers to DreamZero Q/K tensors.
+
+    NDRotaryEmbedding builds the cos/sin rows. CUDA uses FlashInfer's in-place
+    QK RoPE path; non-CUDA falls back to SGLang's native rotary helper.
+    """
+
     cos, sin = freqs_cis
     if _is_cuda:
+        # The local RoPE cache is already sequence-sharded when SP is enabled.
         cos_sin_cache = torch.cat(
             [
                 cos.to(dtype=torch.float32).contiguous(),
@@ -189,7 +205,14 @@ def _apply_rope_qk(
     )
 
 
+# -----------------------------------------------------------------------------
+# Action/state register encoders
+# -----------------------------------------------------------------------------
+
+
 class SinusoidalPositionalEncoding(nn.Module):
+    """Official DreamZero sinusoidal timestep embedding for action registers."""
+
     def __init__(self, embedding_dim: int):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -205,6 +228,8 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class CategorySpecificLinear(nn.Module):
+    """Category-indexed linear projection used by DreamZero action/state heads."""
+
     def __init__(self, num_categories: int, input_dim: int, hidden_dim: int):
         super().__init__()
         self.num_categories = num_categories
@@ -218,6 +243,8 @@ class CategorySpecificLinear(nn.Module):
 
 
 class CategorySpecificMLP(nn.Module):
+    """Two-layer category-indexed MLP for state encoding and action decoding."""
+
     def __init__(
         self,
         num_categories: int,
@@ -236,6 +263,8 @@ class CategorySpecificMLP(nn.Module):
 
 
 class MultiEmbodimentActionEncoder(nn.Module):
+    """Encode noisy action chunks with action timestep and category-specific weights."""
+
     def __init__(self, action_dim: int, hidden_size: int, num_embodiments: int):
         super().__init__()
         self.hidden_size = hidden_size
@@ -256,7 +285,20 @@ class MultiEmbodimentActionEncoder(nn.Module):
         return self.W3(x, cat_ids)
 
 
+# -----------------------------------------------------------------------------
+# Cross attention
+# -----------------------------------------------------------------------------
+
+
 class DreamZeroT2VCrossAttention(nn.Module):
+    """Cross-attention from video/action tokens to text context.
+
+    Reuses SGLang ColumnParallelLinear/RowParallelLinear for TP and USPAttention
+    as the attention backend wrapper. Cross-attention K/V context is replicated;
+    each SP rank computes only its local query shard, so Ulysses all-to-all is
+    disabled here.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -319,6 +361,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
         batch: int,
         crossattn_cache: dict | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project text K/V once per request branch and reuse it across denoising steps."""
+
         if crossattn_cache is not None and crossattn_cache["is_init"]:
             return crossattn_cache["k"], crossattn_cache["v"]
 
@@ -349,6 +393,8 @@ class DreamZeroT2VCrossAttention(nn.Module):
 
 
 class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
+    """I2V cross-attention with separate CLIP-image and text K/V projections."""
+
     def __init__(
         self,
         dim: int,
@@ -382,6 +428,7 @@ class DreamZeroI2VCrossAttention(DreamZeroT2VCrossAttention):
         context: torch.Tensor,
         crossattn_cache: dict | None = None,
     ) -> torch.Tensor:
+        # DreamZero packs CLIP image tokens before text tokens in the i2v context.
         context_img = context[:, :257]
         context = context[:, 257:]
         batch = x.shape[0]
@@ -408,7 +455,19 @@ WAN_CROSSATTENTION_CLASSES = {
 }
 
 
+# -----------------------------------------------------------------------------
+# Causal self attention
+# -----------------------------------------------------------------------------
+
+
 class DreamZeroCausalWanSelfAttention(nn.Module):
+    """Causal self-attention over current video/action/state tokens plus video cache.
+
+    Uses SGLang USPAttention for both regular attention and SP attention. The
+    SP path keeps the cached video prefix replicated and runs Ulysses all-to-all
+    only for the current suffix.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -467,6 +526,8 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
             if use_tensor_parallel
             else nn.Linear(dim, dim)
         )
+        # DreamZero QK norm is full-hidden RMSNorm before the head reshape. This
+        # differs from native per-head QK norm helpers and preserves TP parity.
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = USPAttention(
@@ -510,6 +571,8 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 v.contiguous(),
             ).contiguous()
 
+        # The cache prefix is replicated on every SP rank. Only the current
+        # suffix participates in Ulysses varlen all-to-all.
         q = _usp_input_all_to_all_varlen(q.contiguous(), seq_lens, head_dim=2)
         k = _usp_input_all_to_all_varlen(k.contiguous(), seq_lens, head_dim=2)
         v = _usp_input_all_to_all_varlen(v.contiguous(), seq_lens, head_dim=2)
@@ -535,6 +598,8 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         seq_lens: list[int] | None = None,
         video_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return hidden states and the updated sliding video KV cache."""
+
         if kv_cache is None:
             raise RuntimeError("DreamZero SGLang inference requires a KV cache")
         if video_sequence_length is None:
@@ -562,6 +627,8 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
                 torch.cat([kv_cache[1], v], dim=1),
             )
         else:
+            # The persistent cache stores only video prefix tokens in full
+            # sequence layout; action/state registers are current-step only.
             current_video_k = _sp_gather_tensor(roped_key, seq_lens)[
                 :, :video_sequence_length
             ]
@@ -576,6 +643,7 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
 
         updated_k = torch.cat([kv_cache[0], current_video_k], dim=1)
         updated_v = torch.cat([kv_cache[1], current_video_v], dim=1)
+        # Keep the same sliding-window cache size as the official causal model.
         updated_k = updated_k[:, -self.max_attention_size :]
         updated_v = updated_v[:, -self.max_attention_size :]
         updated_kv_cache = torch.stack([updated_k, updated_v], dim=0)
@@ -584,7 +652,18 @@ class DreamZeroCausalWanSelfAttention(nn.Module):
         return out, updated_kv_cache
 
 
+# -----------------------------------------------------------------------------
+# Transformer blocks and output heads
+# -----------------------------------------------------------------------------
+
+
 class DreamZeroCausalWanTransformerBlock(nn.Module):
+    """DreamZero block: AdaLN self-attention, cross-attention, and AdaLN FFN.
+
+    LayerNormScaleShift reuses SGLang's native norm+scale+shift path for the
+    DreamZero modulation tensors.
+    """
+
     def __init__(
         self,
         cross_attn_type: str,
@@ -683,6 +762,8 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
         seq_lens: list[int] | None = None,
         video_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run one transformer block and return its updated self-attention KV cache."""
+
         e_parts = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         e_parts = align_modulation(e_parts, x.shape[1])
 
@@ -718,6 +799,8 @@ class DreamZeroCausalWanTransformerBlock(nn.Module):
 
 
 class DreamZeroCausalHead(nn.Module):
+    """Project decoded video tokens back to patch-space noise prediction."""
+
     def __init__(self, dim: int, out_dim: int, patch_size: tuple[int, ...], eps=1e-6):
         super().__init__()
         self.dim = dim
@@ -740,6 +823,8 @@ class DreamZeroCausalHead(nn.Module):
 
 
 class MLPProj(nn.Module):
+    """Project CLIP image features into the DreamZero context dimension."""
+
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.proj = nn.Sequential(
@@ -754,7 +839,19 @@ class MLPProj(nn.Module):
         return self.proj(image_embeds)
 
 
+# -----------------------------------------------------------------------------
+# DreamZero causal Wan model
+# -----------------------------------------------------------------------------
+
+
 class DreamZeroCausalWanModel(CachableDiT):
+    """SGLang runtime module for DreamZero causal Wan/action inference.
+
+    Reuses CachableDiT registration/loading hooks, SGLang TP linear layers,
+    NDRotaryEmbedding for video/action/state RoPE, and USPAttention for the
+    sequence-parallel self-attention suffix path.
+    """
+
     _fsdp_shard_conditions = (
         DreamZeroCausalWanConfig().arch_config._fsdp_shard_conditions
     )
@@ -903,6 +1000,7 @@ class DreamZeroCausalWanModel(CachableDiT):
         rope_dtype = (
             torch.float64 if current_platform.is_float64_supported() else torch.float32
         )
+        # Wan-style 3D RoPE splits the head dim across temporal, height, width.
         self.rope_dim_list = [
             head_dim - 4 * (head_dim // 6),
             2 * (head_dim // 6),
@@ -929,8 +1027,12 @@ class DreamZeroCausalWanModel(CachableDiT):
     def _create_freqs(
         self, grid_size: torch.Tensor, start_frame: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build video RoPE rows for the current causal frame window."""
+
         device = self.patch_embedding.weight.device
         frames, height, width = grid_size.tolist()
+        # Causal rollout appends video blocks over time, so temporal RoPE starts
+        # at the global frame offset rather than zero for every request step.
         t = torch.arange(start_frame, start_frame + frames, device=device)
         h = torch.arange(height, device=device)
         w = torch.arange(width, device=device)
@@ -961,6 +1063,8 @@ class DreamZeroCausalWanModel(CachableDiT):
         current_start_frame: int,
         enable_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        """Run transformer blocks over video tokens plus optional action/state registers."""
+
         x = x.flatten(start_dim=2).transpose(1, 2)
         batch = x.shape[0]
         num_timestep_frames = timestep.shape[1]
@@ -982,6 +1086,8 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         if action_register_length is not None:
             action_state_index = (current_start_frame - 1) // self.num_frame_per_block
+            # Action/state registers share the self-attention stream with video
+            # tokens but use their own 1D RoPE timelines.
             action_positions = torch.arange(
                 action_state_index * self.num_action_per_block,
                 (action_state_index + 1) * self.num_action_per_block,
@@ -1007,6 +1113,8 @@ class DreamZeroCausalWanModel(CachableDiT):
         if enable_sequence_parallel:
             x, freqs_cis, seq_lens = _sp_shard_sequence(x, freqs_cis)
 
+        # The video timestep tensor is block-shaped; align it to the flattened
+        # token sequence before appending action/state timesteps.
         if num_timestep_frames <= seq_len:
             repeat = (seq_len + num_timestep_frames - 1) // num_timestep_frames
             timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
@@ -1064,6 +1172,8 @@ class DreamZeroCausalWanModel(CachableDiT):
 
         if enable_sequence_parallel:
             assert seq_lens is not None
+            # Decode heads run after reassembling video/action/state tokens so
+            # each head sees its expected contiguous slice.
             x = _sp_gather_tensor(x, seq_lens)
 
         if action is not None:
@@ -1094,6 +1204,8 @@ class DreamZeroCausalWanModel(CachableDiT):
         embodiment_id: torch.Tensor | None = None,
         enable_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        """Patchify inputs, run causal blocks, unpatchify video, and return updated caches."""
+
         if self.model_type == "i2v":
             assert clip_feature is not None and y is not None
         assert context.shape[1] == self.text_len
