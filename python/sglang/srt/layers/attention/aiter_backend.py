@@ -138,6 +138,10 @@ class ForwardMetadata:
     # built once per forward instead of per layer. See build_dcp_page_table.
     dcp_block_table: Optional[torch.Tensor] = None
     dcp_local_kv_lens: Optional[torch.Tensor] = None
+    # DCP target-verify flattens the gamma+1 window into one single-token row
+    # per query token, so stage A needs its own [bs * q_len + 1] arange
+    # cu_seqlens_q (qo_indptr above stays the per-request window boundaries).
+    dcp_verify_qo_indptr: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -147,6 +151,76 @@ _AITER_PARTITION_SIZE_ROCM = 256
 # 16384x16384 chunk measured 5156 ms at 1, 55.8 ms at 16, 39.5 ms at 64. This is
 # a staging-buffer page size, independent of the KV pool's --page-size.
 _GLUON_PREFILL_PAGE_SIZE = 64
+
+# gluon's MLA reduce and sglang's DCP merge (correct_attn_out) both work in
+# base-2, so any LSE produced here has to be rebased from natural log.
+_LOG2E = 1.4426950408889634
+
+
+def dense_causal_mla_attn_base2(
+    q: torch.Tensor,
+    k_window: torch.Tensor,
+    scaling: float,
+    bs: int,
+    q_len: int,
+    kv_lora_rank: int,
+):
+    """Dense causal MLA attention over one in-hand ``q_len``-token window.
+
+    Used as stage B of the DCP target-verify decomposition. The window is tiny
+    (``gamma + 1`` queries over the same ``gamma + 1`` keys), so a batched matmul
+    beats a paged kernel here -- and it sidesteps two gluon limitations that only
+    bite inside the window: gluon derives its causal mask from the LOCAL shard
+    index (which under DCP is not the global position), and its segmented reduce
+    would need to mask the segments the causal mask empties.
+
+    Args:
+        q: [bs * q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        k_window: [bs * q_len, 1, kv_lora_rank + qk_rope_head_dim] latent KV of
+            the window tokens, in query order. ``v`` is its first
+            ``kv_lora_rank`` columns (MLA absorb form).
+
+    Returns (out [bs * q_len, num_heads, kv_lora_rank] float32,
+    lse [bs * q_len, num_heads] float32 base-2).
+    """
+    num_heads = q.shape[1]
+    qb = q.view(bs, q_len, num_heads, -1)
+    kb = k_window.view(bs, q_len, -1)
+    # Scores in the input dtype (matching the kernels), softmax/LSE in fp32.
+    scores = torch.einsum("bihd,bjd->bhij", qb, kb).float() * scaling
+    causal = torch.ones(q_len, q_len, dtype=torch.bool, device=q.device).tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    lse_e = torch.logsumexp(scores, dim=-1)  # [bs, num_heads, q_len], natural log
+    probs = torch.exp(scores - lse_e.unsqueeze(-1))
+    vb = kb[..., :kv_lora_rank].float()
+    out = torch.einsum("bhij,bjd->bihd", probs, vb)  # [bs, q_len, H, kv_lora_rank]
+    return (
+        out.reshape(bs * q_len, num_heads, kv_lora_rank),
+        (lse_e * _LOG2E).permute(0, 2, 1).reshape(bs * q_len, num_heads),
+    )
+
+
+def lse_combine_base2(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    out_dtype: torch.dtype,
+):
+    """Merge two partial attentions over DISJOINT key sets, given base-2 LSEs.
+
+    ``out_*`` are [tokens, heads, dim] and ``lse_*`` are [tokens, heads]. A
+    partial that saw no keys carries ``lse = -inf`` (what dcp_gluon_mla_reduce
+    writes for an empty shard); its weight is forced to 0 rather than NaN.
+    """
+    m = torch.maximum(lse_a, lse_b)
+    w_a = torch.nan_to_num(torch.exp2(lse_a - m), nan=0.0, posinf=0.0, neginf=0.0)
+    w_b = torch.nan_to_num(torch.exp2(lse_b - m), nan=0.0, posinf=0.0, neginf=0.0)
+    denom = w_a + w_b
+    out = out_a.float() * w_a.unsqueeze(-1) + out_b.float() * w_b.unsqueeze(-1)
+    out = out / denom.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)
+    lse = torch.where(denom == 0.0, float("-inf"), m + torch.log2(denom))
+    return out.to(out_dtype), lse
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -926,6 +1000,92 @@ class AiterAttnBackend(AttentionBackend):
             self.input_dtype,
         )
 
+    def _mla_verify_fwd_gluon_dcp(self, q, k_window, layer, k_descale):
+        """DCP target-verify, split at the verify-window boundary.
+
+        A verify step queries ``q_len = gamma + 1`` tokens per request against
+        the committed KV plus the window itself. Splitting the key set there
+        avoids the one thing gluon cannot do under DCP -- masking on the GLOBAL
+        position ``g(j) = j * W + r`` rather than the local shard index ``j``:
+
+        * stage A, the COMMITTED shard: every entry precedes every window token,
+          so no causal masking is needed at all. The metadata flattens the batch
+          into ``bs * q_len`` single-token rows, which puts gluon in its
+          ``num_tokens_per_seq == 1`` regime where the mask degenerates to
+          ``j < seq_len`` -- exactly "attend this rank's whole shard".
+        * stage B, the in-hand window: dense and not yet sharded, so a plain
+          causal ``q_len x q_len`` attention is correct on its own.
+
+        Stage B is folded in on ONE rank only, so that after the caller's
+        cross-rank merge (cp_lse_ag_out_rs_mla) the window is counted exactly
+        once; the other ranks simply return their shard partial.
+
+        Returns (out [bs * q_len, H_gathered, kv_lora_rank],
+        lse [bs * q_len, H_gathered]) with lse in base-2, ready for that merge.
+        """
+        from aiter.ops.triton.attention.mla import (
+            mla_decode_fwd as gluon_mla_decode_fwd,
+        )
+
+        from sglang.kernels.ops.attention.dcp_gluon_mla_reduce import (
+            dcp_gluon_mla_reduce,
+        )
+
+        fm = self.forward_metadata
+        q_len = fm.max_q_len
+        num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
+        kv_lora_rank = layer.v_head_dim
+        qk_rope_head_dim = layer.qk_head_dim - kv_lora_rank
+
+        # Both were expanded to one row per window token when the metadata was
+        # planned, so the shard lengths and page table are already per-row.
+        seqused_k = fm.dcp_local_kv_lens
+        n_rows = seqused_k.shape[0]
+        bs = n_rows // q_len
+
+        # Same reasoning as the decode path: a per-step max would make gluon's
+        # NUM_SEGMENTS vary between capture and replay, and .item() is illegal
+        # under capture. Per-token correctness comes from seqused_k regardless.
+        if fm.run_graph:
+            max_local = self._dcp_graph_max_local_kv_len()
+        else:
+            max_local = int(seqused_k.max().item())
+
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        out_a = q.new_empty((n_rows, num_heads, kv_lora_rank), dtype=self.input_dtype)
+        segm_output, segm_max, segm_expsum = gluon_mla_decode_fwd(
+            q.view(n_rows, num_heads, layer.qk_head_dim),
+            k_buffer.view(-1, self.page_size, 1, layer.qk_head_dim),
+            out_a,
+            fm.dcp_verify_qo_indptr[: n_rows + 1],
+            seqused_k,
+            max_local,
+            fm.dcp_block_table,
+            layer.scaling,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            True,  # causal (degenerate at num_tokens_per_seq == 1)
+            k_descale,
+            k_descale,
+            skip_reduce=True,
+        )
+        out_a, lse_a = dcp_gluon_mla_reduce(
+            segm_output,
+            segm_max,
+            segm_expsum,
+            seqused_k,
+            self.page_size,
+            self.input_dtype,
+        )
+
+        if fm.dcp_cp_rank != 0:
+            return out_a, lse_a
+
+        out_b, lse_b = dense_causal_mla_attn_base2(
+            q, k_window, layer.scaling, bs, q_len, kv_lora_rank
+        )
+        return lse_combine_base2(out_a, lse_a, out_b, lse_b, self.input_dtype)
+
     def _mla_prefill_fwd_gluon_dcp(self, q, layer, k_descale, forward_batch):
         """DCP prefill (extend) via aiter's gluon MLA absorb-prefill kernel over
         the assembled full-sequence KV in ``attn_dcp_metadata.dcp_kv_buffer``.
@@ -1138,6 +1298,7 @@ class AiterAttnBackend(AttentionBackend):
         dcp_cp_rank = 0
         dcp_block_table = None
         dcp_local_kv_lens = None
+        dcp_verify_qo_indptr = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -1383,9 +1544,19 @@ class AiterAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
-                kv_lens = forward_batch.seq_lens + draft_num
-                kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
+                # Under DCP the committed prefix and the gamma+1 window are
+                # attended as two separate stages, so the shard plan must cover
+                # the COMMITTED length only: the window tokens this rank owns
+                # were already written to the cache by the model layer and would
+                # otherwise be counted twice (once in each stage).
+                verify_dcp = self.use_mla and dcp_enabled()
+                if verify_dcp:
+                    kv_lens = forward_batch.seq_lens.to(torch.int32).clone()
+                    kv_lens_sum = forward_batch.seq_lens_sum
+                else:
+                    kv_lens = forward_batch.seq_lens + draft_num
+                    kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
 
                 qo_indptr = self.qo_indptr[: bs + 1]
                 qo_indptr[: bs + 1] = torch.arange(
@@ -1411,8 +1582,35 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
 
+                if verify_dcp:
+                    dcp_g_kv_indptr = kv_indptr.clone()
+                    dcp_cp_world_size = get_attention_dcp_world_size()
+                    dcp_cp_rank = get_attention_dcp_rank()
+                    # seq_lens_cpu is NOT usable here: the DSPARK verify path
+                    # pre-adds the window to it while the device seq_lens still
+                    # holds the committed length, so the CPU fast path would
+                    # plan a shard that is draft_num tokens too long.
+                    self._plan_dcp_decode_metadata(
+                        kv_indptr,
+                        kv_indices,
+                        kv_lens,
+                        None,
+                        bs,
+                    )
+                    (
+                        dcp_block_table,
+                        dcp_local_kv_lens,
+                        dcp_verify_qo_indptr,
+                    ) = self._build_dcp_verify_page_table(
+                        kv_indptr,
+                        forward_batch.req_pool_indices,
+                        bs,
+                        draft_num,
+                        (max_kv_len + self.dcp_world_size - 1) // self.dcp_world_size,
+                    )
+
                 # if self.kv_cache_dtype == fp8_dtype:
-                if _use_mla_ps_kernel:
+                if _use_mla_ps_kernel and not verify_dcp:
                     max_seqlen_qo = draft_num
                     (
                         work_metadata,
@@ -1457,6 +1655,12 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
                     run_graph=False,
+                    dcp_g_kv_indptr=dcp_g_kv_indptr,
+                    dcp_cp_world_size=dcp_cp_world_size,
+                    dcp_cp_rank=dcp_cp_rank,
+                    dcp_block_table=dcp_block_table,
+                    dcp_local_kv_lens=dcp_local_kv_lens,
+                    dcp_verify_qo_indptr=dcp_verify_qo_indptr,
                 )
             else:
                 draft_num = forward_batch.input_ids.shape[0] // bs
@@ -1711,6 +1915,48 @@ class AiterAttnBackend(AttentionBackend):
         )
         return block_table, local_kv_lens
 
+    def _build_dcp_verify_page_table(
+        self,
+        kv_indptr: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        bs: int,
+        q_len: int,
+        max_local_kv_len: int,
+        out: Optional[torch.Tensor] = None,
+        out_lens: Optional[torch.Tensor] = None,
+        qo_indptr: Optional[torch.Tensor] = None,
+    ):
+        """Per-ROW page table, shard lengths and cu_seqlens_q for the gluon DCP
+        target-verify stage A.
+
+        Stage A flattens the ``bs x q_len`` verify window into ``bs * q_len``
+        single-token rows, which is what puts gluon in its
+        ``num_tokens_per_seq == 1`` regime where the causal mask degenerates to
+        "attend the whole shard" (see _mla_verify_fwd_gluon_dcp). Every row of a
+        request shares that request's committed shard, so the decode table and
+        lengths just repeat ``q_len`` times -- expanded once per forward rather
+        than per layer.
+
+        On the cuda-graph path the caller supplies capture-stable buffers: this
+        runs OUT of the graph, so freshly allocated outputs would be invisible to
+        the captured kernels (they keep the capture-time pointer).
+        """
+        block_table, local_kv_lens = self._build_dcp_decode_page_table(
+            kv_indptr, req_pool_indices, bs, max_local_kv_len
+        )
+        n_rows = bs * q_len
+        if out is None:
+            out = block_table.new_empty((n_rows, block_table.shape[1]))
+        out.view(bs, q_len, -1).copy_(block_table.unsqueeze(1).expand(bs, q_len, -1))
+        if out_lens is None:
+            out_lens = local_kv_lens.new_empty((n_rows,))
+        out_lens.view(bs, q_len).copy_(local_kv_lens.unsqueeze(1).expand(bs, q_len))
+        if qo_indptr is None:
+            qo_indptr = torch.arange(
+                n_rows + 1, dtype=torch.int32, device=kv_indptr.device
+            )
+        return out, out_lens, qo_indptr
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -1754,6 +2000,23 @@ class AiterAttnBackend(AttentionBackend):
             self.cuda_graph_dcp_local_kv_lens = torch.zeros(
                 (max_bs,), dtype=torch.int32, device=self.device
             )
+            if self.num_draft_tokens:
+                # Target-verify flattens each request's gamma+1 window into that
+                # many single-token rows (see _build_dcp_verify_page_table), so
+                # it needs max_bs * num_draft_tokens rows rather than max_bs.
+                # cu_seqlens_q is a plain arange, so one buffer serves every bs.
+                n_verify_rows = max_bs * self.num_draft_tokens
+                self.cuda_graph_dcp_verify_block_table = torch.zeros(
+                    (n_verify_rows, max_local_pages),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.cuda_graph_dcp_verify_local_kv_lens = torch.zeros(
+                    (n_verify_rows,), dtype=torch.int32, device=self.device
+                )
+                self.cuda_graph_dcp_verify_qo_indptr = torch.arange(
+                    n_verify_rows + 1, dtype=torch.int32, device=self.device
+                )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -1877,6 +2140,7 @@ class AiterAttnBackend(AttentionBackend):
         dcp_cp_rank = 0
         dcp_block_table = None
         dcp_local_kv_lens = None
+        dcp_verify_qo_indptr = None
 
         swa_page_table = None
         max_kv_len = (
@@ -2068,7 +2332,12 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            if self.use_mla:
+            # Under DCP the committed prefix and the gamma+1 window are attended
+            # as two separate stages, so plan the shard over the COMMITTED length
+            # only -- the window tokens this rank owns are already in the cache
+            # and would otherwise be counted in both stages.
+            verify_dcp = self.use_mla and dcp_enabled()
+            if self.use_mla and not verify_dcp:
                 kv_lens = seq_lens + self.num_draft_tokens
             else:
                 kv_lens = seq_lens
@@ -2098,9 +2367,41 @@ class AiterAttnBackend(AttentionBackend):
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
+            if verify_dcp:
+                self.cuda_graph_dcp_g_kv_indptr[: bs + 1] = kv_indptr
+                dcp_g_kv_indptr = self.cuda_graph_dcp_g_kv_indptr[: bs + 1]
+                dcp_cp_world_size = get_attention_dcp_world_size()
+                dcp_cp_rank = get_attention_dcp_rank()
+                # seq_lens_cpu is NOT usable here: the DSPARK verify path
+                # pre-adds the window to it while the device seq_lens still holds
+                # the committed length, so the CPU fast path would plan a shard
+                # draft_num tokens too long.
+                self._plan_dcp_decode_metadata(
+                    kv_indptr,
+                    kv_indices,
+                    seq_lens[:bs].to(torch.int32).clone(),
+                    None,
+                    bs,
+                )
+                n_rows = bs * self.num_draft_tokens
+                (
+                    dcp_block_table,
+                    dcp_local_kv_lens,
+                    dcp_verify_qo_indptr,
+                ) = self._build_dcp_verify_page_table(
+                    kv_indptr,
+                    req_pool_indices,
+                    bs,
+                    self.num_draft_tokens,
+                    self._dcp_graph_max_local_kv_len(),
+                    out=self.cuda_graph_dcp_verify_block_table[:n_rows],
+                    out_lens=self.cuda_graph_dcp_verify_local_kv_lens[:n_rows],
+                    qo_indptr=self.cuda_graph_dcp_verify_qo_indptr[: n_rows + 1],
+                )
+
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel:
+                if _use_mla_ps_kernel and not verify_dcp:
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2141,6 +2442,12 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
+                    dcp_g_kv_indptr=dcp_g_kv_indptr,
+                    dcp_cp_world_size=dcp_cp_world_size,
+                    dcp_cp_rank=dcp_cp_rank,
+                    dcp_block_table=dcp_block_table,
+                    dcp_local_kv_lens=dcp_local_kv_lens,
+                    dcp_verify_qo_indptr=dcp_verify_qo_indptr,
                 )
             else:
                 max_q_len = verify_tokens_per_req
@@ -2423,6 +2730,17 @@ class AiterAttnBackend(AttentionBackend):
             V_Buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
+
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.forward_metadata.dcp_cp_world_size > 1
+            ):
+                # Two-stage DCP verify. Dispatched before the dims below because
+                # under DCP the model layer writes the KV shard itself and hands
+                # us the window's k/v directly (v is k's first kv_lora_rank
+                # columns), not a full-sequence k to measure head dims from.
+                return self._mla_verify_fwd_gluon_dcp(q, k, layer, k_descale)
+
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
             assert len(q.shape) == 3
             assert len(k.shape) == 3

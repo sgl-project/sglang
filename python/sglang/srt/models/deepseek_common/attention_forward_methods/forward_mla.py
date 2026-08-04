@@ -1038,10 +1038,21 @@ class DeepseekMLAForwardMixin:
                 k_nope,
                 k_pe,
             )
+            # Decode reads everything it needs back from the KV shard, so it
+            # passes no k/v. TARGET_VERIFY cannot: the gamma+1 window it must
+            # attend densely is round-robin split across ranks the moment it
+            # lands in the cache, so hand the backend the in-hand window latent
+            # (v is its first kv_lora_rank columns, the MLA absorb form).
+            if forward_batch.forward_mode.is_target_verify():
+                k_window = torch.cat([k_nope, k_pe], dim=-1)
+                v_window = k_nope
+            else:
+                k_window = None
+                v_window = None
             attn_output, lse = self.attn_mqa_for_dcp_decode(
                 q,
-                None,
-                None,
+                k_window,
+                v_window,
                 forward_batch,
                 save_kv_cache=False,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
