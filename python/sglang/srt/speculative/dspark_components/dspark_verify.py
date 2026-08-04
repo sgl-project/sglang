@@ -36,6 +36,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
@@ -75,6 +76,7 @@ class TargetVerifyExecutor:
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
+        tp_sync: DsparkTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -83,6 +85,7 @@ class TargetVerifyExecutor:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
+        self._tp_sync = tp_sync
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -126,6 +129,10 @@ class TargetVerifyExecutor:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+
+        self._tp_sync.sync(correct_len)
+        self._tp_sync.sync(bonus)
+        self._tp_sync.sync(cap_trim_lens)
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -458,12 +465,14 @@ class DsparkVerifyEpilogue:
         max_bs: int,
         verify_num_draft_tokens: int,
         device,
+        tp_sync: DsparkTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self._tp_sync = tp_sync
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
@@ -608,6 +617,9 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
+        self._tp_sync.sync(correct_len)
+        self._tp_sync.sync(bonus)
+        self._tp_sync.sync(cap_trim_lens)
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

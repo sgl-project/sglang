@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class DsparkDraftSampler:
         gamma,
         max_bs,
         device,
+        tp_sync: DsparkTpSync,
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
@@ -55,6 +57,7 @@ class DsparkDraftSampler:
             else None
         )
         self.folded_sampling = folded_sampling
+        self._tp_sync = tp_sync
         self.temperatures = None
         self.greedy_mask = None
         self.exp_noise = None
@@ -103,15 +106,19 @@ class DsparkDraftSampler:
                 # In-graph philox noise: each replay advances the generator
                 # and redraws.
                 noise = self.exp_noise[:bs].exponential_()
-                return SampleStepTokens.execute(
-                    step_logits=step_logits,
-                    temperatures=self.temperatures[:bs],
-                    greedy_mask=self.greedy_mask[:bs],
-                    exp_noise=noise,
+                return self._tp_sync.sync(
+                    SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=self.temperatures[:bs],
+                        greedy_mask=self.greedy_mask[:bs],
+                        exp_noise=noise,
+                    )
                 )
 
         else:
-            sampler = greedy_step_sampler
+
+            def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                return self._tp_sync.sync(greedy_step_sampler(step_logits, step_idx))
 
         draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,
@@ -169,6 +176,7 @@ def maybe_build_draft_sampler(
     max_bs: int,
     device,
     tp_rank: int,
+    tp_sync: DsparkTpSync,
     confidence_fn=None,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
@@ -199,6 +207,7 @@ def maybe_build_draft_sampler(
         gamma=gamma,
         max_bs=max_bs,
         device=device,
+        tp_sync=tp_sync,
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,

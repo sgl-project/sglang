@@ -50,6 +50,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -127,6 +128,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
+        parallel = get_parallel()
+        self._tp_sync = DsparkTpSync(
+            parallel.attn_tp_group
+            if server_args.enable_dp_attention
+            else parallel.tp_group
+        )
+
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
@@ -194,6 +202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
+            tp_sync=self._tp_sync,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
         self._verify_epilogue = None
@@ -206,6 +215,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
+                tp_sync=self._tp_sync,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -244,6 +254,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
+            tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -338,6 +349,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
+            tp_sync=self._tp_sync,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
@@ -402,6 +414,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
+        self._tp_sync.sync(next_token_ids)
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
