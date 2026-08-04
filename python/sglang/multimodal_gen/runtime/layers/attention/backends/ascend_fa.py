@@ -140,9 +140,7 @@ class AscendFAImpl(AttentionImpl):
             return torch.empty_like(query)
 
         if not (
-            query.is_contiguous()
-            and key.is_contiguous()
-            and value.is_contiguous()
+            query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
         ):
             # Packed Ulysses Q/K/V are adjacent strided views. Repack them with
             # one allocation instead of launching three large contiguous copies.

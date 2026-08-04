@@ -384,12 +384,8 @@ def _apply_rope_qk(
         half = cos_sin_cache.shape[-1] // 2
         cos, sin = cos_sin_cache.split(half, dim=-1)
         rot_dim = half * 2
-        q_rot = apply_rotary_embedding_native(
-            q[..., :rot_dim].contiguous(), cos, sin
-        )
-        k_rot = apply_rotary_embedding_native(
-            k[..., :rot_dim].contiguous(), cos, sin
-        )
+        q_rot = apply_rotary_embedding_native(q[..., :rot_dim].contiguous(), cos, sin)
+        k_rot = apply_rotary_embedding_native(k[..., :rot_dim].contiguous(), cos, sin)
         return (
             torch.cat((q_rot, q[..., rot_dim:]), dim=-1),
             torch.cat((k_rot, k[..., rot_dim:]), dim=-1),
