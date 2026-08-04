@@ -1392,7 +1392,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             run_once,
             # DP padding can install capture-only tensors on this dummy batch;
             # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=forward_batch,
+            capture_inputs=(
+                forward_batch
+                if forward_batch.global_num_tokens_gpu is not None
+                else None
+            ),
             post_warmup_hook=post_warmup_hook,
         )
 
