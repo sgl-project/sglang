@@ -114,6 +114,14 @@ class TranscriptionAdapter(ABC):
         """
         return text
 
+    def build_input_text(
+        self,
+        request: TranscriptionRequest,
+        audio_token: str = "",
+    ) -> str:
+        """Return the ``text`` for ``GenerateReqInput``. Default is empty."""
+        return ""
+
     @abstractmethod
     def build_verbose_response(
         self,

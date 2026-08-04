@@ -27,7 +27,7 @@ import logging
 import math
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request, WebSocket
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -94,8 +94,15 @@ class OpenAIServingTranscription(OpenAIServingBase):
             sampling_params = self._adapter.build_fused_autodetect_params(request)
         else:
             sampling_params = self._adapter.build_sampling_params(request)
+        mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+        mm_tokens = (
+            getattr(mm_processor, "mm_tokens", None) if mm_processor else None
+        )
+        audio_token = (
+            (getattr(mm_tokens, "audio_token", "") or "") if mm_tokens else ""
+        )
         adapted_request = GenerateReqInput(
-            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
+            text=self._adapter.build_input_text(request, audio_token=audio_token),
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -127,6 +134,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
         stream: bool,
         raw_request: Request,
         timestamp_granularities: Optional[List[str]] = None,
+        prompt: Optional[str] = None,
+        chat_template_kwargs: Optional[Dict] = None,
     ) -> Union[
         TranscriptionResponse,
         TranscriptionVerboseResponse,
@@ -164,6 +173,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
             timestamp_granularities=timestamp_granularities,
             stream=stream,
             audio_duration_s=audio_duration_s,
+            prompt=prompt,
+            chat_template_kwargs=chat_template_kwargs,
         )
         if use_fused:
             request._fused_autodetect = True
