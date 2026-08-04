@@ -201,3 +201,31 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+class ForcedSequenceLogitProcessor(CustomLogitProcessor):
+    """Teacher-forcing: pin each decode step to a per-request recorded token sequence.
+
+    Per-request custom_params: {"forced_output_ids": [int, ...]}. At decode step t
+    (t = tokens already generated for the req), forces the next token to
+    forced_output_ids[t] by masking every other logit; past the end of the list it
+    samples normally. Useful for running two server configurations on a byte-identical
+    decode workload (so the only variable is the config under test) and for
+    reproducible / replayed decoding.
+    """
+
+    def __call__(self, logits, custom_param_list=None):
+        if not custom_param_list:
+            return logits
+        for i, params in enumerate(custom_param_list):
+            if not params:
+                continue
+            forced = params.get("forced_output_ids")
+            if not forced:
+                continue
+            req = params.get("__req__")
+            t = len(req.output_ids) if req is not None else 0
+            if t < len(forced):
+                logits[i, :] = float("-inf")
+                logits[i, forced[t]] = 0.0
+        return logits
