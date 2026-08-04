@@ -8109,9 +8109,9 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64); helion (specializes outer KDA state strides
-        #   and requires a contiguous innermost dimension); cutedsl (KDA fused
-        #   sigmoid-gating update is stride-safe) on KDA-hybrid models only.
+        #   stride as a free int64); helion (specializes KDA state strides 0-3
+        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
+        #   gating update is stride-safe) on KDA-hybrid models only.
         # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
         #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
         #   int64 strides), with the same KDA-only caveat.

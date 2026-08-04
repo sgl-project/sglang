@@ -41,7 +41,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
         )
 
         constructor.assert_called_once_with(
-            ANY,
+            triton_fallback=ANY,
             enable_decode=True,
             enable_prefill=True,
         )
@@ -57,7 +57,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
         )
 
         constructor.assert_called_once_with(
-            ANY,
+            triton_fallback=ANY,
             enable_decode=True,
             enable_prefill=False,
         )
@@ -72,7 +72,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
         )
 
         constructor.assert_called_once_with(
-            ANY,
+            triton_fallback=ANY,
             enable_decode=False,
             enable_prefill=True,
         )

@@ -56,7 +56,7 @@ class KDAKernelDispatcher:
             )
 
             helion_kernel = HelionKDAKernel(
-                triton_kernel,
+                triton_fallback=triton_kernel,
                 enable_decode=decode_backend.is_helion(),
                 enable_prefill=prefill_backend.is_helion(),
             )

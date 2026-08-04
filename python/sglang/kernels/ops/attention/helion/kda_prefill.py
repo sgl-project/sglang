@@ -24,7 +24,9 @@ SOFTPLUS_THRESHOLD = 20.0
 
 # SGLang initializes torch.distributed, but these kernels have no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
-_SMALL_HEAD_THRESHOLD = 12
+# K3 exposes 12 local heads at TP=8. Lower head counts share the same
+# low-occupancy packed-varlen state-propagation regime.
+_PREFILL_SMALL_HEAD_THRESHOLD = 12
 
 
 _L2_NORM_CONFIG = helion.Config(
@@ -90,6 +92,8 @@ _GATE_FIXED_CONFIG = helion.Config(
 
 # Fixed chunks use arithmetic indexing; varlen chunks load sequence metadata.
 # Their generated kernels have different occupancy and cache-policy optima.
+# Eviction policies are positional in the traced load order. Retune them if
+# the shared gate body gains, loses, or reorders loads.
 _GATE_VARLEN_CONFIG = helion.Config(
     block_sizes=[16],
     # The sixth generated load streams the gate tile once per program.
@@ -961,6 +965,8 @@ _STATE_FIXED_CONFIG = helion.Config(
 )
 
 
+# Eviction policies are positional in the traced load order. Retune both
+# varlen configs if the shared state body gains, loses, or reorders loads.
 _STATE_VARLEN_CONFIG = helion.Config(
     atomic_indexing=[],
     block_sizes=[64],
@@ -1159,6 +1165,15 @@ _chunk_state_varlen_small_head = helion.kernel(
     ignore_warnings=_IGNORED_WARNINGS,
 )(_chunk_state.fn)
 
+
+def _select_state_kernel(*, is_varlen: bool, num_heads: int) -> helion.Kernel:
+    if not is_varlen:
+        return _chunk_state
+    if num_heads <= _PREFILL_SMALL_HEAD_THRESHOLD:
+        return _chunk_state_varlen_small_head
+    return _chunk_state_varlen
+
+
 _OUTPUT_CONFIG = helion.Config(
     block_sizes=[128],
     loop_orders=[[1, 2, 0]],
@@ -1352,12 +1367,7 @@ def chunk_kda(
     else:
         metadata = torch.empty(0, device=q.device, dtype=torch.int32)
         chunk_offsets = torch.empty(0, device=q.device, dtype=torch.long)
-    if is_varlen and q.size(2) <= _SMALL_HEAD_THRESHOLD:
-        state_kernel = _chunk_state_varlen_small_head
-    elif is_varlen:
-        state_kernel = _chunk_state_varlen
-    else:
-        state_kernel = _chunk_state
+    state_kernel = _select_state_kernel(is_varlen=is_varlen, num_heads=q.size(2))
     h, v_new = state_kernel(
         kg,
         w,
