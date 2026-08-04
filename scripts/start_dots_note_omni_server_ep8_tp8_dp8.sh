@@ -13,8 +13,6 @@ MODEL_PATH="${MODEL_PATH:-/diancpfs/user/xiaoke/ckpts/dots/release/dots3_note_om
 SGL_PORT="${SGL_PORT:-8192}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 
-export DOTS_OMNI_ENCODER_REPO="${DOTS_OMNI_ENCODER_REPO:-/cpfs/user/qianwu/mm_encoder_server}"
-
 export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -30,11 +28,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_D
 # single warmup forward, so keep the scheduler watchdog from treating it as a
 # deadlock.  Subsequent launches reuse the compiled kernels.
 export SGLANG_WARMUP_TIMEOUT="${SGLANG_WARMUP_TIMEOUT:-1800}"
-# The audio encoder runs inside SGLang's process now. Its standalone-service
-# CUDA graph pool conflicts with DeepEP/NVSHMEM initialization and must remain
-# disabled; SGLang owns the runtime lifecycle.
-export OMNI_AUDIO_ENABLE_CUDA_GRAPH=0
-
 EXTRA_SERVER_ARGS=()
 if [[ "${DISABLE_RADIX_CACHE:-0}" == "1" ]]; then
   EXTRA_SERVER_ARGS+=(--disable-radix-cache)
