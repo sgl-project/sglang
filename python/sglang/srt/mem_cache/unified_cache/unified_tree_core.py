@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BackupSpec,
     DecSwaLockOnlyResult,
     DemoteResult,
     DriveHostEvictionResult,
@@ -1537,12 +1538,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Build transfers for data not already available in Host."""
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
-        assert device_value is not None
-        if node.backuped:
-            device_value = device_value[:0]
+        base_xfer = None
+        if not node.backuped:
+            device_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert device_value is not None
+            base_xfer = PoolTransfer(
+                name=PoolName.KV,
+                device_indices=device_value,
+            )
 
-        comp_xfers: dict[ComponentType, list] = {}
+        component_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
@@ -1550,8 +1555,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
-                comp_xfers[comp.component_type] = t
-        return device_value, comp_xfers
+                component_xfers[comp.component_type] = t
+        return BackupSpec(
+            base_xfer=base_xfer,
+            component_xfers=component_xfers,
+        )
 
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -1670,21 +1678,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def commit_backup(
         self,
         node_id: NodeId,
-        host_indices: torch.Tensor,
-        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        backup_spec: BackupSpec,
     ) -> None:
         """Commit a successful backup to the node."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        if host_indices.numel() > 0:
-            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        if backup_spec.base_xfer is not None:
+            assert backup_spec.base_xfer.host_indices is not None
             self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
                 node,
                 CacheTransferPhase.BACKUP_HOST,
-                transfers=[kv_xfer],
+                transfers=[backup_spec.base_xfer],
                 cache_actions=cache_actions,
             )
-        for ct, xfers in comp_xfers.items():
+        for ct, xfers in backup_spec.component_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
                 CacheTransferPhase.BACKUP_HOST,

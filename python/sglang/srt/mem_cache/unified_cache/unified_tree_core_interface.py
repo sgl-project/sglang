@@ -82,6 +82,15 @@ class InsertStepResult(msgspec.Struct, frozen=True):
     result: Optional[InsertResult] = None
 
 
+class BackupSpec(msgspec.Struct, frozen=True):
+    base_xfer: Optional[PoolTransfer]
+    component_xfers: dict[ComponentType, list[PoolTransfer]]
+
+    @property
+    def is_empty(self) -> bool:
+        return self.base_xfer is None and not self.component_xfers
+
+
 if TYPE_CHECKING:
     import torch
 
@@ -358,9 +367,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def build_backup_spec(
-        self, node_id: NodeId
-    ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
+    def build_backup_spec(self, node_id: NodeId) -> BackupSpec:
         """Read a node's device->host backup spec (device value + transfers) now."""
         ...
 
@@ -416,8 +423,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     def commit_backup(
         self,
         node_id: NodeId,
-        host_indices: torch.Tensor,
-        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        backup_spec: BackupSpec,
     ) -> None:
         """Commit a successful backup to the node."""
         ...
