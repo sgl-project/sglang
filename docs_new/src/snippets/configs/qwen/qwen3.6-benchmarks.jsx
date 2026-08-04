@@ -4,9 +4,9 @@
 // --warmup-requests 64, --flush-cache), run1 landed. tokens_per_sec_per_gpu =
 // output_throughput / tp * (isl+osl)/osl (tp=1). LL @ conc 1+16, HT @ conc 1024+4096.
 //
-// Coverage: 29/44 measured — B200 (10) @ 0.5.15, H200 (7) + B300 (12) @ 0.5.16. Pending:
-// H100 (8, GPU capacity), Xeon (4, no CPU box), and 2 cells whose config was updated past
-// their last measurement (below). Cells without an entry render "pending".
+// Coverage: 32/44 measured — B200 (10) @ 0.5.15, H200 (7) + B300 (12) @ 0.5.16, H100 (3
+// LL) @ 0.5.16. Pending: H100 (5 — the 4 HT sweeps are impractical on one H100 node, and
+// 35b-a3b bf16 LL OOMs at 80GB), Xeon (4, no CPU box), and 2 config-updated cells (below).
 //
 // 35B-A3B NVFP4 (MoE): on 0.5.16 the plain generator command crashes at CUDA-graph capture
 // (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM runner), so the config carries the fix
@@ -307,6 +307,36 @@ export const benchmarks = [
         ttft_ms: 937, tpot_ms: 3.35, tokens_per_sec_per_gpu: 2227 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
         ttft_ms: 955, tpot_ms: 16.65, tokens_per_sec_per_gpu: 7212 },
+    ],
+  },
+  {
+    match: { hw: "h100", variant: "27b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 770, tpot_ms: 7.41, tokens_per_sec_per_gpu: 1082 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 67026, tpot_ms: 8.76, tokens_per_sec_per_gpu: 1898 },
+    ],
+  },
+  {
+    match: { hw: "h100", variant: "27b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 522, tpot_ms: 5.27, tokens_per_sec_per_gpu: 1562 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 8322, tpot_ms: 11.27, tokens_per_sec_per_gpu: 7001 },
+    ],
+  },
+  {
+    match: { hw: "h100", variant: "35b-a3b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 147, tpot_ms: 2.21, tokens_per_sec_per_gpu: 3982 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 181, tpot_ms: 7.17, tokens_per_sec_per_gpu: 17730 },
     ],
   },
 ];
