@@ -16,7 +16,7 @@ def resolve_chat_encoding_spec(
     tokenizer: Any,
     tool_call_parser: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the chat encoding spec for a model: "dsv4", "dsv32", or None.
+    """Return the chat encoding spec for a model.
 
     None means the default path (HF chat template).
     """
@@ -24,12 +24,22 @@ def resolve_chat_encoding_spec(
         return "dsv4"
     if tool_call_parser == "deepseekv32":
         return "dsv32"
+    if tool_call_parser == "kimi_k3":
+        return "kimi_k3"
 
     architectures = hf_config.architectures
     arch = architectures[0] if architectures else ""
 
     if "DeepseekV4" in arch:
         return "dsv4"
+    if "KimiK3" in arch:
+        return "kimi_k3"
+
+    # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
+    # overlay + negative MM placeholders, so it can't go through apply_chat_template;
+    # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
+    if "InklingForConditionalGeneration" in arch:
+        return "inkling"
 
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
     if "DeepseekV3" in arch and not has_chat_template:
@@ -54,6 +64,16 @@ def encode_simple_chat(
     currently renders to zero tokens, but keeping the insertion explicit ties
     this helper to the serving semantics rather than to that coincidence).
     """
+    if spec == "inkling":
+        from sglang.srt.parser.inkling_renderer import render_inkling_messages
+        from sglang.srt.parser.inkling_tokenizer import InklingTokenizer
+
+        return render_inkling_messages(
+            messages,
+            InklingTokenizer(tokenizer=tokenizer),
+            add_generation_prompt=False,
+        )
+
     if spec in ("dsv4", "dsv32"):
         if messages and messages[0]["role"] != "system":
             messages = [{"role": "system", "content": ""}] + list(messages)

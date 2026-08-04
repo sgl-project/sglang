@@ -1,8 +1,8 @@
 # Copied and adapted from: mossVG/mova/diffusion/models/wan_audio_dit.py
 # SPDX-License-Identifier: Apache-2.0
 #
-# NOTE: This module reuses common functions from mova_video_dit.py to reduce code duplication.
-# Audio-specific functions (precompute_freqs_cis_1d, legacy_precompute_freqs_cis_1d) are kept here.
+# NOTE: This module reuses common functions from mova_video_dit.py to reduce
+# code duplication. Audio-specific precompute_freqs_cis_1d is kept here.
 
 import math
 from typing import Any, Optional, Tuple

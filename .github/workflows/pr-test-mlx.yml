@@ -43,12 +43,14 @@ jobs:
           base: main
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(aot)/**/!(*.md)"
               - "python/pyproject_other.toml"
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-mlx.yml"
             sgl_kernel:
-              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+              - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-mlx.yml"
 
   # ==================== PR Gate ==================== #

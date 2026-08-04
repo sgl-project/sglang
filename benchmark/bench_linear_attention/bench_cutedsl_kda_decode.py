@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 import torch
 import triton
 
-from sglang.jit_kernel.cutedsl_kda import cutedsl_fused_sigmoid_gating_kda_update
+from sglang.kernels.ops.attention.cutedsl_kda import (
+    cutedsl_fused_sigmoid_gating_kda_update,
+)
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
