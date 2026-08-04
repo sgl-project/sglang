@@ -341,6 +341,10 @@ class TestPrefetchDispatch(CustomTestCase):
                 ),
             ),
             patch(
+                "sglang.srt.model_loader.loader.get_model",
+                return_value=self._server_args(prefetch, disable_mmap, drop_cache),
+            ),
+            patch(
                 "sglang.srt.model_loader.loader."
                 "buffered_multi_thread_safetensors_weights_iterator",
                 return_value=iter([]),
@@ -356,12 +360,13 @@ class TestPrefetchDispatch(CustomTestCase):
         """Prefetch on + no explicit multithread config -> single-threaded,
         and the opt-out warning fires once."""
         loader = self._make_loader({})
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -375,12 +380,13 @@ class TestPrefetchDispatch(CustomTestCase):
         """Explicit enable_multithread_load=true is the escape hatch; the
         override and its warning must not fire."""
         loader = self._make_loader({"enable_multithread_load": True})
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -395,12 +401,13 @@ class TestPrefetchDispatch(CustomTestCase):
         default) also signals multi-thread intent, so the override must not
         fire and num_threads stays live."""
         loader = self._make_loader({"num_threads": 64})
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -416,12 +423,13 @@ class TestPrefetchDispatch(CustomTestCase):
         """Prefetch off -> multi-threaded iterator is used (default), no
         override warning."""
         loader = self._make_loader({})
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=False
         )
         with (
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -435,12 +443,13 @@ class TestPrefetchDispatch(CustomTestCase):
         """Prefetch is a no-op without mmap, so the override and its warning
         must not fire."""
         loader = self._make_loader({})
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True, disable_mmap=True
         )
         with (
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -454,7 +463,7 @@ class TestPrefetchDispatch(CustomTestCase):
         """FASTSAFETENSORS ignores both flags; override + warning must not
         fire."""
         loader = self._make_loader({}, load_format=LoadFormat.FASTSAFETENSORS)
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -464,6 +473,7 @@ class TestPrefetchDispatch(CustomTestCase):
             ) as mock_fast,
             p_prep,
             p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -482,7 +492,7 @@ class TestPrefetchDispatch(CustomTestCase):
         loader = self._make_loader(
             {"enable_gds": False}, load_format=LoadFormat.FASTSAFETENSORS
         )
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=False,
             drop_cache=True,
         )
@@ -493,6 +503,7 @@ class TestPrefetchDispatch(CustomTestCase):
             ) as mock_fast,
             p_prep,
             p_args,
+            p_model,
             p_buffered,
             p_single,
             p_warn,

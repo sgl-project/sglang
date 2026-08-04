@@ -226,11 +226,29 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class DsparkFoldedSampling(IntEnum):
+    """Sampling support in the graph-folded DSpark draft proposal: OFF =
+    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
+    FORCE = always."""
+
+    OFF = 0
+    AUTO = 1
+    FORCE = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
+
+    # Per-role config-namespace bookkeeping: off / record / enforce (value is
+    # validated fail-loud in runtime_context, which resolves it once at import
+    # so the read stays dynamo-prunable).
+    SGLANG_ROLE_NAMESPACES = EnvStr("off")
+    # record mode: append each newly observed (role, namespace) pair to this
+    # file so the audit survives signal-killed workers.
+    SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
@@ -318,6 +336,7 @@ class Envs:
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
+    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
@@ -661,6 +680,9 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
+    # ABI headers + overlay/). Unset means the path is unavailable, not empty.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1084,6 +1106,9 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Copy rank-local MoE slices into independent CPU storage before H2D when
+    # they reference a larger mmap-backed checkpoint storage.
+    SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
@@ -1153,6 +1178,10 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
+    # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
+    # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
+    SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
@@ -1257,6 +1286,13 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+    # ===================================================================
+    # Rust Server specific envs.
+    # ===================================================================
+    SGLANG_RUST_SERVER = EnvBool(False)
+    # Most batched requests one /generate HTTP call may expand into.
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
 
 envs = Envs()

@@ -71,6 +71,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
+    get_exec,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -91,6 +92,34 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Log the deferred-finalize config at most once per process (rank). Different MoE
+# layers can resolve to different quant methods, so print_info_once (keyed on the
+# full message) would otherwise fire once per distinct quant method.
+_deferred_finalize_info_logged = False
+
+
+def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Copy a CPU tensor view into independent contiguous storage."""
+    if loaded_weight.device.type != "cpu":
+        return loaded_weight
+    tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
+    needs_copy = not (
+        loaded_weight.is_contiguous()
+        and loaded_weight.storage_offset() == 0
+        and loaded_weight.untyped_storage().nbytes() == tensor_bytes
+    )
+    if not needs_copy:
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)
+
+
+def _maybe_copy_weight_view_before_h2d(
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
+        return loaded_weight
+    return _copy_weight_view_before_h2d(loaded_weight)
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -259,12 +288,11 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        server_args = get_server_args()
-        if server_args.ep_join_mode == "scale":
-            storage_ep_size = server_args.elastic_ep_initial_size
+        if get_exec().moe.ep_join_mode == "scale":
+            storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                server_args.ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
@@ -356,12 +384,15 @@ class FusedMoE(torch.nn.Module):
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )
-        print_info_once(
-            "FlashInfer TRTLLM MoE deferred finalize is "
-            f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-            f"(moe_runner_backend={server_args.moe_runner_backend}, "
-            f"quant_method={type(self.quant_method).__name__})."
-        )
+        global _deferred_finalize_info_logged
+        if not _deferred_finalize_info_logged:
+            _deferred_finalize_info_logged = True
+            logging.getLogger(__name__).info(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
 
         self.quant_method.create_weights(
             layer=self,
@@ -559,6 +590,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -631,6 +663,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -701,6 +734,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+        loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
