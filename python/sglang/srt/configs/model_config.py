@@ -855,12 +855,9 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
-            # Handle rope scaling
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
-            rope_scaling = self.hf_text_config.rope_scaling
-            if rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
+            # Handle rope scaling. In transformers v5, rope_scaling is just
+            # rope_parameters for backward compatibility.
+            self._init_mla_scaling(self.hf_text_config.rope_scaling)
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
@@ -874,11 +871,7 @@ class ModelConfig:
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (
@@ -921,9 +914,7 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if getattr(tc, "rope_scaling", None):
-                self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
+            self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -935,11 +926,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
@@ -949,11 +936,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1029,6 +1012,12 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+
+    def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
+        """Base MLA attention scale from the head dims, then the rope mscale."""
+        self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        if rope_scaling:
+            self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
