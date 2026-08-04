@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-umbp",
     nightly=True,
 )
 

@@ -1164,6 +1164,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
@@ -1226,6 +1227,17 @@ jobs:
             -e MC_LOG_LEVEL=TRACE \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Run DeepSeek-V4 HiCache UMBP E2E
+        if: ${{ always() && !cancelled() }}
+        timeout-minutes: 120
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e MC_LOG_LEVEL=TRACE \
+            -e GLOG_logtostderr=1 \
+            -w "/sglang-checkout/test" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-umbp --nightly --timeout-per-file 6000 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
   # On the 6h ('0 */6 * * *') cron these are the only jobs that run; they also
