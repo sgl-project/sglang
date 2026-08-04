@@ -1,10 +1,11 @@
 """Numerics for the NVFP4 dense-linear GEMM backends (--fp4-gemm-backend).
 
-Runs ModelOptFp4LinearMethod end to end (create_weights ->
-process_weights_after_loading -> apply) for each SM100 backend choice and
+Runs the real linear layer path (ColumnParallelLinear -> weight_loader ->
+process_weights_after_loading -> forward) for each SM100 backend choice and
 checks the output against a dequantized-reference matmul. This covers both
 the per-backend weight preparation (padding / interleave / TRTLLM shuffle)
-and the GEMM kernel dispatch.
+and the GEMM kernel dispatch; a MergedColumnParallelLinear case guards the
+per-partition scale gathering of fused gate_up / QKV layers.
 """
 
 import unittest
@@ -15,10 +16,7 @@ from flashinfer import fp4_quantize
 
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp4LinearMethod,
-)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,13 +36,6 @@ SHAPES = [
     (64, 256, 512),
     (5, 160, 336),
     (128, 1024, 1024),
-]
-
-BACKENDS = [
-    "flashinfer_cutedsl",
-    "flashinfer_cutlass",
-    "flashinfer_cudnn",
-    "flashinfer_trtllm",
 ]
 
 
@@ -88,48 +79,142 @@ def dequantize_nvfp4_to_dtype(
     return out.to(dtype=dtype)
 
 
-def _make_quantized_layer(n: int, k: int, device: str = "cuda"):
-    """Build a linear layer holding NVFP4 checkpoint-format weights; returns
-    (method, layer, w_dequant) with w_dequant the fp32 quant->dequant reference."""
+def _init_single_process_dist():
+    import os
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29632")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+
+    if not torch.distributed.is_initialized():
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend="gloo",
+        )
+
+
+def _quantize_shard(w: torch.Tensor, gs=None):
+    """NVFP4-quantize one checkpoint shard; returns (packed, linear sf,
+    global scale, fp32 dequant reference)."""
+    n, k = w.shape
+    if gs is None:
+        gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w.abs().max().to(torch.float32)
+    w_q, w_sf_swizzled = fp4_quantize(w, gs)
+    sf_linear = convert_swizzled_to_linear(
+        w_sf_swizzled.view(torch.float8_e4m3fn), n, k, 16
+    )
+    w_dequant = dequantize_nvfp4_to_dtype(
+        w_q, w_sf_swizzled, gs, torch.float32, w.device
+    )
+    return w_q, sf_linear, gs, w_dequant
+
+
+ACT_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+
+
+def _make_quantized_layer(n: int, k: int):
+    """ColumnParallelLinear with NVFP4 checkpoint-format weights fed through
+    the real weight_loader; returns (layer, w_dequant)."""
+    from sglang.srt.layers.linear import ColumnParallelLinear
+
     quant_config = ModelOptFp4Config(
         is_checkpoint_nvfp4_serialized=True,
         group_size=16,
         use_per_token_activation=False,
+        packed_modules_mapping={},
     )
-    method = ModelOptFp4LinearMethod(quant_config)
-    layer = torch.nn.Module()
-    method.create_weights(
-        layer,
-        input_size_per_partition=k,
-        output_partition_sizes=[n],
+    layer = ColumnParallelLinear(
         input_size=k,
         output_size=n,
+        bias=False,
         params_dtype=torch.bfloat16,
-        weight_loader=lambda *args, **kwargs: None,
-    )
-    layer = layer.to(device)
+        quant_config=quant_config,
+        prefix="model.layers.0.mlp.up_proj",
+        tp_rank=0,
+        tp_size=1,
+    ).cuda()
 
-    w = torch.randn((n, k), device=device, dtype=torch.bfloat16) / 10
-    w_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w.abs().max().to(torch.float32)
-    w_q, w_sf_swizzled = fp4_quantize(w, w_gs)
-    w_sf_linear = convert_swizzled_to_linear(
-        w_sf_swizzled.view(torch.float8_e4m3fn), n, k, 16
-    )
-    w_dequant = dequantize_nvfp4_to_dtype(
-        w_q, w_sf_swizzled, w_gs, torch.float32, device
-    )
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+    w_q, sf_linear, gs, w_dequant = _quantize_shard(w)
+    for name, loaded in (
+        ("weight", w_q),
+        ("weight_scale", sf_linear),
+        ("weight_scale_2", (1.0 / gs).clone()),
+        # Calibrated activation amax stand-in (inputs are randn/10).
+        ("input_scale", torch.tensor(ACT_SCALE, device="cuda")),
+    ):
+        layer.weight_loader_v2(getattr(layer, name), loaded)
+    return layer, w_dequant
 
-    layer.weight.data.copy_(w_q)
-    layer.weight_scale.data.copy_(w_sf_linear)
-    layer.weight_scale_2.data.fill_(1.0 / w_gs)
-    # Calibrated activation amax stand-in (inputs are randn/10).
-    layer.input_scale.data.fill_(1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX))
-    return method, layer, w_dequant
+
+def _make_merged_layer(n_half: int, k: int):
+    """MergedColumnParallelLinear (two fused output shards, e.g. gate_up_proj)
+    loaded per shard with distinct global scales; exercises the per-partition
+    scale_2 / input_scale gathering that fused-QKV regressions hit."""
+    from sglang.srt.layers.linear import MergedColumnParallelLinear
+
+    quant_config = ModelOptFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        group_size=16,
+        use_per_token_activation=False,
+        packed_modules_mapping={"gate_up_proj": ["gate_proj", "up_proj"]},
+    )
+    layer = MergedColumnParallelLinear(
+        input_size=k,
+        output_sizes=[n_half, n_half],
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        prefix="model.layers.0.mlp.gate_up_proj",
+        tp_rank=0,
+        tp_size=1,
+    ).cuda()
+
+    # process_weights_after_loading collapses per-shard weight_scale_2 with
+    # max() and does not requant block scales, so unequal shard scales are a
+    # known accuracy hazard; modelopt fused exports ship equal scale_2 and the
+    # fixture mirrors that.
+    shards = [
+        torch.randn((n_half, k), device="cuda", dtype=torch.bfloat16) / 10
+        for _ in (0, 1)
+    ]
+    shared_gs = (
+        FLOAT8_E4M3_MAX
+        * FLOAT4_E2M1_MAX
+        / max(w.abs().max().to(torch.float32) for w in shards)
+    )
+    dequants = []
+    for shard_id, w in enumerate(shards):
+        w_q, sf_linear, gs, w_dequant = _quantize_shard(w, gs=shared_gs)
+        for name, loaded in (
+            ("weight", w_q),
+            ("weight_scale", sf_linear),
+            ("weight_scale_2", (1.0 / gs).clone()),
+            ("input_scale", torch.tensor(ACT_SCALE, device="cuda")),
+        ):
+            layer.weight_loader_v2(getattr(layer, name), loaded, shard_id)
+        dequants.append(w_dequant)
+    return layer, torch.cat(dequants, dim=0)
 
 
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 dense GEMM backends require SM100+")
 class TestNvFp4LinearBackends(CustomTestCase):
-    def _run_backend(self, backend: str):
+    @classmethod
+    def setUpClass(cls):
+        _init_single_process_dist()
+
+    def _run_backend(self, backend: str, build_layer=_make_quantized_layer):
         torch.manual_seed(7)
         for m, n, k in SHAPES:
             with self.subTest(backend=backend, shape=(m, n, k)):
@@ -138,25 +223,37 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     "FP4_GEMM_RUNNER_BACKEND",
                     Fp4GemmRunnerBackend(backend),
                 ):
-                    method, layer, w_dequant = _make_quantized_layer(n, k)
-                    method.process_weights_after_loading(layer)
+                    layer, w_dequant = build_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
 
                     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
-                    out = method.apply(layer, x)
+                    out, _ = layer(x)
+                    self._assert_matches(layer, x, out, w_dequant)
 
-                    x_gs = layer.input_scale_inv.data.float()
-                    x_q, x_sf = fp4_quantize(x, x_gs)
-                    x_dequant = dequantize_nvfp4_to_dtype(
-                        x_q, x_sf, x_gs, torch.float32, x.device
-                    )
-                    ref = x_dequant @ w_dequant.T
+    def _assert_matches(self, layer, x, out, w_dequant):
+        x_gs = layer.input_scale_inv.data.float()
+        x_q, x_sf = fp4_quantize(x, x_gs)
+        x_dequant = dequantize_nvfp4_to_dtype(x_q, x_sf, x_gs, torch.float32, x.device)
+        ref = x_dequant @ w_dequant.T
+        self.assertEqual(tuple(out.shape), tuple(ref.shape))
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), ref.flatten(), dim=0
+        ).item()
+        self.assertGreater(cos, 0.99)
+        torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
 
-                    self.assertEqual(out.shape, (m, n))
-                    cos = torch.nn.functional.cosine_similarity(
-                        out.float().flatten(), ref.flatten(), dim=0
-                    ).item()
-                    self.assertGreater(cos, 0.99)
-                    torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=5e-2)
+    def test_merged_shards(self):
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp4_utils,
+            "FP4_GEMM_RUNNER_BACKEND",
+            Fp4GemmRunnerBackend("flashinfer_cutedsl"),
+        ):
+            layer, w_dequant = _make_merged_layer(256, 512)
+            layer.quant_method.process_weights_after_loading(layer)
+            x = torch.randn((16, 512), device="cuda", dtype=torch.bfloat16) / 10
+            out, _ = layer(x)
+            self._assert_matches(layer, x, out, w_dequant)
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")

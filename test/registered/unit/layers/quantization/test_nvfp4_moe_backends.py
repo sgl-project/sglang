@@ -94,7 +94,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         from flashinfer import fp4_quantize
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
         torch.manual_seed(7)
         quant_config = ModelOptFp4Config(
@@ -161,18 +161,15 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
             x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda") / 10
             router_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
-            weights = torch.softmax(router_logits, dim=-1)
-            topk_weights, topk_ids = torch.topk(weights, TOPK, dim=-1)
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-            out = layer.forward(
-                x,
-                StandardTopKOutput(
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids.to(torch.int32),
-                    router_logits=router_logits,
-                ),
+            # Route through the real topk compute path, not a hand-rolled one.
+            topk_output = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
             )
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+            out = layer.forward(x, topk_output)
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
