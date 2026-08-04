@@ -35,14 +35,15 @@ Any other architecture or CUDA major fails before dependency installation.
 ## Build Flow
 
 1. Validate `git`, the selected Python interpreter, pip, CUDA, and PyTorch.
-2. Remove an installed `deep_ep` distribution and old `/opt/gdrcopy` and
-   temporary DeepEP source directories. Do not remove PyTorch or SGLang.
-3. Install the system, RDMA, compiler, and packaging dependencies derived from
+2. Create a unique temporary source directory and clone the selected DeepEP
+   branch. The directory created by this run is removed on exit.
+3. Uninstall an existing `deep_ep` distribution, then install the Python build
+   dependencies. Do not remove PyTorch or SGLang.
+4. Install the system, RDMA, and compiler dependencies derived from
    `scripts/ci/cuda/ci_install_deepep.sh`.
-4. Build and install GDRCopy v2.5.1 Debian packages, then ensure the unversioned
-   `libmlx5.so` link and `libfabric-dev` are available.
-5. Clone `https://github.com/sgl-project/DeepEP.git` at the selected branch into
-   a temporary directory.
+5. Replace `/opt/gdrcopy`, build and install GDRCopy v2.5.1 Debian packages,
+   then ensure the unversioned `libmlx5.so` link and `libfabric-dev` are
+   available. Existing dpkg packages are upgraded in place.
 6. For CUDA 13, append `${CUDA_HOME}/include/cccl` to the traditional DeepEP
    extension's `include_dirs` in `setup.py`; fail if the expected insertion
    point or CCCL directory is absent.
@@ -50,8 +51,10 @@ Any other architecture or CUDA major fails before dependency installation.
    `TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3'` and `MAX_JOBS`.
 8. Verify exactly one `deep_ep-*.whl` was produced and print its absolute path.
 
-The cloned source is removed on exit. Installed system dependencies and GDRCopy
-remain available because they are runtime prerequisites.
+The cloned source directory created by the current run is removed on normal or
+error exit. Installed system dependencies and GDRCopy remain available because
+they are runtime prerequisites; abandoned directories from a forcibly killed
+older process are not scanned or removed.
 
 ## Error Handling and Repeatability
 

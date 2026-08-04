@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts" / "build_sgl_deepep.sh"
 
 
@@ -86,6 +91,22 @@ def test_parse_cuda_major_rejects_unsupported_or_malformed_version():
     assert "Unsupported CUDA toolkit" in unsupported.stderr
     assert malformed.returncode != 0
     assert "Could not parse CUDA toolkit version" in malformed.stderr
+
+
+def test_resolve_cuda_home_from_nvcc_follows_symlink(tmp_path: Path):
+    cuda_home = tmp_path / "cuda"
+    nvcc = cuda_home / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    write_executable(nvcc, "exit 0\n")
+    path_bin = tmp_path / "path-bin"
+    path_bin.mkdir()
+    nvcc_link = path_bin / "nvcc"
+    nvcc_link.symlink_to(nvcc)
+
+    result = call_bash_function("resolve_cuda_home_from_nvcc", str(nvcc_link))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(cuda_home)
 
 
 def test_patch_cuda13_cccl_adds_include_once(tmp_path: Path):
@@ -315,6 +336,26 @@ def test_install_python_dependencies_uses_selected_python(tmp_path: Path):
     assert python_log.read_text().strip() == "-m pip install setuptools wheel ninja"
 
 
+def test_remove_existing_deepep_propagates_uninstall_failure(tmp_path: Path):
+    fake_python = tmp_path / "python"
+    write_executable(fake_python, "exit 37\n")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; PYTHON_BIN="$2"; remove_existing_deepep',
+            "bash",
+            str(SCRIPT),
+            str(fake_python),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 37
+
+
 def test_cli_rejects_more_than_one_output_directory():
     result = subprocess.run(
         ["bash", str(SCRIPT), "first-output", "second-output"],
@@ -358,3 +399,7 @@ def test_build_and_report_ends_with_only_the_wheel_path(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     wheel = next(output_dir.glob("deep_ep-*.whl"))
     assert result.stdout.splitlines()[-1] == f"DeepEP wheel: {wheel}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

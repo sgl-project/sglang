@@ -26,7 +26,7 @@
 ### Task 1: Platform and CUDA source helpers
 
 **Files:**
-- Create: `test/srt/test_build_sgl_deepep_script.py`
+- Create: `test/registered/unit/test_build_sgl_deepep_script.py`
 - Create: `scripts/build_sgl_deepep.sh`
 
 **Interfaces:**
@@ -58,7 +58,7 @@ Also test unsupported architecture/CUDA, CUDA release strings for 12.9 and
 
 - [ ] **Step 2: Run tests and verify RED**
 
-Run: `python3 -m pytest -q test/srt/test_build_sgl_deepep_script.py`
+Run: `python3 -m pytest -q test/registered/unit/test_build_sgl_deepep_script.py`
 
 Expected: FAIL because `scripts/build_sgl_deepep.sh` or its functions do not exist.
 
@@ -77,14 +77,14 @@ fails explicitly rather than silently producing an invalid CUDA 13 build.
 
 - [ ] **Step 4: Run tests and verify GREEN**
 
-Run: `python3 -m pytest -q test/srt/test_build_sgl_deepep_script.py`
+Run: `python3 -m pytest -q test/registered/unit/test_build_sgl_deepep_script.py`
 
 Expected: all helper tests pass.
 
 ### Task 2: Dependency installation and wheel orchestration
 
 **Files:**
-- Modify: `test/srt/test_build_sgl_deepep_script.py`
+- Modify: `test/registered/unit/test_build_sgl_deepep_script.py`
 - Modify: `scripts/build_sgl_deepep.sh`
 
 **Interfaces:**
@@ -107,7 +107,7 @@ CUDA devboxes instead of asserting calls made to fake package managers.
 
 - [ ] **Step 2: Run tests and verify RED**
 
-Run: `python3 -m pytest -q test/srt/test_build_sgl_deepep_script.py`
+Run: `python3 -m pytest -q test/registered/unit/test_build_sgl_deepep_script.py`
 
 Expected: the new orchestration tests fail because the functions are absent.
 
@@ -132,7 +132,7 @@ Run:
 
 ```bash
 bash -n scripts/build_sgl_deepep.sh
-python3 -m pytest -q test/srt/test_build_sgl_deepep_script.py
+python3 -m pytest -q test/registered/unit/test_build_sgl_deepep_script.py
 git diff --check
 ```
 

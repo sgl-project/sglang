@@ -56,6 +56,32 @@ parse_cuda_major() {
 }
 
 
+resolve_cuda_home_from_nvcc() {
+    local nvcc_path="$1"
+    local real_nvcc
+    local nvcc_dir
+    local cuda_home
+
+    real_nvcc="$(readlink -f "${nvcc_path}")" || {
+        echo "Could not resolve nvcc path: ${nvcc_path}" >&2
+        return 1
+    }
+    if [[ ! -x "${real_nvcc}" ]]; then
+        echo "Resolved nvcc is not executable: ${real_nvcc}" >&2
+        return 1
+    fi
+
+    nvcc_dir="$(cd "$(dirname "${real_nvcc}")" && pwd -P)"
+    cuda_home="$(cd "${nvcc_dir}/.." && pwd -P)"
+    if [[ ! -x "${cuda_home}/bin/nvcc" ]]; then
+        echo "Could not derive a CUDA toolkit root from nvcc: ${nvcc_path}" >&2
+        return 1
+    fi
+
+    echo "${cuda_home}"
+}
+
+
 patch_cuda13_cccl() {
     local setup_py="$1"
     local cuda_home="$2"
@@ -214,6 +240,11 @@ install_python_dependencies() {
 }
 
 
+remove_existing_deepep() {
+    "${PYTHON_BIN}" -m pip uninstall -y deep_ep
+}
+
+
 install_gdrcopy() {
     local gdrcopy_dir="/opt/gdrcopy"
     local arch="$1"
@@ -300,6 +331,8 @@ main() {
         nvcc_bin="${CUDA_HOME}/bin/nvcc"
     elif command -v nvcc >/dev/null 2>&1; then
         nvcc_bin="$(command -v nvcc)"
+        CUDA_HOME="$(resolve_cuda_home_from_nvcc "${nvcc_bin}")"
+        nvcc_bin="${CUDA_HOME}/bin/nvcc"
     else
         echo "nvcc not found under CUDA_HOME=${CUDA_HOME} or PATH" >&2
         return 1
@@ -357,7 +390,7 @@ main() {
         "${DEEPEP_REPO}" "${deepep_dir}"
 
     echo "--- Removing an existing DeepEP installation ---"
-    "${PYTHON_BIN}" -m pip uninstall -y deep_ep || true
+    remove_existing_deepep
 
     echo "--- Installing Python build dependencies ---"
     install_python_dependencies
