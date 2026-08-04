@@ -995,16 +995,11 @@ class Scheduler(
             and get_exec().moe.ep_join_mode == "recover"
             and not self.server_args.is_ep_offset_joiner
         ):
-            # Only plain fault-recovery joiners (offset=0) need the deferred
-            # post-cuda-graph rejoin. Grow-into-retired-slot joiners
-            # (recover mode, offset > 0) have already completed the
-            # equivalent rejoin + metadata broadcast eagerly in
-            # ``ModelRunner.__init__`` because their metadata must be
-            # available BEFORE the model loads. Calling this again would
-            # re-issue ``_join_world_group``/``_refresh_ep_members`` on a
-            # Mooncake WORLD that already sees this rank as active, and
-            # would also reset ``ElasticEPStateManager`` back out of
-            # ``serving_expanded`` immediately after ``__init__`` set it.
+            # Only plain fault-recovery joiners (offset=0) need the
+            # deferred post-cuda-graph rejoin. Grow-into-retired-slot
+            # joiners already did the rejoin eagerly in
+            # ModelRunner.__init__; calling this again would re-issue
+            # collectives on WORLD and revert scale_phase.
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
@@ -2936,37 +2931,13 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        # Elastic EP scale-down admission gate: while the FSM is between
-        # FLIP_MASK and RECONFIG/EXIT, refuse to hand a new batch to
-        # ``run_batch``. Otherwise, a batch can slip in between the
-        # per-tick FSM stages -- e.g. between the survivor's FLIP_MASK
-        # (which flips ``active_ranks[retiree]=0`` and marks phase
-        # ``retiring``) and the survivor's RECONFIG (which updates the
-        # model's ``num_physical_experts`` to ``K * num_local_experts``).
-        # That mid-transition batch then runs with the model's stale
-        # ``num_physical_experts`` (from the old N-rank layout) fed
-        # into a NIXL kernel sized for the new K-rank layout, tripping
-        # the device-side kernel assertion
-        # ``dst_expert_idx < active_expert_bound`` at
-        # ``nixl_ep_ll.cu:178`` and taking down the whole cohort with
-        # ``cudaErrorLaunchFailure``. The race between the
-        # ``_dispatch_ep_size`` N->K flip in ``_pre_nixl_retire`` and
-        # the ``mark_retiring`` gate close is closed by folding
-        # ``mark_retiring`` into the same FSM tick body as the NIXL
-        # retire barrier consume + ``_pre_nixl_retire`` (see
-        # :meth:`ScaleDownStateMachine._tick_survivor`), so no
-        # scheduler event-loop iter runs between the flip and the
-        # gate close. This ``retiring`` / ``reconfiguring`` gate is
-        # deliberately narrow -- the ``draining`` phase stays
-        # ungated so the cohort-wide ``mlp_sync`` all-gather is
-        # never starved.
-        #
-        # Returning a plan with ``batch_to_run=None`` drops the
-        # scheduler into ``on_idle``, which is exactly where
-        # ``ModelRunner.maybe_retire_ep_ranks`` ticks the FSM forward.
-        # The gate opens again once the FSM leaves the transition band
-        # (survivor: COMPLETE -> ``serving_shrunk``, retiree: EXIT ends
-        # the process).
+        # Scale-down admission gate: block batches while the FSM is
+        # between FLIP_MASK and RECONFIG/EXIT, otherwise a batch may
+        # run with stale num_physical_experts against a resized NIXL
+        # kernel (nixl_ep_ll.cu:178 assertion, cudaErrorLaunchFailure).
+        # Narrow gate: draining stays open so mlp_sync isn't starved.
+        # Returning batch_to_run=None sinks us into on_idle where the
+        # FSM ticks forward.
         if self._elastic_scale_down_in_transition():
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self.process_pending_chunked_abort()
@@ -3967,49 +3938,14 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def _elastic_scale_down_in_transition(self) -> bool:
-        """Return True while the shrink FSM is inside the FLIP_MASK ->
-        RECONFIG window, where the model config is inconsistent with
-        NIXL's peer-connection state (see :meth:`get_next_batch_to_run`
-        for the ``nixl_ep_ll.cu:178`` failure mode this closes).
+        """True while the shrink FSM is in FLIP_MASK -> RECONFIG (model
+        config inconsistent with NIXL peer state).
 
-        Gate the ``retiring`` and ``reconfiguring`` phases only:
-
-        * ``retiring`` is set by :func:`_ScaleDownDriver.on_flip_mask`
-          after ``try_retire_ranks`` has flipped ``active_ranks`` and
-          NIXL is settled on ``dispatch_ep=K``. Model config still
-          reports the pre-shrink ``num_physical_experts`` at this
-          point. The race between the ``_dispatch_ep_size`` N->K
-          flip in ``_pre_nixl_retire`` and the ``mark_retiring``
-          gate close is closed by folding FLIP_MASK's body into the
-          same FSM tick as the NIXL retire barrier consume +
-          ``_pre_nixl_retire`` (see
-          :meth:`ScaleDownStateMachine._tick_survivor`), so a raced
-          ``get_next_batch_to_run`` cannot admit a batch with
-          N-rank ``topk_ids`` while NIXL is already K-rank.
-        * ``reconfiguring`` is set by :func:`_ScaleDownDriver.on_reconfig`
-          just before it kicks the global broadcast + on_scale that
-          rewrites ``num_physical_experts`` to ``K * num_local_experts``.
-
-        ``draining`` is deliberately NOT gated. It is a single-tick
-        transient (``_is_scale_down_drained`` returns True
-        unconditionally, so the FSM leaves DRAIN on the very next tick
-        after posting the retire barrier); more importantly, during
-        DRAIN the ``active_ranks`` mask has not flipped yet AND NIXL's
-        ``_dispatch_ep_size`` is still ``N``, so a batch that runs here
-        executes with the pre-shrink layout consistently across NIXL
-        and the model config -- safe. Gating DRAIN starves the
-        tp_cpu_group ``mlp_sync`` all-gather that lagging ranks (which
-        received the scale request one event-loop iteration late) are
-        still waiting on, wedging the whole cohort behind an unpaired
-        collective. See MC02A + NIXL a2a stress hangs (~14072948
-        20260716 111014 / 110223). A wider ``"nixl_retiring"`` gate
-        would trigger the same shape (closing on a subset of ranks
-        ahead of the others, starving ``mlp_sync``); folding
-        FLIP_MASK into NIXL_RETIRE consume avoids the wider gate.
-
-        ``idle`` / ``pending`` / ``serving_shrunk`` / ``failed`` and
-        every grow-side phase are safe for ``run_batch``.
-        """
+        Gates only retiring / reconfiguring. draining stays open: DRAIN
+        has neither flipped active_ranks nor _dispatch_ep_size, so
+        batches there are safe, and closing it would starve mlp_sync
+        on lagging ranks. idle / pending / serving_shrunk / failed and
+        all grow-side phases are also safe."""
         if self.server_args.elastic_ep_backend is None:
             return False
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -4024,33 +3960,16 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        # Scale-down: retirees may reach the retire barrier while idle
-        # (no in-flight batch keeps them in the forward-pass hook). Poke
-        # the retire handler on every idle tick so shrink can complete
-        # even when the retiree has nothing to drain.
-        #
-        # Ticked BEFORE the ``is_fully_idle`` guard because the
-        # scale-down admission gate in :meth:`get_next_batch_to_run`
-        # holds requests in ``waiting_queue`` during the transition,
-        # and ``is_fully_idle`` returns False as long as that queue is
-        # non-empty. Without this pre-guard tick the FSM stalls at
-        # DRAIN under sustained concurrent traffic (MC07 reproducer):
-        # no ``get_next_batch_to_run`` -> no ``run_batch`` -> no
-        # ``on_idle`` FSM tick -> ``waiting_queue`` grows without bound
-        # -> ``is_fully_idle`` never returns True -> deadlock and the
-        # test times out on ``serving_shrunk``.
+        # Tick the shrink FSM BEFORE is_fully_idle: the admission gate
+        # holds requests in waiting_queue during the transition, so
+        # is_fully_idle would never return True (MC07 stall).
         if self.server_args.elastic_ep_backend is not None:
             model_runner = getattr(self.tp_worker, "model_runner", None)
             if model_runner is not None:
                 model_runner.maybe_retire_ep_ranks()
-                # Flush the completion notification (if any) even when
-                # the scheduler stays idle after finalize. Without this
-                # flush the tokenizer's admission gate (which pauses
-                # /generate during a shrink) would deadlock: no
-                # /generate means no forward pass, and the pending
-                # ElasticScaleUpdateReq is normally only pushed from
-                # ``_maybe_report_active_ranks`` which runs after a
-                # forward pass. Symmetric with the busy-path flush.
+                # Flush completion notif from idle too; the tokenizer
+                # admission gate would otherwise deadlock (no forward
+                # pass while /generate is paused).
                 pending = getattr(
                     model_runner, "_pending_elastic_scale_update", None
                 )
@@ -4707,19 +4626,12 @@ class Scheduler(
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
-        """Begin a pending elastic EP scale-up OR scale-down request.
+        """Begin a pending elastic EP grow OR shrink.
 
-        Grow direction (``new_ep_size > old_ep_size``): joins pre-bound
-        slots via :func:`try_admit_scale_ranks`. Handled by the existing
-        per-tick :func:`ModelRunner.maybe_join_ep_ranks`.
-
-        Shrink direction (``new_ep_size < old_ep_size``): retires the
-        highest-numbered ranks. Handled by
-        :func:`ModelRunner.maybe_retire_ep_ranks`. Requires
-        ``--elastic-ep-backend mooncake`` -- the retirement mask is a
-        Mooncake ``active_ranks`` primitive; the NIXL backend has no
-        symmetric mechanism and stays on the append-only scale-up path.
-        """
+        Grow: try_admit_scale_ranks (append) or try_recover_ranks
+        (refill retired slot); handled by maybe_join_ep_ranks.
+        Shrink: retire highest-numbered ranks; handled by
+        maybe_retire_ep_ranks. Requires --elastic-ep-backend mooncake."""
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
@@ -4775,9 +4687,8 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
-        # Reject shrinks that would leave some logical expert with zero
-        # physical replicas -- EPLB rebalance divides by num_replicas in
-        # ``_fair_choices`` and would crash with ``divmod(k, 0)``.
+        # Reject shrinks that would leave a logical expert with zero
+        # replicas (EPLB _fair_choices would divmod(k, 0)).
         if new_ep_size < old_ep_size:
             import math
 
@@ -4815,12 +4726,8 @@ class Scheduler(
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
 
-        # Classify a grow request. Added slots that overlap a retired
-        # slot (grow-into-retired-slot) go through ``try_recover_ranks``
-        # + ``_finalize_scale_recover``; added slots beyond the launch
-        # cohort go through the append-only ``try_admit_scale_ranks``
-        # path. A single grow request cannot mix the two -- reject
-        # with a clear message so the operator issues them serially.
+        # Classify grow: recover-mode (overlaps retired slot) vs
+        # scale-mode (beyond launch cohort). Cannot mix in one request.
         pending_recover_ranks: List[int] = []
         if new_ep_size > old_ep_size:
             launch_ep = (
@@ -5174,34 +5081,11 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
-        # Both recover-mode and scale-mode joiners have finished every
-        # boot-time step that requires the joiner-specific flag view
-        # (per-cohort pg_world_size in :meth:`ModelRunner.initialize`,
-        # launch-cohort EPLB layout in
-        # :meth:`ExpertLocationMetadata._init_common`, distributed=False
-        # KV-cache profile in
-        # :meth:`ModelRunnerKVCacheMixin._profile_available_bytes`,
-        # tokenizer/detokenizer IPC wiring in
-        # :meth:`DataParallelController.launch_dp_attention_schedulers`,
-        # skip-warmup in the HTTP server, etc.). Clear ``ep_join_mode``
-        # now so the ex-joiner is treated as a normal cohort member on
-        # every subsequent scale operation. Without this, a second
-        # shrink that keeps some recovered ranks alive (e.g.
-        # ``8 -> 4 -> 8 -> 6``, where ex-joiner ranks 4 and 5 survive
-        # the second shrink) trips the ``num_local_physical_experts``
-        # divisibility assert in ``_init_common``: it clamps
-        # ``ep_size = max(effective, elastic_ep_initial_size)
-        # = max(6, 8) = 8``, but the survivor-only
-        # ``physical_to_logical_map`` has already been truncated to
-        # ``num_local * 6`` columns. Scale-mode joiners share the same
-        # invariant (all post-boot control-flow paths that special-case
-        # them do so via ``is_ep_offset_joiner`` -- which pattern-matches
-        # both modes -- or via the boot-time-only
-        # ``_init_joiner_state`` / ``join_scale_process_group``, both of
-        # which have already run by the time we get here). The
-        # ``ep_join_rank_offset`` stays set because
-        # ``_elastic_global_rank`` still uses it to compute the
-        # ex-joiner's global rank as ``tp_rank + offset``.
+        # Clear ep_join_mode after boot so ex-joiners are treated as
+        # normal cohort members on subsequent scales; otherwise a
+        # second shrink keeping ex-joiners alive (e.g. 8->4->8->6)
+        # trips num_local_physical_experts divisibility asserts.
+        # ep_join_rank_offset stays set for _elastic_global_rank.
         if scheduler.server_args.ep_join_mode in ("recover", "scale"):
             scheduler.server_args.override(
                 "elastic_ep.joined", ep_join_mode=None

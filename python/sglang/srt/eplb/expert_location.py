@@ -36,10 +36,8 @@ def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
     from sglang.srt.runtime_context import get_exec, get_parallel
 
-    # Skip same-node preference for offset joiners (scale-append OR
-    # recover-into-retired-slot). Their per-cohort ep_size/nnodes is 0
-    # in the joiner subprocess view, which blows up _find_nearest_expert
-    # with ZeroDivisionError.
+    # Offset joiners have local ep_size / nnodes == 0 in the single-rank
+    # joiner subprocess view, which crashes _find_nearest_expert.
     moe = get_exec().moe
     is_offset_joiner = moe.ep_join_mode == "scale" or (
         moe.ep_join_mode == "recover" and get_parallel().ep_join_rank_offset > 0
@@ -251,14 +249,11 @@ class ExpertLocationMetadata:
         num_physical_experts = base_num_physical_experts
         initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
-            # Offset joiners (scale-append OR recover-into-retired-slot) boot
-            # with local ep_size = tp_size but must size EPLB metadata against
-            # the WIDER post-join deployment. Both modes target the ACTUAL
-            # post-join cohort size (rank_offset + tp_size); for full regrow
-            # this equals initial_ep_size, for partial regrow (e.g. launch=8,
-            # effective=4, target=6, offset=4, tp=2) it is 6 < 8. Using
-            # initial_ep_size here would produce a shape mismatch against
-            # the survivors' map built in _expand_eplb_metadata_for_scale.
+            # Offset joiners must size EPLB against the post-join cohort
+            # (rank_offset + tp_size), NOT initial_ep_size: partial regrows
+            # have rank_offset + tp_size < initial_ep_size, and a shape
+            # mismatch on the WORLD broadcast of physical_to_logical_map
+            # would corrupt memory.
             if server_args.is_ep_offset_joiner:
                 ep_size = max(
                     ep_size,
@@ -542,27 +537,16 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
-    # ``.contiguous()`` is a no-op when the map is already contiguous
-    # (pytorch returns ``self`` without allocation) but required for
-    # correctness on the rare non-contiguous slice case: NCCL/Mooncake
-    # broadcast on a non-contiguous tensor is unsafe.
+    # NCCL/Mooncake broadcast on a non-contiguous tensor is unsafe.
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
 
-    # Skip the rebuild on the src rank: its metadata was already
-    # rebuilt for the new cohort size before this broadcast (see
-    # ``_expand_eplb_metadata_for_scale`` on the survivor caller), the
-    # broadcast is send-only for src, and ``init_by_mapping`` is
-    # deterministic given the same map + ``moe_ep_rank`` -- so a
-    # rebuild here would produce a byte-identical result at the cost
-    # of a nested O(layers * experts * ep_size) recomputation.
-    # Non-src ranks (joiners) always rebuild because their map was
-    # just overwritten by the broadcast.
-    #
-    # Uses group-relative rank so the check works for both the
-    # default WORLD group and elastic-EP sub-groups.
+    # src rank already rebuilt before broadcast; skip its rebuild to
+    # avoid a redundant O(layers*experts*ep_size) recomputation.
+    # Non-src ranks always rebuild since their map was just overwritten.
+    # Group-relative rank works for both WORLD and elastic-EP subgroups.
     try:
         local_rank = torch.distributed.get_rank(group=group)
     except Exception:
@@ -603,18 +587,9 @@ def _compute_logical_to_all_physical_map(
                 layer_id, physical_expert_id
             ].item()
             if not (0 <= logical_expert_id < num_logical_experts):
-                # Convert the otherwise-opaque ``IndexError: list index
-                # out of range`` on the append below into an actionable
-                # trace. Historical root causes seen: (a) shape-mismatch
-                # after a WORLD broadcast when the joiner's
-                # ``num_physical_experts`` was computed against a
-                # different ``elastic_ep_initial_size`` than the
-                # primary (see :meth:`ExpertLocationMetadata._init_
-                # common` clamp for offset joiners); (b) NIXL-side
-                # buffer corruption of the broadcast tensor after a
-                # scale-DOWN followed by a fast regrow (fixed via the
-                # scratch-discard trick in ``ModelRunner._finalize_
-                # scale_down``).
+                # Actionable trace for corrupt / shape-mismatched
+                # broadcast (elastic_ep_initial_size drift or NIXL
+                # scratch corruption).
                 raise IndexError(
                     f"physical_to_logical_map[{layer_id}, "
                     f"{physical_expert_id}] = {logical_expert_id}, "

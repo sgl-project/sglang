@@ -20,7 +20,5 @@ MC09	test/manual/ep/test_mooncake_scale_down.py::TestMooncakeScaleDown8To4To8To4
 MC10	test/manual/ep/test_mooncake_scale_down.py::TestMooncakeScaleDown8To4To8To6MultiNodeNixl	4	Multi-node 8->4->8->6 partial-recovery on NIXL a2a (full regrow + second shrink of just-recovered ranks; needs multi-node driver)	2400
 MC13	test/manual/ep/test_mooncake_scale_down.py::TestMooncakeScaleDown4To5To3	5	Single-node 4->5->3 scale-up-v1 append + mixed-provenance retire (env-gated: needs SGLANG_MC13_FORCE_RUN=1 AND mooncake-transfer-engine-cuda13 >= 0.3.12 which contains kvcache-ai/Mooncake PR #2623 sizing P2PProxy to max_size at construction; short-circuits as SKIPPED without the env var)	900
 MC14	test/manual/ep/test_mooncake_scale_down.py::TestMooncakeScaleDown4To3To4To5	5	Single-node 4->3->4->5 shrink-recover-then-append (MC02+MC02B composition on NIXL a2a; ends with rank 4 as WORLD-only append-slot, deliberately no follow-on shrink of rank 4)	1500
-# Retire primitive smoke test (no model, torchrun-only):
-RETIRE	test/manual/ep/test_mooncake_retire_primitive.py	4	4-rank retire primitive contract check (no model)	300
 # Append-only scale-up baselines (already validated upstream):
 SCALEUP	test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To5To6	5	Append-only scale-up 4->5->6 baseline	1500

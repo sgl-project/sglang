@@ -614,24 +614,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
-        # Elastic EP scale-down admission gate. Cleared when the tokenizer
-        # accepts a shrink request; set again once the completion notification
-        # (or a failure notification) arrives from the scheduler cohort. New
-        # /generate requests block on this event so no client work is admitted
-        # while ranks are draining and hitting the retire barrier. Symmetric
-        # to ``is_pause`` but scoped to elastic-EP shrink transitions. Not
-        # used for scale-up because the scale-up admission path already
-        # defers DPC routing to the joiner until after the ready barrier.
+        # Scale-down admission gate: cleared on shrink accept, set on
+        # completion / failure. Not used for scale-up (which defers
+        # DPC routing until after the ready barrier).
         self._elastic_shrink_pause_event = asyncio.Event()
         self._elastic_shrink_pause_event.set()
-        # Serialize /scale_elastic_ep handling so a second request
-        # cannot slip past ``elastic_pending_ep_size is not None``
-        # while the first is between the pre-check and the eager
-        # publish. Without this, two concurrent shrink calls both
-        # dispatched to schedulers, and the second's rejection
-        # branch's ``_elastic_shrink_pause_event.set()`` reopened
-        # the admission gate while the first shrink was still
-        # draining -- letting client work into the retire window.
+        # Serialize /scale_elastic_ep so a second request cannot slip
+        # past elastic_pending_ep_size between pre-check and publish.
         self._elastic_scale_lock = asyncio.Lock()
 
     def init_lora(self):
@@ -804,10 +793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
             self._raise_if_logical_request_aborted(obj)
 
-            # Elastic EP scale-down admission gate. Cleared while a shrink
-            # is in flight; setter is :meth:`forward_elastic_scale_update`.
-            # We only wait when the event is currently clear so the fast
-            # path stays a single ``is_set`` check.
+            # Scale-down admission gate; fast path stays a single is_set check.
             if not self._elastic_shrink_pause_event.is_set():
                 await self._elastic_shrink_pause_event.wait()
 
@@ -3227,10 +3213,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_pending_ep_size = None
             self.elastic_scale_phase = "failed"
             self.elastic_last_error = msg.error
-            # Reopen the shrink admission gate on failure so buffered
-            # /generate requests aren't stuck forever. If we weren't
-            # gated (scale-up failure), the event is already set and
-            # this is a no-op.
+            # Reopen the gate on failure (no-op for scale-up).
             self._elastic_shrink_pause_event.set()
             return
 
@@ -3242,10 +3225,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         self.elastic_last_error = None
         self.update_control_communicator_fan_out(msg.effective_ep_size)
-        # Reopen the admission gate. For scale-up we were never gated,
-        # so this is a no-op. For scale-down the DPC has now removed
-        # the retired slots from routing (via ``_dispatch_to_scheduler``
-        # above) so it's safe to resume admissions.
+        # Reopen the admission gate; retired slots are already out
+        # of DPC routing after _dispatch_to_scheduler above.
         self._elastic_shrink_pause_event.set()
 
     def get_elastic_ep_state(self):
@@ -3276,21 +3257,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             self.auto_create_handle_loop()
 
-            # Close the /generate admission gate *before* dispatching the
-            # shrink to schedulers. This ensures no client request can slip
-            # through between "operator issued /scale_elastic_ep" and "every
-            # scheduler has begun draining". Scale-up doesn't need the gate
-            # (the scale-up admission path defers DPC routing to the joiner
-            # until the ready barrier releases). :meth:`forward_elastic_scale_update`
-            # reopens the gate on completion or failure.
+            # Close the /generate gate BEFORE fanout so no client
+            # request slips through while schedulers begin draining.
+            # forward_elastic_scale_update reopens on completion/failure.
             is_shrink = obj.new_ep_size < self.elastic_worker_count
-            # Eagerly publish the pending state so a second
-            # /scale_elastic_ep call (should the lock ever be released
-            # briefly across the fanout ``await`` in a future refactor)
-            # observes ``elastic_pending_ep_size is not None`` at its
-            # pre-check and returns early. Defense-in-depth alongside
-            # the lock; also documents caller-ownership so the
-            # pause-event-set-on-failure below is unambiguous.
+            # Publish pending state early: defense-in-depth against a
+            # future refactor releasing the lock across the await.
             self.elastic_pending_ep_size = obj.new_ep_size
             self.elastic_scale_phase = "waiting_for_cohort"
             if is_shrink:
@@ -3301,8 +3273,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await self.scale_elastic_ep_communicator(obj)
                 )
             except Exception:
-                # Roll back the eager publish so the next
-                # /scale_elastic_ep call isn't wedged behind stale state.
+                # Roll back the eager publish.
                 self.elastic_pending_ep_size = None
                 self.elastic_scale_phase = None
                 if is_shrink:
@@ -3315,9 +3286,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.elastic_pending_ep_size = res.pending_ep_size
                     self.elastic_last_error = res.message
                     if is_shrink:
-                        # Scheduler rejected the shrink; nothing to drain, so
-                        # reopen the gate immediately. Safe because the lock
-                        # guarantees we own this in-flight shrink.
+                        # Scheduler rejected; nothing to drain.
                         self._elastic_shrink_pause_event.set()
                     return res
             self.elastic_pending_ep_size = responses[0].pending_ep_size

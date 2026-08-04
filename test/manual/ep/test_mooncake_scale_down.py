@@ -1,23 +1,6 @@
-"""Manual end-to-end tests for Mooncake-native scale-down.
+"""Manual end-to-end tests for Mooncake-native scale-down (MC01-MC14).
 
-Test classes:
-  TestMooncakeScaleDown4To3                    single-node 4->3 shrink + GSM8K parity
-  TestMooncakeScaleDown4To3To4                 4->3->4 slot-reuse round trip
-  TestMooncakeScaleDownNixlShrink              4->3 shrink, NIXL a2a variant
-  TestMooncakeScaleUpFreshGrow                 fresh 3->4 grow-only via append scale
-  TestMooncakeScaleDown4To5To4                 4->5->4 grow-then-shrink
-  TestMooncakeGrow3To4Only                     fresh 3->4 grow-only baseline
-  TestMooncakeScaleDown4To3To2                 4->3->2 chained shrink w/ per-stage parity
-  TestMooncakeScaleDown8To6MultiNode           multi-node 8->6 shrink + GSM8K parity
-  TestMooncakeScaleDown4To3Soak                4->3 shrink + 3-round post-shrink soak
-  TestMooncakeScaleDown4To3ConcurrentTraffic   4->3 shrink under concurrent client load
-
-Prerequisites:
-  * 4 GPUs visible via CUDA_VISIBLE_DEVICES (8 for the multi-node case)
-  * ``--elastic-ep-backend mooncake`` (Mooncake-only scale-down)
-  * ``mooncake_ib_device`` reachable via ``get_rdma_devices_args()``
-
-Run (single node):
+Requires --elastic-ep-backend mooncake and >= 4 GPUs (8 for multi-node).
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pytest \\
         test/manual/ep/test_mooncake_scale_down.py::TestMooncakeScaleDown4To3 \\
@@ -87,61 +70,27 @@ LAUNCH_EP_SIZE = 4
 _MAX_EP_ENV = os.environ.get("SGLANG_MC_MAX_EP_SIZE", "").strip()
 MAX_EP_SIZE = int(_MAX_EP_ENV) if _MAX_EP_ENV else LAUNCH_EP_SIZE
 GSM8K_MIN_SCORE = float(os.environ.get("SGLANG_MC_GSM8K_MIN", "0.50"))
-# Relative-drop tolerance for the single-round post-scale GSM8K parity
-# tests (MC02 scale-up, MC04 chained shrink, MC05 multi-node shrink,
-# MC12 chained NIXL shrink). MC06 is deliberately excluded: it has
-# been restructured to run under
-# :option:`--enable-deterministic-inference` (see
-# :attr:`_MooncakeShrinkEndToEndBase.DETERMINISTIC` and
-# :class:`TestMooncakeScaleDown4To3Soak`) and asserts byte-identical
-# scores across three post-shrink rounds, not a tolerance vs the pre-
-# shrink baseline.
-#
-# Was 0.05 originally and reliable pre-fork on this suite. Raised to
-# 0.10 after empirical characterisation showed the DSV3-lite test
-# model can drift 4-7% relative on a single-round post-scale GSM8K
-# pass due to a combination of upstream numerics changes since the
-# fork base, none of which are attributable to this branch's own
-# edits (verified: our elastic-EP hooks are gated to joiner
-# subprocesses or fire only during scale events, and never execute on
-# the survivor forward path that these single-round parity checks
-# exercise). Cumulative small-numeric change is spread across
-# ~100 upstream commits (top-k renorm fp32 upcast, kernel migration,
-# attention backend rewrites, quantization pipeline updates,
-# minimal-eviction KV cache policy). 0.10 was chosen to comfortably
-# cover the observed post-fork tail (max delta seen: 7.5%) while
-# still catching any wholesale post-scale quality collapse.
+# Relative-drop tolerance for single-round post-scale GSM8K parity tests
+# (MC02, MC04, MC05, MC12). MC06 opts into deterministic mode instead
+# and asserts byte-identical scores across rounds. 0.10 covers observed
+# post-fork numeric drift (max delta ~7.5%) while still catching
+# wholesale quality collapse.
 GSM8K_REL_TOL = float(os.environ.get("SGLANG_MC_GSM8K_REL_TOL", "0.10"))
 GSM8K_NUM_EXAMPLES = int(os.environ.get("SGLANG_MC_GSM8K_NUM", "128"))
-# GSM8K workload size for deterministic-mode tests (currently MC06 only).
-# Kept smaller than ``GSM8K_NUM_EXAMPLES`` because deterministic mode
-# forces ``num_threads=1`` (no concurrent batching, since concurrent
-# batching is what makes GSM8K scores drift run-to-run). A 32-question
-# serial pass takes ~90 s on the DSV3-lite fp8 test model, so a full
-# MC06 run (1 pre + 3 post rounds) fits inside ~6 min end-to-end.
+# Deterministic-mode workload (MC06). Smaller than GSM8K_NUM_EXAMPLES
+# because deterministic mode forces num_threads=1 (~90s per 32-question
+# serial pass on DSV3-lite fp8).
 GSM8K_NUM_EXAMPLES_DETERMINISTIC = int(
     os.environ.get("SGLANG_MC_GSM8K_NUM_DETERMINISTIC", "32")
 )
-# Fixed random seed for :option:`--random-seed` on deterministic-mode
-# launches. The specific value does not matter; only that it is the
-# same on every launch so the three post-shrink GSM8K rounds sample
-# from the same RNG stream.
 DETERMINISTIC_SEED = int(os.environ.get("SGLANG_MC_DETERMINISTIC_SEED", "42"))
-# Loose wholesale-corruption safety margin for the deterministic path.
-# The primary signal is exact byte-equality across the three post-
-# shrink rounds; this floor only fires if the shrunk cohort produces
-# categorically worse output than the pre-shrink baseline (e.g. weight
-# corruption or a broken MoE dispatch), not for run-to-run noise.
+# Loose safety margin -- fires only for wholesale corruption; primary
+# signal is exact byte-equality across post-shrink rounds.
 GSM8K_DETERMINISTIC_SAFETY_MARGIN = float(
     os.environ.get("SGLANG_MC_GSM8K_DETERMINISTIC_SAFETY_MARGIN", "0.15")
 )
 
-# Number of logical experts in the test model. DeepSeek-V3-Lite (both
-# the fp8 and bf16 variants used here) has 72 routed experts. Kept as
-# a module-level constant so the shrink-sizing helper below is
-# self-contained; update in lockstep if ``NIXL_EP_TEST_MODEL`` is
-# pointed at a model with a different ``n_routed_experts``.
-NUM_LOGICAL_EXPERTS = 72
+NUM_LOGICAL_EXPERTS = 72  # DeepSeek-V3-Lite n_routed_experts
 
 
 def _min_redundant_experts_for_shrink(
@@ -149,64 +98,12 @@ def _min_redundant_experts_for_shrink(
     min_target_ep: int,
     num_logical: int = NUM_LOGICAL_EXPERTS,
 ) -> int:
-    """Minimum ``--ep-num-redundant-experts`` for a shrink test that
-    fresh-launches at ``launch_ep`` and needs to reach ``min_target_ep``.
+    """Minimum ``--ep-num-redundant-experts`` for a shrink test.
 
-    Two constraints must hold simultaneously:
-
-    1. **EPLB elastic-layout divisibility** at fresh launch
-       (:func:`sglang.srt.eplb.expert_location._compute_elastic_expert_layout`)::
-
-           (num_logical + ep_num_redundant_experts) % launch_ep == 0
-
-       In elastic-EP deployments (``max_ep_size > tp_size``) server_args
-       auto-derives ``elastic_ep_initial_size = tp_size = launch_ep`` on
-       the primary. The layout function then asserts the base physical
-       expert count is exactly divisible by ``initial_ep_size``. This
-       is the assertion that trips every fresh non-4-rank launch with
-       the default 24 redundant experts.
-
-    2. **Scheduler shrink feasibility** at the ``launch_ep`` ->
-       ``min_target_ep`` transition
-       (:meth:`sglang.srt.managers.scheduler.Scheduler._handle_scale_elastic_ep_req`)::
-
-           num_local * min_target_ep >= num_logical
-
-       where ``num_local = (num_logical + ep_num_redundant_experts) //
-       launch_ep`` is the number of physical expert slots each rank
-       carries. Violating this yields a 400 response ``new_ep_size (T)
-       < minimum feasible (M) for this launch: num_local=..., num_
-       logical=...``.
-
-    Rewriting both in terms of ``num_local = k``:
-
-    * (1) becomes ``k * launch_ep = num_logical + n``, i.e. every valid
-      ``n`` corresponds to a unique integer ``k``.
-    * (2) becomes ``k >= ceil(num_logical / min_target_ep)``.
-
-    So the minimum ``k`` is ``ceil(num_logical / min_target_ep)`` and
-    the minimum ``n`` is ``k_min * launch_ep - num_logical``.
-
-    Worked examples (all with ``num_logical=72``):
-
-    +----------------------+-----+-----+-------+-------+-------+
-    | Test                 |  N  |  T  |   k   |   n   |  base |
-    +======================+=====+=====+=======+=======+=======+
-    | MC02A (4 -> 3)       |  4  |  3  |  24   |  24   |   96  |
-    +----------------------+-----+-----+-------+-------+-------+
-    | MC03A (5 -> 4)       |  5  |  4  |  18   |  18   |   90  |
-    +----------------------+-----+-----+-------+-------+-------+
-    | MC04  (4 -> 3 -> 2)  |  4  |  2  |  36   |  72   |  144  |
-    +----------------------+-----+-----+-------+-------+-------+
-    | MC08  (8 -> 4 -> N)  |  8  |  4  |  18   |  72   |  144  |
-    +----------------------+-----+-----+-------+-------+-------+
-
-    Callers that want extra EPLB headroom (redundancy beyond the exact
-    fit at the shrink target) can pass ``min_target_ep`` set to a value
-    STRICTLY smaller than the actual shrink target, or add a fixed
-    multiple of ``launch_ep`` to the returned value (each ``+launch_ep``
-    keeps divisibility and grows ``num_local`` by one).
-    """
+    Simultaneously satisfies EPLB layout divisibility at fresh launch
+    ((num_logical + n) % launch_ep == 0) and scheduler shrink
+    feasibility (num_local * min_target_ep >= num_logical). Returns
+    ceil(num_logical / min_target_ep) * launch_ep - num_logical."""
     assert launch_ep > 0 and min_target_ep > 0 and num_logical > 0
     assert min_target_ep <= launch_ep, (
         f"min_target_ep ({min_target_ep}) cannot exceed launch_ep "
@@ -239,26 +136,13 @@ def _shrink_common_args(
 ) -> list[str]:
     """Common `sglang serve` args for Mooncake-native shrink tests.
 
-    Defaults match the shrink invariant (``moe-a2a-backend=mooncake``,
-    ``max_ep_size == launch cohort``). Grow-direction tests MUST pass
-    ``moe_a2a_backend="nixl"`` because upstream PR #30164's known
-    limitation is: "Runtime scale-up supports Mooncake as the Elastic
-    EP backend and NIXL as the MoE all-to-all backend." Mooncake a2a on
-    the grow path exercises collectives that the upstream implementation
-    never validated. ``ep_num_redundant_experts`` controls how far the
-    cohort can shrink (the chained 4->3->2 test needs 72 so every
-    logical still has a replica after a 4->2 shrink).
+    Grow-direction tests MUST pass moe_a2a_backend="nixl" per PR #30164
+    (Mooncake a2a on the grow path is not validated upstream).
+    ep_num_redundant_experts controls minimum shrink cohort size.
 
-    ``deterministic=True`` opts the launched server into
-    :option:`--enable-deterministic-inference`, plus a fixed random seed
-    and an explicit ``fa3`` attention backend (which is the Hopper +
-    DeepSeek default that upstream's deterministic-inference resolver
-    would pick anyway; we set it explicitly so the flag survives a
-    server_args resolve pass). Reserved for tests that need
-    across-round-numerically-identical GSM8K scores (MC06) so the
-    correctness signal can be an exact-equality assert rather than a
-    fuzzy tolerance.
-    """
+    deterministic=True enables --enable-deterministic-inference + a
+    fixed random seed + explicit fa3 attention backend so MC06 can
+    assert exact-equality across post-shrink rounds."""
     args = [
         "--trust-remote-code",
         "--moe-a2a-backend",
@@ -299,45 +183,19 @@ def _shrink_common_args(
                 "--enable-deterministic-inference",
                 "--random-seed",
                 str(DETERMINISTIC_SEED),
-                # ``fa3`` is what upstream's deterministic-inference
-                # resolver falls back to on Hopper + DeepSeek anyway
-                # (see ``_deterministic_attention_backend`` in
-                # ``arg_groups/overrides.py``). Setting it explicitly
-                # here removes the resolver's "falling back to fa3"
-                # warning from the launch log and pins the backend so
-                # a future resolver-default change cannot silently
-                # move MC06 off fa3.
+                # Pin fa3 (what upstream's resolver picks anyway on
+                # Hopper + DeepSeek) so future resolver changes cannot
+                # silently move MC06 off fa3.
                 "--attention-backend",
                 "fa3",
-                # EPLB automatic re-balance fires every ``N`` forward
-                # passes (default N=1000). A single 32-question GSM8K
-                # round on the DSV3-lite test model runs on the order
-                # of 1500 forward passes, so an automatic rebalance
-                # would land inside a round, mutate the physical
-                # expert map mid-flight, and break byte-equality
-                # between rounds even though every OTHER source of
-                # non-determinism is pinned. Pin it well above the
-                # combined forward-pass count for the whole three-
-                # round soak (~6k passes) so no automatic rebalance
-                # can fire inside the test. Do NOT set this to a
-                # very-large number: ``server_args._handle_moe`` uses
-                # this same value as the default
-                # ``expert_distribution_recorder_buffer_size``, and
-                # that buffer is allocated as
-                # ``(N * num_layers * num_physical_experts * 4)``
-                # int32 bytes on every rank. On DSV3-lite that is
-                # ~11 KB/step, so N=10_000_000 would ask for ~107 GB
-                # on every GPU and OOM before the model even loads.
+                # Push EPLB auto-rebalance past ~6k combined forward
+                # passes for a three-round MC06 soak. Do NOT go higher:
+                # this value also sizes expert_distribution_recorder_
+                # buffer_size at ~11 KB/step (would OOM at 10M).
                 "--eplb-rebalance-num-iterations",
                 "100000",
-                # Detach the expert-distribution recorder buffer size
-                # from ``--eplb-rebalance-num-iterations`` so the
-                # buffer stays a fixed ~11 MB on DSV3-lite regardless
-                # of how far into the future we push the automatic-
-                # rebalance trigger. Without this the buffer would
-                # inherit 100_000 (~1 GB) from the flag above, which
-                # is not wrong but is 100x wasteful for a test that
-                # only writes ~6k steps into it.
+                # Detach the recorder buffer from the flag above so it
+                # stays a fixed ~11 MB on DSV3-lite.
                 "--expert-distribution-recorder-buffer-size",
                 "1024",
             ]
@@ -350,45 +208,16 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
 
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE: int | None = 1
-    # Override in subclasses that shrink below
-    # ``ceil(num_logical / num_local)`` (e.g. MC04 4->3->2).
-    EP_NUM_REDUNDANT_EXPERTS: int = 24
-    # NIXL a2a is now the default across the MC0N shrink+regrow matrix
-    # so a single sweep exercises the retire / recover paths that our
-    # elastic scale code has actually been hardened against (see the
-    # ``nixl_retire_barrier_*`` primitives in ``elastic_ep.py``). The
-    # Mooncake-a2a variants (``TestMooncakeScaleDown4To3To4MooncakeA2A``,
-    # ``TestMooncakeGrow3To4OnlyMooncakeA2A``) still override this to
-    # ``"mooncake"`` explicitly, so the empirical a2a-backend matrix is
-    # preserved without them being the default.
-    MOE_A2A_BACKEND: str = "nixl"
-    # Launch cohort ``--tp``/``--dp`` size. Defaults to the shared
-    # module-level ``LAUNCH_EP_SIZE`` so the historical 4-rank shrink
-    # matrix (MC01/MC02A/MC04/MC06/MC07) picks it up unchanged.
-    # Subclasses whose fresh-launch cohort is a different size (e.g.
-    # MC03A ``TestMooncakeScaleDown5To4``) override this class
-    # attribute; setUpClass uses it in place of the module constant
-    # so the ``_shrink_common_args`` tp/dp size and
-    # ``CUDA_VISIBLE_DEVICES`` slice track the subclass's launch
-    # cohort.
-    LAUNCH_EP: int = LAUNCH_EP_SIZE
-    # Elastic pool ceiling reserved at primary launch. Shrink-only
-    # tests keep it equal to the launch cohort; grow-back tests must
-    # reserve extra headroom so Mooncake keeps an elastic slot pool
-    # that ``recover_ranks`` can re-attach a joiner into. Matches the
-    # scale-up invariant that a joiner boots with
-    # ``max_world_size > pg_world_size``.
+    EP_NUM_REDUNDANT_EXPERTS: int = 24  # override for shrinks below ceil(num_logical/num_local)
+    MOE_A2A_BACKEND: str = "nixl"  # Mooncake-a2a variants override
+    LAUNCH_EP: int = LAUNCH_EP_SIZE  # override on non-4-rank fresh launches (MC03A etc.)
+    # Elastic pool ceiling reserved at primary launch. Grow-back tests
+    # must set MAX_EP > LAUNCH_EP so Mooncake keeps a recoverable slot
+    # pool for try_recover_ranks.
     MAX_EP: int = MAX_EP_SIZE
-    # Launch the server with :option:`--enable-deterministic-inference`
-    # + a fixed :option:`--random-seed` + an explicit ``fa3`` attention
-    # backend. Enables byte-identical numerics across GSM8K rounds so
-    # the subclass can assert exact-equality on repeated evaluations
-    # (see ``TestMooncakeScaleDown4To3Soak``). Off by default because
-    # deterministic mode disables aiter fusion + forces the pytorch
-    # sampling backend and would slow down all other MC0N tests
-    # without buying them anything (they run a single GSM8K pass
-    # against a noisy pre-shrink baseline, so exact-equality never
-    # holds).
+    # Opt-in for deterministic mode (see _shrink_common_args). Only
+    # MC06 uses this; off by default because deterministic mode disables
+    # aiter fusion and slows unrelated MC0N tests.
     DETERMINISTIC: bool = False
 
     @classmethod
@@ -465,14 +294,9 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
     ) -> float:
         """Run GSM8K against the currently-serving cohort.
 
-        Defaults to a 128-question workload at ``num_threads=16``, which
-        matches the historical MC0N shrink matrix (bounded to keep
-        in-flight tokens under the Mooncake EP per-rank cap of 1024 on a
-        4-rank cohort). Callers can override both to run a smaller
-        serial pass (e.g. :class:`TestMooncakeScaleDown4To3Soak`
-        MC06 in deterministic mode passes ``num_threads=1``,
-        ``num_examples=GSM8K_NUM_EXAMPLES_DETERMINISTIC``).
-        """
+        Default: 128 questions at num_threads=16. MC06 (deterministic)
+        overrides both to run a serial pass at
+        num_examples=GSM8K_NUM_EXAMPLES_DETERMINISTIC."""
         if num_threads is None:
             num_threads = 16
         if num_examples is None:
@@ -496,21 +320,9 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
         return score
 
     def _flush_kv_cache(self, *, timeout_s: float = 60.0) -> None:
-        """Ask the server to flush its radix + KV caches.
-
-        Used by deterministic-mode tests (currently MC06) between
-        GSM8K rounds so each round starts from a clean cache state.
-        Without this, cross-round KV residue interacts with upstream
-        commit ``98cc8d91cf`` ("Evict only the KV shortfall in
-        ``evict_from_tree_cache``"): more FP8-quantised KV persists
-        across rounds and the three back-to-back scores stop being
-        byte-identical even under
-        :option:`--enable-deterministic-inference`.
-
-        Server-side handler is
-        :meth:`sglang.srt.managers.tokenizer_manager.TokenizerManager.flush_cache`;
-        it is a synchronous no-op if there are no in-flight requests.
-        """
+        """Flush server radix + KV caches between deterministic-mode
+        GSM8K rounds. Without this, FP8 KV residue breaks byte-identical
+        scores across rounds even under deterministic-inference."""
         resp = requests.post(
             f"{self.base_url}/flush_cache",
             timeout=timeout_s,
@@ -528,13 +340,8 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
         expected_phase: str,
         timeout_s: float = 600.0,
     ) -> None:
-        # Bumped from 300s to 600s to accommodate slow joiner-subprocess
-        # cold-start on scale-up-v1 paths (MC02B / MC14 Half 3). The joiner
-        # loads FP8 model weights + torch.dist inits + Mooncake handshake
-        # from a cold Python interpreter; on busy nodes this occasionally
-        # exceeds 300s. Matches the primary-side admission deadline
-        # (`server_args.elastic_ep_scale_timeout=600` default) so the
-        # harness never fails before the primary would time out.
+        # 600s matches primary-side elastic_ep_scale_timeout to
+        # accommodate slow joiner cold-start on scale-up-v1 (MC02B/MC14).
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             resp = requests.get(
@@ -563,33 +370,16 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             time.sleep(2)
         self.fail(f"Timed out waiting for scale to reach {expected_phase}")
 
-    # ---- post-scale survivability invariant -----------------------------
-    # Number of forward-pass probes issued at the end of every
-    # ``_scale_to`` to catch "everything looks like ``serving_*`` but the
-    # very next generate crashes" regressions in production code. Kept as
-    # a class attribute so subclasses whose downstream flow already
-    # exercises the just-established topology (MC08 / MC09 per-slot post-
-    # regrow sweeps, MC07 concurrent-traffic pumper) can dial it up or
-    # skip it without editing every ``_scale_to`` call site. The floor of
-    # 2 encodes the minimum "at least 2 more forward passes after
-    # scaling without crashing" invariant from the elastic-scale
-    # production checklist.
+    # Post-scale survivability floor: number of /generate probes after
+    # every _scale_to to catch "serving_* but next generate crashes"
+    # regressions. Subclasses that already exercise the new topology
+    # (MC08/MC09/MC07) can override.
     POST_SCALE_MIN_PROBES: int = 2
 
     def _assert_post_scale_survives(self, new_ep_size: int) -> None:
-        """Exercise the cohort AFTER a scale completes.
-
-        Runs ``max(new_ep_size, POST_SCALE_MIN_PROBES)`` ``/generate``
-        probes, striping across live DP slots. The stripe guarantees
-        each slot in the new topology receives at least one forward
-        pass -- so a joiner that just recovered its slot, or a survivor
-        that just refreshed its NIXL peer table, actually issues a
-        forward pass before the next scale request / GSM8K run rather
-        than letting the crash surface many probes later and taint the
-        parity metric. Any 500 (or transport-level exception in
-        ``_generate_ok``) fails the test immediately with the phase
-        (``post-shrink`` / ``post-regrow``) that broke.
-        """
+        """Run max(new_ep_size, POST_SCALE_MIN_PROBES) /generate probes
+        striped across live DP slots, so every slot in the new topology
+        receives at least one forward pass immediately after the scale."""
         probes = max(new_ep_size, self.POST_SCALE_MIN_PROBES)
         for i in range(probes):
             dp_rank = i % new_ep_size if new_ep_size > 0 else None
@@ -679,23 +469,14 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             tp_size=join_tp,
             max_ep_size=cls.MAX_EP,
             moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
-            # Joiner MUST use the same ``ep_num_redundant_experts`` as the
-            # primary. The joiner runs its OWN EPLB layout computation at
-            # boot (``_compute_elastic_expert_layout``), which asserts
-            # ``(num_logical + ep_num_redundant_experts) % elastic_ep_
-            # initial_size == 0``. If the joiner defaults to 24 while the
-            # primary launched with a non-default value (e.g. MC03A/B's
-            # 18 for ``launch_ep=5``, or MC08's 72 for ``launch_ep=8``),
-            # the joiner scheduler crashes at rank 0 init before it can
-            # even reach the recover rendezvous.
+            # Joiner must use the same ep_num_redundant_experts as
+            # the primary; its own EPLB layout check asserts
+            # (num_logical + n) % elastic_ep_initial_size == 0.
             ep_num_redundant_experts=cls.EP_NUM_REDUNDANT_EXPERTS,
             moe_a2a_backend=cls.MOE_A2A_BACKEND,
         )
-        # Joiner convention: run as ``--nnodes 2 --node-rank 1`` of a
-        # (primary=0, joiner=1) logical two-node view, even on
-        # single-physical-node deployments. This is what DPC's
-        # ``pp_rank_range`` and ``ModelRunner`` expect when computing
-        # ``pg_rank`` for an offset joiner.
+        # Joiner runs as --nnodes 2 --node-rank 1 of a logical
+        # (primary=0, joiner=1) view (what DPC expects for offset joiners).
         _rewrote_nnodes = False
         _rewrote_node_rank = False
         for idx, tok in enumerate(primary_args):
@@ -714,14 +495,8 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             "--model-path",
             cls.model,
             *primary_args,
-            # Joiner's ``elastic_ep_initial_size`` must match the primary's
-            # launch cohort size so ``pg_world_size`` on the joiner side
-            # equals ``LAUNCH_EP`` (see ``ModelRunner._launch_pp_processes``).
-            # Track the subclass's ``LAUNCH_EP`` class attribute rather than
-            # the module-level ``LAUNCH_EP_SIZE`` constant so MC03A/B/MC03
-            # (``LAUNCH_EP=5``) join correctly; MC02A/B and other 4-rank
-            # tests keep the historical ``LAUNCH_EP_SIZE = 4`` default via
-            # the ``LAUNCH_EP: int = LAUNCH_EP_SIZE`` base-class default.
+            # Joiner's elastic_ep_initial_size must match the primary's
+            # LAUNCH_EP (per subclass) so pg_world_size lines up.
             "--elastic-ep-initial-size",
             str(cls.LAUNCH_EP),
             "--elastic-ep-join-mode",
@@ -812,27 +587,15 @@ class TestMooncakeScaleDown4To3(_MooncakeShrinkEndToEndBase):
     f"MC02 slot-reuse E2E needs {LAUNCH_EP_SIZE} GPUs.",
 )
 class TestMooncakeScaleDown4To3To4(_MooncakeShrinkEndToEndBase):
-    """4 -> 3 -> 4 grow-back via recover-into-retired-slot.
+    """MC02: 4 -> 3 -> 4 grow-back via recover-into-retired-slot.
 
-    Validates that a Mooncake-native recover joiner can slot into a
-    previously retired position inside the launch cohort. The
-    ``recover_ranks`` primitive on the survivor side pairs with
-    ``join_process_groups`` on the joiner side; both re-use the DPC
-    socket that :func:`remove_elastic_workers` intentionally kept bound.
-    """
+    Survivor's recover_ranks pairs with joiner's join_process_groups
+    over the DPC socket that remove_elastic_workers kept bound."""
 
-    # PR #30164's grow-collectives (expert-location broadcast, DPC
-    # fan-out grow, NIXL rank/buffer expansion) were validated only
-    # against NIXL a2a; run MC02's grow-back half on the same envelope.
-    # Overridable via env for isolating NIXL-specific issues.
+    # PR #30164 validated grow collectives only against NIXL a2a.
     MOE_A2A_BACKEND = os.environ.get("SGLANG_MC02_A2A_BACKEND", "nixl")
-    # Reserve one extra elastic slot at launch so Mooncake keeps a
-    # recoverable pool after the 4->3 shrink. With
-    # ``max_ep_size == launch_ep_size`` the primary never enters the
-    # "elastic max-size" bootstrap branch and the retired slot is
-    # gone from Mooncake's peer pool; ``recover_ranks`` then returns
-    # False forever and the grow-back hangs (MC03B uses the same
-    # headroom trick with ``_MAX_EP_HEADROOM=5``).
+    # +1 headroom so Mooncake keeps a recoverable pool for the retired
+    # slot after 4->3 (otherwise recover_ranks returns False forever).
     MAX_EP = LAUNCH_EP_SIZE + 1
 
     def test_shrink_then_regrow(self):
@@ -862,49 +625,17 @@ class TestMooncakeScaleDown4To3To4(_MooncakeShrinkEndToEndBase):
     _count_visible_gpus() >= LAUNCH_EP_SIZE,
     f"MC02 (Mooncake a2a) slot-reuse E2E needs {LAUNCH_EP_SIZE} GPUs.",
 )
-class TestMooncakeScaleDown4To3To4MooncakeA2A(_MooncakeShrinkEndToEndBase):
-    """4 -> 3 -> 4 grow-back on Mooncake a2a instead of NIXL a2a.
+class TestMooncakeScaleDown4To3To4MooncakeA2A(TestMooncakeScaleDown4To3To4):
+    """4 -> 3 -> 4 grow-back on Mooncake a2a (known-fail regression fence).
 
     Same topology as :class:`TestMooncakeScaleDown4To3To4`, but with
-    ``--moe-a2a-backend mooncake`` on the grow-back half. Empirical
-    matrix (MC01 / MC02A / MC02B / this) confirms PR #30164's stated
-    limitation: grow direction currently fails with Mooncake a2a
-    because the scale-joiner's own DeepGEMM warmup asserts
-    ``num_groups == num_groups_`` in ``m_grouped_fp8_fp4_gemm_nt_
-    masked`` before any inter-rank collective runs. The failure is
-    inside the MoE runner, not inside Mooncake's ``update_ep_member``
-    -- fixing it requires teaching the Mooncake-a2a EPMoE layer how
-    to boot a scale-joiner with a self-consistent num_groups when
-    ``elastic_ep_initial_size`` differs from ``ep_size``. Kept as a
-    known-fail regression fence: once the joiner-side EPMoE fix
-    lands upstream, this test should pass in step with the NIXL a2a
-    variant :class:`TestMooncakeScaleDown4To3To4`.
-    """
+    ``--moe-a2a-backend mooncake`` on the grow half. Confirms PR #30164's
+    stated limitation (grow direction not supported on Mooncake a2a):
+    scale-joiner's DeepGEMM warmup asserts num_groups mismatch before
+    any collective runs. Should pass in step with the NIXL variant
+    once the joiner-side EPMoE fix lands upstream."""
 
     MOE_A2A_BACKEND = "mooncake"
-    MAX_EP = LAUNCH_EP_SIZE + 1
-
-    def test_shrink_then_regrow(self):
-        self._generate_ok("pre-shrink")
-        self._scale_to(old_ep_size=4, target_ep_size=3)
-        self._generate_ok("post-shrink")
-
-        joiner = self._launch_offset_joiner(
-            rank_offset=3, join_tp=1, port=PORT_B, join_mode="recover",
-        )
-        try:
-            self.assertIsNone(
-                joiner.poll(),
-                "MC02 (Mooncake a2a) grow-back joiner exited before scale request",
-            )
-            self._scale_to(old_ep_size=3, target_ep_size=4)
-            self._generate_ok("post-regrow", routed_dp_rank=3)
-        finally:
-            try:
-                kill_process_tree(joiner.pid)
-                joiner.wait(timeout=10)
-            except Exception:
-                pass
 
 
 @unittest.skipUnless(
@@ -912,17 +643,10 @@ class TestMooncakeScaleDown4To3To4MooncakeA2A(_MooncakeShrinkEndToEndBase):
     f"NIXL shrink test needs {LAUNCH_EP_SIZE} GPUs.",
 )
 class TestMooncakeScaleDownNixlShrink(_MooncakeShrinkEndToEndBase):
-    """4->3 shrink only, NIXL a2a variant.
-
-    Same shrink topology as ``TestMooncakeScaleDown4To3`` but with the
-    NIXL a2a data plane so we exercise the retire path against a
-    different MoE backend.
-    """
+    """4->3 shrink only, NIXL a2a variant."""
 
     MOE_A2A_BACKEND = "nixl"
-    # Reserve one extra elastic slot so Mooncake keeps the retired
-    # slot in its peer pool.
-    MAX_EP = LAUNCH_EP_SIZE + 1
+    MAX_EP = LAUNCH_EP_SIZE + 1  # +1 keeps retired slot in Mooncake pool
 
     def test_shrink_only(self):
         self._generate_ok("pre-shrink")
@@ -932,16 +656,9 @@ class TestMooncakeScaleDownNixlShrink(_MooncakeShrinkEndToEndBase):
 
 
 class _MooncakeGrowFromShrunkBase(CustomTestCase):
-    """Fresh-launch primary that starts at the "as-if-shrunk" size and
-    only exercises the grow half of a shrink-then-grow scenario.
-
-    Launching at the smaller size and appending one slot via
-    ``join_mode="scale"`` reproduces the grow path independently of any
-    residual state from a prior retire -- useful for isolating scale-up
-    regressions from scale-down regressions. Concretely a launch of
-    ep=N-1 with ``max_ep_size=N`` reserves one growth slot and then
-    appends the final slot via the ordinary append-only scale-up flow.
-    """
+    """Fresh-launch primary at "as-if-shrunk" size that exercises only
+    the grow half of a shrink+grow scenario, isolating scale-up
+    regressions from scale-down regressions."""
 
     CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
     MOE_DENSE_TP_SIZE: int | None = 1
@@ -1100,19 +817,10 @@ class _MooncakeGrowFromShrunkBase(CustomTestCase):
         self.assertEqual(body["old_ep_size"], old_ep_size, body)
         self.assertEqual(body["new_ep_size"], target_ep_size, body)
 
-        # PR #30164 admission runs from ``forward()``: ``maybe_join_ep_
-        # ranks`` (admission + commit + 600s timeout) is invoked ONLY
-        # by a forward pass, so an idle cluster that has accepted the
-        # scale request hangs indefinitely. Poll ``/is_scaling_
-        # elastic_ep`` interleaved with a cheap ``/generate`` ping to
-        # keep the busy path ticking. Symmetric with the shrink-side
-        # ``_MooncakeShrinkEndToEndBase._poll_until_serving``.
-        #
-        # 600s harness deadline matches the primary-side
-        # ``server_args.elastic_ep_scale_timeout`` default and gives the
-        # joiner subprocess enough budget for FP8 weight-load +
-        # torch.dist init + Mooncake handshake from a cold interpreter
-        # (~300s is not enough on busy nodes).
+        # PR #30164 admission runs from forward(); an idle cluster hangs.
+        # Poll /is_scaling_elastic_ep interleaved with a cheap /generate
+        # ping to keep the busy path ticking. 600s matches primary-side
+        # elastic_ep_scale_timeout for cold-start joiner budget.
         deadline = time.time() + 600.0
         while time.time() < deadline:
             resp = requests.get(
@@ -1145,118 +853,12 @@ class _MooncakeGrowFromShrunkBase(CustomTestCase):
 
 @unittest.skipUnless(
     _count_visible_gpus() >= 4,
-    "MC03B differential grow-only needs 4 GPUs.",
-)
-class TestMooncakeGrow3To4Only(_MooncakeGrowFromShrunkBase):
-    """Launch ep=3 with headroom, append slot 3, grow-only.
-
-    Grow-only differential test. ``max_ep_size`` is deliberately set
-    above the post-grow size so the joiner boots with
-    ``max_world_size > pg_world_size``; this matches the append-only
-    scale-up invariant that Mooncake's ``bootstrapLocalPeer`` requires
-    to attach to a pre-reserved elastic pool.
-    """
-
-    LAUNCH_EP = 3
-    TARGET_EP = 4
-    _MAX_EP_HEADROOM = 5
-
-    def test_grow_only(self):
-        self._generate_ok("pre-grow")
-
-        joiner = self._launch_scale_joiner(
-            rank_offset=self.LAUNCH_EP,
-            join_tp=self.JOIN_TP,
-            port=PORT_B,
-        )
-        type(self)._joiner_proc = joiner
-        try:
-            self.assertIsNone(
-                joiner.poll(),
-                "MC03B joiner exited before scale request; see joiner log",
-            )
-            self._scale_to(
-                old_ep_size=self.LAUNCH_EP, target_ep_size=self.TARGET_EP
-            )
-            self._generate_ok("post-grow")
-        finally:
-            try:
-                kill_process_tree(joiner.pid)
-                joiner.wait(timeout=10)
-            except Exception:
-                pass
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 4,
-    "MC02B (Mooncake a2a) differential grow-only needs 4 GPUs.",
-)
-class TestMooncakeGrow3To4OnlyMooncakeA2A(_MooncakeGrowFromShrunkBase):
-    """MC02B (Mooncake a2a variant): same 3->4 grow-only topology as
-    :class:`TestMooncakeGrow3To4Only`, but with ``--moe-a2a-backend
-    mooncake`` instead of NIXL. Used together with MC01
-    (:class:`TestMooncakeScaleDown4To3`) and MC02A
-    (:class:`TestMooncakeScaleDownNixlShrink`) to form a 2x2 matrix
-    of {shrink, grow} x {mooncake a2a, nixl a2a} for isolating
-    backend-specific code paths.
-
-    Matrix result (empirical): shrink passes on both a2a backends;
-    grow only passes with NIXL a2a. This cell reproducibly fails
-    inside the scale-joiner's DeepGEMM warmup with
-    ``tvm.error.InternalError: Assertion error num_groups ==
-    num_groups_`` -- the joiner's MoE-runner configuration is
-    already inconsistent before it can call any Mooncake collective.
-    Kept as a known-fail regression fence: once the Mooncake-a2a
-    EPMoE runner is fixed upstream to produce a self-consistent
-    ``num_groups`` for a scale-joiner booted with
-    ``elastic_ep_initial_size != ep_size``, this test should pass.
-    """
-
-    LAUNCH_EP = 3
-    TARGET_EP = 4
-    _MAX_EP_HEADROOM = 5
-    MOE_A2A_BACKEND = "mooncake"
-
-    def test_grow_only(self):
-        self._generate_ok("pre-grow")
-
-        joiner = self._launch_scale_joiner(
-            rank_offset=self.LAUNCH_EP,
-            join_tp=self.JOIN_TP,
-            port=PORT_B,
-        )
-        type(self)._joiner_proc = joiner
-        try:
-            self.assertIsNone(
-                joiner.poll(),
-                "MC02B (Mooncake a2a) joiner exited before scale request; "
-                "see joiner log",
-            )
-            self._scale_to(
-                old_ep_size=self.LAUNCH_EP, target_ep_size=self.TARGET_EP
-            )
-            self._generate_ok("post-grow")
-        finally:
-            try:
-                kill_process_tree(joiner.pid)
-                joiner.wait(timeout=10)
-            except Exception:
-                pass
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 4,
     "Fresh 3->4 grow test needs 4 GPUs.",
 )
 class TestMooncakeScaleUpFreshGrow(_MooncakeGrowFromShrunkBase):
-    """Fresh launch at ep=3, grow to ep=4 via append-only scale mode.
+    """MC02B: launch ep=3 with headroom, append slot 3 via scale-up-v1.
 
-    Companion to :class:`TestMooncakeScaleDownNixlShrink`. Same
-    topology as :class:`TestMooncakeGrow3To4Only`. Both halves
-    (shrink + expand) run as separate single-direction tests so we
-    can validate each scale-direction on its own before touching the
-    combined shrink-then-grow flow.
-    """
+    Companion to TestMooncakeScaleDownNixlShrink (shrink-only baseline)."""
 
     LAUNCH_EP = 3
     TARGET_EP = 4
@@ -1289,17 +891,26 @@ class TestMooncakeScaleUpFreshGrow(_MooncakeGrowFromShrunkBase):
 
 
 @unittest.skipUnless(
+    _count_visible_gpus() >= 4,
+    "MC02B (Mooncake a2a) differential grow-only needs 4 GPUs.",
+)
+class TestMooncakeGrow3To4OnlyMooncakeA2A(TestMooncakeScaleUpFreshGrow):
+    """MC02B (Mooncake a2a variant): 3->4 grow-only on Mooncake a2a.
+
+    Known-fail regression fence: scale-joiner's DeepGEMM warmup asserts
+    num_groups mismatch before any collective runs. Should pass once
+    the Mooncake-a2a EPMoE runner is fixed upstream to boot with a
+    self-consistent num_groups when elastic_ep_initial_size != ep_size."""
+
+    MOE_A2A_BACKEND = "mooncake"
+
+
+@unittest.skipUnless(
     _count_visible_gpus() >= 5 and MAX_EP_SIZE >= 5,
     "MC03 grow-then-shrink E2E needs 5 GPUs and SGLANG_MC_MAX_EP_SIZE>=5.",
 )
 class TestMooncakeScaleDown4To5To4(_MooncakeShrinkEndToEndBase):
-    """4 -> 5 -> 4 grow-then-shrink.
-
-    First uses the existing append-only scale-up path to grow the
-    cohort, then shrinks the freshly-joined rank via the scale-down
-    path. Exercises the branch where the retiree's PG-init state is
-    minimally warm.
-    """
+    """4 -> 5 -> 4 grow-then-shrink; retires a freshly-joined rank."""
 
     def test_grow_then_shrink(self):
         self._generate_ok("pre-grow")
@@ -1324,92 +935,20 @@ class TestMooncakeScaleDown4To5To4(_MooncakeShrinkEndToEndBase):
 
 @unittest.skipUnless(
     os.environ.get("SGLANG_MC13_FORCE_RUN") == "1",
-    # MC13 exercises scale-up-v1 append + subsequent shrink retiring a
-    # mix of launch-cohort and ex-append-joiner slots. Blocked at the
-    # Mooncake C++ layer on the Jun 23 container image (mooncake-
-    # transfer-engine-cuda13 0.3.11.post1): sub-group Process Groups
-    # (``cpu_group`` / ``device_group``) are sized at PG construction
-    # to the launch cohort width, and their ``P2PProxy`` peer arrays
-    # cannot grow to host the appended rank. When the appended rank's
-    # socket resets at retirement, the sub-group ``ConnectionPoller``
-    # cascades into ``resetPeerState(peer)`` on a size-N array with
-    # peer=N and trips the internal ``TORCH_CHECK`` with
-    # ``resetPeerState: peer_rank out of range: N size: N``. The
-    # kvcache-ai/Mooncake PR #2623 (merged 2026-06-26, shipped in
-    # 0.3.12) sizes ``P2PProxy`` to ``max_size`` at construction, so
-    # this class becomes runnable once that wheel is loaded into the
-    # container. Export ``SGLANG_MC13_FORCE_RUN=1`` to bypass this
-    # skip after the fresh wheel has been reinstalled by the sweep
-    # harness (see scripts/_in_container_elastic_scale_up.sh).
+    # See class docstring: requires kvcache-ai/Mooncake PR #2623 (0.3.12+).
     "MC13 requires kvcache-ai/Mooncake PR #2623 (>=0.3.12); "
     "set SGLANG_MC13_FORCE_RUN=1 to run after upgrading the wheel."
 )
 class TestMooncakeScaleDown4To5To3(_MooncakeShrinkEndToEndBase):
-    """MC13: ``4 -> 5 -> 3`` scale-up-v1 append, then shrink retiring
-    a mix of launch-cohort and ex-append-joiner slots.
+    """MC13: 4 -> 5 -> 3 scale-up-v1 append, then shrink retiring both a
+    launch-cohort slot and the ex-append-joiner slot.
 
-    **Env-gated** -- runs only when ``SGLANG_MC13_FORCE_RUN=1`` is
-    exported, because the class exercises a shape that is blocked
-    at the Mooncake C++ layer on any wheel older than 0.3.12
-    (mooncake-transfer-engine-cuda13). The Jun 23 container nightly
-    ships 0.3.11.post1, which sizes each sub-group ``P2PProxy`` peer
-    array to the launch cohort width; retiring the appended rank
-    trips ``resetPeerState: peer_rank out of range: N size: N`` on
-    ``cpu_group`` / ``device_group``. kvcache-ai/Mooncake PR #2623
-    (shipped in 0.3.12, 2026-07-24) resizes ``P2PProxy`` to
-    ``max_size`` at construction and clears that invariant, so the
-    class passes end-to-end when the sweep harness reinstalls the
-    fresh wheel (see ``scripts/_in_container_elastic_scale_up.sh``
-    and ``SGLANG_ELASTIC_MOONCAKE_WHEEL`` in ``sweep_env.sh``).
+    Env-gated by SGLANG_MC13_FORCE_RUN. Mooncake <= 0.3.11.post1 sizes
+    P2PProxy peer arrays to the launch cohort, tripping resetPeerState
+    out-of-range when retiring the appended rank; fixed upstream in
+    kvcache-ai/Mooncake PR #2623 (>= 0.3.12).
 
-    Kept env-gated (not always-on) because the shipped container
-    image still bakes in 0.3.11.post1. Flipping the gate to always-
-    on requires either bumping the container's baked wheel or
-    always running through the reinstall harness. The retire-source
-    table below makes explicit which retiree-provenance combinations
-    are exercised by the baseline:
-
-    +--------------------------+-------------------+
-    | Retiree provenance       | Test class        |
-    +==========================+===================+
-    | Launch cohort only       | MC01/MC05/MC12    |
-    +--------------------------+-------------------+
-    | Ex-recover-mode joiner   | MC10              |
-    +--------------------------+-------------------+
-    | Ex-scale-up-v1 joiner    | **MC13 (this)**   |
-    +--------------------------+-------------------+
-    | Mixed launch + ex-joiner | **MC13 (this)**   |
-    +--------------------------+-------------------+
-
-    Sequence (executed end-to-end on mooncake >= 0.3.12):
-      1. Launch primary with ``LAUNCH_EP = 4``, ``MAX_EP = 5``.
-         Cohort is ranks 0-3; slot 4 is born retired.
-      2. Spawn a joiner subprocess with ``join_tp=1, rank_offset=4,
-         join_mode="scale"`` and post ``/scale_elastic_ep
-         {new_ep_size:5}``. Same append pattern as
-         :class:`TestMooncakeScaleDown4To5To4` and
-         :class:`TestMooncakeScaleUpFreshGrow` (MC02B).
-      3. Post ``/scale_elastic_ep {new_ep_size:3}``. Retires slots 3
-         (launch cohort) and 4 (ex-append-joiner). On mooncake <=
-         0.3.11.post1 this aborts inside ``ConnectionPoller`` on
-         ``cpu_group`` / ``device_group`` because their ``P2PProxy``
-         was allocated with size 4 at PG construction, so
-         ``resetPeerState(4)`` is an out-of-range access. On
-         mooncake >= 0.3.12 the array is pre-sized to
-         ``max_size == 5`` at construction, ``resetPeerState(4)`` is
-         in-range, the retire completes cleanly, and step 4 proceeds.
-      4. Verify ``/generate`` survives on the 3-rank cohort.
-
-    The launch-at-``max_ep_size`` + pre-shrink pattern is still
-    the operator-facing workaround for deployments pinned to
-    mooncake <= 0.3.11.post1: it makes every sub-group P2PProxy
-    pre-size to the widest cohort the deployment will ever need,
-    so long as that ceiling is established before the first live
-    scale event.
-
-    Single-node topology (when SGLANG_MC13_FORCE_RUN=1): needs 5 visible GPUs
-    (4 for the primary cohort + 1 for the joiner subprocess).
-    """
+    Single-node needs 5 GPUs (4 primary + 1 joiner)."""
 
     LAUNCH_EP = 4
     MAX_EP = 5
@@ -1483,23 +1022,10 @@ def _multinode_completion_marker() -> str:
 class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
     """MC05: 8 -> 6 shrink across two 4-GPU nodes.
 
-    Only runs under the ``scripts/_run_mc05_multinode.sh`` harness, which
-    sets ``SGLANG_MC_MN_ROLE`` to ``primary`` (node_rank=0) or ``worker``
-    (node_rank=1) and pins ``SGLANG_MC_MN_MASTER_HOST/PORT``.
-
-    Both nodes launch a 4-rank sglang server bound to the shared
-    ``dist-init-addr``. The primary owns the DPC + HTTP API. The retired
-    ranks (6, 7) live on the worker node; verifies that a retiree
-    ``sys.exit(0)`` propagates cleanly across nodes and that the
-    survivor cohort (0..5) can serve GSM8K post-shrink.
-
-    ``MOE_A2A_BACKEND`` selects the MoE all-to-all data plane. Now
-    defaults to ``"nixl"`` so the whole MC0N sweep runs on the same
-    hardened data plane; the Mooncake-a2a multi-node variant is not
-    kept as a separate class because the shrink-invariant baseline is
-    already covered by :class:`TestMooncakeScaleDownNixlShrink` (MC02A)
-    on the single-node side.
-    """
+    Runs under scripts/_run_mc05_multinode.sh which sets SGLANG_MC_MN_ROLE
+    to primary or worker. Retired ranks (6, 7) live on the worker node;
+    verifies retiree sys.exit propagates cleanly across nodes and that
+    the survivor cohort serves GSM8K post-shrink."""
 
     MOE_DENSE_TP_SIZE = None
     MOE_A2A_BACKEND: str = "nixl"
@@ -1562,14 +1088,9 @@ class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
     def test_scale_down_across_nodes(self):
         marker = _multinode_completion_marker()
         if MULTINODE_MODE == "worker":
-            # Worker doesn't drive the HTTP API; it parks until the
-            # primary publishes a shared-fs marker signalling that the
-            # shrink + GSM8K parity check are done, then exits pytest
-            # so both nodes tear down their sglang servers together.
-            # This avoids the driver SIGTERM'ing the worker mid-sleep
-            # after the primary has already closed its TCPStore master,
-            # which triggers spurious Mooncake pollerLoop / TCPStore
-            # broken-pipe traces on the survivor ranks.
+            # Park on the shared-fs completion marker so both nodes tear
+            # down together; avoids Mooncake / TCPStore broken-pipe
+            # noise from an asymmetric SIGTERM.
             deadline = time.time() + 600
             while time.time() < deadline:
                 if os.path.exists(marker):
@@ -1624,84 +1145,48 @@ class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
 class TestMooncakeScaleDown8To6MultiNodeNixl(TestMooncakeScaleDown8To6MultiNode):
     """MC05P: 8 -> 6 shrink across two nodes with NIXL a2a.
 
-    Same topology as :class:`TestMooncakeScaleDown8To6MultiNode`, but
-    with ``--moe-a2a-backend nixl`` on the MoE data plane. Guards the
-    post-shrink hang fix in ``NixlEPDispatcher._combine_core``: without
-    gating the per-combine ``query_mask_buffer`` + ``sync_active_to_cpu``
-    round-trip on ``NIXL._connected_ep_size != effective_ep_size``, the
-    survivor's first post-shrink combine could piggy-back a CUDA stream
-    sync on a still-pending NIXL kernel and wedge the scheduler for the
-    full NIXL timeout. Reproduces at ~50% without the fix; passes 10/10
-    with it.
-    """
+    Guards the post-shrink hang fix in NixlEPDispatcher._combine_core
+    (gate query_mask_buffer + sync_active_to_cpu on
+    NIXL._connected_ep_size != effective_ep_size)."""
 
     MOE_A2A_BACKEND = "nixl"
 
 
-# MC08: multi-node shrink-then-regrow topology constants. Keyed on
-# their own env vars so a single Slurm allocation can host MC05P and
-# MC08 without cross-talking on the shrink/regrow targets.
+# MC08 topology constants (env-keyed for co-scheduled MC05P + MC08 runs).
 MC08_LAUNCH_EP = int(os.environ.get("SGLANG_MC08_LAUNCH_EP", "8"))
 MC08_SHRINK_TARGET = int(os.environ.get("SGLANG_MC08_SHRINK_TARGET", "4"))
-# Grow-back target. Defaults to the launch cohort size because
-# partial grow-back (target < launch_ep) is not supported by the
-# recover-mode joiner rendezvous today -- Mooncake's
-# ``join_group(WORLD)`` on the joiner blocks until every survivor
-# reactivates every retiree via ``recover_ranks``, and the primary's
-# ``_try_recover_world`` also waits for peer state on
-# ``_WORLD.device_group`` / ``_WORLD.cpu_group`` which only turns True
-# when the joiner reaches its own ``join_group`` calls on those
-# sub-groups. With a partial recovery (e.g. 4->6, joiner covers
-# ranks 4, 5 while 6, 7 stay retired) the joiner never unblocks its
-# WORLD join, so the sub-group joins are never posted and the primary
-# hangs at line 490 in ``elastic_ep._try_recover_world``. Full
-# grow-back (target == launch_ep) mirrors MC02's validated 4->3->4
-# pattern.
+# Full grow-back only: partial regrow deadlocks Mooncake's
+# join_group(WORLD) rendezvous (joiner blocks until every survivor
+# reactivates every retiree via recover_ranks).
 MC08_REGROW_TARGET = int(
     os.environ.get("SGLANG_MC08_REGROW_TARGET", str(MC08_LAUNCH_EP))
 )
-# Elastic pool ceiling. Grow-back requires ``max_ep_size > launch_ep``
-# so Mooncake keeps a recoverable slot pool after the shrink (see
-# MC02's ``MAX_EP = LAUNCH_EP_SIZE + 1`` headroom trick). NIXL EP
-# additionally requires ``num_ranks < NUM_MAX_NVL_PEERS or num_ranks %
-# NUM_MAX_NVL_PEERS == 0`` (nixl_ep.cpp:131) with
-# ``NUM_MAX_NVL_PEERS = 8``, so for an 8-rank launch cohort the next
-# legal ceiling is 16 -- ``launch_ep + 1 = 9`` is single-node-only.
+# NIXL EP requires num_ranks < 8 or % 8 == 0; 8-launch needs ceiling 16.
 MC08_MAX_EP = 16
-# How many sequential ``/generate`` requests each post-regrow DP slot
-# must serve without error. Set to 1 to reproduce the original
-# "one probe per slot" criterion; higher values guard against
-# recovered slots that succeed on the first forward pass but then
-# desynchronize on subsequent ones (e.g. NIXL peer memory that gets
-# populated during the first dispatch but then stales). Sweeps every
-# DP slot in ``[0, MC08_REGROW_TARGET)`` -- survivors included --
-# because a grow-back that corrupts the shared peer table would
-# manifest on survivors too.
+# Per-slot post-regrow probes -- sweep all DP slots since a grow-back
+# corruption in the shared peer table would surface on survivors too.
 MC08_POST_REGROW_PROBES_PER_SLOT = int(
     os.environ.get("SGLANG_MC08_POST_REGROW_PROBES_PER_SLOT", "10")
 )
 
 
-def _mc08_signal_marker(kind: str) -> str:
-    """Shared-fs handshake path for MC08 primary <-> worker signaling.
+def _mc_signal_marker(
+    prefix: str, kind: str, cycle: int | None = None
+) -> str:
+    """Shared-fs handshake path for MCXX primary <-> worker signaling.
 
     Keyed by ``SLURM_JOBID`` and ``SGLANG_MC_MN_MASTER_PORT`` so
-    concurrent MC08 runs never see each other's markers. ``kind``
-    disambiguates the handshake stage:
-
-      * ``launch_joiner`` -- primary tells worker to spawn the joiner
-        subprocess right after shrink is quiesced.
-      * ``joiner_ready`` -- worker acks that the joiner is running
-        (rendezvous is up, DPC is connected).
-      * ``done`` -- primary tells worker the grow-back and parity
-        check are complete, so both sides can tear down.
+    concurrent multi-node runs never see each other's markers.
+    ``cycle`` is optional for tests with multiple shrink-regrow rounds
+    (e.g. MC09).
     """
     slurm_id = os.environ.get(
         "SLURM_JOB_ID", os.environ.get("SLURM_JOBID", "local")
     )
+    cycle_tag = "" if cycle is None else f"_c{cycle}"
     return (
         "/lustre/fsw/portfolios/network/users/qkang/logs/"
-        f"mc08_{kind}_{slurm_id}_{MULTINODE_MASTER_PORT}.marker"
+        f"{prefix}_{kind}{cycle_tag}_{slurm_id}_{MULTINODE_MASTER_PORT}.marker"
     )
 
 
@@ -1713,68 +1198,26 @@ def _mc08_signal_marker(kind: str) -> str:
 class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
     """MC08: 8 -> 4 -> N shrink-then-regrow across two nodes on NIXL a2a.
 
-    ``N`` defaults to :data:`MC08_LAUNCH_EP` (8, a full grow-back) --
-    that's the only recovery target the recover-mode joiner rendezvous
-    reliably supports today, see the note on :data:`MC08_REGROW_TARGET`
-    for why partial grow-back deadlocks in ``_join_world_group``.
+    N defaults to MC08_LAUNCH_EP (8, a full grow-back); partial grow-back
+    is blocked by a Mooncake _join_world_group deadlock (see
+    :data:`MC08_REGROW_TARGET`).
 
-    Extends the multi-node shrink harness of
-    :class:`TestMooncakeScaleDown8To6MultiNode` with MC02's recover-mode
-    grow-back:
+    Two nodes launch an 8-rank cohort with max_ep_size = launch_ep + 1;
+    shrink 8 -> 4 retires all worker-side ranks; the worker spawns a
+    single recover-mode joiner (--tp 2 --dp 2) that re-attaches to slots
+    4/5 via try_recover_ranks. Pre-shrink/post-shrink assert GSM8K parity
+    (MC01 tolerance); post-regrow asserts every DP slot serves
+    MC08_POST_REGROW_PROBES_PER_SLOT sequential /generate requests
+    (concurrent-load parity is out-of-scope for the regrow path).
 
-      * Both nodes launch an 8-rank sglang serve cohort (4 GPUs per
-        node) with ``max_ep_size = launch_ep + 1`` to reserve elastic
-        headroom -- Mooncake keeps a recoverable slot pool after the
-        shrink so ``recover_ranks`` can re-attach a joiner.
-      * The primary drives the DPC + HTTP API and issues all
-        ``/scale_elastic_ep`` calls; the worker parks on shared-fs
-        markers.
-      * Shrink 8 -> 4 retires ranks 4..7, all on the worker node.
-      * The primary then writes the ``launch_joiner`` marker so the
-        worker can spawn a single recover joiner subprocess with
-        ``--tp 2 --dp 2 --elastic-ep-join-mode recover
-        --elastic-ep-join-rank-offset 4``. The joiner occupies the
-        worker's now-free local GPUs 0/1 (which mapped to global ranks
-        4/5 in the pre-shrink cohort) and slots into those two
-        retired positions.
-      * The primary calls scale-up 4 -> N; the survivor cohort's
-        ``try_recover_ranks`` pairs with the joiner's
-        ``join_process_groups`` to bring the retired slots back.
-      * Pass criterion by stage:
-          - Pre-shrink and post-shrink: GSM8K parity with the same
-            relative tolerance MC01/MC05P use.
-          - Post-regrow: every DP slot in the restored cohort
-            (survivors *and* recovered) must serve
-            :data:`MC08_POST_REGROW_PROBES_PER_SLOT` sequential
-            ``/generate`` requests, each returning 200 OK. Concurrent
-            GSM8K parity is intentionally *not* asserted here -- the
-            acceptance target is "all N processes alive and each
-            serving a sustained sequence of one-at-a-time forward
-            passes after the topology is restored", not concurrent-
-            load correctness. The NIXL-EP combine-completion path
-            under 16-way client traffic is a separate open issue
-            tracked in the branch commit history.
-
-    NIXL a2a is required because PR #30164's grow collectives (which
-    the recover path shares) were only validated against ``--moe-a2a-
-    backend nixl``; Mooncake a2a on the grow path is known-broken and
-    additionally deadlocks the shrink half of this multi-node test in
-    ``_finalize_scale_down`` (see
-    :class:`TestMooncakeScaleDown4To3To4MooncakeA2A` docstring).
-    """
+    Requires NIXL a2a: Mooncake a2a on the grow path is known-broken
+    and additionally deadlocks the shrink half here."""
 
     MOE_DENSE_TP_SIZE = None
     MOE_A2A_BACKEND = "nixl"
     MAX_EP = MC08_MAX_EP
-    # 72 redundant experts (144 total expert copies at launch, 18 per
-    # rank on 8-rank cohort) is the minimum that keeps the shrink
-    # feasibility check happy for an 8 -> 4 halving: ``num_local *
-    # shrink_target = 18 * 4 = 72 >= num_logical (72)``. With the
-    # default 24 redundant experts each rank only stores 12 copies,
-    # so the smallest feasible shrink target is 6 -- see the primary's
-    # 400 response ``new_ep_size (N) < minimum feasible (M) for this
-    # launch: num_local=..., num_logical=72``. Matches MC04's chained
-    # 4 -> 3 -> 2 shrink override for the same reason.
+    # 72 = minimum to keep the 8->4 shrink feasible
+    # (num_local * shrink_target >= num_logical).
     EP_NUM_REDUNDANT_EXPERTS = 72
 
     @classmethod
@@ -1851,15 +1294,8 @@ class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
     ) -> subprocess.Popen:
         """Launch a recover-mode joiner subprocess on the worker node.
 
-        Mirrors :func:`_MooncakeShrinkEndToEndBase._launch_offset_joiner`
-        (a ``--nnodes 2 --node-rank 1`` joiner view rendezvousing at the
-        primary's ``dist-init-addr``) but targets the multi-node master
-        addr because MC08's primary is not on ``127.0.0.1``. The joiner
-        rendezvouses as ``rank = ep_join_rank_offset + tp_rank`` of the
-        launch-size world (``pg_world_size = elastic_ep_initial_size``),
-        which drops it into the specific retired slots that ``recover_
-        ranks`` is about to re-activate.
-        """
+        Same shape as _launch_offset_joiner but targets the multi-node
+        master addr (MC08's primary is not on 127.0.0.1)."""
         cmd = [
             "sglang",
             "serve",
@@ -1912,14 +1348,9 @@ class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
         ]
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
-        # The joiner runs on the worker node, whose local scheduler
-        # slots (pre-shrink global ranks LAUNCH_EP/2..LAUNCH_EP-1) map
-        # to worker-local GPUs 0..LAUNCH_EP/2-1. After the shrink those
-        # scheduler processes have sys.exit(0)'d so the corresponding
-        # GPUs are free; pin the joiner to the first ``join_tp`` of
-        # them so the recovered global ranks land on the same physical
-        # GPUs they occupied pre-shrink (keeps IB/NUMA topology stable
-        # across the shrink+regrow cycle).
+        # Pin joiner to the first join_tp worker-local GPUs -- the same
+        # ones the pre-shrink retirees occupied, so IB/NUMA topology
+        # stays stable across shrink+regrow.
         visible = _visible_device_ids()
         if len(visible) < join_tp:
             raise RuntimeError(
@@ -1975,9 +1406,9 @@ class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
         return False  # unreachable; keeps type-checkers happy
 
     def test_shrink_then_regrow_across_nodes(self):
-        launch_joiner_marker = _mc08_signal_marker("launch_joiner")
-        joiner_ready_marker = _mc08_signal_marker("joiner_ready")
-        done_marker = _mc08_signal_marker("done")
+        launch_joiner_marker = _mc_signal_marker("mc08", "launch_joiner")
+        joiner_ready_marker = _mc_signal_marker("mc08", "joiner_ready")
+        done_marker = _mc_signal_marker("mc08", "done")
 
         if MULTINODE_MODE == "worker":
             # Worker: wait for primary to signal joiner launch, then
@@ -2057,15 +1488,10 @@ class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
                 old_ep_size=MC08_SHRINK_TARGET,
                 target_ep_size=MC08_REGROW_TARGET,
             )
-            # Pass criterion for the grow-back half: every DP slot in
-            # the restored cohort -- both survivors [0, SHRINK_TARGET)
-            # and recovered [SHRINK_TARGET, REGROW_TARGET) -- must
-            # serve ``MC08_POST_REGROW_PROBES_PER_SLOT`` sequential
-            # /generate requests without error. We deliberately do
-            # *not* run GSM8K post-regrow -- the acceptance target is
-            # "all N processes alive and each serving a sustained
-            # stream of one-request-at-a-time forward passes after the
-            # topology is restored", not concurrent-load parity.
+            # Post-regrow criterion: every DP slot in the restored
+            # cohort serves MC08_POST_REGROW_PROBES_PER_SLOT sequential
+            # /generate calls. Concurrent-load parity is intentionally
+            # out of scope for the regrow path.
             probes = MC08_POST_REGROW_PROBES_PER_SLOT
             for dp_rank in range(MC08_REGROW_TARGET):
                 for i in range(probes):
@@ -2100,32 +1526,6 @@ class TestMooncakeScaleDown8To4To6MultiNodeNixl(_MooncakeShrinkEndToEndBase):
 MC09_NUM_CYCLES = int(os.environ.get("SGLANG_MC09_NUM_CYCLES", "2"))
 
 
-def _mc09_signal_marker(kind: str, cycle: int | None = None) -> str:
-    """Shared-fs handshake path for MC09 primary <-> worker signaling.
-
-    Keyed by ``SLURM_JOBID`` and ``SGLANG_MC_MN_MASTER_PORT`` so
-    concurrent MC09 runs never see each other's markers. ``kind`` is
-    one of:
-
-      * ``launch_joiner`` (per-cycle) -- primary tells worker to spawn
-        the recover joiner for cycle ``cycle``. Cycle 1's joiner
-        replaces the retired ranks 4..7; cycle 2's joiner takes over
-        after the second shrink retires cycle-1's joiner ranks.
-      * ``joiner_ready`` (per-cycle) -- worker acks that the cycle's
-        joiner subprocess is up.
-      * ``done`` (global) -- primary tells worker all cycles are
-        complete and both sides can tear down.
-    """
-    slurm_id = os.environ.get(
-        "SLURM_JOB_ID", os.environ.get("SLURM_JOBID", "local")
-    )
-    cycle_tag = "" if cycle is None else f"_c{cycle}"
-    return (
-        "/lustre/fsw/portfolios/network/users/qkang/logs/"
-        f"mc09_{kind}{cycle_tag}_{slurm_id}_{MULTINODE_MASTER_PORT}.marker"
-    )
-
-
 @unittest.skipUnless(
     MULTINODE_MODE in ("primary", "worker"),
     "MC09 multi-node double shrink-regrow only runs when SGLANG_MC_MN_ROLE "
@@ -2136,53 +1536,21 @@ class TestMooncakeScaleDown8To4To8To4To8MultiNodeNixl(
 ):
     """MC09: 8 -> 4 -> 8 -> 4 -> 8 double shrink-then-regrow on NIXL a2a.
 
-    Runs :class:`TestMooncakeScaleDown8To4To6MultiNodeNixl` (MC08)'s
-    shrink+regrow cycle twice back-to-back inside a single sglang
-    server process. In theory, the process state at the end of a full
-    grow-back (survivor cohort + recover-mode joiner subprocess
-    holding the recovered slots) is topologically indistinguishable
-    from a fresh 8-rank launch cohort, so cycle 2 should be as green
-    as cycle 1 (MC08 x8 was 8/8 clean at this branch tip). If MC09
-    regresses relative to MC08:
+    Runs MC08's shrink+regrow cycle twice back-to-back in one server
+    process. Cycle 2 should be topologically identical to a fresh
+    8-rank launch; a regression vs MC08 indicates retire/recover
+    residue leaking across the grow-back boundary. Each phase is
+    tagged (``cycle{N} pre-shrink`` etc.) for localization.
 
-      * A retire/recover residue is leaking across the grow-back
-        boundary (e.g. stale NIXL peer registrations, Mooncake C++
-        ``active_ranks`` not fully back to launch state, joiner
-        subprocess's HTTP server contaminating the primary's DP
-        routing, etc.).
-      * The MC09 log makes the failure point explicit: each phase
-        (``cycle{N} pre-shrink``, ``cycle{N} post-shrink``,
-        ``cycle{N} post-regrow``) is tagged, so a hang or GSM8K
-        regression can be localized to the exact side of the second
-        shrink+regrow boundary that broke.
-
-    Worker-side sequencing:
-
-      * MC08 spawns a single recover-mode joiner subprocess to fill
-        the retired slots for the (only) grow-back.
-      * MC09 must spawn a fresh joiner per cycle: after the second
-        shrink retires cycle-1's joiner ranks, cycle-1's joiner still
-        holds the worker GPUs even though its scheduler processes
-        have ``sys.exit(0)``'d. Before spawning cycle-2's joiner the
-        worker path calls :func:`kill_process_tree` on cycle-1's
-        joiner and sleeps briefly so the CUDA driver releases the
-        physical GPUs. ``type(self)._joiner_proc`` always points to
-        the most-recently-spawned joiner so ``tearDownClass`` never
-        leaks a live joiner.
-    """
+    Worker spawns a fresh joiner per cycle: after cycle-1's joiner
+    ranks retire, its HTTP wrapper still holds the worker GPUs, so
+    kill_process_tree + short sleep are required before cycle 2."""
 
     NUM_CYCLES = MC09_NUM_CYCLES
 
     def _mc09_kill_joiner(self, joiner: subprocess.Popen | None) -> None:
-        """Best-effort teardown of an idle joiner between cycles.
-
-        After a shrink retires the joiner's scheduler ranks the
-        joiner's ``sglang serve`` HTTP wrapper stays alive but holds
-        the worker-local GPUs. The next cycle's recover joiner will
-        try to bind the same physical devices, so we must kill the
-        previous joiner and give the CUDA driver a beat before
-        launching the replacement.
-        """
+        """Kill the previous cycle's idle joiner and pause so the CUDA
+        driver releases the worker GPUs before the next cycle."""
         if joiner is None:
             return
         try:
@@ -2196,14 +1564,14 @@ class TestMooncakeScaleDown8To4To8To4To8MultiNodeNixl(
         time.sleep(5)
 
     def test_shrink_then_regrow_across_nodes(self):
-        done_marker = _mc09_signal_marker("done")
+        done_marker = _mc_signal_marker("mc09", "done")
 
         if MULTINODE_MODE == "worker":
             current_joiner: subprocess.Popen | None = None
             for cycle_idx in range(self.NUM_CYCLES):
                 cycle = cycle_idx + 1
-                launch_marker = _mc09_signal_marker("launch_joiner", cycle)
-                ready_marker = _mc09_signal_marker("joiner_ready", cycle)
+                launch_marker = _mc_signal_marker("mc09", "launch_joiner", cycle)
+                ready_marker = _mc_signal_marker("mc09", "joiner_ready", cycle)
 
                 if not self._wait_for_marker(
                     launch_marker, timeout_s=900, abort_marker=done_marker
@@ -2236,23 +1604,13 @@ class TestMooncakeScaleDown8To4To8To4To8MultiNodeNixl(
                         f"rank_offset={rank_offset} join_tp={join_tp}\n"
                     )
 
-                # Park until either the next cycle's launch marker
-                # appears (drive on to spawn the next joiner) or the
-                # primary drops the done marker (all cycles complete).
-                #
-                # We deliberately do NOT poll ``current_joiner.poll()``
-                # here: the primary initiates the next cycle's
-                # shrink 8->4 before writing the next launch marker,
-                # which retires this joiner's scheduler ranks and
-                # legitimately terminates the joiner subprocess with
-                # rc=3. Treating that as a failure races the primary's
-                # shrink against the marker write. Any actual
-                # joiner-side crash surfaces as either the primary's
-                # grow-back hanging (its own scale poll times out) or
-                # the primary dropping ``done`` early, both handled
-                # below.
+                # Park until the next cycle's launch marker or done.
+                # Do NOT poll current_joiner.poll(): the primary's next
+                # shrink legitimately retires this joiner with rc=3
+                # before writing the next marker. Real joiner crashes
+                # surface as a hung primary or an early `done` marker.
                 next_launch_marker = (
-                    _mc09_signal_marker("launch_joiner", cycle + 1)
+                    _mc_signal_marker("mc09", "launch_joiner", cycle + 1)
                     if cycle_idx + 1 < self.NUM_CYCLES
                     else None
                 )
@@ -2303,8 +1661,8 @@ class TestMooncakeScaleDown8To4To8To4To8MultiNodeNixl(
 
             for cycle_idx in range(self.NUM_CYCLES):
                 cycle = cycle_idx + 1
-                launch_marker = _mc09_signal_marker("launch_joiner", cycle)
-                ready_marker = _mc09_signal_marker("joiner_ready", cycle)
+                launch_marker = _mc_signal_marker("mc09", "launch_joiner", cycle)
+                ready_marker = _mc_signal_marker("mc09", "joiner_ready", cycle)
 
                 # Shrink 8 -> 4 (retires ranks 4..7). Cycle 1: the
                 # retirees are the original worker schedulers; cycle 2:
@@ -2371,22 +1729,13 @@ class TestMooncakeScaleDown8To4To8To4To8MultiNodeNixl(
 class TestMooncakeScaleDown4To3To2(_MooncakeShrinkEndToEndBase):
     """MC04: 4 -> 3 -> 2 chained shrink.
 
-    Tests that ``ElasticEPStateManager`` correctly resets between
-    consecutive shrink requests and the survivor's ``_finalize_scale_
-    down`` handles a shrink that starts from an already-shrunk cohort
-    (effective_size=3, not the launch size 4). Also verifies the FSM
-    tears itself down cleanly after each shrink.
-
-    72 redundant experts = 36 local per rank, so 2-rank post-shrink
-    still covers all 72 DeepSeek-V3-Lite logical experts.
-    """
+    Exercises ElasticEPStateManager reset between shrinks and the
+    survivor's _finalize_scale_down starting from an already-shrunk
+    cohort. 72 redundant experts = 36 local per rank so 2-rank cohort
+    still covers all 72 logical experts."""
 
     EP_NUM_REDUNDANT_EXPERTS = 72
-    # 2-rank cohort has to pack 72 logical experts into 2 physical
-    # slots with almost no EPLB slack; allow a wider parity band at
-    # the final stage while still requiring the 3-rank intermediate
-    # to hold ordinary parity.
-    STAGE2_REL_TOL = 0.15
+    STAGE2_REL_TOL = 0.15  # 2-rank cohort has minimal EPLB slack
 
     def test_two_consecutive_shrinks(self):
         self._generate_ok("pre-shrink")
@@ -2438,54 +1787,16 @@ class TestMooncakeScaleDown4To3To2(_MooncakeShrinkEndToEndBase):
 class TestMooncakeScaleDown4To3Soak(_MooncakeShrinkEndToEndBase):
     """MC06: 4->3 shrink followed by three sustained inference rounds.
 
-    A single GSM8K pass after shrink only exercises the survivor
-    cohort for ~48s. This test runs three back-to-back GSM8K rounds
-    with short idle windows between them so we can detect issues that
-    only surface after the shrunk cohort has been serving for
-    minutes:
+    Runs three back-to-back GSM8K rounds after shrink with brief idle
+    windows to catch issues that only surface after the shrunk cohort
+    has served for minutes (slow KV leaks, EPLB reweight confusion,
+    scheduler-timer stalls).
 
-      * Slow leaks in KV cache reclamation or CUDA memory pinned by
-        the retired ranks.
-      * EPLB reweight cycles (fire every 1000 iters) getting confused
-        by the reduced ``effective_ep_size`` mid-flight.
-      * Scheduler timers / DPC keep-alive paths that pause between
-        rounds and never resume.
-
-    **Deterministic structural signal (this class opts in).**
-
-    Runs the server with :option:`--enable-deterministic-inference` +
-    a fixed :option:`--random-seed` (via ``DETERMINISTIC = True``),
-    drives GSM8K serially at ``num_threads=1``, and flushes the KV
-    cache before every round. Under this configuration the three
-    post-shrink GSM8K scores are byte-identical to each other on a
-    healthy shrunk cohort, because every source of run-to-run drift
-    is fixed:
-
-      * batch composition (``num_threads=1`` -> one request in
-        flight -> no concurrent-batching order),
-      * cross-round KV residue (:meth:`_flush_kv_cache` between
-        rounds),
-      * kernel non-determinism (``--enable-deterministic-inference``
-        forces the pytorch sampling backend, disables aiter allreduce
-        fusion, and pins the attention backend to ``fa3`` on Hopper),
-      * RNG stream (``--random-seed``).
-
-    The primary correctness assertion is therefore an **exact
-    equality** across the three post-shrink rounds. A regression that
-    corrupts the shrunk cohort in a batch-order-dependent way (e.g. a
-    stale expert weight, an off-by-one MoE dispatch, a partially
-    initialised KV pool) will make at least one of the three rounds
-    diverge and fail this assertion long before it would move the
-    GSM8K score by 5-10 percent.
-
-    A wholesale-corruption safety net ("post >= pre *
-    ``(1 - GSM8K_DETERMINISTIC_SAFETY_MARGIN)``") is retained so a
-    shrunk cohort that reproducibly answers everything wrong still
-    fails. That floor is intentionally loose (15% default) because it
-    is *not* the primary signal; single-round GSM8K noise on a 32-
-    example workload can be several percent absolute without the
-    model being wrong.
-    """
+    Uses --enable-deterministic-inference + fixed --random-seed +
+    num_threads=1 + KV flush between rounds. Primary assertion is
+    exact equality across the three post-shrink scores; a loose
+    (GSM8K_DETERMINISTIC_SAFETY_MARGIN) wholesale-corruption safety
+    net catches reproducible-but-wrong cohorts."""
 
     DETERMINISTIC = True
 
@@ -2572,57 +1883,16 @@ class TestMooncakeScaleDown4To3Soak(_MooncakeShrinkEndToEndBase):
 class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
     """MC07: 4->3 shrink under concurrent client traffic.
 
-    Pumps N concurrent ``/generate`` streams before, during, and
-    after the shrink event. Requests are time-bucketed by
-    ``start_ts`` (the wall-clock instant the client thread called
-    ``requests.post``) into three windows using the wall-clock
-    markers around the ``/scale_elastic_ep`` call:
+    Pumps N concurrent /generate streams before, during, and after the
+    shrink event. Requests are bucketed by client start_ts into
+    pre-shrink / transition / post-shrink windows. All three must be
+    100% clean; a leak in any window indicates the scheduler admission
+    gate (see Scheduler._elastic_scale_down_in_transition) let a stale
+    batch through and would trip the NIXL device-side expert-bound
+    assertion at nixl_ep_ll.cu:178.
 
-      * **pre-shrink** (warmup): must be 100% clean -- baseline
-        health check.
-      * **transition** (from the moment ``/scale_elastic_ep`` is
-        accepted until the primary reports ``serving_shrunk``):
-        must be 100% clean. With the ``retiring`` scheduler
-        admission gate in place (see
-        :meth:`Scheduler._elastic_scale_down_in_transition`, backed
-        by the atomic fold of FLIP_MASK's ``mark_retiring`` into
-        NIXL_RETIRE's barrier-consume tick body) any request whose
-        ``start_ts`` lands in this window is either (a) admitted
-        before the gate closes and services with the pre-shrink
-        layout, or (b) queued behind the gate and drains to
-        ``serving_shrunk`` before dispatch. Neither path should
-        5xx or time out; a client-visible failure here
-        means the gate leaked. Also carries the "carry-over"
-        requests: those whose ``start_ts`` landed in the
-        transition window but whose response only completed after
-        ``shrink_end_ts`` -- bucketing on ``start_ts`` keeps them
-        here rather than punishing the post-shrink bucket for
-        drain-barrier tail latency.
-      * **post-shrink** (30s of sustained load after
-        ``serving_shrunk``): must be 100% clean -- validates the
-        3-rank cohort serves normal traffic without dropped
-        requests. Requests bucketed here have ``start_ts >=
-        shrink_end_ts``, i.e. the scheduler accepted them AFTER
-        the FSM already reported ``serving_shrunk``. Any failure
-        here means a request that the server admitted on the
-        post-shrink cohort was subsequently dropped -- a real
-        regression, not a benign carry-over.
-
-    Latency sanity: post-shrink median must not exceed a bounded
-    multiple of pre-shrink median.
-
-    Failure mode this test guards against: a survivor whose scheduler
-    admits a fresh batch between the FSM tick that ran
-    ``_pre_nixl_retire`` (drops
-    :attr:`NixlEPBuffer._dispatch_ep_size` from N to K) and the
-    tick that ran ``mark_retiring`` would forward that batch with
-    the model's stale ``num_physical_experts = N * num_local``
-    fed into a NIXL kernel sized for ``K``, tripping the device
-    assertion ``dst_expert_idx < active_expert_bound`` at
-    ``nixl_ep_ll.cu:178`` and taking down the whole cohort with
-    ``cudaErrorLaunchFailure``. Detection here is via the
-    ``_assert_no_scheduler_crash`` sentinel below.
-    """
+    Also asserts post-shrink median latency stays within a bounded
+    multiple of pre-shrink median."""
 
     # 8 concurrent streams each hitting /generate every 200ms -> ~40
     # requests/s sustained. Enough to keep every rank busy without
@@ -2630,36 +1900,16 @@ class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
     NUM_WORKERS = 8
     REQUEST_INTERVAL_S = 0.2
     # ``WARMUP_S`` is the discard window at the start of the pumped load
-    # where CUDA graphs, KV allocator, and expert routing are still
-    # thawing. Requests that START in this window are dropped from the
-    # counting buckets so cold-start jitter doesn't count as a
-    # pre-shrink regression. ``PRE_SHRINK_ASSERT_S`` is the subsequent
-    # steady-state window we DO assert on -- it must be at least a few
-    # seconds wide so the pre-shrink median latency baseline is stable.
+    # Warmup discard window (cold-start jitter) then a steady-state
+    # window that we assert on.
     WARMUP_S = 20.0
     PRE_SHRINK_ASSERT_S = 10.0
     POST_SHRINK_WORKLOAD_S = 30.0
-    # Per-request client timeout. 120s > any observed drain-barrier
-    # window on this cohort size, so client-side timeouts almost
-    # always indicate a real server-side hang rather than a slow
-    # legitimate drain.
-    REQUEST_TIMEOUT_S = 120.0
-    # Post/during median latency can be at most this multiple of
-    # pre-shrink median. 5x accounts for warmup jitter and the 3-rank
-    # cohort processing the same client rate.
-    LATENCY_REGRESSION_TOL = 5.0
-    # Zero-tolerance for transition-window failures: with the
-    # ``retiring`` admission gate closed (see class docstring), every
-    # transition-window request either dispatches under the pre-shrink
-    # layout or drains behind the gate to ``serving_shrunk``. Kept as
-    # a class attribute so a bespoke soak subclass can dial in a small
-    # cushion for pathological infra flakes without editing the
-    # assertion.
+    REQUEST_TIMEOUT_S = 120.0  # > any observed drain-barrier window
+    LATENCY_REGRESSION_TOL = 5.0  # post/pre median cap
+    # Default 0.0 = zero-tolerance for transition-window failures with
+    # admission gate closed. Subclasses may widen for infra flakes.
     TRANSITION_FAILURE_TOL_FRAC = 0.0
-    # Hard cap on scheduler crashes observed via the client. Any
-    # ``Connection refused`` in the error stream means at least one
-    # scheduler process died mid-test, which is the exact class of
-    # failure the ``retiring`` gate closes. Zero-tolerance.
     SCHEDULER_CRASH_ERR_SUBSTRINGS = (
         "Connection refused",
         "ConnectionResetError",
@@ -2667,13 +1917,9 @@ class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
     )
 
     def test_shrink_under_load(self):
-        # A single small /generate is not enough to warm the KV
-        # allocator or the CUDA graph replay -- we've observed that
-        # the first ~20 concurrent requests on a freshly-launched
-        # server can queue behind cold-path allocations and hit the
-        # 120s client timeout. Prime the server with a small burst of
-        # concurrent requests and wait for them to complete before
-        # starting the timed pump.
+        # Prime with a small concurrent burst before starting the
+        # timed pump; a single small /generate is not enough to warm
+        # the KV allocator / CUDA graph replay.
         prime_ok = 0
         prime_errs: list[str] = []
         prime_threads: list[threading.Thread] = []
@@ -2811,22 +2057,9 @@ class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
         )
         post_succ, post_fail, post_errs = _summary("post-shrink", post_bucket)
 
-        # ---- scheduler-crash sentinel -----------------------------------
-        # Fail-fast if ANY bucket contains a client-side error text that
-        # indicates a scheduler process died mid-test (Connection
-        # refused / RemoteDisconnected / ConnectionResetError). The
-        # ``retiring`` admission gate (see
-        # :meth:`Scheduler._elastic_scale_down_in_transition`), backed
-        # by folding FLIP_MASK into NIXL_RETIRE's barrier-consume tick
-        # body, is what keeps the NIXL kernel from tripping the
-        # device-side assertion at ``nixl_ep_ll.cu:178`` and taking
-        # down the whole
-        # cohort with ``cudaErrorLaunchFailure``; any regression that
-        # re-opens that window surfaces here as one or more schedulers
-        # exiting with a CUDA error and the client seeing a burst of
-        # ``Connection refused`` errors on subsequent /generate calls.
-        # Zero-tolerance: even one crash-signature error is a
-        # regression.
+        # Scheduler-crash sentinel: fail-fast on client-side errors
+        # indicating a scheduler process died mid-test. Zero-tolerance:
+        # even one crash-signature is a regression of the admission gate.
         crash_hits: list[tuple[str, str]] = []
         for bucket_name, bucket in (
             ("pre-shrink", pre_bucket),
@@ -2860,16 +2093,9 @@ class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
             f"MC07 post-shrink saw {post_fail} failure(s) after "
             f"serving_shrunk (drain complete): {post_errs}",
         )
-        # Transition window: enforce the bounded failure fraction.
-        # With ``TRANSITION_FAILURE_TOL_FRAC == 0.0`` (the default,
-        # backed by the ``retiring`` admission gate) we require
-        # ``trans_fail == 0`` exactly. Subclasses can set the class
-        # attribute to a nonzero cushion if they want to tolerate a
-        # small tail. We assert on the absolute count (not the
-        # fraction) so the zero-tolerance case does not need
-        # ``assertLess(trans_frac, 0.0)`` -- which is unsatisfiable
-        # for a nonneg fraction. Printed fraction stays for
-        # observability.
+        # Transition window: default TRANSITION_FAILURE_TOL_FRAC=0 gives
+        # zero-tolerance (assert on absolute count, not fraction, since
+        # assertLess(0, 0.0) is unsatisfiable). Subclasses can widen.
         trans_total = trans_succ + trans_fail
         if trans_total > 0:
             trans_frac = trans_fail / trans_total
@@ -2969,63 +2195,25 @@ MC12_LAUNCH_EP = 6
 class TestMooncakeScaleDown6To5To4To3(_MooncakeShrinkEndToEndBase):
     """MC12: 6 -> 5 -> 4 -> 3 3-step chained shrink.
 
-    Runs three consecutive shrinks in a single cohort to exercise the
-    NIXL retire barrier's epoch derivation across a cycle-3 bucket
-    boundary. Under the legacy cumulative-arrival formula
-    ``epoch = (arrival - 1) // world_size + 1``, cycle-3 arrivals
-    straddle ``world_size = launch_ep = 6``:
+    Exercises the NIXL retire barrier's epoch derivation across the
+    cycle-3 arrival-bucket boundary. The pre-fix cumulative formula
+    ``epoch = (arrival - 1) // world_size + 1`` would split cycle 3's
+    posters across two epochs (world_size=launch_ep=6), leaving one
+    subgroup racing alone into on_flip_mask and stalling the rest on
+    a stale ready_key.
 
-      * Cycle 1 (6 posters): arrivals 1..6 -> all epoch 1. ✓
-      * Cycle 2 (5 posters): arrivals 7..11 -> all epoch 2. ✓
-      * Cycle 3 (4 posters): arrivals 12..15 -> arrival 12 lands
-        in bucket ``(12-1)//6+1 = 2``; arrivals 13..15 land in
-        bucket ``(13-1)//6+1 = 3``. **Split.**
+    LAUNCH_EP = 6 (not 8): NIXL EP asserts num_ranks < 8 or
+    num_ranks % 8 == 0 at every cohort size, and 8-launch would need
+    max_ep_size=16.
 
-    A split at cycle 3 causes cohort ranks to write to different
-    ``ready_key`` s, so one subgroup's key hits ``count ==
-    world_size`` on a stale count carried over from cycle 2, races
-    alone into ``on_flip_mask``, and closes the admission gate
-    while its peers stall waiting on the higher-epoch ready_key
-    -- the survivor cohort splits until the 300s outer timeout
-    fires. MC01-MC10 do not cover this: MC04 stops at cycle 2
-    (safe per the arithmetic above); MC10 chains a full-regrow
-    in the middle, resetting the cumulative arrival counter to a
-    world-size boundary before its second shrink.
-
-    Uses ``MOE_A2A_BACKEND = "nixl"`` because the NIXL retire
-    barrier is the one Bug A affects; Mooncake a2a does not post
-    to it. Ends at ``final_ep = 3`` (not 1) because DP-attention
-    requires ``dp_size > 1``; the 3-cycle bucket-boundary crossing
-    is what exposes Bug A, and any target size that keeps
-    ``dp_size >= 2`` on the third shrink is sufficient.
-
-    Uses ``LAUNCH_EP = 6`` (not 8) because NIXL EP asserts
-    ``num_ranks < NUM_MAX_NVL_PEERS (8) or num_ranks % 8 == 0``
-    on every cohort size at rank-init time; an 8-launch would need
-    ``max_ep_size == 16`` for headroom, more than the single-node
-    physical GPU count.
-
-    Expected pass criteria after Bug A fix:
-
-      * Cycle 1 (6 -> 5): post-shrink GSM8K within
-        ``GSM8K_REL_TOL`` of pre-shrink baseline.
-      * Cycle 2 (5 -> 4): post-shrink GSM8K within
-        ``STAGE2_REL_TOL`` (wider, per MC04's rationale).
-      * Cycle 3 (4 -> 3): ``/generate`` must return 200 -- if
-        Bug A regresses, the ``/scale_elastic_ep`` HTTP call times
-        out before we can even probe.
-    """
+    Cycle 1 / 2 assert GSM8K parity (GSM8K_REL_TOL / STAGE2_REL_TOL);
+    cycle 3 only requires /generate = 200 (post-fix survival signal)."""
 
     LAUNCH_EP = MC12_LAUNCH_EP
-    # ``MAX_EP > LAUNCH_EP`` forces ServerArgs to enable the elastic-EP
-    # code path so ``elastic_ep_initial_size`` is auto-populated to
-    # ``tp_size``. Without this, ``_init_common`` falls back to the
-    # non-elastic branch and enforces ``num_physical_experts % ep_size``
-    # ``== 0``, which blows up when a cycle's target size does not
-    # divide the fixed ``num_physical_experts`` count. Using
-    # ``LAUNCH_EP + 1`` matches the MC02A / MC03A ``+1 headroom``
-    # pattern; no rank actually joins into that reserved slot in this
-    # pure-shrink test.
+    # MAX_EP > LAUNCH_EP forces the elastic-EP code path so
+    # elastic_ep_initial_size is auto-populated; without it the
+    # non-elastic branch enforces num_physical_experts % ep_size == 0
+    # which breaks on non-divisor target sizes.
     MAX_EP = MC12_LAUNCH_EP + 1
     EP_NUM_REDUNDANT_EXPERTS = 72
     STAGE2_REL_TOL = 0.15
@@ -3126,41 +2314,20 @@ class TestMooncakeScaleDown4To3ConcurrentTrafficNixl(
     "MC03A shrink 5->4 needs 5 GPUs.",
 )
 class TestMooncakeScaleDown5To4(_MooncakeShrinkEndToEndBase):
-    """MC03A: fresh-launch ep=5, shrink to ep=4 via ``/scale_elastic_ep``.
+    """MC03A: fresh-launch ep=5, shrink to ep=4 via /scale_elastic_ep.
 
-    Structural clone of :class:`TestMooncakeScaleDownNixlShrink`
-    (MC02A, fresh 4->3 NIXL shrink) -- same base class, same shrink
-    endpoint, same NIXL a2a backend, same ``MAX_EP = LAUNCH_EP + 1``
-    elastic-slot headroom. The only differences are the cohort size
-    (``LAUNCH_EP=5`` -> ``TARGET_EP=4`` instead of 4->3) and
-    :attr:`EP_NUM_REDUNDANT_EXPERTS` (see below).
+    Shrink-only counterpart to MC03B (recover-grow 4->5) and MC03
+    (round-trip 5->4->5->4). Every rank is a launch-cohort member,
+    so any crash isolates to the pure shrink path.
 
-    Shrink-only companion to :class:`TestMooncakeGrow4To5RecoverOnly`
-    (MC03B, launch-at-5 pre-shrink-to-4 then recover-grow 4->5) and
-    :class:`TestMooncakeScaleDown5To4To5To4` (MC03, round-trip
-    ``5 -> 4 -> 5 -> 4``). MC03A skips both grow halves entirely --
-    every rank is a launch-cohort member -- so any crash in MC03A
-    must originate in the shrink path itself, and any crash in MC03
-    that is absent from both MC03A and MC03B must be attributable to
-    the shrink-after-recover interaction (retiring a slot that was
-    just re-populated by a recover-mode joiner).
-
-    ``EP_NUM_REDUNDANT_EXPERTS`` is derived from
-    :func:`_min_redundant_experts_for_shrink` -- see that helper's
-    docstring for the derivation of both constraints (EPLB layout
-    divisibility at fresh launch, and scheduler shrink feasibility at
-    the retire boundary). For ``launch_ep=5, min_target_ep=4,
-    num_logical=72`` the formula yields ``k_min = ceil(72/4) = 18`` and
-    ``n_min = 18*5 - 72 = 18`` (base=90); the default ``24`` used by
-    MC02A yields base=96 and fails the fresh tp=5 launch (96 % 5 = 1).
-    """
+    EP_NUM_REDUNDANT_EXPERTS derived from
+    _min_redundant_experts_for_shrink to satisfy EPLB layout
+    divisibility at tp=5 (base=90 vs default 96 which fails)."""
 
     MOE_A2A_BACKEND = "nixl"
     LAUNCH_EP = 5
     TARGET_EP = 4
-    # One elastic slot of headroom so Mooncake keeps the retired slot
-    # in its peer pool -- matches MC02A ``MAX_EP = LAUNCH_EP_SIZE + 1``.
-    MAX_EP = 6
+    MAX_EP = 6  # +1 headroom keeps retired slot in Mooncake pool
     EP_NUM_REDUNDANT_EXPERTS = _min_redundant_experts_for_shrink(
         launch_ep=LAUNCH_EP, min_target_ep=TARGET_EP
     )
@@ -3180,51 +2347,16 @@ class TestMooncakeScaleDown5To4(_MooncakeShrinkEndToEndBase):
 class TestMooncakeGrow4To5RecoverOnly(_MooncakeShrinkEndToEndBase):
     """MC03B: launch at 5, pre-shrink to 4, recover-grow back to 5.
 
-    Grow-only companion to :class:`TestMooncakeScaleDown5To4` (MC03A,
-    shrink-only 5->4) and :class:`TestMooncakeScaleDown5To4To5To4`
-    (MC03, round-trip). Applies the "launch at ``max_ep_size``,
-    pre-shrink, then recover into a retired slot" design principle
-    at the single-node ``LAUNCH_EP=5`` scale so the grow half of
-    MC03 can be exercised in isolation without the second retire.
-
-    Flow:
-      1. ``setUpClass`` launches the primary at ``ep=5`` with
-         ``max_ep_size=6`` (one elastic slot of headroom so Mooncake
-         keeps the retired slot reachable via ``recover_ranks`` -- see
-         MC02B's ``MAX_EP = LAUNCH_EP + 1`` trick).
-      2. ``test`` pre-shrinks 5 -> 4 via ``/scale_elastic_ep`` to
-         retire rank 4. This is the same primitive MC03A validates in
-         isolation; sequencing it in the test body (rather than
-         ``setUpClass``) keeps the fixture logic identical to the
-         shrink-only path.
-      3. A single ``--tp 1`` recover joiner subprocess boots at
-         ``rank_offset=4`` with ``--elastic-ep-join-mode recover``.
-         The joiner's ``pg_world_size`` equals ``LAUNCH_EP=5`` because
-         :meth:`_launch_offset_joiner` now passes ``cls.LAUNCH_EP``
-         (not the module-level default) to ``--elastic-ep-initial-
-         size``, matching the primary's original cohort view.
-      4. ``_scale_to(4 -> 5)`` triggers ``/scale_elastic_ep`` growth,
-         which dispatches through the v1 recover path
-         (:func:`try_recover_ranks`). The survivor cohort's
-         ``mooncake_ep.recover_ranks(WORLD, [4])`` pairs with the
-         joiner's ``mooncake_ep.join_group(WORLD)`` inside
-         :func:`join_process_groups`, flips
-         ``active_ranks[4] = 1``, and the FSM transitions to
-         ``serving_expanded``.
-      5. Post-grow probe on ``routed_dp_rank=4`` confirms the
-         recovered slot serves traffic.
-
-    ``EP_NUM_REDUNDANT_EXPERTS`` matches MC03A (18) -- same launch
-    cohort size, same minimum-target for the pre-shrink, same
-    ``_min_redundant_experts_for_shrink(5, 4)`` result.
-    """
+    Grow-only companion to MC03A (shrink 5->4) and MC03 (round-trip).
+    Exercises the "launch at max_ep_size, pre-shrink, then recover"
+    pattern in isolation: retires rank 4, then a --tp 1 recover-mode
+    joiner boots at rank_offset=4 and pairs with the survivor cohort's
+    try_recover_ranks to flip active_ranks[4] back on."""
 
     MOE_A2A_BACKEND = "nixl"
     LAUNCH_EP = 5
     TARGET_EP = 5
-    # Same MAX_EP as MC03A; +1 headroom keeps the retired slot
-    # recoverable through Mooncake's elastic pool.
-    MAX_EP = 6
+    MAX_EP = 6  # +1 headroom keeps retired slot recoverable
     EP_NUM_REDUNDANT_EXPERTS = _min_redundant_experts_for_shrink(
         launch_ep=LAUNCH_EP, min_target_ep=4
     )
@@ -3257,41 +2389,12 @@ class TestMooncakeGrow4To5RecoverOnly(_MooncakeShrinkEndToEndBase):
     "MC03 round-trip 5->4->5->4 needs 5 GPUs.",
 )
 class TestMooncakeScaleDown5To4To5To4(_MooncakeShrinkEndToEndBase):
-    """MC03: round-trip ``5 -> 4 -> 5 -> 4`` on recover path.
+    """MC03: round-trip 5 -> 4 -> 5 -> 4 on the recover path.
 
-    Composition of the MC03A and MC03B primitives, with a second
-    shrink at the end that retires the slot the recover joiner just
-    re-populated. This is the invariant the round-trip test protects:
-    "a slot that was previously retired, then re-joined via
-    ``recover_ranks``, can be retired again without leaving stale
-    Mooncake / NIXL state on the survivors".
-
-    Flow:
-      1. Launch at ``ep=5`` (single node, ``MAX_EP=6``).
-      2. Shrink 5 -> 4 (retires rank 4).
-      3. Spawn ``--tp 1 --elastic-ep-join-mode recover``
-         ``rank_offset=4`` joiner subprocess.
-      4. Grow 4 -> 5 via ``/scale_elastic_ep`` (recover). Rank 4 is
-         now populated by the joiner subprocess.
-      5. Shrink 5 -> 4 again (retires rank 4 -- the JUST-recovered
-         slot). The joiner subprocess ``sys.exit(0)``s from its
-         ``local_cleanup`` hook when its slot is marked retired.
-
-    Historical context: an earlier "v2 grow" design (since discarded)
-    crashed at the equivalent of step 5 with a Mooncake
-    ``resetPeerState: peer_rank out of range: 4 size: 4`` abort
-    because the launch cohort was 4 and P2PProxy's per-peer array
-    didn't grow to include appended rank 4. Redesigning around the
-    "launch at ``max_ep_size``, pre-shrink" pattern makes rank 4 a
-    launch-cohort member from the start, so P2PProxy sizes its
-    per-peer array to 5 slots at boot; step 5's retire just flips
-    ``active_ranks[4]`` back to 0 (Mooncake-native shrink), same as
-    MC03A. Reusing the v1 recover path (see MC08) removes the crash
-    class without any special-case handling.
-
-    See :meth:`TestMooncakeGrow4To5RecoverOnly.test_recover_grow` for
-    the grow-half narration; the shrink half mirrors MC03A verbatim.
-    """
+    Composes MC03A (shrink) and MC03B (recover-grow) with a final
+    shrink that retires the just-recovered slot. Protects the
+    invariant: "a slot recovered via recover_ranks can be retired
+    again without stale Mooncake / NIXL survivor state"."""
 
     MOE_A2A_BACKEND = "nixl"
     LAUNCH_EP = 5
@@ -3357,56 +2460,17 @@ class TestMooncakeScaleDown5To4To5To4(_MooncakeShrinkEndToEndBase):
     "MC14 shrink-recover-then-append needs 5 GPUs.",
 )
 class TestMooncakeScaleDown4To3To4To5(_MooncakeShrinkEndToEndBase):
-    """MC14: ``4 -> 3 -> 4 -> 5`` shrink, recover-back, then scale-up-v1 append.
+    """MC14: 4 -> 3 -> 4 -> 5 shrink, recover-back, then scale-up-v1 append.
 
-    Chains MC02 (``4 -> 3 -> 4`` recover round-trip) with MC02B
-    (``4 -> 5`` append) end-to-end to verify that a completed
-    shrink+recover cycle leaves the elastic-EP state clean enough for a
-    subsequent scale-up-v1 append to succeed.
+    Chains MC02 (recover round-trip) with MC02B (append) to verify a
+    completed shrink+recover leaves elastic-EP state clean for a
+    subsequent append. Ends with rank 4 as a WORLD-only append slot;
+    does NOT retire it (that shape is MC13 and requires Mooncake >=
+    0.3.12; see :class:`TestMooncakeScaleDown4To5To3`).
 
-    Ends with rank 4 as a WORLD-only append-slot. The test
-    intentionally does NOT retire rank 4 -- retiring the appended slot
-    would trip the Mooncake C++ P2PProxy invariant on the launch-time
-    sub-group backends (``cpu_group`` / ``device_group``), which were
-    sized to 4 at boot and cannot bounds-check ``pollPeer(4)`` when
-    rank 4's socket closes. That crash class is exactly what MC13
-    (:class:`TestMooncakeScaleDown4To5To3`) is the skipped diagnostic
-    for.
-
-    Flow:
-
-    1. Launch at ``ep=4, max_ep=5``. WORLD's P2PProxy is 5-wide;
-       every sub-group's P2PProxy (cpu_group, device_group, TP, DP,
-       EP, moe_ep) is 4-wide because sub-groups inherit width from
-       the launch cohort's rank list.
-    2. Warmup ``/generate`` on the 4-rank cohort.
-    3. Shrink ``4 -> 3`` (MC01 shape). Rank 3 retires. Every
-       P2PProxy's ``pollPeer(3)`` on the retiree socket close is
-       in-bounds (3 < 4 <= 5).
-    4. Warmup on the 3-rank cohort.
-    5. Recover ``3 -> 4`` (MC02 shape). A joiner subprocess boots
-       into slot 3 with ``ep_join_mode=recover``. Every PG's
-       ``recover_ranks(pg, [3])`` writes into the existing slot 3.
-       No new peer indices are touched.
-    6. Warmup on the 4-rank cohort. ``_finalize_scale_recover``
-       cleared ``server_args.ep_join_mode`` on rank 3, so the primary
-       treats it as a normal cohort member for the next scale.
-    7. Append ``4 -> 5`` (MC02B shape). A second joiner subprocess
-       boots into slot 4 with ``ep_join_mode=scale``. Rank 4 joins
-       WORLD only (WORLD is 5-wide, in-bounds). Sub-groups skip the
-       join per the ``include_subgroups=False`` path in
-       ``_join_world_group`` because the joiner's own boot-time sub-
-       PGs have different Mooncake IDs than the primary's launch-
-       time ones.
-    8. Warmup on the 5-rank cohort. Rank 4 is alive; no socket close
-       on index 4 fires anywhere.
-
-    Invariant protected: the elastic-EP state after ``commit_scale``
-    for a recover is indistinguishable (from the primary's / scale-
-    request-handler's perspective) from the state after a fresh boot
-    at the same cohort size, so the very next scale request can be
-    an append.
-    """
+    Invariant: post-commit_scale state for recover is indistinguishable
+    (from the scale-request handler's view) from a fresh boot at the
+    same cohort size, so the next request can be an append."""
 
     MOE_A2A_BACKEND = "nixl"  # scale-up-v1 requires NIXL a2a (per PR #30164)
     MAX_EP = 5                # WORLD's P2PProxy must be >= 5-wide for the append
@@ -3465,23 +2529,11 @@ class TestMooncakeScaleDown4To3To4To5(_MooncakeShrinkEndToEndBase):
                     pass
 
 
-# ---------------------------------------------------------------------------
-# MC10: multi-node partial-recovery test.
-#
-# Extends MC08's 8->4->8 shrink-then-full-regrow with a SECOND shrink
-# down to 6, so the final cohort is a strict subset of the recovered
-# cohort. Validates that ranks recovered via ``try_recover_ranks`` can
-# be retired again, which is the "partial recovery" invariant the
-# test asserts.
-#
-# The two-step shape (``8 -> 4 -> 8 -> 6``, not a direct ``8 -> 4 -> 6``)
-# is dictated by a Mooncake limitation: ``join_group(WORLD)`` on the
-# joiner blocks until every survivor calls ``recover_ranks`` for every
-# retired peer in its world_size. Partial regrow (joiner covers only
-# some retirees, others stay retired) deadlocks on the joiner side.
-# Full regrow followed by a second shrink is a strict superset of the
-# desired final topology and stays on validated primitives.
-# ---------------------------------------------------------------------------
+# MC10: multi-node partial-recovery. Extends MC08 with a second shrink
+# down to 6 so the final cohort is a strict subset of the recovered
+# cohort (retire ranks that were re-populated by try_recover_ranks).
+# Two-step shape (not a direct 8->4->6 partial regrow) because
+# Mooncake's join_group(WORLD) deadlocks on partial regrow.
 MC10_LAUNCH_EP = int(os.environ.get("SGLANG_MC10_LAUNCH_EP", "8"))
 MC10_SHRINK_TARGET = int(os.environ.get("SGLANG_MC10_SHRINK_TARGET", "4"))
 # Full regrow target. Must equal ``MC10_LAUNCH_EP`` per the
@@ -3514,21 +2566,6 @@ MC10_POST_REGROW_PROBES_PER_SLOT = int(
 )
 
 
-def _mc10_signal_marker(kind: str) -> str:
-    """Shared-fs handshake for MC10 primary <-> worker signaling.
-
-    Same convention as :func:`_mc08_signal_marker` but keyed on ``mc10``
-    so concurrent MC08/MC10 runs never see each other's markers.
-    """
-    slurm_id = os.environ.get(
-        "SLURM_JOB_ID", os.environ.get("SLURM_JOBID", "local")
-    )
-    return (
-        "/lustre/fsw/portfolios/network/users/qkang/logs/"
-        f"mc10_{kind}_{slurm_id}_{MULTINODE_MASTER_PORT}.marker"
-    )
-
-
 @unittest.skipUnless(
     MULTINODE_MODE in ("primary", "worker"),
     "MC10 multi-node partial-recovery only runs when SGLANG_MC_MN_ROLE "
@@ -3537,72 +2574,22 @@ def _mc10_signal_marker(kind: str) -> str:
 class TestMooncakeScaleDown8To4To8To6MultiNodeNixl(
     TestMooncakeScaleDown8To4To6MultiNodeNixl
 ):
-    """MC10: ``8 -> 4 -> 8 -> 6`` partial-recovery across two nodes on NIXL a2a.
+    """MC10: 8 -> 4 -> 8 -> 6 partial-recovery across two nodes on NIXL a2a.
 
-    Extension of :class:`TestMooncakeScaleDown8To4To6MultiNodeNixl`
-    (MC08) with a SECOND shrink at the end that retires the top two
-    ranks (6, 7) which the recover-mode grow-back just re-populated.
-    Validates the "retire ranks that were previously rejoined via
-    recover" invariant end-to-end on the multi-node NIXL a2a topology.
+    Extends MC08 (see :class:`TestMooncakeScaleDown8To4To6MultiNodeNixl`)
+    with a final 8 -> 6 shrink that retires ranks 6, 7 which were just
+    re-populated by the recover-mode grow-back. Covers the
+    "retire ranks that were previously rejoined via recover_ranks"
+    contract on multi-node NIXL a2a.
 
-    Why the two-step ``8 -> 4 -> 8 -> 6`` shape instead of a direct
-    ``8 -> 4 -> 6`` partial regrow:
-
-      * Direct partial regrow deadlocks in Mooncake's C++
-        ``join_group(WORLD)``. When the joiner covers only a strict
-        subset of the retirees (e.g. [4, 5] with [6, 7] staying
-        retired), the joiner's ``mooncake_ep.join_group(WORLD)`` waits
-        forever for RDMA handshakes with the still-retired peers,
-        AND the survivor's ``recover_ranks`` cannot flip the mask
-        without ``peerConnected`` -- a chicken-and-egg documented at
-        :data:`MC08_REGROW_TARGET`. This is a Mooncake limitation
-        independent of which sglang endpoint drives the recover.
-      * Full regrow (target == launch_ep) IS validated end-to-end by
-        MC08. In a full regrow the joiner's default ``active_ranks``
-        mask matches the primary's post-recover mask exactly, so
-        ``join_group(WORLD)`` completes and ``recover_ranks``
-        proceeds normally.
-      * A second shrink ``8 -> 6`` is a straightforward exercise of
-        the (also validated) shrink FSM. It retires ranks 6 and 7 --
-        ranks that were JUST recovered by the recover joiner -- so
-        this step specifically covers the "retire ranks that were
-        previously rejoined via recover_ranks" contract.
-
-    The final 6-rank cohort is topologically equivalent to what a
-    hypothetical direct ``8 -> 4 -> 6`` would produce (survivors
-    [0, 4) + recovered [4, 6); slots [6, 8) retired), so downstream
-    workloads see the same routing table.
-
-    Test flow (primary path):
-
-    1. Both nodes launch an 8-rank sglang serve cohort
-       (inherited from MC08's ``setUpClass``).
-    2. Pre-shrink GSM8K parity (8-rank baseline).
-    3. Shrink ``8 -> 4`` via ``/scale_elastic_ep`` retires ranks
-       4..7 (all on the worker node). Post-shrink GSM8K parity.
-    4. Primary drops the ``launch_joiner`` marker. Worker spawns a
-       single ``--tp 4 --dp 4 --elastic-ep-join-mode recover
-       --elastic-ep-join-rank-offset 4`` joiner subprocess covering
-       every retired rank [4, 8).
-    5. Primary ``/scale_elastic_ep`` grow ``4 -> 8``: survivor
-       cohort's ``try_recover_ranks([4, 5, 6, 7])`` pairs with the
-       joiner's ``join_process_groups``, flips
-       ``active_ranks[4..7] = 1``.
-    6. Second shrink ``8 -> 6`` via ``/scale_elastic_ep`` retires
-       ranks 6, 7. This is the step that validates "retire ranks
-       that were just recovered".
-    7. Final-cohort acceptance: every DP slot in
-       ``[0, MC10_FINAL_SHRINK_TARGET) == [0, 6)`` must serve
-       :data:`MC10_POST_REGROW_PROBES_PER_SLOT` sequential
-       ``/generate`` requests. Slots [6, 8) are deliberately NOT
-       probed -- they were retired by the final shrink.
-    8. Primary drops ``done``; worker exits its poll loop.
-    """
+    Two-step (full-regrow then shrink) rather than a direct 8 -> 4 -> 6
+    partial regrow because direct partial regrow deadlocks in
+    Mooncake's C++ join_group(WORLD) (see :data:`MC08_REGROW_TARGET`)."""
 
     def test_shrink_regrow_shrink_across_nodes(self):
-        launch_joiner_marker = _mc10_signal_marker("launch_joiner")
-        joiner_ready_marker = _mc10_signal_marker("joiner_ready")
-        done_marker = _mc10_signal_marker("done")
+        launch_joiner_marker = _mc_signal_marker("mc10", "launch_joiner")
+        joiner_ready_marker = _mc_signal_marker("mc10", "joiner_ready")
+        done_marker = _mc_signal_marker("mc10", "done")
 
         if MULTINODE_MODE == "worker":
             if not self._wait_for_marker(

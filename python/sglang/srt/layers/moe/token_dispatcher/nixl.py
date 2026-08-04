@@ -506,26 +506,10 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
-        # Lazy peer-state discovery via ``query_mask_buffer``:
-        # only run when NIXL's connected peer set may not yet reflect
-        # the elastic-EP active mask. Explicit ``on_retire`` /
-        # ``on_admit`` calls already keep NIXL in sync during a
-        # controlled scale event, so the mask-buffer round-trip is
-        # only useful when the connected size and the effective EP
-        # size disagree -- e.g. an uncontrolled peer death that our
-        # scale-down path did not trigger.
-        #
-        # Skipping when they agree matters on multi-node NIXL a2a
-        # scale-DOWN: the round-trip ends in
-        # ``sync_active_to_cpu`` -> ``active_ranks.cpu()``, which
-        # forces a CUDA stream sync. If the survivor's first
-        # post-shrink combine kernel is still pending on the NIXL
-        # stream (its FINISHED_SUM_TAG round hasn't resolved because
-        # some peer state was churned by retire), that sync piggy-
-        # backs on the stalled combine and the scheduler wedges for
-        # the full NIXL timeout. On MC05P (8->6 across 2 nodes) this
-        # reproduced as a ~50% post-shrink /generate hang; gating on
-        # ``connected != n`` makes 6/6 stress runs pass.
+        # Lazy peer-state discovery: only when NIXL connected size
+        # disagrees with effective EP size (uncontrolled peer death).
+        # Gating avoids a CUDA sync that would piggyback on a stalled
+        # post-shrink combine and wedge the scheduler.
         if self._mask_buffer is not None:
             connected = NixlEPBuffer._state().connected_ep_size
             n = ElasticEPStateManager.get_effective_ep_size()

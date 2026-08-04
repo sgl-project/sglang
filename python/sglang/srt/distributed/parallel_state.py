@@ -86,11 +86,9 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
-# Python-side handle to the mask tensor that Mooncake C++ reads on every
-# collective enqueued on ``torch.distributed.group.WORLD``. Sub-groups
-# stash their own copy on the wrapping GroupCoordinator; WORLD has no
-# wrapper, so we stash it here and let elastic-EP flip retiree/joiner
-# slots symmetrically with sub-groups.
+# Python-side handle to Mooncake C++'s WORLD active_ranks mask tensor.
+# Sub-groups stash their own copy on GroupCoordinator; WORLD has no
+# wrapper, so we stash it here for elastic-EP mask flips.
 _WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
 _WORLD_BACKEND_RANKS: List[int] = []
 
@@ -338,11 +336,9 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.pg import MooncakeBackendOptions
 
-                # Primaries reserve ``max_world_size`` slots only when it
-                # exceeds the current group size; recovered-rank joiners
-                # must pass ``max_world_size`` whenever it is at least
-                # the group size so Mooncake attaches to the pre-reserved
-                # peer pool instead of allocating a fresh one.
+                # Primaries reserve max_world_size only when >
+                # current group; recovered joiners use >= so they
+                # attach to the pre-reserved peer pool.
                 if recovered_rank:
                     pass_max_ws = (
                         max_world_size is not None and max_world_size >= len(ranks)
@@ -2168,11 +2164,8 @@ def init_distributed_environment(
         if backend == "mooncake":
             from mooncake.pg import MooncakeBackendOptions
 
-            # Growth-capable launches (``max_world_size > world_size``)
-            # reserve extra slots in the peer pool so a later
-            # ``recover_ranks`` / grow-back can reactivate a reserved
-            # slot. A recovered-rank joiner uses ``>=`` because it may
-            # fill the last reserved slot exactly.
+            # max_world_size > world_size reserves growth slots for
+            # later recover_ranks. Joiners use >= to fill the last slot.
             if recovered_rank:
                 use_max_ws = (
                     max_world_size is not None and max_world_size >= world_size
@@ -2203,18 +2196,10 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Publish the WORLD-backend active_ranks tensor so elastic-EP
-        # can flip retiree/joiner slots when this PG is used directly.
-        # Sub-groups created via GroupCoordinator stash their own
-        # tensor on the coordinator; WORLD has no wrapper, so the
-        # reference lives only inside Mooncake C++ once
-        # init_process_group returns. Collectives that target
-        # ``torch.distributed.group.WORLD`` (mlp_sync in DP-attention,
-        # dist.barrier(dist.group.WORLD)) read that tensor at
-        # enqueue time; without a python-side handle, ``try_retire_
-        # ranks`` / ``try_recover_ranks`` cannot re-mask them after a
-        # shrink or grow-back, and the joiner cohort drifts out of
-        # sync with the survivor cohort under load.
+        # Publish the WORLD active_ranks tensor for elastic-EP mask
+        # flips. WORLD has no coordinator wrapper, so without this
+        # handle try_retire_ranks / try_recover_ranks cannot re-mask
+        # any WORLD-scope collective (mlp_sync, barrier).
         if backend == "mooncake":
             _register_world_backend_active_ranks(
                 active_ranks, list(range(ar_size))

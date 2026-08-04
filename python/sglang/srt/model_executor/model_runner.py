@@ -18,10 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-import os
-import socket
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -416,158 +413,7 @@ class ModelRunner:
         self.initialize()
         self.check_quantized_moe_compatibility()
 
-        if (
-            self.server_args.elastic_ep_backend is not None
-            and self.server_args.is_ep_joiner
-        ):
-            is_scale_join = self.server_args.ep_join_mode == "scale"
-            # A recover-offset joiner fills a previously retired slot
-            # inside the launch cohort (0 <= offset < initial_size). It
-            # rejoins every launch-time PG and pairs with the survivor's
-            # ``_finalize_scale_recover`` in ``maybe_join_ep_ranks``.
-            is_recover_offset_join = (
-                not is_scale_join and self.server_args.is_ep_offset_joiner
-            )
-            if is_scale_join:
-                # Cohort-target handshake for scale-mode append. The joiner
-                # (this subprocess) publishes ``rank_offset -> post-grow
-                # size`` into the shared TCPStore BEFORE joining Mooncake's
-                # WORLD PG. The primary's ``maybe_join_ep_ranks`` polls
-                # this key via ``get_scale_cohort_target(...)`` while in
-                # ``scale_phase == "waiting_for_cohort"`` and only calls
-                # ``try_admit_scale_ranks`` (which itself invokes
-                # ``mooncake_ep.recover_ranks(WORLD, ...)``) once the key
-                # is present. Without this handshake the primary rushes
-                # into a WORLD-scope Mooncake collective before the joiner
-                # subprocess exists in Mooncake's peer table, and both
-                # sides deadlock -- see :func:`register_scale_cohort` for
-                # why this must run before ``join_scale_process_group``.
-                #
-                # Recover-mode grow uses a different handshake: the
-                # scheduler posts ``pending_recover_ranks`` in the
-                # ``/scale_elastic_ep`` HTTP handler, which is
-                # unambiguous even before the joiner comes up, so recover
-                # skips the cohort-target key entirely.
-                join_effective_ep_size = (
-                    self.server_args.ep_join_rank_offset + self.server_args.tp_size
-                )
-                dist.barrier(group=self.tp_group.cpu_group)
-                if self.ps.tp_rank == 0:
-                    register_scale_cohort(
-                        self.server_args.ep_join_rank_offset,
-                        join_effective_ep_size,
-                    )
-                join_scale_process_group()
-            else:
-                join_process_groups()
-
-            if is_scale_join:
-                self.server_args.override(
-                    "elastic_ep.scale_join", ep_size=join_effective_ep_size
-                )
-            elif is_recover_offset_join:
-                # Post-grow cohort size = the highest rank this joiner
-                # slots into, plus one (``rank_offset + tp_size``). For
-                # a *full* grow-back (e.g. launch=4, offset=3, tp=1)
-                # this equals ``elastic_ep_initial_size``, but a partial
-                # grow-back that only recovers a prefix of the retired
-                # slots (e.g. launch=8, effective=4, target=6,
-                # offset=4, tp=2) has ``rank_offset + tp_size = 6 <
-                # elastic_ep_initial_size = 8``. Using
-                # ``elastic_ep_initial_size`` here would fold the
-                # still-retired trailing ranks (6, 7 in that example)
-                # into the joiner's ``active_ranks`` mask and its
-                # DP-attention world, deadlocking on any collective
-                # that expects them to be alive. Assumes recovery
-                # brings back a contiguous prefix of retired slots
-                # starting at ``ep_join_rank_offset``, which matches
-                # ``ElasticEPStateManager.get_pending_recover_ranks``'s
-                # ``list(range(effective, target))``.
-                join_effective_ep_size = (
-                    self.server_args.ep_join_rank_offset
-                    + self.server_args.tp_size
-                )
-
-            # Both scale-join (append-tail) and recover-mode (refill
-            # a trailing retired slot) grow paths broadcast EPLB
-            # metadata from global rank 0. Rank 0 is a permanent
-            # incumbent under the current shrink/recover contract
-            # (shrinks retire trailing ranks; recovers refill trailing
-            # slots), so it is a valid ``src`` on both the survivor
-            # cohort and any joiner subprocess. Previously the
-            # recover-mode joiner elected itself here -- its
-            # ``active_ranks_cpu`` at this point has only its own bit
-            # flipped (the mask flip runs later in this init block),
-            # so ``_get_healthy_expert_location_src_rank`` short-
-            # circuited to its own global rank while the survivor
-            # cohort's call to the same helper (with fresh
-            # ``active_ranks_cpu`` + ``rejoining_ranks``) elected rank 0.
-            # The resulting ``torch.distributed.broadcast`` calls had
-            # different ``src`` on different ranks -- semantically
-            # illegal; worked only because Mooncake tolerates
-            # mismatched src.
-            broadcast_global_expert_location_metadata(
-                model_config=self.model_config,
-                moe_ep_rank=self.ps.tp_rank + self.server_args.ep_join_rank_offset,
-                src_rank=0,
-            )
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    self.server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.ps.tp_rank + self.server_args.ep_join_rank_offset,
-                )
-            )
-
-            if is_scale_join or is_recover_offset_join:
-                from sglang.srt.layers.dp_attention import (
-                    enable_joiner_all_gather,
-                    update_dp_attention_post_scale,
-                )
-
-                enable_joiner_all_gather()
-                update_dp_attention_post_scale(
-                    new_dp_size=join_effective_ep_size,
-                    new_dp_rank=self.ps.tp_rank + self.server_args.ep_join_rank_offset,
-                )
-                self.server_args.override(
-                    "elastic_ep.scale_join", dp_size=join_effective_ep_size
-                )
-                self.dp_size = join_effective_ep_size
-                if self.eplb_manager is not None:
-                    self.eplb_manager.disable_rebalance(
-                        "EPLB rebalance is disabled after elastic EP scale-up"
-                    )
-
-                inst = ElasticEPStateManager.instance()
-                if inst is not None:
-                    inst.active_ranks.zero_()
-                    inst.active_ranks[:join_effective_ep_size] = 1
-                    inst.snapshot_active_to_last()
-                    inst.sync_active_to_cpu()
-                    inst.effective_ep_size = join_effective_ep_size
-                    inst.scale_phase = "syncing_new_world"
-
-                if is_recover_offset_join:
-                    # Sync random seed from the survivor cohort. Paired
-                    # with the ``is_source=True`` write in
-                    # :meth:`_finalize_scale_recover` on the primary
-                    # survivor. Uses TCPStore instead of
-                    # ``broadcast_pyobj(cpu_group=WORLD)`` because a
-                    # partial-recover deployment leaves the retired-slot
-                    # subprocesses ``sys.exit(0)``'d while their global
-                    # ranks remain nominally in WORLD; a Gloo collective
-                    # would wait for those never-responding peers.
-                    self._sync_random_seed_via_store(is_source=False)
-
-                self._elastic_scale_ready_barrier(
-                    target_size=join_effective_ep_size,
-                    log_tag="JOINER",
-                )
-                if inst is not None:
-                    inst.scale_phase = "serving_expanded"
-            else:
-                ElasticEPStateManager.instance().reset()
+        self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -590,6 +436,157 @@ class ModelRunner:
         self.weight_load_time = 0.0
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
+
+    def _initialize_elastic_ep_joiner(self) -> None:
+        if not (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.is_ep_joiner
+        ):
+            return
+
+        # Route non-scale joiners (recover-offset, fault-recovery) to a
+        # sibling init path; the scale-join body below matches upstream.
+        if self.server_args.ep_join_mode != "scale":
+            self._initialize_elastic_ep_non_scale_joiner()
+            return
+
+        join_effective_ep_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
+        dist.barrier(group=self.tp_group.cpu_group)
+        if self.ps.tp_rank == 0:
+            register_scale_cohort(
+                self.server_args.ep_join_rank_offset,
+                join_effective_ep_size,
+            )
+        join_scale_process_group()
+        self.server_args.override(
+            "elastic_ep.scale_join", ep_size=join_effective_ep_size
+        )
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=0,
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        from sglang.srt.layers.dp_attention import (
+            enable_joiner_all_gather,
+            update_dp_attention_post_scale,
+        )
+
+        enable_joiner_all_gather()
+        update_dp_attention_post_scale(
+            new_dp_size=join_effective_ep_size,
+            new_dp_rank=global_ep_rank,
+        )
+        self.server_args.override(
+            "elastic_ep.scale_join", dp_size=join_effective_ep_size
+        )
+        self.dp_size = join_effective_ep_size
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled while elastic EP scale-up "
+                "is being finalized"
+            )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.active_ranks.zero_()
+            state.active_ranks[:join_effective_ep_size] = 1
+            state.snapshot_active_to_last()
+            state.sync_active_to_cpu()
+            state.effective_ep_size = join_effective_ep_size
+            state.scale_phase = "syncing_new_world"
+        self._elastic_scale_ready_barrier(
+            target_size=join_effective_ep_size,
+            log_tag="JOINER",
+        )
+        if state is not None:
+            state.scale_phase = "serving_expanded"
+
+    def _initialize_elastic_ep_non_scale_joiner(self) -> None:
+        """Init path for recover-offset and fault-recovery joiners.
+
+        Recover-offset (``is_ep_offset_joiner`` with ``ep_join_mode ==
+        "recover"``) fills a previously retired slot inside the launch
+        cohort; pairs with the survivor-side ``_finalize_scale_recover``.
+        Fault-recovery (offset=0) rejoins WORLD and resets scale state.
+        """
+        is_recover_offset_join = self.server_args.is_ep_offset_joiner
+        join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=0,
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        if not is_recover_offset_join:
+            ElasticEPStateManager.instance().reset()
+            return
+
+        # Recover-mode post-grow cohort size = rank_offset + tp_size
+        # (NOT elastic_ep_initial_size). Partial grow-backs leave a
+        # trailing suffix of retired slots that must stay masked out.
+        join_effective_ep_size = (
+            self.server_args.ep_join_rank_offset + self.server_args.tp_size
+        )
+
+        from sglang.srt.layers.dp_attention import (
+            enable_joiner_all_gather,
+            update_dp_attention_post_scale,
+        )
+
+        enable_joiner_all_gather()
+        update_dp_attention_post_scale(
+            new_dp_size=join_effective_ep_size,
+            new_dp_rank=global_ep_rank,
+        )
+        self.server_args.override(
+            "elastic_ep.scale_join", dp_size=join_effective_ep_size
+        )
+        self.dp_size = join_effective_ep_size
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled while elastic EP scale-up "
+                "is being finalized"
+            )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.active_ranks.zero_()
+            state.active_ranks[:join_effective_ep_size] = 1
+            state.snapshot_active_to_last()
+            state.sync_active_to_cpu()
+            state.effective_ep_size = join_effective_ep_size
+            state.scale_phase = "syncing_new_world"
+
+        # TCPStore, not broadcast_pyobj: partial-recover leaves retired-
+        # slot subprocesses exited but nominally in WORLD, and a Gloo
+        # collective would wait for those never-responding peers.
+        self._sync_random_seed_via_store(is_source=False)
+
+        self._elastic_scale_ready_barrier(
+            target_size=join_effective_ep_size,
+            log_tag="JOINER",
+        )
+        if state is not None:
+            state.scale_phase = "serving_expanded"
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
@@ -1863,26 +1860,9 @@ class ModelRunner:
             recorder.start_record()
         self.eplb_manager.enable_rebalance()
 
-    def _reset_eplb_after_elastic_scale_failure(self) -> None:
-        if self.eplb_manager is None:
-            return
-        set_global_expert_distribution_recorder(
-            ExpertDistributionRecorder.init_new(
-                self.server_args,
-                get_global_expert_location_metadata(),
-                rank=self._elastic_global_rank(),
-            )
-        )
-        self._rearm_eplb_after_elastic_scale()
-
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
-        # Guard on global rank 0 (``_elastic_global_rank()``) instead of the
-        # local ``tp_rank``. Ex-joiners whose subprocess covers e.g. global
-        # ranks 4..5 have their local ``tp_rank == 0`` too; after their
-        # ``ep_join_mode`` is cleared, ``is_ep_joiner`` is ``False`` and a
-        # plain ``tp_rank == 0`` check would let the ex-joiner emit a
-        # duplicate ``ElasticScaleUpdateReq`` alongside the primary's on any
-        # subsequent scale event.
+        # Global rank 0 (not local tp_rank): ex-joiners also have
+        # tp_rank==0 and would emit a duplicate update.
         if self._elastic_global_rank() != 0:
             return
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
@@ -1958,14 +1938,9 @@ class ModelRunner:
             new_dp_rank=self._elastic_global_rank(),
         )
         self.server_args.override("elastic_ep.scale", dp_size=target_size)
-        # ``update_dp_attention_post_scale`` only updates the module-level
-        # ``_ATTN_DP_SIZE`` and ``_ATTN_DP_RANK`` globals; the ModelRunner's
-        # own ``dp_size`` attribute stays at the launch value unless we
-        # write it here. Callers that read ``self.dp_size`` directly (e.g.
-        # DP-attention-aware kernels, DPC-side elasticity accounting) would
-        # otherwise observe a stale value after scale-up. Kept in sync with
-        # :meth:`_finalize_scale_recover` and :meth:`_finalize_scale_down`
-        # which do the same write.
+        # update_dp_attention_post_scale only touches module-level
+        # globals; self.dp_size must also be updated so direct readers
+        # (DP-attention-aware kernels, DPC accounting) see fresh state.
         self.dp_size = target_size
 
         ElasticEPStateManager.mark_syncing_new_world()
@@ -1976,12 +1951,8 @@ class ModelRunner:
         ElasticEPStateManager.commit_scale()
         self._rearm_eplb_after_elastic_scale()
 
-        # Gate on global rank 0 rather than local ``tp_rank == 0``. In a
-        # deployment with an ex-joiner (already-recovered offset joiner),
-        # the ex-joiner subprocess also has ``self.tp_rank == 0``
-        # locally; combined with a stale-but-cleared ``ep_join_mode`` the
-        # legacy guard would let it emit a duplicate ``ElasticScale
-        # UpdateReq`` on any subsequent scale.
+        # Gate on global rank 0; ex-joiners also have local tp_rank==0
+        # and would otherwise emit a duplicate ElasticScaleUpdateReq.
         if self._elastic_global_rank() == 0:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -2001,50 +1972,23 @@ class ModelRunner:
             )
 
     def maybe_join_ep_ranks(self) -> None:
-        """Admit inactive ranks for pending scale or recovery operations.
+        """Admit inactive ranks for pending scale/recover operations.
 
-        Restores our pre-rebase behavior deliberately, rejecting two blind
-        adoptions of upstream's evolved ``maybe_join_ep_ranks``:
+        Diverges from upstream in three deliberate ways:
+        1. Per-rank monotonic timeout (no WORLD all_reduce). WORLD may
+           include os._exit'd retirees; a Gloo/NCCL collective would
+           hang waiting for peers that will never respond.
+        2. Iterates [0:effective_ep_size] (not the full max_ep_size
+           slot table) so retired trailing slots don't get spuriously
+           fed into try_recover_ranks.
+        3. has_scaled path returns silently instead of fail_recovery;
+           we need scale to stay requestable after any prior scale.
 
-        1. **No** ``dist.all_reduce(WORLD)`` timeout. Upstream votes on
-           the timeout via a WORLD collective for split-brain safety, but
-           in our design the WORLD group may include ``os._exit(0)``'d
-           retirees from a prior shrink and joiners whose Mooncake peer
-           slot has not yet reconnected. On any WORLD backend that does
-           not gate on ``active_ranks`` (i.e. NCCL / Gloo, as opposed to
-           our Mooncake WORLD backend), the collective would deadlock
-           waiting for peers that will never respond. A per-rank
-           ``time.monotonic()`` check reaches the same decision on every
-           surviving rank because ``pending_since`` is set from the same
-           HTTP admission event.
-
-        2. **No** delegation to upstream's ``maybe_recover_ep_ranks``.
-           Its inner loop iterates ``range(len(tp_active_ranks))`` --
-           i.e. the FULL 0..max_ep_size slot table -- so on any deployment
-           that pre-shrunk at launch (``max_ep_size > world_size``) or
-           has retirees from a prior shrink cycle, it would spuriously
-           feed retired-slot indices into ``try_recover_ranks``. We
-           iterate ``[0:effective_ep_size]`` instead: the live cohort
-           only.
-
-        Layered on top of the pre-rebase behavior:
-
-        * The ``has_scaled`` branch does a **silent** return instead of
-          ``fail_recovery``. Upstream's ``fail_recovery`` sets
-          ``scale_phase = "recovery_unsupported"`` which
-          :meth:`ElasticEPStateManager.request_scale` uses to reject
-          every subsequent scale request. Our design needs scale-up and
-          scale-down to remain requestable after any prior scale.
-        * The pending-recover branch (grow-into-retired-slot) calls
-          ``try_recover_ranks`` on the scheduler-supplied retiree list
-          instead of ``try_admit_scale_ranks`` and skips the cohort
-          rendezvous.
-        * ``try/except`` around finalize converts hard collective
-          failures into ``fail_scale`` + failure report rather than
-          wedging the FSM.
-        * ``_elastic_global_rank() == 0`` guards prevent an ex-joiner
-          (whose local ``tp_rank == 0``) from emitting duplicate scale-
-          update notices alongside the primary.
+        Also: pending_recover_ranks branch calls try_recover_ranks
+        (not try_admit_scale_ranks) and skips the cohort rendezvous;
+        try/except around finalize converts collective failures into
+        fail_scale; _elastic_global_rank()==0 guards prevent ex-joiner
+        duplicate updates.
         """
         if not ElasticEPStateManager.is_scaling():
             return
@@ -2140,22 +2084,8 @@ class ModelRunner:
             )
             if self._elastic_global_rank() == 0:
                 logger.exception("[Elastic EP] %s", error)
-            try:
-                ElasticEPStateManager.fail_scale(error)
-            except Exception:
-                logger.exception(
-                    "[Elastic EP] ElasticEPStateManager.fail_scale itself "
-                    "raised while handling finalize error; state may be "
-                    "inconsistent"
-                )
-            try:
-                self._report_elastic_scale_failure(error, effective_size)
-            except Exception:
-                logger.exception(
-                    "[Elastic EP] _report_elastic_scale_failure itself "
-                    "raised; tokenizer will observe a stalled scale until "
-                    "the outer timeout fires"
-                )
+            ElasticEPStateManager.fail_scale(error)
+            self._report_elastic_scale_failure(error, effective_size)
 
     def _maybe_rebalance_after_rank_fault(
         self,
@@ -2191,22 +2121,12 @@ class ModelRunner:
         self.load_config = load_config
 
     def _sync_random_seed_via_store(self, is_source: bool) -> None:
-        """Broadcast ``server_args.random_seed`` via the shared TCPStore.
+        """Broadcast server_args.random_seed via the shared TCPStore.
 
-        Replaces the legacy ``broadcast_pyobj(cpu_group=WORLD)`` sync
-        so a partial-recover deployment (retired-slot subprocesses
-        already ``sys.exit``'d) does not wedge on a WORLD-Gloo
-        collective. Semantics:
-
-          * ``is_source=True`` writes the authoritative seed to the
-            shared TCPStore key.
-          * ``is_source=False`` polls the same key with a bounded
-            timeout, then overwrites its own ``server_args.random_seed``.
-
-        Only ONE rank per deployment should call with
-        ``is_source=True`` (typically primary global rank 0 / local
-        tp_rank 0). All other ranks read.
-        """
+        Replaces broadcast_pyobj(WORLD) so retired-slot subprocesses
+        (already exited) don't wedge the sync. is_source=True writes
+        (only ONE rank per deployment); others poll with a bounded
+        timeout, then overwrite server_args.random_seed."""
         from sglang.srt.distributed.utils import get_global_tcp_store
 
         try:
@@ -2255,9 +2175,6 @@ class ModelRunner:
             "source to publish seed; keeping boot-time value"
         )
 
-    def _joiner_slot_offset_for_scale(self, from_ep_size: int) -> int:
-        return from_ep_size
-
     def _finalize_scale_recover(
         self,
         ranks_to_recover: list[int],
@@ -2266,44 +2183,15 @@ class ModelRunner:
     ) -> None:
         """Grow-into-retired-slot finalizer.
 
-        Symmetric to :meth:`_finalize_scale_up` but for recover-mode
-        joiners that fill previously retired slots (``0 <= rank <
-        elastic_ep_initial_size``). Differs from ``_finalize_scale_up``:
-          * EPLB metadata is broadcast from a healthy survivor (not from
-            global rank 0, which may itself be the joiner in single-DP
-            deployments).
-          * The random seed is broadcast via a WORLD ``broadcast_pyobj``
-            so the joiner picks up the survivor cohort's value.
-        Differs from ``_finalize_recovered_ep_ranks`` (implicit fault
-        recovery): this path also EXPANDS ``effective_ep_size``,
-        re-broadcasts expert-location metadata sized for the wider
-        cohort, updates ``dp_size``, and emits an
-        :class:`ElasticScaleUpdateReq` so the tokenizer / DPC know a
-        grow finished.
-        """
+        Symmetric to _finalize_scale_up but for recover-mode joiners
+        filling previously retired slots. EPLB metadata is broadcast
+        from an elected healthy survivor; the random seed is published
+        via TCPStore. Also expands effective_ep_size and emits an
+        ElasticScaleUpdateReq (unlike the implicit
+        _finalize_recovered_ep_ranks fault-recovery path)."""
         self.forward_pass_id = 0
         from_ep_size = effective_size
         my_rank = self._elastic_global_rank()
-
-        # Per-phase logging trace: on partial-recover hangs the log
-        # tells us exactly which phase wedged (EPLB expand, metadata
-        # broadcast, DP-attn update, seed sync, or ready barrier).
-        # Kept at DEBUG so healthy-path logs don't grow -- enable via
-        # SGLANG_LOG_LEVEL=DEBUG for post-mortem investigation.
-        _phase_t0 = time.perf_counter()
-
-        def _phase(name: str) -> None:
-            nonlocal _phase_t0
-            now = time.perf_counter()
-            logger.debug(
-                "[Elastic EP][recover-fsm] rank=%d phase=%s elapsed_prev=%.3fs",
-                my_rank,
-                name,
-                now - _phase_t0,
-            )
-            _phase_t0 = now
-
-        _phase("enter")
 
         ElasticEPStateManager.mark_configuring_data_plane()
 
@@ -2312,18 +2200,13 @@ class ModelRunner:
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
-        _phase("active_ranks_flipped")
-
         self._expand_eplb_metadata_for_scale(
             from_ep_size=from_ep_size,
             effective_size=target_size,
         )
 
-        _phase("eplb_expanded")
-
-        # Recover-mode joiners boot fresh, so their expert-location
-        # metadata is a launch-time placeholder. Broadcast from a
-        # healthy survivor so every rank agrees on the post-grow map.
+        # Recover joiners boot with a placeholder metadata; broadcast
+        # from a healthy survivor to align the cohort.
         src_rank = self._get_healthy_expert_location_src_rank(
             is_rejoining_rank=my_rank in ranks_to_recover,
             rejoining_ranks=ranks_to_recover,
@@ -2333,8 +2216,6 @@ class ModelRunner:
             moe_ep_rank=my_rank,
             src_rank=src_rank,
         )
-
-        _phase("metadata_broadcast")
 
         ElasticEPStateManager.on_scale(from_ep_size, target_size)
         set_global_expert_distribution_recorder(
@@ -2359,19 +2240,11 @@ class ModelRunner:
         self.server_args.override("elastic_ep.scale", dp_size=target_size)
         self.dp_size = target_size
 
-        _phase("dp_attn_updated")
-
-        # Recover joiner boots with server_args.random_seed placeholder;
-        # publish the survivor cohort's authoritative value for the
-        # joiner subprocess(es) to read in ``initialize()``. Uses
-        # TCPStore (single-writer, multi-reader) so a partial-recover
-        # deployment does not wedge on a WORLD collective. Only the
-        # primary global rank writes; other survivors already have the
-        # authoritative seed and skip the sync entirely.
+        # Publish authoritative random_seed via TCPStore for the joiner
+        # subprocess to read in initialize(); only primary global rank
+        # writes (single-writer, multi-reader).
         if self.server_args.ep_join_rank_offset == 0 and self.ps.tp_rank == 0:
             self._sync_random_seed_via_store(is_source=True)
-
-        _phase("seed_synced")
 
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
@@ -2380,13 +2253,7 @@ class ModelRunner:
         )
         ElasticEPStateManager.commit_scale()
 
-        _phase("ready_barrier_committed")
-
-        # Gate on global rank 0 (see ``_finalize_scale_up`` for the same
-        # rationale). Even though joiners already fail the current
-        # ``is_ep_offset_joiner`` check, gating on the global rank is
-        # tolerant of the ``ep_join_mode`` clear scheduling and avoids
-        # emit duplication if an ex-joiner survives a subsequent scale.
+        # Gate on global rank 0 (see _finalize_scale_up).
         if self._elastic_global_rank() == 0:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
@@ -2442,19 +2309,11 @@ class ModelRunner:
             )
 
     def maybe_retire_ep_ranks(self) -> None:
-        """Advance a pending Mooncake-native scale-DOWN one step.
+        """Advance pending Mooncake-native scale-down one step.
 
-        Called once per tick from :func:`event_loop_normal` (both busy and
-        idle), symmetric with the grow-direction :func:`maybe_join_ep_
-        ranks`. Delegates to :class:`ScaleDownStateMachine` so each stage
-        (drain / flip mask / reconfig or local cleanup / exit) advances at
-        most once per tick and can surface failures via
-        ``scale_phase = "failed"`` without corrupting the state manager.
-
-        No process-group destroy or rebuild happens anywhere in this
-        flow -- the launch-time PGs stay intact and Mooncake honours the
-        ``active_ranks`` mask to route around retired slots.
-        """
+        Called per tick (symmetric with maybe_join_ep_ranks); delegates
+        to ScaleDownStateMachine. No PG destroy/rebuild; Mooncake honors
+        active_ranks."""
         if self.server_args.elastic_ep_backend != "mooncake":
             return
         if ElasticEPStateManager.get_shrink_direction() != "shrink":
@@ -2483,8 +2342,7 @@ class ModelRunner:
                 logger.error("[Elastic EP][retire] %s", error)
             return
 
-        # Lazily construct the per-rank state machine on the first tick
-        # that observes a pending shrink. Tear down on terminal transition.
+        # Lazy: construct on first pending-shrink tick, tear down on terminal.
         sm = getattr(self, "_scale_down_sm", None)
         if sm is None:
             ranks_to_retire = ElasticEPStateManager.get_pending_shrink_ranks()
@@ -2521,38 +2379,17 @@ class ModelRunner:
         if sm.is_terminal():
             self._scale_down_sm = None
 
-    def _is_scale_down_drained(self) -> bool:
-        """Return True if this rank has no in-flight work to drain.
-
-        Used by the FSM to guard the DRAIN -> FLIP_MASK transition.
-        The scheduler is responsible for pausing NEW admissions
-        (:meth:`Scheduler.on_idle` gates the FSM on ``is_fully_idle``
-        and the tokenizer manager's admission gate stops new /generate
-        calls once a shrink is accepted). Here we only need to confirm
-        that in-flight forward passes have completed on this rank.
-        Returning True is safe because the underlying retire primitives
-        (:func:`retire_barrier` + :func:`try_retire_ranks`)
-        synchronously fence via ``cuda.synchronize`` before flipping the
-        mask.
-        """
-        return True
-
     def _retire_and_exit(
         self,
         ranks_to_retire: List[int],
         target_size: int,
         effective_size: int,
     ) -> None:
-        """Retiree tail: log + ``sys.exit(0)``. Never returns.
+        """Retiree terminal: log + sys.exit(0). Never returns.
 
-        Called on retirees from the FSM's :attr:`ScaleDownRetireeState.EXIT`
-        stage, AFTER :func:`retiree_local_cleanup` has already run in the
-        preceding :attr:`ScaleDownRetireeState.LOCAL_CLEANUP` stage. The
-        DPC observes the child exit code via ``scheduler_procs.join()``
-        and logs the retirement; ``remove_elastic_workers`` (posted from
-        the survivor rank 0 via :func:`_finalize_scale_down`'s
-        :class:`ElasticScaleUpdateReq`) is what actually removes the
-        slot from the routing table.
+        Called from ScaleDownRetireeState.EXIT after local cleanup.
+        The DPC observes the exit code; remove_elastic_workers (posted
+        by survivor rank 0) actually clears the routing slot.
         """
         my_global_rank = self._elastic_global_rank()
         logger.info(
@@ -2577,25 +2414,11 @@ class ModelRunner:
     ) -> None:
         """Truncate physical_to_logical_map to survivor-only slots.
 
-        Symmetric to :func:`_expand_eplb_metadata_for_scale`. Called on
-        the survivor cohort AFTER retirees have exited. Rebuilds the
-        global ExpertLocationMetadata for the K-rank cohort by dropping
-        the trailing ``(from_ep_size - effective_size) * num_local``
-        columns of ``physical_to_logical_map`` -- those columns
-        corresponded to physical expert slots that lived on the retired
-        ranks.
-
-        After slicing, any logical expert whose ONLY physical replicas
-        lived on retired ranks would be dropped, and downstream
-        ``compute_logical_to_rank_dispatch_physical_map`` -> ``_fair_
-        choices`` divides by that logical's replica count and blows up
-        with ``ZeroDivisionError``. Repair pass reassigns one survivor
-        slot per orphan logical (taking it from a slot that holds a
-        duplicated logical) so every logical retains at least one
-        replica. This is a coverage-preservation patch, NOT an
-        elasticity-aware EPLB solve; a follow-up rebalance can rebalance
-        load across the K-rank cohort at a controlled cadence.
-        """
+        Symmetric to _expand_eplb_metadata_for_scale. Drops the trailing
+        columns of the retired ranks, then repairs any orphaned logical
+        expert (reassigns a duplicated survivor slot) so every logical
+        keeps >= 1 physical replica. Coverage patch only, not a full
+        EPLB re-solve; a follow-up rebalance is safe."""
         metadata = get_global_expert_location_metadata()
         if metadata is None:
             return
@@ -2628,16 +2451,11 @@ class ModelRunner:
         shrunk_p2l: torch.Tensor,
         num_logical: int,
     ) -> None:
-        """Ensure every logical expert has at least one physical replica.
+        """Ensure every logical has >= 1 physical replica in shrunk_p2l.
 
-        In-place edits ``shrunk_p2l`` (shape ``[num_layers, num_physical]``)
-        so that no logical index is missing from any layer's row.
-        Reassigns slots that hold a duplicated logical to any orphan
-        logical for that layer. Raises ``RuntimeError`` if the survivor
-        cohort has fewer physical slots than logical experts and cannot
-        cover them all (topology-invalid shrink; increase
-        ``--ep-num-redundant-experts``).
-        """
+        In-place: reassigns duplicated slots to orphaned logicals.
+        Raises if the survivor cohort has fewer physical slots than
+        logical experts (increase --ep-num-redundant-experts)."""
         num_layers, new_num_physical = shrunk_p2l.shape
         if new_num_physical < num_logical:
             raise RuntimeError(
@@ -2682,42 +2500,11 @@ class ModelRunner:
     ) -> None:
         """Survivor tail: MoE / dp_attn / expert-location rebuild + commit.
 
-        Mirror of :func:`_finalize_scale_up`, minus any process-group
-        destroy or rebuild -- the core scale-down invariant. Called on
-        every survivor rank AFTER :func:`try_retire_ranks` has flipped
-        the active_ranks mask (retirees have already run
-        :func:`_retire_and_exit` and are gone from the process table).
-
-        Reconfig sequence:
-        1. ExpertLocationMetadata rebuild for the K-rank cohort (via
-           :func:`_shrink_eplb_metadata_for_scale`).
-        2. Broadcast the new metadata over WORLD (Mooncake mask now
-           honors the flipped bits, so retirees are naturally excluded).
-        3. Trigger :func:`ElasticEPStateManager.on_scale` -- this is a
-           no-op under Mooncake but keeps the API surface symmetric with
-           the NIXL grow path.
-        4. Reset ExpertDistributionRecorder for the new size.
-        5. Freeze EPLB rebalance (matches grow behavior).
-        6. :func:`update_dp_attention_post_scale` with new_dp_size=K.
-        7. Survivor-cohort barrier via :func:`_elastic_scale_ready_barrier`
-           on the SGLang WORLD group (Mooncake CPU backend, mask-honoring).
-        8. :func:`commit_scale` (transitions to ``serving_shrunk``).
-        9. Emit :class:`ElasticScaleUpdateReq` (direction=``shrink``) so
-           the DPC can remove the retired slots from its routing table.
-
-        CUDA graph invariant: pre-shrink CUDA graphs on survivors embed
-        torch collective dispatches on the same launch-time PG objects
-        that persist across the mask flip. Because Mooncake reads its
-        ``active_ranks`` mask at collective enqueue time, a captured
-        graph's replay of an all_reduce / all_gather on WORLD honours
-        the post-flip mask and skips retirees. We therefore do NOT
-        invalidate + recapture graphs here; the recapture cost is
-        O(minutes) and
-        avoiding it is a large latency win. If a future Mooncake release
-        latches the mask at graph capture, we'll need to add an
-        ``init_device_graphs`` recapture call after ``commit_scale`` --
-        that trap surfaces as post-shrink AllReduce timeouts on the
-        first replay.
+        Mirror of _finalize_scale_up, minus PG destroy/rebuild (the
+        core scale-down invariant). Called AFTER try_retire_ranks has
+        flipped the active_ranks mask; retirees have already exited.
+        CUDA graphs are NOT recaptured: Mooncake reads active_ranks at
+        collective enqueue time so replays skip retirees naturally.
         """
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
         from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
@@ -2766,12 +2553,7 @@ class ModelRunner:
         )
         ElasticEPStateManager.commit_scale()
 
-        # Gate on global rank 0. In an ``8 -> 4 -> 8 -> 6`` sequence,
-        # ex-joiner ranks 4 and 5 survive the second shrink; their
-        # subprocess-local ``tp_rank`` is also 0, so a legacy
-        # ``self.tp_rank == 0`` guard would let them emit a duplicate
-        # ``ElasticScaleUpdateReq(direction="shrink")`` alongside the
-        # primary rank 0's message.
+        # Gate on global rank 0 (see _finalize_scale_up).
         if self._elastic_global_rank() == 0:
             slot_offset = target_size
             slot_count = effective_size - target_size
@@ -2795,29 +2577,12 @@ class ModelRunner:
         is_rejoining_rank: bool,
         rejoining_ranks: Optional[List[int]] = None,
     ) -> int:
-        """Elect a survivor to broadcast EPLB metadata during recover.
+        """Elect the lowest active, non-rejoining rank as EPLB src.
 
-        Purely local election -- every rank picks the same ``src`` from
-        the ``active_ranks`` mask deterministically. This deliberately
-        avoids a WORLD-scope ``all_gather_object``, which would hang or
-        EOF whenever launch-cohort slots have been retired without a
-        subsequent recover (partial-recover scenarios like
-        ``8 -> 4 -> 6``: launch ranks 6, 7 remain permanently retired,
-        their subprocesses have ``sys.exit(0)``'d, and the WORLD
-        cpu_group still references them so any gather waits for a
-        response they will never send).
-
-        Election rule: the LOWEST-numbered rank that is (a) currently
-        active and (b) not in ``rejoining_ranks``. Falls back to the
-        legacy ``all_gather_object`` path if the state manager's
-        ``active_ranks_cpu`` is not yet populated (early boot, tests
-        that stub out the mask).
-
-        ``is_rejoining_rank`` is retained for backward compatibility
-        with the legacy fallback path; the local election uses
-        ``rejoining_ranks`` (a caller-supplied set) which is more
-        accurate.
-        """
+        Purely local (reads active_ranks_cpu); avoids a WORLD gather
+        that would hang under partial-recover with retired slots.
+        Falls back to legacy all_gather_object if the state manager
+        mask is not yet populated."""
         rejoining_set = set(rejoining_ranks) if rejoining_ranks is not None else set()
 
         active_cpu = None
@@ -2841,10 +2606,7 @@ class ModelRunner:
                     continue
                 return int(global_rank)
 
-        # Legacy fallback: WORLD gather. Only reachable in early-boot
-        # / test paths where the state manager is not fully initialized.
-        # If a retired-slot subprocess has exited, this path will hang
-        # -- outer ``elastic_ep_scale_timeout`` catches it.
+        # Legacy fallback (early-boot / tests): WORLD gather.
         world_group = get_world_group()
         gathered_rejoin_flags = world_group.all_gather_object(is_rejoining_rank)
         for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
@@ -2856,417 +2618,11 @@ class ModelRunner:
             "every rank is either rejoining or retired."
         )
 
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        load_format: str,
-        weight_name_filter: Optional[Callable[[str], bool]] = None,
-        recapture_cuda_graph: bool = False,
-    ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
-        logger.info(
-            f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
-        )
-
-        target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
-
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
-            return False, message
-
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.model)
-            )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
-                )
-
-            return iter
-
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
-
-        with set_default_torch_dtype(self.model_config.dtype):
-            try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.model, iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
-                gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
-                return False, message
-
-        self.model = model
-        self.server_args.override(
-            "model_runner.update_weights",
-            model_path=model_path,
-            load_format=load_format,
-        )
-        self.load_config = load_config
-
-        if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
-            or (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            )
-        ):
-            self.init_decode_cuda_graph()
-
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
-
-    def init_weights_send_group_for_remote_instance(
-        self,
-        master_address,
-        ports,
-        group_rank,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
-
-        logger.info(
-            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
-            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
-        )
-
-        current_platform.empty_cache()
-        success = False
-        message = ""
-        try:
-            na = NetworkAddress(master_address, group_port)
-            self._weights_send_group[group_name] = init_custom_process_group(
-                backend=backend,
-                init_method=na.to_tcp(),
-                world_size=world_size,
-                rank=group_rank,
-                group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
-            )
-            dist.barrier(group=self._weights_send_group[group_name])
-            success = True
-            message = f"Succeeded to init group through {na.to_host_port_str()} group."
-        except Exception as e:
-            message = f"Failed to init group: {e}."
-            logger.error(message)
-
-        current_platform.empty_cache()
-        return success, message
-
-    def send_weights_to_remote_instance(
-        self,
-        master_address,
-        ports,
-        group_name,
-    ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
-
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
-            message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
-            logger.error(message)
-            return False, message
-
-        current_platform.empty_cache()
-        success = False
-        na = NetworkAddress(master_address, group_port)
-        message = ""
-        try:
-            for _, weights in self.model.named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
-                )
-            success = True
-            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
-        except Exception as e:
-            message = f"Failed to send weights: {e}."
-            logger.error(message)
-
-        # destroy the process group after sending weights
-        del self._weights_send_group[group_name]
-        torch.distributed.distributed_c10d.destroy_process_group(send_group)
-        current_platform.empty_cache()
-        return success, message
-
-    def init_weights_update_group(
-        self,
-        master_address,
-        master_port,
-        rank_offset,
-        world_size,
-        group_name,
-        backend="nccl",
-    ):
-        """Initialize the Torch process group for model parameter updates.
-
-        `_model_update_group` is used in the RLHF workflow, where rank
-        0 is the actor model in the training engine, and the other ranks are
-        the inference engine, which is used for rollout.
-
-        In the RLHF workflow, the training engine updates the model
-        weights/parameters online, and broadcasts them to the inference
-        engine through the `_model_update_group` process group.
-        """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
-        assert group_name != "", "Group name cannot be empty"
-
-        rank = rank_offset + self.tp_rank
-
-        logger.info(
-            f"init custom process group: master_address={master_address}, master_port={master_port}, "
-            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
-        )
-
-        try:
-            na = NetworkAddress(master_address, master_port)
-            self._model_update_group[group_name] = init_custom_process_group(
-                backend=backend,
-                init_method=na.to_tcp(),
-                world_size=world_size,
-                rank=rank,
-                group_name=group_name,
-            )
-            return True, "Succeeded to initialize custom process group."
-        except Exception as e:
-            message = f"Failed to initialize custom process group: {e}."
-            logger.error(message)
-            return False, message
-
-    def destroy_weights_update_group(self, group_name):
-        try:
-            if group_name in self._model_update_group:
-                pg = self._model_update_group.pop(group_name)
-                torch.distributed.destroy_process_group(pg)
-                return True, "Succeeded to destroy custom process group."
-            else:
-                return False, "The group to be destroyed does not exist."
-        except Exception as e:
-            message = f"Failed to destroy custom process group: {e}."
-            logger.error(message)
-            return False, message
-
-    def update_weights_from_distributed(
-        self,
-        names,
-        dtypes,
-        shapes,
-        group_name,
-        load_format: Optional[str] = None,
-    ):
-        """
-        Update specific parameter in the model weights online
-        through `_model_update_group` process group.
-
-        Args:
-            name: the name of the parameter to be updated.
-            dtype: the data type of the parameter to be updated.
-            shape: the shape of the parameter to be updated.
-        """
-
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        if load_format == "flattened_bucket":
-            return self._update_bucketed_weights_from_distributed(
-                names, dtypes, shapes, group_name
-            )
-        try:
-            weights = []
-            handles = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
-                weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
-
-            self.model.load_weights(weights)
-            return True, "Succeeded to update parameter online."
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def _update_bucketed_weights_from_distributed(
-        self, names, dtypes, shapes, group_name
-    ):
-        try:
-            named_tensors = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                named_tensors.append(
-                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-                )
-            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            flattened_tensor = bucket.get_flattened_tensor()
-            torch.distributed.broadcast(
-                flattened_tensor,
-                src=0,
-                group=self._model_update_group[group_name],
-            )
-            reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-    def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
-        load_format: Optional[str] = None,
-    ):
-        monkey_patch_torch_reductions()
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-
-        # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
-
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
-        elif load_format is None:
-            self.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
-
-    def _update_weights_from_flattened_bucket(
-        self,
-        flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
-        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
-        metadata = flattened_tensor_bucket_dict["metadata"]
-
-        # Convert metadata dict to our format
-        converted_metadata = []
-        for meta in metadata:
-            converted_meta = FlattenedTensorMetadata(
-                name=meta.name,
-                shape=meta.shape,
-                dtype=meta.dtype,
-                start_idx=meta.start_idx,
-                end_idx=meta.end_idx,
-                numel=meta.numel,
-            )
-            converted_metadata.append(converted_meta)
-
-        # Create bucket and reconstruct tensors
-        bucket = FlattenedTensorBucket(
-            flattened_tensor=flattened_tensor, metadata=converted_metadata
-        )
-        reconstructed_tensors = bucket.reconstruct_tensors()
-
-        # Load the reconstructed tensors using the standard method
-        self.model.load_weights(reconstructed_tensors)
-
-        return True, "Success"
-
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
-    ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
-
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
-        """
-        # TODO: (chenyang) Add support for Qwen models.
-        try:
-            return self.model.get_weights_by_name(
-                name, truncate_size, tp_size=self.tp_size
-            )
-        except Exception as e:
-            logger.error(f"Error when getting parameter {name}: {e}")
-            return None
 
 class _ScaleDownDriver(ScaleDownStateMachineDriver):
-    """FSM driver: bridges finite-state-machine transitions to the
-    ModelRunner side-effect helpers.
-
-    Kept separate from :class:`ModelRunner` so the FSM (which lives in
-    ``elastic_ep.scale_down_state``) has no import-time dependency on the
-    model_runner module, and so tests can stub the driver in isolation.
-    """
+    """FSM driver: bridges state transitions to ModelRunner side
+    effects. Kept out of ModelRunner so the FSM has no import-time
+    dependency and tests can stub it easily."""
 
     def __init__(self, model_runner: "ModelRunner") -> None:
         self._mr = model_runner
@@ -3275,19 +2631,15 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
         ElasticEPStateManager.mark_draining()
 
     def is_drained(self, sm: ScaleDownStateMachine) -> bool:
-        return self._mr._is_scale_down_drained()
+        # Safe to always return True: retire primitives cuda.synchronize
+        # before flipping the mask, and admission is already paused at
+        # the scheduler / tokenizer manager.
+        return True
 
     def post_drain_barrier(self, sm: ScaleDownStateMachine):
-        # NOTE: no pre-barrier ``current_platform.synchronize()`` here.
-        # A GPU sync at this point is unsafe on the NIXL a2a backend:
-        # if the retiree's last combine left an RDMA-recv completion
-        # hook pending, its cuda.sync would wait for a peer that has
-        # already advanced to DRAIN and stopped issuing NIXL ops, and
-        # the FSM tick would never return to poll the async barrier.
-        # Any GPU work still in flight is fenced by later stages --
-        # ``retiree_local_cleanup`` for retirees (runs after NIXL peers
-        # have been disconnected on survivors) and the next forward
-        # pass for survivors.
+        # No cuda.synchronize here: NIXL a2a would wait on an RDMA-recv
+        # completion hook from a peer already past DRAIN. Later stages
+        # fence any lingering GPU work.
         return retire_barrier_post()
 
     def check_drain_barrier(self, handle) -> bool:
@@ -3310,9 +2662,7 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
 
     def on_flip_mask(self, sm: ScaleDownStateMachine) -> None:
         ElasticEPStateManager.mark_retiring()
-        ok = try_retire_ranks(sm.ranks_to_retire)
-        if not ok:
-            raise RuntimeError(f"try_retire_ranks({sm.ranks_to_retire}) failed")
+        try_retire_ranks(sm.ranks_to_retire)
 
     def on_reconfig(self, sm: ScaleDownStateMachine) -> None:
         self._mr._finalize_scale_down(
@@ -3322,48 +2672,14 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
         )
 
     def on_local_cleanup(self, sm: ScaleDownStateMachine) -> None:
-        # Retiree's last-mile local quiesce. Kept as its own FSM state
-        # so a future refinement (e.g. per-Mooncake-QP flush) can extend
-        # the drain window without changing the tick cadence.
+        # Retiree last-mile quiesce; its own state to allow future
+        # per-QP flush without changing the tick cadence.
         retiree_local_cleanup()
 
     def on_exit(self, sm: ScaleDownStateMachine) -> None:
-        # Never returns. _retire_and_exit calls sys.exit(0).
+        # Never returns.
         self._mr._retire_and_exit(
             ranks_to_retire=sm.ranks_to_retire,
             target_size=sm.target_size,
             effective_size=sm.effective_size,
         )
-
-
-def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
-    params_dict = dict(model.named_parameters())
-    for name, tensor in named_tensors:
-        default_weight_loader(params_dict[name], tensor)
-
-
-def _unwrap_tensor(tensor, tp_rank, device):
-    if isinstance(tensor, LocalSerializedTensor):
-        tensor = tensor.get(tp_rank)
-    return tensor.to(device)
-
-
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
-    mode = forward_batch.forward_mode
-    bs = forward_batch.batch_size
-    if mode == ForwardMode.EXTEND:
-        ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
-
-
-@dataclass
-class LocalSerializedTensor:
-    """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
-    The i-th element in the list corresponds to i-th rank's GPU."""
-
-    values: List[bytes]
-
-    def get(self, rank: int):
-        return MultiprocessingSerializer.deserialize(self.values[rank])

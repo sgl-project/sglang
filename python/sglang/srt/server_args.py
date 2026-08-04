@@ -2269,22 +2269,10 @@ class ServerArgs:
     ep_size: A[
         int,
         Arg(
-            # Runtime-mutable via ``server_args.override("elastic_ep.scale",
-            # ep_size=...)``. Because elastic-EP mutates this in place on
-            # every shrink/grow, treat it as the *current effective*
-            # EP size rather than the launch-time size -- callers that
-            # need the launch-time layout should read
-            # ``elastic_ep_initial_size`` (or ``max_ep_size`` for the
-            # storage upper bound). All ``override(...)`` mutations are
-            # audited via the ``_runtime_mutations`` / ``_resolved_
-            # overrides`` provenance stashes, so post-mortem attribution
-            # is preserved.
-            #
-            # TODO: split into a separate runtime-state class
-            # (``ElasticEPState.current_ep_size``) so ``ServerArgs``
-            # remains immutable post-resolution and callers of
-            # ``server_args.ep_size`` don't silently observe a moving
-            # target across scale events.
+            # Runtime-mutable via override("elastic_ep.scale"). Reflects
+            # the CURRENT effective EP size; callers wanting the
+            # launch-time layout should read elastic_ep_initial_size or
+            # max_ep_size instead.
             help="The expert parallelism size.",
             aliases=["--expert-parallel-size", "--ep"],
             resolvable=True,
@@ -2436,23 +2424,10 @@ class ServerArgs:
     ] = 0
     elastic_ep_initial_size: A[
         Optional[int],
-        # Naming note: this is the *storage-layout* EP size, not the
-        # *initial serving* size. It fixes per-rank expert storage
-        # allocation once at launch so that later scale operations
-        # simply flip ``active_ranks`` bits inside the pre-sized layout
-        # (Mooncake C++ peer arrays cannot grow at runtime).
-        #
-        # Scale joiners must pass the primary deployment's launch-time
-        # storage-layout EP size here, regardless of the size to which
-        # they are being admitted. Recover-mode joiners (filling a
-        # retired slot with ``0 <= rank < elastic_ep_initial_size``)
-        # rely on this to allocate a matching storage layout so the
-        # broadcast physical_to_logical_map fits without a rebuild.
-        #
-        # TODO: the name reads as "initial serving size" but is used
-        # as "storage-layout size" -- rename to
-        # ``ep_storage_layout_size`` (or similar) and add a
-        # deprecation shim.
+        # NOTE: this is the storage-layout EP size (fixed at launch),
+        # not the initial serving size. Scale/recover joiners must
+        # pass the primary's launch-time value.
+        # TODO: rename to ep_storage_layout_size with a deprecation shim.
         "EP size used to define the immutable per-rank expert storage layout. "
         "Scale joiners must use the primary deployment's launch-time EP size.",
         NS("parallel"),
@@ -6892,15 +6867,9 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
-                # Per-PG safety audit for Mooncake-native scale-down:
-                # the attention_tp pynccl fast-path is built directly on
-                # raw NCCL and does NOT consult Mooncake's active_ranks
-                # mask, so a retired rank would still be expected to
-                # participate in these collectives after mask flip --
-                # deadlock or NCCL abort. Refuse to boot under those
-                # knobs so nobody hits this trap silently during a
-                # scale-down. Fixing this without rebuilding the raw
-                # NCCL comm on shrink is an open follow-up.
+                # Per-PG safety audit: refuse boot under raw-NCCL
+                # fast-paths (attention_tp pynccl, symm-mem) that
+                # bypass Mooncake's active_ranks mask.
                 if envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get():
                     raise ValueError(
                         "SGLANG_SYNC_TOKEN_IDS_ACROSS_TP is incompatible with "
@@ -6920,18 +6889,10 @@ class ServerArgs:
                         "any post-flip collective. Drop --enable-symm-mem, "
                         "or use --elastic-ep-backend nixl."
                     )
-                # The shm MessageQueue broadcaster is fixed-size at
-                # cohort launch and has no remove_reader primitive. If
-                # a retiree exits mid-fanout its reader flag never
-                # flips and the next full wrap deadlocks the writer.
-                # Under --elastic-ep-backend mooncake we force it OFF
-                # -- the fallback path in
-                # ``GroupCoordinator.broadcast_object`` goes through
-                # ``torch.distributed.broadcast_object_list`` on the
-                # cpu_group (Mooncake-CPU backend, honors active_ranks
-                # mask), which naturally skips retirees on a post-flip
-                # broadcast. Adding MessageQueue.remove_reader is a
-                # follow-up.
+                # Force off: shm broadcaster is fixed-size and has no
+                # remove_reader; a retiree exit deadlocks the writer.
+                # Fallback via broadcast_object_list on cpu_group is
+                # mask-aware.
                 if envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
                     envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.set(False)
                     logger.warning(
@@ -6956,11 +6917,8 @@ class ServerArgs:
                     "effective EP size."
                 )
         if self.ep_join_rank_offset != 0:
-            # ``scale`` (append-only) and ``recover``
-            # (grow-into-retired-slot) both slot a joiner into a
-            # specific global rank via the offset. Everything else
-            # (implicit fault recovery of a rank inside the current
-            # cohort) uses offset=0.
+            # Only scale + recover-mode joiners use a non-zero offset;
+            # implicit fault recovery uses offset=0.
             assert self.ep_join_mode in ("scale", "recover"), (
                 "--elastic-ep-join-rank-offset is only valid with "
                 "--elastic-ep-join-mode scale or recover."
@@ -7022,9 +6980,7 @@ class ServerArgs:
                         "--moe-dense-tp-size 1."
                     )
             elif self.is_ep_offset_joiner:
-                # Recover-into-retired-slot joiner: slots INSIDE the
-                # existing launch cohort, so offset < initial_size and
-                # offset + tp_size <= initial_size.
+                # Recover-into-retired-slot: slot inside the launch cohort.
                 assert self.elastic_ep_initial_size is not None, (
                     "Elastic EP recover joiners require --elastic-ep-initial-size "
                     "set to the primary deployment's launch-time EP size."
@@ -8615,14 +8571,9 @@ class ServerArgs:
 
     @property
     def is_ep_offset_joiner(self) -> bool:
-        """True if this joiner slots into a specific pre-known global rank.
-
-        Covers both ``scale`` (append into a fresh slot beyond the
-        launch cohort) and ``recover`` when it also carries a non-zero
-        ``ep_join_rank_offset`` (grow-into-retired-slot). Contrast with
-        the offset=0 recover path, which is implicit fault recovery of a
-        rank already inside the current effective cohort.
-        """
+        """True if this joiner slots into a specific global rank
+        (scale append OR recover with offset>0). Offset=0 recover is
+        implicit fault recovery inside the current cohort."""
         if self.ep_join_mode == "scale":
             return True
         if self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0:
@@ -8827,12 +8778,9 @@ class ServerArgs:
             )
 
     def check_server_args(self):
-        # Elastic-EP offset joiners (scale-append AND recover-into-
-        # retired-slot) run with a per-cohort ``tp_size`` that is
-        # deliberately smaller than the wider deployment and are
-        # launched as ``--nnodes 2 --node-rank 1`` under the joiner
-        # convention. Their ``tp_size % nnodes`` is not meaningful
-        # because they only occupy the joiner half.
+        # Offset joiners run with per-cohort tp_size < deployment and
+        # under --nnodes 2 --node-rank 1; tp_size % nnodes isn't
+        # meaningful for them.
         if not self.is_ep_offset_joiner:
             assert (
                 self.tp_size * self.pp_size
