@@ -9,8 +9,8 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=4, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestBuildEagleTree(unittest.TestCase):
@@ -313,6 +313,92 @@ class TestBuildEagleTree(unittest.TestCase):
             ],
             "Draft tokens tensor does not match expected values",
         )
+
+    def test_skip_prefix_fill_preserves_tree_blocks(self):
+        """fill_prefix_mask=False must leave every kernel-written cell intact.
+
+        The fill only supplies the [0, seq_len) prefix columns; the qlen x qlen
+        tree block comes from the kernel and must be identical either way.
+        """
+        device = get_device()
+        bs, topk, spec_steps, num_draft_token = 2, 1, 3, 4
+        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device=device)
+        seq_lens_sum = int(seq_lens.sum().item())
+        # topk=1 chain: token i descends from i-1; index 0 is the root.
+        parent_list = torch.tensor([[0, 0, 1]] * bs, dtype=torch.int64, device=device)
+        top_scores_index = torch.tensor(
+            [[0, 1, 2]] * bs, dtype=torch.int64, device=device
+        )
+        draft_tokens = torch.arange(
+            bs * (num_draft_token - 1), dtype=torch.int64, device=device
+        ).view(bs, -1)
+        bonus_tokens = torch.tensor([101, 102], dtype=torch.int32, device=device)
+        mask_numel = seq_lens_sum * num_draft_token + num_draft_token**2 * bs
+
+        def build(fill_prefix_mask):
+            # All-False start matches the real preallocated scratch: a skipped
+            # fill leaves the prefix stale-False.
+            tree_mask_buf = torch.zeros((mask_numel,), dtype=torch.bool, device=device)
+            return build_tree_kernel_efficient(
+                bonus_tokens=bonus_tokens,
+                parent_list=parent_list,
+                top_scores_index=top_scores_index,
+                draft_tokens=draft_tokens,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                topk=topk,
+                spec_steps=spec_steps,
+                num_verify_tokens=num_draft_token,
+                tree_mask_buf=tree_mask_buf,
+                fill_prefix_mask=fill_prefix_mask,
+            )
+
+        def split_rows(tree_mask):
+            """Flat mask -> (all prefix columns, all tree-block cells)."""
+            prefixes, blocks = [], []
+            offset = 0
+            for seq_len in seq_lens.tolist():
+                row_len = seq_len + num_draft_token
+                for tid in range(num_draft_token):
+                    row = tree_mask[
+                        offset + row_len * tid : offset + row_len * (tid + 1)
+                    ]
+                    prefixes.append(row[:seq_len])
+                    blocks.append(row[seq_len:])
+                offset += row_len * num_draft_token
+            return torch.cat(prefixes), torch.cat(blocks)
+
+        filled = build(fill_prefix_mask=True)
+        skipped = build(fill_prefix_mask=False)
+
+        filled_prefix, filled_blocks = split_rows(filled[0])
+        skipped_prefix, skipped_blocks = split_rows(skipped[0])
+
+        self.assertTrue(
+            torch.equal(filled_blocks, skipped_blocks),
+            "Tree blocks diverged: the kernel must write every tree cell "
+            "regardless of the prefix fill",
+        )
+        # Anti-vacuous: proves the two runs really differ on the prefix.
+        self.assertTrue(filled_prefix.all(), "Fill did not mark the prefix columns")
+        self.assertFalse(
+            skipped_prefix.any(), "Skipped fill unexpectedly touched the prefix columns"
+        )
+
+        for idx, name in enumerate(
+            (
+                "positions",
+                "retrieve_index",
+                "retrieve_next_token",
+                "retrieve_next_sibling",
+                "draft_tokens",
+            ),
+            start=1,
+        ):
+            self.assertTrue(
+                torch.equal(filled[idx], skipped[idx]),
+                f"{name} diverged between filled and skipped runs",
+            )
 
 
 if __name__ == "__main__":

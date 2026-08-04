@@ -334,7 +334,7 @@ class AnthropicOutputConfig(BaseModel):
     ``task_budget`` is propagated as a custom-param hint.
     """
 
-    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
 
 

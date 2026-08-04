@@ -39,13 +39,15 @@ def _triton_fallback(
     A_log=None,
     dt_bias=None,
     lower_bound=None,
+    return_intermediate_states=False,
 ):
     """Fall back to the Triton chunk_kda kernel (handles all preprocessing).
 
     `g` is the RAW gate; chunk_kda applies the gate activation internally when
     A_log is provided, so A_log/dt_bias/lower_bound must be threaded through too
     -- otherwise the fallback silently skips activation. chunk_kda updates the
-    ssm state in-place via cache_indices and returns only the output tensor.
+    ssm state in-place via cache_indices and returns only the output tensor
+    (or (output, h) when return_intermediate_states is set).
     """
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
@@ -62,6 +64,7 @@ def _triton_fallback(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        output_intermediate_states=return_intermediate_states,
     )
 
 
@@ -111,9 +114,10 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         extend_seq_lens_cpu: Optional[list] = None,
         is_spec_decode: bool = False,
+        return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        if self._should_fall_back(
+        if return_intermediate_states or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
             return _triton_fallback(
@@ -128,6 +132,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 A_log=A_log,
                 dt_bias=dt_bias,
                 lower_bound=lower_bound,
+                return_intermediate_states=return_intermediate_states,
             )
 
         return self._flashkda_extend(

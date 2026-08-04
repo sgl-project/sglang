@@ -1,3 +1,4 @@
+from sglang.srt.runtime_context import get_context, get_observability
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -70,22 +71,19 @@ class _DummyPublisherThread:
         pass
 
 
-def _fake_server_args(**fields):
-    """server_args stand-in: carries fields and the override() entry point."""
+def _publish_server_args(test, **fields):
+    """Publish a config for the reporter under test and return the instance."""
     fields.setdefault("decode_log_interval", 40)
-    ns = types.SimpleNamespace(**fields)
-
-    def _override(source, **updates):
-        for key, value in updates.items():
-            setattr(ns, key, value)
-
-    ns.override = _override
-    return ns
+    override = get_context().override_server_args(**fields)
+    server_args = override.install()
+    test.addCleanup(override.restore)
+    return server_args
 
 
-def _make_reporter(scheduler) -> SchedulerMetricsReporter:
+def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "server_args"):
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = _publish_server_args(
+            test,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             kv_events_config=None,
@@ -133,7 +131,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler._fpm_gpu_time_acc = 0.0
         self.scheduler.waiting_queue = []
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
-        self.reporter = _make_reporter(self.scheduler)
+        self.reporter = _make_reporter(self, self.scheduler)
         self.scheduler.enable_fpm = True
 
     def _make_batch(self, **overrides):
@@ -232,11 +230,12 @@ class TestForwardPassMetrics(unittest.TestCase):
             self.scheduler._fpm_publisher.metrics[0].wall_time, 0.035, places=4
         )
 
-    def test_disagg_prefill_queued_metrics(self):
+    def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
-            queue=[_FakeReq(100), _FakeReq(200), _FakeReq(50)],
+            queue=[_FakeReq(100)],
         )
+        self.scheduler.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
         with patch(
@@ -273,7 +272,8 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = _publish_server_args(
+            self,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -289,7 +289,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            reporter = _make_reporter(self, scheduler)
 
         self.assertTrue(scheduler.enable_fpm)
         self.assertEqual(scheduler._fpm_worker_id, "endpoint-42")
@@ -297,11 +297,20 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(scheduler._fpm_publisher.worker_id, "endpoint-42")
         self.assertEqual(scheduler._fpm_publisher.dp_rank, 2)
         self.assertTrue(scheduler._fpm_publisher.endpoint.startswith("ipc://"))
-        self.assertIsNotNone(scheduler.server_args.forward_pass_metrics_ipc_name)
+        # The bag is what makes the write a bag write: an instance mutation
+        # would still show up in the resolved dict through its ServerArgs base.
+        endpoint = get_observability().forward_pass_metrics_ipc_name
+        self.assertTrue(endpoint.startswith("ipc://"))
+        self.assertEqual(
+            get_context().resolved_server_args_dict()["forward_pass_metrics_ipc_name"],
+            endpoint,
+        )
+        self.assertIsNone(scheduler.server_args.forward_pass_metrics_ipc_name)
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
-        scheduler.server_args = _fake_server_args(
+        scheduler.server_args = _publish_server_args(
+            self,
             enable_metrics=False,
             enable_metrics_for_all_schedulers=False,
             extra_metric_labels=None,
@@ -317,7 +326,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
-            reporter = _make_reporter(scheduler)
+            reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
 

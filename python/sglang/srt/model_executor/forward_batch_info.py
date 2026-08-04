@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -218,6 +218,53 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+# Predicate for whether a forward's sequence is sharded across the attn-TP group
+# (vs. replicated on every rank). Injected at init; unset defaults to sharded.
+_attn_tp_sequence_sharded_predicate: Optional[Callable[[int], bool]] = None
+
+
+def register_attn_tp_sequence_sharded_predicate(
+    predicate: Callable[[int], bool],
+) -> None:
+    """Register the predicate for whether a forward is sharded across attn-TP."""
+    global _attn_tp_sequence_sharded_predicate
+    _attn_tp_sequence_sharded_predicate = predicate
+
+
+def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
+    mode = getattr(server_args, "return_hidden_states_mode", None)
+    if mode == "last":
+        return CaptureHiddenMode.LAST
+    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+        return CaptureHiddenMode.FULL
+    return CaptureHiddenMode.NULL
+
+
+def get_required_capture_hidden_mode(
+    capture_hidden_mode: CaptureHiddenMode,
+    spec_info: Optional[SpecInput],
+) -> CaptureHiddenMode:
+    spec_capture_hidden_mode = (
+        getattr(spec_info, "capture_hidden_mode", None) or CaptureHiddenMode.NULL
+    )
+    return max(capture_hidden_mode, spec_capture_hidden_mode)
+
+
+def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's slice of the sequence.
+
+    A replicated (non-sharded) forward puts the whole sequence on every rank, so
+    the slice is the full range with no offset; localizing it as a shard would
+    drop real tokens on non-zero ranks.
+    """
+    predicate = _attn_tp_sequence_sharded_predicate
+    if predicate is not None and not predicate(num_tokens_per_dp):
+        return num_tokens_per_dp, 0
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -227,15 +274,27 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_parallel().attn_tp_rank
-    attn_tp_size = get_parallel().attn_tp_size
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - rank_offset,
         0,
         tokens_per_rank,
     )
+
+
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+) -> int:
+    """Int-scalar twin of ``compute_local_num_token_non_padded``.
+
+    Replay-time hooks hold the global count as a host int
+    (``num_token_non_padded_cpu``) and write the localized result into a
+    device buffer; keeping the math on ints lets them use ``Tensor.fill_``
+    instead of staging a CPU tensor through a host-to-device copy per replay.
+    """
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
+    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
 @dataclass
@@ -482,6 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
+    _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -651,17 +711,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
 
-        # capture_hidden_mode=None means no override: derive from
-        # SB.return_hidden_states / spec_info.capture_hidden_mode.
+        # capture_hidden_mode=None means no override: capture the server's
+        # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
-            if batch.return_hidden_states:
-                capture_hidden_mode = CaptureHiddenMode.FULL
-            elif batch.spec_info is not None:
-                capture_hidden_mode = getattr(
-                    batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+            request_capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if model_runner.is_draft_worker
+                else max(
+                    batch.return_hidden_states_mode,
+                    get_server_return_hidden_states_mode(model_runner.server_args),
                 )
-            else:
-                capture_hidden_mode = CaptureHiddenMode.NULL
+            )
+            capture_hidden_mode = get_required_capture_hidden_mode(
+                request_capture_hidden_mode,
+                batch.spec_info,
+            )
 
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():
@@ -808,6 +872,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.server_args.enable_lora:
+                model_runner.lora_manager.reset_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -922,7 +988,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_server_args().enable_mis and any(
+            if get_exec().features.enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1091,7 +1157,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_server_args().rl_on_policy_target
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
@@ -1160,8 +1226,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local import: a module-level cp_utils import here is circular (#27014).
-        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+        # Local imports: module-level CP helper imports here are circular (#27014).
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import enable_cp_v2
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -1181,9 +1248,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
         # prefill with NaN draft logits, see #23269).
         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        cp_align_size = get_cp_padding_align_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+        if not enable_cp_v2():
+            cp_align_size = get_cp_padding_align_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1235,7 +1303,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len,
+            num_tokens,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
+            self.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
@@ -1358,6 +1430,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
+        self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
@@ -1467,6 +1540,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self._original_batch_size is not None:
             self.batch_size = self._original_batch_size
         bs = self.batch_size
+
+        # MLP-sync padding appended dummy rows after the real ones; slice the
+        # per-request tensors back so post-forward consumers (seeded sampling,
+        # ngram token-table updates) never see the padding. The draft-decode
+        # branch below does the same for speculative batches.
+        if self.spec_info is None and self._original_num_tokens is not None:
+            self.positions = self.positions[: self._original_num_tokens]
+            self.seq_lens = self.seq_lens[:bs]
+            self.req_pool_indices = self.req_pool_indices[:bs]
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
@@ -1640,7 +1724,7 @@ def _clamp_position_native(seq_lens):
 
 
 if is_cuda() or is_hip():
-    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+    from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
