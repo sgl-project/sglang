@@ -1837,6 +1837,15 @@ class AiterAttnBackend(AttentionBackend):
                     swa_out_cache_loc=swa_out_cache_loc,
                 )
 
+    def _dcp_graph_local_len_bounds(self, bs: int) -> tuple[int, int]:
+        """Static (max, total) upper bounds on this rank's local shard lengths
+        for a cuda-graph batch of ``bs`` rows, as accepted by
+        ``plan_dcp_decode_metadata(static_local_len_bounds=...)``. Every row is
+        bounded by the worst-case shard, so the batch total is ``bs`` times it.
+        """
+        max_local = self._dcp_graph_max_local_kv_len()
+        return max_local, bs * max_local
+
     def _plan_dcp_decode_metadata(
         self,
         kv_indptr: torch.Tensor,
@@ -1844,13 +1853,25 @@ class AiterAttnBackend(AttentionBackend):
         kv_lens_gpu: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         bs: int,
+        static_local_len_bounds: Optional[tuple[int, int]] = None,
     ):
         """Localize kv_indptr / kv_indices to this rank's DCP round-robin shard
         (in place). When ``seq_lens_cpu`` is available, size the plan from a CPU
         local-length array (``init_metadata_replay=True``) so no per-step GPU->CPU
-        sync is needed.
+        sync is needed; when only ``static_local_len_bounds`` is available, size it
+        from those bounds, which is equally sync-free.
         """
-        if seq_lens_cpu is not None:
+        if static_local_len_bounds is not None:
+            plan_dcp_decode_metadata(
+                kv_lens_gpu,
+                kv_indptr,
+                kv_indices,
+                init_metadata_replay=False,
+                fast_decode_kwargs={},
+                bs=bs,
+                static_local_len_bounds=static_local_len_bounds,
+            )
+        elif seq_lens_cpu is not None:
             kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32).clone()
             update_local_kv_lens_for_dcp(kv_len_arr_cpu)
             plan_dcp_decode_metadata(
@@ -2375,13 +2396,18 @@ class AiterAttnBackend(AttentionBackend):
                 # seq_lens_cpu is NOT usable here: the DSPARK verify path
                 # pre-adds the window to it while the device seq_lens still holds
                 # the committed length, so the CPU fast path would plan a shard
-                # draft_num tokens too long.
+                # draft_num tokens too long. The exact device sizing costs two
+                # GPU->CPU syncs on EVERY replay, so size the plan from the
+                # static per-graph bounds instead -- sync-free by construction.
+                # (Measured as a wash at bs=1 and bs~44: the overlap scheduler
+                # keeps the CPU ahead, so the sync waited on finished work.)
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
                     seq_lens[:bs].to(torch.int32).clone(),
                     None,
                     bs,
+                    static_local_len_bounds=self._dcp_graph_local_len_bounds(bs),
                 )
                 n_rows = bs * self.num_draft_tokens
                 (
