@@ -191,6 +191,21 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
         )
 
 
+def split_cached_prefix_by_tier(
+    prefix_len: int, host_hit_len: int, storage_hit_len: int
+) -> tuple[int, int, int]:
+    """Split a request's cached prefix into (device, host, storage) tokens.
+
+    prefix_len is len(prefix_indices) AFTER host load-back, so it contains the
+    host-loaded portion; host_hit_len in turn contains the storage-prefetched
+    portion (storage is clamped to it to handle edge cases).
+    """
+    storage = min(host_hit_len, storage_hit_len)
+    host = host_hit_len - storage
+    device = max(0, prefix_len - host_hit_len)
+    return device, host, storage
+
+
 def _compute_pad_value(hash: int) -> int:
     """Compute pad value from hash."""
     return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
@@ -2393,24 +2408,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
                 # would incorrectly count previously computed tokens as cache hits.
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
+                    # after prefetch completes.
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ) = split_cached_prefix_by_tier(
+                        prefix_len=len(req.prefix_indices),
+                        host_hit_len=req.host_hit_length,
+                        storage_hit_len=req.storage_hit_length,
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

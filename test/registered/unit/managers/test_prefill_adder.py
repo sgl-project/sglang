@@ -97,6 +97,8 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.host_hit_length = 0
+        req.storage_hit_length = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
