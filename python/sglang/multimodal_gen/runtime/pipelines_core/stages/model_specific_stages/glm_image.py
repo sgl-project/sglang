@@ -147,9 +147,7 @@ def _seed_for_output(seed: Optional[Union[int, List[int]]], output_idx: int):
 def _expand_prompts_and_seeds(batch: Req) -> tuple[list[str], list[int]]:
     prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
     num_outputs = _num_outputs_per_prompt(batch)
-    dynamic_seeds = (getattr(batch, "extra", None) or {}).get(
-        "dynamic_batch_seeds"
-    )
+    dynamic_seeds = (getattr(batch, "extra", None) or {}).get("dynamic_batch_seeds")
 
     if dynamic_seeds is not None:
         if len(dynamic_seeds) != len(prompts):

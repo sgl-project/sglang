@@ -13,6 +13,9 @@ from dataclasses import dataclass
 
 import torch
 import zmq
+from transformers import AutoProcessor
+from zmq.utils.monitor import recv_monitor_message
+
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
 )
@@ -36,8 +39,6 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 )
 from sglang.multimodal_gen.runtime.dynamic_batching import can_dynamic_batch
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
-from transformers import AutoProcessor
-from zmq.utils.monitor import recv_monitor_message
 
 logger = logging.getLogger(__name__)
 
@@ -587,7 +588,9 @@ class DiffusionServer:
 
         group_id = f"glm-fanout::{time.monotonic_ns()}"
         output_start = 0
-        sequential_multi_output = self._server_args.pipeline_config.supports_sequential_multi_output_inference()
+        sequential_multi_output = (
+            self._server_args.pipeline_config.supports_sequential_multi_output_inference()
+        )
         for client_index, client in enumerate(clients):
             output_count = max(1, int(client.req.num_outputs_per_prompt or 1))
             output_end = output_start + output_count
