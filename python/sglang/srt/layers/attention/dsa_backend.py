@@ -448,6 +448,7 @@ class DeepseekSparseAttnBackend(
             self.aiter_sparse_mla_extend_kv_indices = None
             self.aiter_sparse_mla_extend_plan_serial = -1
             self.aiter_sparse_mla_identity_scale = None
+            self.aiter_sparse_mla_descale_cache: Dict[int, torch.Tensor] = {}
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
@@ -458,14 +459,15 @@ class DeepseekSparseAttnBackend(
                     q_dtype=torch.bfloat16,
                     kv_dtype=fp8_dtype,
                 )
-                # asm_mla.cu rejects fp8 Q unless BOTH scales are given, and the
-                # fused rope/cache path quantizes Q and KV against a unit scale,
-                # so the value is a constant 1.0. Allocating it per layer costs
-                # 2 fill launches x every layer x every forward, which measured
-                # +0.62 ms per decode iteration -- more than the aiter kernel
-                # itself saves. One tensor, allocated once, is shared by every
-                # layer and by both the decode and extend paths; nothing ever
-                # writes to it.
+                # asm_mla.cu rejects fp8 Q unless BOTH scales are given, and a
+                # checkpoint without calibrated KV scales leaves layer.k_scale
+                # unset, so the descale degenerates to 1.0 -- see
+                # _aiter_sparse_mla_descale. Building that scalar per layer
+                # costs 2 fill launches x every layer x every forward, which
+                # measured +0.62 ms per decode iteration -- more than the aiter
+                # kernel itself saves. One tensor, allocated once, is shared by
+                # every layer and by both the decode and extend paths; nothing
+                # ever writes to it.
                 self.aiter_sparse_mla_identity_scale = torch.ones(
                     (), dtype=torch.float32, device=self.device
                 )
@@ -3156,6 +3158,44 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    def _aiter_sparse_mla_descale(self, layer: RadixAttention) -> torch.Tensor:
+        """Per-tensor descale for aiter's sparse-MLA kernel.
+
+        The kernel evaluates ``logits = (Q_fp8 . KV_fp8) * q_scale * kv_scale``,
+        so the scales it is given must be the ones the values were quantized
+        *with*.  Both operands are quantized against ``layer.k_scale``: KV on
+        cache write, and Q inside ``fused_qk_rope_cat_and_cache_mla`` (see
+        ``forward_mla.py``, which passes ``self.attn_mqa.k_scale``).  One scale
+        therefore serves both kernel arguments.
+
+        A checkpoint that ships no calibrated KV scales leaves ``k_scale``
+        unset, quantization degenerates to a raw cast, and the descale is 1.0;
+        that case returns the preallocated unit scalar so the common path
+        allocates nothing.  Hardcoding 1.0 instead would silently mis-scale
+        every logit by ``k_scale ** 2`` on a checkpoint that *does* ship KV
+        scales -- no error, no warning, just wrong attention weights.
+        """
+        k_scale = getattr(layer, "k_scale", None)
+        if k_scale is None:
+            return self.aiter_sparse_mla_identity_scale
+
+        cached = self.aiter_sparse_mla_descale_cache.get(layer.layer_id)
+        if cached is None:
+            if k_scale.numel() != 1:
+                raise ValueError(
+                    "aiter sparse MLA needs a per-tensor KV scale, but layer "
+                    f"{layer.layer_id} has k_scale with {k_scale.numel()} "
+                    "elements. Use --dsa-decode-backend tilelang "
+                    "--dsa-prefill-backend tilelang for this checkpoint."
+                )
+            cached = (
+                k_scale.detach()
+                .to(device=self.device, dtype=torch.float32)
+                .reshape(())
+            )
+            self.aiter_sparse_mla_descale_cache[layer.layer_id] = cached
+        return cached
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -3199,12 +3239,11 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Both point at the
-        # same preallocated unit scalar -- see __init__ for why it is not built
-        # here.
-        identity_scale = self.aiter_sparse_mla_identity_scale
-        q_scale = identity_scale if q_kernel.dtype.itemsize == 1 else None
-        kv_scale = identity_scale if kv_cache.dtype == fp8_dtype else None
+        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Q and KV were
+        # quantized against the same layer scale, so both arguments get it.
+        descale = self._aiter_sparse_mla_descale(layer)
+        q_scale = descale if q_kernel.dtype.itemsize == 1 else None
+        kv_scale = descale if kv_cache.dtype == fp8_dtype else None
 
         # dsa_cu_seqlens_k is seq_lens clamped to index_topk, cumulatively summed
         # -- exactly the sparse indptr, and already up to date for this batch.
@@ -3309,11 +3348,10 @@ class DeepseekSparseAttnBackend(
             device=q.device,
         )
 
-        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Both point at
-        # the same preallocated unit scalar -- see __init__ for why it is not
-        # built here.
-        identity_scale = self.aiter_sparse_mla_identity_scale
-        q_scale = identity_scale if q_kernel.dtype.itemsize == 1 else None
+        # asm_mla.cu rejects fp8 Q unless BOTH scales are given. Q and KV were
+        # quantized against the same layer scale, so both arguments get it.
+        descale = self._aiter_sparse_mla_descale(layer)
+        q_scale = descale if q_kernel.dtype.itemsize == 1 else None
 
         sparse_mla_decode(
             q_kernel,
@@ -3332,7 +3370,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_q=1,
             sm_scale=layer.scaling,
             q_scale=q_scale,
-            kv_scale=identity_scale,
+            kv_scale=descale,
         )
 
         if self.need_pad_heads:
