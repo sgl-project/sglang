@@ -78,7 +78,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - Tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and Blackwell (B200); `--tp 8` on 80 GB cards (H100, H800).
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
 - The chat template enables thinking by default. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}`; to disable it server-wide, launch with `--default-chat-template-kwargs '{"enable_thinking":false}'` (see §3.1).
-- `--speculative-algorithm NEXTN` enables the NEXTN speculative decoding path on the Balanced recipes.
+- The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`), so `--speculative-algorithm NEXTN` works out of the box with no separate draft model. It is on in the Balanced recipes; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
 - The B200 Low-Latency recipe uses DSpark speculative decoding (`--speculative-algorithm DSPARK`) with a separate draft checkpoint; replace `<dspark-draft-model>` with the published draft repository.
 - Native context is 128K. The Balanced recipes set `--context-length 262144` and apply YaRN with factor 2.0 to extend it to 256K.
 
