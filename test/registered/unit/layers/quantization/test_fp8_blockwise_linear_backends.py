@@ -1,11 +1,13 @@
-"""Numerics for the FP8 blockwise / MXFP8 dense-linear GEMM backends
-(--fp8-gemm-backend).
+"""Numerics for the FP8 dense-linear GEMM backends (--fp8-gemm-backend).
 
-Runs Fp8LinearMethod end to end (create_weights ->
-process_weights_after_loading -> apply) for each backend choice and checks
-the output against a dequantized-reference matmul. This covers the
-per-backend weight preparation (e.g. UE8M0 scale requant for DeepGEMM,
-per-backend MXFP8 scale packing) and the GEMM kernel dispatch.
+Runs the quant-method layer path (create_weights ->
+process_weights_after_loading -> apply) against a dequantized-reference
+matmul, covering the per-backend weight preparation (e.g. UE8M0 scale requant
+for DeepGEMM, per-backend MXFP8 scale packing) and the GEMM dispatch.
+Three formats: FP8 blockwise (Fp8LinearMethod), MXFP8 (Fp8LinearMethod with
+use_mxfp8), and per-tensor FP8 (ModelOptFp8LinearMethod, auto dispatch).
+The backend set adapts to the device SM version, so the same file covers
+Hopper (SM90), B200-class (SM100/103), and consumer Blackwell (SM120).
 """
 
 import unittest
@@ -16,11 +18,17 @@ import torch
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 FP8_MAX = 448.0
 
@@ -31,25 +39,38 @@ FP8_BLOCK_SHAPES = [
     (128, 1024, 1024),
 ]
 
-# SM100-capable backends; flashinfer_deepgemm is SM90-only and aiter is ROCm.
-FP8_BLOCK_BACKENDS = [
-    "triton",
-    "deep_gemm",
-    "flashinfer_trtllm",
-    "flashinfer_cutlass",
-]
-
 # (M, N, K); K must be a multiple of 256 (flashinfer trtllm mxfp8 requirement).
 MXFP8_SHAPES = [
     (64, 512, 512),
     (5, 384, 768),
 ]
 
-MXFP8_BACKENDS = [
-    "triton",
-    "flashinfer_trtllm",
-    "flashinfer_cutlass",
+# (M, N, K); per-tensor has no block-alignment constraints.
+PER_TENSOR_SHAPES = [
+    (64, 512, 512),
+    (5, 384, 896),
 ]
+
+
+def _fp8_block_backends():
+    sm = get_device_sm()
+    if 100 <= sm < 110:
+        return ["triton", "deep_gemm", "flashinfer_trtllm", "flashinfer_cutlass"]
+    if sm >= 120:
+        # cutlass is the SM120-only explicit backend; the trtllm / deepgemm
+        # kernels do not support consumer Blackwell.
+        return ["triton", "cutlass"]
+    if sm == 90:
+        # flashinfer_deepgemm (swapAB) is SM90-only.
+        return ["triton", "deep_gemm", "flashinfer_deepgemm"]
+    return []
+
+
+def _mxfp8_backends():
+    # MXFP8 linear is validated on SM100/103 only.
+    if 100 <= get_device_sm() < 110:
+        return ["triton", "flashinfer_trtllm", "flashinfer_cutlass"]
+    return []
 
 
 def _quantize_fp8_blockwise(w: torch.Tensor, block: int = 128):
@@ -78,9 +99,12 @@ def _quantize_mxfp8(w: torch.Tensor, block: int = 32):
     return w_fp8.reshape(n, k), scale_e8m0, w_dequant
 
 
-def _make_layer(quant_config: Fp8Config, n: int, k: int, device: str = "cuda"):
-    method = Fp8LinearMethod(quant_config)
+def _create_weights(method, n: int, k: int, device: str = "cuda"):
     layer = torch.nn.Module()
+    kwargs = {}
+    if isinstance(method, Fp8LinearMethod):
+        # The shape check reads TP world size (needs distributed init); skip it here.
+        kwargs["skip_block_quant_check"] = True
     method.create_weights(
         layer,
         input_size_per_partition=k,
@@ -88,16 +112,16 @@ def _make_layer(quant_config: Fp8Config, n: int, k: int, device: str = "cuda"):
         input_size=k,
         output_size=n,
         params_dtype=torch.bfloat16,
-        # The shape check reads TP world size (needs distributed init); skip it here.
-        skip_block_quant_check=True,
-        weight_loader=lambda *args, **kwargs: None,
+        weight_loader=lambda *args, **kw: None,
+        **kwargs,
     )
-    layer = layer.to(device)
-    return method, layer
+    return layer.to(device)
 
 
 class _LinearBackendCheck(CustomTestCase):
-    def _check_backend(self, backend: str, shapes, build_layer):
+    def _check_backend(self, backend: str, allowed, shapes, build_layer):
+        if backend not in allowed:
+            self.skipTest(f"{backend} not in SM{get_device_sm()} backend set")
         torch.manual_seed(7)
         for m, n, k in shapes:
             with self.subTest(backend=backend, shape=(m, n, k)):
@@ -123,7 +147,7 @@ class _LinearBackendCheck(CustomTestCase):
                     torch.testing.assert_close(out.float(), ref, rtol=5e-2, atol=1e-1)
 
 
-@unittest.skipIf(get_device_sm() < 100, "targets the SM100 backend set")
+@unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
 class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
     @staticmethod
     def _build_layer(n: int, k: int):
@@ -132,27 +156,39 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
             activation_scheme="dynamic",
             weight_block_size=[128, 128],
         )
-        method, layer = _make_layer(quant_config, n, k)
+        method = Fp8LinearMethod(quant_config)
+        layer = _create_weights(method, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         w_fp8, scale_inv, w_dequant = _quantize_fp8_blockwise(w)
         layer.weight.data.copy_(w_fp8)
         layer.weight_scale_inv.data.copy_(scale_inv)
         return method, layer, w_dequant
 
+    def _run(self, backend: str):
+        self._check_backend(
+            backend, _fp8_block_backends(), FP8_BLOCK_SHAPES, self._build_layer
+        )
+
     def test_triton(self):
-        self._check_backend("triton", FP8_BLOCK_SHAPES, self._build_layer)
+        self._run("triton")
 
     def test_deep_gemm(self):
-        self._check_backend("deep_gemm", FP8_BLOCK_SHAPES, self._build_layer)
+        self._run("deep_gemm")
 
     def test_flashinfer_trtllm(self):
-        self._check_backend("flashinfer_trtllm", FP8_BLOCK_SHAPES, self._build_layer)
+        self._run("flashinfer_trtllm")
 
     def test_flashinfer_cutlass(self):
-        self._check_backend("flashinfer_cutlass", FP8_BLOCK_SHAPES, self._build_layer)
+        self._run("flashinfer_cutlass")
+
+    def test_flashinfer_deepgemm(self):
+        self._run("flashinfer_deepgemm")
+
+    def test_cutlass(self):
+        self._run("cutlass")
 
 
-@unittest.skipIf(get_device_sm() < 100, "targets the SM100 backend set")
+@unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
 class TestMxfp8LinearBackends(_LinearBackendCheck):
     @staticmethod
     def _build_layer(n: int, k: int):
@@ -161,21 +197,48 @@ class TestMxfp8LinearBackends(_LinearBackendCheck):
             activation_scheme="dynamic",
             use_mxfp8=True,
         )
-        method, layer = _make_layer(quant_config, n, k)
+        method = Fp8LinearMethod(quant_config)
+        layer = _create_weights(method, n, k)
         w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
         w_fp8, scale_e8m0, w_dequant = _quantize_mxfp8(w)
         layer.weight.data.copy_(w_fp8)
         layer.weight_scale_inv.data.copy_(scale_e8m0)
         return method, layer, w_dequant
 
+    def _run(self, backend: str):
+        self._check_backend(backend, _mxfp8_backends(), MXFP8_SHAPES, self._build_layer)
+
     def test_triton(self):
-        self._check_backend("triton", MXFP8_SHAPES, self._build_layer)
+        self._run("triton")
 
     def test_flashinfer_trtllm(self):
-        self._check_backend("flashinfer_trtllm", MXFP8_SHAPES, self._build_layer)
+        self._run("flashinfer_trtllm")
 
     def test_flashinfer_cutlass(self):
-        self._check_backend("flashinfer_cutlass", MXFP8_SHAPES, self._build_layer)
+        self._run("flashinfer_cutlass")
+
+
+@unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
+class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
+    """Per-tensor FP8 (ModelOptFp8LinearMethod, static scales) on the auto
+    dispatch path -- the checkpoint style of nvidia/*-FP8 models."""
+
+    @staticmethod
+    def _build_layer(n: int, k: int):
+        quant_config = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+        method = ModelOptFp8LinearMethod(quant_config)
+        layer = _create_weights(method, n, k)
+        w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+        scale = (w.float().abs().max() / FP8_MAX).clamp(min=1e-12)
+        w_fp8 = (w.float() / scale).to(torch.float8_e4m3fn)
+        layer.weight.data.copy_(w_fp8)
+        layer.weight_scale.data.fill_(scale)
+        layer.input_scale.data.fill_(1.0 / FP8_MAX)
+        w_dequant = w_fp8.float() * scale
+        return method, layer, w_dequant
+
+    def test_auto(self):
+        self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
 
 
 if __name__ == "__main__":
