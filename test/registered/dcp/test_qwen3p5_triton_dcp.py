@@ -2,8 +2,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -18,16 +20,17 @@ register_amd_ci(
     suite="nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp",
     nightly=True,
 )
+register_cuda_ci(est_time=4800, suite="nightly-4-gpu-b200", nightly=True)
 
 QWEN35_MODEL_PATH = os.environ.get("QWEN3_5_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B-FP8")
 SERVER_LAUNCH_TIMEOUT = 4800
-TP_SIZE = 8
-DCP_SIZE = 2
+TP_SIZE = 4
+DCP_SIZE = 4
 GSM8K_ACCURACY_THRESHOLD = 0.90
 
 
 class TestQwen35TritonDCPGsm8k(CustomTestCase):
-    """Qwen3.5 Triton DCP (tp=8, dcp=2) full GSM8K accuracy on AMD MI35x."""
+    """Qwen3.5 Triton DCP (TP4/DCP4) full GSM8K accuracy."""
 
     @classmethod
     def setUpClass(cls):
@@ -52,8 +55,9 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
             ),
         ]
         env = os.environ.copy()
-        env["SGLANG_USE_AITER"] = "1"
-        env["HSA_NO_SCRATCH_RECLAIM"] = "1"
+        if torch.version.hip:
+            env["SGLANG_USE_AITER"] = "1"
+            env["HSA_NO_SCRATCH_RECLAIM"] = "1"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -83,7 +87,7 @@ class TestQwen35TritonDCPGsm8k(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_a_gsm8k (qwen3.5-triton-dcp2)\n" f'{metrics["score"]=:.3f}\n'
+                f"### test_a_gsm8k (qwen3.5-triton-dcp4)\n" f'{metrics["score"]=:.3f}\n'
             )
         self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)
 
