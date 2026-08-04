@@ -64,9 +64,10 @@ directory.
 
 ## Verification
 
-Local tests execute the real script with mocked host commands to verify all four
-platform cells, unsupported platform rejection, CUDA 13 CCCL injection,
-the fixed architecture list, output handling, and command failures. Static
+Local tests source and execute the real script functions to verify all four
+platform cells, unsupported platform rejection, CUDA 13 CCCL injection, output
+handling, and command failures. The wheel-build test uses a real minimal
+setuptools project whose build rejects the wrong architecture list. Static
 checks include `bash -n` and ShellCheck when available.
 
 End-to-end validation uses two 4-GPU devboxes, reusing each devbox across two
