@@ -18,9 +18,11 @@ concurrency:
   group: seed-rust-ext-cache
   cancel-in-progress: true
 
+# issues: read is what check-maintenance needs to reach the maintenance issue;
+# declaring permissions at all drops everything not listed here.
 permissions:
-  actions: write
   contents: read
+  issues: read
 
 jobs:
   seed:
