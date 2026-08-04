@@ -29,7 +29,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     ceil_div,
@@ -169,6 +168,12 @@ def _should_use_masked_standard_layout(
     if _masked_standard_layout_memory_budget_bytes is None:
         # Serving sets an all-rank budget before capture. Direct eager callers
         # fall back to this rank's free memory without querying inside capture.
+        # Import lazily to avoid a module-initialization cycle through
+        # runner_utils -> DeepEP -> MoE -> this module.
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
         if get_is_capture_mode():
             return False
         free_memory, _ = torch.cuda.mem_get_info(hidden_states.device)
