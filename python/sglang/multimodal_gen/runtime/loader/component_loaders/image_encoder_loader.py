@@ -54,7 +54,6 @@ class ImageEncoderLoader(TextEncoderLoader):
         finalize_encoder_folding(
             encoder_config,
             server_args.encoder_parallel,
-            batched=server_args.batching_max_size > 1,
         )
 
         # Always start with local device; load_model will adjust for offload if needed

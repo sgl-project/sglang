@@ -129,6 +129,14 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_nemotron_h(config) -> bool:
+    return _hf_arch(config) in (
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "NemotronHForCausalLMMTP",
+    )
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -497,7 +505,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
