@@ -67,7 +67,7 @@ elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:
     if not _is_hip:
-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+        warnings.warn("Only CUDA, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class GGUFConfig(QuantizationConfig):
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
         if _is_hip:
-            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
+            warnings.warn("Only CUDA and MUSA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
@@ -584,8 +584,16 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             for shard_id in ("w1", "w3")
         }
         expected_w2 = {(expert_id, "w2") for expert_id in range(num_experts)}
-        actual_w13 = set(getattr(layer.w13_qweight, "expert_data_map", {}))
-        actual_w2 = set(getattr(layer.w2_qweight, "expert_data_map", {}))
+        stream_to_final = bool(
+            getattr(
+                self.quant_config,
+                "stream_moe_weights_to_final_device",
+                False,
+            )
+        )
+        inventory_attr = "gguf_loaded_keys" if stream_to_final else "expert_data_map"
+        actual_w13 = set(getattr(layer.w13_qweight, inventory_attr, {}))
+        actual_w2 = set(getattr(layer.w2_qweight, inventory_attr, {}))
         if actual_w13 != expected_w13:
             raise ValueError(
                 "GGUF MoE W13 expert inventory is incomplete: "
@@ -597,7 +605,31 @@ class GGUFMoEMethod(FusedMoEMethodBase):
                 f"expected={len(expected_w2)}, actual={len(actual_w2)}"
             )
 
-        layer.materialize_gguf_weights()
+        if not stream_to_final:
+            layer.materialize_gguf_weights()
+        else:
+            for label, weight in (
+                ("w13", layer.w13_qweight),
+                ("w2", layer.w2_qweight),
+            ):
+                if weight.device.type != "cuda":
+                    raise RuntimeError(
+                        f"streamed GGUF MoE {label} remained on {weight.device}"
+                    )
+                if getattr(weight, "data_container", None):
+                    raise RuntimeError(
+                        f"streamed GGUF MoE {label} retained staged tensors"
+                    )
+                if getattr(weight, "expert_data_map", None):
+                    raise RuntimeError(
+                        f"streamed GGUF MoE {label} retained an expert data map"
+                    )
+            logger.info(
+                "GGUF_STREAM_FINAL_COMPLETE w13_shape=%s w2_shape=%s device=%s",
+                tuple(layer.w13_qweight.shape),
+                tuple(layer.w2_qweight.shape),
+                layer.w13_qweight.device,
+            )
         if isinstance(layer.w13_qweight, UninitializedParameter) or isinstance(
             layer.w2_qweight, UninitializedParameter
         ):

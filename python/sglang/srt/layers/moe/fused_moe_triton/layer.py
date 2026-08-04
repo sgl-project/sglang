@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.gguf_moe_loader import (
+    plan_gguf_moe_stream_destination,
     plan_gguf_moe_tp_shard,
     record_gguf_moe_qtype,
 )
@@ -90,6 +91,8 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -1057,10 +1060,86 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
                 packed_type_size=packed_type_size,
             )
+            local_weight = loaded_weight.narrow(axis, start_idx, shard_size)
+
+            stream_to_final = bool(
+                getattr(
+                    getattr(self.quant_method, "quant_config", None),
+                    "stream_moe_weights_to_final_device",
+                    False,
+                )
+            )
+            if stream_to_final:
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "streaming Kimi K3 GGUF MoE loading requires CUDA"
+                    )
+                target_device = torch.device("cuda", torch.cuda.current_device())
+                parameter_shape, destination = plan_gguf_moe_stream_destination(
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    num_experts=self.num_local_experts,
+                    local_shape=local_weight.shape,
+                )
+                if isinstance(param, UninitializedParameter):
+                    param.materialize(
+                        parameter_shape,
+                        device=target_device,
+                        dtype=local_weight.dtype,
+                    )
+                    param.gguf_loaded_keys = set()
+                    logger.info(
+                        "GGUF_STREAM_FINAL_ALLOC shard=%s shape=%s device=%s",
+                        shard_id,
+                        parameter_shape,
+                        target_device,
+                    )
+                else:
+                    if tuple(param.shape) != parameter_shape:
+                        raise ValueError(
+                            "streaming GGUF MoE parameter shape changed: "
+                            f"expected={parameter_shape}, actual={tuple(param.shape)}"
+                        )
+                    if param.device != target_device:
+                        raise RuntimeError(
+                            "streaming GGUF MoE parameter is on the wrong device: "
+                            f"expected={target_device}, actual={param.device}"
+                        )
+                    if param.dtype != local_weight.dtype:
+                        raise ValueError(
+                            "streaming GGUF MoE parameter dtype changed: "
+                            f"expected={local_weight.dtype}, actual={param.dtype}"
+                        )
+
+                key = (expert_id, shard_id)
+                loaded_keys = getattr(param, "gguf_loaded_keys", None)
+                if not isinstance(loaded_keys, set):
+                    raise RuntimeError("streaming GGUF MoE load inventory is missing")
+                if key in loaded_keys:
+                    raise ValueError(f"duplicate streaming GGUF MoE weight: {key!r}")
+
+                destination_expert, row_start, row_length = destination
+                destination_weight = param.data[
+                    destination_expert, row_start : row_start + row_length
+                ]
+                if destination_weight.shape != local_weight.shape:
+                    raise ValueError(
+                        "streaming GGUF MoE destination shape differs: "
+                        f"destination={tuple(destination_weight.shape)}, "
+                        f"source={tuple(local_weight.shape)}"
+                    )
+                # The pageable mmap source must remain valid until the transfer
+                # completes.  The default blocking copy provides that boundary;
+                # the adapter evicts this expert's source pages when its
+                # generator resumes immediately afterwards.
+                destination_weight.copy_(local_weight, non_blocking=False)
+                loaded_keys.add(key)
+                return True
+
             # The GGUF iterator may expose a zero-copy read-only mmap view. Keep
             # only this rank's shard, and own it on the parameter device before
             # advancing the iterator or retaining it in expert_data_map.
-            loaded_weight = loaded_weight.narrow(axis, start_idx, shard_size).to(
+            loaded_weight = local_weight.to(
                 device=param.device, copy=True
             )
 

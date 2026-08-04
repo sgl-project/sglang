@@ -88,3 +88,43 @@ def plan_gguf_moe_tp_shard(
                 f"type_size={packed_type_size}, tp_size={tp_size}"
             )
     return axis, tp_rank * length, length
+
+
+def plan_gguf_moe_stream_destination(
+    *,
+    shard_id: str,
+    expert_id: int,
+    num_experts: int,
+    local_shape: Sequence[int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Plan one expert's final slot in a streaming packed-MoE parameter.
+
+    Returns ``(parameter_shape, (expert, row_start, row_length))``.  W1 and W3
+    share the fused W13 parameter, so their rows occupy its lower and upper
+    halves.  W2 owns the complete row range of its separate parameter.
+
+    Keeping this shape arithmetic pure makes the peak-memory invariant
+    testable without CUDA: the runtime can materialize the final parameter
+    once and copy each incoming expert directly into its permanent slot,
+    rather than retaining every expert tensor and allocating a second fused
+    copy after the whole checkpoint has been read.
+    """
+
+    if shard_id not in GGUF_MOE_SHARDS:
+        raise ValueError(f"unsupported GGUF MoE shard id: {shard_id!r}")
+    if num_experts <= 0 or not 0 <= expert_id < num_experts:
+        raise ValueError(
+            f"invalid GGUF MoE expert: id={expert_id}, count={num_experts}"
+        )
+    if len(local_shape) != 2 or any(int(value) <= 0 for value in local_shape):
+        raise ValueError(
+            f"GGUF MoE local expert weight must be a positive 2D shape: "
+            f"{local_shape}"
+        )
+
+    rows, columns = (int(value) for value in local_shape)
+    if shard_id == "w2":
+        return (num_experts, rows, columns), (expert_id, 0, rows)
+
+    row_start = 0 if shard_id == "w1" else rows
+    return (num_experts, 2 * rows, columns), (expert_id, row_start, rows)

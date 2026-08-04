@@ -80,6 +80,8 @@ class KimiK3GGUFQuantConfig:
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
         class _KimiK3GGUFConfig(GGUFConfig):
+            stream_moe_weights_to_final_device = True
+
             def get_quant_method(self, layer: torch.nn.Module, prefix: str):
                 if isinstance(layer, FusedMoE):
                     return GGUFMoEMethod(self)

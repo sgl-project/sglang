@@ -7,6 +7,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 import unittest
 
 from sglang.srt.layers.quantization.gguf_moe_loader import (
+    plan_gguf_moe_stream_destination,
     plan_gguf_moe_tp_shard,
     record_gguf_moe_qtype,
 )
@@ -97,6 +98,50 @@ class TestGGUFMoETPShardingContract(unittest.TestCase):
             ),
             (1, 0, 12 * 66),
         )
+
+
+class TestGGUFMoEStreamingDestinationContract(unittest.TestCase):
+    def test_w1_streams_into_lower_half_of_final_w13(self):
+        self.assertEqual(
+            plan_gguf_moe_stream_destination(
+                shard_id="w1",
+                expert_id=7,
+                num_experts=896,
+                local_shape=(768, 1036),
+            ),
+            ((896, 1536, 1036), (7, 0, 768)),
+        )
+
+    def test_w3_streams_into_upper_half_of_same_final_w13(self):
+        self.assertEqual(
+            plan_gguf_moe_stream_destination(
+                shard_id="w3",
+                expert_id=7,
+                num_experts=896,
+                local_shape=(768, 1036),
+            ),
+            ((896, 1536, 1036), (7, 768, 768)),
+        )
+
+    def test_w2_streams_into_final_down_parameter(self):
+        self.assertEqual(
+            plan_gguf_moe_stream_destination(
+                shard_id="w2",
+                expert_id=895,
+                num_experts=896,
+                local_shape=(3584, 222),
+            ),
+            ((896, 3584, 222), (895, 0, 3584)),
+        )
+
+    def test_stream_plan_rejects_invalid_expert(self):
+        with self.assertRaisesRegex(ValueError, "invalid GGUF MoE expert"):
+            plan_gguf_moe_stream_destination(
+                shard_id="w2",
+                expert_id=896,
+                num_experts=896,
+                local_shape=(3584, 222),
+            )
 
 
 if __name__ == "__main__":
