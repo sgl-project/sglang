@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_exec, get_schedule
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
         UpdateWeightFromDiskReqInput,
@@ -62,13 +64,13 @@ class EagleDraftWorkerBase(ABC):
         num_steps = self.speculative_num_steps
         sa = self.server_args
         decode_max_bs = (
-            sa.cuda_graph_config.decode.max_bs
-            if sa.cuda_graph_config is not None
+            get_exec().graph.cuda_graph_config.decode.max_bs
+            if get_exec().graph.cuda_graph_config is not None
             else None
         )
         max_bs = max(
             decode_max_bs or 0,
-            sa.max_running_requests or 0,
+            get_schedule().max_running_requests or 0,
             1,
         )
         # A single-step chain has no parent entries (slow path drops the last

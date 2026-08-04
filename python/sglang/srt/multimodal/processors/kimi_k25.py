@@ -416,6 +416,8 @@ class KimiGPUProcessorWrapper:
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    prefer_tokenized_input = True
+    precompute_hash_before_cpu_transfer = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

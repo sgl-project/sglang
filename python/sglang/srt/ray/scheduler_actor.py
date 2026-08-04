@@ -16,13 +16,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 import ray
 
-if TYPE_CHECKING:
-    from sglang.srt.server_args import PortArgs, ServerArgs
-
+from sglang.srt.runtime_context import publish
+from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +98,10 @@ class SchedulerActor:
                 logger.info(
                     f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {actual_gpu_id}"
                 )
+
+        # This actor constructs Scheduler directly (no run_scheduler_process),
+        # which reads the config namespaces before the model worker's publish.
+        publish(server_args, role="scheduler")
 
         # Create scheduler (loads model into GPU, initializes NCCL)
         self.scheduler = Scheduler(

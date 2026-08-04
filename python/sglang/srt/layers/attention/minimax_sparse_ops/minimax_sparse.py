@@ -67,6 +67,12 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    idx_q_scale: Optional[float] = None,
+    idx_k_scale: Optional[float] = None,
+    idx_v_scale: Optional[float] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -106,6 +112,9 @@ def minimax_sparse_prefill(
         cu_seqblocks_q=cu_seqblocks_q,
         max_seqblock_q=max_seqblock_q,
         all_seqblock_q=all_seqblock_q,
+        q_scale=idx_q_scale,
+        k_scale=idx_k_scale,
+        v_scale=idx_v_scale,
     )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
@@ -134,6 +143,9 @@ def minimax_sparse_prefill(
                 prefix_lens=prefix_lens,
                 block_size_k=block_size_k,
                 sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         except MSAUnavailableError as err:
             _warn_msa_fallback(err)
@@ -154,6 +166,9 @@ def minimax_sparse_prefill(
                 sm_scale=sm_scale,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -173,6 +188,9 @@ def minimax_sparse_prefill(
             sm_scale=sm_scale,
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
     return idx_o, o
 
@@ -208,6 +226,12 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    idx_q_scale: Optional[float] = None,
+    idx_k_scale: Optional[float] = None,
+    idx_v_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
@@ -230,6 +254,9 @@ def minimax_sparse_decode(
         disable_index_value=disable_index_value,
         use_dense_main_attn=dense_main_attn_fn is not None,
         page_size=page_size,
+        q_scale=idx_q_scale,
+        k_scale=idx_k_scale,
+        v_scale=idx_v_scale,
     )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -262,6 +289,9 @@ def minimax_sparse_decode(
                     sm_scale=sm_scale,
                     kv_indices=msa_kv_indices,
                     plan=msa_plan,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
             except MSAUnavailableError as err:
                 _warn_msa_fallback(err)
@@ -276,6 +306,9 @@ def minimax_sparse_decode(
                     block_size=block_size_k,
                     topk_idx=topk_idx,
                     sm_scale=sm_scale,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -289,5 +322,8 @@ def minimax_sparse_decode(
                 block_size=block_size_k,
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
     return idx_o, o

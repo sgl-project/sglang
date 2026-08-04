@@ -22,7 +22,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_context, get_resources
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -313,7 +313,7 @@ def create_grammar_backend(
     tokenizer,
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
-    think_end_id: Optional[int] = None,
+    think_end_ids: Optional[List[int]] = None,
 ) -> Optional[BaseGrammarBackend]:
     name = server_args.grammar_backend
 
@@ -360,7 +360,7 @@ def create_grammar_backend(
                 "Falling back to grammar_backend='none'. "
                 "Structured outputs (JSON schema, regex, EBNF) will not be available."
             )
-            server_args.override("grammar.import_fallback", grammar_backend="none")
+            get_context().override("grammar.import_fallback", grammar_backend="none")
             return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
@@ -384,7 +384,7 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and think_end_id is not None:
+    if server_args.reasoning_parser and think_end_ids:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )

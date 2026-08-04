@@ -94,6 +94,35 @@ class SDPAImpl(AttentionImpl):
         output = output.transpose(1, 2)
         return output
 
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del max_seqlen
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        output = torch.empty_like(query)
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if start == stop:
+                continue
+            segment = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                None,
+            )
+            output[start:stop].copy_(segment[0])
+        return output
+
 
 class CudnnSDPABackend(SDPABackend):
     @staticmethod
@@ -122,7 +151,7 @@ class DynamicCudnnSDPABackend(SDPABackend):
         return DynamicCudnnSDPAImpl
 
 
-class DynamicCudnnSDPAImpl(AttentionImpl):
+class DynamicCudnnSDPAImpl(SDPAImpl):
     def __init__(
         self,
         num_heads: int,

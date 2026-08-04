@@ -28,6 +28,20 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+def _warn_if_expected_param_dtype_missing(
+    model: torch.nn.Module, expected_dtype: torch.dtype | None
+) -> None:
+    if expected_dtype is None:
+        return
+    param_dtypes = {param.dtype for param in model.parameters()}
+    if expected_dtype not in param_dtypes:
+        logger.warning(
+            "Model parameter dtypes do not include expected param dtype, %s vs %s",
+            param_dtypes,
+            expected_dtype,
+        )
+
+
 def _server_args_for_transformer_component(
     server_args: ServerArgs, component_name: str
 ) -> ServerArgs:
@@ -89,7 +103,8 @@ class TransformerLoader(ComponentLoader):
         # Don't let a quantized load quietly fall back to the unquantized native
         # model. That would drop the requested precision and bury the real error.
         return (
-            component_server_args.transformer_weights_path is not None
+            super().should_raise_customized_load_error(server_args, component_name)
+            or component_server_args.transformer_weights_path is not None
             or component_server_args.quantization is not None
         )
 
@@ -185,15 +200,6 @@ class TransformerLoader(ComponentLoader):
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
 
-        # considering the existent of mixed-precision models (e.g., nunchaku)
-        if (
-            next(model.parameters()).dtype != quant_spec.param_dtype
-            and quant_spec.param_dtype
-        ):
-            logger.warning(
-                "Model dtype does not match expected param dtype, %s vs %s",
-                next(model.parameters()).dtype,
-                quant_spec.param_dtype,
-            )
+        _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
 
         return model

@@ -171,7 +171,9 @@ class TestGetLoads(CustomTestCase):
                     disaggregation=DisaggregationMetrics(
                         mode="decode", decode_transfer_queue_reqs=4
                     ),
-                    queues=QueueMetrics(waiting=2, grammar=1, paused=0, retracted=3),
+                    queues=QueueMetrics(
+                        waiting=2, grammar=1, paused=0, retracted=3, prealloc_ready=1
+                    ),
                 )
             )
 

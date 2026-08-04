@@ -6,6 +6,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -455,6 +456,22 @@ class TestCopyForForward(CustomTestCase):
 # from_schedule_batch
 class TestFromScheduleBatch(CustomTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # from_schedule_batch reads these two flags from the exec bag; give
+        # each test a mutable stand-in so it does not depend on a published
+        # (or leaked) process context.
+        self._exec_ns = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            features=SimpleNamespace(enable_custom_logit_processor=False),
+        )
+        exec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_exec",
+            return_value=self._exec_ns,
+        )
+        exec_patch.start()
+        self.addCleanup(exec_patch.stop)
+
     def _make_req(
         self,
         temp=1.0,
@@ -537,6 +554,7 @@ class TestFromScheduleBatch(CustomTestCase):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
         mock_server_args.return_value.enable_deterministic_inference = True
         mock_server_args.return_value.enable_custom_logit_processor = False
+        self._exec_ns.deterministic.enable_deterministic_inference = True
 
         reqs = [self._make_req(seed=123), self._make_req(seed=None)]
         batch = MagicMock()
@@ -585,6 +603,7 @@ class TestFromScheduleBatch(CustomTestCase):
 
         mock_server_args.return_value.enable_deterministic_inference = False
         mock_server_args.return_value.enable_custom_logit_processor = True
+        self._exec_ns.features.enable_custom_logit_processor = True
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
         req1 = self._make_req()

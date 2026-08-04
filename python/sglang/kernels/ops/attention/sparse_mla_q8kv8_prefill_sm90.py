@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.jit.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -59,20 +59,19 @@ def _q8kv8_cuda_flags() -> list[str]:
 
 @cache_once
 def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
-    with override_jit_cuda_arch(9, 0, "a"):
-        return load_jit(
-            "sparse_mla_q8kv8_prefill_sm90",
-            cuda_files=[
-                "sparse_mla_q8kv8_prefill_sm90/entry.cuh",
-            ],
-            cuda_wrappers=[
-                ("dispatch", "sparse_prefill_q8kv8_dispatch"),
-                ("dispatch_full", "sparse_prefill_q8kv8_dispatch_full"),
-                ("dispatch_topk_length", "sparse_prefill_q8kv8_dispatch_topk_length"),
-            ],
-            extra_cuda_cflags=_q8kv8_cuda_flags(),
-            extra_dependencies=["cutlass"],
-        )
+    return load_jit(
+        "sparse_mla_q8kv8_prefill_sm90",
+        cuda_files=[
+            "sparse_mla_q8kv8_prefill_sm90/entry.cuh",
+        ],
+        cuda_wrappers=[
+            ("dispatch", "sparse_prefill_q8kv8_dispatch"),
+            ("dispatch_full", "sparse_prefill_q8kv8_dispatch_full"),
+            ("dispatch_topk_length", "sparse_prefill_q8kv8_dispatch_topk_length"),
+        ],
+        extra_cuda_cflags=_q8kv8_cuda_flags(),
+        extra_dependencies=["cutlass"],
+    )
 
 
 # Pre-resolve entry-point callables on first use to avoid per-call module

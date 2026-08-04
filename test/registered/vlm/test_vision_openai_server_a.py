@@ -17,6 +17,7 @@ from sglang.test.vlm_utils import (
     OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
@@ -74,7 +75,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

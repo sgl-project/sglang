@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -26,6 +26,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        # Set by prepare_lora_batch() before each forward; cleared by
+        # reset_batch_state() on DP-attention idle forwards. None means "no
+        # batch prepared" — the LoRA layers read it to skip LoRA application.
+        self.batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
         # Static metadata read by prefill-CUDA-graph kernels, refreshed in
@@ -34,6 +38,15 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+
+    def reset_batch_state(self):
+        """Idle-forward counterpart of prepare_lora_batch(): clears all
+        per-batch metadata. batch_info=None is the master "no batch
+        prepared" signal that the layer guards (lora_active) read."""
+        self.batch_info = None
+        self.lm_head_batch_info = None
+        self.lm_head_pass_batch_infos = None
+        self._lm_head_pass_idx = None
 
     def run_lora_a_embedding(
         self,

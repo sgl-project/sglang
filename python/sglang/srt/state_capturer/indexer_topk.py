@@ -6,7 +6,7 @@ import pybase64
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.
         server_args = get_server_args()
-        max_batch_size = max(server_args.chunked_prefill_size, max_running_requests)
+        max_batch_size = max(get_schedule().chunked_prefill_size, max_running_requests)
 
         super().__init__(
             num_tokens=num_tokens,
@@ -89,9 +89,8 @@ def create_indexer_capturer(
     max_running_requests: int,
     device: str,
 ) -> Optional[IndexerTopkCapturer]:
-    from sglang.srt.runtime_context import get_server_args
 
-    enable = get_server_args().enable_return_indexer_topk
+    enable = get_exec().features.enable_return_indexer_topk
     # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
     # path); other backends would create a capturer but never feed it.
     if enable and device != "cuda":

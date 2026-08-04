@@ -210,6 +210,16 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = default_radix_cache_factory(ctx)
         source = "default"
 
+    if ctx.server_args.enable_session_radix_cache and not getattr(
+        cache, "enable_session_radix_cache", False
+    ):
+        raise ValueError(
+            "--enable-session-radix-cache requires UnifiedRadixCache, but "
+            f"tree_cache is {type(cache).__name__}. Set "
+            "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (or remove "
+            "--enable-session-radix-cache)."
+        )
+
     streaming_wrapped = False
     if (
         ctx.server_args.enable_streaming_session

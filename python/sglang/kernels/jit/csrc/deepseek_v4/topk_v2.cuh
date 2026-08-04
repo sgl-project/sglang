@@ -220,8 +220,13 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
     if (blockIdx.y == worker_rank) Streaming::forward<kPDL>(problem, &smem);
   } else {
     auto cluster = cooperative_groups::this_cluster();
-    problem.out = cluster.map_shared_rank(topk_indices, worker_rank);
-    Cluster::forward<kPDL>(problem, &smem);  // write to peer's output shared memory
+    // The mapped alias stays in a copy: the elected rank reads the very same
+    // bytes back through `topk_indices` below, and letting a shared::cluster
+    // address reach the `problem.out` that problem_transform loads makes cicc
+    // segfault on CUDA 13.x (issue #32830).
+    auto peer_problem = problem;
+    peer_problem.out = cluster.map_shared_rank(topk_indices, worker_rank);
+    Cluster::forward<kPDL>(peer_problem, &smem);  // write to peer's output shared memory
     cluster.sync();
   }
 

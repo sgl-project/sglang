@@ -414,6 +414,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     ht,
     ssm_state_indices,
     scale,
+    lower_bound,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -428,6 +429,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
@@ -475,8 +477,14 @@ def fused_recurrent_kda_packed_decode_kernel(
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
 
     x = b_a + b_dt
-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
-    b_g = -tl.exp(A_log_val) * softplus_x  # [BK]
+    if USE_LOWER_BOUND:
+        # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias)),
+        # matching the chunked prefill kernel (kda.py) and FLA reference.
+        b_g = lower_bound * tl.sigmoid(tl.exp(A_log_val) * x)  # [BK]
+    else:
+        # Standard gate: -exp(A_log) * softplus(g + bias)
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        b_g = -tl.exp(A_log_val) * softplus_x  # [BK]
 
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
     # Keep beta in fp32 (no bf16 round-trip) to match the generic decode
@@ -508,6 +516,7 @@ def fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA T=1 decode fast path. Mirrors ``fused_recurrent_gated_delta_rule_packed_decode``
     but the gate ``g`` is a per-K vector instead of a scalar.
@@ -612,6 +621,40 @@ def fused_recurrent_kda_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
+    # Batched-decode CUDA fast path:
+    # row-streaming state update reaches the in-place R+W bandwidth of the
+    # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
+    # [BV, K] register tile per warp. ULP-level output differences only
+    # (reduction order); small batches keep triton (launch-bound anyway).
+    if use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
+
+        if kda_decode_cuda.covered(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+            H,
+        ):
+            kda_decode_cuda.kda_packed_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                out,
+                ssm_state_indices,
+                H,
+                lower_bound,
+            )
+            return out, initial_state
+
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
         raise ValueError(
@@ -641,6 +684,7 @@ def fused_recurrent_kda_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,
@@ -655,6 +699,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -830,6 +875,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
+    stride_h0_source,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
@@ -897,22 +943,28 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        # Slot stride comes from the caller (h0_source.stride(0)): the state pool
+        # may be an envelope-strided view (page-major / unified memory), where the
+        # per-slot pitch spans ALL layers' state, not HV*K*V. int64: envelope
+        # pitches overflow an int32 index product.
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_source
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Prepare intermediate state cache variables if enabled
+    # Prepare intermediate state cache variables if enabled. int64: the buffer
+    # is contiguous but `cache_idx * cache_steps * HV * K * V` can exceed int32
+    # for large slot counts.
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
@@ -987,11 +1039,11 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:  # Add bounds checking
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_source
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -1053,6 +1105,11 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
+        stride_h0_source=(
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,

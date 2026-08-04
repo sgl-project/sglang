@@ -25,7 +25,6 @@ import torch.nn as nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.runtime_context import get_server_args
 
 
 class ViTCudaGraphRunner:
@@ -80,7 +79,9 @@ class ViTCudaGraphRunner:
         )
 
         self._attn: Optional[VisionAttention] = getattr(first_blk, "attn", None)
-        self._attn_backend = getattr(self._attn, "qkv_backend", None)
+        self._attn_backend: Optional[str] = getattr(
+            self._attn, "qkv_backend_name", None
+        )
 
     @property
     def device(self) -> torch.device:
@@ -151,13 +152,13 @@ class ViTCudaGraphRunner:
         cu_full_kk = self.cu_full_len_kk[graph_key]
         max_full_len = int(cu_full_kk.max().item())
 
-        override_backend = get_server_args().mm_attention_backend
+        backend = self._attn_backend
 
         if self._fullatt_block_indexes and 0 not in vit.fullatt_block_indexes:
             warmup_cu_ws = [cu_window, cu_window_kk, max_window_len]
         else:
             warmup_cu_ws = [cu_full, cu_full_kk, max_full_len]
-        if override_backend == "fa3":
+        if backend == "fa3":
             warmup_cu_ws = [warmup_cu_ws[0], warmup_cu_ws[2]]
 
         warmup_kwargs = dict(
@@ -192,12 +193,14 @@ class ViTCudaGraphRunner:
                     cu_seqlens_kk_now = cu_full_kk
                     max_len = max_full_len
 
-                if override_backend == "triton_attn":
+                if backend == "triton_attn":
                     cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif override_backend == "fa3":
+                elif backend == "fa3":
                     cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
-                    raise RuntimeError("Not supported ViT attention backend")
+                    raise RuntimeError(
+                        f"ViT CUDA graph does not support attention backend: {backend}"
+                    )
 
                 if position_embeddings is not None:
                     if layer_num == 0:

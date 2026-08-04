@@ -9,6 +9,8 @@ license.workspace = true
 # of the main sglang wheel at the given import path.
 [package.metadata.sglang]
 python-module = "sglang.srt.grpc._core"
+# Always build optimized, even for an editable install.
+debug = false
 
 [lib]
 # Unique per-crate artifact name (the shared workspace target/ dir cannot hold

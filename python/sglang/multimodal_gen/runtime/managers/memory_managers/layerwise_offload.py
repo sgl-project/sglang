@@ -67,8 +67,12 @@ class LayerwiseOffloadManager:
         )
         self.copy_stream = torch.get_device_module().Stream()
 
+        # ``named_parameters()`` is relative to ``model``, just like the path in
+        # ``layers_attr_str``. Anchor the match so a manager for top-level
+        # ``blocks`` cannot also capture an unrelated nested list such as
+        # ``token_refiner.blocks`` whose forward hooks run at a different time.
         self._layer_name_re = re.compile(
-            rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
+            rf"^{re.escape(layers_attr_str)}\.(?P<layer_idx>\d+)(\.|$)"
         )
 
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
@@ -99,7 +103,7 @@ class LayerwiseOffloadManager:
         if not m:
             return None
         try:
-            return int(m.group(2))
+            return int(m.group("layer_idx"))
         except Exception:
             return None
 
@@ -612,6 +616,10 @@ class LayerwiseOffloadableModuleMixin:
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
         configured_layer_names = []
+        # These legacy tuning knobs are explicitly DiT-scoped. Auxiliary
+        # components still support layerwise streaming, but their layers run
+        # once per component use and get no reuse benefit from DiT residency.
+        dit_tuning_enabled = self.layerwise_offload_dit_group_enabled
         for layer_name in self.layer_names:
             module_list = named_modules.get(layer_name)
             if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
@@ -620,14 +628,17 @@ class LayerwiseOffloadableModuleMixin:
                 continue
 
             num_layers = len(module_list)
-            if server_args.dit_offload_prefetch_size < 1.0:
-                prefetch_size = 1 + int(
-                    round(server_args.dit_offload_prefetch_size * (num_layers - 1))
-                )
+            prefetch_value = (
+                server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
+            )
+            if prefetch_value < 1.0:
+                prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))
             else:
-                prefetch_size = int(server_args.dit_offload_prefetch_size)
+                prefetch_size = int(prefetch_value)
 
-            resident_value = server_args.dit_layerwise_resident_layers
+            resident_value = (
+                server_args.dit_layerwise_resident_layers if dit_tuning_enabled else 0.0
+            )
             if resident_value <= 0:
                 resident_layers = 0
             elif resident_value < 1.0:

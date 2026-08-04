@@ -25,10 +25,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=182, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -441,6 +442,57 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         # Test retrieving a non-existent model
         with self.assertRaises(openai.NotFoundError):
             client.models.retrieve("non-existent-model")
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAICompletionWithRust(CustomTestCase):
+    """Run the existing Completion matrix unchanged through the Rust frontend."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    # Reuse the reference test methods directly so Python and Rust coverage
+    # cannot drift into separate matrices.
+    run_completion = TestOpenAIServer.run_completion
+    run_completion_stream = TestOpenAIServer.run_completion_stream
+    test_completion = TestOpenAIServer.test_completion
+    test_completion_stream = TestOpenAIServer.test_completion_stream
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
+    """Run the existing Chat matrix unchanged through the Rust frontend."""
+
+    run_chat_completion = TestOpenAIServer.run_chat_completion
+    run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
+    test_chat_completion = TestOpenAIServer.test_chat_completion
+    test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
+
+    # This class is a Chat gate; Completion already has its own Rust matrix.
+    test_completion = None
+    test_completion_stream = None
 
 
 class TestOpenAIServerv1Responses(CustomTestCase):

@@ -80,14 +80,21 @@ _TOKENSPEED_MAX_Q_LEN = 8
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_q_len: int = _TOKENSPEED_MAX_Q_LEN,
 ) -> torch.Tensor:
     from sglang.srt.runtime_context import get_resources
 
+    # DCP target verification gathers Q to the full head count before launching
+    # TokenSpeed; size for that launch shape, not the rank-local head count.
+    num_heads *= get_parallel().attn_dcp_size
+    max_q_len = max(max_q_len, _TOKENSPEED_MAX_Q_LEN)
     needed = (
         tokenspeed_mla.get_num_sm(device)
         * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
+        * max_q_len
         * (kv_lora_rank + 1)
         * 4
     )
@@ -133,7 +140,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                self.device, self.num_q_heads, self.kv_lora_rank
+                self.device,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                max_q_len=(
+                    model_runner.server_args.max_speculative_num_draft_tokens or 1
+                ),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2

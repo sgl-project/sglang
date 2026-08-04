@@ -117,8 +117,17 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             enable_mamba_extra_buffer_lazy=lambda: lazy,
         )
         fake = SimpleNamespace(server_args=server_args)
+        # The bag reads (disable_radix_cache / disable_overlap_schedule) come
+        # from the published context; the derived-method calls stay on the
+        # injected stand-in.
+        from sglang.srt import runtime_context as rc
+
         with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
-            return KVCacheConfigurator._calculate_mamba_ratio(fake)
+            with rc.get_context().override_server_args(
+                disable_radix_cache=False,
+                disable_overlap_schedule=disable_overlap,
+            ):
+                return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
     def test_flag_off_restores_original_ratios(self):
         r = lambda **kw: self._ratio(skip=False, **kw)

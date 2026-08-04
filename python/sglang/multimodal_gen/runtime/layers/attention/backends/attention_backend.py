@@ -170,6 +170,20 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement packed varlen attention"
+        )
+
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:
     return wrap_method_with_debug_kernel_once(

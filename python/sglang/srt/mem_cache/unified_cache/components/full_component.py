@@ -43,6 +43,60 @@ class FullComponent(TreeComponent):
         super().__init__(cache, params)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+        # Lazy bind eviction strategy since tree core is initialized after component init.
+        self.session_ref_eviction_strategy = (
+            self._session_ref_eviction_strategy
+            if cache.enable_session_radix_cache
+            else None
+        )
+
+    def _ensure_eviction_strategy(self) -> None:
+        if self.session_ref_eviction_strategy is None:
+            self.session_ref_eviction_strategy = (
+                self.tree_core.eviction_strategy.get_priority
+            )
+
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        node = leaf
+        while node is not None and node is not self.tree_core.root_node:
+            cd = node.component_data[self.component_type]
+            assert cd.session_ref > 0
+            cd.session_ref -= 1
+            node = node.parent
+
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = old_ancestor if old_ancestor is not None else self.tree_core.root_node
+        node = leaf
+        while (
+            node is not None
+            and node is not stop
+            and node is not self.tree_core.root_node
+        ):
+            node.component_data[self.component_type].session_ref += 1
+            node = node.parent
+
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = fallback if fallback is not None else self.tree_core.root_node
+        node = leaf
+        while (
+            node is not None
+            and node is not stop
+            and node is not self.tree_core.root_node
+        ):
+            cd = node.component_data[self.component_type]
+            assert cd.session_ref > 0
+            cd.session_ref -= 1
+            node = node.parent
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -86,7 +140,9 @@ class FullComponent(TreeComponent):
     ):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
+        new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
+        assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
@@ -127,11 +183,16 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
+    def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
+        ref = self.session_ref(node)
+        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
+
     def _evict_device_start(self, request_cnt: int) -> None:
+        self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
         self._evict_device_heap = [
-            (self.tree_core.eviction_strategy.get_priority(n), n)
+            (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_device_leaves
         ]
         heapq.heapify(self._evict_device_heap)
@@ -151,7 +212,7 @@ class FullComponent(TreeComponent):
         ):
             heapq.heappush(
                 self._evict_device_heap,
-                (self.tree_core.eviction_strategy.get_priority(lv.parent), lv.parent),
+                (self.session_ref_eviction_strategy(lv.parent), lv.parent),
             )
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
@@ -174,8 +235,9 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        self._ensure_eviction_strategy()
         heap = [
-            (self.tree_core.eviction_strategy.get_priority(n), n)
+            (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_host_leaves
         ]
         heapq.heapify(heap)
@@ -191,7 +253,7 @@ class FullComponent(TreeComponent):
             ):
                 heapq.heappush(
                     heap,
-                    (self.tree_core.eviction_strategy.get_priority(x.parent), x.parent),
+                    (self.session_ref_eviction_strategy(x.parent), x.parent),
                 )
 
     def acquire_component_lock(

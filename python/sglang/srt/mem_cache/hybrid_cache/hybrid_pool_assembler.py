@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     import torch
@@ -72,6 +73,14 @@ def build_kv_host_pool(
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    parallel = get_parallel()
+    if parallel.dcp_enabled:
+        assert use_mla, (
+            "HiCache + DCP is only wired for the MLA host pool; the MHA host "
+            "pool has no DCP index translation."
+        )
+        kwargs["dcp_size"] = parallel.attn_dcp_size
+        kwargs["dcp_rank"] = parallel.attn_dcp_rank
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
@@ -552,16 +561,22 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    kv_host_size, mamba_host_size = None, 0
+    if server_args.hicache_size > 0:
+        kv_host_size, mamba_host_size = _split_hicache_size(
+            server_args.hicache_size, (kv_pool, mamba_pool)
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size=kv_host_size,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
         layout=server_args.hicache_mem_layout,
     )
@@ -639,22 +654,29 @@ def build_hybrid_mamba_swa_stack(
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    kv_host_size, swa_host_size, mamba_host_size = None, None, 0
+    if server_args.hicache_size > 0:
+        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
+            server_args.hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=False,
+        host_size=kv_host_size,
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=False,
+        host_size=swa_host_size,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        mamba_host_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )

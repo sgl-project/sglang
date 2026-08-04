@@ -15,6 +15,11 @@ on:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
+      build_only:
+        description: "Build and validate one Linux AMD64 CUDA 13 image locally on the runner without logging in or pushing."
+        required: false
+        type: boolean
+        default: false
       overlay_dockerfile:
         description: "Optional extra Dockerfile lines appended after FROM <base> to build a layered image (e.g. 'RUN pip install ...'). Note: this job has no repo checkout, so only FROM + RUN work — you cannot COPY files from this repo. Leave empty to skip overlay."
         required: false
@@ -135,6 +140,7 @@ jobs:
 
   build-and-publish:
     needs: prepare
+    if: ${{ !inputs.build_only }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
@@ -144,9 +150,68 @@ jobs:
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
 
+  build-only:
+    needs: prepare
+    if: ${{ inputs.build_only && github.repository == 'sgl-project/sglang' }}
+    runs-on: x64-docker-build-node
+    env:
+      IMAGE: sglang-diffusion-build-only:${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE_DIR: source-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref || github.ref }}
+          path: ${{ env.SOURCE_DIR }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CUDA 13 diffusion image locally (no push)
+        run: |
+          cd "$SOURCE_DIR"
+          docker buildx build \
+            --target framework_final \
+            --platform linux/amd64 \
+            --load \
+            -t "$IMAGE" \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${{ needs.prepare.outputs.extra_build_args }} \
+            --no-cache \
+            .
+
+      - name: Verify diffusion dependencies
+        run: |
+          docker run --rm "$IMAGE" python3 -c '
+          import importlib
+          modules = (
+              "av",
+              "cache_dit",
+              "cv2",
+              "diffusers",
+              "imageio_ffmpeg",
+              "moviepy",
+              "msgpack",
+              "sglang.multimodal_gen",
+              "soundfile",
+              "trimesh",
+          )
+          for module in modules:
+              importlib.import_module(module)
+          print("diffusion dependency smoke check passed")
+          '
+
+      - name: Remove local test image
+        if: always()
+        run: docker image rm "$IMAGE" || true
+
   cleanup-nightly:
     needs: build-and-publish
-    if: ${{ !inputs.tag && !inputs.pr_number }}
+    if: ${{ !inputs.build_only && !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
       tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
@@ -155,7 +220,7 @@ jobs:
 
   build-overlay:
     needs: [prepare, build-and-publish]
-    if: ${{ inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !inputs.build_only && inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

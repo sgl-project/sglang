@@ -19,6 +19,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -162,16 +166,17 @@ def capture_prefill_graph(
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return None
 
-    # Skip prefill CG for EAGLE target on tc_piecewise: that backend
-    # captures CaptureHiddenMode.NULL while runtime requests FULL, so
-    # the captured graph is dead, and capturing it perturbs FP4 /
-    # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
-    # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
-    # (restored from #25795), so it does NOT need this skip.
+    # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
+    # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
+    # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
+    # state and corrupt decode replay (see #28386 and #28870). BCG captures
+    # FULL for EAGLE target in PrefillCudaGraphRunner.__init__, so it does not
+    # need this skip.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and not model_runner.server_args.enable_return_hidden_states
+        and get_server_return_hidden_states_mode(model_runner.server_args)
+        < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
@@ -205,6 +210,47 @@ def capture_prefill_graph(
     if not model_runner.server_args.cuda_graph_config.prefill.bs:
         logger.warning("Disable prefill CUDA graph because the capture size is not set")
         return None
+
+    prefill_config = model_runner.server_args.cuda_graph_config.prefill
+    prefill_backend = prefill_config.backend
+    context_length = model_runner.model_config.context_len
+    if prefill_backend == Backend.FULL:
+        max_capture_requests = prefill_config.full_prefill_max_req
+        if max_capture_requests is None:
+            max_capture_requests = max(
+                model_runner.server_args.chunked_prefill_size // 512, 1
+            )
+        max_capture_requests = min(
+            max_capture_requests, model_runner.req_to_token_pool.size
+        )
+        # Resolve Full's fixed request-axis shape once, just like bs below.
+        prefill_config.full_prefill_max_req = max_capture_requests
+    else:
+        max_capture_requests = model_runner.req_to_token_pool.size
+    # The capture dummy batch has at most max_capture_requests rows, and
+    # each row can contain at most context_length tokens. Their product is
+    # therefore the largest aggregate-token bucket capture can represent.
+    max_capture_tokens = max_capture_requests * context_length
+    capture_num_tokens = sorted(
+        num_tokens
+        for num_tokens in prefill_config.bs
+        if num_tokens <= max_capture_tokens
+    )
+    # Resolve the context- and request-capacity-bounded buckets once before
+    # constructing the runner so every backend consumes the same config.
+    prefill_config.bs = capture_num_tokens
+    if not capture_num_tokens:
+        logger.warning(
+            "Disable prefill CUDA graph capture because no configured "
+            "capture size fits backend=%s with max_capture_tokens=%s "
+            "(max_capture_requests=%s, context_length=%s, request-pool size=%s).",
+            prefill_backend,
+            max_capture_tokens,
+            max_capture_requests,
+            context_length,
+            model_runner.req_to_token_pool.size,
+        )
+        return eager_runner
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
@@ -246,7 +292,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    prefill_backend = model_runner.server_args.cuda_graph_config.prefill.backend
     if should_skip_auto_prefill_cuda_graph_for_memory(
         before_mem,
         getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
@@ -263,7 +308,6 @@ def capture_prefill_graph(
 
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
-    capture_num_tokens = sorted(model_runner.server_args.cuda_graph_config.prefill.bs)
     logger.info(
         f"Capture {capture_name} CUDA graph begin. "
         f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "

@@ -1019,6 +1019,7 @@ def post_reorder_triton_kernel(
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
+    num_valid_tokens_per_expert,
     expert_start_loc,
     m_indices,
     num_experts: tl.constexpr,
@@ -1037,15 +1038,17 @@ def _fwd_kernel_ep_scatter_1(
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
-    cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
-    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+    for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
+        offsets = start_m + off_expert
         tl.store(
-            m_indices_start_ptr + start_m + off_expert,
-            cur_expert,
+            m_indices_start_ptr + offsets,
+            tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
         )
 
 
@@ -1137,6 +1140,7 @@ def ep_scatter(
     recv_x_scale: torch.Tensor,
     recv_topk: torch.Tensor,
     num_recv_tokens_per_expert: torch.Tensor,
+    num_valid_tokens_per_expert: torch.Tensor,
     expert_start_loc: torch.Tensor,
     output_tensor: torch.Tensor,
     output_tensor_scale: torch.Tensor,
@@ -1172,6 +1176,7 @@ def ep_scatter(
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
+        num_valid_tokens_per_expert,
         expert_start_loc,
         m_indices,
         num_experts=num_experts,
@@ -1575,7 +1580,11 @@ def moe_ep_deepgemm_preprocess(
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
-    if is_fp8 and use_mxfp8:
+    # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
+    # scale afterward can change the represented activation by up to 2x.
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
         from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )

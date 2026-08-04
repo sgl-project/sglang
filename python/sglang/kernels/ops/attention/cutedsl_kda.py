@@ -94,6 +94,10 @@ def _define_kernels():
         pool_idx = h0_indices[i_n]
 
         if pool_idx >= 0:
+            # State indexing in int64: envelope-strided pools (unified memory /
+            # page-major) put pool_idx * stride(0) far past 2^31 (the CuTe twin
+            # of the fla/chunk_delta_h.py stride_init_state fix).
+            pool_idx64 = cutlass.Int64(pool_idx)
             k_local = in_warp_tid // V_PER_WARP_SMALL
             v_local = in_warp_tid % V_PER_WARP_SMALL
             v_base = warp_idx * V_PER_WARP_SMALL
@@ -206,7 +210,7 @@ def _define_kernels():
                         h_val = 0.0
                         if v_global_load < v.shape[3]:
                             h_val = cutlass.Float32(
-                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                                h0_source[(pool_idx64, i_hv, v_global_load, k_load)]
                             )
                         sData[(k_load, v_load, stage)] = h_val
 
@@ -263,7 +267,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         v_global_write = v_tile * TILE_V_SMALL + v_write
                         if v_global_write < v.shape[3]:
-                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                            h0_source[(pool_idx64, i_hv, v_global_write, k_write)] = (
                                 sData[(k_write, v_write, stage)]
                             )
 
@@ -311,6 +315,10 @@ def _define_kernels():
         pool_idx = h0_indices[i_n]
 
         if pool_idx >= 0:
+            # State indexing in int64: envelope-strided pools (unified memory /
+            # page-major) put pool_idx * stride(0) far past 2^31 (the CuTe twin
+            # of the fla/chunk_delta_h.py stride_init_state fix).
+            pool_idx64 = cutlass.Int64(pool_idx)
             k_local = in_warp_tid // V_PER_WARP_SMALL
             v_local = in_warp_tid % V_PER_WARP_SMALL
             v_base = warp_idx * V_PER_WARP_SMALL
@@ -423,7 +431,7 @@ def _define_kernels():
                         h_val = 0.0
                         if v_global_load < v.shape[3]:
                             h_val = cutlass.Float32(
-                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                                h0_source[(pool_idx64, i_hv, v_global_load, k_load)]
                             )
                         sData[(k_load, v_load, stage)] = h_val
 
@@ -480,7 +488,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         v_global_write = v_tile * TILE_V_SMALL + v_write
                         if v_global_write < v.shape[3]:
-                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                            h0_source[(pool_idx64, i_hv, v_global_write, k_write)] = (
                                 sData[(k_write, v_write, stage)]
                             )
 
@@ -523,6 +531,10 @@ def _define_kernels():
         pool_idx = h0_indices[i_n]
 
         if pool_idx >= 0:
+            # State indexing in int64: envelope-strided pools (unified memory /
+            # page-major) put pool_idx * stride(0) far past 2^31 (the CuTe twin
+            # of the fla/chunk_delta_h.py stride_init_state fix).
+            pool_idx64 = cutlass.Int64(pool_idx)
             k_local = in_warp_tid // V_PER_WARP
             v_local = in_warp_tid % V_PER_WARP
             v_base = warp_idx * V_PER_WARP
@@ -634,7 +646,7 @@ def _define_kernels():
                         h_val = 0.0
                         if v_global_load < v.shape[3]:
                             h_val = cutlass.Float32(
-                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                                h0_source[(pool_idx64, i_hv, v_global_load, k_load)]
                             )
                         sData[(k_load, v_load, stage)] = h_val
 
@@ -691,7 +703,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         v_global_write = v_tile * TILE_V + v_write
                         if v_global_write < v.shape[3]:
-                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                            h0_source[(pool_idx64, i_hv, v_global_write, k_write)] = (
                                 sData[(k_write, v_write, stage)]
                             )
 
@@ -734,6 +746,10 @@ def _define_kernels():
         pool_idx = h0_indices[i_n]
 
         if pool_idx >= 0:
+            # State indexing in int64: envelope-strided pools (unified memory /
+            # page-major) put pool_idx * stride(0) far past 2^31 (the CuTe twin
+            # of the fla/chunk_delta_h.py stride_init_state fix).
+            pool_idx64 = cutlass.Int64(pool_idx)
             k_local = in_warp_tid // V_PER_WARP
             v_local = in_warp_tid % V_PER_WARP
             v_base = warp_idx * V_PER_WARP
@@ -845,7 +861,7 @@ def _define_kernels():
                         h_val = 0.0
                         if v_global_load < v.shape[3]:
                             h_val = cutlass.Float32(
-                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                                h0_source[(pool_idx64, i_hv, v_global_load, k_load)]
                             )
                         sData[(k_load, v_load, stage)] = h_val
 
@@ -902,7 +918,7 @@ def _define_kernels():
                     if k_write < TILE_K:
                         v_global_write = v_tile * TILE_V + v_write
                         if v_global_write < v.shape[3]:
-                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                            h0_source[(pool_idx64, i_hv, v_global_write, k_write)] = (
                                 sData[(k_write, v_write, stage)]
                             )
 
@@ -1223,11 +1239,28 @@ def _get_jit_functions():
     return _jit_functions
 
 
-def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode):
-    """Get or compile the KDA kernel for given dimensions."""
+def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode):
+    """Get or compile the KDA kernel for given dimensions.
+
+    ``h0_source`` is the caller's real state pool: ``from_dlpack`` bakes its
+    exact layout into the compiled kernel, so envelope-strided pools (unified
+    memory / page-major, slot stride(0) != HV*V*K) compile against their true
+    slot pitch. The cache key carries the strides alongside the shape.
+    """
     global _compiled_kernels
 
-    key = (N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode)
+    pool_size = h0_source.shape[0]
+    key = (
+        N,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tuple(h0_source.stride()),
+        use_small_batch,
+        is_varlen_decode,
+    )
     if key in _compiled_kernels:
         return _compiled_kernels[key]
 
@@ -1250,7 +1283,6 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
 
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
     dt_bias = torch.zeros(HV, K, dtype=torch.bfloat16, device="cuda")
-    h0_source = torch.zeros(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
@@ -1261,7 +1293,7 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     b_tensor = from_dlpack(b, assumed_align=16)
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+    h0_source_tensor = from_dlpack(h0_source.detach(), assumed_align=16)
     h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
     o_tensor = from_dlpack(o, assumed_align=16)
 
@@ -1304,6 +1336,7 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     logger.info(
         "CuTe DSL KDA kernel compiled: "
         f"N={N}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, "
+        f"pool_strides={tuple(h0_source.stride())}, "
         f"small_batch={use_small_batch}, varlen={is_varlen_decode}"
     )
     return compiled_kernel
@@ -1369,6 +1402,9 @@ def cutedsl_fused_sigmoid_gating_kda_update(
 
     State layout contract:
         initial_state_source.shape == (pool_size, HV, V, K)
+        The slot dim may be envelope-strided (stride(0) > HV*V*K under
+        unified-memory / page-major pools); each slot's [HV, V, K] block must
+        be compact. State updates are written back in place through the view.
 
     Dense decode:
         q/k: (N, 1, H, K)
@@ -1453,7 +1489,16 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     A_log = _normalize_A_log(A_log, HV)
     dt_bias = _normalize_dt_bias(dt_bias, HV, K)
 
-    h0_source = h0_source.contiguous()
+    # h0_source may be an envelope-strided pool view (unified memory /
+    # page-major): slot stride(0) is the per-slot envelope pitch, not HV*V*K.
+    # Never .contiguous() it — on a strided view that copies, so the kernel's
+    # in-place state update would land in a dropped temporary. The kernel only
+    # needs each slot's [HV, V, K] block itself to be compact.
+    assert h0_source.stride()[1:] == (V * K, K, 1), (
+        "CuTe DSL KDA decode requires a compact per-slot [HV, V, K] state "
+        f"block; got strides {tuple(h0_source.stride())} for shape "
+        f"{tuple(h0_source.shape)}"
+    )
 
     initial_state_indices = initial_state_indices.contiguous()
     if cu_seqlens is not None:
@@ -1496,7 +1541,7 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = _get_compiled_kernel(
-        N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
+        N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode
     )
 
     compiled_kernel(

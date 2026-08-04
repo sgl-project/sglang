@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_memory, get_server_args, get_spec
 from sglang.srt.utils import create_device_stream, device_stream_context
 
 try:
@@ -109,7 +109,7 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_memory().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -448,7 +448,7 @@ class LMCRadixCache(RadixCache):
             return
 
         global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
+        topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len

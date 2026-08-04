@@ -32,6 +32,10 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
+    "minimaxai--minimax-h3": "MiniMaxH3Pipeline",
+    "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "minimax--minimax-h3": "MiniMaxH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "lerobot--pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",

@@ -39,7 +39,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
-            else self.tokenizer_manager.server_args.model_path
+            else self.tokenizer_manager.model_path
         )
         if not self.id2label:
             raise ValueError("id2label mapping is missing")

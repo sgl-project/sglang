@@ -46,8 +46,6 @@ def _get_state(
     if not hasattr(attn_module.kv_b_proj, "A_buffer"):
         return None
     lora_backend = attn_module.kv_b_proj.lora_backend
-    if not hasattr(lora_backend, "batch_info"):
-        return None
     batch_info = lora_backend.batch_info
     if batch_info is None:
         return None

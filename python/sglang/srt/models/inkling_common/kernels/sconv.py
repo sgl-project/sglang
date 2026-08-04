@@ -23,6 +23,49 @@ class SconvExtendMetadata(TypedDict):
     si: torch.Tensor
 
 
+class SconvMetadataOut(TypedDict):
+    """Preallocated destinations for the fused metadata kernels.
+
+    A caller that needs the addresses to stay stable across cuda-graph replays
+    passes its static buffers, already sliced to this step's B / T, so the kernel
+    writes straight into them instead of allocating.
+    """
+
+    query_start_loc: torch.Tensor  # [B + 1] int32
+    has_initial_state: torch.Tensor  # [B] bool
+    cache_mask: torch.Tensor  # [B, 1, 1] bool
+    safe_idx: torch.Tensor  # [B] int64
+    cu: torch.Tensor  # [B + 1] int64
+    si: torch.Tensor  # [T] int32
+
+
+def _metadata_out(
+    out: "SconvMetadataOut | None", *, B: int, T: int, device: torch.device
+) -> SconvMetadataOut:
+    """Metadata destinations: freshly allocated, or ``out`` shape-checked."""
+    spec = (
+        ("query_start_loc", (B + 1,), torch.int32),
+        ("has_initial_state", (B,), torch.bool),
+        ("cache_mask", (B, 1, 1), torch.bool),
+        ("safe_idx", (B,), torch.int64),
+        ("cu", (B + 1,), torch.int64),
+        ("si", (T,), torch.int32),
+    )
+    if out is None:
+        return SconvMetadataOut(
+            **{
+                name: torch.empty(shape, dtype=dtype, device=device)
+                for name, shape, dtype in spec
+            }
+        )
+    for name, shape, dtype in spec:
+        t = out[name]
+        assert (
+            tuple(t.shape) == shape and t.dtype == dtype and t.is_contiguous()
+        ), f"{name}: got {tuple(t.shape)}/{t.dtype}, want {shape}/{dtype} contiguous"
+    return out
+
+
 CHUNK_SIZE = 64
 
 # ---------------------------------------------------------------------------
@@ -260,23 +303,25 @@ def _fused_decode_metadata_kernel(
 
 
 def fused_decode_sconv_metadata(
-    B: int, cache_indices: torch.Tensor
+    B: int, cache_indices: torch.Tensor, out: SconvMetadataOut | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
     """Single-launch replacement for the decode metadata prep: the two arange calls,
     ones, `!= PAD`, `&`, `clamp` and `.long()` that
     ``precompute_helion_decode_metadata`` (+ its callers) issued as ~7 tiny
     elementwise kernels. Returns
     ``(query_start_loc, has_initial_state, SconvDecodeMetadata)`` with tensors
-    bit-identical to the unfused path.
+    bit-identical to the unfused path. Pass ``out`` to write into preallocated
+    (e.g. cuda-graph-static) destinations instead of fresh allocations.
     """
     assert cache_indices.shape[0] == B and cache_indices.stride(0) == 1
     device = cache_indices.device
-    query_start_loc = torch.empty(B + 1, dtype=torch.int32, device=device)
-    has_initial_state = torch.empty(B, dtype=torch.bool, device=device)
-    cache_mask = torch.empty((B, 1, 1), dtype=torch.bool, device=device)
-    safe_idx = torch.empty(B, dtype=torch.int64, device=device)
-    cu = torch.empty(B + 1, dtype=torch.int64, device=device)
-    si = torch.empty(B, dtype=torch.int32, device=device)
+    dst = _metadata_out(out, B=B, T=B, device=device)
+    query_start_loc = dst["query_start_loc"]
+    has_initial_state = dst["has_initial_state"]
+    cache_mask = dst["cache_mask"]
+    safe_idx = dst["safe_idx"]
+    cu = dst["cu"]
+    si = dst["si"]
     BLOCK = 1024
     _fused_decode_metadata_kernel[(triton.cdiv(B + 1, BLOCK),)](
         cache_indices,
@@ -419,13 +464,15 @@ def fused_extend_sconv_metadata(
     extend_seq_lens: torch.Tensor | None = None,
     his_src: torch.Tensor | None = None,
     draft_token_num: int | None = None,
+    out: SconvMetadataOut | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata] | None:
     """Single-launch replacement for the extend metadata prep: the
-    zeros + cumsum(+scan-init) + slice-copy + compare chain of
-    ``_prepare_extend_common_metadata`` plus the != PAD, &, clamp, long, to,
-    arange, searchsorted, clamp, int32 chain of
-    ``precompute_helion_extend_metadata`` (~10-14 tiny kernels, re-issued per
-    owning sconv instance -- and per de-tied draft step under draft_extend_v2).
+    zeros + cumsum(+scan-init) + slice-copy + compare chain the unfused
+    ``query_start_loc`` / ``has_initial_state`` build issues, plus the != PAD, &,
+    clamp, long, to, arange, searchsorted, clamp, int32 chain of
+    ``precompute_helion_extend_metadata`` (~10-14 tiny kernels, and before the
+    conv-state backend owned this prep, re-issued once per conv module of the
+    owning layer).
     Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
     tensors bit-identical to the unfused path, or None when the shape falls
     outside the fused kernel's single-tile bound (caller runs unfused).
@@ -433,7 +480,8 @@ def fused_extend_sconv_metadata(
     ``his_mode`` selects the has_initial_state source: HIS_ZEROS (boundary-KV
     draft extend), HIS_PREFIX (``his_src`` = extend_prefix_lens), HIS_SEQ_MINUS_EXT
     (``his_src`` = seq_lens), HIS_ONES (target_verify; ``draft_token_num`` set,
-    ``extend_seq_lens`` unused).
+    ``extend_seq_lens`` unused). Pass ``out`` to write into preallocated (e.g.
+    cuda-graph-static) destinations instead of fresh allocations.
     """
     if B > _FUSED_EXTEND_MAX_B or not cache_indices.is_cuda:
         return None
@@ -444,12 +492,13 @@ def fused_extend_sconv_metadata(
     else:
         assert extend_seq_lens is not None and extend_seq_lens.stride(0) == 1
     device = cache_indices.device
-    query_start_loc = torch.empty(B + 1, dtype=torch.int32, device=device)
-    has_initial_state = torch.empty(B, dtype=torch.bool, device=device)
-    cache_mask = torch.empty((B, 1, 1), dtype=torch.bool, device=device)
-    safe_idx = torch.empty(B, dtype=torch.int64, device=device)
-    cu = torch.empty(B + 1, dtype=torch.int64, device=device)
-    si = torch.empty(T, dtype=torch.int32, device=device)
+    dst = _metadata_out(out, B=B, T=T, device=device)
+    query_start_loc = dst["query_start_loc"]
+    has_initial_state = dst["has_initial_state"]
+    cache_mask = dst["cache_mask"]
+    safe_idx = dst["safe_idx"]
+    cu = dst["cu"]
+    si = dst["si"]
     BLOCK_T = 256
     dummy = cache_indices  # never dereferenced thanks to masks/constexpr
     _fused_extend_metadata_kernel[(1 + triton.cdiv(T, BLOCK_T),)](

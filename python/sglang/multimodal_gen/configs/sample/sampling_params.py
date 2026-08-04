@@ -123,6 +123,10 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
+    # Model-owned, request-scoped approximate acceleration profile. Models
+    # that support it must validate the deployment and workload explicitly.
+    # It intentionally participates in the dynamic-batch signature.
+    quality: str = "lossless"
 
     # Frame interpolation
     enable_frame_interpolation: bool = False
@@ -328,6 +332,64 @@ class SamplingParams:
         if self.realtime_chunk_size is not None:
             req.realtime_chunk_size = self.realtime_chunk_size
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-specific multipart video fields accepted by this type."""
+
+        return frozenset()
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls,
+        request: Any,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Adapt generic video-API kwargs before constructing this params type."""
+        del request
+        return kwargs
+
+    def prepare_video_request_for_queue(self, req: Any) -> None:
+        """Resolve model-specific admission facts before a video job is queued."""
+        del req
+
+    def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any] | None:
+        """Return per-output requests when a model owns grouped execution.
+
+        ``None`` preserves the default model-native ``num_outputs`` handling.
+        Models that need the framework's independent-seed request expansion
+        can opt in after their shared pre-queue work has completed.
+        """
+        del req
+        return None
+
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        """Resolve model-specific facts for one synthetic warmup request."""
+        del req, server_args
+
+    def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
+        """Return model-resolved fields to publish with the queued video job."""
+        del req
+        return {}
+
+    def validate_video_final_outputs(
+        self,
+        output_paths: list[str],
+        req: Any,
+    ) -> dict[str, str]:
+        """Validate final files and return truthful completion metadata."""
+        del output_paths, req
+        return {}
+
+    def cleanup_video_request(self, req: Any) -> None:
+        """Release request-scoped resources owned by the model integration."""
+        del req
+
+    def refresh_request_extra_after_output_expansion(self, req: Any) -> None:
+        """Refresh request identity after assigning a per-output seed."""
+        del req
+
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
         if data_type == DataType.ACTION:
@@ -344,6 +406,11 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError(
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        if not isinstance(self.quality, str) or not self.quality.strip():
+            raise ValueError(
+                f"quality must be a non-empty string, got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
@@ -863,9 +930,19 @@ class SamplingParams:
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         add_argument(
+            "--quality",
+            type=str,
+            help=(
+                "Select a model-owned quality/performance profile. "
+                "Support and validated deployment constraints are model-specific."
+            ),
+        )
+        add_argument(
             "--num-outputs-per-prompt",
+            "--num-outputs",
+            dest="num_outputs_per_prompt",
             type=int,
-            help="Number of outputs to generate per prompt",
+            help="Number of outputs to generate per prompt (alias: --num-outputs)",
         )
         add_argument(
             "--seed",

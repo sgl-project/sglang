@@ -341,10 +341,14 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
+    *,
+    scheduler_batches=None,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+        result = await scheduler_client.forward(
+            scheduler_batches if scheduler_batches is not None else [batch]
+        )
 
         if (
             result.output is None

@@ -27,7 +27,18 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    get_required_capture_hidden_mode,
+    get_server_return_hidden_states_mode,
+)
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_observability,
+    get_server_args,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -84,7 +95,7 @@ class SchedulerBatchResultProcessor:
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
-        use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
+        use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
@@ -92,7 +103,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if self.server_args.enable_hisparse:
+                if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
@@ -214,11 +225,33 @@ class SchedulerBatchResultProcessor:
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0
+            prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
+                batch,
+                self.server_args,
+            )
 
             # Check finish conditions
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if (
+                    batch.return_hidden_states
+                    and logits_output.hidden_states is not None
+                ):
+                    assert extend_input_len_per_req is not None
+                    hidden_state_offset = self._append_prefill_hidden_states(
+                        req=req,
+                        logits_output=logits_output,
+                        hidden_state_offset=hidden_state_offset,
+                        capture_hidden_mode=prefill_hidden_capture_mode,
+                        extend_input_len=extend_input_len_per_req[i],
+                        store=(
+                            not req.finished()
+                            and not req.is_retracted
+                            and req.inflight_middle_chunks <= 0
+                        ),
+                    )
+
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
@@ -243,7 +276,7 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
+                        if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
@@ -261,16 +294,6 @@ class SchedulerBatchResultProcessor:
 
                     if req.return_sampling_mask:
                         self.add_sampling_mask_return_values(i, req, logits_output)
-
-                    if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
-                    ):
-                        hidden_state_offset = self._append_prefill_hidden_states(
-                            req=req,
-                            logits_output=logits_output,
-                            hidden_state_offset=hidden_state_offset,
-                        )
 
                     if req.grammar is not None:
                         self._apply_prefill_grammar(
@@ -476,19 +499,74 @@ class SchedulerBatchResultProcessor:
         req: Req,
         logits_output: LogitsProcessorOutput,
         hidden_state_offset: int,
+        capture_hidden_mode: CaptureHiddenMode,
+        extend_input_len: int,
+        store: bool = True,
     ) -> int:
-        req.hidden_states.append(
-            logits_output.hidden_states[
-                hidden_state_offset : (
-                    hidden_state_offset := hidden_state_offset
-                    + len(req.origin_input_ids)
+        if capture_hidden_mode.is_full():
+            start = hidden_state_offset
+            hidden_state_offset += extend_input_len
+            if not store or not req.return_hidden_states:
+                return hidden_state_offset
+
+            req_hidden_states = logits_output.hidden_states[start:hidden_state_offset]
+            if req.return_hidden_states is True:
+                req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
+            elif req.return_hidden_states == "last":
+                req.hidden_states.append(req_hidden_states[-1].cpu().tolist())
+        elif capture_hidden_mode.is_last():
+            index = hidden_state_offset
+            hidden_state_offset += 1
+            if store and req.return_hidden_states:
+                req.hidden_states.append(
+                    logits_output.hidden_states[index].cpu().tolist()
                 )
-            ]
-            .cpu()
-            .clone()
-            .tolist()
-        )
+        else:
+            raise ValueError(
+                f"Unexpected hidden states capture mode: {capture_hidden_mode}"
+            )
         return hidden_state_offset
+
+    @staticmethod
+    def _append_decode_hidden_states(
+        *,
+        req: Req,
+        hidden_states: torch.Tensor,
+        start: int,
+        accept_len: int,
+    ) -> None:
+        if accept_len <= 0:
+            return
+
+        if req.return_hidden_states == "last":
+            valid_accept_len = accept_len
+            if req.finished_len is not None:
+                step_start = len(req.output_ids) - accept_len
+                valid_accept_len = max(
+                    0,
+                    min(accept_len, req.finished_len - step_start),
+                )
+            if valid_accept_len > 0:
+                req.hidden_states[:] = [
+                    hidden_states[start + valid_accept_len - 1].cpu().tolist()
+                ]
+        else:
+            req.hidden_states.extend(
+                hidden_states[start : start + accept_len].cpu().tolist()
+            )
+
+    @staticmethod
+    def _get_prefill_hidden_capture_mode(
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+    ) -> CaptureHiddenMode:
+        return get_required_capture_hidden_mode(
+            max(
+                batch.return_hidden_states_mode,
+                get_server_return_hidden_states_mode(server_args),
+            ),
+            batch.spec_info,
+        )
 
     def _apply_prefill_grammar(
         self, *, req: Req, next_token_id: int, already_advanced: bool = False
@@ -756,7 +834,7 @@ class SchedulerBatchResultProcessor:
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
-        if self.server_args.enable_metrics:
+        if get_observability().enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
@@ -808,10 +886,11 @@ class SchedulerBatchResultProcessor:
                 stride = result.speculative_num_draft_tokens or 1
                 accept_len = len(next_token_id)
                 start = i * stride
-                req.hidden_states.extend(
-                    logits_output.hidden_states[start : start + accept_len]
-                    .cpu()
-                    .tolist()
+                self._append_decode_hidden_states(
+                    req=req,
+                    hidden_states=logits_output.hidden_states,
+                    start=start,
+                    accept_len=accept_len,
                 )
 
             if req.grammar is not None:
@@ -939,7 +1018,7 @@ class SchedulerBatchResultProcessor:
         self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (
-            self.server_args.disaggregation_decode_enable_offload_kvcache
+            get_disagg().disaggregation_decode_enable_offload_kvcache
             and not req.finished()
         ):
             self.decode_offload_manager.offload_kv_cache(req)
@@ -959,12 +1038,12 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if self.server_args.enable_hisparse:
+                if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
@@ -987,9 +1066,9 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
-        think_end_id = self.model_config.think_end_id
-        if req.require_reasoning and think_end_id is not None:
-            req.update_reasoning_tokens(next_token_id, think_end_id)
+        think_end_ids = self.model_config.think_end_ids
+        if req.require_reasoning and think_end_ids:
+            req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,
@@ -1063,7 +1142,7 @@ class SchedulerBatchResultProcessor:
                 other_idx
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
-                server_args.mamba_track_interval,
+                get_exec().mamba.mamba_track_interval,
                 server_args.max_speculative_num_draft_tokens,
             )
             if (
@@ -1102,7 +1181,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_server_args().mamba_track_interval
+        interval = get_exec().mamba.mamba_track_interval
 
         if batch.spec_algorithm.is_none():
             if req.kv_committed_len % interval == 0:

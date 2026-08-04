@@ -4,29 +4,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
 
 
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
-
-
-class TestMmProcessConfigValidation(unittest.TestCase):
+class TestMmProcessConfigValidation(CustomTestCase):
     """Server-args validation for mm_process_config."""
 
     def _validate_config(self, mm_process_config):
@@ -78,7 +66,7 @@ class TestMmProcessConfigValidation(unittest.TestCase):
         self.assertEqual(args.mm_process_config, config)
 
 
-class TestBaseProcessorConfigExtraction(unittest.TestCase):
+class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
     def _make_processor(
@@ -174,12 +162,11 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.mm_io_worker_num, 6)
 
 
-class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
+class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     @staticmethod
     def _server_args(mm_feature_transport):
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
-            keep_mm_feature_on_device=False,
             disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
@@ -200,7 +187,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         # transport policy must still resolve from the instance's ServerArgs.
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -212,12 +199,30 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
         self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.use_ipc_pool_handle_cache)
+        memory_pool.assert_called_once()
+
+    def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False), patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertTrue(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -229,7 +234,49 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
+
+
+class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
+    @staticmethod
+    def _processor(enabled):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
+            processor = BaseMultimodalProcessor()
+        processor.precompute_hash_before_cpu_transfer = enabled
+        processor.use_cuda_ipc = False
+        return processor
+
+    def test_enabled_path_sets_hash_and_pad_value(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
+        )
+
+        self._processor(True)._precompute_hashes_before_cpu_transfer([item])
+
+        self.assertIsNotNone(item.hash)
+        self.assertIsNotNone(item.pad_value)
+        self.assertTrue(item.feature.is_cpu)
+
+    def test_disabled_path_leaves_item_unmodified(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
+        )
+
+        self._processor(False)._precompute_hashes_before_cpu_transfer([item])
+
+        self.assertIsNone(item.hash)
+        self.assertIsNone(item.pad_value)
 
 
 class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
@@ -326,7 +373,7 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deepcopy.call_count, 3)
 
 
-class TestProcessMmDataKwargs(unittest.TestCase):
+class TestProcessMmDataKwargs(CustomTestCase):
     """Verify process_mm_data injects per-modality kwargs correctly."""
 
     def _make_base_processor(self, mm_process_config):
@@ -339,7 +386,6 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
         server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
@@ -358,7 +404,6 @@ class TestProcessMmDataKwargs(unittest.TestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
-        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         proc.mm_feature_transport = server_args.mm_feature_transport
         proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
@@ -467,7 +512,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         self.assertEqual(audio_kw.get("sample_rate"), 16000)
 
 
-class TestOverrideProcessorsConfigInjection(unittest.TestCase):
+class TestOverrideProcessorsConfigInjection(CustomTestCase):
     """Regression tests for processors that override process_mm_data."""
 
     def _make_override_processor(self, processor_cls, mm_process_config):
@@ -476,7 +521,6 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = False
         server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
@@ -489,7 +533,6 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
-        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         proc.mm_feature_transport = server_args.mm_feature_transport
         proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
@@ -558,7 +601,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         self.assertTrue(audio_kw.get("truncation"))
 
 
-class TestQwenVideoConfigRouting(unittest.TestCase):
+class TestQwenVideoConfigRouting(CustomTestCase):
     def test_preprocessed_video_drops_sglang_owned_config(self):
         from sglang.srt.multimodal.processors.qwen_vl import (
             _get_processor_video_config,
@@ -587,7 +630,7 @@ class TestQwenVideoConfigRouting(unittest.TestCase):
         self.assertIsNone(_get_processor_video_config(video_config, [None]))
 
 
-class TestDoubleBosGuard(unittest.TestCase):
+class TestDoubleBosGuard(CustomTestCase):
     """Regression test for the multimodal double-BOS bug.
 
     Repro condition (Cohere2 / Llama3-LLaVA-Next family):
@@ -610,7 +653,6 @@ class TestDoubleBosGuard(unittest.TestCase):
         server_args.mm_io_worker_num = 0
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
