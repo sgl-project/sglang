@@ -1,10 +1,12 @@
 """Flat attention KV pool for the MLX backend.
 
 Each layer buffer has shape ``(pool_size, n_kv_heads, head_dim)``.
-This v1 pool is intentionally uniform: every wrapped softmax-attention
-layer must share the same KV shape and full-context KV semantics.
-Heterogeneous KV shapes and sliding-window KV need per-layer/window-aware
-pools before they can use MLX radix reuse.
+The pool stores full-attention layers only, and stays intentionally
+uniform: every stored layer must share the same KV shape and
+full-context KV semantics.  Sliding-window layers keep window-bounded
+per-request caches instead (a shared window-aware SWA pool with
+cross-request reuse is the planned follow-up); heterogeneous KV shapes
+need per-layer pools.
 
 Slot 0 is reserved as padding (1-based indexing).
 """
