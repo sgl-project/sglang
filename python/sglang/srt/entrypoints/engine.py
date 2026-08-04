@@ -1017,11 +1017,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # Engine.__init__ or CLI entry).
         load_plugins()
 
-        if (
-            server_args.reasoning_parser == "auto"
-            or server_args.tool_call_parser == "auto"
-        ):
-            resolve_auto_parsers(server_args)
+        resolve_auto_parsers(server_args)
 
         server_args.check_server_args()
         _set_gc(server_args)
