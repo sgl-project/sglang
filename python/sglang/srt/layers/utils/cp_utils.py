@@ -1,5 +1,3 @@
-import logging
-import os
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Callable, List
@@ -286,35 +284,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     return outputs
 
 
-logger = logging.getLogger(__name__)
-
-_CP_PROBE = os.environ.get("SGLANG_CP_PROBE") == "1"
-_CP_PROBE_SEEN = {}
-
-
-def _cp_probe(input_tensor):
-    """TEMPORARY diagnostic: log each distinct cp_all_gather_rerange_output call
-    site once, with the tensor it gathers. Enabled by SGLANG_CP_PROBE=1."""
-    import traceback
-
-    st = traceback.extract_stack(limit=6)[-3]
-    key = f"{st.filename.split('/')[-1]}:{st.lineno} in {st.name}"
-    rec = _CP_PROBE_SEEN.setdefault(key, [0, None])
-    rec[0] += 1
-    rec[1] = (tuple(input_tensor.shape), str(input_tensor.dtype))
-    if rec[0] in (1, 61, 122, 183):
-        logger.info(
-            "[CP_PROBE] %-58s n=%-4d shape=%s dtype=%s",
-            key,
-            rec[0],
-            rec[1][0],
-            rec[1][1],
-        )
-
-
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
-    if _CP_PROBE:
-        _cp_probe(input_tensor)
     """
     # for in-seq-split
     |   +-----------before allgather------------+|
