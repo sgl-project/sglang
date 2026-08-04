@@ -19,27 +19,14 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha_rocm import (
-    rocm_concat_mha_k,
-    rocm_kv_b_proj_mxfp4_fp8_prefill,
-    rocm_normalize_kv_a,
-    rocm_normalize_q_for_mha_dsa_fp8,
-    rocm_normalize_q_for_mha_fp8,
-    rocm_normalize_q_for_mha_mxfp4,
-)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
-    _is_hip,
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
-
-_use_fp8_prefill_attn = (
-    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
-)
+from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -52,14 +39,14 @@ elif _is_musa:
     from sgl_kernel import concat_mla_k
 
 
-def _resolve_attn_backend(forward_batch: ForwardBatch):
+def resolve_attn_backend(forward_batch: ForwardBatch):
     backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
 
 
-def _forward_dsa_indexer_for_mha(
+def forward_dsa_indexer_for_mha(
     indexer,
     *,
     hidden_states: torch.Tensor,
@@ -170,22 +157,12 @@ class DeepseekMHAForwardMixin:
             # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
             if self.use_dsa:
-                # DSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
-                # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
-                # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
-                # tuple.
-                if (
-                    _use_aiter_gfx95
-                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                ):
-                    q, q_lora = rocm_normalize_q_for_mha_dsa_fp8(self, q)
-                else:
-                    q_lora = self.q_a_layernorm(q)
-                    q = self.q_b_proj(q_lora)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                q_lora = self.q_a_layernorm(q)
+                q = self.q_b_proj(q_lora)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
                 if self.should_run_indexer():
-                    _forward_dsa_indexer_for_mha(
+                    forward_dsa_indexer_for_mha(
                         self.indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
@@ -193,11 +170,6 @@ class DeepseekMHAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                # MXFP4: fused RMSNorm + quant
-                q = rocm_normalize_q_for_mha_mxfp4(self, q)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-                q = rocm_normalize_q_for_mha_fp8(self, q)
             else:
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -212,10 +184,7 @@ class DeepseekMHAForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv_a_quanted, kv_a = rocm_normalize_kv_a(self, kv_a)
-        else:
-            kv_a = self.kv_a_layernorm(kv_a)
+        kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
@@ -223,7 +192,7 @@ class DeepseekMHAForwardMixin:
         # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
         # returns FP8 tensors ready for its kernel. Backends without the
         # hook fall through to the BF16 path below.
-        backend = _resolve_attn_backend(forward_batch)
+        backend = resolve_attn_backend(forward_batch)
         if hasattr(backend, "prepare_prefill_qkv"):
             q_out, k_out, v_out = backend.prepare_prefill_qkv(
                 q=q,
@@ -275,23 +244,12 @@ class DeepseekMHAForwardMixin:
                         q.dtype,
                         forward_batch,
                     )
-        if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
-            # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
-            # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
-            # directly in FP8, avoiding a separate elementwise cast
-            k, v = rocm_kv_b_proj_mxfp4_fp8_prefill(self, kv_a, k_pe)
-        else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-                kv = self.kv_b_proj(kv_a_quanted)[0]
-            else:
-                kv = self.kv_b_proj(kv_a)[0]
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope = kv[..., : self.qk_nope_head_dim]
-            v = kv[..., self.qk_nope_head_dim :]
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
 
-            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(
@@ -399,7 +357,7 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
 
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
-        backend = _resolve_attn_backend(forward_batch)
+        backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
 
@@ -557,8 +515,6 @@ class DeepseekMHAForwardMixin:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
-        elif _is_hip and self.current_attention_backend == "aiter":
-            k = rocm_concat_mha_k(self, k_nope, k_pe)
         else:
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope

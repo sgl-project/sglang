@@ -48,22 +48,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
-    rocm_absorb_q_bmm,
-    rocm_absorb_v_bmm,
-    rocm_fused_qk_rope_cat_and_cache_mla,
-    rocm_normalize_q_kv_a,
-)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
-    _is_gfx95_supported,
-    _is_hip,
     _is_musa,
-    _use_aiter,
-    _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import (
@@ -114,7 +104,7 @@ if _is_cuda:
         return out
 
 
-def _should_defer_dsa_cp_kv_gather(
+def should_defer_dsa_cp_kv_gather(
     *,
     dsa_prefill_cp: bool,
     fuse_rope_for_trtllm_mla: bool,
@@ -159,7 +149,7 @@ class DeepseekMLAForwardMixin:
             return False
         if not self.use_dsa:
             return False
-        if self.use_deep_gemm_bmm or _is_hip:
+        if self.use_deep_gemm_bmm:
             return False
         if is_kv_b_lora_active(self):
             return False
@@ -247,13 +237,8 @@ class DeepseekMLAForwardMixin:
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if _use_aiter:
-                    q, k_nope, q_lora_rocm = rocm_normalize_q_kv_a(self, q, k_nope)
-                    if q_lora_rocm is not None:
-                        q_lora = q_lora_rocm
-                else:
-                    q = self.q_a_layernorm(q)
-                    k_nope = self.kv_a_layernorm(k_nope)
+                q = self.q_a_layernorm(q)
+                k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -356,11 +341,6 @@ class DeepseekMLAForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
-            elif _is_hip:
-                q_nope_out = rocm_absorb_q_bmm(
-                    self, q_nope, is_capture_mode=get_is_capture_mode()
-                )
-
             elif self.w_kc.dtype == torch.float8_e4m3fn:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
@@ -398,25 +378,12 @@ class DeepseekMLAForwardMixin:
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
-        skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
-        if (
-            self.rotary_emb is not None
-            and (not fuse_rope_for_trtllm_mla)
-            and (not skip_rope_for_dsa_tilelang_fused)
-            and (not skip_rope_for_aiter_fused_mla)
-            and (
-                not _use_aiter
-                or not _is_gfx95_supported
-                or self.use_dsa
-                or self.current_attention_backend == "triton"
-            )
-        ):
+        if self.rotary_emb is not None and not fuse_rope_for_trtllm_mla:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = _should_defer_dsa_cp_kv_gather(
+        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
@@ -481,145 +448,70 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
-                q_cat, _, k_pe_fused, _ = rocm_fused_qk_rope_cat_and_cache_mla(
-                    self,
-                    q_nope_out,
-                    q_pe,
-                    k_nope,
-                    k_pe,
-                    positions,
-                    out_cache_loc=forward_batch.out_cache_loc,
+            extra_args = {}
+            if self._fuse_rope_for_trtllm_mla(forward_batch):
+                extra_args = {
+                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                    "is_neox": self.rotary_emb.is_neox_style,
+                    "llama_4_scaling": llama_4_scaling,
+                }
+            if fusion_plan is not None:
+                bmm_attention_fn = (
+                    bcg_mla_bmm_then_unified_attention
+                    if is_in_breakable_cuda_graph()
+                    else mla_bmm_then_unified_attention
                 )
-                save_kv_cache = False
-                # On decode, pass q_cat directly to attn_mqa with q_rope=None so
-                # dsa_backend.forward_decode reuses q_cat as a zero-copy view
-                # (`q.contiguous().view(...)` fast-path) instead of running the
-                # redundant `concat_mla_absorb_q_general(q_nope_fused, q_pe_fused)`
-                # that would otherwise rebuild a tensor byte-identical to q_cat.
-                # On ROCm tilelang decode, this eliminates the
-                # `CatArrayBatchedCopy<OpaqueType<1u>, ...>` kernel that used to
-                # fire once per layer per decode step (~2.6 us / layer saved).
-                # Prefill keeps the split form because dsa_backend.forward_extend
-                # asserts `q_rope is not None`.
-                if forward_batch.forward_mode.is_decode_or_idle():
-                    if llama_4_scaling is not None:
-                        # llama_4_scaling applies only to the q_nope portion;
-                        # mutate in place via the slice view of q_cat.
-                        q_cat[..., : self.kv_lora_rank] *= llama_4_scaling
-                    attn_output = self.attn_mqa(
-                        q_cat,
-                        None,
-                        None,
-                        forward_batch,
-                        q_rope=None,
-                        k_rope=k_pe_fused,
-                        save_kv_cache=save_kv_cache,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
-                else:
-                    q_nope_fused = q_cat[..., : self.kv_lora_rank]
-                    q_pe_fused = q_cat[..., self.kv_lora_rank :]
-                    if llama_4_scaling is not None:
-                        q_nope_fused *= llama_4_scaling
-                    attn_output = self.attn_mqa(
-                        q_nope_fused,
-                        None,
-                        None,
-                        forward_batch,
-                        q_rope=q_pe_fused,
-                        k_rope=k_pe_fused,
-                        save_kv_cache=save_kv_cache,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
+                bmm_attention_fn(
+                    fusion_plan.q_nope_t,
+                    self.w_kc,
+                    fusion_plan.q_nope_out_buf,
+                    q_nope_out,
+                    k_nope,
+                    fusion_plan.attn_output_buf,
+                    save_kv_cache,
+                    self.layer_id,
+                    q_pe,
+                    k_pe,
+                    cos_sin_cache=extra_args.get("cos_sin_cache"),
+                    is_neox=extra_args.get("is_neox"),
+                    llama_4_scaling=extra_args.get("llama_4_scaling"),
+                    topk_indices=topk_indices,
+                )
+                attn_output = fusion_plan.attn_output_buf
+            elif forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+                # set return_lse=True to correct attn_output
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
             else:
-                extra_args = {}
-                if self._fuse_rope_for_trtllm_mla(forward_batch):
-                    extra_args = {
-                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                        "is_neox": self.rotary_emb.is_neox_style,
-                        "llama_4_scaling": llama_4_scaling,
-                    }
-                if fusion_plan is not None:
-                    bmm_attention_fn = (
-                        bcg_mla_bmm_then_unified_attention
-                        if is_in_breakable_cuda_graph()
-                        else mla_bmm_then_unified_attention
-                    )
-                    bmm_attention_fn(
-                        fusion_plan.q_nope_t,
-                        self.w_kc,
-                        fusion_plan.q_nope_out_buf,
-                        q_nope_out,
-                        k_nope,
-                        fusion_plan.attn_output_buf,
-                        save_kv_cache,
-                        self.layer_id,
-                        q_pe,
-                        k_pe,
-                        cos_sin_cache=extra_args.get("cos_sin_cache"),
-                        is_neox=extra_args.get("is_neox"),
-                        llama_4_scaling=extra_args.get("llama_4_scaling"),
-                        topk_indices=topk_indices,
-                    )
-                    attn_output = fusion_plan.attn_output_buf
-                elif (
-                    forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
-                ):
-                    # set return_lse=True to correct attn_output
-                    attn_output, lse = self.attn_mqa_for_dcp_decode(
-                        q_nope_out,
-                        k_nope,
-                        k_nope,
-                        forward_batch,
-                        q_rope=q_pe,
-                        k_rope=k_pe,
-                        **extra_args,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
-                else:
-                    attn_output = self.attn_mqa(
-                        q_nope_out,
-                        k_nope,
-                        k_nope,
-                        forward_batch,
-                        q_rope=q_pe,
-                        k_rope=k_pe,
-                        **extra_args,
-                        **(
-                            dict(topk_indices=topk_indices)
-                            if topk_indices is not None
-                            else {}
-                        ),
-                    )
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
-            if self._skip_rope_for_aiter_fused_mla():
-                q, _, _, k = rocm_fused_qk_rope_cat_and_cache_mla(
-                    self,
-                    q_nope_out,
-                    q_pe,
-                    k_nope,
-                    k_pe,
-                    positions,
-                    out_cache_loc=forward_batch.out_cache_loc,
-                )
-                save_kv_cache = False
-            else:
-                q = torch.cat([q_nope_out, q_pe], dim=-1)
-                k = torch.cat([k_nope, k_pe], dim=-1)
+            q = torch.cat([q_nope_out, q_pe], dim=-1)
+            k = torch.cat([k_nope, k_pe], dim=-1)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
@@ -679,9 +571,6 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif _is_hip:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
-
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
@@ -778,28 +667,6 @@ class DeepseekMLAForwardMixin:
             )
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
-
-    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
-        """
-        Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
-        """
-        server_args = get_server_args()
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend in ("dsa", "nsa")
-            and (
-                server_args.dsa_decode_backend == "tilelang"
-                or server_args.dsa_prefill_backend == "tilelang"
-            )
-        )
-
-    def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
-        """
-        Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
-        when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
-        that calls fused_qk_rope_cat_and_cache_mla).
-        """
-        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
 
 
 # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
