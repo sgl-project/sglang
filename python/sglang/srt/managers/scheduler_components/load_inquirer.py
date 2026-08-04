@@ -14,6 +14,7 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
+from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -155,7 +156,7 @@ class SchedulerLoadInquirer:
             )
 
         lora = None
-        if self.server_args.enable_lora:
+        if get_lora().enable_lora:
             lora = LoRAMetrics(
                 slots_used=stats.lora_pool_slots_used,
                 slots_total=stats.lora_pool_slots_total,
@@ -165,6 +166,7 @@ class SchedulerLoadInquirer:
         mode_str = "null"
         prefill_bootstrap = prefill_inflight = 0
         decode_prealloc = decode_transfer = decode_retracted = 0
+        decode_prealloc_ready = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
@@ -175,6 +177,11 @@ class SchedulerLoadInquirer:
             decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
             decode_retracted = len(
                 self.get_disagg_decode_prealloc_queue().retracted_queue
+            )
+            decode_prealloc_ready = sum(
+                1
+                for decode_req in self.get_disagg_decode_prealloc_queue().queue
+                if decode_req.waiting_for_input
             )
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
@@ -192,6 +199,7 @@ class SchedulerLoadInquirer:
             grammar=stats.num_grammar_queue_reqs,
             paused=stats.num_paused_reqs,
             retracted=stats.num_retracted_reqs,
+            prealloc_ready=decode_prealloc_ready,
         )
 
         totals = self.get_decode_moment_totals()
