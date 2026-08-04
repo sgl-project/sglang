@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolName,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
@@ -295,6 +296,42 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+
+
+class TestHybridComponentSuffix(HiCacheFileLRUTestBase):
+    def test_mamba_keys_are_isolated_by_tp_rank(self):
+        b0 = self.make_backend(is_mla=True, tp_rank=0, tp_size=2, subdir="mamba")
+        b1 = self.make_backend(is_mla=True, tp_rank=1, tp_size=2, subdir="mamba")
+
+        # MLA KV remains shared, while rank-local Mamba state uses distinct files.
+        self.assertEqual(
+            b0._get_component_key("page", PoolName.KV),
+            b1._get_component_key("page", PoolName.KV),
+        )
+        self.assertNotEqual(
+            b0._get_component_key("page", PoolName.MAMBA),
+            b1._get_component_key("page", PoolName.MAMBA),
+        )
+        self.assertTrue(b0.set("page", _t(8, fill=10), component_name=PoolName.MAMBA))
+        self.assertTrue(b1.set("page", _t(8, fill=20), component_name=PoolName.MAMBA))
+        target0, target1 = _t(8), _t(8)
+        self.assertIsNotNone(b0.get("page", target0, component_name=PoolName.MAMBA))
+        self.assertIsNotNone(b1.get("page", target1, component_name=PoolName.MAMBA))
+        self.assertTrue(torch.equal(target0, _t(8, fill=10)))
+        self.assertTrue(torch.equal(target1, _t(8, fill=20)))
+
+    def test_replicated_pool_keys_do_not_follow_mha_primary(self):
+        b0 = self.make_backend(is_mla=False, tp_rank=0, tp_size=2, subdir="indexer")
+        b1 = self.make_backend(is_mla=False, tp_rank=1, tp_size=2, subdir="indexer")
+
+        self.assertNotEqual(
+            b0._get_component_key("page", PoolName.KV),
+            b1._get_component_key("page", PoolName.KV),
+        )
+        self.assertEqual(
+            b0._get_component_key("page", PoolName.INDEXER),
+            b1._get_component_key("page", PoolName.INDEXER),
+        )
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
