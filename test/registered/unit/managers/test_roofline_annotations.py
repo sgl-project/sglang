@@ -135,9 +135,9 @@ class TestStepSpanRoofline(CustomTestCase):
         )
 
     def test_target_verify_uses_draft_token_width(self):
-        # MTP/EAGLE target-verify: N_Q per req = num_draft_tokens. Its query
-        # tokens are causally/tree masked (prefill-like), so it is emitted under
-        # the context (``c_``) group to receive the sqsq causal correction.
+        # MTP/EAGLE target-verify: N_Q per req = num_draft_tokens. It is
+        # classified as generation (``g_``) by request phase (matching vLLM);
+        # its quadratic self-attention is still captured in g_sqsq.
         # ndt=3, seqs=[10,20]: sq=3*2=6, sk=30, sqsq=9+9=18,
         # sqsk=3*10+3*20=90.
         fb = _fb(
@@ -148,7 +148,7 @@ class TestStepSpanRoofline(CustomTestCase):
         )
         self.assertEqual(
             self._name(fb),
-            "step[TARGET_VERIFY bs=2 c_sq=6 c_sqsq=18 c_sqsk=90 c_sk=30]",
+            "step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]",
         )
 
     def test_target_verify_without_cpu_mirror_falls_back_to_base(self):

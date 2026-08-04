@@ -59,18 +59,17 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     """Compute the roofline aggregates from the batch's CPU-side length mirrors.
 
     All roofline aggregates are emitted, always prefixed by phase: ``c_`` for
-    context (EXTEND, TARGET_VERIFY) and ``g_`` for generation (DECODE), with
+    context (EXTEND) and ``g_`` for generation (DECODE, TARGET_VERIFY), with
     MIXED emitting both groups. The per-phase ``sq`` (Σ N_Q) is always emitted
     so the suffix is self-contained, even where it duplicates the base label's
     ``bs`` (vanilla decode) or ``toks`` (pure extend).
 
     Speculative decoding (EAGLE/MTP) breaks the vanilla ``N_Q == 1`` decode
     assumption: draft-decode and target-verify process ``num_tokens_per_req``
-    query tokens per request (see :func:`_decode_query_width`). Target-verify
-    is classified as context (``c_``) because those query tokens are
-    causally/tree masked against each other (prefill-like), so its ``sqsq``
-    causal correction is applied by the roofline model; spec draft-decode
-    stays generation (``g_``) with ``g_sq = bs * num_tokens_per_req``.
+    query tokens per request (see :func:`_decode_query_width`). Both are
+    classified as generation (``g_``) by request phase (matching vLLM), with
+    ``g_sq = bs * num_tokens_per_req``. Target-verify's quadratic self-attention
+    among those query tokens is still captured numerically in ``g_sqsq``.
 
     Returns an empty string when the required host mirrors are unavailable
     (e.g. some overlap-schedule paths drop ``seq_lens_cpu``), so the base label
@@ -81,13 +80,14 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
 
     # DECODE (vanilla or spec draft-decode) and TARGET_VERIFY both key off
     # ``seq_lens_cpu`` for N_KV and a uniform per-request query width N_Q, and
-    # differ only in phase:
-    #   * DECODE        -> generation (``g_``); N_Q is 1 (vanilla) or the spec
-    #                      draft-decode width.
-    #   * TARGET_VERIFY -> context (``c_``); its ``num_tokens_per_req`` query
-    #                      tokens are causally/tree masked against each other,
-    #                      so it is prefill-like and its ``sqsq`` causal
-    #                      correction must be applied by the roofline model.
+    # are both classified as generation (``g_``) by request phase (matching
+    # vLLM's convention):
+    #   * DECODE        -> N_Q is 1 (vanilla) or the spec draft-decode width.
+    #   * TARGET_VERIFY -> N_Q is ``num_tokens_per_req`` (the draft-token count);
+    #                      the request is past its prompt (generation phase), so
+    #                      it is bucketed under ``g_`` even though those query
+    #                      tokens self-attend. The quadratic self-attention cost
+    #                      is still captured numerically in ``g_sqsq`` (Σ N_Q²).
     if mode == ForwardMode.DECODE or mode == ForwardMode.TARGET_VERIFY:
         if seq_lens_cpu is None:
             return ""
@@ -95,10 +95,10 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
         nkvs = [int(x) for x in seq_lens_cpu.tolist()]
         nqs = [nq] * len(nkvs)
         sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
-        # ``sq`` is always emitted (self-contained suffix): for DECODE it equals
-        # ``bs`` (vanilla) or ``bs * num_tokens_per_req`` (spec draft-decode).
-        p = "c" if mode == ForwardMode.TARGET_VERIFY else "g"
-        return f"{p}_sq={sq} {p}_sqsq={sqsq} {p}_sqsk={sqsk} {p}_sk={sk}"
+        # ``sq`` is always emitted (self-contained suffix): it equals ``bs``
+        # (vanilla decode) or ``bs * num_tokens_per_req`` (spec draft-decode /
+        # target-verify).
+        return f"g_sq={sq} g_sqsq={sqsq} g_sqsk={sqsk} g_sk={sk}"
 
     ext_seq = forward_batch.extend_seq_lens_cpu
     ext_prefix = forward_batch.extend_prefix_lens_cpu
