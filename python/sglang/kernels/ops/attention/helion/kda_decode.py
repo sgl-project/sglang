@@ -9,7 +9,9 @@ import torch
 # SGLang initializes torch.distributed, but this kernel has no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
 _LOG2_E = 1.4426950408889634
-_SMALL_HEAD_THRESHOLD = 12
+# K3 exposes 12 local value heads at TP=8. Lower value-head counts share the
+# same low-occupancy decode regime.
+_DECODE_SMALL_VALUE_HEAD_THRESHOLD = 12
 
 # Tile V on the CUDA x axis so tensor-parallel head counts do not change the
 # grid width.
@@ -27,6 +29,8 @@ _KDA_BF16_CONFIG = helion.Config(
     block_sizes=[16],
     indexing="pointer",
     l2_groupings=[16],
+    # Policies are positional in the traced load order. Retune them if the
+    # decode body gains, loses, or reorders loads.
     load_eviction_policies=[
         "",
         "last",
@@ -49,7 +53,9 @@ _KDA_BF16_CONFIG = helion.Config(
     range_warp_specializes=[None],
 )
 
-# Bounded-gate, small-head decode benefits from a wider V tile and an XYZ grid.
+# The bounded sigmoid gate has lower ALU and register pressure than the
+# unbounded softplus gate, allowing small-head BF16 decode to use a wider V
+# tile. The same tile regresses the unbounded path.
 _KDA_BF16_SMALL_HEAD_CONFIG = helion.Config(
     block_sizes=[32],
     loop_orders=[[2, 1, 0]],
@@ -187,6 +193,23 @@ _helion_fused_recurrent_kda_packed_decode_bf16_small_head = helion.kernel(
     config=_KDA_BF16_SMALL_HEAD_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
+
+
+def _select_decode_kernel(
+    *,
+    is_bf16_state: bool,
+    num_v_heads: int,
+    use_lower_bound: bool,
+) -> helion.Kernel:
+    if (
+        is_bf16_state
+        and use_lower_bound
+        and num_v_heads <= _DECODE_SMALL_VALUE_HEAD_THRESHOLD
+    ):
+        return _helion_fused_recurrent_kda_packed_decode_bf16_small_head
+    if is_bf16_state:
+        return _helion_fused_recurrent_kda_packed_decode_bf16
+    return _helion_fused_recurrent_kda_packed_decode
 
 
 def _validate_packed_decode_inputs(
@@ -327,7 +350,7 @@ def helion_fused_recurrent_kda_packed_decode(
     * The return is the same ``(out, initial_state)`` object pair supplied by the
       caller.
     """
-    _, num_q_heads, _, _, _ = _validate_packed_decode_inputs(
+    _, _, num_v_heads, _, _ = _validate_packed_decode_inputs(
         mixed_qkv,
         a,
         b,
@@ -337,18 +360,13 @@ def helion_fused_recurrent_kda_packed_decode(
         out,
         ssm_state_indices,
     )
-    is_bf16_state = initial_state.dtype is torch.bfloat16
-    if (
-        is_bf16_state
-        and lower_bound is not None
-        and num_q_heads <= _SMALL_HEAD_THRESHOLD
-    ):
-        kernel = _helion_fused_recurrent_kda_packed_decode_bf16_small_head
-    elif is_bf16_state:
-        kernel = _helion_fused_recurrent_kda_packed_decode_bf16
-    else:
-        kernel = _helion_fused_recurrent_kda_packed_decode
     use_lower_bound = lower_bound is not None
+    is_bf16_state = initial_state.dtype is torch.bfloat16
+    kernel = _select_decode_kernel(
+        is_bf16_state=is_bf16_state,
+        num_v_heads=num_v_heads,
+        use_lower_bound=use_lower_bound,
+    )
     lower_bound_value = 0.0 if lower_bound is None else lower_bound
     result = kernel(
         mixed_qkv,
