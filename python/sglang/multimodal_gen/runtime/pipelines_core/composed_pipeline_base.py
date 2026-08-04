@@ -1089,3 +1089,29 @@ class ComposedPipelineBase(ABC):
             batches,
             server_args,
         )
+
+    @torch.no_grad()
+    def prepare_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        """Run the grouped preparation stage for sequential DiT execution."""
+        return self.executor.execute_group(self.stages[:1], batches, server_args)
+
+    @torch.no_grad()
+    def forward_prepared_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield terminal outputs for requests whose grouped prep already ran."""
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        remaining_stages = self.stages[1:]
+        for batch in batches:
+            yield self.executor.execute_with_profiling(
+                remaining_stages, batch, server_args
+            )
