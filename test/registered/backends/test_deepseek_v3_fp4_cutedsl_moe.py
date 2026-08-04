@@ -1,18 +1,7 @@
-"""Backend tests for CuteDSL MoE (FusedMoE + moe_runner, moe_a2a=none).
-
-Exercises the CuteDSL moe_runner path with ModelOpt FP4 by launching a
-server with --moe-runner-backend flashinfer_cutedsl.
-
-Two configurations are tested:
-  - EP=1, TP=4: each GPU holds all experts with TP-sharded intermediate dim
-  - EP=4, TP=4: each GPU holds 1/4 of experts at full intermediate width,
-    partial results combined via all-reduce (no A2A dispatch)
-
-Requires 4 GPUs. Run from repo root with:
-  python -m pytest test/registered/backends/test_deepseek_v3_fp4_cutedsl_moe.py -v -s
-Or via the nightly suite:
-  python test/run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly
-"""
+"""CuteDSL MoE e2e with EP=TP=4 (moe_a2a=none): each GPU holds 1/4 of the
+experts at full intermediate width, partial results combined via all-reduce.
+Kept for the distributed-EP dimension; single-GPU backend numerics live in
+unit/layers/quantization/test_nvfp4_moe_backends.py."""
 
 import unittest
 from types import SimpleNamespace

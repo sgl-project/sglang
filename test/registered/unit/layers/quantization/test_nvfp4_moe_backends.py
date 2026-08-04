@@ -29,12 +29,6 @@ kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
 
-BACKENDS = [
-    "flashinfer_cutlass",
-    "flashinfer_trtllm",
-    "flashinfer_cutedsl",
-]
-
 
 def _init_single_process_dist():
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
