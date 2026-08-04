@@ -104,8 +104,7 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own,
-      # so the cache is the only source here.
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
       - uses: ./.github/actions/download-rust-ext
 
       - name: Install dependencies
@@ -276,15 +275,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      # Worth the most here of the three jobs: this runner is hosted, so it has no
-      # persistent cargo target dir to fall back on and every dispatch compiled
-      # cold. Its setup-python pins the same 3.10 the modules were built against.
+      # Worth the most of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir and every dispatch compiled cold. Its
+      # setup-python pins the same 3.10 the modules were built against.
       - uses: ./.github/actions/download-rust-ext
         id: rust_ext
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
-      # (rust/sglang-grpc) when installing the main `sglang` wheel from source, so
-      # nothing needs it once the prebuilt modules are in place.
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
       - name: Install protoc + Rust toolchain
         if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10

@@ -91,10 +91,9 @@ jobs:
           artifact_name: ${{ inputs.rust_ext_artifact }}
 
       # Both only serve the fallback where this stage compiles the extensions
-      # itself, so they follow whether the modules actually arrived, not the
-      # producer job's output: with the artifact expired and the cache evicted,
-      # cargo and a warm target dir are still needed here. Otherwise rust-cache
-      # restores ~1 GB per partition for nothing, on an over-quota cache.
+      # itself, so they follow whether the modules arrived, not the producer job's
+      # output. Otherwise rust-cache restores ~1 GB per partition for nothing, on
+      # an over-quota cache.
       - name: Install protoc + Rust toolchain
         if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
