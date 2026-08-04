@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.managers import mm_utils
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
