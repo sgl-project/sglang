@@ -33,6 +33,14 @@ runs:
         name: ${{ inputs.artifact_name }}
         path: python/sglang/srt/
 
+    # Gated with the restore below, not run unconditionally: a job whose artifact
+    # arrived never reads the cache, so it should not pay an apt-get for it. The
+    # self-hosted images ship without zstd, and the entries were saved with it.
+    - name: Ensure zstd so the cache entry is readable
+      if: steps.artifact.outcome != 'success'
+      shell: bash
+      run: bash scripts/ci/utils/ensure_zstd.sh
+
     # Second, not first: the cache is evictable and this repo sits at its 10 GB
     # limit. A run reads its own branch's entries plus the default branch's, so
     # seed-rust-ext-cache.yml and the branch's own rust-ext-build both land here.
