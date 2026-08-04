@@ -94,9 +94,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
-        # `.any()` on a device tensor is a full stream sync; resolve it ONCE per
-        # forward here and pass the bool down (metadata.has_mamba_track_mask).
-        # Never re-derive it per layer.
+        # Resolve the tracked-row selection once per forward
         has_mamba_track_mask = bool(
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()
@@ -794,11 +792,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
         )
-        # `forward` slices the track destinations from the TAIL ([-num_decodes:])
-        # because eager mixed batches put decode rows last, while the graph path
-        # refills the static track buffer at the FRONT ([:bs]). Those two agree
-        # only while num_decodes == bs; if that ever stops holding, the track-save
-        # scatters to the wrong slots and silently corrupts cached mamba state.
+        # `forward` slices the track destinations from ([-num_decodes:])
         assert (
             self.forward_metadata.num_decodes == forward_batch.batch_size
         ), f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
@@ -838,9 +832,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if forward_batch.mamba_track_mask is not None:
-            # No `.any()` here: it is a per-layer stream sync, and
-            # _track_mamba_state_extend already gates on the once-per-forward
-            # metadata.has_mamba_track_mask (same predicate).
             if intermediate_states is not None:
                 self._track_mamba_state_extend(
                     forward_batch,

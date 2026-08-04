@@ -275,10 +275,7 @@ class Mamba2Metadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
-        # Resolve the tracked-row selection ONCE per forward: `nonzero` has a
-        # data-dependent output size, so it syncs, and the mixer runs this for
-        # every mamba layer. GDN/KDA hoist the same two tensors into their
-        # metadata (see GDNAttnBackend.init_forward_metadata).
+        # Resolve the tracked-row selection once per forward
         mamba_track_mask_indices = None
         conv_states_mask_indices = None
         if forward_metadata.has_mamba_track_mask:

@@ -562,9 +562,7 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
-            # Runs once per mamba LAYER: read the pre-resolved selection off the
-            # metadata. Deriving it here (`mask.any()` + `mask.nonzero()`) costs
-            # two stream syncs per layer, i.e. dozens per prefill forward.
+            # Runs once per mamba layer
             if (
                 metadata.has_mamba_track_mask
                 and metadata.track_conv_indices is not None
