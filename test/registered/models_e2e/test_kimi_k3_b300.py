@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-b300")
 
 MODEL_PATH = (
     "/data/radixark/model-cache/hub/models--moonshotai--Kimi-K3/"
@@ -66,6 +66,7 @@ class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
                 DSPARK_DRAFT_MODEL,
                 "--speculative-dspark-block-size",
                 "7",
+                "--enable-linear-replayssm-spec",
             ],
         )
 
@@ -94,7 +95,6 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
                 "8",
                 "--dcp-size",
                 "8",
-                "--disable-custom-all-reduce",
                 "--mem-fraction-static",
                 "0.85",
                 "--weight-loader-prefetch-checkpoints",
