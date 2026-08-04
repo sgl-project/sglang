@@ -27,6 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  NCCL_NVLS_ENABLE: "0"
   # Must match TORCH_VER in docker/sgl-deep-gemm.Dockerfile — the wheel's
   # pre-compiled _C.so links against this torch ABI.
   TORCH_VER: "2.13.0"
