@@ -51,8 +51,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
-    capture_module_attrs,
-    check_ipc_quant_support,
+    WeightCacheQuantStates,
     cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
@@ -124,13 +123,6 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
-        # module qualname -> {attr: scalar}, the Python-side layout state that
-        # post-processing stamps and IPC handles cannot carry (see
-        # capture_module_attrs).
-        self.module_attrs: Dict[str, Dict[str, Any]] = {}
-        # MoE runner backend as resolved during this daemon's model load; the
-        # client compares it once its own model is built.
-        self.moe_runner_backend: str = ""
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -151,9 +143,6 @@ class WeightCacheDaemon:
                 f"Distributed already initialized, skipping"
             )
             return
-
-        # Initialize distributed environment
-        import torch.distributed as dist
 
         if not dist.is_initialized():
             if self.dist_init_method is None:
@@ -233,14 +222,6 @@ class WeightCacheDaemon:
         )
         publish(server_args, role="weight_cache_daemon")
 
-        from sglang.srt.layers.moe import get_moe_runner_backend, initialize_moe_config
-        from sglang.srt.layers.quantization.fp4_utils import (
-            initialize_fp4_gemm_config,
-        )
-
-        initialize_fp4_gemm_config(server_args)
-        initialize_moe_config(server_args)
-
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
@@ -265,6 +246,13 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
+        self.quant_states = WeightCacheQuantStates(
+            quant_config=quant_config,
+            quant_method=quant_method,
+            server_args=server_args,
+            where="daemon",
+        )
+
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -284,11 +272,6 @@ class WeightCacheDaemon:
             revision=self.revision or "",
             **compute_env_stamp(),
         )
-
-        # Refuse to serve quant methods not verified for IPC sharing. Checked
-        # before loading so an unsupported model fails fast instead of after
-        # minutes of disk I/O.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
@@ -325,8 +308,7 @@ class WeightCacheDaemon:
         # risk observing half-written weights.
         current_platform.synchronize()
 
-        self.module_attrs = capture_module_attrs(self.model)
-        self.moe_runner_backend = get_moe_runner_backend().value
+        self.quant_states.capture_module_attrs(self.model)
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -525,8 +507,8 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
-                    "module_attrs": self.module_attrs,
-                    "moe_runner_backend": self.moe_runner_backend,
+                    "module_attrs": self.quant_states.module_attrs,
+                    "moe_runner_backend": self.quant_states.moe_runner_backend,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.

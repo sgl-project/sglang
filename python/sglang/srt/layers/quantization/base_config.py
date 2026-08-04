@@ -42,34 +42,6 @@ class QuantizeMethodBase(ABC):
         """
         return
 
-    def ipc_transferable_attrs(self) -> frozenset[str]:
-        """Plain layer attributes post-processing stamps and apply() reads.
-
-        The daemon captures these off the layer after post-processing and the
-        client stamps them onto its own layer. Values must be simple scalars to
-        survive the transport; tensors travel as IPC handles instead.
-        """
-        return frozenset()
-
-    def ipc_reshapes_weights(self) -> bool:
-        """Whether post-processing changes the shape of exported tensors.
-
-        When True, a client rebinds its parameters to the daemon's shapes rather
-        than treating the difference from its own create_weights as drift.
-        """
-        return False
-
-    def ipc_rebind_after_import(self, layer: nn.Module) -> None:
-        """Re-establish state that depends on tensor identity, after IPC import.
-
-        Post-processing may hand other objects references to the tensors it
-        produced (e.g. a token dispatcher). Those references point at the
-        daemon's objects, so a client redoes that wiring against its own
-        IPC-mapped tensors. Implementations should share one code path with
-        process_weights_after_loading rather than restating it.
-        """
-        return
-
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""

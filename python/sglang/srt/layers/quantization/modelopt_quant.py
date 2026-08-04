@@ -1502,19 +1502,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
 
-    def ipc_transferable_attrs(self) -> frozenset[str]:
-        # weights_padding_cols: K padding added for kernel alignment; apply()
-        #   pads the activation by the same amount and defaults to 0 when unset,
-        #   so a client that never received it pads wrong and serves garbage.
-        # output_size_per_partition: recomputed from the post-processed weight's
-        #   shape and read by apply() to size its output.
-        return frozenset({"weights_padding_cols", "output_size_per_partition"})
-
-    def ipc_reshapes_weights(self) -> bool:
-        # Weights are padded for kernel alignment and their scales swizzled, so
-        # the exported shapes differ from what create_weights registered.
-        return True
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2257,30 +2244,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
-    def ipc_transferable_attrs(self) -> frozenset[str]:
-        # intermediate_size_per_partition: padded MoE size, set by
-        #   align_fp4_moe_weights_for_flashinfer_trtllm and read by the runners.
-        # _w13_deinterleaved: marks w13 as already deinterleaved, so a later
-        #   post-processing pass over these weights cannot do it twice.
-        return frozenset({"intermediate_size_per_partition", "_w13_deinterleaved"})
-
-    def ipc_reshapes_weights(self) -> bool:
-        # Expert weights are padded for kernel alignment and their block scales
-        # swizzled, so the exported shapes differ from create_weights'.
-        return True
-
-    def ipc_rebind_after_import(self, layer: torch.nn.Module) -> None:
-        layer.dispatcher.set_quant_config(
-            {
-                "input_global_scale": (
-                    layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else None
-                )
-            }
-        )
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
@@ -2420,7 +2383,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     (1.0 / layer.g1_alphas).to(torch.float32),
                 )
 
-        self._set_dispatcher_quant_config(layer)
+        # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
+        layer.dispatcher.set_quant_config(
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
+                )
+            }
+        )
         block_size = 16
         # Validate weight scales
         assert_dim = 2 if layer.moe_runner_config.is_gated else 1

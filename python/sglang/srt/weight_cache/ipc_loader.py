@@ -26,7 +26,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
-    apply_module_attrs,
+    WeightCacheQuantStates,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
@@ -130,12 +130,27 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        # Only now that we are certain we will map the daemon's tensors: this
+        # gives us the per-method adaptation the daemon used (which shapes may
+        # differ, what has to be rewired), and constructing it resolves this
+        # process's MoE/FP4 backends -- a no-op repeat of what the engine
+        # already did, but it needs published server args, which the disk
+        # fallback path above must not require.
+        from sglang.srt.runtime_context import get_server_args
+
+        quant_states = WeightCacheQuantStates(
+            quant_config=engine_quant_config,
+            quant_method=quant_method,
+            server_args=get_server_args(),
+            where="client",
+        )
+
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
             quant_config,
-            quant_method=quant_method,
+            quant_states=quant_states,
             module_attrs=cache_data.get("module_attrs") or {},
             daemon_moe_runner_backend=cache_data.get("moe_runner_backend", ""),
         )
@@ -289,7 +304,7 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
-        quant_method: str = "",
+        quant_states: WeightCacheQuantStates,
         module_attrs: Optional[dict] = None,
         daemon_moe_runner_backend: str = "",
     ) -> nn.Module:
@@ -337,15 +352,10 @@ class IpcModelLoader(BaseModelLoader):
         reshaped_count = 0
         map_tic = time.perf_counter()
 
-        # Ask the model itself, rather than matching on a quant method name:
-        # a method whose post-processing pads/swizzles declares it, and the
-        # client then rebinds to the daemon's shapes instead of treating the
-        # difference from its own create_weights as daemon/client drift.
-        postprocess_reshapes = any(
-            module.quant_method.ipc_reshapes_weights()
-            for _, module in model.named_modules()
-            if getattr(module, "quant_method", None) is not None
-        )
+        # A method whose post-processing pads/swizzles says so, and the client
+        # then rebinds to the daemon's shapes instead of treating the difference
+        # from its own create_weights as daemon/client drift.
+        postprocess_reshapes = quant_states.ipc_reshapes_weights()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
@@ -408,12 +418,12 @@ class IpcModelLoader(BaseModelLoader):
             )
 
         if module_attrs:
-            changed = apply_module_attrs(model, module_attrs)
+            changed = quant_states.apply_module_attrs(model, module_attrs)
             logger.info(
                 f"[IpcModelLoader] Applied daemon module attributes "
                 f"({changed} changed across {len(module_attrs)} modules)"
             )
-        self._rebind_quant_state_after_import(model)
+        self._rebind_quant_state_after_import(model, quant_states)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -454,7 +464,7 @@ class IpcModelLoader(BaseModelLoader):
         if reshaped_count:
             logger.info(
                 f"[IpcModelLoader] Rebound {reshaped_count} tensor(s) to the "
-                f"daemon's post-processed shape (expected for {quant_method})"
+                f"daemon's post-processed shape (expected for {quant_states.quant_method})"
             )
 
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
@@ -469,30 +479,19 @@ class IpcModelLoader(BaseModelLoader):
         return model
 
     @staticmethod
-    def _rebind_quant_state_after_import(model) -> None:
-        """Let each quant method re-establish state that depends on tensor identity.
+    def _rebind_quant_state_after_import(model, quant_states) -> None:
+        """Re-establish state that depends on tensor identity.
 
         Post-processing may hand other objects references to the tensors it
         produced (NVFP4 MoE gives the token dispatcher its input global scale).
-        Those are the daemon's objects, so every quant method gets a chance to
-        redo that wiring against this process's IPC-mapped tensors; the base
-        implementation is a no-op, so methods with nothing to rebind cost a call.
+        Those are the daemon's objects, so the quant states object redoes that
+        wiring against this process's IPC-mapped tensors; it decides per module
+        whether there is anything to do.
         """
-        from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
-
-        rebound = 0
         for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is None:
+            if getattr(module, "quant_method", None) is None:
                 continue
-            quant_method.ipc_rebind_after_import(module)
-            if (
-                type(quant_method).ipc_rebind_after_import
-                is not QuantizeMethodBase.ipc_rebind_after_import
-            ):
-                rebound += 1
-        if rebound:
-            logger.info(f"[IpcModelLoader] Rebound quant state on {rebound} module(s)")
+            quant_states.ipc_rebind_after_import(module)
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
