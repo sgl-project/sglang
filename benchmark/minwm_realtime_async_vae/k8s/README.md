@@ -3,9 +3,11 @@
 The base kustomization creates one `p5.4xlarge` H100 Denoiser and one
 `g6.2xlarge` or `g6.4xlarge` L4 TAEHV worker. Both NodePools are Spot-only,
 expire after four hours, and must still be deleted explicitly after a run.
-The benchmark reuses the existing `default/s3-claim`, ECR image, GPU
-EC2NodeClasses, and AWS Load Balancer Controller. It does not create or write a
-DynamoDB lease table; one Gateway process owns the in-memory leases.
+The benchmark reuses the existing `default/s3-claim` for the donor model and
+creates a read-only S3 CSI volume for the checkpoint in
+`leap-world-us-west-2`. It also reuses the ECR image, GPU EC2NodeClasses, and
+AWS Load Balancer Controller. It does not create or write a DynamoDB lease
+table; one Gateway process owns the in-memory leases.
 
 Before applying, render the manifests and replace `REPLACE_WITH_GIT_SHA` with a
 pushed commit SHA:

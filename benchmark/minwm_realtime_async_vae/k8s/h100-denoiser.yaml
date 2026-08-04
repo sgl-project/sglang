@@ -99,7 +99,7 @@ spec:
             - name: MINWM_CHECKPOINT_SOURCE
               value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
             - name: MINWM_CHECKPOINT
-              value: /s3/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
+              value: /checkpoint-archive/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
             - name: MINWM_DONOR
               value: /s3/world-model/checkpoints/minWM/Wan2.2-TI2V-5B-from-diffusers
             - name: TAEHV_REVISION
@@ -256,6 +256,9 @@ spec:
               ephemeral-storage: 300Gi
               nvidia.com/gpu: "1"
           volumeMounts:
+            - name: checkpoint-archive
+              mountPath: /checkpoint-archive
+              readOnly: true
             - name: s3
               mountPath: /s3
               readOnly: true
@@ -264,6 +267,10 @@ spec:
             - name: shm
               mountPath: /dev/shm
       volumes:
+        - name: checkpoint-archive
+          persistentVolumeClaim:
+            claimName: minwm-async-west-s3
+            readOnly: true
         - name: s3
           persistentVolumeClaim:
             claimName: s3-claim

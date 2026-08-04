@@ -11,6 +11,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 BASE_MANIFESTS = (
     "gpu-device-plugin.yaml",
+    "west-s3-volume.yaml",
     "h100-denoiser.yaml",
     "l4-vae.yaml",
     "gateway-service.yaml",

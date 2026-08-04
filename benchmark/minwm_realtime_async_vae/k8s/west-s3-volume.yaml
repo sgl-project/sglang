@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: minwm-async-west-s3-pv
+  labels:
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  capacity:
+    storage: 1200Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  csi:
+    driver: s3.csi.aws.com
+    volumeHandle: minwm-async-west-s3-20260804
+    volumeAttributes:
+      bucketName: leap-world-us-west-2
+      mount-timeout-seconds: "300"
+  mountOptions:
+    - region us-west-2
+    - --read-part-size 25165824
+    - --maximum-throughput-gbps 100
+    - --metadata-ttl 3600
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minwm-async-west-s3
+  namespace: default
+  labels:
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: minwm-async-west-s3-pv
+  resources:
+    requests:
+      storage: 1200Gi

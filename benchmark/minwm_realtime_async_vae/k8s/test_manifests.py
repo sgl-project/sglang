@@ -48,3 +48,32 @@ def test_webui_enables_i2v_and_t2v_in_production_manifest():
     manifest = (Path(__file__).parent / "h100-denoiser.yaml").read_text()
     assert '"generationModes":["i2v","t2v"]' in manifest
     assert '"t2vDefaultNumFrames":121' in manifest
+
+
+def test_west_checkpoint_uses_a_matching_read_only_s3_mount():
+    documents = load_documents()
+    volume = find(documents, "PersistentVolume", "minwm-async-west-s3-pv")
+    assert volume["spec"]["csi"]["volumeAttributes"]["bucketName"] == (
+        "leap-world-us-west-2"
+    )
+    assert volume["spec"]["accessModes"] == ["ReadOnlyMany"]
+
+    deployment = find(documents, "Deployment", "minwm-async-denoiser")
+    pod_spec = deployment["spec"]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    checkpoint = next(
+        entry["value"]
+        for entry in container["env"]
+        if entry["name"] == "MINWM_CHECKPOINT"
+    )
+    assert checkpoint.startswith("/checkpoint-archive/")
+    assert any(
+        mount["name"] == "checkpoint-archive" and mount["readOnly"]
+        for mount in container["volumeMounts"]
+    )
+    assert any(
+        item["name"] == "checkpoint-archive"
+        and item["persistentVolumeClaim"]["claimName"] == "minwm-async-west-s3"
+        and item["persistentVolumeClaim"]["readOnly"]
+        for item in pod_spec["volumes"]
+    )
