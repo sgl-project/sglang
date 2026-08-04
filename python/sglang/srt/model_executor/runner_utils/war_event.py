@@ -41,11 +41,11 @@ def maybe_publish_prefill_war_read_done(
     """Publish prefill read-done after compliant metadata initialization."""
     if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
         return
-    # Verify/draft modes publish through the decode graph runner. Speculative
-    # workers opt in only when the target runner is their last prefill reader.
     if forward_batch.forward_mode != ForwardMode.EXTEND:
         return
-    if not model_runner.spec_algorithm.supports_prefill_war_read_done():
+    # TODO(Jialin): Relax this gate for speculative decoding after its prefill
+    # WAR boundaries are validated.
+    if not model_runner.spec_algorithm.is_none():
         return
     if not model_runner.attn_backend.prefill_shared_reads_end_at_metadata_init:
         return

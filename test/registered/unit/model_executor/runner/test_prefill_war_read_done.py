@@ -36,16 +36,8 @@ def _batch(mode=ForwardMode.EXTEND):
     return SimpleNamespace(forward_mode=mode)
 
 
-@pytest.mark.parametrize(
-    "spec_algorithm",
-    [
-        SpeculativeAlgorithm.NONE,
-        SpeculativeAlgorithm.DFLASH,
-        SpeculativeAlgorithm.DSPARK,
-    ],
-)
-def test_publishes_recorded_event_when_enabled(spec_algorithm):
-    runner = _model_runner(spec_algorithm=spec_algorithm)
+def test_publishes_recorded_event_when_enabled():
+    runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         maybe_publish_prefill_war_read_done(runner, _batch(), _DEVICE_MODULE)
     published = runner.war_fastpath_read_done_event

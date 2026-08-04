@@ -95,9 +95,6 @@ class CustomSpecAlgo:
     def supports_target_verify_war_read_done(self) -> bool:
         return False
 
-    def supports_prefill_war_read_done(self) -> bool:
-        return False
-
     def supports_ragged_verify(self) -> bool:
         return False
 
