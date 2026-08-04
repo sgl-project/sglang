@@ -10,6 +10,14 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     register_transcription_adapter,
 )
 
+# Per-second output-token budget for clips long enough to exceed the floor.
+# Speech runs ~2-3 words/s and tokenizers emit >1 token/word, so 15 tok/s
+# leaves generous headroom over the natural transcript length while still
+# bounding runaway generation.
+_MAX_NEW_TOKENS_PER_SECOND = 15
+# Floor for the generation-length cap; sized so a ~30s clip always fits.
+_DEFAULT_MAX_NEW_TOKENS = 448
+
 
 @register_transcription_adapter("Qwen2Audio")
 class Qwen2AudioAdapter(TranscriptionAdapter):
@@ -23,9 +31,16 @@ class Qwen2AudioAdapter(TranscriptionAdapter):
     """
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
+        # ``/v1/audio/transcriptions`` has no request-side length field, so the
+        # adapter is the only control. Short clips use the floor; longer clips
+        # scale with duration so the transcript is not silently truncated.
+        duration_s = request.audio_duration_s or 0.0
         return {
             "temperature": request.temperature,
-            "max_new_tokens": 448,
+            "max_new_tokens": max(
+                _DEFAULT_MAX_NEW_TOKENS,
+                int(duration_s * _MAX_NEW_TOKENS_PER_SECOND),
+            ),
         }
 
     def build_verbose_response(

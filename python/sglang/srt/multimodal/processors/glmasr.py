@@ -29,13 +29,25 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    # GLM-ASR's chat template keys on ``{"type": "audio"}`` (or any mapping
+    # containing an ``audio`` key) to emit its audio placeholder span.
+    _TRANSCRIPTION_CONVERSATION = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": ""},
+                {"type": "text", "text": "Transcribe the audio."},
+            ],
+        }
+    ]
+
     def _build_transcription_prompt(self, input_text) -> str:
         """Fall back to a default ASR prompt for audio-only requests.
 
         The ``/v1/audio/transcriptions`` endpoint sends empty text (and hence
-        empty ``input_ids``), which carries no audio placeholder. Build the
-        standard GLM-ASR chat prompt with one audio span so the encoder
-        features have a slot to fill.
+        empty ``input_ids``), which carries no audio placeholder. Render the
+        GLM-ASR chat prompt with one audio span so the encoder features have a
+        slot to fill; otherwise the caller-supplied text is used as-is.
         """
         if isinstance(input_text, list):
             input_text = (
@@ -43,17 +55,10 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
             )
         if input_text and input_text.strip():
             return input_text
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": ""},
-                    {"type": "text", "text": "Transcribe the audio."},
-                ],
-            }
-        ]
         return self._processor.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
+            self._TRANSCRIPTION_CONVERSATION,
+            add_generation_prompt=True,
+            tokenize=False,
         )
 
     async def process_mm_data_async(
