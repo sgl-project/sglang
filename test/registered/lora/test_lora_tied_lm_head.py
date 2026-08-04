@@ -46,11 +46,17 @@ except ImportError:
 
 from transformers import AutoModelForCausalLM
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+    CustomTestCase,
+    empty_gpu_cache,
+)
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
+register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
+
 
 # Use a small model with tie_word_embeddings=True
 BASE_MODEL = "Qwen/Qwen2.5-0.5B"
@@ -123,7 +129,7 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
 
     # Clean up the model to free memory
     del peft_model, model
-    torch.cuda.empty_cache()
+    empty_gpu_cache()
 
 
 class TestLoRATiedLMHead(CustomTestCase):
@@ -174,7 +180,7 @@ class TestLoRATiedLMHead(CustomTestCase):
                 lora_paths=[self._adapter_dir] * len(prompts),
             )
 
-        torch.cuda.empty_cache()
+        empty_gpu_cache()
 
         # Run HuggingFace with LoRA (via PEFT)
         with HFRunner(
