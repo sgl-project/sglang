@@ -1029,7 +1029,10 @@ def decode_attention_fwd(
             kv_indptr,
             kv_indices,
             total_programs,
-            sm_scale,
+            # Fold k_scale into sm_scale and pass v_scale, exactly as the standard grouped
+            # kernel does, so Lean dequantizes fp8 KV consistently (both are 1.0 for bf16/fp16).
+            sm_scale * k_scale,
+            v_scale,
             XCD_REMAP,
             NUM_XCDS,
             lean_Mp,
@@ -1208,6 +1211,7 @@ def _lean_attention_decode_kernel(
     kv_indptr,
     kv_indices,
     sm_scale,
+    v_scale,
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -1342,6 +1346,10 @@ def _lean_attention_decode_kernel(
         q = tl.load(
             Q + off_q, mask=mask_h[:, None] & mask_d[None, :], other=0.0
         )  # [BLOCK_M, BLOCK_DMODEL]
+        # Cast q to the K buffer dtype so the main dot is a same-dtype MMA. For fp8 KV this
+        # makes it dot(fp8, fp8) (triton rejects a bf16xfp8 mix); k_scale is folded into
+        # sm_scale to dequantize. For bf16/fp16 KV this is a no-op. Mirrors the standard kernel.
+        q_k = q.to(K_Buffer.dtype.element_ty)
 
         # MLA rope split: the positional-encoding dims live in [BLOCK_DMODEL, Lk).
         if BLOCK_DPE > 0:
@@ -1387,7 +1395,7 @@ def _lean_attention_decode_kernel(
                 other=0.0,
             )
 
-            qk = tl.dot(q, k)  # [BLOCK_M, BLOCK_N]
+            qk = tl.dot(q_k, k)  # [BLOCK_M, BLOCK_N]
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
                     kv_loc[None, :] * stride_buf_kbs
@@ -1399,8 +1407,9 @@ def _lean_attention_decode_kernel(
                     mask=(offs_n[None, :] < tok_end) & (mask_dpe[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe)
-            qk *= sm_scale
+                # Dequantize the rope-split K to q's dtype for this small dot (matches standard).
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            qk *= sm_scale  # sm_scale carries k_scale (folded by the caller)
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < tok_end),
                 qk,
@@ -1482,7 +1491,10 @@ def _lean_attention_decode_kernel(
                     e_max = m_new
                     e_sum = l_new
 
-            acc = acc / e_sum[:, None]
+            # v_scale dequantizes the fp8 V contribution accumulated via dot(p, v); it is 1.0
+            # for bf16/fp16 V. Applied once here at the single output-write site (mirrors the
+            # standard kernel's `acc / e_sum * v_scale`).
+            acc = acc / e_sum[:, None] * v_scale
             offs_o = (
                 cur_batch * stride_obs + offs_h[:, None] * stride_oh + offs_dv[None, :]
             )
@@ -1643,7 +1655,8 @@ def _decode_lean_attention_fwd(
     kv_indptr,
     kv_indices,
     total_programs,
-    sm_scale,
+    sm_scale,  # already folded with k_scale by the caller (matches the standard kernel)
+    v_scale,
     XCD_REMAP,
     NUM_XCDS,
     Mp,
@@ -1712,6 +1725,7 @@ def _decode_lean_attention_fwd(
         kv_indptr,
         kv_indices,
         sm_scale,
+        v_scale,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),

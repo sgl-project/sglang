@@ -117,6 +117,79 @@ def _run_pair(H_Q, H_KV, D, B, S, dev="cuda", dt=torch.float16, seed=0):
     return o_std, o_lean
 
 
+def _lean_scratch(H_KV, kv_group_num, D_V, dev):
+    total_programs, _, _ = _lean_decode_launch_params(H_KV, kv_group_num)
+    return (
+        torch.empty((total_programs, _LEAN_BLOCK_M), dtype=torch.float32, device=dev),
+        torch.empty((total_programs, _LEAN_BLOCK_M), dtype=torch.float32, device=dev),
+        torch.empty(
+            (total_programs, _LEAN_BLOCK_M, D_V), dtype=torch.float32, device=dev
+        ),
+        torch.zeros((total_programs,), dtype=torch.int32, device=dev),
+    )
+
+
+def _run_pair_fp8(H_Q, H_KV, D, B, S, fp8_dtype, dev="cuda", seed=0):
+    """Standard vs Lean on **fp8** K/V with non-unit k_scale/v_scale.
+
+    Both arms go through the public ``decode_attention_fwd`` dispatch (enable_lean False/True),
+    which folds k_scale into sm_scale and applies v_scale — the exact production path. They share
+    the same fp8 inputs and dequant scales, so their outputs must agree (the fp8 quantization
+    error is identical for both); this guards that Lean's fp8 dtype handling matches the standard
+    kernel. Returns (o_std, o_lean).
+    """
+    torch.manual_seed(seed)
+    D_V = D
+    kv_group_num = H_Q // H_KV
+    sm = 1.0 / (D**0.5)
+    tot = B * S
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    q = torch.randn(B, H_Q, D, dtype=torch.float16, device=dev)
+    k_ref = torch.randn(tot, H_KV, D, dtype=torch.float32, device=dev)
+    v_ref = torch.randn(tot, H_KV, D_V, dtype=torch.float32, device=dev)
+    # Per-tensor symmetric quantization to fp8, mirroring how fp8 KV is stored + dequantized.
+    k_scale = (k_ref.abs().max() / fp8_max).item()
+    v_scale = (v_ref.abs().max() / fp8_max).item()
+    k = (k_ref / k_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    v = (v_ref / v_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+    kv_indptr = torch.arange(0, (B + 1) * S, step=S, device=dev, dtype=torch.int32)
+    kv_indices = torch.arange(0, tot, device=dev, dtype=torch.int32)
+    num_kv_splits = torch.full((B,), MAX_KV_SPLITS, dtype=torch.int32, device=dev)
+
+    def _call(enable_lean):
+        attn_logits = torch.empty(
+            (B, H_Q, MAX_KV_SPLITS, D_V), dtype=torch.float32, device=dev
+        )
+        attn_lse = torch.empty((B, H_Q, MAX_KV_SPLITS), dtype=torch.float32, device=dev)
+        o = torch.zeros(B, H_Q, D_V, dtype=torch.float16, device=dev)
+        mp, lp, op, locks = _lean_scratch(H_KV, kv_group_num, D_V, dev)
+        decode_attention_fwd(
+            q,
+            k,
+            v,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            MAX_KV_SPLITS,
+            sm,
+            k_scale,
+            v_scale,
+            enable_lean=enable_lean,
+            lean_Mp=mp,
+            lean_Lp=lp,
+            lean_Op=op,
+            lean_locks=locks,
+        )
+        return o
+
+    return _call(False), _call(True)
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "Lean decode kernel requires a GPU")
 class TestLeanAttentionParity(CustomTestCase):
     """Lean must be numerically identical to the standard SplitK kernel."""
@@ -140,6 +213,35 @@ class TestLeanAttentionParity(CustomTestCase):
                         self.assertTrue(
                             torch.isfinite(o_lean).all(),
                             f"{name}: non-finite Lean output",
+                        )
+
+    def test_fp8_kv_parity(self):
+        # Phase 2: Lean must handle fp8 KV cache the same way the standard kernel does
+        # (cast q->K.dtype for the MMA, fold k_scale into sm_scale, apply v_scale). Guards the
+        # regression where the Lean path crashed on fp8 K ("Unsupported rhs dtype fp8e4nv").
+        fp8_dtype = None
+        for name in ("float8_e4m3fn", "float8_e4m3fnuz"):
+            if hasattr(torch, name):
+                fp8_dtype = getattr(torch, name)
+                break
+        if fp8_dtype is None:
+            self.skipTest("no fp8 e4m3 dtype available in this torch build")
+        for name, H_Q, H_KV, D in GQA_SHAPES:
+            for B in (1, 8):
+                for S in (8192, 32768):
+                    with self.subTest(model=name, batch=B, ctx=S, dtype=str(fp8_dtype)):
+                        o_std, o_lean = _run_pair_fp8(H_Q, H_KV, D, B, S, fp8_dtype)
+                        self.assertTrue(
+                            torch.isfinite(o_lean).all(),
+                            f"{name}: non-finite Lean fp8 output",
+                        )
+                        cos = torch.nn.functional.cosine_similarity(
+                            o_lean.flatten().float(), o_std.flatten().float(), dim=0
+                        ).item()
+                        self.assertGreater(
+                            cos,
+                            0.99,
+                            f"{name} b={B} ctx={S}: Lean fp8 diverged from SplitK (cos={cos:.5f})",
                         )
 
 
