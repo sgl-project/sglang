@@ -248,6 +248,9 @@ if is_blackwell_system():
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
+
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
     assert url is not None

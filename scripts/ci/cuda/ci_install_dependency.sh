@@ -673,6 +673,19 @@ if spec.origin != want:
 print(f"sglang resolves to {spec.origin}")
 '
 
+    # Import, not find_spec: the finders locate an extension without dlopening it,
+    # so a .so that cannot load passes find_spec and only fails inside some suite.
+    python3 -c '
+import importlib
+for mod in ("server", "grpc", "multimodal"):
+    name = f"sglang.srt.{mod}._core"
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        raise SystemExit(f"{name} is present but does not load: {exc!r}")
+    print(f"{name} loads")
+'
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
