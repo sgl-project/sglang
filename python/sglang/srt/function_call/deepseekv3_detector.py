@@ -100,11 +100,40 @@ class DeepSeekV3Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
+            # Hold back a partial fence prefix so it doesn't leak into the
+            # content stream when the fence is split across streaming chunks.
+            # Mirrors the base-class _ends_with_partial_token holdback that
+            # this override was otherwise missing. Covers both the begin and
+            # end fences, since the end fences can also arrive split across
+            # chunks after a tool call's JSON has completed.
+            max_partial_len = 0
+            for fence in (
+                self.bot_token,
+                "<｜tool▁call▁begin｜>",
+                "<｜tool▁call▁end｜>",
+                self.eot_token,
+            ):
+                partial_len = self._ends_with_partial_token(current_text, fence)
+                if partial_len > max_partial_len:
+                    max_partial_len = partial_len
+
+            if max_partial_len:
+                # Flush the leading normal text immediately and keep only the
+                # partial fence prefix in the buffer. Holding back the whole
+                # buffer would trap the leading text and discard it once the
+                # fence completes and the parser switches to tool-call mode.
+                normal_text = current_text[:-max_partial_len]
+                self._buffer = current_text[-max_partial_len:]
+                for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+                    if e_token in normal_text:
+                        normal_text = normal_text.replace(e_token, "")
+                return StreamingParseResult(normal_text=normal_text)
+
             self._buffer = ""
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                if e_token in current_text:
+                    current_text = current_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=current_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -187,7 +216,14 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             # Remove the completed tool call from buffer, keep any remaining content
                             self._buffer = current_text[match.end() :]
                         else:
-                            self._buffer = ""
+                            # The JSON is complete but <｜tool▁call▁end｜> hasn't
+                            # fully arrived yet. Keep the in-flight tail (after
+                            # the closing ``` fence) so the end fences are
+                            # consumed as structure once they arrive, instead of
+                            # discarding them now and dropping the leading '<'
+                            # (which would let the rest leak as content).
+                            json_end = partial_match.end(3)
+                            self._buffer = current_text[json_end + 4 :]
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
