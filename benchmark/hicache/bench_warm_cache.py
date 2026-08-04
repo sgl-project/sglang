@@ -7,10 +7,17 @@ This benchmark is designed for cache-focused studies where each request has a
 fixed total input length and an exactly controlled shared-prefix ratio. For each
 shared-prefix percentage, the benchmark:
 
-1. Flushes the server KV cache.
+1. Flushes the server KV cache via /flush_cache.
 2. Builds prompts with an identical shared prefix and random unique suffixes.
 3. Warms only the shared prefix once.
-4. Benchmarks the full prompts through SGLang's native /generate endpoint.
+4. Benchmarks the full prompts via the selected backend endpoint.
+
+Supported backends:
+  sglang            - native /generate endpoint (token-id level)
+  sglang-oai        - /v1/completions (OpenAI-compatible)
+  sglang-oai-chat   - /v1/chat/completions (OpenAI-compatible)
+  vllm / vllm-chat  - /v1/completions or /v1/chat/completions
+  lmdeploy / lmdeploy-chat - same
 
 Compared with the existing hicache shared-prefix benchmarks, this benchmark
 provides direct control over total length, shared-prefix length, and suffix
@@ -20,6 +27,7 @@ length at the token-id level.
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 import warnings
@@ -175,32 +183,226 @@ async def async_request_sglang_generate(
     return output
 
 
+def _get_auth_headers() -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+
+
+async def async_request_openai_completions(
+    api_url: str,
+    input_ids: List[int],
+    prompt_len: int,
+    output_len: int,
+    pbar: Optional[Any] = None,
+) -> RequestFuncOutput:
+    async with _create_bench_client_session() as session:
+        payload = {
+            "model": args.model,
+            "prompt": input_ids,
+            "temperature": 0.0,
+            "max_tokens": output_len,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "ignore_eos": not args.disable_ignore_eos,
+            **args.extra_request_body,
+        }
+        headers = _get_auth_headers()
+        output = RequestFuncOutput(prompt_len=prompt_len)
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        output.start_time = st
+        most_recent_timestamp = st
+        latency = 0.0
+
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            continue
+
+                        data = json.loads(chunk)
+                        timestamp = time.perf_counter()
+
+                        usage = data.get("usage") or {}
+                        if usage:
+                            output.output_len = usage.get(
+                                "completion_tokens", output.output_len
+                            )
+                            continue
+
+                        text = data["choices"][0].get("text", "")
+                        if text:
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+                            generated_text += text
+                            most_recent_timestamp = timestamp
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                else:
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
+                    output.success = False
+        except Exception as exc:
+            output.success = False
+            output.error = str(exc)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_chat_completions(
+    api_url: str,
+    prompt_text: str,
+    prompt_len: int,
+    output_len: int,
+    pbar: Optional[Any] = None,
+) -> RequestFuncOutput:
+    async with _create_bench_client_session() as session:
+        payload = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": 0.0,
+            "max_tokens": output_len,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "ignore_eos": not args.disable_ignore_eos,
+            **args.extra_request_body,
+        }
+        headers = _get_auth_headers()
+        output = RequestFuncOutput(prompt_len=prompt_len)
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        output.start_time = st
+        most_recent_timestamp = st
+        latency = 0.0
+
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+                        if chunk == "[DONE]":
+                            continue
+
+                        data = json.loads(chunk)
+                        timestamp = time.perf_counter()
+
+                        usage = data.get("usage") or {}
+                        if usage:
+                            output.output_len = usage.get(
+                                "completion_tokens", output.output_len
+                            )
+                            continue
+
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+                            generated_text += content
+                            most_recent_timestamp = timestamp
+
+                    output.generated_text = generated_text
+                    output.success = True
+                    output.latency = latency
+                else:
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
+                    output.success = False
+        except Exception as exc:
+            output.success = False
+            output.error = str(exc)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+BACKEND_TO_PORTS = {
+    "sglang": 30000,
+    "sglang-oai": 30000,
+    "sglang-oai-chat": 30000,
+    "vllm": 8000,
+    "vllm-chat": 8000,
+    "lmdeploy": 23333,
+    "lmdeploy-chat": 23333,
+}
+
+COMPLETIONS_BACKENDS = {"sglang-oai", "vllm", "lmdeploy"}
+CHAT_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
+
+
 async def run_batch(
     api_url: str,
     prompts: List[Dict[str, Any]],
     output_len: int,
     max_concurrency: Optional[int],
+    backend: str,
     pbar: Optional[Any] = None,
 ) -> List[RequestFuncOutput]:
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
+    if backend in COMPLETIONS_BACKENDS:
+        request_fn = async_request_openai_completions
+    elif backend in CHAT_BACKENDS:
+        request_fn = async_request_openai_chat_completions
+    else:
+        request_fn = async_request_sglang_generate
+
     async def limited_request(prompt: Dict[str, Any]) -> RequestFuncOutput:
+        if backend in CHAT_BACKENDS:
+            kw = {
+                "api_url": api_url,
+                "prompt_text": prompt["prompt_text"],
+                "prompt_len": prompt["prompt_len"],
+                "output_len": output_len,
+                "pbar": pbar,
+            }
+        else:
+            kw = {
+                "api_url": api_url,
+                "input_ids": prompt["input_ids"],
+                "prompt_len": prompt["prompt_len"],
+                "output_len": output_len,
+                "pbar": pbar,
+            }
         if semaphore is None:
-            return await async_request_sglang_generate(
-                api_url=api_url,
-                input_ids=prompt["input_ids"],
-                prompt_len=prompt["prompt_len"],
-                output_len=output_len,
-                pbar=pbar,
-            )
+            return await request_fn(**kw)
         async with semaphore:
-            return await async_request_sglang_generate(
-                api_url=api_url,
-                input_ids=prompt["input_ids"],
-                prompt_len=prompt["prompt_len"],
-                output_len=output_len,
-                pbar=pbar,
-            )
+            return await request_fn(**kw)
 
     tasks = [asyncio.create_task(limited_request(prompt)) for prompt in prompts]
     return await asyncio.gather(*tasks)
@@ -221,37 +423,108 @@ def gen_token_ids(
     return rng.choices(vocab_ids, k=token_num)
 
 
+def _gen_token_pool(
+    token_count: int,
+    tokenizer: PreTrainedTokenizerBase,
+    rng: random.Random,
+) -> List[int]:
+    """Encode random ASCII into a pool of *token_count* stable token IDs.
+
+    One ``tokenizer.encode`` call for the entire pool; callers slice from
+    the result and ``tokenizer.decode`` each slice (which is cheap).
+    """
+    if token_count <= 0:
+        return []
+    chars = "abcdefghijklmnopqrstuvwxyz "
+    raw = "".join(rng.choices(chars, k=token_count * 6))
+    return tokenizer.encode(raw, add_special_tokens=False)[:token_count]
+
+
 def build_prompts(
     vocab_ids: List[int],
     total_tokens: int,
     shared_pct: int,
     num_prompts: int,
     rng: random.Random,
-) -> List[Dict[str, Any]]:
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    need_chat_text: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Return (prompts, shared_prefix_text).
+
+    When *need_chat_text* is False (sglang / completions backends), prompts
+    contain raw ``input_ids`` built from random token IDs.
+
+    When *need_chat_text* is True (chat backends), prompts contain
+    ``prompt_text`` built from random ASCII that tokenizes to the target
+    length.  A single ``tokenizer.encode`` call builds the entire token
+    pool; per-prompt work is decode-only.
+    """
     prefix_len = total_tokens * shared_pct // 100
     suffix_len = total_tokens - prefix_len
 
-    shared_prefix = gen_token_ids(vocab_ids, prefix_len, rng)
+    shared_prefix_text: Optional[str] = None
 
-    prompts: List[Dict[str, Any]] = []
+    if need_chat_text and tokenizer is not None:
+        pool = _gen_token_pool(prefix_len + num_prompts * suffix_len, tokenizer, rng)
+        prefix_ids = pool[:prefix_len]
+        shared_prefix_text = tokenizer.decode(prefix_ids) if prefix_len > 0 else ""
+
+        prompts: List[Dict[str, Any]] = []
+        for i in range(num_prompts):
+            offset = prefix_len + i * suffix_len
+            suffix_ids = pool[offset : offset + suffix_len]
+            input_ids = prefix_ids + suffix_ids
+            suffix_text = tokenizer.decode(suffix_ids) if suffix_len > 0 else ""
+            prompts.append(
+                {
+                    "input_ids": input_ids,
+                    "prompt_text": shared_prefix_text + suffix_text,
+                    "prompt_len": len(input_ids),
+                }
+            )
+        return prompts, shared_prefix_text
+
+    shared_prefix = gen_token_ids(vocab_ids, prefix_len, rng)
+    prompts = []
     for _ in range(num_prompts):
         suffix = gen_token_ids(vocab_ids, suffix_len, rng)
         input_ids = shared_prefix + suffix
         prompts.append({"input_ids": input_ids, "prompt_len": len(input_ids)})
 
-    return prompts
+    return prompts, None
 
 
-async def warm_shared_prefix(api_url: str, shared_prefix_ids: List[int]) -> None:
+async def warm_shared_prefix(
+    api_url: str,
+    shared_prefix_ids: List[int],
+    backend: str,
+    shared_prefix_text: Optional[str] = None,
+) -> None:
     if not shared_prefix_ids:
         return
 
-    warmup = await async_request_sglang_generate(
-        api_url=api_url,
-        input_ids=shared_prefix_ids,
-        prompt_len=len(shared_prefix_ids),
-        output_len=1,
-    )
+    prompt_len = len(shared_prefix_ids)
+    if backend in CHAT_BACKENDS:
+        warmup = await async_request_openai_chat_completions(
+            api_url=api_url,
+            prompt_text=shared_prefix_text,
+            prompt_len=prompt_len,
+            output_len=1,
+        )
+    elif backend in COMPLETIONS_BACKENDS:
+        warmup = await async_request_openai_completions(
+            api_url=api_url,
+            input_ids=shared_prefix_ids,
+            prompt_len=prompt_len,
+            output_len=1,
+        )
+    else:
+        warmup = await async_request_sglang_generate(
+            api_url=api_url,
+            input_ids=shared_prefix_ids,
+            prompt_len=prompt_len,
+            output_len=1,
+        )
     if not warmup.success:
         raise RuntimeError(
             "Warmup failed - Please make sure benchmark arguments are correctly "
@@ -491,19 +764,25 @@ async def benchmark_shared_prefix_pct(
     flush_cache(base_url)
     time.sleep(1)
 
+    need_chat_text = args.backend in CHAT_BACKENDS
     print(f"Building {args.num_prompts} prompts ...")
-    prompts = build_prompts(
+    prompts, shared_prefix_text = build_prompts(
         vocab_ids=vocab_ids,
         total_tokens=args.total_tokens,
         shared_pct=pct,
         num_prompts=args.num_prompts,
         rng=rng,
+        tokenizer=tokenizer if need_chat_text else None,
+        need_chat_text=need_chat_text,
     )
 
     if prefix_len > 0:
         print(f"Warming shared prefix only ({prefix_len} tokens) ...")
         await warm_shared_prefix(
-            api_url=api_url, shared_prefix_ids=prompts[0]["input_ids"][:prefix_len]
+            api_url=api_url,
+            shared_prefix_ids=prompts[0]["input_ids"][:prefix_len],
+            backend=args.backend,
+            shared_prefix_text=shared_prefix_text,
         )
 
     print(f"Sending requests (max_concurrency={args.max_concurrency}) ...")
@@ -513,6 +792,7 @@ async def benchmark_shared_prefix_pct(
         prompts=prompts,
         output_len=args.output_len,
         max_concurrency=args.max_concurrency,
+        backend=args.backend,
         pbar=None,
     )
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -558,8 +838,9 @@ async def main() -> None:
         "--backend",
         type=str,
         default="sglang",
-        choices=["sglang"],
-        help="Warm-cache benchmark currently supports the native SGLang /generate endpoint.",
+        choices=list(BACKEND_TO_PORTS.keys()),
+        help="Backend to benchmark. 'sglang' uses the native /generate endpoint; "
+        "others use OpenAI-compatible /v1/completions or /v1/chat/completions.",
     )
     parser.add_argument(
         "--base-url",
@@ -568,7 +849,12 @@ async def main() -> None:
         help="Server base url if not using host and port.",
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=30000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Server port. Defaults to backend-specific port if not set.",
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -641,8 +927,17 @@ async def main() -> None:
         json.loads(args.extra_request_body) if args.extra_request_body else {}
     )
 
+    if args.port is None:
+        args.port = BACKEND_TO_PORTS.get(args.backend, 30000)
+
     base_url = args.base_url or f"http://{args.host}:{args.port}"
-    api_url = f"{base_url}/generate"
+
+    if args.backend in COMPLETIONS_BACKENDS:
+        api_url = f"{base_url}/v1/completions"
+    elif args.backend in CHAT_BACKENDS:
+        api_url = f"{base_url}/v1/chat/completions"
+    else:
+        api_url = f"{base_url}/generate"
     pcts = [int(p.strip()) for p in args.pcts.split(",") if p.strip()]
     rng = random.Random(args.seed)
 
