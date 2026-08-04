@@ -39,6 +39,7 @@ def publish_config_and_parallel_state():
 
 HIDDEN = 16
 
+
 @pytest.fixture(autouse=True)
 def single_process_runtime_context():
     # These mm_utils unit tests exercise cache-hit paths that acknowledge
@@ -51,8 +52,8 @@ def single_process_runtime_context():
             yield
     finally:
         server_args_override.restore()
-        
-        
+
+
 # Three items with text gaps between their placeholder runs; offsets are
 # (start, end) inclusive, mirroring processor output.
 ITEM_OFFSETS = [(2, 5), (9, 14), (20, 24)]
