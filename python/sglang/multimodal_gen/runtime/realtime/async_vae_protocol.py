@@ -62,6 +62,7 @@ class ChunkSequenceTracker:
         self.session_id = session_id
         self.generation_id = generation_id
         self.next_chunk_index = 0
+        self._accepted_headers: dict[int, LatentChunkHeader] = {}
 
     def accept(self, header: LatentChunkHeader) -> AcceptDisposition:
         header.validate()
@@ -70,9 +71,12 @@ class ChunkSequenceTracker:
         if header.generation_id != self.generation_id:
             raise ProtocolViolation("stale generation")
         if header.chunk_index == self.next_chunk_index:
+            self._accepted_headers[header.chunk_index] = header
             self.next_chunk_index += 1
             return AcceptDisposition.ACCEPT
         if header.chunk_index < self.next_chunk_index:
+            if self._accepted_headers.get(header.chunk_index) != header:
+                raise ProtocolViolation("conflicting duplicate chunk")
             return AcceptDisposition.DUPLICATE
         raise ProtocolViolation("out-of-order chunk")
 

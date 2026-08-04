@@ -69,6 +69,26 @@ def test_controller_waits_for_capacity_but_not_same_user_limit():
     asyncio.run(scenario())
 
 
+def test_controller_can_reject_capacity_without_queueing_preinit_connection():
+    async def scenario():
+        store = InMemorySessionLeaseStore(max_active_sessions=1, ttl_s=60)
+        controller = RealtimeAdmissionController(store, wait_timeout_s=10)
+        first = await controller.admit("u1", "s1", "g1")
+
+        with pytest.raises(AdmissionRejected, match="CAPACITY_EXHAUSTED"):
+            await controller.admit(
+                "u2",
+                "s2",
+                "g2",
+                wait_for_capacity=False,
+            )
+
+        assert await store.active_count() == 1
+        await controller.release(first)
+
+    asyncio.run(scenario())
+
+
 def test_different_users_run_concurrently_but_same_user_is_rejected():
     async def scenario():
         controller = RealtimeAdmissionController(

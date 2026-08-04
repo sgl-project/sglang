@@ -129,7 +129,7 @@ class AsyncVAEWorker:
         identity = (request.session_id, request.generation_id)
         async with self._session_lock:
             if identity in self._sessions:
-                return
+                raise ProtocolViolation("VAE session generation is already active")
             if len(self._sessions) >= self.max_sessions:
                 raise VAESessionCapacityError(
                     f"VAE session capacity exhausted: {self.max_sessions}"

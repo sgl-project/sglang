@@ -640,6 +640,11 @@ async def _send_remote_frame_batch(
             "height": frame_batch.height,
             "channels": 3,
             "bytes_per_frame": frame_batch.width * frame_batch.height * 3,
+            "frame_batch_index": frame_batch.frame_batch_index,
+            "num_frame_batches": (
+                frame_batch.frame_batch_index + 1 if frame_batch.is_final else 0
+            ),
+            "is_final_frame_batch": frame_batch.is_final,
         },
         metrics=batch.metrics,
     )
@@ -815,14 +820,14 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
     session.vae_client = client
     output_format = session.request.realtime_output_format or "webp"
     quality = int(session.request.output_compression or 90)
-    await client.open(
-        output_format=output_format,
-        quality=quality,
-        preview_max_width=session.request.realtime_preview_max_width,
-    )
     coordinator = _OrderedDecodeCoordinator()
 
     try:
+        await client.open(
+            output_format=output_format,
+            quality=quality,
+            preview_max_width=session.request.realtime_preview_max_width,
+        )
         while session.can_schedule_chunk():
             if coordinator.pending is not None and coordinator.pending.done():
                 await coordinator.finish()
@@ -1291,6 +1296,8 @@ def _schedule_queued_control_refresh(
     event_kind: str,
     event_id: int | None,
 ) -> None:
+    if event_kind != "camera_actions":
+        return
     session.pending_control_refresh = (event_kind, event_id)
     task = session.control_refresh_task
     if task is None or task.done():
@@ -1366,6 +1373,7 @@ async def _listen_generate_request(
         try:
             receive_started = time.perf_counter()
             raw_message = await ws.receive_bytes()
+            session.mark_client_activity()
             receive_wait_ms = (time.perf_counter() - receive_started) * 1000
             data = msgspec.msgpack.decode(raw_message)
             if not isinstance(data, dict):
@@ -1502,6 +1510,24 @@ async def _wait_for_server_warmup(websocket: WebSocket) -> None:
         await warmup_done.wait()
 
 
+async def _wait_for_initialization_or_watchdog(
+    initialization_task: asyncio.Task,
+    watchdog_task: asyncio.Task,
+) -> str | None:
+    done, _ = await asyncio.wait(
+        (initialization_task, watchdog_task),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if initialization_task in done:
+        await initialization_task
+        return None
+
+    reason = await watchdog_task
+    initialization_task.cancel()
+    await _await_realtime_task(initialization_task)
+    return reason
+
+
 @router.websocket("/generate")
 async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
@@ -1531,27 +1557,20 @@ async def generate(websocket: WebSocket):
         "server.ws_accepted",
         client=str(websocket.client) if websocket.client else None,
     )
-    warmup_started = time.perf_counter()
-    await _wait_for_server_warmup(websocket)
-    warmup_wait_ms = (time.perf_counter() - warmup_started) * 1000
-    if warmup_wait_ms > 1.0:
-        log_realtime_trace(
-            logger,
-            session,
-            "server.warmup_wait_done",
-            wait_ms=round(warmup_wait_ms, 3),
-        )
     controller = _get_admission_controller(server_args)
     lease = None
+    initialization_task = None
     generate_task = None
     listen_task = None
     watchdog_task = None
     try:
-        # receive new generate request
-        await _listen_generate_request(ws, session, trace_sink)
-
         try:
-            lease = await controller.admit(user_id, session.id, session.generation_id)
+            lease = await controller.admit(
+                user_id,
+                session.id,
+                session.generation_id,
+                wait_for_capacity=False,
+            )
         except AdmissionRejected as exc:
             log_realtime_trace(
                 logger,
@@ -1573,11 +1592,6 @@ async def generate(websocket: WebSocket):
             "server.session_admitted",
             user_key_hash=_user_id_fingerprint(user_id),
         )
-
-        # continuously generate video chunk
-        generate_task = asyncio.create_task(_generate_loop(ws, session))
-        # continuously listen for user events
-        listen_task = asyncio.create_task(_listen_events(ws, session))
         watchdog_task = asyncio.create_task(
             _session_watchdog(
                 session,
@@ -1589,6 +1603,43 @@ async def generate(websocket: WebSocket):
             )
         )
 
+        async def initialize_session() -> None:
+            warmup_started = time.perf_counter()
+            await _wait_for_server_warmup(websocket)
+            warmup_wait_ms = (time.perf_counter() - warmup_started) * 1000
+            if warmup_wait_ms > 1.0:
+                log_realtime_trace(
+                    logger,
+                    session,
+                    "server.warmup_wait_done",
+                    wait_ms=round(warmup_wait_ms, 3),
+                )
+            await _listen_generate_request(ws, session, trace_sink)
+
+        initialization_task = asyncio.create_task(initialize_session())
+        init_close_reason = await _wait_for_initialization_or_watchdog(
+            initialization_task,
+            watchdog_task,
+        )
+        if init_close_reason is not None:
+            log_realtime_trace(
+                logger,
+                session,
+                "server.session_watchdog_closed",
+                reason=init_close_reason,
+                phase="initialization",
+            )
+            await _close_realtime_websocket(
+                ws,
+                code=1000,
+                reason=init_close_reason,
+            )
+            return
+
+        # continuously generate video chunk
+        generate_task = asyncio.create_task(_generate_loop(ws, session))
+        # continuously listen for user events
+        listen_task = asyncio.create_task(_listen_events(ws, session))
         wait_tasks = [generate_task, listen_task, watchdog_task]
         await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
         if generate_task.done() and session.reached_max_chunks():
@@ -1615,6 +1666,9 @@ async def generate(websocket: WebSocket):
             if watchdog_task is not None:
                 watchdog_task.cancel()
                 await _await_realtime_task(watchdog_task)
+            if initialization_task is not None and not initialization_task.done():
+                initialization_task.cancel()
+                await _await_realtime_task(initialization_task)
             await _cleanup_realtime_session(session, generate_task, listen_task)
         finally:
             if lease is not None:

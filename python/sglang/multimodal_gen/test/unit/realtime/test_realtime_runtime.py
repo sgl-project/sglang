@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     lingbot_world_realtime_adapter as lingbot_realtime,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
+    minwm_realtime_adapter as minwm_realtime,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters import (
     sana_wm_realtime_adapter as sana_wm_realtime,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
@@ -803,6 +806,47 @@ def test_generate_session_targets_latest_active_chunk_for_control_refresh():
     assert session.latest_active_chunk == second
 
 
+def test_prompt_event_does_not_replace_pending_camera_refresh():
+    session = GenerateSession()
+    session.pending_control_refresh = ("camera_actions", 7)
+    session.control_refresh_task = SimpleNamespace(done=lambda: False)
+
+    realtime_video_api._schedule_queued_control_refresh(session, "prompt", 8)
+
+    assert session.pending_control_refresh == ("camera_actions", 7)
+
+
+def test_minwm_camera_refresh_preserves_dispatched_prompt_version():
+    adapter = minwm_realtime.MinWMRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="initial prompt",
+            generation_mode="t2v",
+        )
+    )
+    session.prompt_version = 5
+    chunk = session.new_chunk(prompt_version=2)
+    batch = SimpleNamespace(
+        condition_inputs={},
+        realtime_chunk_size=4,
+        realtime_action_version=0,
+        realtime_prompt_version=2,
+    )
+
+    replacement = adapter.refresh_queued_request(
+        session,
+        SimpleNamespace(),
+        chunk,
+        batch,
+        "camera_actions",
+    )
+
+    assert replacement.realtime_prompt_version == 2
+
+
 def test_event_listener_ingests_new_controls_while_scheduler_refresh_is_pending(
     monkeypatch,
 ):
@@ -1160,6 +1204,30 @@ def test_session_watchdog_closes_idle_session():
             await controller.release(lease)
 
     assert asyncio.run(run()) == "session idle timeout"
+
+
+def test_initialization_is_cancelled_when_preinit_watchdog_expires():
+    async def run():
+        cancelled = asyncio.Event()
+
+        async def initialize():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def watchdog():
+            await asyncio.sleep(0)
+            return "session idle timeout"
+
+        reason = await realtime_video_api._wait_for_initialization_or_watchdog(
+            asyncio.create_task(initialize()),
+            asyncio.create_task(watchdog()),
+        )
+        return reason, cancelled.is_set()
+
+    assert asyncio.run(run()) == ("session idle timeout", True)
 
 
 def test_strict_realtime_identity_requires_authenticated_principal():

@@ -36,6 +36,17 @@ def _tensor_from_payload(header, payload: bytes) -> torch.Tensor:
     return torch.frombuffer(bytearray(payload), dtype=dtype).reshape(header.shape)
 
 
+async def _bind_socket_session(
+    worker: AsyncVAEWorker,
+    current_identity: tuple[str, str] | None,
+    opened: SessionOpen,
+) -> tuple[str, str]:
+    if current_identity is not None:
+        raise ProtocolViolation("WebSocket already owns a VAE session")
+    await worker.open(opened)
+    return opened.session_id, opened.generation_id
+
+
 def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -82,8 +93,7 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                         quality=int(message.get("quality") or 90),
                         preview_max_width=message.get("preview_max_width"),
                     )
-                    await worker.open(opened)
-                    identity = (opened.session_id, opened.generation_id)
+                    identity = await _bind_socket_session(worker, identity, opened)
                     await send(
                         encode_message(
                             "session_accepted",

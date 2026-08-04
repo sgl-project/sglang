@@ -45,6 +45,14 @@ def test_latent_header_accepts_next_chunk_and_deduplicates_retry():
     assert tracker.accept(_header(chunk_index=1)) is AcceptDisposition.ACCEPT
 
 
+def test_latent_header_rejects_conflicting_duplicate_chunk():
+    tracker = ChunkSequenceTracker("s1", "g2")
+    tracker.accept(_header())
+
+    with pytest.raises(ProtocolViolation, match="conflicting duplicate"):
+        tracker.accept(_header(request_id="different-request"))
+
+
 def test_latent_header_rejects_gap_and_wrong_session():
     tracker = ChunkSequenceTracker("s1", "g2")
 

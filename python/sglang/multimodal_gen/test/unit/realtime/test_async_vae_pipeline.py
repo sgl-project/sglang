@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_ap
     _OrderedDecodeCoordinator,
 )
 from sglang.multimodal_gen.runtime.realtime.async_vae_client import RealtimeVAEClient
+from sglang.multimodal_gen.runtime.realtime.async_vae_client import RemoteFrameBatch
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     decode_message,
     encode_message,
@@ -115,6 +117,99 @@ def test_remote_frame_handlers_keep_first_frame_trace_scoped_to_their_chunk():
             "request-1",
         ]
         assert [item[0] for item in sends] == ["batch-0", "batch-0", "batch-1"]
+
+    asyncio.run(scenario())
+
+
+def test_remote_frame_batch_preserves_worker_stream_sequence_metadata():
+    async def scenario():
+        captured = []
+
+        class Adapter:
+            async def send_output(self, _ws, _session, output, _batch):
+                captured.append(output.raw_frame_metadata)
+                return realtime_video_api.empty_frame_send_stats()
+
+        session = SimpleNamespace(adapter=Adapter())
+        frame_batch = RemoteFrameBatch(
+            session_id="s",
+            generation_id="g",
+            request_id="r",
+            chunk_index=2,
+            event_id=7,
+            payloads=(b"webp",),
+            content_type="image/webp",
+            width=8,
+            height=8,
+            frame_batch_index=3,
+            is_final=True,
+            encode_ms=1.0,
+        )
+        await realtime_video_api._send_remote_frame_batch(
+            SimpleNamespace(),
+            session,
+            SimpleNamespace(metrics=None),
+            frame_batch,
+            realtime_video_api.empty_frame_send_stats(),
+        )
+
+        assert captured == [
+            {
+                "width": 8,
+                "height": 8,
+                "channels": 3,
+                "bytes_per_frame": 192,
+                "frame_batch_index": 3,
+                "num_frame_batches": 4,
+                "is_final_frame_batch": True,
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_vae_open_failure_still_closes_client(monkeypatch):
+    async def scenario():
+        closed = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def open(self, **_kwargs):
+                raise RuntimeError("handshake failed")
+
+            async def close(self):
+                closed.append(True)
+
+        async def ignore_error(*_args, **_kwargs):
+            pass
+
+        monkeypatch.setattr(realtime_video_api, "RealtimeVAEClient", Client)
+        monkeypatch.setattr(realtime_video_api, "write_error_msg", ignore_error)
+        session = SimpleNamespace(
+            adapter=object(),
+            request=SimpleNamespace(
+                realtime_output_format="webp",
+                output_compression=80,
+                realtime_preview_max_width=560,
+            ),
+            id="s",
+            generation_id="g",
+            vae_client=None,
+        )
+        server_args = SimpleNamespace(
+            realtime_vae_worker_url="ws://vae",
+            realtime_vae_timeout_s=1,
+            realtime_vae_max_message_mb=64,
+        )
+
+        await realtime_video_api._generate_loop_async_vae(
+            SimpleNamespace(), session, server_args
+        )
+
+        assert closed == [True]
+        assert session.vae_client is None
 
     asyncio.run(scenario())
 
@@ -445,7 +540,5 @@ def test_remote_vae_client_fails_and_removes_pending_on_frame_callback_error():
             await handle.wait()
         assert not client._pending
         await client.close()
-
-    import pytest
 
     asyncio.run(scenario())

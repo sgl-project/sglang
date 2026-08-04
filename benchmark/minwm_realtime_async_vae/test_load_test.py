@@ -3,6 +3,7 @@ from argparse import Namespace
 from load_test import (
     aggregate_measurement_seconds,
     init_request,
+    iter_trace_events,
     record_action_latency,
     server_action_latencies,
     stage_values,
@@ -46,6 +47,27 @@ def test_stage_values_excludes_warmup_and_records_local_vae():
         "denoise_ms": [310.0],
         "vae_decode_ms": [16.0],
     }
+
+
+def test_iter_trace_events_supports_batched_server_messages():
+    assert iter_trace_events(
+        {
+            "type": "trace_events",
+            "traces": [
+                {"event": "server.scheduler_forward_start", "chunk_index": 2},
+                {"event": "server.model_denoise_complete", "chunk_index": 2},
+            ],
+        }
+    ) == [
+        {"event": "server.scheduler_forward_start", "chunk_index": 2},
+        {"event": "server.model_denoise_complete", "chunk_index": 2},
+    ]
+
+
+def test_iter_trace_events_keeps_legacy_single_trace_message():
+    assert iter_trace_events(
+        {"type": "trace_event", "trace": {"event": "server.init_ready"}}
+    ) == [{"event": "server.init_ready"}]
 
 
 def test_stage_values_backfills_overlap_after_next_denoise_completes():

@@ -551,7 +551,11 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         )
 
         replacement.realtime_action_version = session.action_version
-        replacement.realtime_prompt_version = session.prompt_version
+        replacement.realtime_prompt_version = getattr(
+            batch,
+            "realtime_prompt_version",
+            chunk.prompt_version,
+        )
         replacement.realtime_event_id = self._get_state_realtime_event_id(preview_state)
         return replacement
 

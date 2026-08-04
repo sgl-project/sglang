@@ -253,6 +253,19 @@ async def stream_actions(
             pass
 
 
+def iter_trace_events(message: dict) -> list[dict]:
+    message_type = message.get("type")
+    if message_type == "trace_event":
+        trace = message.get("trace")
+        return [dict(trace)] if isinstance(trace, dict) else []
+    if message_type == "trace_events":
+        traces = message.get("traces")
+        if not isinstance(traces, list):
+            return []
+        return [dict(trace) for trace in traces if isinstance(trace, dict)]
+    return []
+
+
 async def run_session(args: argparse.Namespace, concurrency: int, index: int) -> dict:
     import websockets
 
@@ -311,17 +324,18 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                     raise RuntimeError(
                         message.get("content") or "realtime server error"
                     )
-                if message_type == "trace_event":
-                    trace = dict(message.get("trace") or {})
-                    trace_events.append(trace)
-                    trace_chunk = trace.get("chunk_index")
-                    if (
-                        measured_started_at is None
-                        and trace.get("event") == "server.scheduler_forward_start"
-                        and trace_chunk is not None
-                        and int(trace_chunk) >= args.warmup_chunks
-                    ):
-                        measured_started_at = time.perf_counter()
+                if message_type in {"trace_event", "trace_events"}:
+                    for trace in iter_trace_events(message):
+                        trace_events.append(trace)
+                        trace_chunk = trace.get("chunk_index")
+                        if (
+                            measured_started_at is None
+                            and trace.get("event")
+                            == "server.scheduler_forward_start"
+                            and trace_chunk is not None
+                            and int(trace_chunk) >= args.warmup_chunks
+                        ):
+                            measured_started_at = time.perf_counter()
                     continue
                 if message_type == "frame_batch_header":
                     pending_raw_header = message

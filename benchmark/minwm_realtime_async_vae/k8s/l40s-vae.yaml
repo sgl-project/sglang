@@ -16,6 +16,7 @@ spec:
     metadata:
       labels:
         seedleap.ai/capacity-pool: minwm-async-vae-l40s
+        seedleap.ai/vae-worker: "true"
         seedleap.ai/test-run: minwm-async-vae-benchmark
     spec:
       expireAfter: 4h

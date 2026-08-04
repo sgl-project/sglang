@@ -131,14 +131,19 @@ class RealtimeAdmissionController:
         self.wait_timeout_s = max(0.0, wait_timeout_s)
 
     async def admit(
-        self, user_id: str, session_id: str, generation_id: str
+        self,
+        user_id: str,
+        session_id: str,
+        generation_id: str,
+        *,
+        wait_for_capacity: bool = True,
     ) -> SessionLease:
         deadline = time.monotonic() + self.wait_timeout_s
         while True:
             try:
                 return await self.store.acquire(user_id, session_id, generation_id)
             except AdmissionRejected as exc:
-                if exc.reason != "CAPACITY_EXHAUSTED":
+                if exc.reason != "CAPACITY_EXHAUSTED" or not wait_for_capacity:
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

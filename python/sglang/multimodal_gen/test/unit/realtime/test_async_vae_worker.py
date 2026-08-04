@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints import realtime_vae_server
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     LatentChunkHeader,
 )
@@ -90,6 +91,49 @@ def test_worker_keeps_decoder_state_per_generation():
 
         assert engine.decoder_ids == {("s1", "g1"), ("s2", "g2")}
         await worker.close_all()
+
+    asyncio.run(scenario())
+
+
+def test_worker_rejects_duplicate_active_session_owner():
+    async def scenario():
+        worker = AsyncVAEWorker(_FakeEngine(), max_sessions=2)
+        await worker.open(SessionOpen("s1", "g1"))
+
+        with pytest.raises(ProtocolViolation, match="already active"):
+            await worker.open(SessionOpen("s1", "g1"))
+
+        await worker.close_all()
+
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        ProtocolViolation,
+    )
+
+    asyncio.run(scenario())
+
+
+def test_vae_websocket_cannot_rebind_to_another_session():
+    async def scenario():
+        worker = AsyncVAEWorker(_FakeEngine(), max_sessions=2)
+        identity = await realtime_vae_server._bind_socket_session(
+            worker,
+            None,
+            SessionOpen("s1", "g1"),
+        )
+
+        with pytest.raises(ProtocolViolation, match="already owns"):
+            await realtime_vae_server._bind_socket_session(
+                worker,
+                identity,
+                SessionOpen("s2", "g2"),
+            )
+
+        assert worker.active_sessions == 1
+        await worker.close_all()
+
+    from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
+        ProtocolViolation,
+    )
 
     asyncio.run(scenario())
 

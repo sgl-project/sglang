@@ -20,6 +20,23 @@ def test_l40s_alternate_is_spot_only_and_never_in_base_topology():
     assert "l40s-vae.yaml" not in kustomization
 
 
+def test_vae_deployment_can_land_on_either_l4_or_l40s_pool():
+    base_documents = load_documents()
+    l40s_documents = load_documents(("l40s-vae.yaml",))
+    deployment = find(base_documents, "Deployment", "minwm-async-vae")
+    selector = deployment["spec"]["template"]["spec"]["nodeSelector"]
+    assert selector["seedleap.ai/vae-worker"] == "true"
+    assert "karpenter.sh/nodepool" not in selector
+
+    for documents, name in (
+        (base_documents, "minwm-async-vae-l4"),
+        (l40s_documents, "minwm-async-vae-l40s"),
+    ):
+        nodepool = find(documents, "NodePool", name)
+        labels = nodepool["spec"]["template"]["metadata"]["labels"]
+        assert labels["seedleap.ai/vae-worker"] == "true"
+
+
 def test_wan22_5b_uses_the_matching_taehv_checkpoint():
     for filename in ("h100-denoiser.yaml", "l4-vae.yaml"):
         manifest = (Path(__file__).parent / filename).read_text()
