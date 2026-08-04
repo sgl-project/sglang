@@ -138,10 +138,20 @@ class AscendFAImpl(AttentionImpl):
         ]
         if not actual_seq_lengths:
             return torch.empty_like(query)
+
+        if not (
+            query.is_contiguous()
+            and key.is_contiguous()
+            and value.is_contiguous()
+        ):
+            # Packed Ulysses Q/K/V are adjacent strided views. Repack them with
+            # one allocation instead of launching three large contiguous copies.
+            qkv = torch.stack((query, key, value), dim=0)
+            query, key, value = qkv.unbind(0)
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            query,
+            key,
+            value,
             num_heads=query.shape[1],
             num_key_value_heads=key.shape[1],
             scale=self.softmax_scale,

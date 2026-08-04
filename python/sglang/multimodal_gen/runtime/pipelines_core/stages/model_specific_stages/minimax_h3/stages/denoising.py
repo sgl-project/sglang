@@ -518,11 +518,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         device = get_local_torch_device()
         if (
-            device.type not in {"cuda", "xpu", "npu"}
+            device.type not in {"cuda", "npu"}
             or not torch.get_device_module(device).is_available()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CUDA, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CUDA or Ascend NPU"
             )
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(

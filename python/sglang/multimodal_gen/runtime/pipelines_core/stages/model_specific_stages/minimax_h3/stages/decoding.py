@@ -45,7 +45,7 @@ def _required_tensor(value, path: str) -> torch.Tensor:
 def _autocast_enabled_for_device(
     tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
 ) -> bool:
-    return tensor.device.type in ("cuda", "xpu", "npu") and autocast_enabled(
+    return tensor.device.type in ("cuda", "npu") and autocast_enabled(
         dtype, disable_autocast
     )
 

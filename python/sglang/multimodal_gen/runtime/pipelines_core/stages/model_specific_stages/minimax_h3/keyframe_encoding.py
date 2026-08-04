@@ -42,7 +42,7 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
     devices: list[torch.device] = []
     device_module = None
     device_type = None
-    if device is not None and device.type != "cpu":
+    if device is not None and device.type in {"cuda", "npu"}:
         device_module = torch.get_device_module(device)
         if device_module.is_available():
             devices = [device]
