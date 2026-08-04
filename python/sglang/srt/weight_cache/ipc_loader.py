@@ -27,6 +27,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import (
     CacheConfig,
     WeightCacheQuantStates,
+    check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
@@ -96,9 +97,7 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        WeightCacheQuantStates.check_supported(
-            quant_method, engine_quant_config, where="client"
-        )
+        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config)
@@ -397,8 +396,7 @@ class IpcModelLoader(BaseModelLoader):
                 f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
                 f"mismatch between the IPC daemon and the meta-initialized model. "
                 f"The quantization method passed the IPC allowlist gate "
-                f"(WeightCacheQuantStates.check_supported), so this is NOT an "
-                f"unsupported-quant "
+                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
                 f"case — it indicates the daemon's weight fingerprint is "
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
