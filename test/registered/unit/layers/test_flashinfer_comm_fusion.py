@@ -97,6 +97,48 @@ class TestFlashInferCommFusion(unittest.TestCase):
         )
         self.assertEqual(sizes, [2162688, 2162688, 2162688])
 
+    def test_mnnvl_workspace_preflight_keeps_multicast_granularity(self):
+        multicast_queries = []
+
+        class _FakeMulticastProp:
+            numDevices = None
+            size = None
+            handleTypes = None
+
+        class _FakeCudaDriver:
+            CUresult = types.SimpleNamespace(CUDA_SUCCESS=0)
+            CUmemAllocationGranularity_flags = types.SimpleNamespace(
+                CU_MEM_ALLOC_GRANULARITY_RECOMMENDED=0
+            )
+            CUmulticastGranularity_flags = types.SimpleNamespace(
+                CU_MULTICAST_GRANULARITY_RECOMMENDED=0
+            )
+            CUmulticastObjectProp = _FakeMulticastProp
+
+            @staticmethod
+            def cuMemGetAllocationGranularity(_prop, _flag):
+                return 0, 65536
+
+            @staticmethod
+            def cuMulticastGetGranularity(mc_prop, _flag):
+                multicast_queries.append(mc_prop.size)
+                return 0, 1 << 25
+
+        prop = types.SimpleNamespace(requestedHandleTypes=object())
+        sizes = fusion._flashinfer_trtllm_workspace_allocation_sizes(
+            _FakeCudaDriver(),
+            prop,
+            world_size=2,
+            max_token_num=32,
+            hidden_dim=16,
+            dtype=torch.bfloat16,
+            align_multicast=True,
+        )
+        # McastGPUBuffer rounds each allocation up to the multicast
+        # granularity (32 MiB here), on top of the allocation granularity.
+        self.assertEqual(sizes, [1 << 25, 1 << 25, 1 << 25])
+        self.assertEqual(multicast_queries, [2162688, 2162688, 2162688])
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1

@@ -243,8 +243,16 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    align_multicast: bool = False,
 ) -> list[int]:
-    """Mirror FlashInfer TRTLLM SymmDeviceMemory local allocation sizes."""
+    """Mirror FlashInfer TRTLLM SymmDeviceMemory local allocation sizes.
+
+    TRT-LLM symmetric memory is created with multicast disabled, so its
+    allocations only round to the allocation granularity. The mnnvl backend
+    allocates through McastGPUBuffer, which additionally rounds each
+    allocation to the multicast granularity; pass ``align_multicast=True`` to
+    mirror that so the preflight probes at least the real allocation size.
+    """
     elem_size = 4 if dtype == torch.float32 else 2
     buffer_size = world_size * max_token_num * hidden_dim * 2
     flag_size = world_size * 256 * 4
@@ -278,6 +286,24 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
 
         allocation_size = ceil_align(buffer_size + signal_pad_size, alloc_granularity)
 
+        if align_multicast:
+            mc_prop = cuda_driver.CUmulticastObjectProp()
+            mc_prop.numDevices = world_size
+            mc_prop.size = allocation_size
+            mc_prop.handleTypes = prop.requestedHandleTypes
+
+            err, mc_granularity = cuda_driver.cuMulticastGetGranularity(
+                mc_prop,
+                cuda_driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
+            )
+            if err != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(
+                    "cuMulticastGetGranularity failed for FlashInfer "
+                    f"workspace preflight: {err}"
+                )
+
+            allocation_size = ceil_align(allocation_size, mc_granularity)
+
         allocation_sizes.append(allocation_size)
     return allocation_sizes
 
@@ -302,6 +328,7 @@ def _preflight_check_workspace_memory(
     hidden_dim: int,
     dtype: torch.dtype,
     cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
+    backend: str = "trtllm",
 ) -> bool:
     """Collectively decide whether to enter FlashInfer workspace creation.
 
@@ -310,6 +337,11 @@ def _preflight_check_workspace_memory(
     exits while peers enter handle exchange, peers can hang until the watchdog
     aborts. Probe the same handle type and allocation sequence first, then vote
     on a CPU group so all ranks proceed or skip together.
+
+    The mnnvl backend allocates multicast-backed buffers, so its probe sizes
+    are additionally rounded to the multicast granularity; trtllm symmetric
+    memory disables multicast and must not query it (the query fails on
+    devices without multicast support, such as SM120).
     """
     import torch.distributed as dist
 
@@ -331,6 +363,7 @@ def _preflight_check_workspace_memory(
             max_token_num,
             hidden_dim,
             dtype,
+            align_multicast=(backend == "mnnvl"),
         )
         local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
     except Exception as e:
@@ -452,6 +485,7 @@ class FlashInferWorkspaceManager:
             hidden_dim=hidden_dim,
             dtype=dtype,
             cpu_group=cpu_group,
+            backend=backend,
         ):
             _flashinfer_allreduce_unavailable = True
             self.workspace = None
