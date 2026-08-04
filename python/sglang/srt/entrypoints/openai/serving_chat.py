@@ -1031,7 +1031,7 @@ class OpenAIServingChat(OpenAIServingBase):
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
             return_prompt_token_ids=(
                 request.return_prompt_token_ids
-                or request.return_token_ids,
+                or request.return_token_ids
                 or self._should_return_input_ids(request)
             ),
         )
