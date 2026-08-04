@@ -510,7 +510,6 @@ class LayerCommunicator:
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
-        emit_bf16: bool = True,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
@@ -518,7 +517,6 @@ class LayerCommunicator:
             forward_batch,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
-            emit_bf16=emit_bf16,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -568,7 +566,6 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
-        emit_bf16: bool = True,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -603,10 +600,7 @@ class LayerCommunicator:
                             hidden_states,
                             residual,
                             use_attn_tp_group=False,
-                            # A quantized consumer (e.g. a checkpoint that
-                            # quantizes Qwen3.5 in_proj_a/in_proj_b) passes
-                            # emit_bf16=False to veto the sidecar write.
-                            keep_bf16=self.fused_ar_quant_keep_bf16 and emit_bf16,
+                            keep_bf16=self.fused_ar_quant_keep_bf16,
                         )
                     if quant_result is not None:
                         hidden_states, residual = quant_result
@@ -665,11 +659,7 @@ class LayerCommunicator:
                                 _unq_bf16,
                             )
 
-                    elif (
-                        _use_aiter
-                        and (quant_format == "fp8_per_token")
-                        and not emit_bf16
-                    ):
+                    elif _use_aiter and (quant_format == "fp8_per_token"):
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
                             self.input_layernorm.weight.data,
@@ -719,11 +709,7 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
-                    elif (
-                        _use_aiter
-                        and (quant_format == "fp8_per_token")
-                        and not emit_bf16
-                    ):
+                    elif _use_aiter and (quant_format == "fp8_per_token"):
                         if post_residual_addition is not None:
                             residual = residual + post_residual_addition
                         hidden_states, residual = _fused_rmsnorm_fp8_per_token_quant(
