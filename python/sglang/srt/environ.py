@@ -337,6 +337,11 @@ class Envs:
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
+    # Keep the graph-folded proposal as the default. Backends can disable the
+    # whole proposal fold independently of the non-greedy sampling buffers.
+    SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
+    SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
