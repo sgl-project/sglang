@@ -180,7 +180,7 @@ class TestMlxExtendRouting(CustomTestCase):
         from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker.server_args = SimpleNamespace(startup_weight_load_mode="overlap")
+        worker.server_args = SimpleNamespace(is_startup_weight_load_overlap=True)
 
         with self.assertRaisesRegex(ValueError, "CUDA only"):
             MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)

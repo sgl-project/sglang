@@ -132,6 +132,8 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
+_PREFETCH_STOP_TIMEOUT_SECONDS = 60.0
+CAPTURE_SAFE_WEIGHT_SENTINEL = 1e-3
 
 
 def _get_prefetch_block_size() -> int:
@@ -841,10 +843,12 @@ class CheckpointFilePrefetchHandle:
         *,
         thread: threading.Thread,
         cancel_event: threading.Event,
+        succeeded_event: threading.Event,
         errors: List[Tuple[str, Exception]],
     ) -> None:
         self._thread = thread
         self._cancel_event = cancel_event
+        self._succeeded_event = succeeded_event
         self._errors = errors
 
     def wait(self, timeout: Optional[float] = None) -> None:
@@ -856,10 +860,18 @@ class CheckpointFilePrefetchHandle:
         """Stop scheduling shards and interrupt reads at the next block."""
         self._cancel_event.set()
 
-    def stop(self) -> None:
+    def stop(self, timeout: Optional[float] = _PREFETCH_STOP_TIMEOUT_SECONDS) -> None:
         """Cancel prefetching and wait for the background worker to finish."""
         self.cancel()
-        self.wait()
+        self.wait(timeout)
+
+    @property
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
+    @property
+    def failed(self) -> bool:
+        return bool(self._errors) or (self.done and not self._succeeded_event.is_set())
 
     @property
     def cancelled(self) -> bool:
@@ -908,6 +920,7 @@ def _prefetch_all_checkpoints(
     my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
     cancel_event = threading.Event()
+    succeeded_event = threading.Event()
     errors: List[Tuple[str, Exception]] = []
 
     logger.info(
@@ -981,17 +994,19 @@ def _prefetch_all_checkpoints(
     def _run_prefetch() -> None:
         start = time.perf_counter()
         _prefetch_all()
-        elapsed = time.perf_counter() - start
+        succeeded_event.set()
         logger.info(
-            "Rank %d: prefetching checkpoint files into page cache finished in %.2fs",
+            "Rank %d: prefetching checkpoint files into page cache "
+            "finished in %.2fs",
             local_rank,
-            elapsed,
+            time.perf_counter() - start,
         )
 
     thread = threading.Thread(target=_run_prefetch, daemon=True)
     handle = CheckpointFilePrefetchHandle(
         thread=thread,
         cancel_event=cancel_event,
+        succeeded_event=succeeded_event,
         errors=errors,
     )
     thread.start()
@@ -1565,6 +1580,21 @@ def set_runai_streamer_env(load_config: LoadConfig):
     aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
     if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
+
+
+@torch.no_grad()
+def initialize_capture_safe_weights(
+    model: torch.nn.Module,
+    value: float = CAPTURE_SAFE_WEIGHT_SENTINEL,
+) -> None:
+    """Fill floating-point parameters with finite values for graph warmup.
+
+    Persistent buffers are intentionally left intact: unlike parameters, they
+    are not guaranteed to be replaced by ``model.load_weights()``.
+    """
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            param.fill_(value)
 
 
 def initialize_dummy_weights(

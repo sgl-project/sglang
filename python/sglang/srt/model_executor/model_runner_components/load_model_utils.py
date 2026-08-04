@@ -294,7 +294,7 @@ def load_model_with_memory_saver(
             model_config=model_config,
         )
         device_config = DeviceConfig(device, gpu_id)
-        if server_args.startup_weight_load_mode == "overlap":
+        if server_args.is_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
                 StartupWeightLoadOptions,

@@ -25,9 +25,7 @@ class TestStartupWeightLoad(CustomTestCase):
         if startup_weight_load_mode is not None:
             kwargs["startup_weight_load_mode"] = startup_weight_load_mode
 
-        engine = None
-        try:
-            engine = sgl.Engine(**kwargs)
+        with sgl.Engine(**kwargs) as engine:
             return engine.generate(
                 "The capital of France is",
                 sampling_params={
@@ -38,9 +36,6 @@ class TestStartupWeightLoad(CustomTestCase):
                 return_logprob=True,
                 logprob_start_len=0,
             )
-        finally:
-            if engine is not None:
-                engine.shutdown()
 
     def test_overlap_matches_default_serial_startup(self):
         # Omitting the flag is intentional: it pins the merge-safe default path.

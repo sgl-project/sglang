@@ -8508,6 +8508,10 @@ class ServerArgs:
     def is_ep_scale_joiner(self) -> bool:
         return self.ep_join_mode == "scale"
 
+    @property
+    def is_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode == "overlap"
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 

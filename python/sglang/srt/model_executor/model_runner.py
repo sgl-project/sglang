@@ -1138,9 +1138,9 @@ class ModelRunner:
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
-                elastic_ep_backend=self.server_args.elastic_ep_backend,
+                elastic_ep_backend=get_exec().moe.elastic_ep_backend,
                 tp_rank=self.ps.tp_rank,
-                is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
+                is_ep_joiner=self.server_args.is_ep_joiner,
             )
 
     def start_startup_weight_load(self) -> None:

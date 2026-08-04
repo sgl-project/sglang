@@ -109,7 +109,7 @@ class MlxModelRunnerStub(ModelRunner):
 
     @staticmethod
     def validate_startup_weight_load_mode(server_args) -> None:
-        if server_args.startup_weight_load_mode != "serial":
+        if server_args.is_startup_weight_load_overlap:
             raise ValueError(
                 "--startup-weight-load-mode=overlap is not supported: CUDA only"
             )

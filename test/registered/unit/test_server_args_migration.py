@@ -89,13 +89,12 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
-        self.assertEqual(self._parse([]).startup_weight_load_mode, "serial")
-        self.assertEqual(
-            self._parse(
-                ["--startup-weight-load-mode", "overlap"]
-            ).startup_weight_load_mode,
-            "overlap",
-        )
+        serial = self._parse([])
+        overlap = self._parse(["--startup-weight-load-mode", "overlap"])
+        self.assertEqual(serial.startup_weight_load_mode, "serial")
+        self.assertFalse(serial.is_startup_weight_load_overlap)
+        self.assertEqual(overlap.startup_weight_load_mode, "overlap")
+        self.assertTrue(overlap.is_startup_weight_load_overlap)
 
         with self.assertRaises(SystemExit):
             self.parser.parse_args(

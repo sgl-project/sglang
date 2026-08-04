@@ -110,6 +110,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
+    initialize_capture_safe_weights,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
@@ -574,6 +575,7 @@ class DefaultModelLoader(BaseModelLoader):
         source: Source,
         *,
         resolved_source: Optional[ResolvedSource] = None,
+        startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
@@ -605,14 +607,13 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints
-            weight_loader_prefetch = (
-                configured_prefetch or startup_prefetch_active
-            )
             start_iterator_prefetch = (
-                configured_prefetch and not startup_prefetch_active
+                configured_prefetch and not startup_prefetch_started
+            )
+            concurrent_prefetch_active = (
+                startup_prefetch_active or start_iterator_prefetch
             )
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
             weight_loader_drop_cache_after_load = (
@@ -630,7 +631,7 @@ class DefaultModelLoader(BaseModelLoader):
             # e.g. local NVMe, where prefetch is a no-op and multi-threading
             # helps.
             if (
-                weight_loader_prefetch
+                concurrent_prefetch_active
                 and not weight_loader_disable_mmap
                 and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
                 and use_multithread
@@ -810,7 +811,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> nn.Module:
         """Initialize final storage with values safe for graph warmup."""
         with set_default_torch_dtype(model_config.dtype):
-            initialize_dummy_weights(model)
+            initialize_capture_safe_weights(model)
             _post_load_weights(model)
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -831,6 +832,7 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         resolved_sources: Tuple[ResolvedSource, ...],
         target_device: torch.device,
+        startup_prefetch_active: bool,
     ) -> None:
         """Load real checkpoint values into a capture-ready model."""
 
@@ -839,7 +841,8 @@ class DefaultModelLoader(BaseModelLoader):
                 yield from self._get_weights_iterator(
                     resolved_source.source,
                     resolved_source=resolved_source,
-                    startup_prefetch_active=True,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=startup_prefetch_active,
                 )
 
         with set_default_torch_dtype(model_config.dtype):

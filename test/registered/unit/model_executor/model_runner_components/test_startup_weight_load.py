@@ -27,6 +27,7 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     StartupWeightLoadState,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -90,15 +91,22 @@ def _make_model_config(**overrides):
 
 
 class _RecordingPrefetchHandle:
-    def __init__(self, trace):
+    def __init__(self, trace, *, done=False, errors=()):
         self._trace = trace
+        self.done = done
+        self.errors = errors
+
+    @property
+    def failed(self):
+        return bool(self.errors)
 
     def wait(self, timeout=None):
         self._trace.append("wait_prefetch")
 
-    def stop(self):
+    def stop(self, timeout=None):
         self._trace.append("stop_prefetch")
         self.wait()
+        self.done = True
 
 
 class _RecordingLoader:
@@ -130,8 +138,10 @@ class _RecordingLoader:
         model_config,
         resolved_sources,
         target_device,
+        startup_prefetch_active,
     ):
         self._trace.append("commit")
+        self.startup_prefetch_active = startup_prefetch_active
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.fill_(3)
@@ -350,6 +360,7 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertIs(model.weight, model.tied_weight)
         torch.testing.assert_close(model.weight, torch.full_like(model.weight, 3))
         self.assertTrue(log_info.call_args.args[0].startswith("Load weight end."))
+        self.assertTrue(manager._loader.startup_prefetch_active)
         self.assertEqual(
             parallel_state_patch.call_args_list,
             [call(), call(reverse=True)],
@@ -379,6 +390,70 @@ class TestStartupWeightLoadManager(CustomTestCase):
         ):
             manager.finalize()
 
+    def test_finalize_rejects_parameter_left_at_capture_sentinel(self):
+        trace = []
+        model = _TiedWeightModel()
+        loader = _RecordingLoader(model, trace)
+
+        def skip_commit(**kwargs):
+            trace.append("commit")
+
+        loader.commit_model_weights = skip_commit
+        manager = self._manager(loader)
+        manager.prepare()
+        with torch.no_grad():
+            model.weight.fill_(1e-3)
+        manager.start_prefetch()
+
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "did not replace capture-safe dummy values: parameter:tied_weight",
+            ),
+        ):
+            manager.finalize()
+
+    def test_completed_prefetch_restores_normal_loader(self):
+        trace = []
+        model = _TiedWeightModel()
+        loader = _RecordingLoader(model, trace)
+        loader.prefetch_handle.done = True
+        manager = self._manager(loader)
+        manager.prepare()
+        manager.start_prefetch()
+
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+        ):
+            manager.finalize()
+
+        self.assertFalse(loader.startup_prefetch_active)
+        self.assertIn("wait_prefetch", trace)
+        self.assertNotIn("stop_prefetch", trace)
+
+    def test_failed_prefetch_falls_back_and_logs_summary(self):
+        trace = []
+        model = _TiedWeightModel()
+        loader = _RecordingLoader(model, trace)
+        loader.prefetch_handle.errors = (("bad.safetensors", OSError("failed")),)
+        manager = self._manager(loader)
+        manager.prepare()
+        manager.start_prefetch()
+
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+            patch(f"{_STARTUP_MODULE}.logger.warning") as warning,
+        ):
+            manager.finalize()
+
+        self.assertFalse(loader.startup_prefetch_active)
+        warning.assert_called_once()
+        self.assertIn("falling back", warning.call_args.args[2])
+
     def test_start_prefetch_requires_capture_ready_and_starts_once(self):
         trace = []
         manager = self._manager(_RecordingLoader(nn.Linear(2, 2), trace))
@@ -406,6 +481,25 @@ class TestModelStorageManifest(CustomTestCase):
 
         self.assertEqual(manifest.changed_names(model), ())
 
+    def test_manifest_keeps_strong_tensor_references(self):
+        model = _TiedWeightModel()
+        manifest = ModelStorageManifest.capture(model)
+
+        metadata = dict(manifest.tensors)["parameter:weight"]
+        self.assertIs(metadata.tensor, model.weight)
+
+    def test_capture_sentinel_check_ignores_buffers(self):
+        model = _TiedWeightModel()
+        with torch.no_grad():
+            model.weight.fill_(1e-3)
+            model.scale.fill_(1e-3)
+        manifest = ModelStorageManifest.capture(model)
+
+        self.assertEqual(
+            manifest.unchanged_parameter_names(1e-3),
+            ("parameter:tied_weight",),
+        )
+
     def test_parameter_rebind_and_alias_break_are_detected(self):
         model = _TiedWeightModel()
         manifest = ModelStorageManifest.capture(model)
@@ -416,6 +510,16 @@ class TestModelStorageManifest(CustomTestCase):
             manifest.changed_names(model),
             ("parameter:tied_weight",),
         )
+
+
+class TestCaptureSafeWeightInitialization(CustomTestCase):
+    def test_only_parameters_are_filled(self):
+        model = _TiedWeightModel()
+
+        initialize_capture_safe_weights(model, value=0.125)
+
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 0.125))
+        torch.testing.assert_close(model.scale, torch.ones_like(model.scale))
 
 
 class _LifecycleRunner:
@@ -490,7 +594,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
         runner.startup_weight_load = manager
         runner.server_args = SimpleNamespace(
             elastic_ep_backend=None,
-            is_ep_scale_joiner=False,
+            is_ep_joiner=False,
         )
         runner.ps = SimpleNamespace(tp_rank=0)
         return runner
@@ -512,9 +616,17 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             self.assertIs(runner.startup_weight_load, manager)
             trace.append("barrier")
 
-        with patch(
-            "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
-            side_effect=barrier,
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner.dist_barrier_after_load",
+                side_effect=barrier,
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(elastic_ep_backend=None)
+                ),
+            ),
         ):
             runner.finalize_startup_weight_load()
 
@@ -543,7 +655,9 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = SimpleNamespace(startup_weight_load_mode=mode)
+        scheduler.server_args = SimpleNamespace(
+            is_startup_weight_load_overlap=mode == "overlap"
+        )
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", None
@@ -563,7 +677,18 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
 
         scheduler.spec_algorithm = SimpleNamespace(is_none=stop_after_startup)
 
-        with self.assertRaisesRegex(RuntimeError, "stop after startup"):
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(
+                        elastic_ep_backend=None,
+                        ep_join_mode=None,
+                    )
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "stop after startup"),
+        ):
             scheduler.init_model_worker()
 
         return trace

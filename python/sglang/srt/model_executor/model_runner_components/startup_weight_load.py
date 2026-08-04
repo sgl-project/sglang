@@ -15,7 +15,10 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.utils import get_model_architecture
-from sglang.srt.model_loader.weight_utils import CheckpointFilePrefetchHandle
+from sglang.srt.model_loader.weight_utils import (
+    CAPTURE_SAFE_WEIGHT_SENTINEL,
+    CheckpointFilePrefetchHandle,
+)
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -131,7 +134,7 @@ class StartupWeightLoadOptions:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class TensorStorageMetadata:
-    object_id: int
+    tensor: torch.Tensor = dataclasses.field(repr=False, compare=False)
     data_ptr: int
     shape: Tuple[int, ...]
     stride: Tuple[int, ...]
@@ -142,13 +145,30 @@ class TensorStorageMetadata:
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> TensorStorageMetadata:
         return cls(
-            object_id=id(tensor),
+            tensor=tensor,
             data_ptr=tensor.data_ptr(),
             shape=tuple(tensor.shape),
             stride=tuple(tensor.stride()),
             dtype=tensor.dtype,
             device=tensor.device,
             storage_offset=tensor.storage_offset(),
+        )
+
+    def matches(self, other: TensorStorageMetadata) -> bool:
+        return self.tensor is other.tensor and (
+            self.data_ptr,
+            self.shape,
+            self.stride,
+            self.dtype,
+            self.device,
+            self.storage_offset,
+        ) == (
+            other.data_ptr,
+            other.shape,
+            other.stride,
+            other.dtype,
+            other.device,
+            other.storage_offset,
         )
 
 
@@ -167,7 +187,7 @@ class ModelStorageManifest:
                 (f"{kind}:{name}", TensorStorageMetadata.from_tensor(tensor))
                 for name, tensor in tensors
             )
-        return cls(tensors=tuple(sorted(entries)))
+        return cls(tensors=tuple(sorted(entries, key=lambda entry: entry[0])))
 
     def changed_names(self, model: nn.Module) -> Tuple[str, ...]:
         before = dict(self.tensors)
@@ -175,7 +195,32 @@ class ModelStorageManifest:
         return tuple(
             name
             for name in sorted(before.keys() | after.keys())
-            if before.get(name) != after.get(name)
+            if name not in before
+            or name not in after
+            or not before[name].matches(after[name])
+        )
+
+    def unchanged_parameter_names(self, value: float) -> Tuple[str, ...]:
+        names = []
+        checks = []
+        seen_tensor_ids = set()
+        for name, metadata in self.tensors:
+            tensor = metadata.tensor
+            if (
+                not name.startswith("parameter:")
+                or not torch.is_floating_point(tensor)
+                or id(tensor) in seen_tensor_ids
+            ):
+                continue
+            seen_tensor_ids.add(id(tensor))
+            names.append(name)
+            checks.append(torch.all(tensor == value))
+
+        if not checks:
+            return ()
+        unchanged = torch.stack(checks).cpu().tolist()
+        return tuple(
+            name for name, is_unchanged in zip(names, unchanged) if is_unchanged
         )
 
 
@@ -201,6 +246,7 @@ class StartupWeightLoadManager:
         self._created_at = time.perf_counter()
         self._capture_ready_at: Optional[float] = None
         self._prefetch_started_at: Optional[float] = None
+        self._prefetch_failure_reported = False
 
     @classmethod
     def create(
@@ -239,6 +285,9 @@ class StartupWeightLoadManager:
         options: StartupWeightLoadOptions,
     ) -> Optional[str]:
         architectures = tuple(model_config.hf_config.architectures or ())
+        # NOTE(2026-08): TP1/TP2 and FP16/BF16 are deliberate hard gates for
+        # the first overlap rollout. Broaden them only with storage-stability,
+        # capture-sentinel, and startup correctness coverage for the new case.
         basic_rules = (
             (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
@@ -408,6 +457,7 @@ class StartupWeightLoadManager:
         assert self._prefetch_started_at is not None
         self._state = StartupWeightLoadState.COMMITTING
         manifest = ModelStorageManifest.capture(self._model)
+        startup_prefetch_active = self._prepare_prefetch_for_commit()
         commit_started_at = time.perf_counter()
         monkey_patch_vllm_parallel_state()
         self._loader.commit_model_weights(
@@ -415,6 +465,7 @@ class StartupWeightLoadManager:
             model_config=self._model_config,
             resolved_sources=self._resolved_sources,
             target_device=torch.device(self._device_config.device),
+            startup_prefetch_active=startup_prefetch_active,
         )
         torch.cuda.synchronize()
         changed_names = manifest.changed_names(self._model)
@@ -422,6 +473,15 @@ class StartupWeightLoadManager:
             preview = ", ".join(changed_names[:8])
             raise RuntimeError(
                 "Startup weight commit changed graph-visible tensor storage: "
+                f"{preview}"
+            )
+        unchanged_names = manifest.unchanged_parameter_names(
+            CAPTURE_SAFE_WEIGHT_SENTINEL
+        )
+        if unchanged_names:
+            preview = ", ".join(unchanged_names[:8])
+            raise RuntimeError(
+                "Startup weight commit did not replace capture-safe dummy values: "
                 f"{preview}"
             )
         monkey_patch_vllm_parallel_state(reverse=True)
@@ -435,8 +495,45 @@ class StartupWeightLoadManager:
             time.perf_counter() - self._created_at,
         )
 
+    def _prepare_prefetch_for_commit(self) -> bool:
+        assert self._prefetch_handle is not None
+        if not self._prefetch_handle.failed:
+            return not self._prefetch_handle.done
+
+        self._prefetch_handle.stop()
+        self._report_prefetch_failure(falling_back=True)
+        return False
+
     def _stop_prefetch(self) -> None:
         if self._prefetch_handle is None:
             return
-        self._prefetch_handle.stop()
+        if self._prefetch_handle.done:
+            self._prefetch_handle.wait()
+        else:
+            self._prefetch_handle.stop()
+        self._report_prefetch_failure(falling_back=False)
         self._prefetch_handle = None
+
+    def _report_prefetch_failure(self, *, falling_back: bool) -> None:
+        handle = self._prefetch_handle
+        if handle is None or not handle.failed or self._prefetch_failure_reported:
+            return
+
+        if handle.errors:
+            path, error = handle.errors[0]
+            failure_detail = (
+                f"{len(handle.errors)} recorded failure(s), first: {path!r}: {error}"
+            )
+        else:
+            failure_detail = "the background worker terminated before completion"
+        action = (
+            "falling back to normal weight loading"
+            if falling_back
+            else "real weight loading completed despite incomplete staging"
+        )
+        logger.warning(
+            "Checkpoint prefetch was incomplete because %s; %s",
+            failure_detail,
+            action,
+        )
+        self._prefetch_failure_reported = True

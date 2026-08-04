@@ -11,7 +11,7 @@ import threading
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import safetensors.torch
 import torch
@@ -19,6 +19,7 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
+    CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     fastsafetensors_weights_iterator,
@@ -109,7 +110,6 @@ class TestPrefetchCheckpoints(CustomTestCase):
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_wait_returns_after_worker_thread_failure(self, _):
         worker_errors = []
-
         with (
             patch(
                 "concurrent.futures.ThreadPoolExecutor",
@@ -123,8 +123,28 @@ class TestPrefetchCheckpoints(CustomTestCase):
             handle = _prefetch_all_checkpoints(["dummy.safetensors"], num_threads=1)
             handle.wait(timeout=5)
 
+        self.assertTrue(handle.done)
+        self.assertTrue(handle.failed)
+        self.assertEqual(handle.errors, ())
         self.assertEqual(len(worker_errors), 1)
         self.assertIsInstance(worker_errors[0], RuntimeError)
+
+    def test_prefetch_stop_has_a_bounded_default_wait(self):
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        cancel_event = threading.Event()
+        handle = CheckpointFilePrefetchHandle(
+            thread=thread,
+            cancel_event=cancel_event,
+            succeeded_event=threading.Event(),
+            errors=[],
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "checkpoint prefetching"):
+            handle.stop()
+
+        self.assertTrue(cancel_event.is_set())
+        thread.join.assert_called_once_with(60.0)
 
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_prefetch_keeps_bounded_pending_window(self, _):
@@ -395,14 +415,6 @@ class TestPrefetchDispatch(CustomTestCase):
                 return_value=("/dummy", ["f.safetensors"], True),
             ),
             patch(
-                "sglang.srt.model_loader.loader.get_server_args",
-                return_value=self._server_args(
-                    prefetch,
-                    disable_mmap,
-                    drop_cache,
-                ),
-            ),
-            patch(
                 "sglang.srt.model_loader.loader.get_model",
                 return_value=self._server_args(prefetch, disable_mmap, drop_cache),
             ),
@@ -422,12 +434,11 @@ class TestPrefetchDispatch(CustomTestCase):
         """Prefetch on + no explicit multithread config -> single-threaded,
         and the opt-out warning fires once."""
         loader = self._make_loader({})
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -442,12 +453,11 @@ class TestPrefetchDispatch(CustomTestCase):
         """Explicit enable_multithread_load=true is the escape hatch; the
         override and its warning must not fire."""
         loader = self._make_loader({"enable_multithread_load": True})
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -463,12 +473,11 @@ class TestPrefetchDispatch(CustomTestCase):
         default) also signals multi-thread intent, so the override must not
         fire and num_threads stays live."""
         loader = self._make_loader({"num_threads": 64})
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -485,12 +494,11 @@ class TestPrefetchDispatch(CustomTestCase):
         """Prefetch off -> multi-threaded iterator is used (default), no
         override warning."""
         loader = self._make_loader({})
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=False
         )
         with (
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -511,12 +519,12 @@ class TestPrefetchDispatch(CustomTestCase):
             weight_files=("f.safetensors",),
             use_safetensors=True,
         )
-        p_prep, p_args, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=False
         )
         with (
             p_prep as mock_prepare,
-            p_args,
+            p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
             p_warn as mock_warning,
@@ -525,6 +533,7 @@ class TestPrefetchDispatch(CustomTestCase):
                 loader._get_weights_iterator(
                     source,
                     resolved_source=resolved_source,
+                    startup_prefetch_started=True,
                     startup_prefetch_active=True,
                 )
             )
@@ -535,16 +544,82 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_buffered.assert_not_called()
         mock_warning.assert_called_once()
 
+    def test_completed_startup_prefetch_restores_multithread_loader(self):
+        loader = self._make_loader({})
+        source = self._make_source()
+        resolved_source = DefaultModelLoader.ResolvedSource(
+            source=source,
+            hf_folder="/dummy",
+            weight_files=("f.safetensors",),
+            use_safetensors=True,
+        )
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=False
+        )
+        with (
+            p_prep as mock_prepare,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            list(
+                loader._get_weights_iterator(
+                    source,
+                    resolved_source=resolved_source,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=False,
+                )
+            )
+
+        mock_prepare.assert_not_called()
+        mock_buffered.assert_called_once()
+        self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
+    def test_completed_startup_prefetch_is_not_started_twice(self):
+        loader = self._make_loader({})
+        source = self._make_source()
+        resolved_source = DefaultModelLoader.ResolvedSource(
+            source=source,
+            hf_folder="/dummy",
+            weight_files=("f.safetensors",),
+            use_safetensors=True,
+        )
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+            prefetch=True
+        )
+        with (
+            p_prep,
+            p_model,
+            p_buffered as mock_buffered,
+            p_single as mock_single,
+            p_warn as mock_warning,
+        ):
+            list(
+                loader._get_weights_iterator(
+                    source,
+                    resolved_source=resolved_source,
+                    startup_prefetch_started=True,
+                    startup_prefetch_active=False,
+                )
+            )
+
+        mock_buffered.assert_called_once()
+        self.assertFalse(mock_buffered.call_args.kwargs["prefetch"])
+        mock_single.assert_not_called()
+        mock_warning.assert_not_called()
+
     def test_prefetch_does_not_override_when_mmap_disabled(self):
         """Prefetch is a no-op without mmap, so the override and its warning
         must not fire."""
         loader = self._make_loader({})
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True, disable_mmap=True
         )
         with (
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -559,7 +634,7 @@ class TestPrefetchDispatch(CustomTestCase):
         """FASTSAFETENSORS ignores both flags; override + warning must not
         fire."""
         loader = self._make_loader({}, load_format=LoadFormat.FASTSAFETENSORS)
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=True
         )
         with (
@@ -568,7 +643,6 @@ class TestPrefetchDispatch(CustomTestCase):
                 return_value=iter([]),
             ) as mock_fast,
             p_prep,
-            p_args,
             p_model,
             p_buffered as mock_buffered,
             p_single as mock_single,
@@ -588,7 +662,7 @@ class TestPrefetchDispatch(CustomTestCase):
         loader = self._make_loader(
             {"enable_gds": False}, load_format=LoadFormat.FASTSAFETENSORS
         )
-        p_prep, p_args, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
+        p_prep, p_model, p_buffered, p_single, p_warn = self._patch_dispatch(
             prefetch=False,
             drop_cache=True,
         )
@@ -598,7 +672,6 @@ class TestPrefetchDispatch(CustomTestCase):
                 return_value=iter([]),
             ) as mock_fast,
             p_prep,
-            p_args,
             p_model,
             p_buffered,
             p_single,
