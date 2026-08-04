@@ -46,3 +46,4 @@
 - [附录 B：关键文件索引](appendix/appx-file-index.md)
 - [附录 C：SM89/L40S 生产部署实录](appendix/appx-sm89-l40s-deployment.md)
 - [附录 D：SM89/L40S 生产性能分析与优化建议](appendix/appx-sm89-l40s-performance-tuning.md)
+- [附录 E：Qwen3.6-27B 生产部署数据分析报告](appendix/Qwen3.6-27B.md)
