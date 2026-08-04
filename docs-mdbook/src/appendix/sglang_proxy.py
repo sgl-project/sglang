@@ -43,8 +43,9 @@ async def _forward(
 ):
     """限并发 + 转发：超时 429、后端不可达 502（释放槽位，不泄漏）、上游错误原样透传。
     请求头（含 Authorization）与响应头均透传，不丢东西。"""
+    sem = sems[kind]  # 捕获当前信号量对象，热换后 release 仍回到同一个对象，避免超限
     try:
-        await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
+        await asyncio.wait_for(sem.acquire(), TIMEOUT)
     except asyncio.TimeoutError:
         return JSONResponse(too_many_body, status_code=429)
 
@@ -52,7 +53,7 @@ async def _forward(
         {
             k: v
             for k, v in headers.items()
-            if k.lower() not in ("host", "content-length", "connection")
+            if k.lower() not in ("host", "content-length", "connection", "content-type")
         }
         if headers
         else None
@@ -62,7 +63,7 @@ async def _forward(
         req = client.build_request("POST", BACKEND + path, json=body, headers=fwd_headers)
         resp = await client.send(req, stream=True)
     except Exception as e:  # noqa: BLE001 后端不可达：释放槽位，避免泄漏导致全量 429
-        sems[kind].release()
+        sem.release()
         await client.aclose()
         return JSONResponse(
             {"error": {"message": f"backend unreachable: {e}", "type": "upstream_error", "code": 502}},
@@ -75,7 +76,7 @@ async def _forward(
         if k.lower() not in ("content-type", "content-length", "transfer-encoding", "connection")
     }
     if resp.status_code >= 400:
-        sems[kind].release()
+        sem.release()
         err = await resp.aread()
         await resp.aclose()
         await client.aclose()
@@ -91,7 +92,7 @@ async def _forward(
             async for chunk in resp.aiter_bytes():
                 yield chunk
         finally:
-            sems[kind].release()
+            sem.release()
             await resp.aclose()
             await client.aclose()
 
@@ -171,14 +172,14 @@ async def set_limits(payload: dict):
                 v = int(v)
             except (TypeError, ValueError):
                 continue
-            if v > 0:
+            if v > 0 and v != LIMITS[k]:
                 LIMITS[k] = v
                 sems[k] = asyncio.Semaphore(v)  # 重建信号量，在途请求不受影响
                 updated[k] = v
     return {"limits": LIMITS, "updated": updated}
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS", "HEAD", "PUT", "DELETE"])
 async def passthrough(path: str, request: Request):
     """兜底透传：/health /metrics /v1/completions /v1/embeddings 等其它接口，
     不参与限并发/priority，原样转发给 SGLang。"""
