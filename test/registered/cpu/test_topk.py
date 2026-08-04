@@ -1,8 +1,16 @@
 import unittest
+from unittest.mock import patch
 
 import torch
-
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    TritonKernelTopKOutput,
+)
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
@@ -172,6 +180,64 @@ class TestBiasedTopK(CustomTestCase):
 
 
 class TestTopK(CustomTestCase):
+    def test_native_forward_preserves_standard_format(self):
+        topk = TopK(top_k=2)
+        hidden_states = torch.randn(1, 4)
+        router_logits = torch.randn(1, 8)
+        expected = StandardTopKOutput(
+            torch.randn(1, 2), torch.zeros(1, 2, dtype=torch.int64), router_logits
+        )
+
+        with patch("sglang.srt.layers.moe.topk.select_experts", return_value=expected):
+            output = topk.forward_native(hidden_states, router_logits)
+
+        self.assertIs(output, expected)
+        self.assertTrue(topk.topk_config.torch_native)
+
+    def test_native_forward_preserves_bypassed_format(self):
+        topk = TopK(top_k=2, output_format=TopKOutputFormat.BYPASSED)
+        hidden_states = torch.randn(1, 4)
+        router_logits = torch.randn(1, 8)
+
+        output = topk.forward_native(hidden_states, router_logits)
+
+        self.assertIsInstance(output, BypassedTopKOutput)
+        self.assertIs(output.hidden_states, hidden_states)
+        self.assertIs(output.router_logits, router_logits)
+
+    def test_native_forward_preserves_backend_bypassed_format(self):
+        topk = TopK(top_k=2)
+        hidden_states = torch.randn(1, 4)
+        router_logits = torch.randn(1, 8)
+
+        with patch(
+            "sglang.srt.layers.moe.topk.get_moe_runner_backend",
+            return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+        ):
+            output = topk.forward_native(hidden_states, router_logits)
+
+        self.assertIsInstance(output, BypassedTopKOutput)
+        self.assertIs(output.hidden_states, hidden_states)
+        self.assertIs(output.router_logits, router_logits)
+
+    def test_native_forward_preserves_triton_format(self):
+        topk = TopK(top_k=2, output_format=TopKOutputFormat.TRITON_KERNEL)
+        hidden_states = torch.randn(1, 4)
+        router_logits = torch.randn(1, 8)
+        routing_data, gather_idx, scatter_idx = object(), object(), object()
+
+        with patch(
+            "sglang.srt.layers.moe.topk.routing",
+            return_value=(routing_data, gather_idx, scatter_idx),
+            create=True,
+        ):
+            output = topk.forward_native(hidden_states, router_logits)
+
+        self.assertIsInstance(output, TritonKernelTopKOutput)
+        self.assertIs(output.routing_data, routing_data)
+        self.assertIs(output.gather_indx, gather_idx)
+        self.assertIs(output.scatter_indx, scatter_idx)
+
     def _run_single_test(self, M, E, topk, renormalize, dtype):
         torch.manual_seed(1998)
 
