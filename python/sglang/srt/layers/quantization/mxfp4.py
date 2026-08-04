@@ -441,6 +441,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
         self.hidden_size = hidden_size
+
+        # Checkpoints that ship one tensor per expert (DeepSeek) go through the
+        # generic per-expert loader, which dispatches scale loading on this
+        # attribute. Without it the loader raises on the first scale tensor.
+        # GPT-OSS never hit this: its fused all-experts-at-once tensors take the
+        # naive-copy fast path above the dispatch.
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(

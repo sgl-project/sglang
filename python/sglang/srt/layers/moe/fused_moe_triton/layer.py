@@ -951,6 +951,17 @@ class FusedMoE(torch.nn.Module):
                 if expert_id >= self.quant_method.num_gpu_experts:
                     return
 
+        # MXFP4 block scales are stored as e8m0 by some checkpoints (DeepSeek)
+        # and as raw uint8 by others (GPT-OSS), but the parameter buffer is
+        # always uint8. Copying an e8m0 tensor into it converts numerically --
+        # a scale byte of 120 means 2^-7, so it lands as 0 and silently zeroes
+        # every block scale. Reinterpret the bits instead.
+        if (
+            loaded_weight.dtype == torch.float8_e8m0fnu
+            and param.dtype == torch.uint8
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,

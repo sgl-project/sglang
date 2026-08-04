@@ -2694,6 +2694,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        expert_scale_suffix: str = "weight_scale_inv",
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2748,7 +2749,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
-            name = name.removesuffix(".scale") + ".weight_scale_inv"
+            # fp8 block scales are reciprocals and land on ``weight_scale_inv``;
+            # mxfp4 block scales are not, and their buffer is ``weight_scale``.
+            # Using the fp8 name for an mxfp4 checkpoint silently drops every
+            # expert scale (the parameter never matches, so it stays zeroed).
+            name = name.removesuffix(".scale") + "." + expert_scale_suffix
 
         return name
 
@@ -2844,6 +2849,13 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
+        expert_scale_suffix = (
+            "weight_scale"
+            if self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            else "weight_scale_inv"
+        )
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -2907,6 +2919,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        expert_scale_suffix=expert_scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)
