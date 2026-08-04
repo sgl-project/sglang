@@ -670,6 +670,19 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 
 @contextmanager
+def draft_pp_context():
+    # The draft model is one layer and never spans pipeline stages; give it a
+    # single-member pp group so it initializes as if pp were off.
+    from sglang.srt.distributed.parallel_state import (
+        get_self_pp_group,
+        patch_pipeline_parallel_group,
+    )
+
+    with patch_pipeline_parallel_group(get_self_pp_group()):
+        yield
+
+
+@contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
