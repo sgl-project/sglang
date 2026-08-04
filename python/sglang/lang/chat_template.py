@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 class ChatTemplateStyle(Enum):
@@ -15,9 +15,28 @@ class ChatTemplate:
     default_system_prompt: str
     role_prefix_and_suffix: Dict[str, Tuple[str, str]]
     stop_str: List[str] = ()
-    image_token: str = "<image>"
-    audio_token: str = "<audio>"
+    image_token: Optional[str] = None
+    audio_token: Optional[str] = None
     style: ChatTemplateStyle = ChatTemplateStyle.PLAIN
+
+    def get_image_token(self) -> str:
+        return self._require_mm_token("image_token", self.image_token)
+
+    def get_audio_token(self) -> str:
+        return self._require_mm_token("audio_token", self.audio_token)
+
+    def _require_mm_token(self, field: str, token: Optional[str]) -> str:
+        # Guessing a placeholder is worse than failing: a template with no
+        # declared token (notably the `default` fallback) would hand back a
+        # string the server's multimodal processor does not recognize, and the
+        # request then silently degrades to a text-only prompt.
+        if token is None:
+            raise ValueError(
+                f"Chat template '{self.name}' declares no {field}. Register the "
+                f"model's chat template with an explicit {field}, or take the "
+                "placeholder from the server-side multimodal processor."
+            )
+        return token
 
     def get_prefix_and_suffix(
         self, role: str, hist_messages: List[Dict]
