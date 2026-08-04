@@ -105,7 +105,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
-- `--quality {PROFILE}`: select a model-owned request quality/performance profile. Supported names and deployment constraints are model-specific.
+- `--quality {lossless,high}`: request-level quality. `lossless` (default) keeps the exact reference path, bit-exact against the reference implementation; `high` opts into the model-owned validated accelerated path, whose quality stays guaranteed but is not bit-exact. Support and validated deployment constraints are model-specific.
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 
