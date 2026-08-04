@@ -245,7 +245,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
         // launcher process.
-        let listener = bind_tcp_listener(cfg.rust_server_args.http_addr)?;
+        let http_addr = cfg.rust_server_args.http_addr;
+        let listener = bind_tcp_listener(http_addr)
+            .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
