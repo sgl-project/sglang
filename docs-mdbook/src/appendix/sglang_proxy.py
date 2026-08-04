@@ -32,22 +32,44 @@ def classify(body: dict) -> str:
     return "thinking"
 
 
-async def _forward(kind: str, path: str, body: dict, default_media: str, too_many_body: dict):
-    """限并发 + 转发：超时 429、后端不可达 502（释放槽位，不泄漏）、上游错误原样透传。"""
+async def _forward(
+    kind: str,
+    path: str,
+    body: dict,
+    default_media: str,
+    too_many_body: dict,
+    headers: dict | None = None,
+):
+    """限并发 + 转发：超时 429、后端不可达 502（释放槽位，不泄漏）、上游错误原样透传。
+    请求头（含 Authorization）与响应头均透传，不丢东西。"""
     try:
         await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
     except asyncio.TimeoutError:
         return JSONResponse(too_many_body, status_code=429)
 
+    fwd_headers = (
+        {
+            k: v
+            for k, v in headers.items()
+            if k.lower() not in ("host", "content-length", "connection")
+        }
+        if headers
+        else None
+    )
     client = httpx.AsyncClient(timeout=None)
     try:
-        req = client.build_request("POST", BACKEND + path, json=body)
+        req = client.build_request("POST", BACKEND + path, json=body, headers=fwd_headers)
         resp = await client.send(req, stream=True)
     except Exception as e:  # noqa: BLE001 后端不可达：释放槽位，避免泄漏导致全量 429
         sems[kind].release()
         await client.aclose()
         return JSONResponse({"error": "backend unreachable", "detail": str(e)}, status_code=502)
 
+    resp_headers = {
+        k: v
+        for k, v in resp.headers.items()
+        if k.lower() not in ("content-type", "content-length", "transfer-encoding", "connection")
+    }
     if resp.status_code >= 400:
         sems[kind].release()
         err = await resp.aread()
@@ -57,6 +79,7 @@ async def _forward(kind: str, path: str, body: dict, default_media: str, too_man
             content=err,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type") or "application/json",
+            headers=resp_headers,
         )
 
     async def stream():
@@ -69,7 +92,9 @@ async def _forward(kind: str, path: str, body: dict, default_media: str, too_man
             await client.aclose()
 
     return StreamingResponse(
-        stream(), media_type=resp.headers.get("content-type") or default_media
+        stream(),
+        media_type=resp.headers.get("content-type") or default_media,
+        headers=resp_headers,
     )
 
 
@@ -86,6 +111,7 @@ async def chat(request: Request):
         forwarded,
         "text/event-stream",
         {"error": "too many requests", "type": "concurrency_limit"},
+        headers=request.headers,
     )
 
 
@@ -104,6 +130,7 @@ async def messages(request: Request):
             "type": "error",
             "error": {"type": "overloaded_error", "message": "too many requests"},
         },
+        headers=request.headers,
     )
 
 
@@ -161,6 +188,11 @@ async def passthrough(path: str, request: Request):
         stream(),
         media_type=resp.headers.get("content-type") or "application/json",
         status_code=resp.status_code,
+        headers={
+            k: v
+            for k, v in resp.headers.items()
+            if k.lower() not in ("content-type", "content-length", "transfer-encoding", "connection")
+        },
     )
 
 
