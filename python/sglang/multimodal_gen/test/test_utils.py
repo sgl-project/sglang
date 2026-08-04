@@ -44,7 +44,7 @@ SGL_TEST_FILES_CI_DATA_REVISION = "f4cf4e435f3b6b7cdeb02b09214e76d27da23579"
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "6d689f4833e8c106ff0d853865f50496d1f2b453"
+    SGL_TEST_FILES_CI_DATA_REVISION = "d180ad38872dff3d1ad03e4610cffcda874d3eb8"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -2001,6 +2001,30 @@ def _save_generated_artifact_images(
         Image.fromarray(_ensure_rgb_uint8_image(frame)).save(path)
         generated_files.append(str(path.relative_to(out_dir)))
     return generated_files
+
+
+def save_missing_consistency_gt_artifact(
+    artifact_dir: str | Path | None,
+    case_id: str,
+    num_gpus: int,
+    output_frames: list[np.ndarray],
+    is_video: bool,
+    output_format: str | None = None,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+
+    out_dir = Path(artifact_dir) / "missing_consistency_gt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filenames = _consistency_gt_filenames(
+        case_id,
+        num_gpus,
+        is_video=is_video,
+        output_format=output_format,
+    )
+    for frame, filename in zip(output_frames, filenames):
+        Image.fromarray(_ensure_rgb_uint8_image(frame)).save(out_dir / filename)
+    return out_dir
 
 
 def _write_consistency_failure_index(

@@ -51,6 +51,12 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
+# Validated request-level quality levels. "lossless" is the exact reference
+# path (bit-exact against the CI golden outputs); "high" opts into validated
+# accelerated paths whose quality is guaranteed but not bit-exact.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+
+
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
     """Create a filesystem- and ffmpeg-friendly filename.
 
@@ -123,9 +129,20 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
-    # Model-owned, request-scoped approximate acceleration profile. Models
-    # that support it must validate the deployment and workload explicitly.
-    # It intentionally participates in the dynamic-batch signature.
+    # Model-owned, request-scoped quality level.
+    #
+    # - "lossless" (default): the exact reference path. Output is expected to
+    #   be bit-identical to the HF reference implementation and to pass the
+    #   CI golden/ground-truth comparisons.
+    # - "high": opt into validated accelerated paths. Quality stays
+    #   guaranteed (the intent is to back every such path with mathematical
+    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
+    #   the output is no longer bit-exact versus the HF reference or the CI
+    #   ground truth.
+    #
+    # Models that support "high" must validate the deployment and workload
+    # explicitly. It intentionally participates in the dynamic-batch
+    # signature.
     quality: str = "lossless"
 
     # Frame interpolation
@@ -408,9 +425,10 @@ class SamplingParams:
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
             )
 
-        if not isinstance(self.quality, str) or not self.quality.strip():
+        if self.quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"quality must be a non-empty string, got {self.quality!r}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, "
+                f"got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
@@ -932,9 +950,14 @@ class SamplingParams:
         add_argument(
             "--quality",
             type=str,
+            choices=list(QUALITY_LEVELS),
             help=(
-                "Select a model-owned quality/performance profile. "
-                "Support and validated deployment constraints are model-specific."
+                "Request-level quality: 'lossless' (default) keeps the exact "
+                "reference path, bit-exact against the reference "
+                "implementation; 'high' opts into the model-owned validated "
+                "accelerated path, whose quality stays guaranteed but is not "
+                "bit-exact. Support and validated deployment constraints are "
+                "model-specific."
             ),
         )
         add_argument(

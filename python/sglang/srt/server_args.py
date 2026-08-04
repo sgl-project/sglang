@@ -4456,6 +4456,7 @@ class ServerArgs:
             is_deepseek_v4,
             is_nemotron_h,
         )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4482,7 +4483,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4737,14 +4739,6 @@ class ServerArgs:
                 prefill_cuda_graph_config.max_bs = min(
                     prefill_cuda_graph_config.max_bs, 4096
                 )
-
-        # Clamp to context_length if explicitly set — prevents prefill CG
-        # warmup from compiling graphs with more tokens than the model
-        # buffers can hold, which causes illegal memory access (#21112).
-        if self.context_length is not None:
-            prefill_cuda_graph_config.max_bs = min(
-                prefill_cuda_graph_config.max_bs, self.context_length
-            )
 
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (
