@@ -86,7 +86,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -97,6 +97,7 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -287,6 +288,15 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+# Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
+# This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
+is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 11],
+        cuda_version=(12, 8),
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
@@ -433,23 +443,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(gpu_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(gpu_id)
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -538,11 +534,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
@@ -560,6 +552,18 @@ def get_dispatch_device_backend():
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
+
+
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 def get_amdgpu_memory_capacity():
@@ -1510,6 +1514,15 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -1534,6 +1547,24 @@ def load_audio(
         source = audio_file
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
+
+    from sglang.srt.multimodal.audio_from_video import (
+        decode_audio_container,
+        is_audio_container,
+    )
+
+    if isinstance(source, bytes):
+        header = source[:16]
+    else:
+        with open(source, "rb") as audio_stream:
+            header = audio_stream.read(16)
+
+    if is_audio_container(header):
+        return decode_audio_container(
+            source,
+            target_sr=sr,
+            mono=mono,
+        )
 
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
@@ -1560,10 +1591,13 @@ def load_audio(
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    try:
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
@@ -1736,6 +1770,20 @@ def _normalize_video_input(
         return None
 
 
+def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
+    """Normalize a video input and return its encoded bytes."""
+    if isinstance(video_file, VideoData):
+        video_file = video_file.url
+
+    source = _normalize_video_input(video_file)
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
@@ -1749,7 +1797,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
@@ -1823,12 +1877,16 @@ def suppress_noisy_warnings():
     cutlass_dsl_noisy = {
         (
             DeprecationWarning,
-            "Use explicit `struct.scalar.ptr` for pointer instead.",
+            "Using `struct.scalar` as pointer is deprecated.",
         ),
         (
             UserWarning,
             "NamedBarrier wait also arrives on the barrier. "
             "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+        (
+            DeprecationWarning,
+            "builtin type swigvarlink has no __module__ attribute",
         ),
     }
     for cat, msg in cutlass_dsl_noisy:
@@ -1869,7 +1927,27 @@ def suppress_other_loggers():
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
+_KERNEL_VERSION_CHECK_PACKAGES = frozenset(
+    {
+        "flashinfer-python",
+        "flashinfer_python",
+        "sglang-kernel",
+        "sglang_kernel",
+    }
+)
+
+
+def _should_skip_kernel_pkg_version_check(pkg: str) -> bool:
+    return (
+        pkg in _KERNEL_VERSION_CHECK_PACKAGES
+        and envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.get()
+    )
+
+
 def assert_pkg_version(pkg: str, min_version: str, message: str):
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return
+
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
@@ -1890,11 +1968,14 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.12")
+        min_version: Minimum version required (e.g., "0.6.15.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
     """
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return True
+
     try:
         installed_version = version(pkg)
         return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
@@ -2058,11 +2139,10 @@ def set_ulimit(target_soft_limit=65535):
 
 def rank0_log(msg: str):
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_rank,
         model_parallel_is_initialized,
     )
 
-    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
         logger.info(msg)
 
 
@@ -2310,25 +2390,30 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(app):
+def add_prometheus_track_response_middleware(
+    app, extra_labels: Optional[Dict[str, str]] = None
+):
     from prometheus_client import Counter, Gauge
+
+    extra_labels = extra_labels or {}
+    extra_label_names = list(extra_labels.keys())
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
         documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
     )
 
     http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=["endpoint", "status_code", "method"],
+        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
     )
 
     http_requests_active = Gauge(
         name="sglang:http_requests_active",
         documentation="Number of currently active HTTP requests",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
         multiprocess_mode="livesum",
     )
 
@@ -2354,8 +2439,8 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
+        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
+        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
         if routing_key:
             routing_keys_active.inc(routing_key)
 
@@ -2363,6 +2448,7 @@ def add_prometheus_track_response_middleware(app):
             response = await call_next(request)
 
             http_response_counter.labels(
+                **extra_labels,
                 endpoint=path,
                 method=method,
                 status_code=str(response.status_code),
@@ -2370,7 +2456,9 @@ def add_prometheus_track_response_middleware(app):
 
             return response
         finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            http_requests_active.labels(
+                **extra_labels, endpoint=path, method=method
+            ).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)
 
@@ -2382,7 +2470,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            return getattr(route, "path", request.url.path), True
 
     return request.url.path, False
 
@@ -2729,6 +2817,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
@@ -3364,10 +3453,9 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3382,10 +3470,9 @@ def log_debug_on_rank0(logger, msg):
     Log a debug message only on tensor model parallel rank 0.
     Falls back to logging if distributed is not initialized or error occurs.
     """
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.debug(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3419,6 +3506,11 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph():
         return
 
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().capture.disable_dispose_tensor:
+        return
+
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
 
@@ -3449,21 +3541,40 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+    # elastic-EP scale-up rewrites dp_size on the published config
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        if get_exec().moe.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import (
+                elastic_expanded_world_enabled,
+            )
+
+            if elastic_expanded_world_enabled():
+                return True
         if (
-            server_args.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
+        elif get_moe_a2a_backend().is_flashinfer():
+            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
+            # replay different-sized graphs -> geometry mismatch -> illegal memory
+            # access (issue #30242). No literal MLP TP-gather happens here -- the
+            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
+            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
+            # max-based graph bucket). See #30432 re: the misleading flag name.
+            return True
         else:
             return (
-                server_args.moe_dense_tp_size
-                > server_args.tp_size // server_args.dp_size
+                get_parallel().moe_dense_tp_size
+                > server_args.tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3477,14 +3588,19 @@ def require_attn_tp_gather(server_args: ServerArgs):
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    if server_args.disable_attn_tp_gather:
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
-        if server_args.enable_dp_attention:
-            return server_args.dp_size < server_args.tp_size
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < server_args.tp_size
         else:
             return True
     else:
@@ -3496,7 +3612,34 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 
 def require_mlp_sync(server_args: ServerArgs):
-    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+    from sglang.srt.runtime_context import get_parallel
+
+    return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
@@ -3976,6 +4119,21 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -3996,6 +4154,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
@@ -4361,3 +4522,13 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c

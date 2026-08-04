@@ -360,7 +360,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             if sample_frames is None
             else int(sample_frames) * int(self.num_token_per_frame)
         )
-        logger.info(
+        logger.debug(
             "LingBot interactive KV window: session_id=%s request_id=%s "
             "chunk_idx=%s mode=%s window_frames=%s sample_frames=%s "
             "cache_frames=%s sink_frames=%s current_frames=%s sample_tokens=%s "

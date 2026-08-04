@@ -165,6 +165,14 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_kv_scale_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
+            return self.swa_kv_pool.get_kv_scale_buffer(layer_id_pool)
+        else:
+            return self.full_kv_pool.get_kv_scale_buffer(layer_id_pool)
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.

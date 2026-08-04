@@ -34,6 +34,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -45,6 +46,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -259,19 +261,14 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 
 def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     """Declare a load-time resolved field (model-file config overrides,
-    weight-resolved dtypes) on the published ``server_args``: resolution has
-    already materialized, so the declaration writes through, joining the
-    declaration stash for provenance and republish consistency."""
+    weight-resolved dtypes): validated against the resolvable whitelist, then
+    written to the config bags via ``get_context().override``; ``server_args``
+    stays the pristine startup record."""
     from sglang.srt.runtime_context import get_context
 
-    server_args = get_context().server_args
-    validate_declarations(server_args, [(source, dict(declared))])
-    override = getattr(server_args, "override", None)
-    if override is not None:
-        override(source, **declared)
-    else:
-        # Config-shaped fixtures without the mutation entry point.
-        _apply_fields(server_args, declared)
+    context = get_context()
+    validate_declarations(context.server_args, [(source, dict(declared))])
+    context.override(source, **declared)
 
 
 def collect_model_override_declarations(
@@ -380,7 +377,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
 
             # Deferred import to avoid a circular import at module-load
-            # time (dsa.utils imports get_global_server_args).
+            # time (dsa.utils imports the runtime-context accessors).
             from sglang.srt.layers.attention.dsa.utils import (
                 aiter_can_use_preshuffle_paged_mqa,
             )
@@ -446,10 +443,21 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 # Keep in sync with MIMO_V2_MODEL_ARCHS (server_args.py / configs/hf_config.py).
 @_register_for("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
 def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
     if server_args.speculative_algorithm == "EAGLE":
         logger.info("Enable multi-layer EAGLE speculative decoding for MiMoV2 model.")
-        return {"enable_multi_layer_eagle": True}
-    return {}
+        overrides["enable_multi_layer_eagle"] = True
+
+    # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
+    # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.
+    if (
+        is_sm100_supported()
+        and server_args.moe_runner_backend == "auto"
+        and get_quantization_config(hf_config) == "fp8"
+    ):
+        overrides["moe_runner_backend"] = "flashinfer_trtllm"
+        logger.info("MiMoV2 FP8 on SM100: moe_runner_backend=flashinfer_trtllm.")
+    return overrides
 
 
 @_register_for("MiniMaxM2ForCausalLM")
@@ -458,6 +466,150 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
     return {"enable_tf32_matmul": True}
+
+
+@_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
+
+    overrides: Dict[str, Any] = {}
+
+    quant_method = get_quantization_config(hf_config)
+    quant_resolved = server_args.quantization
+    if (
+        quant_resolved is None
+        and not server_args._quantization_explicitly_unset
+        and quant_method is not None
+    ):
+        overrides["quantization"] = quant_method
+        quant_resolved = quant_method
+
+    if is_hip():
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = "triton"
+        if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
+            overrides["moe_runner_backend"] = "triton"
+        if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():
+            envs.USE_ROCM_AITER_ROPE_BACKEND.set("0")
+        aiter_fusion_resolved = server_args.enable_aiter_allreduce_fusion
+        if (
+            server_args.ep_size > 1
+            and server_args.moe_a2a_backend == "none"
+            and aiter_fusion_resolved
+        ):
+            logger.warning(
+                "Disable --enable-aiter-allreduce-fusion for MiniMax-M3 "
+                "standard EP on ROCm because the deferred fused all-reduce "
+                "corrupts sparse MoE partial outputs."
+            )
+            overrides["enable_aiter_allreduce_fusion"] = False
+            aiter_fusion_resolved = False
+        # By default MiniMax-M3 on ROCm keeps NCCL all-reduce (custom AR off)
+        # whenever aiter all-reduce fusion is not used. Opting in via
+        # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom all-reduce enabled so the
+        # quick-reduce path (ROCM_QUICK_REDUCE_QUANTIZATION=INT4/INT6/INT8) can
+        # accelerate the large prefill all-reduce.
+        if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
+            overrides["disable_custom_all_reduce"] = True
+    elif is_sm100_supported():
+        if server_args.is_attention_backend_not_set():
+            if (
+                server_args.kv_cache_dtype == "fp8_e4m3"
+                and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
+            ):
+                # fp8 attention GEMMs activate whenever possible
+                # (m3_fp8_attn_gemm_enabled); only trtllm_mha serves the dense
+                # fp8-q path, so prefer it over fa4 for fp8 KV. The
+                # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch keeps the fa4
+                # default (pre-fp8 behavior).
+                overrides["attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "fa4"
+        backend_resolved = overrides.get(
+            "attention_backend", server_args.attention_backend
+        )
+        page_resolved = server_args.page_size
+        # fa4 (fmha_sm100) and trtllm_mha both allow the page_size == 128
+        # sparse block MSA needs (trtllm_mha via trtllm-gen's dynamic
+        # tokens-per-page kernels).
+        if page_resolved is None and backend_resolved in ("fa4", "trtllm_mha"):
+            overrides["page_size"] = 128
+            page_resolved = 128
+        if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
+            overrides["moe_runner_backend"] = "deep_gemm"
+        elif (
+            server_args.moe_runner_backend == "auto"
+            and quant_resolved == "modelopt_mixed"
+        ):
+            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "MiniMax-M3 on SM100: attention_backend="
+            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved}, "
+            f"moe_runner_backend={overrides.get('moe_runner_backend', server_args.moe_runner_backend)}."
+        )
+    elif is_sm90_supported():
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = "fa3"
+        page_resolved = server_args.page_size
+        if (
+            page_resolved is None
+            and overrides.get("attention_backend", server_args.attention_backend)
+            == "fa3"
+        ):
+            overrides["page_size"] = 128
+            page_resolved = 128
+        logger.info(
+            "MiniMax-M3 on Hopper: attention_backend="
+            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved} "
+            "(MSA is SM100-only; sparse attention runs on the Triton path)."
+        )
+
+    # fp8 attention GEMMs have no opt-in flag: m3_fp8_attn_gemm_enabled
+    # (server_args.py) derives the mode from kv_cache_dtype (fp8_e4m3) +
+    # attention_backend (trtllm_mha) + SM100 at runtime. Surface the
+    # resolution here: warn on fp8_e5m2 (fmha_sm100's variant lookup would
+    # silently dispatch the e4m3 kernel, so e5m2 stays on the widening Triton
+    # path), log when the fp8 GEMM mode is active, and log when the
+    # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch suppresses it.
+    if server_args.kv_cache_dtype == "fp8_e5m2":
+        logger.warning(
+            "MiniMax-M3 with kv_cache_dtype fp8_e5m2: fp8 attention GEMMs stay "
+            "DISABLED (fmha_sm100's variant lookup would silently dispatch the "
+            "e4m3 kernel for e5m2); sparse attention runs on the widening "
+            "Triton path. Use --kv-cache-dtype fp8_e4m3 for fp8 attention GEMMs."
+        )
+    elif (
+        server_args.kv_cache_dtype == "fp8_e4m3"
+        and overrides.get("attention_backend", server_args.attention_backend)
+        == "trtllm_mha"
+        and is_sm100_supported()
+    ):
+        if envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get():
+            logger.info(
+                "MiniMax-M3 fp8 attention GEMMs DISABLED by "
+                "SGLANG_DISABLE_M3_FP8_ATTN_GEMM: bf16 indexer + widening "
+                "Triton sparse path, bf16 q; dense layers keep trtllm_mha's "
+                "fp8 KV cache."
+            )
+        else:
+            logger.info(
+                "MiniMax-M3 fp8 attention GEMMs active (kv_cache_dtype fp8_e4m3 + "
+                "trtllm_mha on SM100): fp8 main/index KV, fp8-cast q, fp8 "
+                "sparse/MSA kernels. Set SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 to "
+                "force the pre-fp8 numerics."
+            )
+
+    moe_runner_resolved = overrides.get(
+        "moe_runner_backend", server_args.moe_runner_backend
+    )
+    if quant_resolved is None and moe_runner_resolved in ("auto", "deep_gemm"):
+        if moe_runner_resolved == "deep_gemm":
+            logger.warning(
+                "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+            )
+        overrides["moe_runner_backend"] = "triton"
+
+    return overrides
 
 
 @_register_for(
@@ -525,7 +677,6 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         # use bf16 for mxfp4 triton kernels
         overrides["dtype"] = "bfloat16"
     if server_args.moe_runner_backend == "auto":
-        from sglang.srt.environ import envs
 
         if is_sm100_supported() and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
@@ -533,10 +684,10 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
             )
         elif is_sm120_supported() and is_mxfp4_quant_format:
-            # trtllm-gen only supports SM100
-            overrides["moe_runner_backend"] = "marlin"
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.warning(
-                "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+                "Detected SM120 and MXFP4 quantization format for GPT-OSS model, "
+                "enabling FlashInfer CUTLASS MXFP4 MOE kernel."
             )
         elif (is_hip() and envs.SGLANG_USE_AITER.get()) and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "auto"
@@ -687,7 +838,7 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
-@_register_for("Lfm2ForCausalLM")
+@_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
 def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
         return {"attention_backend": "flashinfer"}
@@ -734,6 +885,57 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+    return overrides
+
+
+@_register_for(
+    "InklingForConditionalGeneration",
+    "InklingForConditionalGenerationMTP",
+)
+def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Inkling architecture defaults: SWA / mamba KV-pool ratios tuned for the
+    hybrid-SWA layout, the extra-buffer mamba strategy, and the unified radix
+    tree (which Inkling requires — models/inkling.py asserts it). The full-graph
+    prefill default is set separately (inline, before cuda-graph resolution) —
+    see ServerArgs.__post_init__ / _apply_inkling_prefill_cuda_graph_default. The
+    server-arg defaults each yield to an explicit user value (compared against
+    the ServerArgs class default); the prefill declaration is materialized
+    before _parse_cuda_graph_config folds cuda_graph_backend_prefill into
+    prefill.backend, and an explicit --cuda-graph-backend-prefill /
+    --disable-prefill-cuda-graph still wins. The unified-radix env write follows
+    the MiniMax-M3 handler precedent (env is not a resolvable server-arg)."""
+    from sglang.srt.server_args import ServerArgs
+
+    overrides: Dict[str, Any] = {}
+    # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
+    # resolved in __post_init__ before declarations are materialized, so a
+    # cuda_graph_backend_prefill declared here lands too late (the breakable
+    # default would already have been auto-disabled for this multimodal arch).
+    # It is set inline before _handle_cuda_graph_config instead.
+    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+    if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+        overrides["mamba_full_memory_ratio"] = 0.1
+    # Inkling requires the extra-buffer mamba strategy (inkling.py asserts
+    # enable_mamba_extra_buffer()); the generic "auto" resolution does not cover
+    # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
+    if server_args.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
+        overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
+    # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
+    # (Hopper), so a bare launch fails on the first attention forward. Pin a
+    # supported default when the user left every attention-backend flag unset
+    # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
+    # --attention-backend / --prefill/decode-attention-backend still wins.
+    if server_args.is_attention_backend_not_set():
+        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
+        overrides["attention_backend"] = inkling_attn_backend
+        logger.info(
+            f"Use {inkling_attn_backend} as the attention backend for Inkling "
+            "(requires fa4 or triton)."
+        )
+    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides
 
 
@@ -832,7 +1034,6 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for("Qwen3VLForConditionalGeneration")
 def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if (
         is_hip()
@@ -986,6 +1187,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
         "Lfm2ForCausalLM",
+        "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
     }
 )
@@ -995,6 +1197,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 # delegates here.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
+        "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
@@ -1110,6 +1313,29 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_tilelang_dsa_fp8_kv(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
+    Reject here instead of crashing at decode CUDA-graph capture."""
+    if (
+        not hip
+        and kv_cache_dtype == "fp8_e4m3"
+        and "tilelang" in {prefill_backend, decode_backend}
+    ):
+        raise ValueError(
+            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
+            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
+            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
@@ -1132,6 +1358,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
+    model_arch = hf_config.architectures[0]
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and major == 12
+        and kv_cache_dtype == "fp8_e4m3"
+        and not is_hip()
+    )
+
+    if is_glm_sm12_fp8:
+        backend = "flashinfer_sparse_mla"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
+            f"prefill={backend}, decode={backend}."
+        )
+        return declared
 
     if view.enable_hisparse:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
@@ -1168,6 +1413,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
@@ -1279,7 +1525,6 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
     quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
     ep_size, exactly like the legacy in-branch writes."""
-    from sglang.srt.environ import envs
 
     hf_config = view.get_model_config().hf_config
     model_arch = hf_config.architectures[0]
@@ -1349,22 +1594,20 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
-    """Slot pass in the DeepSeek V4 validation branch: SM120 lacks
-    tcgen05/TMEM, fall back to the marlin MoE runner (reads the
-    mid-resolution moe_runner_backend, after the dispatch-time nvfp4
-    default)."""
+    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
     hf_config = view.get_model_config().hf_config
     if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
     if is_sm120_supported() and view.moe_runner_backend == "auto":
-        logger.info("Use marlin as MoE runner backend on SM120 for DeepseekV4")
-        return {"moe_runner_backend": "marlin"}
+        logger.info(
+            "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
     return {}
 
 
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
         logger.warning(
@@ -1598,10 +1841,24 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         view.attention_backend == "trtllm_mha"
         or view.decode_attention_backend == "trtllm_mha"
         or view.prefill_attention_backend == "trtllm_mha"
+        or view.speculative_draft_attention_backend == "trtllm_mha"
     ):
-        if page_size not in [16, 32, 64]:
+        # 128 runs on trtllm-gen's dynamic tokens-per-page kernels (flashinfer
+        # >= 0.6.12), which require GQA and equal QK/V head dims — validated at
+        # TRTLLMHAAttnBackend init where the model config is known.
+        if page_size not in [16, 32, 64, 128]:
             logger.warning(
-                f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
+                f"TensorRT-LLM MHA only supports page_size of 16, 32, 64 or 128, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if (
+        view.attention_backend == "hpc_ops"
+        or view.decode_attention_backend == "hpc_ops"
+        or view.prefill_attention_backend == "hpc_ops"
+    ):
+        if page_size != 64:
+            logger.warning(
+                f"HPC-Ops attention only supports a page_size of 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
     if page_size != view.page_size:
@@ -1782,7 +2039,6 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
-    from sglang.srt.environ import envs
 
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
@@ -1804,7 +2060,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1:
+    if view.dp_size == 1 and view.ep_join_mode != "scale":
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 
@@ -1844,20 +2100,29 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 "--moe-runner-backend flashinfer_trtllm or "
                 "flashinfer_trtllm_routed."
             )
-    if view.quantization == "mxfp8":
+    # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
+    # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
+    # FusedMoE keys its w1/w3 shard swap ("flashinfer assumes w31") and its
+    # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
+    # load with gate and up exchanged. Leave the backend at "auto" and let
+    # create_moe_runner resolve it to ASCEND.
+    if view.quantization == "mxfp8" and not is_npu():
+        from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
+
+        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
+        allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
+        if is_gfx95_mxfp8:
+            allowed.append("triton")
+        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
-        elif moe_runner_backend not in [
-            "cutlass",
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-        ]:
+            moe_runner_backend = mxfp8_default
+        elif moe_runner_backend not in allowed:
             logger.warning(
-                "mxfp8 quantization supports only cutlass, flashinfer_trtllm, "
-                "or flashinfer_trtllm_routed backends. "
-                f"Overriding {moe_runner_backend!r}."
+                "mxfp8 quantization supports only %s backends. " "Overriding %r.",
+                ", ".join(allowed),
+                moe_runner_backend,
             )
-            moe_runner_backend = "flashinfer_trtllm"
+            moe_runner_backend = mxfp8_default
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
@@ -1900,12 +2165,12 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
-    legacy write slots in _handle_a2a_moe: DeepEP Waterfill requires the
+    legacy write slots in _handle_a2a_moe: Waterfill requires the
     fusion enabled; FlashInfer A2A requires it disabled."""
-    if view.moe_a2a_backend == "deepep" and view.enable_deepep_waterfill:
+    if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
-                "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                "disable_shared_experts_fusion is overridden to False because Waterfill requires shared expert fusion."
             )
             return {"disable_shared_experts_fusion": False}
         return {}
@@ -1918,7 +2183,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
 
 
 def _cutlass_moe_env_override(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     if envs.SGLANG_CUTLASS_MOE.get():
         logger.warning(
@@ -1934,19 +2198,27 @@ def _cutlass_moe_env_override(view: Any) -> dict:
 
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
-    {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer", "mori"}
+    {
+        "megamoe",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "ascend_fuseep",
+        "flashinfer",
+        "mori",
+        "pplx",
+    }
 )
 
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-    from sglang.srt.environ import envs
 
     moe_a2a_backend = view.moe_a2a_backend
-    if view.enable_deepep_waterfill and moe_a2a_backend != "deepep":
+    if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
-            "moe_a2a_backend is overridden to 'deepep' because DeepEP "
-            "Waterfill requires the DeepEP backend."
+            "moe_a2a_backend is overridden to 'deepep' because Waterfill "
+            "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
     if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":

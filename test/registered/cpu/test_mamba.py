@@ -1,12 +1,12 @@
-import unittest
+import sys
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import softplus
-from utils import parametrize, precision
+from utils import precision
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
@@ -250,199 +250,200 @@ def torch_gdn_gating(A_log, a, b, dt_bias):
     ), b.sigmoid().unsqueeze(0)
 
 
-class TestMambaAttention(CustomTestCase):
-    def test_chunk_gated_delta_rule(self):
-        B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE = 1, 128, 16, 32, 128, 128, 17
-        seq_lens = torch.tensor(
-            [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
-            dtype=torch.int32,
-        )
-        cu_seqlens_ = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32),
-                seq_lens.cumsum(dim=0, dtype=torch.int32),
-            ]
-        )
-        T = cu_seqlens_[-1].item()
-        cache_indices = torch.tensor([3, 11, 15, 7], dtype=torch.int32)
-        state_slots = cache_indices
-        query_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
-        key_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
-        value_ = torch.randn((B, T, HV, V), dtype=torch.bfloat16)
-        g_ = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32))
-        beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
-        initial_state_ = torch.randn((POOL_SIZE, HV, V, K), dtype=torch.float32) * 0.1
-
-        # skip `use_qk_l2norm_in_kernel=False` case since it's not numerically stable in bfloat16
-        for use_qk_l2norm_in_kernel in [True]:
-            core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
-                query=query_,
-                key=key_,
-                value=value_,
-                g=g_,
-                beta=beta_,
-                cu_seqlens=cu_seqlens_,
-                initial_state=initial_state_[state_slots],
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            )
-
-            query = query_.clone()
-            key = key_.clone()
-            value = value_.clone()
-            g = g_.clone()
-            beta = beta_.clone()
-            cu_seqlens = cu_seqlens_.clone()
-            initial_state = initial_state_.clone().transpose(-1, -2).contiguous()
-            initial_state_before = initial_state.clone()
-
-            core_attn_out, returned_state = (
-                torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                    initial_state_indices=cache_indices,
-                )
-            )
-            last_recurrent_state = (
-                initial_state[state_slots].transpose(-1, -2).contiguous()
-            )
-            untouched_slots = torch.ones(POOL_SIZE, dtype=torch.bool)
-            untouched_slots[state_slots] = False
-            atol = rtol = precision[core_attn_out.dtype]
-            torch.testing.assert_close(
-                core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
-            )
-            torch.testing.assert_close(
-                last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
-            )
-            torch.testing.assert_close(returned_state, initial_state)
-            torch.testing.assert_close(
-                initial_state[untouched_slots], initial_state_before[untouched_slots]
-            )
-
-    def test_fused_gdn_gating(self):
-        dims = [6, 32]
-        for dim in dims:
-            for A_log_dtype in [torch.float32, torch.bfloat16]:
-                A_log = torch.rand(dim, dtype=A_log_dtype)
-                a = torch.rand(1024, dim, dtype=torch.bfloat16)
-                b = torch.rand(1024, dim, dtype=torch.bfloat16)
-                dt_bias = torch.rand(dim, dtype=torch.bfloat16)
-
-                g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
-                g_sgl, beta_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(
-                    A_log, a, b, dt_bias
-                )
-                atol = rtol = precision[g.dtype]
-                atol2 = rtol2 = precision[beta.dtype]
-                torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
-                torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
-
-    @parametrize(
-        batch_size=[1, 4],
-        num_value_heads=[32],
-        head_k_dim=[128],
-        head_v_dim=[128],
-        num_heads=[16],
-        seq_len=[1],
-        attn_tp_size=[1],
+@pytest.mark.parametrize(
+    ("B", "T_PER_SEQ", "HK", "HV", "K", "V", "POOL_SIZE"),
+    [
+        (1, 128, 3, 6, 128, 128, 17),
+        (1, 128, 16, 32, 128, 128, 17),
+    ],
+)
+def test_chunk_gated_delta_rule(B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE):
+    seq_lens = torch.tensor(
+        [T_PER_SEQ - 7, T_PER_SEQ + 11, T_PER_SEQ - 13, T_PER_SEQ + 9],
+        dtype=torch.int32,
     )
-    def test_fused_sigmoid_gating_delta_rule_update(
-        self,
-        batch_size,
-        num_value_heads,
-        head_k_dim,
-        head_v_dim,
-        num_heads,
-        seq_len,
-        attn_tp_size,
-    ):
-        key_dim = head_k_dim * num_heads
-        value_dim = head_v_dim * num_value_heads
-        mixed_qkv_dim = (key_dim * 2 + value_dim) // attn_tp_size
-        mixed_qkv = torch.rand(
-            seq_len * batch_size, mixed_qkv_dim, dtype=torch.bfloat16
+    cu_seqlens_ = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32),
+            seq_lens.cumsum(dim=0, dtype=torch.int32),
+        ]
+    )
+    T = cu_seqlens_[-1].item()
+    cache_indices = torch.tensor([3, 11, 15, 7], dtype=torch.int32)
+    state_slots = cache_indices
+    query_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+    key_ = torch.randn((B, T, HK, K), dtype=torch.bfloat16)
+    value_ = torch.randn((B, T, HV, V), dtype=torch.bfloat16)
+    g_ = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32))
+    beta_ = torch.sigmoid(torch.randn((B, T, HV), dtype=torch.bfloat16))
+    initial_state_ = torch.randn((POOL_SIZE, HV, V, K), dtype=torch.float32) * 0.1
+
+    # skip `use_qk_l2norm_in_kernel=False` case since it's not numerically stable in bfloat16
+    for use_qk_l2norm_in_kernel in [True]:
+        core_attn_out_ref, last_recurrent_state_ref = chunk_gated_delta_rule_update(
+            query=query_,
+            key=key_,
+            value=value_,
+            g=g_,
+            beta=beta_,
+            cu_seqlens=cu_seqlens_,
+            initial_state=initial_state_[state_slots],
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                key_dim // attn_tp_size,
-                key_dim // attn_tp_size,
-                value_dim // attn_tp_size,
-            ],
-            dim=-1,
+
+        query = query_.clone()
+        key = key_.clone()
+        value = value_.clone()
+        g = g_.clone()
+        beta = beta_.clone()
+        cu_seqlens = cu_seqlens_.clone()
+        initial_state = initial_state_.clone().transpose(-1, -2).contiguous()
+        initial_state_before = initial_state.clone()
+
+        core_attn_out, returned_state = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            head_first=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            initial_state_indices=cache_indices,
         )
-        query = query.view(1, batch_size, num_heads, head_k_dim)
-        key = key.view(1, batch_size, num_heads, head_k_dim)
-        value = value.view(1, batch_size, num_value_heads, head_v_dim)
-        A_log = torch.rand(num_value_heads, dtype=torch.float32)
-        a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
-        b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
-        dt_bias = torch.rand(num_value_heads, dtype=torch.bfloat16)
-        ssm_states_kv = torch.rand(
-            513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32
+        last_recurrent_state = initial_state[state_slots].transpose(-1, -2).contiguous()
+        untouched_slots = torch.ones(POOL_SIZE, dtype=torch.bool)
+        untouched_slots[state_slots] = False
+        atol = rtol = precision[core_attn_out.dtype]
+        torch.testing.assert_close(
+            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
         )
-        cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)
-        query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32)
-        use_qk_l2norm_in_kernel = True
-        query_ref = query.clone()
-        key_ref = key.clone()
-        if num_value_heads // num_heads > 1:
-            query_ref = query_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
-            key_ref = key_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
-        for A_log_dtype in [torch.float32, torch.bfloat16]:
-            A_log = A_log.to(A_log_dtype)
-            core_attn_out_ref, last_recurrent_state_ref = (
-                sigmoid_gating_delta_rule_update(
-                    query_ref.transpose(0, 1),
-                    key_ref.transpose(0, 1),
-                    value.transpose(0, 1),
-                    A_log,
-                    a,
-                    dt_bias,
-                    b,
-                    initial_state=ssm_states_kv[cache_indices]
-                    .transpose(-1, -2)
-                    .contiguous(),
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                )
-            )
-            core_attn_out = (
-                torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a,
-                    b=b,
-                    initial_state_source=ssm_states_kv,
-                    initial_state_indices=cache_indices,
-                    cu_seqlens=query_start_loc,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
-                )
-            )
-            last_recurrent_state = (
-                ssm_states_kv[cache_indices].transpose(-1, -2).contiguous()
-            )
-            atol = rtol = precision[core_attn_out.dtype]
-            torch.testing.assert_close(
-                core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
-            )
-            torch.testing.assert_close(
-                last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
-            )
+        torch.testing.assert_close(
+            last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(returned_state, initial_state)
+        torch.testing.assert_close(
+            initial_state[untouched_slots], initial_state_before[untouched_slots]
+        )
+
+
+@pytest.mark.parametrize("dim", [6, 32])
+@pytest.mark.parametrize(
+    "A_log_dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["float32", "bfloat16"],
+)
+def test_fused_gdn_gating(dim, A_log_dtype):
+    A_log = torch.rand(dim, dtype=A_log_dtype)
+    a = torch.rand(1024, dim, dtype=torch.bfloat16)
+    b = torch.rand(1024, dim, dtype=torch.bfloat16)
+    dt_bias = torch.rand(dim, dtype=torch.bfloat16)
+
+    g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
+    g_sgl, beta_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(A_log, a, b, dt_bias)
+    atol = rtol = precision[g.dtype]
+    atol2 = rtol2 = precision[beta.dtype]
+    torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
+    torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
+
+
+@pytest.mark.parametrize(
+    (
+        "batch_size",
+        "num_value_heads",
+        "head_k_dim",
+        "head_v_dim",
+        "num_heads",
+        "seq_len",
+        "attn_tp_size",
+    ),
+    [
+        (1, 32, 128, 128, 16, 1, 1),
+        (4, 32, 128, 128, 16, 1, 1),
+    ],
+)
+def test_fused_sigmoid_gating_delta_rule_update(
+    batch_size,
+    num_value_heads,
+    head_k_dim,
+    head_v_dim,
+    num_heads,
+    seq_len,
+    attn_tp_size,
+):
+    key_dim = head_k_dim * num_heads
+    value_dim = head_v_dim * num_value_heads
+    mixed_qkv_dim = (key_dim * 2 + value_dim) // attn_tp_size
+    mixed_qkv = torch.rand(seq_len * batch_size, mixed_qkv_dim, dtype=torch.bfloat16)
+    query, key, value = torch.split(
+        mixed_qkv,
+        [
+            key_dim // attn_tp_size,
+            key_dim // attn_tp_size,
+            value_dim // attn_tp_size,
+        ],
+        dim=-1,
+    )
+    query = query.view(1, batch_size, num_heads, head_k_dim)
+    key = key.view(1, batch_size, num_heads, head_k_dim)
+    value = value.view(1, batch_size, num_value_heads, head_v_dim)
+    A_log = torch.rand(num_value_heads, dtype=torch.float32)
+    a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
+    b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
+    dt_bias = torch.rand(num_value_heads, dtype=torch.bfloat16)
+    ssm_states_kv = torch.rand(
+        513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32
+    )
+    cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)
+    query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32)
+    use_qk_l2norm_in_kernel = True
+    query_ref = query.clone()
+    key_ref = key.clone()
+    if num_value_heads // num_heads > 1:
+        query_ref = query_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
+        key_ref = key_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
+    for A_log_dtype in [torch.float32, torch.bfloat16]:
+        A_log = A_log.to(A_log_dtype)
+        core_attn_out_ref, last_recurrent_state_ref = sigmoid_gating_delta_rule_update(
+            query_ref.transpose(0, 1),
+            key_ref.transpose(0, 1),
+            value.transpose(0, 1),
+            A_log,
+            a,
+            dt_bias,
+            b,
+            initial_state=ssm_states_kv[cache_indices].transpose(-1, -2).contiguous(),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        core_attn_out = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states_kv,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+        last_recurrent_state = (
+            ssm_states_kv[cache_indices].transpose(-1, -2).contiguous()
+        )
+        atol = rtol = precision[core_attn_out.dtype]
+        torch.testing.assert_close(
+            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(
+            last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+        )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
