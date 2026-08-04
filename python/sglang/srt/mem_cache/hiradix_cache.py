@@ -574,7 +574,6 @@ class HiRadixCache(RadixCache):
         cleanup even if queue sizes temporarily differ across ranks.
         """
         self._drain_storage_control_queues_impl(
-            n_revoke=None,
             n_storage_hit=0,
             n_backup=None,
             n_release=None,
@@ -583,7 +582,6 @@ class HiRadixCache(RadixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -600,10 +598,6 @@ class HiRadixCache(RadixCache):
                     break
                 drained += 1
                 yield item
-
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
 
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
@@ -622,6 +616,13 @@ class HiRadixCache(RadixCache):
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
+                    self._revoke_pending_prefetch(req_id)
+                    logger.debug(
+                        f"Revoking prefetch for request {req_id} due to insufficient hits ({operation.storage_hit_count})."
+                    )
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -671,7 +672,6 @@ class HiRadixCache(RadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -992,7 +992,6 @@ class HiRadixCache(RadixCache):
         cache_controller = self.cache_controller
         storage_queue_sizes = (
             (
-                cache_controller.prefetch_revoke_queue.qsize(),
                 cache_controller.prefetch_hit_queue.qsize(),
                 cache_controller.ack_backup_queue.qsize(),
                 cache_controller.host_mem_release_queue.qsize(),
@@ -1497,9 +1496,8 @@ class HiRadixCache(RadixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
                 self._drain_storage_control_queues_impl(
-                    n_revoke=n_revoke,
                     n_storage_hit=n_storage_hit,
                     n_backup=n_backup,
                     n_release=n_release,
@@ -1519,7 +1517,6 @@ class HiRadixCache(RadixCache):
 
         qsizes = torch.tensor(
             [
-                cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
@@ -1528,9 +1525,8 @@ class HiRadixCache(RadixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
