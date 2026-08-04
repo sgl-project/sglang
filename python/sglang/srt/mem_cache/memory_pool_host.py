@@ -1804,11 +1804,24 @@ class DSAIndexerPoolHost(HostKVCache):
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
-        logger.info(
-            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-            requested_bytes / 1e9,
-            layout,
-        )
+        draft_layer_num = self.layer_num - self.target_layer_num
+        if draft_layer_num > 0:
+            logger.info(
+                "Allocating %.2f GB host memory for DSA indexer (layout=%s), "
+                "packed MTP layers: "
+                "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                requested_bytes / 1e9,
+                layout,
+                self.target_layer_num,
+                draft_layer_num,
+                self.layer_num,
+            )
+        else:
+            logger.info(
+                "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
+                requested_bytes / 1e9,
+                layout,
+            )
         self.init_kv_buffer()
         self.can_use_jit = False
         self.can_use_write_back_jit = False

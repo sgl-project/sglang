@@ -150,12 +150,26 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
-            logger.info(
-                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                pool_label,
-                self.size,
-                requested_bytes / 1e9,
-            )
+            draft_layer_num = self.layer_num - self.target_layer_num
+            if draft_layer_num > 0:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, "
+                    "%.2f GB host memory, packed MTP KV layers: "
+                    "target_layers=%d, draft_layers=%d, total_layers=%d.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                    self.target_layer_num,
+                    draft_layer_num,
+                    self.layer_num,
+                )
+            else:
+                logger.info(
+                    "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                    pool_label,
+                    self.size,
+                    requested_bytes / 1e9,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)

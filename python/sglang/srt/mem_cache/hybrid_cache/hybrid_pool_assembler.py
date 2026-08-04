@@ -903,6 +903,7 @@ def _build_mha_mla_host_pool(
     page_size: int,
     layout: str,
     allocator_type: str,
+    pool_label: str,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -912,6 +913,7 @@ def _build_mha_mla_host_pool(
         page_size=page_size,
         layout=layout,
         allocator_type=allocator_type,
+        pool_label=pool_label,
     )
     if isinstance(pool, MHATokenToKVPool):
         return get_mha_host_pool_cls(pool)(pool, **kwargs)
@@ -944,6 +946,7 @@ def build_full_draft_pools(
         page_size=controller.page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
+        pool_label="draft",
     )
     draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
@@ -1024,6 +1027,7 @@ def build_swa_draft_pools(
             page_size=target_swa_host_pool.page_size,
             layout=target_swa_host_pool.layout,
             allocator_type=_get_allocator_type(server_args),
+            pool_label="draft_swa",
         )
 
     layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
