@@ -1,0 +1,31 @@
+diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
+index 23494e8..190cef7 100644
+--- a/csrc/kernels/internode_ll.cu
++++ b/csrc/kernels/internode_ll.cu
+@@ -560,7 +560,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+               bool use_nvfp4, bool use_ue8m0_for_sf,
+               void* workspace, int num_device_sms,
+               cudaStream_t stream, int phases) {
+-    constexpr int kNumMaxTopK = 9;
++    constexpr int kNumMaxTopK = 11;
+     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+     const int num_warps_per_group = 32 / num_warp_groups;
+     EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
+@@ -1210,7 +1210,7 @@ void combine_v2(void* combined_x,
+         num_device_sms = 32;
+     }
+
+-    constexpr int kNumMaxTopk = 9;
++    constexpr int kNumMaxTopk = 11;
+     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+     const int num_warps_per_group = 32 / num_warp_groups;
+     const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
+@@ -1662,7 +1662,7 @@ void combine(void* combined_x,
+         );
+     }
+
+-    constexpr int kNumMaxTopk = 9;
++    constexpr int kNumMaxTopk = 11;
+     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+     const int num_warps_per_group = 32 / num_warp_groups;
+     const int num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms);
