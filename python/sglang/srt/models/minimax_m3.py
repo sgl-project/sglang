@@ -54,7 +54,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -85,6 +88,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_cuda_alike,
     is_hip,
     log_info_on_rank0,
     make_layers,
@@ -100,6 +104,14 @@ _FP8_KV_DTYPES = (
     torch.float8_e5m2,
     torch.float8_e4m3fnuz,
 )
+
+
+def _can_fuse_shared_expert(quant_config: Optional[QuantizationConfig]) -> bool:
+    if quant_config is None:
+        return True
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is None or bool(can_fuse_fn())
+
 
 # rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
@@ -326,6 +338,12 @@ class MiniMaxM3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
         )
+        use_aiter_moe_fse = (
+            self.num_fused_shared_experts > 0
+            and _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and get_moe_runner_backend().is_aiter()
+        )
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=True,
@@ -333,8 +351,11 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            use_grouped_topk=use_aiter_moe_fse,
+            num_expert_group=1 if use_aiter_moe_fse else None,
+            topk_group=1 if use_aiter_moe_fse else None,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=True,
+            apply_routed_scaling_factor_on_output=not use_aiter_moe_fse,
         )
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -1480,10 +1501,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
+        elif not is_cuda_alike():
+            disable_reason = (
+                "Shared experts fusion currently requires CUDA or ROCm devices."
+            )
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+        elif not _can_fuse_shared_expert(self.quant_config):
+            disable_reason = (
+                "Shared experts fusion is not supported by this quantization config."
+            )
         elif get_parallel().moe_ep_size > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():

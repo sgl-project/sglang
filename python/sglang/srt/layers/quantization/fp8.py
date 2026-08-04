@@ -129,6 +129,11 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
+def _use_aiter_mxfp8_moe() -> bool:
+    """Whether the selected backend can consume native gfx950 MXFP8 weights."""
+    return _use_aiter and _is_gfx95_supported and get_moe_runner_backend().is_aiter()
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -1948,6 +1953,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
                 )
 
+        if _use_aiter_mxfp8_moe():
+            if not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+                raise NotImplementedError(
+                    "AITER MXFP8 MoE currently requires the gate/up-interleaved "
+                    "layout. Set SGLANG_USE_AITER_MOE_GU_ITLV=1."
+                )
+            from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+
+            num_experts = w13_q.shape[0]
+            w13_q = shuffle_weight(w13_q, is_guinterleave=True, gate_up=True)
+            w2_q = shuffle_weight(w2_q, is_guinterleave=True, gate_up=False)
+            w13_s = shuffle_scale(
+                w13_s.reshape(-1, w13_s.shape[-1]),
+                num_experts,
+                is_guinterleave=True,
+                gate_up=True,
+            )
+            w2_s = shuffle_scale(w2_s.reshape(-1, w2_s.shape[-1]))
+
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
         def _copy_or_rebind(param: Parameter, new_value: torch.Tensor) -> None:
@@ -1963,6 +1987,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         _copy_or_rebind(layer.w2_weight, w2_q)
         _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
         _copy_or_rebind(layer.w2_weight_scale_inv, w2_s)
+        if _use_aiter_mxfp8_moe():
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         layer.w13_weight.requires_grad_(False)
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
@@ -2605,7 +2632,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         no_combine: bool = False,
     ) -> Optional[AiterMoeQuantInfo]:
-        if not (_use_aiter or _use_hip_int4):
+        aiter_backend = (
+            _is_hip
+            and getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if not (aiter_backend or _use_hip_int4):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
 
@@ -2616,13 +2648,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
+        activation = None
+        gate_up_interleaved = None
+        swiglu_limit = self.moe_runner_config.swiglu_limit or 0.0
 
         if self.block_quant:
-            quant_type = (
-                AiterQuantType.PER_1X32
-                if self.is_fp4_expert
-                else AiterQuantType.PER_128X128
-            )
+            block_shape = tuple(self.weight_block_size or ())
+            quant_type_by_block_shape = {
+                (1, 32): AiterQuantType.PER_1X32,
+                (128, 128): AiterQuantType.PER_128X128,
+            }
+            try:
+                quant_type = quant_type_by_block_shape[block_shape]
+            except KeyError as exc:
+                raise NotImplementedError(
+                    f"AITER MoE does not support FP8 block shape {block_shape}."
+                ) from exc
+
+            if self.use_mxfp8:
+                if not _use_aiter_mxfp8_moe():
+                    raise NotImplementedError(
+                        "Native AITER MXFP8 MoE requires ROCm gfx950 and "
+                        "--moe-runner-backend aiter with SGLANG_USE_AITER=1."
+                    )
+                if not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+                    raise NotImplementedError(
+                        "AITER MXFP8 MoE currently requires the "
+                        "gate/up-interleaved layout."
+                    )
+                activation = (
+                    "swiglu"
+                    if self.moe_runner_config.is_gated
+                    else self.moe_runner_config.activation
+                )
+                gate_up_interleaved = True
+                if self.moe_runner_config.gemm1_clamp_limit is not None:
+                    swiglu_limit = float(self.moe_runner_config.gemm1_clamp_limit)
 
             if self.is_fp4_expert:
                 fp4_weight_dtype = _require_fp4_dtype()
@@ -2643,10 +2704,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            expert_mask=layer.dispatcher.expert_mask_gpu if aiter_backend else None,
+            swiglu_limit=swiglu_limit,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            activation=activation,
+            gate_up_interleaved=gate_up_interleaved,
         )
 
 

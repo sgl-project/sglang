@@ -59,7 +59,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
-    fused_moe_kwargs: Optional[dict[str, Any]] = None
+    activation: Optional[str] = None
+    gate_up_interleaved: Optional[bool] = None
 
 
 @dataclass
@@ -156,12 +157,19 @@ class AiterRunnerCore(MoeRunnerCore):
         )
 
         extra: dict = {}
-        if quant_info.fused_moe_kwargs:
-            extra.update(quant_info.fused_moe_kwargs)
+        activation = _aiter_activation(quant_info.activation or self.config.activation)
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if quant_info.gate_up_interleaved is not None:
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            extra["gate_mode"] = (
+                GateMode.INTERLEAVE.value
+                if quant_info.gate_up_interleaved
+                else GateMode.SEPARATED.value
+            )
         if quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
@@ -174,11 +182,12 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
-            )
+            if "gate_mode" not in extra:
+                extra["gate_mode"] = (
+                    GateMode.INTERLEAVE.value
+                    if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
@@ -190,7 +199,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
