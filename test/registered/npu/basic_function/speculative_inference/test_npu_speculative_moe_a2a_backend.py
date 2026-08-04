@@ -65,20 +65,6 @@ class TestAscendDistTimeout(CustomTestCase):
         ]
 
     def test_a_gsm8k(self):
-        if _is_pr_pipeline:
-            process = popen_launch_server(
-                self.model,
-                self.base_url,
-                timeout=1500,
-                other_args=self.common_args,
-                env=self.env,
-            )
-            try:
-                run_npu_pr_smoke(self.base_url)
-            finally:
-                kill_process_tree(process.pid)
-            return
-        print(f"##=== Testing accuracy: {self.model} ===##")
         process = popen_launch_server(
             self.model,
             self.base_url,
@@ -88,23 +74,28 @@ class TestAscendDistTimeout(CustomTestCase):
         )
 
         try:
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(self.base_url)
+            else:
+                print(f"##=== Testing accuracy: {self.model} ===##")
 
-            metrics = run_eval(args)
-            self.assertGreaterEqual(
-                metrics["score"],
-                self.accuracy,
-                f"GSM8K score {metrics['score']} below threshold {self.accuracy}",
-            )
+                args = SimpleNamespace(
+                    base_url=self.base_url,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+
+                metrics = run_eval(args)
+                self.assertGreaterEqual(
+                    metrics["score"],
+                    self.accuracy,
+                    f"GSM8K score {metrics['score']} below threshold {self.accuracy}",
+                )
         finally:
             kill_process_tree(process.pid)
 

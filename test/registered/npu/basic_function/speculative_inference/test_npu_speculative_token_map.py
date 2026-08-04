@@ -70,19 +70,6 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
                 "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
-        if _is_pr_pipeline:
-            process = popen_launch_server(
-                QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
-                DEFAULT_URL_FOR_TEST,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                other_args=args,
-                env=env,
-            )
-            try:
-                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
-            finally:
-                kill_process_tree(process.pid)
-            return
         process = popen_launch_server(
             QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
             DEFAULT_URL_FOR_TEST,
@@ -91,18 +78,21 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             env=env,
         )
         try:
-            eval_args = SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
-            metrics = run_eval(eval_args)
-            self.assertGreaterEqual(metrics["score"], 0.83)
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                eval_args = SimpleNamespace(
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+                metrics = run_eval(eval_args)
+                self.assertGreaterEqual(metrics["score"], 0.83)
         finally:
             kill_process_tree(process.pid)
 
@@ -140,19 +130,6 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
                 "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
-        if _is_pr_pipeline:
-            process = popen_launch_server(
-                LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH,
-                DEFAULT_URL_FOR_TEST,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                other_args=args,
-                env=env,
-            )
-            try:
-                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
-            finally:
-                kill_process_tree(process.pid)
-            return
         process = popen_launch_server(
             LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH,
             DEFAULT_URL_FOR_TEST,
@@ -161,20 +138,23 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
             env=env,
         )
         try:
-            eval_args = SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                eval_name="gsm8k",
-                api="completion",
-                num_examples=1319,
-                num_threads=128,
-                max_tokens=512,
-                num_shots=5,
-                temperature=0.0,
-            )
-            metrics = run_eval(eval_args)
-            self.assertGreaterEqual(
-                metrics["score"], 0.75
-            )  # adjust threshold as needed
+            if _is_pr_pipeline:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            else:
+                eval_args = SimpleNamespace(
+                    base_url=DEFAULT_URL_FOR_TEST,
+                    eval_name="gsm8k",
+                    api="completion",
+                    num_examples=1319,
+                    num_threads=128,
+                    max_tokens=512,
+                    num_shots=5,
+                    temperature=0.0,
+                )
+                metrics = run_eval(eval_args)
+                self.assertGreaterEqual(
+                    metrics["score"], 0.75
+                )  # adjust threshold as needed
         finally:
             kill_process_tree(process.pid)
 

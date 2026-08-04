@@ -46,27 +46,8 @@ class TestAscendAutoRoundMoE(CustomTestCase):
         ]
 
     def test_a_gsm8k(self):
-        if _is_pr_pipeline:
-            for model in self.models:
-                with self.subTest(model=model):
-                    process = popen_launch_server(
-                        model,
-                        self.base_url,
-                        timeout=3600,
-                        other_args=[
-                            *self.common_args,
-                        ],
-                    )
-
-                    try:
-                        run_npu_pr_smoke(self.base_url)
-                    finally:
-                        kill_process_tree(process.pid)
-            return
         for model in self.models:
             with self.subTest(model=model):
-                logger.info(f"##=== Testing accuracy: {model} ===##")
-
                 process = popen_launch_server(
                     model,
                     self.base_url,
@@ -77,21 +58,26 @@ class TestAscendAutoRoundMoE(CustomTestCase):
                 )
 
                 try:
-                    args = SimpleNamespace(
-                        num_shots=5,
-                        data_path=None,
-                        num_questions=1319,
-                        max_new_tokens=512,
-                        parallel=128,
-                        host=f"http://{self.url.hostname}",
-                        port=int(self.url.port),
-                    )
+                    if _is_pr_pipeline:
+                        run_npu_pr_smoke(self.base_url)
+                    else:
+                        logger.info(f"##=== Testing accuracy: {model} ===##")
 
-                    metrics = run_eval_few_shot_gsm8k(args)
-                    self.assertGreaterEqual(
-                        metrics["accuracy"],
-                        TEST_MODEL_MATRIX[model]["accuracy"],
-                    )
+                        args = SimpleNamespace(
+                            num_shots=5,
+                            data_path=None,
+                            num_questions=1319,
+                            max_new_tokens=512,
+                            parallel=128,
+                            host=f"http://{self.url.hostname}",
+                            port=int(self.url.port),
+                        )
+
+                        metrics = run_eval_few_shot_gsm8k(args)
+                        self.assertGreaterEqual(
+                            metrics["accuracy"],
+                            TEST_MODEL_MATRIX[model]["accuracy"],
+                        )
                 finally:
                     kill_process_tree(process.pid)
 
