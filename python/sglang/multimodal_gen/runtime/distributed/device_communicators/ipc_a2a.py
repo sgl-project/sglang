@@ -99,8 +99,13 @@ class IpcA2AState:
         self.max_buffers = 0
         self.calls = 0
         self.rank = None
+        self.group = None
         self.failed = False
         self.inited = False
+
+    def reset(self) -> None:
+        """Drop mappings that belong to a model-parallel group being replaced."""
+        self.__init__()
 
     def _share(self, t, group):
         """Exchange `t` with the peer via torch IPC, re-opening the handle in
@@ -136,6 +141,7 @@ class IpcA2AState:
         from torch.utils.cpp_extension import load_inline
 
         self.rank = dist.get_rank(group=group)
+        self.group = group
         dev = torch.cuda.current_device()
         if not torch.cuda.can_device_access_peer(dev, 1 - dev):
             raise _Unsupported("no peer-to-peer access between the two devices")
@@ -260,7 +266,11 @@ def ipc_a2a_ready(group) -> bool:
     from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if not envs.SGLANG_DIFFUSION_IPC_A2A or IPC_A2A.failed:
+    if not envs.SGLANG_DIFFUSION_IPC_A2A:
+        return False
+    if IPC_A2A.group is not None and IPC_A2A.group is not group:
+        IPC_A2A.reset()
+    if IPC_A2A.failed:
         return False
     # TP+Ulysses groups are strided in global-rank order, while this transport
     # supports the adjacent two-device topology used by TP1+U2. Reject the
