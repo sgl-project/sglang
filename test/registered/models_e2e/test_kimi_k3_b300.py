@@ -58,7 +58,7 @@ class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
                 DSPARK_DRAFT_MODEL,
                 "--speculative-dspark-block-size",
                 "7",
-                "--enable-linear-replayssm-spec",
+                "--enable-gdn-replayssm-spec",
             ],
         )
 
