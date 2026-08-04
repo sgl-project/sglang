@@ -337,13 +337,21 @@ require_prebuilt_rust_exts() {
         return
     fi
 
+    # Match this interpreter's EXT_SUFFIX rather than globbing _core*.so: no crate
+    # sets abi3, so a module built for another minor version still satisfies the
+    # glob while the import system ignores it - which is exactly the silent
+    # is_rust_server_built() skip this check exists to catch. Test runners have no
+    # setup-python, so their interpreter is whatever the image ships.
+    local suffix
+    suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
     local pkg
     for pkg in server grpc multimodal; do
-        compgen -G "python/sglang/srt/${pkg}/_core*.so" >/dev/null || missing+=("${pkg}")
+        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo "::error::SGLANG_BUILD_RUST_EXTS=none but no prebuilt extension module found for: ${missing[*]}"
+        echo "::error::SGLANG_BUILD_RUST_EXTS=none but no _core${suffix} found for: ${missing[*]}"
+        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
         exit 1
     fi
     echo "Using prebuilt Rust extension modules; skipping the cargo build."

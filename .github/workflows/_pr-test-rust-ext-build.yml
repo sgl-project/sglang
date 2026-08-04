@@ -22,7 +22,11 @@ on:
         type: string
         required: true
       artifact_name:
-        description: 'Artifact name, also the cache key prefix. Encodes the arch, since the modules are not portable across them.'
+        description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
+        type: string
+        default: rust-ext-x86_64
+      cache_key_prefix:
+        description: 'Cache key prefix, deliberately shared across callers so they compile at most once between them. Encodes the arch, since the modules are not portable across them.'
         type: string
         default: rust-ext-x86_64
       max_glibc:
@@ -73,7 +77,7 @@ jobs:
             python/sglang/srt/server/_core*.so
             python/sglang/srt/grpc/_core*.so
             python/sglang/srt/multimodal/_core*.so
-          key: ${{ inputs.artifact_name }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
       # The extension's ABI tag must match the test runners, so pin their version.
       - name: Set up Python 3.10
@@ -126,10 +130,12 @@ jobs:
           max_allowed="${{ inputs.max_glibc }}"
           status=0
           for so in "${built[@]}"; do
+              # `|| true` because grep exits 1 with no match, and pipefail would
+              # take the whole step down instead of reaching the empty branch.
               needed=$(objdump -T "$so" \
                   | grep -oE 'GLIBC_2\.[0-9]+' \
                   | sed 's/GLIBC_//' \
-                  | sort -V | tail -1)
+                  | sort -V | tail -1 || true)
               echo "${so}: requires glibc <= ${needed:-none}"
               if [ -n "${needed}" ] \
                  && [ "$(printf '%s\n%s\n' "${max_allowed}" "${needed}" | sort -V | tail -1)" != "${max_allowed}" ]; then

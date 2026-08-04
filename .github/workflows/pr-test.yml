@@ -614,6 +614,8 @@ jobs:
         sgl-kernel-build-wheels-arm,
         call-sgl-kernel-tests,
 
+        rust-ext-build,
+
         wait-for-base-a,
         wait-for-base-b,
 
