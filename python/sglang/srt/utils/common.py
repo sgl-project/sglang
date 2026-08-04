@@ -997,7 +997,7 @@ def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "npu") and torch.npu.is_available():
         try:
             import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce  # noqa: F401
             from torchair.configs.compiler_config import CompilerConfig
         except ImportError:
             raise ImportError(
@@ -1534,7 +1534,7 @@ CLIENT_MEDIA_EXCEPTIONS = (
 
 
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
