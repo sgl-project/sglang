@@ -69,7 +69,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -99,6 +99,31 @@ def _select_local_dcp_heads_for_autotune(
     """Select this rank's head shard without communicating dummy outputs."""
     rank = get_parallel().attn_dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
+
+
+def _is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    if not get_parallel().dcp_enabled:
+        return False
+    if forward_batch.forward_mode.is_decode():
+        return True
+    if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
+        return False
+
+    server_args = get_server_args()
+    decode_backend = (
+        server_args.decode_attention_backend or server_args.attention_backend
+    )
+    return (
+        get_spec().speculative_algorithm == "DSPARK"
+        and get_spec().speculative_attention_mode == "decode"
+        and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
+    )
+
+
+def _is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    # FlashMLA exposes natural-log softmax LSE. FlashInfer MLA and the other
+    # currently supported MLA DCP decode backends expose base-2 LSE.
+    return attention_backend == "flashmla"
 
 
 if _is_cuda:
@@ -350,11 +375,7 @@ class DeepseekMLAForwardMixin:
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
             get_parallel().dcp_replicate_q_proj
-            and get_parallel().dcp_enabled
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            )
+            and _is_dcp_mla_decode_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -790,10 +811,7 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            ):
+            if _is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -946,10 +964,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
-                    forward_batch.forward_mode.is_decode()
-                    or forward_batch.forward_mode.is_target_verify()
-                ) and get_parallel().dcp_enabled:
+                elif _is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -1023,10 +1038,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        ) and get_parallel().dcp_enabled:
+        if _is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
@@ -1034,26 +1046,31 @@ class DeepseekMLAForwardMixin:
             )
             if get_in_autotune_dummy_run():
                 # The synthetic FlashInfer MoE autotune pass discards model
-                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
-                # zero attention partials.
+                # outputs. Avoid an unnecessary cross-node exchange of zero
+                # attention partials.
                 attn_output = _select_local_dcp_heads_for_autotune(
                     attn_output, self.num_local_heads
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
+                is_lse_base_on_e = _is_mla_dcp_lse_base_on_e(
+                    self.current_attention_backend
+                )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
-                    # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
                         lse.contiguous(),
                         get_parallel().dcp_group,
-                        is_lse_base_on_e=False,
+                        is_lse_base_on_e=is_lse_base_on_e,
                         comm_backend=dcp_comm_backend,
                     )
                 else:
                     attn_output = cp_lse_ag_out_rs_mla(
-                        attn_output, lse, get_parallel().dcp_group
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)

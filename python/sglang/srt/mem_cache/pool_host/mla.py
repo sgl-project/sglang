@@ -64,6 +64,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         override_kv_cache_dim: Optional[int] = None,
         dcp_size: int = 1,
         dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -77,6 +79,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             allocator_type,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
+            pool_label=pool_label,
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged

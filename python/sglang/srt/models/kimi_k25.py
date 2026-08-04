@@ -38,17 +38,19 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import (
-    MLP2,
-    concat_or_single,
-    tpool_patch_merger,
-)
+from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
+    concat_or_single,
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -98,13 +100,11 @@ class MoonViTEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        qkv_hidden_size: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
-        proj_size = qkv_hidden_size if qkv_hidden_size is not None else hidden_dim
-        self.hidden_size_per_attention_head = proj_size // self.num_heads
+        self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -119,7 +119,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
-            projection_size=proj_size,
+            projection_size=hidden_dim,
             use_qkv_parallel=True,
             qkv_bias=attn_bias,
             proj_bias=attn_bias,
@@ -422,6 +422,9 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 class MoonViT3dEncoder(nn.Module):
+    # Class-level default so forward() stays usable on instances built with
+    # __new__ (unit tests skip __init__).
+    use_fused_rope = False
 
     def __init__(
         self,
@@ -438,8 +441,9 @@ class MoonViT3dEncoder(nn.Module):
             video_attn_type == "spatial_temporal"
         ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
         self.video_attn_type = video_attn_type
-        qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
-        self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
+        self.rope_2d = Rope2DPosEmbRepeated(
+            block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
+        )
         self.use_fused_rope = (
             _is_cuda and get_exec().deterministic.rl_on_policy_target is None
         )
@@ -463,7 +467,13 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
-        if self.use_fused_rope:
+        # The in-place kernel is a JIT template on the q/k dtype, and only
+        # fp16/bf16 are exercised by test_vision_rope_inplace. Leave other
+        # dtypes on the portable path rather than ship an untested one.
+        if self.use_fused_rope and hidden_states.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
             rope_freqs_cis = prepare_fused_qk_complex_rope_inplace(rope_freqs_cis)
 
         sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
@@ -532,21 +542,17 @@ class MoonViT3dPretrainedModel(nn.Module):
             pos_emb_type=config.pos_emb_type,
         )
 
-        qkv_hidden_size = getattr(config, "qkv_hidden_size", None)
-        block_cfg = {
-            "num_heads": config.num_attention_heads,
-            "hidden_dim": config.hidden_size,
-            "mlp_dim": config.intermediate_size,
-            "activation": PytorchGELUTanh(),
-            "attn_bias": getattr(config, "attn_bias", True),
-            "use_data_parallel": use_data_parallel,
-        }
-        if qkv_hidden_size is not None:
-            block_cfg["qkv_hidden_size"] = qkv_hidden_size
         self.encoder = MoonViT3dEncoder(
             hidden_dim=config.hidden_size,
             num_layers=config.num_hidden_layers,
-            block_cfg=block_cfg,
+            block_cfg={
+                "num_heads": config.num_attention_heads,
+                "hidden_dim": config.hidden_size,
+                "mlp_dim": config.intermediate_size,
+                "activation": PytorchGELUTanh(),
+                "attn_bias": True,
+                "use_data_parallel": use_data_parallel,
+            },
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
@@ -622,28 +628,11 @@ class K2VLMultiModalProjector(nn.Module):
 
 @torch.inference_mode()
 def mm_projection_auto(
-    mm_projector: torch.nn.Module | None,
-    vt_output: torch.Tensor | Sequence[torch.Tensor],
+    mm_projector: torch.nn.Module,
+    vt_output: Sequence[torch.Tensor],
 ) -> torch.Tensor:
-    """Project vision outputs and return one flattened feature tensor.
-
-    MoonViT may return one tensor per image because image resolutions vary, but
-    the language-model embedding path consumes the images as one contiguous
-    sequence.  The previous implementation split the projected tensor back
-    into per-image views and immediately concatenated those views at the call
-    site. Keeping the packed result avoids a redundant split/cat pair, and a
-    single-item sequence reuses its tensor directly. The returned feature is
-    always flattened to the 2D contract consumed by ``get_image_feature``.
-    """
-    batched = (
-        vt_output
-        if isinstance(vt_output, torch.Tensor)
-        else concat_or_single(vt_output, dim=0)
-    )
-    if mm_projector is None:
-        return batched.reshape(-1, batched.shape[-1])
-
-    projected = mm_projector(batched)
+    """Project MoonViT's per-image outputs into one flattened (tokens, dim) feature."""
+    projected = mm_projector(concat_or_single(vt_output, dim=0))
     return projected.reshape(-1, projected.shape[-1])
 
 
@@ -777,7 +766,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return image_features
 
         pixel_values = materialize_item_features(list(range(len(items))))
-        image_embeds = self.vision_tower(pixel_values, grid_thws.to(device))
+        # grid_thws stays on the host: MoonViT3d only reads it as shape metadata
+        # (.tolist() in the pos-emb, RoPE and merger), so a device copy would
+        # buy one sync per read. Same contract the encoder-DP path relies on.
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):

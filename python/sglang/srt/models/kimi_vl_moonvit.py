@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/modeling_kimi_vl.py
-# This file is meant to be used in kimi_vl.py only
+# Shared MoonViT building blocks for kimi_vl.py and kimi_k25.py
 # Copyright 2025 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc. team. All rights reserved.
 #
 # The code is based on llava (llava/modeling_llava.py) and DeepSeek-V3 (DeepSeek-V3/modeling_deepseek.py), but modified for KimiVL.
@@ -566,27 +566,17 @@ def patch_merger(
     return outputs
 
 
-def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    """Concatenate multiple tensors without copying a singleton input."""
-
-    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
-
-
 def tpool_patch_merger(
     x: torch.Tensor,
     grid_thws: torch.Tensor,
     merge_kernel_size: tuple[int, int] = (2, 2),
-    *,
-    grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[torch.Tensor]:
     """Group spatial patches and average only across real video frames."""
 
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
-    shapes = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
-    for t, h, w in shapes:
-        t, h, w = int(t), int(h), int(w)
+    for t, h, w in grid_thws.tolist():
         seq = x[pre_sum : pre_sum + t * h * w]
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width

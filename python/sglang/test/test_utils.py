@@ -183,6 +183,22 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def build_vlm_image_prompt(processor, question: str) -> str:
+    # Take the image placeholder from the model's own HF chat template: a
+    # hand-written one silently degrades to a text-only prompt on any model
+    # whose placeholder differs.
+    return processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -247,6 +263,9 @@ if is_blackwell_system():
 
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):

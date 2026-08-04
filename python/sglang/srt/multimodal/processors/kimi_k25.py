@@ -1,7 +1,7 @@
 import math
 import re
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import numpy as np
 import torch
@@ -85,7 +85,12 @@ def _expand_image_token_ids(
     image_token_id: int,
     image_token_counts: List[int],
 ) -> torch.Tensor:
-    """Expand one placeholder per image without tokenizing the media string again."""
+    """Expand one placeholder per image without tokenizing the media string again.
+
+    Same rebuild as ``BaseMultimodalProcessor._expand_input_ids``, but staying in
+    the array domain skips a list round trip on the way to the output tensor.
+    test_kimi_k25.py pins the two together.
+    """
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.detach().flatten().cpu().numpy()
     input_ids = np.asarray(input_ids, dtype=np.int64)
@@ -122,6 +127,13 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     input does not trip a device mismatch against the CUDA normalization
     constants downstream. No-op if already on the device.
     """
+    if image.dtype != torch.uint8:
+        # Raw 0-255 is load-bearing downstream: the resize rounds to integers
+        # and the normalization folds in a 1/255 scale, so a normalized float
+        # image would collapse to 0/1 and then be rescaled.
+        raise ValueError(
+            f"Kimi GPU preprocessing expects raw uint8 pixels, got {image.dtype}"
+        )
     image = image.cuda()
     if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
         image = image.unsqueeze(0)
@@ -137,15 +149,16 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
 def _resize_bicubic_if_needed(
     image: torch.Tensor, target_height: int, target_width: int
 ) -> torch.Tensor:
-    """Match the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
+    """Track the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
 
-    Kimi's HF processors only ever downscale (NaViT scale <= 1.0), and PIL's
-    bicubic widens the kernel support by the scale factor, i.e. it always
-    antialiases; ``F.interpolate`` needs ``antialias=True`` to do the same.
-    PIL also returns uint8, so quantize the resized result back to integer
-    pixel values before normalization (round-to-nearest, clipped to [0, 255]);
-    without this the float overshoot leaks past the [-1, 1] range the model
-    was trained on.
+    NaViT only ever downscales, and PIL's bicubic widens its kernel support by
+    the scale factor -- it always antialiases, which ``F.interpolate`` only does
+    under ``antialias=True``. PIL also returns uint8, so round and clip back to
+    integer pixels; the bicubic overshoot would otherwise survive normalization.
+
+    Close but not exact: PIL evaluates uint8 resizes in fixed point, so a few
+    8-bit levels of residual remain -- against PIL's float path we agree to 5e-3,
+    i.e. the kernel matches and only the arithmetic differs.
     """
     image = image.float()
     if image.shape[-2:] == (target_height, target_width):
@@ -169,7 +182,7 @@ def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, in
     return 1, height // patch_size, width // patch_size
 
 
-def _default_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
+def _to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if isinstance(image, Image.Image):
         return _pil_to_cuda_chw(image)
     return _ensure_chw_rgb(image)
@@ -181,26 +194,15 @@ def _process_single_image(
     image_scale: torch.Tensor,
     image_bias: torch.Tensor,
     patch_size: int,
-    to_chw: Callable[
-        [Union[torch.Tensor, Image.Image]], torch.Tensor
-    ] = _default_to_cuda_chw,
-    post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Process a single image on GPU: resize -> pad -> normalize -> patchify.
-
-    ``to_chw`` converts the input to a CUDA CHW tensor (models may keep an
-    alpha channel here); ``post_resize`` runs on the resized ``(B, C, H, W)``
-    batch before patchify (e.g. K3's transparent-background compositing).
-    """
-    image = to_chw(image)
+    """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
+    image = _to_cuda_chw(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
     x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
-    if post_resize is not None:
-        x = post_resize(x)
 
     return normalize_and_patchify(
         x, image_scale, image_bias, patch_size, padded_h, padded_w
@@ -248,10 +250,6 @@ def _gpu_preprocess_images(
     image_scale: torch.Tensor,
     image_bias: torch.Tensor,
     patch_size: int,
-    to_chw: Callable[
-        [Union[torch.Tensor, Image.Image]], torch.Tensor
-    ] = _default_to_cuda_chw,
-    post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
@@ -280,32 +278,21 @@ def _gpu_preprocess_images(
         if len(group) == 1:
             idx, image, config = group[0]
             patches = _process_single_image(
-                image,
-                config,
-                image_scale,
-                image_bias,
-                patch_size,
-                to_chw=to_chw,
-                post_resize=post_resize,
+                image, config, image_scale, image_bias, patch_size
             )
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
         else:
-            indexed_images = []
-            for idx, image, _ in group:
-                indexed_images.append((idx, to_chw(image)))
+            indexed_images = [(idx, _to_cuda_chw(image)) for idx, image, _ in group]
 
             # One NaViT target group can include several original resolutions.
             # Batch only source-compatible images, which removes redundant
             # bicubic launches for common multi-image requests without padding
             # random-size inputs to a larger source resolution.
-            resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
-            if post_resize is not None:
-                # Runs before the concat: a hook may change the channel count
-                # (K3 composites RGBA onto a background, returning RGB), and
-                # mixed 3/4-channel sources cannot be concatenated first.
-                resized = [post_resize(part) for part in resized]
-            batch = torch.cat(resized, dim=0)
+            batch = torch.cat(
+                _resize_images_by_source_shape(indexed_images, target_h, target_w),
+                dim=0,
+            )
 
             T = 1
             gh, gw = padded_h // patch_size, padded_w // patch_size
@@ -383,7 +370,7 @@ class KimiGPUProcessorWrapper:
 
         if images and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
-        return self._cpu_call(text, images, **kwargs)
+        return self._cpu_call(text, images, original_input_ids, **kwargs)
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
         if original_input_ids is not None:
@@ -422,9 +409,9 @@ class KimiGPUProcessorWrapper:
                 )
             )
 
-        # 2. Reuse the request's existing tokenization when available. The
-        # media placeholder expansion is exact and avoids tokenizing thousands
-        # of repeated ``<|media_pad|>`` strings.
+        # 2. Reuse the request's tokenization when available: expanding the
+        # placeholders is exact, and skips tokenizing thousands of repeated
+        # ``<|media_pad|>`` strings.
         input_ids = self._prepare_input_ids(
             input_text, resize_configs, original_input_ids
         )
@@ -443,18 +430,23 @@ class KimiGPUProcessorWrapper:
             "image_grid_thw": grid_thws,
         }
 
-    def _cpu_call(self, text, images, **kwargs):
+    def _cpu_call(self, text, images, original_input_ids=None, **kwargs):
         """Fallback: token expansion + medias kwarg -> original HF processor."""
         input_text = text[0] if isinstance(text, list) else text
 
         if images:
             # Token expansion via media_tokens_calculator
+            image_token_counts = [
+                int(
+                    self._hf_processor.media_processor.media_tokens_calculator(
+                        {"type": "image", "image": image}
+                    )
+                )
+                for image in images
+            ]
             parts = input_text.split(self._image_token)
             result = [parts[0]]
-            for image, part in zip(images, parts[1:]):
-                num_tokens = self._hf_processor.media_processor.media_tokens_calculator(
-                    {"type": "image", "image": image}
-                )
+            for num_tokens, part in zip(image_token_counts, parts[1:]):
                 result.append(self._image_token * num_tokens + part)
             input_text = "".join(result)
 
@@ -462,6 +454,12 @@ class KimiGPUProcessorWrapper:
             kwargs["medias"] = [{"type": "image", "image": img} for img in images]
 
         out = self._hf_processor(text=[input_text], **kwargs)
+        if images and original_input_ids is not None:
+            # preserve_processor_input_ids turns off the base class rebuild, so
+            # this path has to keep the request's own tokens itself.
+            out["input_ids"] = _expand_image_token_ids(
+                original_input_ids, self._image_token_id, image_token_counts
+            )
         grid_thws = out.pop("grid_thws", None)
         if grid_thws is not None:
             out["image_grid_thw"] = grid_thws
@@ -494,9 +492,7 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
-    # The wrapper already expands the placeholders from the request's own token
-    # IDs, so the retokenize-avoidance rebuild in process_and_combine_mm_data
-    # would only rebuild the identical sequence.
+    # The GPU wrapper expands placeholders from the request's own token IDs.
     preserve_processor_input_ids = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
@@ -537,16 +533,22 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         **kwargs,
     ):
         expected_image_count = len(image_data or [])
-        if self.validate_tokenized_image_placeholders(
-            input_text, self.mm_tokens.image_token_id, expected_image_count
-        ):
+        placeholder_count = self.count_image_placeholders(
+            input_text, self.mm_tokens.image_token_id
+        )
+        if placeholder_count is not None:
+            if placeholder_count != expected_image_count:
+                raise ValueError(
+                    "Kimi image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                )
             base_output = await self.fast_load_mm_data(
                 prompt=input_text,
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
-                # Unlike load_mm_data, fast_load_mm_data does not derive
-                # input_ids from the prompt; without this the wrapper falls
-                # back to re-tokenizing the expanded placeholder string.
+                # fast_load_mm_data, unlike load_mm_data, does not derive
+                # input_ids from the prompt; without this the wrapper falls back
+                # to re-tokenizing the expanded string.
                 input_ids=input_text,
             )
         else:
@@ -555,12 +557,13 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
                 image_data=image_data,
                 multimodal_tokens=self.mm_tokens,
             )
-
-        if len(base_output.images) != expected_image_count:
-            raise ValueError(
-                "Kimi image placeholders must map one-to-one to image data: "
-                f"expected {expected_image_count}, loaded {len(base_output.images)}"
-            )
+            # Only the text-scanning loader can come back with a different
+            # count; fast_load_mm_data fills one slot per image_data entry.
+            if len(base_output.images) != expected_image_count:
+                raise ValueError(
+                    "Kimi image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, loaded {len(base_output.images)}"
+                )
 
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
