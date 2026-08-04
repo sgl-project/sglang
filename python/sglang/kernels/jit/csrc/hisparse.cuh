@@ -49,6 +49,56 @@ __device__ __forceinline__ void transfer_item_warp(
     dst[i] = src[i];
   }
 }
+
+// Copies one DSv4 C4 token as a single 73-word space instead of two separate
+// transfer_item_warp calls.
+//
+// A token is a 576B value and an 8B scale that sit in different runs of the
+// page row, so it cannot be moved as one contiguous range. Copying the two
+// pieces separately costs three wavefront passes on wave64 -- 64 value words,
+// 8 value words, then 1 scale word -- and because item_size_bytes reaches
+// transfer_item_warp as a runtime argument the compiler keeps the value copy
+// as a rolled loop with s_waitcnt vmcnt(0) inside it, so all three passes
+// serialize on host memory latency. Walking one 73-word space puts the value
+// tail and the scale in the same pass, and the pass count being a compile-time
+// constant lets both loads issue before either store, leaving one exposed
+// round trip instead of three. This is the same shape as the CUDA
+// device::hisparse::transfer_item, adapted to wave64.
+__device__ __forceinline__ void transfer_dsv4_item_warp(
+    int32_t lane_id,
+    const int64_t* __restrict__ src_value,
+    const int64_t* __restrict__ src_scale,
+    int64_t* __restrict__ dst_value,
+    int64_t* __restrict__ dst_scale) {
+  constexpr int32_t kValueWords = static_cast<int32_t>(device::hisparse::kValueBytes / sizeof(int64_t));
+  constexpr int32_t kTotalWords = static_cast<int32_t>(device::hisparse::kItemBytes / sizeof(int64_t));
+  constexpr int32_t kPasses = (kTotalWords + WARP_SIZE - 1) / WARP_SIZE;
+  static_assert(device::hisparse::kValueBytes % sizeof(int64_t) == 0, "value must be whole 64-bit words");
+  static_assert(device::hisparse::kScaleBytes % sizeof(int64_t) == 0, "scale must be whole 64-bit words");
+
+  const int64_t* src_slot[kPasses];
+  int64_t* dst_slot[kPasses];
+  int64_t staged[kPasses];
+
+#pragma unroll
+  for (int32_t p = 0; p < kPasses; ++p) {
+    const int32_t i = p * WARP_SIZE + lane_id;
+    const bool is_value = i < kValueWords;
+    const bool is_scale = !is_value && i < kTotalWords;
+    src_slot[p] = is_value ? src_value + i : (is_scale ? src_scale + (i - kValueWords) : nullptr);
+    dst_slot[p] = is_value ? dst_value + i : (is_scale ? dst_scale + (i - kValueWords) : nullptr);
+    if (src_slot[p] != nullptr) {
+      staged[p] = *src_slot[p];
+    }
+  }
+
+#pragma unroll
+  for (int32_t p = 0; p < kPasses; ++p) {
+    if (dst_slot[p] != nullptr) {
+      *dst_slot[p] = staged[p];
+    }
+  }
+}
 #else
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
@@ -521,14 +571,13 @@ __global__ void load_cache_to_device_buffer_kernel(
       // ROCm path: host cache and device buffer both use the page-padded C4
       // layout (same as the write path and the CUDA branch). We can't reuse
       // device::hisparse::transfer_item here because its warp logic is hardcoded
-      // to a 32-lane warp; on wavefront64 we use the warp-width-agnostic
-      // transfer_item_warp with paged source and destination addressing.
+      // to a 32-lane warp; on wavefront64 we use transfer_dsv4_item_warp, which
+      // moves the value and the scale in one warp-width-agnostic copy.
       using namespace device::hisparse;
       const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(device_buffer_k, static_cast<int32_t>(dst_loc));
       const auto [src_value_ptr, src_scale_ptr] =
           get_pointer_paged(const_cast<void*>(host_cache_k), static_cast<int32_t>(src_loc));
-      transfer_item_warp(lane_id, src_value_ptr, dst_value_ptr, kValueBytes);
-      transfer_item_warp(lane_id, src_scale_ptr, dst_scale_ptr, kScaleBytes);
+      transfer_dsv4_item_warp(lane_id, src_value_ptr, src_scale_ptr, dst_value_ptr, dst_scale_ptr);
 #else
       // CUDA path: page-padded device layout + page-padded host layout, K-only.
       // The host cache is pinned DRAM but uses the same row layout as the GPU C4
