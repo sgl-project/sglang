@@ -88,6 +88,8 @@ export const config = {
   // Playground axes on top of the selected Deploy cell. All variants tp=1;
   // the speculative select flips MTP (EAGLE) — the preset the LL cells bake in.
   playgroundFeatures: {
+
+    // ----- Attention Parallelism -----
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 1, 2, 4, 8] },
@@ -96,15 +98,104 @@ export const config = {
           labels: { "auto": "Auto", "false": "Off" } },
       ],
     },
+
+    // ----- MoE Parallelism (35B-A3B is MoE; hidden on the dense 27B) -----
+    moe: {
+      backend: {
+        options: [
+          { id: null,     label: "Inherited" },
+          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"],
+            hide: { variant: ["27b"] } },
+        ],
+      },
+      ep: { label: "EP", values: [
+        null,
+        { value: 1, hide: { variant: ["27b"] } },
+        { value: 2, hide: { variant: ["27b"] } },
+        { value: 4, hide: { variant: ["27b"] } },
+        { value: 8, hide: { variant: ["27b"] } },
+      ]},
+    },
+
+    // ----- Parsers (Qwen3.6: qwen3 reasoning + qwen3_coder tool-call; Playground-only) -----
+    parsers: {
+      items: [
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser qwen3_coder" },
+      ],
+    },
+
+    // ----- Speculative Decoding (EAGLE / MTP); disabled on Xeon (unsupported) -----
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
-        { id: "eagle",   label: "EAGLE / MTP",
+        { id: "eagle",   label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
+          disable: { hw: ["xeon"] },
+          disableReason: "Speculative decoding is not supported on Xeon (CPU)." },
       ],
     },
+
+    // ----- PD Disaggregation -----
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        { id: "mooncake", label: "Mooncake" },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Hierarchical KV Cache -----
+    hicache: {
+      backends: [
+        { id: null,       label: "Auto" },
+        { id: "file",     label: "File" },
+        { id: "mooncake", label: "Mooncake" },
+        { id: "hf3fs",    label: "HF3FS" },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      writePolicies: [
+        { id: "auto",          label: "Auto" },
+        { id: "write_through", label: "Write-through" },
+        { id: "write_back",    label: "Write-back" },
+      ],
+    },
+
+    // ----- Mamba Radix Cache (Qwen3.6 hybrid Gated-Delta-Net) -----
+    // Coupled with MTP in the Deploy cells (LL bakes V2); exposed here to override.
+    flagSelects: [
+      {
+        id: "mambaCache",
+        title: "Mamba Radix Cache",
+        stripPrefixes: ["--mamba-radix-cache-strategy"],
+        options: [
+          { id: "auto", label: "Inherited" },
+          { id: "v1",   label: "V1 (off)" },
+          { id: "v2",   label: "V2 (extra_buffer)",
+            flags: ["--mamba-radix-cache-strategy extra_buffer"] },
+        ],
+      },
+    ],
   },
 
   cells: [
@@ -687,10 +778,11 @@ export const config = {
     // ---- Xeon (CPU) — speculative unsupported -> single recipe -> balanced.
     // Ported verbatim from the legacy generator (--device cpu --disable-overlap-schedule
     // --tp {3 for 35B-A3B, 6 for 27B}; no spec/mamba/mem-fraction/trtllm_mha). NVFP4 is
-    // Blackwell-only, so Xeon has bf16+fp8 only. verified:false — no Xeon box to benchmark.
+    // Blackwell-only, so Xeon has bf16+fp8 only. verified:true — Intel-provided/vetted
+    // recipe (no perf benchmark on our side, so these render with no speed row).
     {
       match: { hw: "xeon", variant: "35b-a3b", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -703,7 +795,7 @@ export const config = {
     },
     {
       match: { hw: "xeon", variant: "35b-a3b", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -716,7 +808,7 @@ export const config = {
     },
     {
       match: { hw: "xeon", variant: "27b", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -729,7 +821,7 @@ export const config = {
     },
     {
       match: { hw: "xeon", variant: "27b", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
