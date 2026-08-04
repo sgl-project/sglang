@@ -352,6 +352,13 @@ class RustServer:
         server_args = dict(vars(scheduler.server_args))
         model_config = dict(vars(scheduler.model_config))
         model_config["hf_config"] = None  # HF config is not JSON-serializable
+        # Resolved default sampling params (generation_config.json when
+        # `--sampling-defaults model`, {} otherwise). The rust server consumes
+        # these for omitted temperature/top_p in chat conversions instead of
+        # hard-coding the OpenAI terminal defaults.
+        model_config["default_sampling_params"] = (
+            scheduler.model_config.get_default_sampling_params()
+        )
         server_args["model_config"] = model_config
         # Launch-time facts Python's /server_info reports from scheduler_info /
         # the package — stamped here so the rust endpoint can serve them

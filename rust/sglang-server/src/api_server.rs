@@ -20,13 +20,14 @@ use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
-/// Shared handler state: the submit machinery (`senders`, `egress_buf`)
-/// + shared tokenizer.
+/// Shared handler state: submission handles, immutable server configuration,
+/// and the API-owned chat formatter.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    chat_formatter: Option<openai::ChatFormatter>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
@@ -42,10 +43,12 @@ pub async fn serve(
     // releases.
     shutdown: flume::Receiver<()>,
 ) {
+    let chat_formatter = openai::load_chat_support(&server_args);
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
+        chat_formatter,
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.
@@ -88,6 +91,14 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
+    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
+    // Nagle/delayed-ACK penalty on keep-alive connections.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|io| {
+        if let Err(e) = io.set_nodelay(true) {
+            tracing::debug!(error = %e, "set_nodelay failed");
+        }
+    });
     // `with_connect_info` exposes the peer address to the access-log middleware.
     let serve = axum::serve(
         listener,

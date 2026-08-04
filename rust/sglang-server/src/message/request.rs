@@ -359,6 +359,9 @@ impl GenerateBody {
                 rid,
                 text,
                 input_ids,
+                // Native text prompts keep the post-processor specials; the
+                // chat flow sets this explicitly.
+                skip_special_tokens: false,
                 sampling_params,
                 stream,
                 // Python `GenerateReqInput` defaults.
@@ -394,6 +397,13 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the egress is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
+    /// Internal service call: decode a complete token-id sequence to text. Walks
+    /// the same FSM as every request (validate → register → Queued), but the
+    /// stage that answers it is the detok shard itself, never the scheduler
+    /// ring; the result arrives on the registered sink as one `Data` payload
+    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
+    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
+    Detokenize { token_ids: TokenIds },
 }
 
 /// A single in-flight `/generate` request (per-item from
@@ -422,6 +432,12 @@ pub struct GenerateRequest {
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
+    /// Template-rendered prompts (chat) already contain their role/special
+    /// tokens, so the tokenizer pool strips the auto-added BOS/EOS prefix —
+    /// the Rust analogue of Python's `add_special_tokens=False` at the
+    /// chat-template encode site (`serving_chat._encode_messages`). Consumed
+    /// by the pool before the header is built; never reaches the scheduler wire.
+    pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified at ingress, then serialized into the header.
     pub sampling_params: SamplingParams,
