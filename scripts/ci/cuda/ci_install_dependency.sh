@@ -171,6 +171,17 @@ clean_site_packages() {
         set -x
     fi
 
+    # An orphaned sglang/ shadows the checkout: `uv pip uninstall` deletes only
+    # what RECORD lists, so __pycache__ keeps the directory alive without
+    # __init__.py, PathFinder claims it as a namespace portion, and the editable
+    # install's _EditableFinder sits at the END of sys.meta_path - submodule
+    # imports fail. No install leaves this directory without __init__.py.
+    if [ -d "$SITE_PACKAGES/sglang" ] && [ ! -f "$SITE_PACKAGES/sglang/__init__.py" ]; then
+        echo "Removing orphaned sglang skeleton that would shadow the checkout: $SITE_PACKAGES/sglang"
+        find "$SITE_PACKAGES/sglang" -maxdepth 2 | head -20
+        rm -rf "$SITE_PACKAGES/sglang"
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -180,41 +191,65 @@ install_rust_build_dependencies() {
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-configure_rust_toolchain() {
-    # setuptools-rust launches Cargo from python/, outside the directory scope
-    # of rust/rust-toolchain.toml. Force that repository pin into the process
-    # environment so a runner's mutable default toolchain cannot win instead.
+    # install_rustup.sh installs the workspace pin and exports it to later
+    # Actions steps. Re-export it in this parent shell because setuptools-rust
+    # runs below in the same step, from python/ rather than rust/.
     local toolchain_file pinned_channel selected_rustc selected_cargo
+    local actual_rustc_identity actual_cargo_identity
+    local expected_rustc_identity expected_cargo_identity
+    local -a rust_channels
     toolchain_file="${REPO_ROOT}/rust/rust-toolchain.toml"
-    pinned_channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${toolchain_file}")
-    if [ -z "${pinned_channel}" ]; then
-        echo "ERROR: Could not read a Rust channel from ${toolchain_file}"
+    mapfile -t rust_channels < <(
+        sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "${toolchain_file}"
+    )
+    if [ "${#rust_channels[@]}" -ne 1 ] || [ -z "${rust_channels[0]}" ]; then
+        echo "ERROR: Expected exactly one Rust channel in ${toolchain_file}"
         exit 1
     fi
+    pinned_channel="${rust_channels[0]}"
     if ! command -v rustup >/dev/null 2>&1; then
-        echo "ERROR: rustup is required to enforce the repository Rust toolchain (${pinned_channel})"
+        echo "ERROR: rustup is required to verify repository toolchain ${pinned_channel}"
         exit 1
     fi
-
-    # install_rustup.sh normally installed this already. Repeat idempotently so
-    # a partial or stale runner setup cannot silently fall back to its default.
-    rustup toolchain install --profile minimal "${pinned_channel}"
     export RUSTUP_TOOLCHAIN="${pinned_channel}"
 
     selected_rustc=$(rustup which rustc)
     selected_cargo=$(rustup which cargo)
-    if [ "${selected_rustc}" != "$(rustup which --toolchain "${pinned_channel}" rustc)" ] \
-        || [ "${selected_cargo}" != "$(rustup which --toolchain "${pinned_channel}" cargo)" ]; then
+    actual_rustc_identity=$(rustc --version --verbose)
+    actual_cargo_identity=$(cargo --version --verbose)
+    expected_rustc_identity=$("${selected_rustc}" --version --verbose)
+    expected_cargo_identity=$("${selected_cargo}" --version --verbose)
+    if [ "${actual_rustc_identity}" != "${expected_rustc_identity}" ] \
+        || [ "${actual_cargo_identity}" != "${expected_cargo_identity}" ]; then
         echo "ERROR: Active Rust tools do not resolve to repository toolchain ${pinned_channel}"
         exit 1
     fi
 
-    echo "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN}"
-    rustc --version --verbose
-    cargo --version --verbose
+    echo "Using pinned Rust toolchain ${pinned_channel} for this install"
+    printf '%s\n' "${actual_rustc_identity}"
+    printf '%s\n' "${actual_cargo_identity}"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+setup_cargo_cache() {
+    # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
+    # rust/target, so every job recompiles the whole dependency graph. Move the
+    # target dir out of the tree: setuptools-rust has no target-dir option of its
+    # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
+    export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    mkdir -p "${CARGO_TARGET_DIR}"
+
+    # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
+    # carries the ENOSPC story). cargo cannot prune partially, so drop the whole
+    # tree and pay one cold build.
+    local used
+    used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+    if [ "${used:-0}" -ge 85 ]; then
+        echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+        rm -rf "${CARGO_TARGET_DIR}"
+        mkdir -p "${CARGO_TARGET_DIR}"
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -636,6 +671,24 @@ verify_imports() {
     python3 -c "import torch; print(torch.version.cuda)"
     python3 -c "import cutlass; import cutlass.cute;"
 
+    # A shadowed sglang still imports, so without this the failure only surfaces
+    # as a missing submodule during the test step. find_spec, not import: the
+    # finders alone answer this and importing would pull in torch for nothing.
+    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import importlib.util, os
+want = os.environ["SGLANG_EXPECTED_INIT"]
+spec = importlib.util.find_spec("sglang")
+if spec is None:
+    raise SystemExit("sglang is not importable at all after install")
+if spec.origin != want:
+    raise SystemExit(
+        f"sglang resolves to origin={spec.origin} "
+        f"(search={list(spec.submodule_search_locations or [])}), expected {want}; "
+        "something in site-packages is shadowing the checkout"
+    )
+print(f"sglang resolves to {spec.origin}")
+'
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -651,8 +704,8 @@ main() {
     install_apt_packages
     clean_site_packages
     if [ -z "${SGLANG_CI_PREBUILT_WHEEL:-}" ]; then
+        setup_cargo_cache
         install_rust_build_dependencies
-        configure_rust_toolchain
     else
         echo "Prebuilt SGLang wheel selected; skipping Rust build setup"
     fi

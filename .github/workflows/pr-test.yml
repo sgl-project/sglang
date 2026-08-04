@@ -233,6 +233,27 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # H20 runners use the host's CPython 3.12, so they need a separate x86_64
+  # wheel from the CPython 3.10 artifact consumed by the other x86 stages.
+  sglang-build-wheel-py312:
+    needs: [check-changes, call-gate]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-sglang-wheel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build SGLang Wheel Python 3.12
+      arch_suffix: '-x86_64-cp312'
+      clean_persistent_workspace: true
+      python_version: '3.12'
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   # GB300 is ARM64, so it consumes a wheel built and verified on the same
   # architecture rather than attempting to install the x86 artifact above.
   sglang-build-wheel-arm:
@@ -545,7 +566,7 @@ jobs:
     secrets: inherit
 
   base-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sglang-build-wheel]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, sglang-build-wheel-py312]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -555,7 +576,7 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
-      sglang_wheel_artifact: ${{ needs.sglang-build-wheel.outputs.artifact_name }}
+      sglang_wheel_artifact: ${{ needs.sglang-build-wheel-py312.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-deepep-4-gpu-h100:
@@ -643,6 +664,7 @@ jobs:
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
         sglang-build-wheel,
+        sglang-build-wheel-py312,
         sglang-build-wheel-arm,
         call-sgl-kernel-tests,
 
