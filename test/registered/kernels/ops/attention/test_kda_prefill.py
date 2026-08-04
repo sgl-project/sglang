@@ -1,3 +1,5 @@
+import os
+import shutil
 import unittest
 
 import torch
@@ -123,6 +125,16 @@ class TestKdaPrefill(CustomTestCase):
         ):
             self.skipTest("PTX KDA prefill requires GB300")
         q, k, v, gate, beta_logits, a_log, dt_bias, state = _inputs(1)
+        if os.environ.get("SGLANG_IS_IN_CI") == "true":
+            # Temporary CI cleanup for a diagnostic PR: run this a few times to
+            # clear stale GB300 runner caches, then close the PR. Do not merge.
+            from torch.utils.cpp_extension import get_default_build_root
+
+            torch_extensions_dir = os.environ.get(
+                "TORCH_EXTENSIONS_DIR", get_default_build_root()
+            )
+            shutil.rmtree(torch_extensions_dir, ignore_errors=True)
+            os.makedirs(torch_extensions_dir, exist_ok=True)
         actual, actual_state = ptx_chunk_kda_fwd(
             q=q,
             k=k,
