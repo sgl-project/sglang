@@ -113,9 +113,11 @@ pub struct GenerateBody {
     #[serde(default)]
     pub image_data: Option<rmpv::Value>,
     /// Caller-supplied per-item content hashes (hex strings) that override the
-    /// computed ones, so an external router's keys align with the prefix
-    /// cache. Python parity: honored on single requests only — the Python
-    /// `__getitem__` fan-out does not forward it to batch sub-requests.
+    /// computed ones, so an external router's keys align with the prefix cache.
+    /// Single requests only — `GenerateReqInput` declares the batched shapes, but
+    /// its `__getitem__` never forwards them to sub-requests, so Python drops
+    /// them; a batch that sends them is rejected here rather than answered with
+    /// hashes it did not ask for.
     #[serde(default)]
     pub mm_hashes: Option<rmpv::Value>,
     #[serde(default)]
@@ -340,6 +342,17 @@ impl GenerateBody {
         let bootstrap_pair_keys =
             flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
         let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
+        // `mm_hashes` has no batch form: Python's `__getitem__` never forwards the
+        // field to sub-requests, and honoring it only here would give the two
+        // servers different prefix-cache keys for the same body. Reject rather than
+        // drop (Python's silent choice) — the field exists to align a caller's
+        // keys, so ignoring it returns subtly wrong ones, where a 400 is
+        // actionable.
+        if is_batch && mm_value_present(&mm_hashes) {
+            return Err(Error::Validation(
+                "mm_hashes is not supported for batch requests; send one request per prompt".into(),
+            ));
+        }
         // Multimodal columns, mirroring the Python batch-normalize rules
         // (`_normalize_image_data` / `_normalize_video_data` / `_normalize_audio_data`).
         let images = split_mm_column(image_data, n, is_batch, MmBroadcast::WrapInList)
@@ -421,8 +434,8 @@ impl GenerateBody {
         .collect();
         let mut requests: Vec<GenerateRequest> = requests;
         // Python parity: `mm_hashes` reaches the processor only for single
-        // requests (the batch `__getitem__` drops it); malformed shapes are
-        // ignored, never a 400.
+        // requests (batches are rejected above); malformed entries are ignored,
+        // never a 400.
         if !is_batch
             && let (Some(rmpv::Value::Array(vals)), Some(req)) = (mm_hashes, requests.first_mut())
             && let Some(mm) = req.mm.as_deref_mut()
@@ -1047,14 +1060,21 @@ mod tests {
         assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
         assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
 
-        let (ps, _) = requests(
+        // A batch cannot carry hashes (Python drops them), so it is rejected...
+        for body in [
             r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
-        )
-        .unwrap();
-        assert!(
-            ps.iter()
-                .all(|p| p.mm.as_ref().unwrap().mm_hashes.is_empty())
-        );
+            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": ["x", "y"]}"#,
+        ] {
+            let err = requests(body).err().unwrap();
+            assert!(matches!(err, Error::Validation(_)), "{body}: {err:?}");
+        }
+        // ...while an absent or empty field is not a payload and must still pass.
+        for body in [
+            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": null}"#,
+            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": []}"#,
+        ] {
+            assert!(requests(body).is_ok(), "{body}");
+        }
     }
 
     /// `take_mm_work` clones `text` (the scheduler header still needs it) and
