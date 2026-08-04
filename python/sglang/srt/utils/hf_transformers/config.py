@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -214,6 +215,41 @@ class MistralModelConfigParser(ModelConfigParserBase):
         )
 
 
+def _validate_local_model_path(model) -> None:
+    """Raise a clear error when a local filesystem path is requested but missing.
+
+    The HF stack (``AutoConfig.from_pretrained`` and friends) treats any string
+    that is not an existing local path as a Hugging Face Hub repo id and runs
+    ``validate_repo_id`` on it. For an absolute path such as
+    ``/workspace/models/eagle`` that validation fails with a cryptic
+    ``HFValidationError: Repo id must be in the form 'repo_name' or
+    'namespace/repo_name'``, which hides the real problem (the path is
+    misspelled or not mounted in this process). This is especially confusing for
+    ``--speculative-draft-model-path``: the main model loads fine from an
+    absolute path, so users do not expect the draft path to be rejected purely
+    for being absolute.
+
+    We pre-check inputs that are unambiguously local paths (absolute, or
+    starting with ``./``, ``../`` or ``~``) and raise an explicit
+    ``FileNotFoundError`` instead. Hub repo ids like ``org/model`` never match
+    these patterns, so remote loading is never affected.
+    """
+    if not isinstance(model, (str, os.PathLike)):
+        return
+    model_str = os.fspath(model)
+    looks_like_local_path = os.path.isabs(model_str) or model_str.startswith(
+        ("./", "../", "~")
+    )
+    if looks_like_local_path and not os.path.exists(os.path.expanduser(model_str)):
+        raise FileNotFoundError(
+            f"Local model path '{model_str}' does not exist. "
+            "If you meant to download from the Hugging Face Hub, pass a repo id "
+            "like 'org/model' (no leading '/', './' or '~'). Otherwise, check "
+            "that the path is spelled correctly and is mounted/accessible inside "
+            "this process (e.g. the container or pod)."
+        )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -243,6 +279,11 @@ def get_config(
         client = create_remote_connector(model)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
+
+    # Surface a clear error for missing local paths before the HF stack
+    # mis-classifies them as Hub repo ids and fails with a cryptic
+    # HFValidationError (see _validate_local_model_path for details).
+    _validate_local_model_path(model)
 
     if model_config_parser == "auto":
         # `model` is post-rewrite (gguf parent / runai uri / remote pull).
