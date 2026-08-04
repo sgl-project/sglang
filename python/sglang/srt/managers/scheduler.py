@@ -3904,9 +3904,6 @@ class Scheduler(
         # reset token ratio
         self.new_token_ratio_tracker.reset()
 
-        # reset device timer window so idle time isn't counted
-        self.metrics_reporter.reset_device_timer_window()
-
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
 
