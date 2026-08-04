@@ -346,6 +346,7 @@ class FusedMoE(torch.nn.Module):
             layer_id=layer_id,
             top_k=top_k,
             num_fused_shared_experts=num_fused_shared_experts,
+            moe_ep_size=self.moe_ep_size,
             params_dtype=params_dtype,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,

@@ -43,6 +43,7 @@ class MoeRunnerConfig:
     layer_id: Optional[int] = None
     top_k: Optional[int] = None
     num_fused_shared_experts: Optional[int] = None
+    moe_ep_size: int = 1
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
