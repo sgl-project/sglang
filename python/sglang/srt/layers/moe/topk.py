@@ -472,6 +472,29 @@ class TopK(MultiPlatformOp):
         assert TopKOutputChecker.format_is_standard(topk_output)
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
+    def _get_output_format(self) -> TopKOutputFormat:
+        if self.topk_config.output_format is not None:
+            return self.topk_config.output_format
+        if get_moe_runner_backend().is_triton_kernels():
+            return TopKOutputFormat.TRITON_KERNEL
+        # ===== TO BE REFACTORED ====
+        if get_moe_runner_backend().is_experimental_sgl_trtllm():
+            try:
+                use_standard_for_lora = bool(get_lora().enable_lora)
+            except ValueError:
+                use_standard_for_lora = False
+            return (
+                TopKOutputFormat.STANDARD
+                if use_standard_for_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        # ===== END TO BE REFACTORED ====
+        if get_moe_runner_backend().is_flashinfer_trtllm() or (
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        ):
+            return TopKOutputFormat.BYPASSED
+        return TopKOutputFormat.STANDARD
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -507,29 +530,6 @@ class TopK(MultiPlatformOp):
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
-
-    def _get_output_format(self) -> TopKOutputFormat:
-        if self.topk_config.output_format is not None:
-            return self.topk_config.output_format
-        if get_moe_runner_backend().is_triton_kernels():
-            return TopKOutputFormat.TRITON_KERNEL
-        # ===== TO BE REFACTORED ====
-        if get_moe_runner_backend().is_experimental_sgl_trtllm():
-            try:
-                use_standard_for_lora = bool(get_lora().enable_lora)
-            except ValueError:
-                use_standard_for_lora = False
-            return (
-                TopKOutputFormat.STANDARD
-                if use_standard_for_lora
-                else TopKOutputFormat.BYPASSED
-            )
-        # ===== END TO BE REFACTORED ====
-        if get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
-        ):
-            return TopKOutputFormat.BYPASSED
-        return TopKOutputFormat.STANDARD
 
     def forward_cuda(
         self,
