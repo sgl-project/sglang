@@ -860,8 +860,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -872,6 +870,12 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is produced on the current stream and consumed asynchronously
+        # by stream_kv. Keep the allocation alive until the current stream has
+        # been ordered after stream_kv; otherwise CUDA Graph's memory pool may
+        # reuse it for _compute_q_b while the KV branch is still reading it.
+        del qkv_a
 
         return q
 
