@@ -164,9 +164,15 @@ jobs:
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
-          uv venv /tmp/rust-ext-build --python python3.10 --seed
+          # Per-job path: these runners are persistent and shared, so a fixed one
+          # both inherits the previous job's venv and races a concurrent build.
+          venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
+          # would fail the step, and nothing here is worth keeping for a postmortem.
+          trap 'rm -rf "${venv}" || true' EXIT
+          uv venv "${venv}" --python python3.10 --seed
           # shellcheck disable=SC1091
-          source /tmp/rust-ext-build/bin/activate
+          source "${venv}/bin/activate"
           uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
           cd python
           SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace
