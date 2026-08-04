@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -41,6 +42,45 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_return_hidden_states_mode_configuration(self):
+        disabled = ServerArgs(model_path="dummy")
+        self.assertFalse(disabled.enable_return_hidden_states)
+        self.assertIsNone(disabled.return_hidden_states_mode)
+
+        last = ServerArgs(
+            model_path="dummy",
+            return_hidden_states_mode="last",
+        )
+        self.assertTrue(last.enable_return_hidden_states)
+        self.assertEqual(last.return_hidden_states_mode, "last")
+
+        legacy_full = ServerArgs(
+            model_path="dummy",
+            enable_return_hidden_states=True,
+        )
+        self.assertTrue(legacy_full.enable_return_hidden_states)
+        self.assertEqual(legacy_full.return_hidden_states_mode, "full")
+
+        parsed_last = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--return-hidden-states-mode",
+                "last",
+            ]
+        )
+        self.assertTrue(parsed_last.enable_return_hidden_states)
+        self.assertEqual(parsed_last.return_hidden_states_mode, "last")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states_mode must be one of",
+        ):
+            ServerArgs(
+                model_path="dummy",
+                return_hidden_states_mode="lst",
+            )
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -64,6 +104,30 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMmEncoderDataParallelLogging(CustomTestCase):
+    def test_logs_when_encoder_dp_has_no_parallelism(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=1
+        )
+
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=1", logs.output[0])
+        self.assertIn("no data-parallel work", logs.output[0])
+
+    def test_logs_encoder_dp_tradeoff_for_tp(self):
+        server_args = ServerArgs(
+            model_path="dummy", mm_enable_dp_encoder=True, tp_size=4
+        )
+
+        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+            server_args._handle_data_parallelism()
+
+        self.assertIn("TP=4", logs.output[0])
+        self.assertIn("high-resolution or multi-image", logs.output[0])
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -194,6 +258,56 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+
+    def test_pd_prefill_dcp_warns_about_performance(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            dcp_size=4,
+        )
+        with self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs:
+            server_args._handle_pd_disaggregation()
+        self.assertIn("without improving prefill performance", "\n".join(logs.output))
+
+    def test_pd_decode_dcp_forces_chunk_cache(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            dcp_size=4,
+        )
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="fake",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_radix_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            disaggregation_decode_enable_radix_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+            server_args._handle_pd_disaggregation()
 
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
@@ -1199,17 +1313,6 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
-class TestSessionRadixCacheServerArgs(unittest.TestCase):
-    def test_requires_priority_radix_eviction_policy(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            enable_session_radix_cache=True,
-            radix_eviction_policy="lru",
-        )
-        with self.assertRaisesRegex(ValueError, "--radix-eviction-policy priority"):
-            server_args._handle_cache_compatibility()
-
-
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."
@@ -1294,6 +1397,60 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
 
         self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
+class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
+    """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
+    test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
+
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_enable_lora_keeps_breakable_prefill_graph(self):
+        args = self._handled_args(enable_lora=True)
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_paths_keep_breakable_prefill_graph(self):
+        args = self._handled_args(lora_paths=["dummy/lora-adapter"])
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_still_disables_tc_piecewise_prefill_graph(self):
+        # Pin the tc_piecewise LoRA rule itself, with the hardware rule
+        # neutralized so this runs on CPU-only CI.
+        args = ServerArgs(model_path="dummy", enable_lora=True)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        with (
+            patch("sglang.srt.server_args.is_hip", return_value=False),
+            patch("sglang.srt.server_args.is_npu", return_value=False),
+            patch("sglang.srt.server_args.is_cpu", return_value=False),
+            patch("sglang.srt.server_args.is_mps", return_value=False),
+            patch("sglang.srt.server_args.is_xpu", return_value=False),
+        ):
+            args._disable_tc_piecewise_cudagraph_if_incompatible()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
 
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):

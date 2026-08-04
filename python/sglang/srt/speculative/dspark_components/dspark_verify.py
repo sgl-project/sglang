@@ -5,6 +5,23 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
+    AcceptSampling,
+    FinalizeAcceptLens,
+    SelectMixedAccept,
+    SoftmaxTemp,
+    accept_greedy_triton,
+    finalize_accept_lens_triton,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildCommitInjectLayout,
+    BuildOutTokens,
+    BuildRaggedVerifyWindow,
+    RaggedVerifyWindow,
+    ScatterCompactToStrided,
+    scatter_compact_to_strided_into,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -19,24 +36,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
-    AcceptGreedy,
-    AcceptSampling,
-    FinalizeAcceptLens,
-    SelectMixedAccept,
-    SoftmaxTemp,
-    accept_greedy_triton,
-    finalize_accept_lens_triton,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
-    BuildCommitInjectLayout,
-    BuildOutTokens,
-    BuildRaggedVerifyWindow,
-    RaggedVerifyWindow,
-    ScatterCompactToStrided,
-    scatter_compact_to_strided_into,
-)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+# Draft proposal probs feeding rejection sampling; the data layer is the
+# in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
+_VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -49,7 +54,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
         return False
-    if getattr(sampling_info, "vocab_mask", None) is not None:
+    if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
@@ -677,6 +682,7 @@ def accept_draft_tokens(
         temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
     ).view(bs, gamma_rows, vocab)
+    expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,

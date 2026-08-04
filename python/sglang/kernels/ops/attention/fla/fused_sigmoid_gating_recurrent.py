@@ -12,6 +12,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     dt_bias,
     softplus_beta,
     softplus_threshold,
+    lower_bound,
     q,
     k,
     v,
@@ -19,6 +20,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    stride_h0_source,
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
@@ -47,10 +49,24 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    # ReplaySSM fused ring-write. Pointers stay None and CACHE_RING False for
+    # decode / flag-off -> byte-identical. The gate ring layout follows IS_KDA
+    # (see the store below).
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
+    stride_rawv_slot: tl.constexpr = 0,
+    stride_rawk_slot: tl.constexpr = 0,
+    stride_g_slot: tl.constexpr = 0,
+    stride_beta_slot: tl.constexpr = 0,
+    MAX_CACHE_LEN: tl.constexpr = 0,
+    CACHE_RING: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -94,11 +110,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        # Slot stride comes from the caller (h0_source.stride(0)): the state pool
+        # may be an envelope-strided view (page-major / unified memory), where the
+        # per-slot pitch spans ALL layers' state, not HV*K*V. int64: envelope
+        # pitches overflow an int32 index product.
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_source
                 + i_hv * K * V
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -118,10 +138,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             retrieve_parent_token_base, mask=mask_retrieve, other=0
         )
 
-    # Prepare intermediate state cache index if enabled
+    # Prepare intermediate state cache index if enabled. int64: the buffer is
+    # contiguous but `cache_idx * cache_steps * HV * K * V` can exceed int32 for
+    # large slot counts.
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
@@ -159,19 +181,86 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_a = tl.load(p_a).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        if USE_LOWER_BOUND:
+            # KDA safe gate: lower_bound * sigmoid(exp(A_log) * (a + dt_bias))
+            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            # Compute g = -exp(A_log) * softplus(a + dt_bias)
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+        # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
+        # into the per-slot ring for the commit fold to replay. Must sit here --
+        # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed,
+        # so the fold's replay is bit-identical to the update below. rawk uses
+        # the k-head i_h (shared across a GQA group); rawv/g/beta use the v-head
+        # i_hv. step_idx < MAX_CACHE_LEN: absorb-inflated rows can exceed the
+        # ring; the overflow steps are past the committable prefix, so drop them
+        # (writing them would smash the next slot's ring).
+        if CACHE_RING:
+            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + ring_slot * stride_rawv_slot
+                    + i_hv * MAX_CACHE_LEN * V
+                    + step_idx * V
+                    + o_v,
+                    b_v.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if i_v == 0:
+                    tl.store(
+                        replayssm_rawk
+                        + ring_slot * stride_rawk_slot
+                        + i_h * MAX_CACHE_LEN * K
+                        + step_idx * K
+                        + o_k,
+                        b_k.to(replayssm_rawk.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                    # b_g follows IS_KDA: KDA loads a/dt_bias with mask_k, so the
+                    # gate is a per-K vector and the ring row is K wide; GDN's is
+                    # a scalar per (head, step). The two layouts are not
+                    # interchangeable -- storing one into the other's stride is a
+                    # shape error, not a slow path -- and memory_pool.py sizes
+                    # replayssm_g off the same is_kda test.
+                    if IS_KDA:
+                        tl.store(
+                            replayssm_g
+                            + ring_slot * stride_g_slot
+                            + i_hv * MAX_CACHE_LEN * K
+                            + step_idx * K
+                            + o_k,
+                            b_g,
+                            mask=mask_k,
+                        )
+                    else:
+                        tl.store(
+                            replayssm_g
+                            + ring_slot * stride_g_slot
+                            + i_hv * MAX_CACHE_LEN
+                            + step_idx,
+                            b_g,
+                        )
+                    if i_k == 0:
+                        tl.store(
+                            replayssm_beta
+                            + ring_slot * stride_beta_slot
+                            + i_hv * MAX_CACHE_LEN
+                            + step_idx,
+                            b_beta,
+                        )
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -226,11 +315,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_indices + i_n).to(tl.int64)
             if idx >= 0:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + idx * stride_h0_source
                     + i_hv * K * V
                     + o_v[None, :] * K
                     + o_k[:, None]
@@ -254,6 +343,7 @@ def fused_sigmoid_gating_delta_rule_update(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
+    lower_bound: Optional[float] = None,
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
@@ -262,6 +352,14 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
+    # stores pre-norm k / raw v / gate / beta into these per-slot rings,
+    # replacing the eager ring-write. Off by default -> decode unchanged.
+    cache_ring: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -319,12 +417,36 @@ def fused_sigmoid_gating_delta_rule_update(
         else 0
     )
 
+    # ring strides (per-slot rings are contiguous [num_slots, heads, L, dim];
+    # the kernel offsets within a slot with MAX_CACHE_LEN and the dim extents).
+    if cache_ring:
+        # stride(0) is used as the slot pitch, so a tensor still carrying the
+        # layer dim would scribble outside its slot. The gate ring is the one
+        # whose rank depends on the model: per-K vector for KDA, per-head scalar
+        # for GDN, matching g_shape in memory_pool.py and the IS_KDA branch in
+        # the store above.
+        assert (
+            replayssm_rawv.dim() == 4
+            and replayssm_rawk.dim() == 4
+            and replayssm_g.dim() == (4 if is_kda else 3)
+            and replayssm_beta.dim() == 3
+        ), "cache_ring expects per-layer ring views"
+        max_cache_len = replayssm_rawv.shape[-2]
+        stride_rawv_slot = replayssm_rawv.stride(0)
+        stride_rawk_slot = replayssm_rawk.stride(0)
+        stride_g_slot = replayssm_g.stride(0)
+        stride_beta_slot = replayssm_beta.stride(0)
+    else:
+        max_cache_len = 0
+        stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,
         v=v,
@@ -332,6 +454,11 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
+        stride_h0_source=(
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
@@ -358,9 +485,20 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        MAX_CACHE_LEN=max_cache_len,
+        CACHE_RING=cache_ring,
         num_warps=num_warps,
         num_stages=num_stages,
     )

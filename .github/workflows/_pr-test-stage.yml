@@ -108,7 +108,7 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -116,7 +116,7 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
         uses: actions/download-artifact@v6
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
