@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
