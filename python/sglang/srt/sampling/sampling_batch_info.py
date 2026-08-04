@@ -12,7 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -86,7 +86,7 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_server_args()
-        enable_deterministic = global_server_args.enable_deterministic_inference
+        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -142,7 +142,7 @@ class SamplingBatchInfo:
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
-            global_server_args.enable_custom_logit_processor
+            get_exec().features.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]

@@ -211,6 +211,15 @@ def _handle_output_by_index(output, i):
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
             ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
             ),
@@ -318,6 +327,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
