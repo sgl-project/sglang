@@ -11,8 +11,10 @@ import concurrent.futures
 import functools
 import logging
 import os
-from typing import Callable, List, Optional
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from transformers import AutoProcessor
 
@@ -30,11 +32,32 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-_MM_GRID_ATTRS = {
+
+_mm_grid_attrs = {
     Modality.IMAGE: ("image_grid_thw", "image_grid_hws", "grid_thws"),
     Modality.VIDEO: ("video_grid_thw",),
     Modality.AUDIO: ("audio_feature_lens_raw",),
 }
+
+
+def _convert(data):
+    if isinstance(data, torch.Tensor):
+        return data
+    elif isinstance(data, np.ndarray):
+        return torch.tensor(data)
+    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
+        return torch.tensor(np.array(data))
+    elif isinstance(data, list) and isinstance(data[0], (int, float)):
+        return torch.tensor(data)
+    else:
+        return data
+
+
+@dataclass
+class EncoderPreprocessResult:
+    mm_inputs: dict
+    grid_thw: Union[torch.Tensor, List]
+    token_counts: List[int]
 
 
 class EncoderPreprocessor:
@@ -348,12 +371,13 @@ class EncoderPreprocessor:
 
     async def process_mm_items(
         self, mm_items, modality: Modality
-    ) -> tuple[dict, List[int]]:
+    ) -> EncoderPreprocessResult:
         """Process multimodal items through the HF processor pipeline.
 
         Returns the ``mm_inputs`` dict produced by the HF image/video/audio
-        processor and one output token count per grid entry. Does not look up
-        ``get_feature_fn``; that stays in :class:`MMEncoder`.
+        processor, its normalized grid metadata, and one output token count per
+        grid entry. Does not look up ``get_feature_fn``; that stays in
+        :class:`MMEncoder`.
         """
         if modality == Modality.IMAGE:
             mm_inputs = await self._process_image_items(
@@ -369,21 +393,24 @@ class EncoderPreprocessor:
             )
         else:
             raise ValueError(f"Unsupported modality: {modality}")
-        return mm_inputs, self._get_token_counts(mm_inputs, modality)
+        grid_thw = self._get_mm_grid_dim(mm_inputs, modality)
+        token_counts = [self.get_num_tokens(grid, modality) for grid in grid_thw]
+        return EncoderPreprocessResult(
+            mm_inputs=mm_inputs,
+            grid_thw=grid_thw,
+            token_counts=token_counts,
+        )
 
     def supports_modality(self, modality: Modality) -> bool:
         return modality in self._supported_modalities
 
-    def _get_image_merge_size(self) -> int:
-        return getattr(self.image_processor, "merge_size", 2)
-
     async def process_batch_mm_items(
         self, requests: List[dict], modality: Modality
-    ) -> tuple[dict, List[int], List[int]]:
+    ) -> tuple[EncoderPreprocessResult, List[int]]:
         """Flatten requests, run the processor once, and return batch layout."""
         flat_items, items_per_req = self._flatten_batch_requests(requests, modality)
-        mm_inputs, token_counts = await self.process_mm_items(flat_items, modality)
-        return mm_inputs, token_counts, items_per_req
+        result = await self.process_mm_items(flat_items, modality)
+        return result, items_per_req
 
     def _flatten_batch_requests(
         self, requests: List[dict], modality: Modality
@@ -522,47 +549,72 @@ class EncoderPreprocessor:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
 
-    def _get_grid_dims(self, mm_inputs: dict, modality: Modality):
-        attrs = _MM_GRID_ATTRS[modality]
+    def _get_mm_grid_dim(self, mm_inputs: dict, modality: Modality):
+        attrs = _mm_grid_attrs[modality]
+        model_type = (self.model_type or "").lower()
         if modality == Modality.IMAGE:
-            if self.model_type == "kimi_k25":
+            if model_type == "kimi_k25":
                 attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
-            elif self.model_type == "kimi_vl":
+            elif model_type == "kimi_vl":
                 attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
         for attr in attrs:
             if attr in mm_inputs and mm_inputs[attr] is not None:
-                return mm_inputs[attr]
+                return _convert(mm_inputs[attr])
         raise ValueError(
-            f"Grid dim ({_MM_GRID_ATTRS[modality]}) not found in mm_inputs"
+            f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}"
         )
 
-    def _get_token_counts(self, mm_inputs: dict, modality: Modality) -> List[int]:
+    def get_num_patches(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
-            output_lengths = mm_inputs.get("audio_feature_lens")
-            if output_lengths is None:
-                grid_dims = self._get_grid_dims(mm_inputs, modality)
-                output_lengths = self._get_feat_extract_output_lengths(grid_dims)
-            if isinstance(output_lengths, torch.Tensor):
-                return [int(v) for v in output_lengths.tolist()]
-            return [int(v) for v in output_lengths]
+            return int(grid.item())
+        if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
+            h, w = self._kimi_hw_from_patch_grid(grid)
+            return h * w
+        return int(grid[0] * grid[1] * grid[2])
 
-        grid_dims = self._get_grid_dims(mm_inputs, modality)
-        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
-            merge_h, merge_w = (
-                self.model_config.hf_config.vision_config.merge_kernel_size
+    @staticmethod
+    def _kimi_hw_from_patch_grid(
+        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
+    ) -> Tuple[int, int]:
+        """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
+        if isinstance(grid, torch.Tensor):
+            values = grid.flatten().tolist()
+        elif isinstance(grid, np.ndarray):
+            values = grid.reshape(-1).tolist()
+        else:
+            values = np.asarray(grid).reshape(-1).tolist()
+
+        if len(values) not in (2, 3):
+            raise ValueError(
+                f"Invalid Kimi image grid metadata: {values}; "
+                "expected [h, w] or [t, h, w]"
             )
-            token_counts = []
-            for grid in grid_dims:
-                flat_grid = grid.flatten() if isinstance(grid, torch.Tensor) else grid
-                token_counts.append(
-                    int(flat_grid[-2] * flat_grid[-1]) // (merge_h * merge_w)
-                )
-            return token_counts
+        return int(values[-2]), int(values[-1])
 
-        merge_size = self._get_image_merge_size()
-        return [
-            int(grid[0] * grid[1] * grid[2]) // (merge_size**2) for grid in grid_dims
-        ]
+    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
+        h, w = self._kimi_hw_from_patch_grid(grid)
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
+    def get_num_tokens(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Compatibility helper for callers that still provide patch grids."""
+        if modality == Modality.AUDIO:
+            input_length = self.get_num_patches(grid, modality)
+            return self._get_feat_extract_output_lengths(input_length)
+        else:
+            if (
+                self.model_type in ["kimi_k25", "kimi_vl"]
+                and modality == Modality.IMAGE
+            ):
+                return self._kimi_tokens_from_patch_grid(grid)
+            merge_size = getattr(self.image_processor, "merge_size", 2)
+            return self.get_num_patches(grid, modality) // (merge_size**2)
 
     # ------------------------------------------------------------------
     # Video Timestamp Computation

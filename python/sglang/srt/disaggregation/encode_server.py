@@ -7,7 +7,7 @@ import pickle
 import time
 import traceback
 from http import HTTPStatus
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import aiohttp
 import msgspec
@@ -24,7 +24,12 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
-from sglang.srt.disaggregation.encoder_preprocessor import EncoderPreprocessor
+from sglang.srt.disaggregation.encoder_preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+    _convert,
+    _mm_grid_attrs,
+)
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -228,10 +233,8 @@ class EncodeContext(msgspec.Struct):
 
     req_id: str  # first request's id, for cache prefetch keys and logs
     modality: Modality
-    mm_inputs: dict
+    preprocess_result: EncoderPreprocessResult
     get_feature_fn: Any
-    grid_thw: List
-    token_counts: List[int]
     mm_feature: Any
     num_items: int
     items_per_req: List[int]  # grid entries per request, in flatten order
@@ -264,46 +267,11 @@ class TensorWrapper:
         return memoryview(c_obj)
 
 
-def _convert(data):
-    if isinstance(data, torch.Tensor):
-        return data
-    elif isinstance(data, np.ndarray):
-        return torch.tensor(data)
-    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
-        return torch.tensor(np.array(data))
-    elif isinstance(data, list) and isinstance(data[0], (int, float)):
-        return torch.tensor(data)
-    else:
-        return data
-
-
-_mm_grid_attrs = {
-    # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
-    Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
-    Modality.VIDEO: ["video_grid_thw"],
-    Modality.AUDIO: ["audio_feature_lens_raw"],
-}
-
 _mm_feature_attrs = {
     Modality.IMAGE: ["pixel_values"],
     Modality.VIDEO: ["pixel_values_videos"],
     Modality.AUDIO: ["input_features"],
 }
-
-
-def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
-    attrs = _mm_grid_attrs[modality]
-    model_type = (model_type or "").lower()
-    if modality == Modality.IMAGE:
-        # Kimi K2.5 emits grid_thws, while Kimi-VL emits image_grid_hws.
-        if model_type == "kimi_k25":
-            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
-        elif model_type == "kimi_vl":
-            attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
-    for attr in attrs:
-        if attr in mm_inputs and mm_inputs[attr] is not None:
-            return _convert(mm_inputs[attr])
-    raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
 
 def _get_mm_feature(mm_inputs, modality):
@@ -565,65 +533,12 @@ class MMEncoder:
         logger.info(f"Global cache embedding dims: {dims}")
         return dims
 
-    def get_num_patches(
-        self, grid: Union[torch.Tensor, List[int]], modality: Modality
-    ) -> int:
-        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
-        if modality == Modality.AUDIO:
-            return int(grid.item())
-        if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
-            h, w = self._kimi_hw_from_patch_grid(grid)
-            return h * w
-        return int(grid[0] * grid[1] * grid[2])
-
-    @staticmethod
-    def _kimi_hw_from_patch_grid(
-        grid: Union[torch.Tensor, np.ndarray, List[int], Tuple[int, ...]],
-    ) -> Tuple[int, int]:
-        """Extract (height, width) from Kimi 2D or 3D patch-grid metadata."""
-        if isinstance(grid, torch.Tensor):
-            values = grid.flatten().tolist()
-        elif isinstance(grid, np.ndarray):
-            values = grid.reshape(-1).tolist()
-        else:
-            values = np.asarray(grid).reshape(-1).tolist()
-
-        if len(values) not in (2, 3):
-            raise ValueError(
-                f"Invalid Kimi image grid metadata: {values}; "
-                "expected [h, w] or [t, h, w]"
-            )
-        return int(values[-2]), int(values[-1])
-
-    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
-        h, w = self._kimi_hw_from_patch_grid(grid)
-        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
-        return (h * w) // (merge_h * merge_w)
-
-    def get_num_tokens(
-        self, grid: Union[torch.Tensor, List[int]], modality: Modality
-    ) -> int:
-        """Compatibility helper for callers that still provide patch grids."""
-        if modality == Modality.AUDIO:
-            input_length = self.get_num_patches(grid, modality)
-            return self.preprocessor._get_feat_extract_output_lengths(input_length)
-        if self.model_type in ("kimi_k25", "kimi_vl") and modality == Modality.IMAGE:
-            return self._kimi_tokens_from_patch_grid(grid)
-        merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
-        return self.get_num_patches(grid, modality) // (merge_size**2)
-
     def slice_embedding(
         self,
         mm_embedding: torch.Tensor,
         token_counts: Iterable[int],
-        modality: Optional[Modality] = None,
     ) -> List[torch.Tensor]:
-        """Slice embeddings using token counts or legacy patch-grid metadata."""
-        if modality is not None:
-            token_counts = (
-                self.get_num_tokens(grid, modality) for grid in token_counts
-            )
+        """Slice embeddings using preprocessing-owned token counts."""
         slices, offset = [], 0
         for count in token_counts:
             slices.append(mm_embedding[offset : offset + count])
@@ -650,7 +565,7 @@ class MMEncoder:
         offset = 0
         logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
-            num_patches = self.get_num_patches(grid, modality)
+            num_patches = self.preprocessor.get_num_patches(grid, modality)
             feature_slice = mm_feature[offset : offset + num_patches]
             tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
             tmp_item.set_pad_value()
@@ -661,18 +576,17 @@ class MMEncoder:
     def _encode_missing(
         self,
         mm_feature,
-        mm_inputs: dict,
+        preprocess_result: EncoderPreprocessResult,
         indices: List[int],
-        token_counts: List[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
-        grid_thw: Optional[List] = None,
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        if grid_thw is None:
-            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        mm_inputs = preprocess_result.mm_inputs
+        grid_thw = preprocess_result.grid_thw
+        token_counts = preprocess_result.token_counts
 
         # Audio features are per-item (list of mels for mimo_v2, or batched
         # N x n_mels x T_max for qwen2_audio); slice by item index and keep
@@ -688,7 +602,7 @@ class MMEncoder:
             offsets = [0]
             curr = 0
             for g in grid_thw:
-                curr += self.get_num_patches(g, modality)
+                curr += self.preprocessor.get_num_patches(g, modality)
                 offsets.append(curr)
             for idx in indices:
                 sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
@@ -738,7 +652,7 @@ class MMEncoder:
         modality_str = modality.name.lower()
         preprocess_start = time.perf_counter()
         try:
-            mm_inputs, token_counts, items_per_req = (
+            preprocess_result, items_per_req = (
                 await self.preprocessor.process_batch_mm_items(requests, modality)
             )
         except NotImplementedError as e:
@@ -766,7 +680,9 @@ class MMEncoder:
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_fn = getattr(target, f"get_{modality_str}_feature")
 
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        mm_inputs = preprocess_result.mm_inputs
+        grid_thw = preprocess_result.grid_thw
+        token_counts = preprocess_result.token_counts
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
         if num_items != sum(items_per_req):
@@ -807,10 +723,8 @@ class MMEncoder:
         return EncodeContext(
             req_id=requests[0]["req_id"],
             modality=modality,
-            mm_inputs=mm_inputs,
+            preprocess_result=preprocess_result,
             get_feature_fn=get_feature_fn,
-            grid_thw=grid_thw,
-            token_counts=token_counts,
             mm_feature=mm_feature,
             num_items=num_items,
             items_per_req=items_per_req,
@@ -856,7 +770,7 @@ class MMEncoder:
             return []
 
         hit_hashes = [ctx.str_mm_hashes[i] for i in hit_indices]
-        hit_tokens = [ctx.token_counts[i] for i in hit_indices]
+        hit_tokens = [ctx.preprocess_result.token_counts[i] for i in hit_indices]
         self.mm_global_cache.prefetch(ctx.req_id, hit_hashes, hit_tokens, ctx.modality)
         return hit_hashes
 
@@ -941,7 +855,7 @@ class MMEncoder:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
         fallback_index_set = set(fallback_indices)
-        token_counts = ctx.token_counts
+        token_counts = ctx.preprocess_result.token_counts
         dim = self.mm_global_cache.get_embedding_dim(ctx.modality)
 
         mm_embedding = torch.empty(
@@ -1004,7 +918,7 @@ class MMEncoder:
     ) -> torch.Tensor:
         miss_slice_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
         fallback_slice_pos = {idx: pos for pos, idx in enumerate(fallback_indices)}
-        token_counts = ctx.token_counts
+        token_counts = ctx.preprocess_result.token_counts
         embedding_dim = self.mm_global_cache.get_embedding_dim(ctx.modality)
         mm_embedding = torch.empty(
             (sum(token_counts), embedding_dim),
@@ -1055,12 +969,10 @@ class MMEncoder:
         if missing_indices:
             new_slices = self._encode_missing(
                 ctx.mm_feature,
-                ctx.mm_inputs,
+                ctx.preprocess_result,
                 missing_indices,
-                ctx.token_counts,
                 ctx.modality,
                 ctx.get_feature_fn,
-                ctx.grid_thw,
             )
 
         miss_d2h_handles = []
@@ -1084,12 +996,10 @@ class MMEncoder:
             )
             fallback_slices = self._encode_missing(
                 ctx.mm_feature,
-                ctx.mm_inputs,
+                ctx.preprocess_result,
                 fallback_indices,
-                ctx.token_counts,
                 ctx.modality,
                 ctx.get_feature_fn,
-                ctx.grid_thw,
             )
             if self.rank == 0 and not keep_on_gpu:
                 fallback_hashes = [ctx.str_mm_hashes[i] for i in fallback_indices]
@@ -1158,7 +1068,7 @@ class MMEncoder:
                     "feature": ctx.mm_feature,
                 }
             )
-            for k, v in ctx.mm_inputs.items():
+            for k, v in ctx.preprocess_result.mm_inputs.items():
                 if k in _mm_feature_attrs[modality]:
                     continue
                 mm_item.set(k, _convert(v))
@@ -1227,7 +1137,7 @@ class MMEncoder:
             if (
                 not keep_on_gpu
                 and modality == Modality.VIDEO
-                and ctx.mm_inputs.get("video_audio_features")
+                and ctx.preprocess_result.mm_inputs.get("video_audio_features")
             ):
                 target = (
                     self.model.thinker if hasattr(self.model, "thinker") else self.model
@@ -1235,7 +1145,9 @@ class MMEncoder:
                 encode_video_audio_fn = getattr(target, "encode_video_audio", None)
                 if encode_video_audio_fn is not None:
                     audio_forward_start = time.perf_counter()
-                    audio_embedding = encode_video_audio_fn(ctx.mm_inputs)
+                    audio_embedding = encode_video_audio_fn(
+                        ctx.preprocess_result.mm_inputs
+                    )
                     if (
                         encoder_metrics_collector is not None
                         and not ctx.is_health_check
@@ -1273,7 +1185,7 @@ class MMEncoder:
                 ctx, keep_on_gpu=keep_on_gpu
             )
 
-        expected_tokens = sum(ctx.token_counts)
+        expected_tokens = sum(ctx.preprocess_result.token_counts)
         if mm_embedding is not None and mm_embedding.shape[0] != expected_tokens:
             raise InternalError(
                 f"Encoder produced {mm_embedding.shape[0]} tokens, but "
@@ -1420,7 +1332,11 @@ class MMEncoder:
         item_offset = 0
         token_offset = 0
         for req, num_items in zip(requests, ctx.items_per_req):
-            num_tokens = sum(ctx.token_counts[item_offset : item_offset + num_items])
+            num_tokens = sum(
+                ctx.preprocess_result.token_counts[
+                    item_offset : item_offset + num_items
+                ]
+            )
             embedding = mm_embedding[token_offset : token_offset + num_tokens]
             if keep_on_gpu and len(requests) > 1:
                 # A view would pin the whole batch tensor until the last transfer.
@@ -1429,7 +1345,9 @@ class MMEncoder:
                 req["req_id"],
                 req["num_parts"],
                 req["part_idx"],
-                ctx.grid_thw[item_offset : item_offset + num_items],
+                ctx.preprocess_result.grid_thw[
+                    item_offset : item_offset + num_items
+                ],
                 ctx.modality,
                 embedding,
                 **ctx.aux_data,
