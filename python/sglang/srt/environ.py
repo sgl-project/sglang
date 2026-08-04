@@ -759,6 +759,13 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
+    # MoonEP
+    SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # -1 uses MoonEP's training-safe default B = E / EP.
+    SGLANG_MOONEP_NUM_PREFETCH_SLOTS = EnvInt(-1)
+    SGLANG_MOONEP_TOKEN_PADDING = EnvInt(128)
+    SGLANG_MOONEP_NUM_SMS = EnvInt(32)
+
     # PPLX-EP (Perplexity pplx-kernels NVSHMEM all-to-all)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 

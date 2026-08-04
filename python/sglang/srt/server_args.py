@@ -267,6 +267,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MOE_A2A_BACKEND_CHOICES = [
     "none",
     "deepep",
+    "moonep",
     "mooncake",
     "nixl",
     "mori",
@@ -2249,6 +2250,7 @@ class ServerArgs:
         Literal[
             "none",
             "deepep",
+            "moonep",
             "mooncake",
             "nixl",
             "mori",
@@ -6640,6 +6642,15 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if a2a_backend == "moonep":
+            logger.warning(
+                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
+                "Cuda graph is disabled while the eager MoonEP dispatch/"
+                "prefetch/compute/combine path is validated."
+            )
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "mooncake":
             logger.warning(
