@@ -87,7 +87,7 @@ class TestHCHead(CustomTestCase):
         hc_scale = torch.randn(1, dtype=torch.float32, device="xpu").contiguous()
         return x, hc_fn, hc_scale, hc_base
 
-    def test_hc_head_triton_vs_sycl(self):
+    def test_hc_head(self):
         for num_tokens in self.NUM_TOKENS:
             with self.subTest(num_tokens=num_tokens):
                 x, hc_fn, hc_scale, hc_base = self._make_inputs(num_tokens)
@@ -116,6 +116,13 @@ class TestHCHead(CustomTestCase):
                     rtol=2e-2,
                 )
 
+    def test_hc_head_perf(self):
+        for num_tokens in self.NUM_TOKENS:
+            with self.subTest(num_tokens=num_tokens):
+                x, hc_fn, hc_scale, hc_base = self._make_inputs(num_tokens)
+
+                _ctx = types.SimpleNamespace(norm_eps=self.NORM_EPS, hc_eps=self.HC_EPS)
+
                 triton_stats = _bench_ms(
                     lambda: triton_fused_hc_head(
                         x,
@@ -130,16 +137,11 @@ class TestHCHead(CustomTestCase):
                     lambda: DeepseekV4Model.hc_head(_ctx, x, hc_fn, hc_scale, hc_base)
                 )
 
-                print(
-                    "hc_head num_tokens={num_tokens}: "
-                    "triton mean={triton_mean:.3f} ms median={triton_median:.3f} ms; "
-                    "sycl mean={sycl_mean:.3f} ms median={sycl_median:.3f} ms".format(
-                        num_tokens=num_tokens,
-                        triton_mean=triton_stats["mean_ms"],
-                        triton_median=triton_stats["median_ms"],
-                        sycl_mean=sycl_stats["mean_ms"],
-                        sycl_median=sycl_stats["median_ms"],
-                    )
+                self.assertLess(
+                    sycl_stats["median_ms"],
+                    triton_stats["median_ms"],
+                    f"sycl ({sycl_stats['median_ms']:.3f} ms) not faster than triton "
+                    f"({triton_stats['median_ms']:.3f} ms) at num_tokens={num_tokens}",
                 )
 
 
