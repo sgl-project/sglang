@@ -29,6 +29,7 @@ _SUPPORTED_DRAFT_BACKENDS = (
     "triton",
     "trtllm_mha",
     "ascend",
+    "intel_xpu",
 )
 
 
@@ -42,13 +43,22 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 def _resolve_draft_attention_backend_fallback(
     *, draft_server_args: ServerArgs, algo_label: str
 ) -> str:
+    from sglang.srt.utils import is_xpu
+
+    # FlashInfer is CUDA-only: default to triton on Intel XPU and ROCm
+    # (intel_xpu is supported but must be selected explicitly), flashinfer on CUDA.
+    if is_xpu() or torch.version.hip:
+        platform_fallback = "triton"
+    else:
+        platform_fallback = "flashinfer"
+
     draft_backend = draft_server_args.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = draft_server_args.get_attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return platform_fallback
     if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
-        fallback = "triton" if torch.version.hip else "flashinfer"
+        fallback = platform_fallback
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
