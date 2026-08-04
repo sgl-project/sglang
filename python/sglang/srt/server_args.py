@@ -7930,8 +7930,14 @@ class ServerArgs:
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
                 self.optimistic_prefill_attempts = 0
-            elif self.enable_hierarchical_cache:
-                logger.warning("Optimistic prefill does not support hierarchical cache")
+            elif self.enable_hierarchical_cache and (
+                self.hicache_storage_backend is not None
+                or self.hicache_write_policy != "write_back"
+            ):
+                logger.warning(
+                    "Optimistic prefill only supports L2 hierarchical cache "
+                    "with write-back policy"
+                )
                 self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
