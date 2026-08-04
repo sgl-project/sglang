@@ -39,6 +39,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -63,7 +64,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            replayssm_d is not None
+            lower_bound is None
+            and replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -106,6 +108,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)
@@ -125,6 +128,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        lower_bound = kwargs.get("lower_bound", None)
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -140,6 +144,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     def target_verify(
@@ -159,6 +164,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -167,6 +173,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
+        # lower_bound must match the decode/extend gate so the verified state evolves
+        # identically to the committed decode state.
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -187,6 +195,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
         )
 
     def extend(

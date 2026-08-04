@@ -202,6 +202,7 @@ class KDAKernelDispatcher:
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
@@ -222,6 +223,7 @@ class KDAKernelDispatcher:
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
         )
 
     def extend(
@@ -329,6 +331,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        # KDA safe-gate lower bound must be applied during decode too, else the
+        # bounded gate never fires and generation cannot emit EOS.
+        lower_bound = layer.lower_bound
 
         # ReplaySSM is mostly a GDN bandwidth optimization. It remains wired for
         # KDA correctness paths, but packed decode is faster for KDA today.
@@ -364,6 +369,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 b=b,
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
+                lower_bound=lower_bound,
                 scale=layer.head_k_dim**-0.5,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
@@ -393,6 +399,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             b=b,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
+            lower_bound=lower_bound,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -634,4 +641,5 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=layer.lower_bound,
         )
