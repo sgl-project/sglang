@@ -5,6 +5,7 @@ validation in ``ServerArgs._handle_dcp_validation``:
   - a2a / fi_a2a require --dcp-size > 1
   - fi_a2a requires a CUDA platform (the authoritative MNNVL fabric probe runs
     later, at model-runner init)
+  - --dcp-size must divide --tp-size
   - dcp>1 requires CUDA or HIP (base behavior from the merged DCP PR)
 
 Tests construct with safe defaults (dcp_size=1) then mutate the fields and call
@@ -49,11 +50,12 @@ class TestDCPCommBackendValidation(CustomTestCase):
     """Verify ``_handle_dcp_validation`` accepts/rejects the right combos."""
 
     @staticmethod
-    def _make_args(dcp_size, dcp_comm_backend):
+    def _make_args(dcp_size, dcp_comm_backend, tp_size=None):
         # Construct with safe defaults (dcp_size=1) so __post_init__ never trips
         # the dcp>1 platform gate, then set the fields under test.
         args = ServerArgs(model_path="dummy")
         args.dcp_size = dcp_size
+        args.tp_size = dcp_size if tp_size is None else tp_size
         args.dcp_comm_backend = dcp_comm_backend
         return args
 
@@ -96,6 +98,13 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=8, dcp_comm_backend="ag_rs")
         args._handle_dcp_validation()  # no raise
         self.assertEqual(args.dcp_size, 8)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_dcp_size_must_divide_tp_size(self, *_):
+        args = self._make_args(dcp_size=3, dcp_comm_backend="ag_rs", tp_size=8)
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            args._handle_dcp_validation()
 
 
 if __name__ == "__main__":

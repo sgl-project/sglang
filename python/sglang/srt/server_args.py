@@ -3772,9 +3772,9 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
-        # early instead of letting them fail deeper in model initialization.
+        # Decode context parallel (DCP) is accelerator-specific. Reject invalid
+        # or unverified configurations early instead of letting them fail
+        # deeper in model initialization.
         if self.dcp_size < 1:
             raise ValueError(
                 "Decode context parallel size (--dcp-size / "
@@ -3807,6 +3807,12 @@ class ServerArgs:
                 )
         if not self.dcp_size > 1:
             return
+        if self.tp_size % self.dcp_size != 0:
+            raise ValueError(
+                "Tensor parallel size (--tp-size) must be divisible by decode "
+                "context parallel size (--dcp-size), but got "
+                f"tp_size={self.tp_size}, dcp_size={self.dcp_size}."
+            )
         if is_hip():
             return
         elif is_cuda():
