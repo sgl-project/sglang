@@ -241,7 +241,7 @@ class EncoderScheduler:
                     f"{(time.time() - start) * 1000:.1f}ms"
                 )
         except Exception as e:
-            # batch_encode normally catches and returns errors via _batch_set_error.
+            # batch_encode normally catches and returns errors via _stage_errors.
             # If it raised, rank-0 may have skipped a collective broadcast, leaving
             # TP workers stuck. Don't try to recover — fail every pending future
             # and let the client retry. Re-broadcasting would risk a deadlock.
