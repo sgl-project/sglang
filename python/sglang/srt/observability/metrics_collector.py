@@ -1661,9 +1661,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
-        stream: bool = False,
+        is_streaming: bool = False,
     ):
-        stream_labels = {**labels, "is_streaming": "true" if stream else "false"}
+        stream_labels = {
+            **labels,
+            "is_streaming": "true" if is_streaming else "false",
+        }
         self.prompt_tokens_total.labels(**stream_labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
         if spec_verify_ct > 0:
