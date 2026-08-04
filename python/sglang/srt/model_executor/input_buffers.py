@@ -67,8 +67,10 @@ def share_input_buffers_in(obj) -> None:
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba
-# state pool, so stale content is unsafe to execute.
-_INDEX_SEMANTIC_BUFFERS = frozenset(
+# state pool, so stale content is unsafe to execute. Authoritative for both
+# the capture-time reset below and the registry's ZERO padding policy, which
+# build_decode_registry checks against this set.
+INDEX_SEMANTIC_BUFFERS = frozenset(
     {
         "positions",
         "mrope_positions",
@@ -89,7 +91,7 @@ class ForwardInputBuffers:
     def reset_index_buffers(self) -> None:
         """Zero the index-semantic buffers this set declares."""
         for f in fields(self):
-            if f.name not in _INDEX_SEMANTIC_BUFFERS:
+            if f.name not in INDEX_SEMANTIC_BUFFERS:
                 continue
             buffer = getattr(self, f.name)
             if buffer is not None:
