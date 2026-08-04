@@ -86,7 +86,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
-        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE), the runner created a *scheduled*
+        # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
         # past the two warmup runs so only the capture run is recorded, and each
         # batch size produces its own trace via the profiler's on_trace_ready.
