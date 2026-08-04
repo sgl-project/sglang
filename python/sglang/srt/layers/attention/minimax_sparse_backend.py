@@ -565,8 +565,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
         self.sparse.dense_backend = dense_backend
-        # Both sub-backends build metadata for every forward, including the
-        # extend-autotune dummy.
         self.extend_dummy_seqs_capped_by_req_pool = (
             dense_backend.extend_dummy_seqs_capped_by_req_pool
             or sparse_backend.extend_dummy_seqs_capped_by_req_pool

@@ -44,8 +44,7 @@ class HybridAttnBackend(AttentionBackend):
             self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
         self.max_context_len = model_runner.model_config.context_len
-        # _select_backend routes EXTEND to prefill_backend unconditionally, so
-        # only its metadata sizing constrains the extend-autotune dummy.
+        # _select_backend routes EXTEND to prefill_backend unconditionally.
         self.extend_dummy_seqs_capped_by_req_pool = (
             prefill_backend.extend_dummy_seqs_capped_by_req_pool
         )

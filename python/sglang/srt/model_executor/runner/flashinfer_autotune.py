@@ -256,13 +256,9 @@ def maybe_flashinfer_autotune_extend(
     per-rank extend token count tunes all buckets up to it.
     """
     mr = runner.model_runner
-    # max_prefill_tokens is a per-scheduler — i.e. per dp-rank — budget on
-    # total extend tokens per forward batch (chunked_prefill_size only caps
-    # per-request chunks), so tuning at that size covers every real per-rank
-    # extend shape. Warmup runs on all dp ranks at once, so under
-    # dp-attention the mlp-tp-gathered dummy also reaches
-    # dp_size * max_prefill_tokens — the worst-case serving gather — keeping
-    # the gathered MoE buckets covered as well.
+    # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
+    # runs on all dp ranks at once, so the gathered dummy already reaches the
+    # worst-case serving gather. Do not divide by dp_size.
     num_tokens = mr.server_args.max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
@@ -271,18 +267,16 @@ def maybe_flashinfer_autotune_extend(
         # extend-bucket autotune for spec configs is a follow-up.
         return
     if mr.model_config.is_multimodal:
-        # The dummy runs with mm_inputs=None, which multimodal prefill paths
-        # iterate; placeholder mm metadata is a follow-up.
+        # The dummy runs mm_inputs=None, which multimodal prefill paths iterate.
         return
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size
         num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
     else:
-        # Packed dummies (fewer, longer seqs) tune measurably worse tactics
-        # for the same token bucket, so pack only where the backend would
-        # otherwise crash. None (not 1) keeps the backend's own
-        # seq_len_fill_value in _dummy_run.
+        # Packed dummies tune measurably worse tactics for the same token
+        # bucket, so pack only where the backend would otherwise crash. None
+        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
         num_tokens_per_req = None
     per_req = num_tokens_per_req or 1
     batch_size = (num_tokens + per_req - 1) // per_req
