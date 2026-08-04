@@ -57,19 +57,22 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
-            size=size_swa,
-            dtype=dtype,
-            layer_num=self.swa_layer_nums,
-            **kwargs,
-        )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
+        full_pool_kwargs = kwargs.copy()
+        full_pool_kwargs.pop("swa_head_num", None)
+        full_pool_kwargs.pop("swa_head_dim", None)
+        full_pool_kwargs.pop("swa_v_head_dim", None)
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
+            allocation_label="Full",
+            **full_pool_kwargs,
+        )
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=size_swa,
+            dtype=dtype,
+            layer_num=self.swa_layer_nums,
+            allocation_label="SWA",
             **kwargs,
         )
         # {layer_id: (index, is_swa_layer)}

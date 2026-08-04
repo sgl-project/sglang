@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -55,6 +56,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -75,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    ReturnHiddenStatesMode,
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -91,6 +94,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
@@ -103,6 +107,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda,
+    is_mnnvl_fabric_device,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -135,7 +140,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     all_child_pids: List[int] = dataclasses.field(default_factory=list)
     wait_for_ready: Callable[[], None] = lambda: None
-    wait_for_completion: Callable[[], None] = lambda: None
+    block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
 
 
@@ -230,6 +235,14 @@ class Engine(EngineScoreMixin, EngineBase):
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
         logger.info(f"{server_args=}")
+
+        # Rust Server is not supported with the offline Engine API
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "SGLANG_RUST_SERVER is not supported with the offline Engine "
+                "API; it only replaces the HTTP server path (`sglang serve`). "
+                "Unset SGLANG_RUST_SERVER to use sgl.Engine."
+            )
 
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
@@ -354,7 +367,9 @@ class Engine(EngineScoreMixin, EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
-        return_hidden_states: bool = False,
+        return_hidden_states: Union[
+            ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
+        ] = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,
@@ -458,7 +473,9 @@ class Engine(EngineScoreMixin, EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         require_reasoning: bool = False,
-        return_hidden_states: bool = False,
+        return_hidden_states: Union[
+            ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
+        ] = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,
@@ -900,7 +917,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             for proc in scheduler_procs:
                 proc.join()
                 logger.error(
@@ -913,7 +930,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 scheduler_infos=scheduler_infos,
                 all_child_pids=all_child_pids,
                 wait_for_ready=wait_for_ready,
-                wait_for_completion=wait_for_completion,
+                block_until_scheduler_exits=block_until_scheduler_exits,
             ),
             scheduler_procs,
         )
@@ -975,6 +992,35 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return processes, names
 
+    @staticmethod
+    def _set_startup_time(
+        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        scheduler_init_result: SchedulerInitResult,
+        startup_tic: float,
+    ) -> None:
+        startup_time = build_engine_startup_time(
+            (
+                info.get("startup_time")
+                for info in scheduler_init_result.scheduler_infos
+            ),
+            tokenizer_e2e=time.perf_counter() - startup_tic,
+        )
+        tokenizer_manager.set_startup_time(startup_time)
+        cuda_graph_timings = ", ".join(
+            f"{phase}={duration:.2f}"
+            for phase, duration in startup_time["cuda_graph"].items()
+        )
+        logger.info(
+            "Engine startup timings (s): load_weight=%.2f, "
+            "kv_cache_allocation=%.2f, scheduler_e2e=%.2f, "
+            "cuda_graph={%s}, tokenizer_e2e=%.2f",
+            startup_time["load_weight"],
+            startup_time["kv_cache_allocation"],
+            startup_time["scheduler_e2e"],
+            cuda_graph_timings,
+            startup_time["tokenizer_e2e"],
+        )
+
     @classmethod
     def _launch_subprocesses(
         cls,
@@ -995,6 +1041,8 @@ class Engine(EngineScoreMixin, EngineBase):
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog, weight_cache_daemon_procs).
         """
+        startup_tic = time.perf_counter()
+
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
@@ -1004,7 +1052,6 @@ class Engine(EngineScoreMixin, EngineBase):
         load_plugins()
 
         server_args.check_server_args()
-        _set_gc(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -1074,7 +1121,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args.host, server_args.port, server_args.enable_metrics
             )
 
-            scheduler_init_result.wait_for_completion()
+            scheduler_init_result.block_until_scheduler_exits()
             return (
                 None,
                 None,
@@ -1082,6 +1129,29 @@ class Engine(EngineScoreMixin, EngineBase):
                 scheduler_init_result,
                 None,
                 weight_cache_daemon_procs,
+            )
+
+        # The embedded Rust server (started inside the rank-0 scheduler) owns
+        # the API server, tokenization, and detokenization. In that mode we do
+        # not start the Python detokenizer subprocess(es) or tokenizer manager.
+        # Do not use RayEngine with the Rust server, as it is not supported.
+        if envs.SGLANG_RUST_SERVER.get():
+            scheduler_init_result.wait_for_ready()
+            # Set up subprocess liveness watchdog to detect crashes
+            processes = list(scheduler_procs or [])
+            names = [f"scheduler_{i}" for i in range(len(processes))]
+            subprocess_watchdog = SubprocessWatchdog(
+                processes=processes, process_names=names
+            )
+            subprocess_watchdog.start()
+
+            return (
+                None,
+                None,
+                port_args,
+                scheduler_init_result,
+                subprocess_watchdog,
+                None,
             )
 
         # Launch detokenizer process(es) — optionally fronted by a router when
@@ -1106,6 +1176,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()
+
+        cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
@@ -1234,8 +1306,11 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self.tokenizer_manager.resolved_config_dict(
+                    dataclasses.asdict(self.tokenizer_manager.server_args)
+                ),
                 **self._scheduler_init_result.scheduler_infos[0],
+                "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
             }
@@ -1308,15 +1383,9 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        if load_format == "flattened_bucket":
-            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
-                cast(List[SerializedTensorPayload], named_tensors)
-            )
-        else:
-            serialized_named_tensors = [
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.tp_size)
-            ]
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            named_tensors, load_format
+        )
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
@@ -1367,23 +1436,38 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def _serialize_tensors_per_rank(
+        self,
+        tensors,
+        load_format: Optional[str],
+    ) -> List[bytes]:
+        """One serialized payload per TP rank: each rank deserializes only its
+        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
+        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        if load_format == "flattened_bucket":
+            return normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], tensors)
+            )
+        else:
+            return [
+                MultiprocessingSerializer.serialize(tensors)
+                for _ in range(self.server_args.tp_size)
+            ]
+
     def load_lora_adapter_from_tensors(
         self,
         lora_name: str,
-        tensors,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        if load_format == "flattened_bucket":
-            serialized_tensors = tensors
-        else:
-            serialized_tensors = MultiprocessingSerializer.serialize(
-                tensors, output_str=True
-            )
+        serialized_named_tensors = self._serialize_tensors_per_rank(
+            tensors, load_format
+        )
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
-            serialized_tensors=serialized_tensors,
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
         )
         return self.loop.run_until_complete(
@@ -1489,6 +1573,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
+    # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
+    # cuMem-based buffers and MNNVL transport. Default them on (user-set
+    # values win; the symm-mem override below only fires when unset).
+    if server_args.nnodes > 1 and is_mnnvl_fabric_device():
+        os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+        os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (
@@ -1579,11 +1669,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
-
-def _set_gc(server_args: ServerArgs):
+    # Set gc threshold
     if gc_threshold := server_args.gc_threshold:
-        import gc
-
         gc.set_threshold(*gc_threshold)
 
 

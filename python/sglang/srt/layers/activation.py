@@ -33,7 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -130,7 +130,7 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
@@ -179,6 +179,37 @@ class SiluAndMul(MultiPlatformOp):
             # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.
             self._musa_swish_glu = nn.SwishGLU()
         return self._musa_swish_glu(x)
+
+
+class SituAndMul(MultiPlatformOp):
+    """SituGLU activation used by Kimi K3.
+
+    Computes beta * tanh(gate / beta) * sigmoid(gate) * up.
+    When linear_beta is set, up is softly clipped:
+        up = linear_beta * tanh(up / linear_beta).
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+
+        return situ_and_mul(x, None, self.beta, self.linear_beta)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
 
 class GeluAndMul(MultiPlatformOp):

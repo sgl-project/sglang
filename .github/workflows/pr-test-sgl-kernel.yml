@@ -6,6 +6,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this job compiles them during install.'
+        type: string
+        default: ''
       runner_config:
         required: true
         type: string
@@ -44,25 +48,36 @@ jobs:
 
       - name: Cleanup
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd sgl-kernel
+          cd python/sglang/kernels/aot
           pytest tests/
 
   sgl-kernel-benchmark-test:
@@ -79,25 +94,36 @@ jobs:
 
       - name: Cleanup
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run benchmark tests
         timeout-minutes: 45
         run: |
-          cd sgl-kernel/benchmark
+          cd python/sglang/kernels/aot/benchmark
           echo "Running sgl-kernel benchmark tests in CI mode..."
 
           echo "CI environment variable: $CI"
@@ -126,25 +152,36 @@ jobs:
 
       - name: Cleanup
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run sgl-kernel unit tests on B200
         timeout-minutes: 30
         run: |
-          cd sgl-kernel
+          cd python/sglang/kernels/aot
           pytest tests/
 
   # Adding a single CUDA13 build-and-run check for the kernel
@@ -157,13 +194,13 @@ jobs:
 
   #     - name: Cleanup
   #       run: |
-  #         ls -alh sgl-kernel/dist || true
-  #         rm -rf sgl-kernel/dist/* || true
+  #         ls -alh python/sglang/kernels/aot/dist || true
+  #         rm -rf python/sglang/kernels/aot/dist/* || true
 
   #     - name: Download CUDA 13.0 artifacts
   #       uses: actions/download-artifact@v4
   #       with:
-  #         path: sgl-kernel/dist/
+  #         path: python/sglang/kernels/aot/dist/
   #         merge-multiple: true
   #         pattern: wheel-python3.10-cuda*
 
@@ -174,5 +211,5 @@ jobs:
   #     - name: Run kernel unit tests
   #       timeout-minutes: 30
   #       run: |
-  #         cd sgl-kernel
+  #         cd python/sglang/kernels/aot
   #         pytest tests/

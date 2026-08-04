@@ -342,9 +342,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
         }
         serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
 
+        # flattened_bucket callers pass one serialized copy per TP rank, same
+        # as Engine.update_weights_from_tensor.
         result = self.engine.load_lora_adapter_from_tensors(
             lora_name="self_cognition_Alice_flattened",
-            tensors=serialized,
+            tensors=[serialized],
             config_dict=self.lora_config_dict,
             load_format="flattened_bucket",
         )
