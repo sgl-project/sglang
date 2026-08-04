@@ -74,6 +74,13 @@ pub enum DetokMsg {
     /// One decode step's chunks for *this shard*. Batched because `tm-egress` blocks
     /// per send, so one message per request cost ~1.3 µs × batch (5.1x at 4096).
     Chunks(Vec<ChunkEvent>),
+    /// Decode a complete token-id sequence — the backend of
+    /// [`RequestKind::Detokenize`], the one request kind the detok stage itself
+    /// answers (it never reaches the scheduler ring). Sent by tm-ingress right
+    /// after the same rid's `Register` on the same channel (FIFO), so the shard
+    /// delivers the text through the registered sink like a control `Result`
+    /// and drops the entry.
+    Decode { rid: Rid, token_ids: Vec<u32> },
     /// Control result: one already-serialized payload delivered to the sink verbatim.
     Result { rid: Rid, payload: bytes::Bytes },
     /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).

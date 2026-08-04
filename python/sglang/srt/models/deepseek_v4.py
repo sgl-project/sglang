@@ -84,6 +84,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.fp8_utils import (
+    view_aiter_fused_rms_transposed_fp8_scale,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -138,7 +141,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -243,6 +246,11 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         output_unquantized_inp1=True,
         transpose_scale=_use_aiter_bpreshuffle_gfx95,
     )
+    if _use_aiter_bpreshuffle_gfx95:
+        x_quant = (
+            x_quant[0],
+            view_aiter_fused_rms_transposed_fp8_scale(x_quant[1]),
+        )
     return x_quant, x_bf16
 
 
@@ -620,7 +628,7 @@ class MQALayer(MqaAttentionBase):
             base=self.rope_base,
             rope_scaling=self.rope_scaling,
             is_neox_style=False,
-            device=get_server_args().device,
+            device=get_device().device,
         )
 
         if _is_npu:
@@ -2495,7 +2503,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2546,11 +2554,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if get_server_args().enforce_shared_experts_fusion:
+        if get_exec().moe.enforce_shared_experts_fusion:
             if self.config.n_shared_experts != 1:
                 raise ValueError(
                     "DeepSeek V4 shared-experts fusion expects exactly one shared "
@@ -2744,8 +2752,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def _prewarm_mhc_pre_kernels(self) -> None:
-        """One-shot mhc_pre() JIT prewarm at load time, synced across ranks.
+    def _prewarm_mhc_kernels(self) -> None:
+        """One-shot MHC JIT prewarm at load time, synced across ranks.
 
         Runs before any forward so the compile burst stays off the serving
         path; the barrier keeps ranks from proceeding while a peer is still
@@ -2766,16 +2774,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         if layer is None:
             return
 
-        from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
+        from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
 
         tic = time.perf_counter()
+        residual = torch.zeros(
+            (1, layer.hc_mult, layer.hidden_size),
+            dtype=torch.bfloat16,
+            device=layer.hc_attn_fn.device,
+        )
         prewarm_mhc_pre(
             # Template carrying dtype/device; buckets allocate their own sizes.
-            residual=torch.zeros(
-                (1, layer.hc_mult, layer.hidden_size),
-                dtype=torch.bfloat16,
-                device=layer.hc_attn_fn.device,
-            ),
+            residual=residual,
             fn=layer.hc_attn_fn,
             hc_scale=layer.hc_attn_scale,
             hc_base=layer.hc_attn_base,
@@ -2789,13 +2798,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             norm_weight=layer.input_layernorm.weight.data,
             norm_eps=layer.input_layernorm.variance_epsilon,
         )
+        mhc_post(
+            x=residual.new_zeros((1, layer.hidden_size)),
+            residual=residual,
+            post_layer_mix=torch.zeros(
+                (1, layer.hc_mult, 1),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+            comb_res_mix=torch.zeros(
+                (1, layer.hc_mult, layer.hc_mult),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+        )
         torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
         torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
-            "DeepSeek V4 MHC prenorm prewarm at load: compile %.1fs, rank sync +%.1fs",
+            "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
             compile_secs,
             time.perf_counter() - tic - compile_secs,
         )
@@ -3145,7 +3168,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            self._prewarm_mhc_pre_kernels()
+            self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
