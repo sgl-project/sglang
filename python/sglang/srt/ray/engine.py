@@ -205,28 +205,21 @@ def _create_scheduler_actor(
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
-        # run_event_loop() blocks its worker thread for the actor's lifetime; allow
-        # one extra thread so a concurrent pull_weights() (RDT weight sync) is not
-        # starved. Safe because generation is paused during the pull.
+        # run_event_loop() blocks one thread for the actor's lifetime; leave a spare
+        # for pull_weights, which the trainer calls while generation is paused.
         max_concurrency=2 if rdt else 1,
-        # The http `port` is unique per engine and known to the trainer, so it lets
-        # RDT discover this engine's scheduler actors by name (ray list_named_actors)
-        # without an HTTP round-trip, even when several engines share one node.
+        # The http `port` disambiguates engines co-located on one node, letting the
+        # trainer find these actors via list_named_actors.
         name=(
             f"sglang_scheduler_node{rank0_node_ip}"
             f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
             f"_port{server_args.port}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}"
         ),
-        # Detached so the trainer (a different Ray driver/job) can discover these via
-        # list_named_actors / get_actor for RDT pull_weights. Non-detached named
-        # actors are not listed cross-job. RayEngine.shutdown ray.kills them, so they
-        # don't leak past the engine's lifetime.
+        # Non-detached named actors are not listed cross-job, so the trainer (a
+        # separate Ray job) could not discover them. RayEngine.shutdown kills these.
         lifetime="detached" if rdt else None,
-        # scheduler_actor uses the absolute GPU id from get_accelerator_ids(); that
-        # requires Ray NOT to remap CUDA_VISIBLE_DEVICES (else set_device(absolute)
-        # -> invalid device ordinal). The trainer job sets this in its runtime_env,
-        # but these actors are created by the sglang subprocess's job, so set it on
-        # the actor directly.
+        # SchedulerActor calls set_device() with the absolute id from
+        # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
         runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,

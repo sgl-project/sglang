@@ -2671,7 +2671,7 @@ class ServerArgs:
     ] = False
     enable_engine_info_bootstrap: A[
         bool,
-        "Start the EngineInfoBootstrapServer and register per-rank parallelism config WITHOUT the mooncake/verbs P2P transfer-engine seeding. Used by RDT (NIXL) weight sync, which needs /parallelism_config but not P2P memory registration.",
+        "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",
     ] = False
     enable_rdt_weight_sync: A[
         bool,
@@ -8110,18 +8110,14 @@ class ServerArgs:
             return False
 
     def needs_engine_info_bootstrap(self) -> bool:
-        """Host the EngineInfoBootstrapServer on this node (rank 0). True for the
-        transfer-engine seed, and for RDT/NIXL weight sync (which needs the server
-        to expose parallelism config to the trainer, but not the P2P memory seeding)."""
+        """Whether this node (rank 0) hosts the EngineInfoBootstrapServer."""
         return (
             self.remote_instance_weight_loader_start_seed_via_transfer_engine
             or self.enable_engine_info_bootstrap
         )
 
     def registers_parallelism_config(self) -> bool:
-        """Publish this rank's parallelism config to the bootstrap server (hosted
-        locally by the seed, or remotely). True whenever a transfer engine is in use,
-        and for RDT/NIXL weight sync."""
+        """Whether this rank publishes its parallelism config to the bootstrap server."""
         return (
             self.remote_instance_weight_loader_use_transfer_engine()
             or self.enable_engine_info_bootstrap

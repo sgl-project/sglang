@@ -55,9 +55,6 @@ class RemoteInstanceWeightTransporter:
         ).to_host_port_str()
 
     def maybe_init_parallelism_config(self) -> None:
-        # Compute the per-rank parallelism config whenever it will be published to
-        # the bootstrap server (transfer engine, or RDT/NIXL which needs it without
-        # one).
         if self.server_args.registers_parallelism_config():
             self.parallelism_config = RankParallelismConfig.from_parallel_state(
                 self.tp_rank
