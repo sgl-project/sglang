@@ -902,8 +902,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and not self.is_write_back
             and node.backuped
             and node.write_through_pending_id is None
-            and state.params.mamba_value is not None
-            and not state.result.mamba_exist
+            and node.component_data[ComponentType.MAMBA].value is not None
             and node.component_data[ComponentType.MAMBA].host_value is None
         )
 
