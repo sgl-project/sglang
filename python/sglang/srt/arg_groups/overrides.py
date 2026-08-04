@@ -939,6 +939,25 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+def _has_modelopt_w4a16_moe_layers(hf_config: Any) -> bool:
+    quantization_config = getattr(hf_config, "quantization_config", {}) or {}
+    if hasattr(quantization_config, "to_dict"):
+        quantization_config = quantization_config.to_dict()
+    if not isinstance(quantization_config, dict):
+        return False
+
+    quantized_layers = quantization_config.get("quantized_layers", {}) or {}
+    if not isinstance(quantized_layers, dict):
+        return False
+
+    return any(
+        isinstance(info, dict)
+        and str(info.get("quant_algo", "")).upper() == "W4A16_NVFP4"
+        and (".experts." in name or name.endswith(".experts"))
+        for name, info in quantized_layers.items()
+    )
+
+
 @_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
@@ -973,10 +992,17 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         server_args.moe_runner_backend == "auto"
     ):
         if is_sm100_supported() and server_args.moe_a2a_backend == "none":
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-            logger.info(
-                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
-            )
+            if _has_modelopt_w4a16_moe_layers(model_config.hf_config):
+                overrides["moe_runner_backend"] = "marlin"
+                logger.info(
+                    "Use marlin as MoE runner backend on sm100 for "
+                    f"{model_arch} with W4A16_NVFP4 MoE layers"
+                )
+            else:
+                overrides["moe_runner_backend"] = "flashinfer_trtllm"
+                logger.info(
+                    f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+                )
         elif (
             (
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")

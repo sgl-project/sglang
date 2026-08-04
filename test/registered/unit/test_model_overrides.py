@@ -403,6 +403,84 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
             )
 
+    def _nemotron_h_args(self, *, quantized_layers):
+        hf_config = SimpleNamespace(
+            architectures=["NemotronHForCausalLM"],
+            mlp_hidden_act="relu2",
+            quantization_config={
+                "quant_algo": "MIXED_PRECISION",
+                "quant_method": "modelopt_mixed",
+                "quantized_layers": quantized_layers,
+            },
+        )
+        model_config = SimpleNamespace(
+            quantization="modelopt_mixed", hf_config=hf_config
+        )
+        return (
+            SimpleNamespace(
+                quantization="modelopt_fp4",
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend=None,
+                get_model_config=lambda: model_config,
+            ),
+            hf_config,
+        )
+
+    def test_nemotron_h_w4a16_moe_uses_marlin_on_sm100(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.1.mixer.experts.0.down_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+            }
+        )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config),
+                {
+                    "quantization": "modelopt_mixed",
+                    "moe_runner_backend": "marlin",
+                    "attention_backend": "flashinfer",
+                },
+            )
+
+    def test_nemotron_h_nvfp4_moe_keeps_flashinfer_trtllm_on_sm100(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.1.mixer.experts.0.down_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                },
+                "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+            }
+        )
+
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _nemotron_h_overrides(server_args, hf_config),
+                {
+                    "quantization": "modelopt_mixed",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                    "attention_backend": "flashinfer",
+                },
+            )
+
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
         config_extra = {
