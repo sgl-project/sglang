@@ -88,8 +88,7 @@ def _make_layer(quant_config: Fp8Config, n: int, k: int, device: str = "cuda"):
         input_size=k,
         output_size=n,
         params_dtype=torch.bfloat16,
-        # The shape check reads the TP world size, which needs an initialized
-        # distributed group; single-process kernel test skips it.
+        # The shape check reads TP world size (needs distributed init); skip it here.
         skip_block_quant_check=True,
         weight_loader=lambda *args, **kwargs: None,
     )

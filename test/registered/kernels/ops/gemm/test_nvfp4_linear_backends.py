@@ -89,11 +89,8 @@ def dequantize_nvfp4_to_dtype(
 
 
 def _make_quantized_layer(n: int, k: int, device: str = "cuda"):
-    """Build a linear layer holding NVFP4 checkpoint-format weights.
-
-    Returns (method, layer, w_dequant) where w_dequant is the fp32 reference
-    weight after a quantize -> dequantize round trip.
-    """
+    """Build a linear layer holding NVFP4 checkpoint-format weights; returns
+    (method, layer, w_dequant) with w_dequant the fp32 quant->dequant reference."""
     quant_config = ModelOptFp4Config(
         is_checkpoint_nvfp4_serialized=True,
         group_size=16,
