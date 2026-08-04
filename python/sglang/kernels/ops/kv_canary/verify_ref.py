@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from sglang.kernels.ops.kv_canary import consts
@@ -93,6 +95,12 @@ def launch_canary_verify_kernel_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
+    host_real_kv_sources = materialize_real_kv_sources_on_host(
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+        work_device=work_device,
+    )
+
     violation_rows: list[list[int]] = []
 
     for k in range(active):
@@ -118,9 +126,7 @@ def launch_canary_verify_kernel_torch_reference(
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
-            work_device=work_device,
+            host_sources=host_real_kv_sources,
         )
         expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
 
@@ -190,37 +196,84 @@ def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
     return splitmix64_mix3(prev_hash, token, position)
 
 
-def _compute_real_kv_hash_scalar(
+class _HostRealKvSource(NamedTuple):
+    """A ``RealKvSource`` with its byte view already materialized on the host.
+
+    The underlying ``tensor`` is invariant across the slots hashed in one launch,
+    so the (potentially device→host) copy + uint8 view is done once here rather
+    than per slot. On a slow-D2H device the per-slot copy of a whole KV layer
+    would dominate — for a multi-thousand-token prefill it stalls the forward
+    outright."""
+
+    tensor_u8: torch.Tensor
+    page_size: int
+    num_bytes_per_token: int
+    effective_read_bytes: int
+
+
+def materialize_real_kv_sources_on_host(
     *,
-    slot_idx: int,
     real_kv_sources: tuple[RealKvSource, ...],
     real_kv_hash_mode: consts.RealKvHashMode,
     work_device: torch.device,
-) -> int:
+) -> tuple[_HostRealKvSource, ...]:
+    """Copy each source to ``work_device`` once and precompute its read width.
+
+    Returns an empty tuple when hashing is disabled (mode NONE / no sources), so
+    callers can cheaply skip the per-slot fold."""
     mode = int(real_kv_hash_mode)
     if mode == int(consts.RealKvHashMode.NONE) or len(real_kv_sources) == 0:
+        return ()
+
+    host_sources: list[_HostRealKvSource] = []
+    for source in real_kv_sources:
+        tensor_u8 = (
+            source.tensor.detach().to(device=work_device).contiguous().view(torch.uint8)
+        )
+        effective_read_bytes = (
+            16 if mode == int(consts.RealKvHashMode.PARTIAL) else source.read_bytes
+        )
+        # The per-slot fold reads a dim-1 slice, which clamps to the row end instead of
+        # raising; a row too narrow for page_size slots would silently hash fewer bytes
+        # (0 for the tail slots) and still report the chain clean. RealKvSource.__post_init__
+        # does not cover this, so check it here, once per launch.
+        row_bytes = int(tensor_u8.shape[1])
+        min_row_bytes = source.page_size * source.num_bytes_per_token
+        if row_bytes < min_row_bytes:
+            raise ValueError(
+                f"kv-canary: RealKvSource row is too narrow for its slot layout: "
+                f"dim-1 is {row_bytes} bytes but page_size={source.page_size} x "
+                f"num_bytes_per_token={source.num_bytes_per_token} needs {min_row_bytes}"
+            )
+        host_sources.append(
+            _HostRealKvSource(
+                tensor_u8=tensor_u8,
+                page_size=source.page_size,
+                num_bytes_per_token=source.num_bytes_per_token,
+                effective_read_bytes=effective_read_bytes,
+            )
+        )
+    return tuple(host_sources)
+
+
+def _compute_real_kv_hash_scalar(
+    *,
+    slot_idx: int,
+    host_sources: tuple[_HostRealKvSource, ...],
+) -> int:
+    if len(host_sources) == 0:
         return 0
 
     acc: int = 0
 
-    for source in real_kv_sources:
-        page_size = source.page_size
-        num_bytes_per_token = source.num_bytes_per_token
-        read_bytes = source.read_bytes
-        tensor_u8 = (
-            source.tensor.detach().to(device=work_device).contiguous().view(torch.uint8)
-        )
+    for source in host_sources:
+        row = slot_idx // source.page_size
+        col_within_page = slot_idx % source.page_size
+        col_start = col_within_page * source.num_bytes_per_token
 
-        row = slot_idx // page_size
-        col_within_page = slot_idx % page_size
-        col_start = col_within_page * num_bytes_per_token
-
-        effective_read_bytes = (
-            16 if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
-        )
-        raw_bytes: list[int] = []
-        for b in range(effective_read_bytes):
-            raw_bytes.append(int(tensor_u8[row, col_start + b].item()))
+        raw_bytes = source.tensor_u8[
+            row, col_start : col_start + source.effective_read_bytes
+        ].tolist()
 
         source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
 
