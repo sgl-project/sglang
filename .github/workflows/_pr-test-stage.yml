@@ -54,6 +54,10 @@ on:
         description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
         type: string
         default: ''
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this stage compiles them during install.'
+        type: string
+        default: ''
 
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
@@ -108,7 +112,7 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
@@ -116,14 +120,27 @@ jobs:
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
         uses: actions/download-artifact@v6
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
+
+      # continue-on-error: the artifact expires in a day, so a later re-run just
+      # compiles during install. download-artifact creates srt/server/, which
+      # exists only as build output.
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         env:
           GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
