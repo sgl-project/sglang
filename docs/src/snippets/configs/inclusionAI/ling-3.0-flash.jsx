@@ -350,8 +350,6 @@ sgl-eval run gsm8k \\
         "--speculative-draft-model-path {{DSPARK_DRAFT}}",
         "--disable-radix-cache",
         "--mem-fraction-static 0.8",
-        "--cuda-graph-max-bs-decode 2",
-        "--max-running-requests 16",
         "--max-total-tokens 1048576",
         "--flashinfer-allreduce-fusion-backend auto",
         "--scheduler-recv-interval 16",
