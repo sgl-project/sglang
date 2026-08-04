@@ -781,6 +781,36 @@ class MooncakeKVManager(CommonKVManager):
             # compared to using multiple threads
             return process_layers(layers_params)
 
+    def _validate_envelope_kv_layout(
+        self, dst_kv_ptrs: list[int], dst_kv_item_len: Optional[int]
+    ) -> None:
+        """Reject a peer whose KV registration shape differs from ours when
+        either side registered ONE whole-envelope region.
+
+        The envelope form addresses the destination as
+        ``dst_ptr + page_id * item_len`` using OUR ``item_len``, so a peer on a
+        different page size / spec, or without unified memory, would take
+        envelope-sized blocks at the wrong offsets. Must run before the first
+        RDMA write.
+        """
+        src_is_envelope = len(self.kv_args.kv_data_ptrs) == 1
+        dst_is_envelope = len(dst_kv_ptrs) == 1
+        if not (src_is_envelope or dst_is_envelope):
+            return
+        src_item_len = self.kv_args.kv_item_lens[0] if src_is_envelope else None
+        if (
+            src_is_envelope != dst_is_envelope
+            or dst_kv_item_len is None
+            or src_item_len != dst_kv_item_len
+        ):
+            raise RuntimeError(
+                "PD KV layout mismatch on the whole-envelope path: prefill has "
+                f"{len(self.kv_args.kv_data_ptrs)} KV region(s) with item_len="
+                f"{src_item_len}, decode has {len(dst_kv_ptrs)} with item_len="
+                f"{dst_kv_item_len}. With --enable-unified-memory both sides "
+                "must enable it and use the same page size and model spec."
+            )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -790,7 +820,9 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
     ):
+        self._validate_envelope_kv_layout(dst_kv_ptrs, dst_kv_item_len)
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -1710,6 +1742,7 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                             )
                         elif (
                             self.enable_staging
