@@ -285,12 +285,12 @@ ITL 92ms 下，每 100 个输出 token ≈ 9.2s。**E2E<10s 只对短输出任�
 
 | 参数 | 建议值 | 理由 |
 |------|--------|------|
-| `enable_thinking` | `false` | 提取是确定性任务，thinking 是纯开销；若误选工具再开 `thinking_budget ≤ 128` |
+| `enable_thinking` | `false` | 提取是确定性任务，thinking 是纯开销；模型模板不支持 thinking_budget，无法软限制 |
 | `max_tokens` | 512（严格 <10s 目标用 256） | 工具调用 JSON 典型 50~160 token；512 覆盖长参数工具，256 保 E2E |
 | `temperature` | 0.0 | 确定性 |
 | `repetition_penalty` | 1.0 | |
 
-`thinking_budget` 通过 `chat_template_kwargs` 传递，先发一个请求验证模板是否支持该字段。
+> 注：Qwen3.6-27B 模板不支持 `thinking_budget`（实测无此字段，静默忽略），thinking 长度只能靠 `max_tokens` 硬截断（见 9.3）。
 
 ### 9.3 代码检视（质量-延迟权衡）
 
@@ -299,26 +299,26 @@ ITL 92ms 下，每 100 个输出 token ≈ 9.2s。**E2E<10s 只对短输出任�
 ```json
 {
     "chat_template_kwargs": {
-        "enable_thinking": true,
-        "thinking_budget": 1024
+        "enable_thinking": true
     },
     "temperature": 0.1,
     "top_p": 0.95,
     "repetition_penalty": 1.05,
-    "max_completion_tokens": 2048,
-    "max_tokens": 2048
+    "max_completion_tokens": 4096,
+    "max_tokens": 4096
 }
 ```
 
-| 档位 | thinking_budget | max_tokens | 单请求 decode | 适用 |
-|------|----------------|------------|--------------|------|
-| 快速档 | 512 | 1024 | ~33s | 简单审查/格式检查 |
-| **默认档** | **1024** | **2048** | ~50s | 常规代码检视（先跑 A/B 再调） |
-| 深度档 | 2048 | 3072 | ~82s | 复杂/安全/跨模块检视，接受长 E2E |
+| 档位 | max_tokens | 单请求 decode | 适用 |
+|------|-----------|--------------|------|
+| **默认档（保答案）** | **4096** | ~82s+ | 常规代码检视，答案完整 |
+| 折中档 | 3072 | ~66s+ | thinking 长时可能截断答案，需抽检 |
+| 快速档（不建议） | 2048 | ~50s | **已验证：thinking 吃满后答案被截断** |
 
-- **质量-延迟是同一杠杆两端**：budget 越低延迟越低、复杂场景精度越可能下降；用"budget vs bug 检出率"的 A/B 曲线决定档位，不要凭感觉；
-- `max_tokens` **暂勿超过 4096**：在加卡/换 H20-H100 或质量分级落地前，这是防队列爆炸的安全上限；
-- `thinking_budget` 是模板级约束（模型提前知道预算、主动压缩推理），优于 max_tokens 硬截断；先验证模板支持该字段，不支持则退化为硬截断（质量略差）。
+- **Qwen3.6-27B 模板不支持 `thinking_budget` / `budget_tokens`**（实测 tokenizer_config 中无此字段，设置会被静默忽略）——控制输出长度的唯一手段是 `max_tokens` 硬截断；
+- 硬截断的代价：`max_tokens` 过低会截在 thinking 中途、答案丢失（2048 已实测复现）；没有"限思考预算"的软开关；
+- 想真正砍 thinking 延迟，只有两条路：**关 thinking**（`enable_thinking: false` + 结构化 prompt 直接给审查结论，无 thinking token，E2E 减半以上，需质量 A/B）或**加容量/换 H20-H100**；
+- 质量-延迟是同一杠杆两端，用"max_tokens vs bug 检出率"的 A/B 曲线决定档位，不要凭感觉。
 
 ### 9.4 通用配置（压低 TTFT）
 
