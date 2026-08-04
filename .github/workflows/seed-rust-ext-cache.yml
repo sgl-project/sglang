@@ -1,9 +1,8 @@
 name: Seed Rust Ext Cache
 
-# A cache entry is only visible to every PR when it was written from the default
-# branch's ref, and pr-test.yml has no push trigger - so after a merge that changes
-# the key, every PR misses and compiles for itself until the next scheduled run, up
-# to 12h later. Seed it here instead, once per merge that can move the key.
+# A cache entry only reaches every PR when it was written from the default branch's
+# ref, and pr-test.yml has no push trigger - so a merge that moves the key leaves
+# every PR compiling for itself until the next scheduled run, up to 12h later.
 
 on:
   push:
@@ -18,8 +17,8 @@ concurrency:
   group: seed-rust-ext-cache
   cancel-in-progress: true
 
-# issues: read is what check-maintenance needs to reach the maintenance issue;
-# declaring permissions at all drops everything not listed here.
+# Declaring permissions at all drops everything not listed, and check-maintenance
+# needs issues: read to reach the maintenance issue.
 permissions:
   contents: read
   issues: read

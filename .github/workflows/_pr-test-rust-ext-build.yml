@@ -150,10 +150,9 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Same path ci_install_dependency.sh uses, so a runner that also runs
-          # test stages keeps one warm cargo cache. That script drops the tree
-          # under disk pressure; repeat the guard here, since nothing else prunes
-          # it on a runner that only ever builds.
+          # Same path ci_install_dependency.sh uses, so a runner that also runs test
+          # stages keeps one warm cache. Its guard is repeated here because nothing
+          # prunes the tree on a runner that only ever builds.
           export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
           mkdir -p "${CARGO_TARGET_DIR}"
           used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
