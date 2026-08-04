@@ -16,7 +16,6 @@ use crate::error::Error;
 
 // `Failed(Error)` carries the cause for observability even where it isn't read
 // back yet; `EncodeDone` belongs to the deferred Encoder edge.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RequestState {
     Received,

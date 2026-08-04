@@ -176,8 +176,12 @@ def build_replay_fb_view(
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
-        # when mamba-track is disabled.
-        mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
+        # when mamba-track is disabled, slice to [:bs] like every other buffer
+        mamba_track_indices=(
+            None
+            if buffers.mamba_track_indices is None
+            else buffers.mamba_track_indices[:bs]
+        ),
         spec_info=forward_batch.spec_info,
     )
 
