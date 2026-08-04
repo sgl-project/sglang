@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
+import einops
 import torch
 
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
@@ -93,14 +94,6 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     exp = torch.where(is_ru, exp + 1, exp)
     new_x = exp.to(torch.uint8).view(torch.int)
     return new_x.transpose(1, 2).contiguous().transpose(1, 2)
-
-
-def _tma_align_packed_ue8m0(scale: torch.Tensor) -> torch.Tensor:
-    # SM120's grouped GEMM validates strides in check_sf_layout; the packed
-    # INT32 scales from _cast_to_e8m0_with_rounding_up need TMA alignment.
-    return deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-        scale.view(torch.float32)
-    ).view(torch.int32)
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
@@ -479,8 +472,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-            if _is_sm120:
-                hidden_states_scale = _tma_align_packed_ue8m0(hidden_states_scale)
         elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
@@ -516,10 +507,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
-            # DeepSeek V4: _varlen_deep_gemm_silu_mul_quant decides whether the
-            # clamp can be fused into the activation kernel or has to be
-            # applied separately, so hand it the limit unconditionally.
-            swiglu_limit_arg = self.swiglu_limit
+            # DeepSeek V4: clamped swiglu requires the DSV4 JIT EP activation.
+            assert (
+                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                swiglu_limit_arg = self.swiglu_limit
+            else:
+                gateup_output = einops.rearrange(
+                    gateup_output, "grp tok hidden -> (grp tok) hidden"
+                )
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+                gateup_output = einops.rearrange(
+                    gateup_output,
+                    "(grp tok) hidden -> grp tok hidden",
+                    grp=num_groups,
+                )
 
         # Act.
         topk_ids_rs = running_state.get("topk_ids")
@@ -1270,31 +1276,15 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    use_jit_ep_activation = (
-        envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-        and N % 4 == 0
-        and G % 4 == 0
-        and D // 8 >= E
-    )
-    fuse_swiglu_limit = (
-        use_jit_ep_activation and envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
-    )
-    if swiglu_limit is not None and not fuse_swiglu_limit:
-        # The JIT EP activation is the only fused consumer of swiglu_limit;
-        # when it cannot run, clamp in place and fall through to plain silu.
-        _apply_swiglu_limit(
-            gateup_output.view(-1, gateup_output.shape[-1]),
-            swiglu_limit=swiglu_limit,
-        )
-        swiglu_limit = None
-
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
     # on the DSV4 JIT kernel; it is the only implementation carrying them.
     if swiglu_limit is not None or swizzle:
-        assert use_jit_ep_activation, (
-            "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True, "
-            "N % 4 == 0, G % 4 == 0 and D // 8 >= num_experts, got "
-            f"N={N} G={G} D={D} E={E}"
+        assert (
+            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+        ), "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
+            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
+            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
         )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input = torch.empty(
@@ -1341,11 +1331,17 @@ def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
     assert swiglu_limit == 10
-    assert gateup_output.dtype == torch.bfloat16
 
     num_tokens, hidden_size_x2 = gateup_output.shape
-    half = hidden_size_x2 // 2
-    # In-place to avoid materializing a concat.
-    gateup_output[:, :half].clamp_(max=swiglu_limit)
-    gateup_output[:, half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
-    return gateup_output
+    assert gateup_output.dtype == torch.bfloat16
+
+    gate, up = torch.chunk(gateup_output, chunks=2, dim=-1)
+    assert gate.shape == (num_tokens, hidden_size_x2 // 2)
+    assert up.shape == (num_tokens, hidden_size_x2 // 2)
+
+    up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+    gate = torch.clamp(gate, max=swiglu_limit)
+
+    out = torch.cat([gate, up], dim=-1)
+    assert out.shape == (num_tokens, hidden_size_x2)
+    return out
