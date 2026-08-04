@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.test_utils import CustomTestCase
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -196,6 +198,26 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
         self.cache.release_radix_session("s1")
         self.assertEqual(self.full.session_ref(leaf), 0)
 
+    def test_pressure_counters_follow_session_and_lock_lifecycle(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        self.assertEqual(self.cache.active_radix_session_count(), 0)
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 0)
+
+        generation = self.cache.open_radix_session("s1")
+        self.assertEqual(self.cache.active_radix_session_count(), 1)
+        register(self.cache, [1, 2, 3, 4], "s1", generation)
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
+
+        lock_result = self.cache.inc_lock_ref(leaf.id)
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 0)
+        self.cache.dec_lock_ref(leaf.id, lock_result.to_dec_params())
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
+
+        self.cache.release_radix_session("s1")
+        self.assertEqual(self.cache.active_radix_session_count(), 0)
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 0)
+        self.cache.sanity_check()
+
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])
         old_generation = self.cache.open_radix_session("s1")
@@ -206,16 +228,62 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.assertEqual(self.full.session_ref(leaf), 0)
 
+    def test_pressure_counter_survives_referenced_node_split(self):
+        insert(self.cache, [1, 2, 3, 4])
+        register(self.cache, [1, 2, 3, 4], "s1")
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
+
+        insert(self.cache, [1, 2, 5, 6])
+
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
+        self.cache.sanity_check()
+        self.cache.release_radix_session("s1")
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 0)
+        self.cache.sanity_check()
+
+    def test_pool_stats_exports_session_pressure_to_scheduler_metrics(self):
+        pool_stats = PoolStats(
+            full_num_used=7,
+            full_token_usage=0.25,
+            full_available_size=11,
+            full_evictable_size=13,
+            session_radix_active_sessions=2,
+            session_radix_full_referenced_evictable_size=17,
+            session_radix_swa_referenced_evictable_size=19,
+            session_radix_mamba_referenced_evictable_size=23,
+        )
+        scheduler_stats = SchedulerStats()
+
+        pool_stats.update_scheduler_stats(scheduler_stats)
+
+        self.assertEqual(scheduler_stats.session_radix_active_sessions, 2)
+        self.assertEqual(
+            scheduler_stats.session_radix_full_referenced_evictable_tokens, 17
+        )
+        self.assertEqual(
+            scheduler_stats.session_radix_swa_referenced_evictable_tokens, 19
+        )
+        self.assertEqual(
+            scheduler_stats.session_radix_mamba_referenced_evictable_slots, 23
+        )
+
     def test_eviction_prefers_unreferenced_full_kv(self):
         referenced = insert(self.cache, [1, 2, 3, 4])
         insert(self.cache, [7, 8, 9])
         register(self.cache, [1, 2, 3, 4], "s1")
+
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
 
         self.cache.evict(EvictParams(num_tokens=3))
 
         self.assertEqual(match_len(self.cache, [7, 8, 9]), 0)
         self.assertEqual(match_len(self.cache, [1, 2, 3, 4]), 4)
         self.assertEqual(self.full.session_ref(referenced), 1)
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 4)
+
+        self.cache.evict(EvictParams(num_tokens=1))
+        self.assertEqual(self.cache.full_session_referenced_evictable_size(), 0)
+        self.cache.sanity_check()
 
 
 if __name__ == "__main__":
