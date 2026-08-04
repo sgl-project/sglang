@@ -183,6 +183,19 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class GateGemvMode(IntEnum):
+    """Small-batch Inkling gate linear implementation.
+
+    OFF: always the cublas GEMM
+    PAIR: PDL-chained GEMV and gate JIT kernels
+    FUSED: single-launch GEMV + gate epilogue (last-block ticket)
+    """
+
+    OFF = 0
+    PAIR = 1
+    FUSED = 2
+
+
 class ToolStrictLevel(IntEnum):
     """
     Defines the strictness levels for tool call parsing and validation.
@@ -197,11 +210,45 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class InvariantCheckLevel(IntEnum):
+    """Signal level for value/index validity checks (see invariants.py).
+
+    OFF: data layer only (sanitize/containment); no detection, no signal.
+    WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
+    STRICT: detect + crash on GUARD/FATAL violations (CI default).
+
+    The data layer is unconditional and independent of this level; only the
+    detection + signal layer is gated here.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
+class DsparkFoldedSampling(IntEnum):
+    """Sampling support in the graph-folded DSpark draft proposal: OFF =
+    greedy-only folding, AUTO = on when its buffers fit in free GPU memory,
+    FORCE = always."""
+
+    OFF = 0
+    AUTO = 1
+    FORCE = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
+
+    # Per-role config-namespace bookkeeping: off / record / enforce (value is
+    # validated fail-loud in runtime_context, which resolves it once at import
+    # so the read stays dynamo-prunable).
+    SGLANG_ROLE_NAMESPACES = EnvStr("off")
+    # record mode: append each newly observed (role, namespace) pair to this
+    # file so the audit survives signal-killed workers.
+    SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
@@ -216,6 +263,7 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
+    SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
@@ -235,6 +283,7 @@ class Envs:
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
 
     # SGLang CI
@@ -287,6 +336,7 @@ class Envs:
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
+    SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
@@ -300,6 +350,9 @@ class Envs:
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    # Allocator-history buffer for /start_profile activities=["MEM"]; the
+    # default truncates long windows (each entry is one alloc/free event).
+    SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
@@ -344,6 +397,7 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
@@ -357,6 +411,7 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
@@ -375,6 +430,9 @@ class Envs:
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
     SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
+    # Force the WAR barrier to wait for the whole forward instead of the
+    # read-done fastpath event.
+    SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -458,7 +516,6 @@ class Envs:
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
-    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
@@ -486,6 +543,7 @@ class Envs:
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+    MOONCAKE_TENANT_ID = EnvStr("default")
 
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
@@ -521,6 +579,14 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
+    # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
+    # halves the gathered hidden-state bytes over NCCL; the combine
+    # (reduce_scatterv) leg stays bf16 (NCCL SUM cannot run on fp8).  Lossy on
+    # the wire — same group quantization the MoE expert GEMMs apply to their
+    # input anyway, but router/shared-expert reads see rounded values, so this
+    # stays accuracy-gated and default OFF.
+    SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -611,6 +677,12 @@ class Envs:
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
+    # token count.
+    SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # Unpacked cubin pool for the JIT-built trtllm-gen fused MoE (cubins + flat
+    # ABI headers + overlay/). Unset means the path is unavailable, not empty.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -647,6 +719,18 @@ class Envs:
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
+    # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):
+    # shrinks the [num_local_experts, m, *] MoE intermediates ~4x under
+    # load imbalance (they otherwise OOM saturated --moe-runner-backend
+    # deep_gemm serving).  Costs one D2H sync per MoE layer.
+    SGLANG_OPT_DG_MASKED_M_CAP = EnvBool(False)
+    # Drop dp-attention MAX_LEN pad rows from MoE dispatch (StandardDispatcher
+    # post-translation topk_ids -> -1): pad rows otherwise run the router on
+    # stale hidden values and burn expert compute whose outputs are discarded;
+    # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
+    # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
+    SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
@@ -675,6 +759,9 @@ class Envs:
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
+    # PPLX-EP (Perplexity pplx-kernels NVSHMEM all-to-all)
+    SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
@@ -691,6 +778,35 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
+    # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
+    # directly in fp8 ("born fp8") and the standalone concat-cast kernel
+    # disappears.  Not bit-exact vs the default path (same rounding stages,
+    # different GEMM accumulation order), hence default OFF until accuracy-
+    # gated (oracle + full-set gsm8k).
+    SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
+    # per-row valid-topk count (derived from the trailing -1 pad run of the
+    # topk indices) so the kernel skips whole pad-only topk blocks instead of
+    # computing masked zero contributions.  Bit-exact by construction: skipped
+    # blocks contain only -1 pads, and -1 entries inside the consumed range
+    # still take the in-kernel clamp+mask path.
+    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
+    # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
+    # chains fork independently from the q_a_layernorm output.  Requires
+    # SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q; eager-prefill-only via the born
+    # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
+    # WAR-safe.
+    SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
+    # directly into the persistent fp8 kv buffer and zero the pad band in one
+    # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
+    SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Q8KV8 born-fp8 q-prep codegen: "auto" = per-K Triton dispatch (default);
+    # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
+    # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
+    SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -700,7 +816,7 @@ class Envs:
 
     # Kernels
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -724,6 +840,14 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
+    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
+    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
+    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
+    # Default per-direction workspace cap for CustomAllReduceV2; explicit
+    # constructor sizes take precedence over this.
+    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -739,7 +863,8 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
-    SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
+    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
@@ -761,6 +886,12 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Signal level for value/index validity checks (nan/inf/oob/...); see
+    # invariants.py. OFF (prod default) runs only the free data layer, WARN
+    # adds throttled logging, STRICT (CI default) crashes on violations.
+    # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
+    # every callsite migrates.
+    SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
@@ -790,9 +921,19 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
+    # falls back to the per-conv-type Python loop.
+    SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
+    # during decode (it is already COW'd to the request's own slot) and shrink the
+    # mamba pool ratio accordingly. Frees one resident slot per running request,
+    # raising max_running_requests. Off = original locking + ratio (escape hatch).
+    SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    # Registered TreeCore backend serving the unified radix cache.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
@@ -805,9 +946,13 @@ class Envs:
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
-    # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
-    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+    # Logprob processor
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
+    )
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+    )
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
@@ -891,12 +1036,85 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
+    # ====================================================================
+    # Inkling
+    SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
+    # Inside the fused gate: use the CUDA JIT top-k+renorm kernel (v2) instead
+    # of the triton kernel when the production Inkling shape applies.
+    SGLANG_OPT_USE_GATE_TOPK_JIT = EnvBool(True)
+    # Inside the fused gate: replace the cublas gate linear with the
+    # expert-per-block GEMV JIT kernel at small token counts (GateGemvMode).
+    SGLANG_OPT_GATE_GEMV_MODE = EnvInt(GateGemvMode.PAIR)
+    # Capture all multi-layer EAGLE draft-extend steps and the in-graph chain
+    # rotation into ONE CUDA graph instead of one captured graph per step.
+    SGLANG_ENABLE_SINGLE_CG_DRAFT = EnvBool(True)
+    # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
+    # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
+    SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
+    # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
+    SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
+    # serving enables this layout independently of the flag.
+    SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)
+    # Use the autotuned JIT all-reduce, falling back to torch multimem for
+    # shapes where it wins.
+    SGLANG_OPT_USE_INKLING_CUSTOM_AR = EnvBool(True)
+    # Fuse small-batch decode all-reduce, MLP convolution, and attention norm.
+    # Requires the custom all-reduce; other shapes use the unfused path.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM = EnvBool(True)
+    # Fuse eligible extend all-reduce, convolution, and cache updates.
+    # Supports scattered or full-width state and requires the custom all-reduce.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV = EnvBool(True)
+    # Fuse eligible convolution, QK norm, window, and KV-store prologue work.
+    # Non-BF16 caches retain the backend KV store.
+    SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE = EnvBool(True)
+    # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
+    # When unset, selection follows model, quantization, and LoRA requirements.
+    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    # Fold the conditional long-context log-scaling tau into its producers
+    # instead of separate output-sized scale kernels: the fused attn
+    # prologue's q path (bit-exact, before MXFP8 quantization there) and the
+    # rel_logits projection's r OPERAND (the diagonal scale commutes through
+    # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
+    # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
+    # on the outputs.
+    # Fold the MoE shared-expert partials into the custom AR kernels instead
+    # of a separate {routed + shared} torch.add per MoE layer; some buckets
+    # keep a pre-add during the AR stage-in. torch.add numerics
+    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
+    # Dispatch the rel_logits projection around einsum's hidden compaction
+    # copy of the strided r operand (a view into the packed qkvr output):
+    # zero-copy strided-batched matmul at small t, JIT row-compact + einsum
+    # above the band, single-launch tau-folded kernel in the small-t tau
+    # band. Bit-identical to the plain einsum; flag-off restores it.
+    SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH = EnvBool(True)
+
+    # Quantize and store MXFP8 K/V data and scales in one fused kernel.
+    SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE = EnvBool(True)
+    # Default reasoning effort in [0.0, 0.99] when omitted by a request.
+    # An empty string falls back to the protocol default (0.9); the effort
+    # directive is always emitted.
+    SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
+    SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    # ====================================================================
+
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Copy rank-local MoE slices into independent CPU storage before H2D when
+    # they reference a larger mmap-backed checkpoint storage.
+    SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
+    # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
+    SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
 
     # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -956,13 +1174,14 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
-    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
-    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
+    # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
+    # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
+    SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
@@ -981,6 +1200,14 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
+    # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
+    # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
+    # instead of quantizing the same [T, hidden] tensor twice with different
+    # scale layouts. Only engages on CUDA with fp8 block-128 weights, the
+    # standard dispatcher, and the triton MoE runner; falls back silently
+    # otherwise.
+    SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
@@ -1023,6 +1250,8 @@ class Envs:
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL = EnvFloat(10.0)
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
+    # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
+    SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
@@ -1057,6 +1286,13 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+    # ===================================================================
+    # Rust Server specific envs.
+    # ===================================================================
+    SGLANG_RUST_SERVER = EnvBool(False)
+    # Most batched requests one /generate HTTP call may expand into.
+    SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
 
 envs = Envs()
@@ -1093,7 +1329,12 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
+    _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
+    _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
+    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
+    _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(

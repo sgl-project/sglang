@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
@@ -164,24 +163,38 @@ class TestDPAttentionDP2TP4VLM(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_vlm_generate(self):
-        chat_template = get_chat_template_by_model_path(self.model)
-        prompt = f"{chat_template.image_token}What is in this image?"
+        # Go through /v1/chat/completions so the server inserts the model's own
+        # image placeholder instead of the test guessing one.
         response = requests.post(
-            self.base_url + "/generate",
+            self.base_url + "/v1/chat/completions",
             json={
-                "text": prompt,
-                "image_data": [self.image_url],
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 16,
-                },
+                "model": "default",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": self.image_url},
+                            },
+                            {"type": "text", "text": "What is in this image?"},
+                        ],
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 16,
             },
         )
         response.raise_for_status()
         response_json = response.json()
         print(response_json)
-        self.assertIn("output_ids", response_json)
-        self.assertGreater(len(response_json["output_ids"]), 0)
+        self.assertTrue(response_json["choices"][0]["message"]["content"])
+
+        # image_tokens comes from the prefill's multimodal item offsets, so a
+        # non-zero count is what proves the image reached the vision tower.
+        usage_details = response_json["usage"].get("prompt_tokens_details")
+        self.assertIsNotNone(usage_details, "prompt carried no multimodal tokens")
+        self.assertGreater(usage_details.get("image_tokens", 0), 0)
 
 
 if __name__ == "__main__":

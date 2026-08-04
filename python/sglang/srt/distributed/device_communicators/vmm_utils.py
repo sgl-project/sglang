@@ -52,6 +52,56 @@ def is_vmm_pointer(ptr: int) -> bool:
     return False
 
 
+def compute_graph_capture_bases(graph_inputs: List[tuple]):
+    """Map graph-capture inputs onto their VMM base allocations.
+
+    ``graph_inputs`` is a list of ``(device_ptr, nbytes)`` pairs. A captured
+    tensor can cross expandable-segment allocation boundaries, so each input
+    is walked with ``cuMemGetAddressRange`` until its byte span is covered.
+
+    Returns ``(bases_info, input_chunk_indices, input_offsets)``:
+      - ``bases_info[i] = (base_ptr, alloc_size)`` per unique allocation
+      - ``input_chunk_indices[j]`` = indices of allocations covering input j
+      - ``input_offsets[j]`` = byte offset of input j from its first base
+    """
+    drv = _get_cuda_driver()
+    base_to_idx = {}
+    bases_info: List[tuple] = []
+    input_chunk_indices: List[List[int]] = []
+    input_offsets: List[int] = []
+    for ptr, nbytes in graph_inputs:
+        ptr, remaining = int(ptr), int(nbytes)
+        if remaining <= 0:
+            raise RuntimeError(f"Invalid graph capture input size: {nbytes}")
+        cursor = ptr
+        first_base = None
+        chunks: List[int] = []
+        while remaining > 0:
+            err, base, size = drv.cuMemGetAddressRange(cursor)
+            if err != drv.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemGetAddressRange: {err}")
+            base, size = int(base), int(size)
+            if first_base is None:
+                first_base = base
+            byte_offset = cursor - base
+            if not 0 <= byte_offset < size:
+                raise RuntimeError(
+                    f"graph capture input at {ptr} is outside VMM allocation "
+                    f"[base={base}, size={size}]"
+                )
+            idx = base_to_idx.setdefault(base, len(bases_info))
+            if idx == len(bases_info):
+                bases_info.append((base, size))
+            chunks.append(idx)
+            advance = min(remaining, size - byte_offset)
+            assert advance > 0, "Failed to advance VMM graph capture span"
+            remaining -= advance
+            cursor += advance
+        input_chunk_indices.append(chunks)
+        input_offsets.append(ptr - first_base)
+    return bases_info, input_chunk_indices, input_offsets
+
+
 def make_rw_access_desc(device_id: int):
     """A read-write, device-local ``CUmemAccessDesc`` for ``device_id``."""
     drv = _get_cuda_driver()
