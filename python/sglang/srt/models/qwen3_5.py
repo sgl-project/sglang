@@ -133,9 +133,6 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
-# Opt-in: dispatch GDN to the fused vLLM SYCL op in sgl-kernel-xpu
-# (torch.ops.sgl_kernel.gdn_attention). Default OFF -> Triton path unchanged.
-_xpu_fused_gdn = get_bool_env_var("SGLANG_XPU_FUSED_GDN", "False") and _is_xpu
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -637,20 +634,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         core_attn_out = z = None
-        if _xpu_fused_gdn:
-            from sglang.srt.model_executor.forward_context import get_attn_backend
+        from sglang.srt.model_executor.forward_context import get_attn_backend
 
-            backend = get_attn_backend()
-            backend = getattr(backend, "linear_attn_backend", backend)
-            if hasattr(backend, "forward_fused_gdn") and backend.supports_fused_gdn(
-                self.attn, forward_batch
-            ):
-                core_attn_out, z = backend.forward_fused_gdn(
-                    self.attn,
-                    forward_batch,
-                    projected_states_qkvz,
-                    projected_states_ba,
-                )
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if hasattr(backend, "forward_fused_gdn") and backend.supports_fused_gdn(
+            self.attn, forward_batch
+        ):
+            core_attn_out, z = backend.forward_fused_gdn(
+                self.attn,
+                forward_batch,
+                projected_states_qkvz,
+                projected_states_ba,
+            )
 
         if core_attn_out is None:
             if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:

@@ -345,18 +345,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             is_blackwell,
             is_npu,
             is_sm120_supported,
+            is_xpu,
         )
 
-        if not is_npu():
-            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-                HybridLinearAttnBackend,
-                Mamba2AttnBackend,
-            )
-            from sglang.srt.layers.attention.linear.gdn_backend import (
-                GDNAttnBackend,
-                flashinfer_gdn_prefill_default,
-            )
-        else:
+        if is_npu():
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
             )
@@ -366,6 +358,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
                 AscendMamba2AttnBackend as Mamba2AttnBackend,
             )
+        else:
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                Mamba2AttnBackend,
+            )
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                GDNAttnBackend,
+                flashinfer_gdn_prefill_default,
+            )
+
+            if is_xpu():
+                from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
+                    XpuGDNAttnBackend as GDNAttnBackend,
+                )
 
         check_environments()
         prefill_default = None
