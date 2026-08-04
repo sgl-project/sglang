@@ -522,20 +522,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if base_diffusers_kwargs != candidate_diffusers_kwargs:
             return "extra.diffusers_kwargs"
 
-        base_profile = (
-            (True, base_req.profile_all_stages, base_req.num_profiled_timesteps)
-            if base_req.profile
-            else (False,)
-        )
-        candidate_profile = (
-            (
+        if base_req.profile:
+            base_profile = (
+                True,
+                base_req.profile_all_stages,
+                base_req.num_profiled_timesteps,
+            )
+        else:
+            base_profile = (False,)
+
+        if candidate_req.profile:
+            candidate_profile = (
                 True,
                 candidate_req.profile_all_stages,
                 candidate_req.num_profiled_timesteps,
             )
-            if candidate_req.profile
-            else (False,)
-        )
+        else:
+            candidate_profile = (False,)
         if base_profile != candidate_profile:
             return "profiling"
 
@@ -755,38 +758,44 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         output_iter = iter(outputs)
         try:
             for index, item in enumerate(items):
-                try:
-                    output_batch = next(output_iter)
-                except StopIteration:
-                    error = (
-                        "Grouped execution returned fewer outputs than requests "
-                        "while processing sequentially."
-                    )
-                    logger.error(error)
-                    for remaining_item in items[index:]:
-                        self._return_item_result(
-                            remaining_item, OutputBatch(error=error)
-                        )
-                    return
-                except Exception as e:
-                    logger.error(
-                        "Failed to execute grouped requests sequentially: %s",
-                        e,
-                        exc_info=True,
-                    )
-                    error = f"Failed to execute grouped requests sequentially: {e}"
-                    for remaining_item in items[index:]:
-                        self._return_item_result(
-                            remaining_item, OutputBatch(error=error)
-                        )
+                output_batch, error = self._fetch_next_output(output_iter)
+                if error is not None:
+                    self._return_sequential_errors(items[index:], error)
                     return
 
+                assert output_batch is not None
                 self._return_item_result(item, output_batch)
                 del output_batch
         finally:
             close = getattr(output_iter, "close", None)
             if close is not None:
                 close()
+
+    @staticmethod
+    def _fetch_next_output(
+        output_iter: Iterator[OutputBatch],
+    ) -> tuple[OutputBatch | None, str | None]:
+        try:
+            return next(output_iter), None
+        except StopIteration:
+            error = (
+                "Grouped execution returned fewer outputs than requests "
+                "while processing sequentially."
+            )
+            logger.error(error)
+            return None, error
+        except Exception as e:
+            error = f"Failed to execute grouped requests sequentially: {e}"
+            logger.error(error, exc_info=True)
+            return None, error
+
+    def _return_sequential_errors(
+        self,
+        items: list[tuple[bytes | None, Any]],
+        error: str,
+    ) -> None:
+        for item in items:
+            self._return_item_result(item, OutputBatch(error=error))
 
     @contextmanager
     def _record_return_stage(
