@@ -930,23 +930,20 @@ void load_cache_to_device_buffer_mtp(
       "MTP cache_index must have shape [num_requests, 2, hash_size].");
   const int64_t ring_hash_size = cache_index.shape()[2];
   RuntimeCheck(
-      ring_hash_size > 0 && (ring_hash_size & (ring_hash_size - 1)) == 0,
-      "ring hash capacity must be a power of two.");
+      ring_hash_size > 0 && (ring_hash_size & (ring_hash_size - 1)) == 0, "ring hash capacity must be a power of two.");
   RuntimeCheck(
       scratch_locs.ndim() == 2 && scratch_locs.shape()[1] > 0,
       "MTP scratch_locs must have shape [num_requests, scratch_capacity].");
   const int64_t num_request_slots = scratch_locs.shape()[0];
   RuntimeCheck(
-      cache_index.shape()[0] >= num_request_slots,
-      "MTP cache_index request capacity is smaller than scratch_locs.");
+      cache_index.shape()[0] >= num_request_slots, "MTP cache_index request capacity is smaller than scratch_locs.");
   RuntimeCheck(
       cache_policy.ndim() == 2 && cache_policy.shape()[0] >= num_request_slots + 1 &&
           cache_policy.shape()[1] >= HOT_BUFFER_SIZE,
       "MTP cache_policy must contain one CLOCK control row and one reference-epoch row per request.");
   RuntimeCheck(
       scratch_state.ndim() == 2 && scratch_state.shape()[0] >= num_request_slots + 1 &&
-          scratch_state.shape()[1] >= 4 * num_request_slots &&
-          scratch_state.shape()[1] >= 5 * total_occurrences,
+          scratch_state.shape()[1] >= 4 * num_request_slots && scratch_state.shape()[1] >= 5 * total_occurrences,
       "MTP scratch_state must contain one counter row and one miss-metadata row per request.");
   RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "MTP scratch metadata stride must be 64-bit aligned.");
 
