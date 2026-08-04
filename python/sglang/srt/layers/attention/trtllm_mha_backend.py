@@ -99,6 +99,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    # Prefill metadata initialization snapshots all scheduler-shared inputs.
+    prefill_shared_reads_end_at_metadata_init: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
