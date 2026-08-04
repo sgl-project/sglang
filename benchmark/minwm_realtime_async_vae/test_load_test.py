@@ -4,6 +4,7 @@ from load_test import (
     aggregate_measurement_seconds,
     init_request,
     record_action_latency,
+    server_action_latencies,
     stage_values,
 )
 
@@ -110,3 +111,51 @@ def test_aggregate_measurement_seconds_uses_real_overlapping_wall_window():
     ]
 
     assert aggregate_measurement_seconds(sessions) == 3.0
+
+
+def test_server_action_latencies_use_sampled_event_and_first_frame_marker():
+    events = [
+        {
+            "event": "server.event_received",
+            "event_id": 7,
+            "client_sent_epoch_ms": 10_000.0,
+            "server_epoch_ms": 10_020.0,
+            "server_elapsed_ms": 20.0,
+        },
+        {
+            "event": "server.remote_first_frame_received",
+            "chunk_index": 3,
+            "event_id": 7,
+            "server_epoch_ms": 10_540.0,
+            "server_elapsed_ms": 540.0,
+        },
+    ]
+
+    assert server_action_latencies(events, min_chunk_index=2) == {
+        "action_to_server_first_frame_ms": [540.0],
+        "action_ingress_to_server_first_frame_ms": [520.0],
+    }
+
+
+def test_server_action_latencies_support_sync_marker_and_latest_prior_event():
+    events = [
+        {
+            "event": "server.event_received",
+            "event_id": 3,
+            "client_sent_epoch_ms": 20_000.0,
+            "server_epoch_ms": 20_010.0,
+            "server_elapsed_ms": 10.0,
+        },
+        {
+            "event": "server.output_send_start",
+            "chunk_index": 4,
+            "event_id": 4,
+            "server_epoch_ms": 20_430.0,
+            "server_elapsed_ms": 430.0,
+        },
+    ]
+
+    assert server_action_latencies(events) == {
+        "action_to_server_first_frame_ms": [430.0],
+        "action_ingress_to_server_first_frame_ms": [420.0],
+    }

@@ -3360,6 +3360,13 @@ function receive(data, epoch) {
       recordTraceTopologyEvent(message.trace || message, receivedAt);
       return;
     }
+    if (message.type === "trace_events") {
+      const traces = Array.isArray(message.traces) ? message.traces : [];
+      traces.forEach((traceEvent) => {
+        recordTraceTopologyEvent(traceEvent, receivedAt);
+      });
+      return;
+    }
     if (message.type === "frame_batch") {
       const payload = message.payload;
       delete message.payload;

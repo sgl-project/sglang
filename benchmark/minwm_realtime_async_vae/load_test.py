@@ -156,6 +156,64 @@ def record_action_latency(
         action_sent_at.pop(event_id, None)
 
 
+def server_action_latencies(
+    trace_events: list[dict], *, min_chunk_index: int = 0
+) -> dict[str, list[float]]:
+    received: dict[int, tuple[float, float]] = {}
+    markers: dict[int, dict] = {}
+    for event in trace_events:
+        name = event.get("event")
+        event_id_value = event.get("event_id")
+        if name == "server.event_received" and event_id_value is not None:
+            client_epoch_ms = event.get("client_sent_epoch_ms")
+            server_elapsed_ms = event.get("server_elapsed_ms")
+            if client_epoch_ms is not None and server_elapsed_ms is not None:
+                received[int(event_id_value)] = (
+                    float(client_epoch_ms),
+                    float(server_elapsed_ms),
+                )
+            continue
+        if name not in {
+            "server.remote_first_frame_received",
+            "server.output_send_start",
+        }:
+            continue
+        chunk_value = event.get("chunk_index")
+        if chunk_value is None:
+            continue
+        chunk_index = int(chunk_value)
+        if chunk_index >= min_chunk_index:
+            markers.setdefault(chunk_index, event)
+
+    client_to_first_frame: list[float] = []
+    ingress_to_first_frame: list[float] = []
+    for marker in (markers[index] for index in sorted(markers)):
+        marker_event_id = marker.get("event_id")
+        marker_epoch_ms = marker.get("server_epoch_ms")
+        marker_elapsed_ms = marker.get("server_elapsed_ms")
+        if (
+            marker_event_id is None
+            or marker_epoch_ms is None
+            or marker_elapsed_ms is None
+        ):
+            continue
+        eligible = [event_id for event_id in received if event_id <= int(marker_event_id)]
+        if not eligible:
+            continue
+        client_epoch_ms, received_elapsed_ms = received[max(eligible)]
+        client_delta = float(marker_epoch_ms) - client_epoch_ms
+        ingress_delta = float(marker_elapsed_ms) - received_elapsed_ms
+        if client_delta >= 0:
+            client_to_first_frame.append(round(client_delta, 3))
+        if ingress_delta >= 0:
+            ingress_to_first_frame.append(round(ingress_delta, 3))
+
+    return {
+        "action_to_server_first_frame_ms": client_to_first_frame,
+        "action_ingress_to_server_first_frame_ms": ingress_to_first_frame,
+    }
+
+
 def aggregate_measurement_seconds(sessions: list[dict]) -> float:
     starts = [
         float(session["measured_started_at"])
@@ -315,11 +373,20 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
         if measured_started_at is not None and measured_completed_at is not None
         else 0.0
     )
+    server_action = server_action_latencies(
+        trace_events, min_chunk_index=args.warmup_chunks
+    )
     return {
         "session_index": index,
         "trace_id": trace_id,
         "chunk_total_ms": chunk_total,
-        "action_to_first_frame_ms": action_latencies,
+        "action_to_first_frame_ms": server_action[
+            "action_to_server_first_frame_ms"
+        ],
+        "action_ingress_to_first_frame_ms": server_action[
+            "action_ingress_to_server_first_frame_ms"
+        ],
+        "client_observed_action_to_first_frame_ms": action_latencies,
         "frames": frame_count,
         "measured_seconds": measured_seconds,
         "measured_started_at": measured_started_at,
@@ -341,6 +408,16 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
     action = [
         value for session in sessions for value in session["action_to_first_frame_ms"]
     ]
+    action_ingress = [
+        value
+        for session in sessions
+        for value in session["action_ingress_to_first_frame_ms"]
+    ]
+    client_observed_action = [
+        value
+        for session in sessions
+        for value in session["client_observed_action_to_first_frame_ms"]
+    ]
     stages: dict[str, list[float]] = defaultdict(list)
     for session in sessions:
         for name, values in session["stage_values"].items():
@@ -359,7 +436,12 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
         "error_rate": len(errors) / concurrency,
         "chunk_total_ms": latency_summary(chunks),
         "action_to_first_frame_ms": latency_summary(action),
+        "action_ingress_to_first_frame_ms": latency_summary(action_ingress),
+        "client_observed_action_to_first_frame_ms": latency_summary(
+            client_observed_action
+        ),
         "aggregate_fps": total_frames / wall_seconds if wall_seconds else 0.0,
+        "measurement_wall_seconds": wall_seconds,
         "per_session_fps": latency_summary(session_fps),
         "min_session_fps": min(session_fps, default=0.0),
         "stage_ms": {name: latency_summary(values) for name, values in stages.items()},

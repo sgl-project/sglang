@@ -43,6 +43,11 @@ assert.match(
 );
 assert.match(
   appJs,
+  /message\.type === "trace_events"/,
+  "client should consume batched server trace events",
+);
+assert.match(
+  appJs,
   /recordTraceTopologyEvent\(\{ event: "server\.chunk_complete", \.\.\.stats \}/,
   "chunk stats should feed both dump artifacts and live trace topology",
 );

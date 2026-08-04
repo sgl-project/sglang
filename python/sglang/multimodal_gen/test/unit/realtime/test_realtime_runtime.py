@@ -90,6 +90,41 @@ class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
         raise NotImplementedError
 
 
+def test_realtime_trace_sender_batches_events_without_dropping_them():
+    class _WebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_bytes(self, payload):
+            self.messages.append(msgspec.msgpack.decode(payload))
+
+    async def run():
+        websocket = _WebSocket()
+        queue = asyncio.Queue()
+        for index in range(3):
+            queue.put_nowait({"event": f"server.stage_{index}"})
+
+        task = asyncio.create_task(
+            realtime_video_api._send_realtime_trace_events(websocket, queue)
+        )
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return websocket.messages
+
+    assert asyncio.run(run()) == [
+        {
+            "type": "trace_events",
+            "traces": [
+                {"event": "server.stage_0"},
+                {"event": "server.stage_1"},
+                {"event": "server.stage_2"},
+            ],
+        }
+    ]
+
+
 def test_realtime_diffusion_stage_declares_long_lived_components():
     stage = _TestRealtimeDiffusionStage()
     server_args = SimpleNamespace(

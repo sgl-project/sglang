@@ -69,6 +69,8 @@ logger = init_logger(__name__)
 _REALTIME_CONTROL_REFRESH_TIMEOUT_S = 1.0
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _TRACE_EVENT_QUEUE_LIMIT = 256
+_TRACE_EVENT_BATCH_LIMIT = 64
+_TRACE_EVENT_BATCH_WAIT_S = 0.005
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
 _ADMISSION_CONTROLLER: RealtimeAdmissionController | None = None
 _ADMISSION_CONFIG: tuple | None = None
@@ -280,15 +282,25 @@ async def _send_realtime_trace_events(
     queue: asyncio.Queue,
 ) -> None:
     while True:
-        payload = await queue.get()
+        batch = [await queue.get()]
+        deadline = asyncio.get_running_loop().time() + _TRACE_EVENT_BATCH_WAIT_S
+        while len(batch) < _TRACE_EVENT_BATCH_LIMIT:
+            timeout = deadline - asyncio.get_running_loop().time()
+            if timeout <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(queue.get(), timeout=timeout))
+            except TimeoutError:
+                break
         await ws.send_bytes(
             msgspec.msgpack.encode(
                 {
-                    "type": "trace_event",
-                    "trace": payload,
+                    "type": "trace_events",
+                    "traces": batch,
                 }
             )
         )
+        await asyncio.sleep(0)
 
 
 def _get_admission_controller(server_args) -> RealtimeAdmissionController:
