@@ -384,6 +384,10 @@ def compact_row_index_triton(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
     bs = verify_lens.shape[0]
+    # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
+    assert bs <= 1 << (
+        _SEARCH_NBITS - 1
+    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
     incl = torch.cumsum(verify_lens, dim=0).contiguous()
     req = torch.empty(padded_total, dtype=torch.int64, device=device)
     within = torch.empty(padded_total, dtype=torch.int64, device=device)

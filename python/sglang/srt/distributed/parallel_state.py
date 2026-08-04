@@ -311,7 +311,7 @@ class GroupCoordinator:
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
-                from mooncake.ep import MooncakeBackendOptions
+                from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
@@ -429,6 +429,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
@@ -1072,7 +1073,12 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         if self.world_size == 1:
@@ -1966,7 +1972,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2108,7 +2114,7 @@ def init_distributed_environment(
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
         if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
+            from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
             ar_size = max_world_size if use_max_ws else world_size
@@ -2399,7 +2405,6 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),

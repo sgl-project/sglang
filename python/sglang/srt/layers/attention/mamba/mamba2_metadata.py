@@ -55,6 +55,9 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    state_checkpoint_cu_starts: Optional[torch.Tensor] = None
+    num_state_checkpoints: int = 0
+    state_checkpoint_every_n_tokens: int = 0
 
     is_target_verify: bool = False
     draft_token_num: int = 1
@@ -272,6 +275,16 @@ class Mamba2Metadata(ForwardMetadata):
             if forward_batch.spec_info is not None
             else 1
         )
+        # Resolve the tracked-row selection once per forward
+        mamba_track_mask_indices = None
+        conv_states_mask_indices = None
+        if forward_metadata.has_mamba_track_mask:
+            mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                as_tuple=True
+            )[0]
+            conv_states_mask_indices = forward_batch.mamba_track_indices[
+                mamba_track_mask_indices
+            ]
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -285,6 +298,8 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
+            mamba_track_mask_indices=mamba_track_mask_indices,
+            conv_states_mask_indices=conv_states_mask_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
