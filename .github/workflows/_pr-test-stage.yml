@@ -124,7 +124,11 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      # Skipped whole, not just the artifact half: an empty name is how base-c-gb300
+      # opts out of prebuilt modules entirely to keep covering the source build, and
+      # the cache key is arch-blind - it would hand that aarch64 stage x86_64 ones.
       - uses: ./.github/actions/download-rust-ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
 
