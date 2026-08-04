@@ -477,6 +477,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.fused_experts = None
 
     def create_weights(
         self,
@@ -508,12 +509,17 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         )
         set_weight_attrs(
             w13_qweight_type,
-            {"is_gguf_weight_type": True, "weight_type": 0, "ignore_warning": True},
+            {
+                "is_gguf_weight_type": True,
+                "weight_type": 0,
+                "shard_weight_type": {},
+                "ignore_warning": True,
+            },
         )
         set_weight_attrs(w13_qweight_type, extra_weight_attrs)
         layer.register_parameter("w13_qweight_type", w13_qweight_type)
 
-        tensor_shape = (num_experts, intermediate_size_per_partition, hidden_size)
+        tensor_shape = (num_experts, hidden_size, intermediate_size_per_partition)
         # gate down proj
         w2_qweight = GGUFUninitializedParameter(requires_grad=False)
         set_weight_attrs(
@@ -534,11 +540,106 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         )
         set_weight_attrs(
             w2_qweight_type,
-            {"is_gguf_weight_type": True, "weight_type": 0, "ignore_warning": True},
+            {
+                "is_gguf_weight_type": True,
+                "weight_type": 0,
+                "shard_weight_type": {},
+                "ignore_warning": True,
+            },
         )
 
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """Validate and materialize the packed CUDA/MUSA MoE weights."""
+
+        w13_types = layer.w13_qweight_type.shard_weight_type
+        w2_types = layer.w2_qweight_type.shard_weight_type
+        if set(w13_types) != {"w1", "w3"}:
+            raise ValueError(f"GGUF MoE W13 qtype inventory is incomplete: {w13_types}")
+        if w13_types["w1"] != w13_types["w3"]:
+            raise ValueError(
+                "GGUF MoE cannot fuse W1 and W3 with different qtypes: "
+                f"w1={w13_types['w1']}, w3={w13_types['w3']}"
+            )
+        if set(w2_types) != {"w2"}:
+            raise ValueError(f"GGUF MoE W2 qtype inventory is incomplete: {w2_types}")
+
+        supported_types = UNQUANTIZED_TYPES | DEQUANT_TYPES
+        for label, qtype in (
+            ("w13", w13_types["w1"]),
+            ("w2", w2_types["w2"]),
+        ):
+            if qtype not in supported_types:
+                raise ValueError(
+                    f"Unsupported GGUF MoE {label} quantization type: "
+                    f"{WeightType(qtype)}"
+                )
+
+        num_experts = self.moe_runner_config.num_local_experts
+        expected_w13 = {
+            (expert_id, shard_id)
+            for expert_id in range(num_experts)
+            for shard_id in ("w1", "w3")
+        }
+        expected_w2 = {(expert_id, "w2") for expert_id in range(num_experts)}
+        actual_w13 = set(getattr(layer.w13_qweight, "expert_data_map", {}))
+        actual_w2 = set(getattr(layer.w2_qweight, "expert_data_map", {}))
+        if actual_w13 != expected_w13:
+            raise ValueError(
+                "GGUF MoE W13 expert inventory is incomplete: "
+                f"expected={len(expected_w13)}, actual={len(actual_w13)}"
+            )
+        if actual_w2 != expected_w2:
+            raise ValueError(
+                "GGUF MoE W2 expert inventory is incomplete: "
+                f"expected={len(expected_w2)}, actual={len(actual_w2)}"
+            )
+
+        layer.materialize_gguf_weights()
+        if isinstance(layer.w13_qweight, UninitializedParameter) or isinstance(
+            layer.w2_qweight, UninitializedParameter
+        ):
+            raise RuntimeError("GGUF MoE weights remained uninitialized after loading")
+
+        w13 = layer.w13_qweight
+        w2 = layer.w2_qweight
+        config = self.moe_runner_config
+        if w13.shape[:2] != (
+            num_experts,
+            2 * config.intermediate_size_per_partition,
+        ):
+            raise ValueError(
+                f"GGUF MoE W13 materialized with invalid shape: {w13.shape}"
+            )
+        if w2.shape[:2] != (num_experts, config.hidden_size):
+            raise ValueError(f"GGUF MoE W2 materialized with invalid shape: {w2.shape}")
+
+        for label, weight, qtype, expected_cols in (
+            ("w13", w13, w13_types["w1"], config.hidden_size),
+            (
+                "w2",
+                w2,
+                w2_types["w2"],
+                config.intermediate_size_per_partition,
+            ),
+        ):
+            if qtype in UNQUANTIZED_TYPES:
+                logical_cols = weight.shape[2]
+            else:
+                block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+                if weight.shape[2] % type_size:
+                    raise ValueError(
+                        f"GGUF MoE {label} packed width is not type-aligned: "
+                        f"shape={weight.shape}, type_size={type_size}"
+                    )
+                logical_cols = weight.shape[2] // type_size * block_size
+            if logical_cols != expected_cols:
+                raise ValueError(
+                    f"GGUF MoE {label} logical input width differs: "
+                    f"expected={expected_cols}, actual={logical_cols}"
+                )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

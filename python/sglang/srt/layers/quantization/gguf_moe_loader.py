@@ -1,0 +1,90 @@
+"""Pure loading-contract helpers for GGUF MoE weights.
+
+This module intentionally has no torch or platform imports so its shape and
+type checks can be exercised in CPU-only unit tests.
+"""
+
+from __future__ import annotations
+
+from collections.abc import MutableMapping, Sequence
+
+GGUF_MOE_SHARDS = frozenset({"w1", "w2", "w3"})
+
+
+def record_gguf_moe_qtype(
+    shard_weight_types: MutableMapping[str, int],
+    shard_id: str,
+    qtype: int,
+) -> None:
+    """Record one GGUF MoE shard type and reject ambiguous W13 fusion."""
+
+    if shard_id not in GGUF_MOE_SHARDS:
+        raise ValueError(f"unsupported GGUF MoE shard id: {shard_id!r}")
+    qtype = int(qtype)
+    previous = shard_weight_types.get(shard_id)
+    if previous is not None and previous != qtype:
+        raise ValueError(
+            f"GGUF MoE shard {shard_id} repeats with different qtypes: "
+            f"{previous} and {qtype}"
+        )
+
+    if shard_id in {"w1", "w3"}:
+        other_id = "w3" if shard_id == "w1" else "w1"
+        other = shard_weight_types.get(other_id)
+        if other is not None and other != qtype:
+            w1_qtype = qtype if shard_id == "w1" else other
+            w3_qtype = qtype if shard_id == "w3" else other
+            raise ValueError(
+                "GGUF MoE cannot fuse W1 and W3 with different qtypes: "
+                f"w1={w1_qtype}, w3={w3_qtype}"
+            )
+
+    # Mutate only after every invariant has passed so a caller that catches a
+    # validation error cannot observe a partially accepted qtype inventory.
+    shard_weight_types[shard_id] = qtype
+
+
+def plan_gguf_moe_tp_shard(
+    *,
+    shard_id: str,
+    shape: Sequence[int],
+    tp_size: int,
+    tp_rank: int,
+    packed_type_size: int | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(axis, start, length)`` for one rank's packed MoE shard.
+
+    W1/W3 are column-parallel in logical weight space and therefore split
+    their output rows (axis 0). W2 is row-parallel and must split its packed
+    input columns (axis 1). For quantized byte tensors, ``packed_type_size``
+    makes the W2 split fail closed unless every rank receives whole GGML
+    blocks.
+    """
+
+    if shard_id not in GGUF_MOE_SHARDS:
+        raise ValueError(f"unsupported GGUF MoE shard id: {shard_id!r}")
+    if len(shape) != 2 or any(int(value) <= 0 for value in shape):
+        raise ValueError(f"GGUF MoE expert weight must be a positive 2D shape: {shape}")
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid MoE TP topology: size={tp_size}, rank={tp_rank}")
+
+    axis = 1 if shard_id == "w2" else 0
+    extent = int(shape[axis])
+    if extent % tp_size:
+        raise ValueError(
+            f"GGUF MoE {shard_id} dimension {extent} is not divisible by "
+            f"TP size {tp_size}"
+        )
+    length = extent // tp_size
+    if packed_type_size is not None:
+        if packed_type_size <= 0:
+            raise ValueError("GGUF packed type size must be positive")
+        if axis != 1:
+            raise ValueError("packed block validation only applies to W2 input shards")
+        if extent % packed_type_size or length % packed_type_size:
+            raise ValueError(
+                "GGUF MoE W2 TP split cuts a packed quantization block: "
+                f"packed_width={extent}, local_width={length}, "
+                f"type_size={packed_type_size}, tp_size={tp_size}"
+            )
+    return axis, tp_rank * length, length

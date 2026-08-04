@@ -63,6 +63,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
+from sglang.srt.layers.quantization.gguf_moe_loader import (
+    plan_gguf_moe_tp_shard,
+    record_gguf_moe_qtype,
+)
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -1025,19 +1029,40 @@ class FusedMoE(torch.nn.Module):
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
 
         if is_gguf_weight_type:
-            # Store weight type for this expert
-            param.weight_type = loaded_weight.item()
+            qtype = int(loaded_weight.item())
+            shard_weight_type = getattr(param, "shard_weight_type", None)
+            if shard_weight_type is None:
+                shard_weight_type = {}
+                param.shard_weight_type = shard_weight_type
+            record_gguf_moe_qtype(shard_weight_type, shard_id, qtype)
+            param.weight_type = qtype
             return True
 
         if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            if self.moe_tp_size > 1:
-                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
-                    shard_size = loaded_weight.size(0) // self.moe_tp_size
-                    start_idx = tp_rank * shard_size
-                    loaded_weight = loaded_weight.narrow(
-                        0, start_idx, shard_size
-                    ).clone()
+            packed_type_size = None
+            if shard_id == "w2" and loaded_weight.dtype == torch.uint8:
+                import gguf
+
+                w2_types = getattr(self.w2_qweight_type, "shard_weight_type", {})
+                if set(w2_types) != {"w2"}:
+                    raise ValueError(
+                        "GGUF MoE W2 qtype must be loaded before its packed weight"
+                    )
+                _block_size, packed_type_size = gguf.GGML_QUANT_SIZES[w2_types["w2"]]
+
+            axis, start_idx, shard_size = plan_gguf_moe_tp_shard(
+                shard_id=shard_id,
+                shape=loaded_weight.shape,
+                tp_size=self.moe_tp_size,
+                tp_rank=tp_rank,
+                packed_type_size=packed_type_size,
+            )
+            # The GGUF iterator may expose a zero-copy read-only mmap view. Keep
+            # only this rank's shard, and own it on the parameter device before
+            # advancing the iterator or retaining it in expert_data_map.
+            loaded_weight = loaded_weight.narrow(axis, start_idx, shard_size).to(
+                device=param.device, copy=True
+            )
 
             # Store in data_container with expert/shard info
             if not hasattr(param, "expert_data_map"):
@@ -1661,13 +1686,35 @@ class FusedMoE(torch.nn.Module):
                                 w3 = expert_weights[e].get("w3")
 
                                 if w1 is not None and w3 is not None:
-                                    fused = torch.cat([w1, w3], dim=0)
-                                    weight_list.append(fused)
+                                    if w1.shape[1:] != w3.shape[1:]:
+                                        raise ValueError(
+                                            "GGUF MoE cannot fuse W1/W3 with "
+                                            f"different packed shapes: {w1.shape}, "
+                                            f"{w3.shape}"
+                                        )
+                                    weight_list.append((w1, w3))
 
                         if weight_list:
-                            stacked = torch.stack(weight_list, dim=0)
-                            param.materialize(stacked.shape, dtype=stacked.dtype)
-                            param.data.copy_(stacked)
+                            first_w1, first_w3 = weight_list[0]
+                            shape = (
+                                len(weight_list),
+                                first_w1.shape[0] + first_w3.shape[0],
+                                first_w1.shape[1],
+                            )
+                            param.materialize(shape, dtype=first_w1.dtype)
+                            split = first_w1.shape[0]
+                            for expert_id, (w1, w3) in enumerate(weight_list):
+                                if (
+                                    w1.shape != first_w1.shape
+                                    or w3.shape != first_w3.shape
+                                ):
+                                    raise ValueError(
+                                        "GGUF MoE W13 experts have inconsistent shapes"
+                                    )
+                                param.data[expert_id, :split].copy_(w1)
+                                param.data[expert_id, split:].copy_(w3)
+                            data_container.clear()
+                            expert_data_map.clear()
                     elif "w2" in name:
                         # w2 is down projection
                         weight_list = []
@@ -1677,9 +1724,17 @@ class FusedMoE(torch.nn.Module):
                                 weight_list.append(w2_weight)
 
                         if weight_list:
-                            stacked = torch.stack(weight_list, dim=0)
-                            param.materialize(stacked.shape, dtype=stacked.dtype)
-                            param.data.copy_(stacked)
+                            first = weight_list[0]
+                            shape = (len(weight_list), *first.shape)
+                            param.materialize(shape, dtype=first.dtype)
+                            for expert_id, weight in enumerate(weight_list):
+                                if weight.shape != first.shape:
+                                    raise ValueError(
+                                        "GGUF MoE W2 experts have inconsistent shapes"
+                                    )
+                                param.data[expert_id].copy_(weight)
+                            data_container.clear()
+                            expert_data_map.clear()
 
 
 @register_custom_op(out_shape="hidden_states")
