@@ -390,6 +390,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         peer = self._peer
         if peer is None or not peer.lazy_compaction:
             return 0
+        if peer.disagg_move_gate is not None and not peer.disagg_move_gate():
+            # The peer cannot compact while a PD transfer is in flight, so these
+            # holes are not realizable. Crediting them would let the scheduler
+            # admit work that `_flush_peer_for_alloc` then cannot satisfy, and
+            # the caller treats a failed alloc as a memory-estimation bug.
+            return 0
         return len(peer._free_phys_pages) * peer.entry_bytes_per_page
 
     def schedulable_available_size(self) -> int:

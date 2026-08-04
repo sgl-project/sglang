@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
+from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -130,6 +131,39 @@ class TestPrefillMoveGate(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
         self.assertTrue(gate(), "abort cleanup must let compaction resume")
+
+
+class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
+    """`schedulable_available_size` credits holes a peer urgent-flush would
+    release. While the move gate is closed that flush relocates nothing, so
+    crediting them lets the scheduler admit work `_flush_peer_for_alloc` cannot
+    satisfy; the alloc then returns None and the decode prealloc path treats
+    that as a memory-estimation bug and aborts the scheduler.
+    """
+
+    class _Peer:
+        def __init__(self, gate):
+            self.lazy_compaction = True
+            self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
+            self.entry_bytes_per_page = 512
+            self.disagg_move_gate = gate
+
+    class _Owner:
+        def __init__(self, peer):
+            self._peer = peer
+
+    def _credit(self, gate):
+        peer = self._Peer(gate)
+        owner = self._Owner(peer)
+        return MultiEndedAllocator._peer_drainable_hole_bytes(owner)
+
+    def test_credit_follows_the_gate(self):
+        # No PD gate installed (non-disagg): holes are realizable as before.
+        self.assertEqual(self._credit(gate=None), 4 * 512)
+        # Gate open: peer can compact, so the credit stands.
+        self.assertEqual(self._credit(gate=lambda: True), 4 * 512)
+        # Gate closed: an urgent flush would move nothing, so credit nothing.
+        self.assertEqual(self._credit(gate=lambda: False), 0)
 
 
 class TestMoveGateRejectsNonPdNode(CustomTestCase):
