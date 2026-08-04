@@ -214,13 +214,14 @@ jobs:
   # hash, so the job always runs but only compiles on a miss.
   rust-ext-build:
     needs: [check-changes, call-gate]
-    # Scheduled runs included: only they run on the default branch's ref, and a
-    # cache entry is visible to every PR only if it was written there. !cancelled()
-    # so a skipped call-gate does not take this job with it - a docs-only PR still
-    # installs sglang in every stage.
+    # Ungated on the event, unlike the jobs above: a cache entry is visible to
+    # every PR only if it was written from the default branch's ref, so every
+    # main-ref run - schedule, dispatch, workflow_call - has to seed it.
+    #
+    # !cancelled() so a skipped call-gate does not take this job with it, since a
+    # docs-only PR still installs sglang in every stage.
     if: |
       !cancelled() &&
-      inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
