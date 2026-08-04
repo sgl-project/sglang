@@ -79,6 +79,24 @@ async def models():
         return JSONResponse(r.json(), status_code=r.status_code)
 
 
+@app.post("/admin/limits")
+async def set_limits(payload: dict):
+    """运行时限并发调整，无需重启。示例:
+    curl -X POST http://127.0.0.1:8080/admin/limits \\
+         -H 'Content-Type: application/json' \\
+         -d '{"tool_call": 12, "thinking": 16}'
+    """
+    updated = {}
+    for k, v in payload.items():
+        if k in LIMITS:
+            v = int(v)
+            if v > 0:
+                LIMITS[k] = v
+                sems[k] = asyncio.Semaphore(v)  # 重建信号量，在途请求不受影响
+                updated[k] = v
+    return {"limits": LIMITS, "updated": updated}
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default="http://127.0.0.1:8000")

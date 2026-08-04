@@ -45,6 +45,8 @@ KEEP_ALIVE_INTERVAL=45
 LOAD_BALANCE_METHOD=round_robin
 ENABLE_PRIORITY=false
 PROXY_PORT=0
+PROXY_TOOL_CALL_LIMIT=8
+PROXY_THINKING_LIMIT=12
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -68,6 +70,8 @@ while [[ $# -gt 0 ]]; do
         --load-balance-method) LOAD_BALANCE_METHOD="$2"; shift 2 ;;
         --priority-scheduling) ENABLE_PRIORITY=true; shift ;;
         --proxy-port) PROXY_PORT="$2"; shift 2 ;;
+        --proxy-tool-call-limit) PROXY_TOOL_CALL_LIMIT="$2"; shift 2 ;;
+        --proxy-thinking-limit) PROXY_THINKING_LIMIT="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -161,6 +165,7 @@ echo " keep-alive: $([ "$KEEP_ALIVE" = true ] && echo "on 每${KEEP_ALIVE_INTERV
 echo " load-balance: $LOAD_BALANCE_METHOD (DP 路由; round_robin 避免前缀粘滞热点)"
 echo " priority-scheduling: $([ "$ENABLE_PRIORITY" = true ] && echo on || echo off)"
 echo " proxy: $([ "$PROXY_PORT" != "0" ] && echo "on 端口$PROXY_PORT (限并发+priority)" || echo off)"
+echo " proxy-limits: tool_call=$PROXY_TOOL_CALL_LIMIT thinking=$PROXY_THINKING_LIMIT (运行时可调: POST /admin/limits)"
 echo "=========================================="
 
 # ==================== 常驻 keep-alive ====================
@@ -191,7 +196,8 @@ if [ "$PROXY_PORT" != "0" ]; then
             curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models" && break
             sleep 5
         done
-        exec python3.12 "$PROXY_SCRIPT" --backend "http://127.0.0.1:$PORT" --listen "$PROXY_PORT"
+        exec python3.12 "$PROXY_SCRIPT" --backend "http://127.0.0.1:$PORT" --listen "$PROXY_PORT" \
+            --tool-call-limit "$PROXY_TOOL_CALL_LIMIT" --thinking-limit "$PROXY_THINKING_LIMIT"
     ) &
     PROXY_PID=$!
 fi
