@@ -3609,7 +3609,6 @@ class ServerArgs:
         # radix tracking, and mutually exclusive with ReplaySSM.
         self._validate_gdn_mtp_cache_mode()
 
-
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -5683,7 +5682,7 @@ class ServerArgs:
         """
         if self.gdn_mtp_cache_mode != "none":
             return
-        if self.enable_gdn_replayssm_spec or self.enable_linear_replayssm:
+        if self.enable_linear_replayssm_spec or self.enable_linear_replayssm:
             raise ValueError(
                 "--gdn-mtp-cache-mode=none is mutually exclusive with ReplaySSM "
                 "(--enable-gdn-replayssm-spec / --enable-linear-replayssm). "

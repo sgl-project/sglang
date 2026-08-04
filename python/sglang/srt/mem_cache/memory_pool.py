@@ -692,7 +692,7 @@ class MambaPool:
                 from sglang.srt.server_args import get_global_server_args
 
                 cache_mode = get_global_server_args().gdn_mtp_cache_mode
-                if enable_gdn_replayssm_spec or cache_mode == "none":
+                if enable_linear_replayssm_spec or cache_mode == "none":
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
