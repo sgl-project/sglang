@@ -580,6 +580,35 @@ def _gemma2_gemma3_overrides(server_args: Any, hf_config: Any) -> dict:
     return {"disable_hybrid_swa_memory": True}
 
 
+@_register_for("Exaone4ForCausalLM", "ExaoneMoeForCausalLM")
+def _exaone_overrides(server_args: Any, hf_config: Any) -> dict:
+    overrides: Dict[str, Any] = {}
+    model_arch = hf_config.architectures[0]
+    accepted_backends = ["triton", "fa3", "fa4", "trtllm_mha"]
+
+    if server_args.attention_backend is None:
+        if is_cuda() and is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
+        elif is_cuda() and get_device_sm() >= 90:
+            overrides["attention_backend"] = "fa3"
+        else:
+            overrides["attention_backend"] = "triton"
+
+    attention_backend = overrides.get(
+        "attention_backend", server_args.attention_backend
+    )
+    assert (
+        attention_backend in accepted_backends
+    ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+
+    if is_sm100_supported():
+        logger.warning(
+            f"Disabling hybrid SWA memory for {model_arch} to prevent accuracy degradation."
+        )
+        overrides["disable_hybrid_swa_memory"] = True
+    return overrides
+
+
 @_register_for("GptOssForCausalLM")
 def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
