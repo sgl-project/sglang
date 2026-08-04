@@ -58,7 +58,7 @@ export const Playground = ({ config }) => {
   // Snippets cannot import each other, so the overlay-resolution rule is written
   // twice. A divergence makes the Deploy command and the playground base disagree,
   // which shows up as phantom +/- lines in the diff and no error anywhere.
-  // Guarded by docs_new/scripts/check_cookbook_configs.mjs.
+  // Guarded by docs/scripts/check_cookbook_configs.mjs.
   const optionVisible = (opt, sel) =>
     typeof opt.showWhen !== "function" || opt.showWhen(sel);
   const optionDisabled = (opt, sel) =>
