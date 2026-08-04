@@ -370,7 +370,7 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
     extras={
         "action_horizon": 50,
         "action_dim": 32,
-        "state_dim": 32,
+        "state_dim": 14,
         "image_size": 64,
         "num_inference_steps": 2,
         "seed": 0,
