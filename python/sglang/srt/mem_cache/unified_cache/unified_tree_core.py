@@ -372,9 +372,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     per-component LRUs, the size/leaf bookkeeping, and the component drivers,
     plus ``reset()``.
 
-    TODO(Jialin): the tree operations still live on ``UnifiedRadixCache`` and
-    reach this state through its proxy properties; they migrate onto this class
-    as the TreeCore split completes.
     """
 
     def __init__(
