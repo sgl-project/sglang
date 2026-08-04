@@ -93,6 +93,11 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# Log the deferred-finalize config at most once per process (rank). Different MoE
+# layers can resolve to different quant methods, so print_info_once (keyed on the
+# full message) would otherwise fire once per distinct quant method.
+_deferred_finalize_info_logged = False
+
 
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
@@ -379,12 +384,15 @@ class FusedMoE(torch.nn.Module):
             and get_moe_runner_backend().is_flashinfer_trtllm()
             and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
         )
-        print_info_once(
-            "FlashInfer TRTLLM MoE deferred finalize is "
-            f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-            f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
-            f"quant_method={type(self.quant_method).__name__})."
-        )
+        global _deferred_finalize_info_logged
+        if not _deferred_finalize_info_logged:
+            _deferred_finalize_info_logged = True
+            logging.getLogger(__name__).info(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
 
         self.quant_method.create_weights(
             layer=self,
