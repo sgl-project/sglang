@@ -544,17 +544,19 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 **启动命令**（pod 内端口统一 8000，不传 `--gpu-ids`，K8s 自动分配）
 
 ```bash
-# 1) tool call 主力（4 卡 → 自动 TP2 DP2）
+# 1) tool call 主力（4 卡 → 自动 TP2 DP2；round_robin 修复热点，warmup+keep-alive 防冷启动）
 bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
     --port 8000 \
     --max-running-requests 5 \
-    --enable-speculative --speculative-num-steps 2 --speculative-num-draft-tokens 3
+    --enable-speculative --speculative-num-steps 2 --speculative-num-draft-tokens 3 \
+    --load-balance-method round_robin --warmup --keep-alive
 
 # 2) 代码检视（2 卡 → 自动 TP2 DP1）
 bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
     --port 8000 \
     --max-running-requests 12 \
-    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4
+    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4 \
+    --load-balance-method round_robin --warmup --keep-alive
 ```
 
 **注意事项**
@@ -606,6 +608,8 @@ round_robin 下每个 worker 首请求后各自缓存 system prompt，命中率�
 - thinking non-stream TTFT 11.34s 是"等全部生成完才返回"的固有特性，非延迟问题；
 - tool call **保留 MTP**（accept 97.6%，工作得极好）；问题是路由不是 MTP，关掉反而让 ITL 从 69.7ms 回到 ~92ms。
 
+> **GLM 分析建议"tool call 不需要 MTP"，与实测不符**：其推理（短输出场景 verify 开销不划算）建立在输出 ≤50 token 且实例为 prefill/TTFT 瓶颈的前提上；实测 tool call 输出平均 160 token、accept 97.6%，两个前提都不满足。且其把 TTFT 9.95s 归因于 verify 争抢，实际是 DP Router 热点（排队）。验证方法：同一实例开/关 MTP 各跑 10 分钟，对比 ITL / E2E / TTFT / 吞吐，用数据定论。
+
 ### 11.4 关键洞察与行动
 
 - **统一 6 卡方案的"均衡"可能是被混合流量掩盖的热点**：之前流量前缀多样所以看着均衡；tool call 专属实例前缀单一所以暴露。**回退统一方案时也显式加 round_robin**，TTFT 可能从 8.76~14.36s 明显下降；
@@ -628,3 +632,25 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 ```
 
 > 6 卡 pod 由 K8s 分配；若脚本自动推断不是 TP2 DP3（如检测到 7 卡），显式传 `--tp-size 2 --dp-size 3` 或用 `--gpu-ids`（裸机）限定 6 卡。
+
+### 11.6 两实例最终启动命令（round_robin 修复后）
+
+> 已验证 `--load-balance-method` 在部署版本可用；脚本默认已是 `round_robin`。
+
+```bash
+# 1) tool call 主力（4 卡 pod → 自动 TP2 DP2）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 5 \
+    --enable-speculative --speculative-num-steps 2 --speculative-num-draft-tokens 3 \
+    --load-balance-method round_robin --warmup --keep-alive
+
+# 2) thinking / 代码检视（2 卡 pod → 自动 TP2 DP1）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 12 \
+    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4 \
+    --load-balance-method round_robin --warmup --keep-alive
+```
+
+验证点：启动日志出现 `load-balance: round_robin`；两个 worker 都有 running/queue（不再一个满载一个空转）；TTFT 明显下降、GPU 利用率回到 ~90%。tool call 并发先 5，`queue_time≈0` 且 TTFT<2s 后再试 8。
