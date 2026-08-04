@@ -97,8 +97,9 @@ sgl-eval run gsm8k \\
   cells: [
     // ==== NVIDIA Hopper + NVFP4 W4A4 (single node, TP=1) ====
     {
+      // Not marked verified: the recipe ran on the 20260719 nightly, but no
+      // GSM8K-class eval has been measured yet (see the pending benchmarks file).
       match: { hw: "h100", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
