@@ -207,6 +207,25 @@ def test_metadata_update_records_inside_cuda_graph():
     )
 
 
+def test_swa_cache_write_uses_metadata_slot_snapshot():
+    snapshot = torch.tensor([6], dtype=torch.int64)
+
+    def translate_live_mapping(_):
+        raise AssertionError("cache writes must not read the live SWA mapping")
+
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend._swa_kv_pool = SimpleNamespace(
+        layers_mapping={1: (0, True)},
+        translate_loc_from_full_to_swa=translate_live_mapping,
+    )
+    backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
+    forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
+
+    cache_loc = backend._get_layer_cache_loc(SimpleNamespace(layer_id=1), forward_batch)
+
+    torch.testing.assert_close(cache_loc, snapshot, rtol=0, atol=0)
+
+
 def _build_inputs(bs, pool_size, max_num_pages, max_seq_pages, seq_max, seed):
     """Build random pool / indices / seq_lens consistent with backend buffers."""
     g = torch.Generator(device="cpu").manual_seed(seed)
