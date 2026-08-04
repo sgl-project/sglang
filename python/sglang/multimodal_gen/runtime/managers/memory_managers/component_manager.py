@@ -620,8 +620,7 @@ class ComponentResidencyManager:
         if not use.memory_intensive:
             return
         released_accelerator_storage = (
-            was_on_local_accelerator
-            and not self._module_on_local_accelerator(module)
+            was_on_local_accelerator and not self._module_on_local_accelerator(module)
         )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
         if not (released_accelerator_storage or released_layerwise_storage):
