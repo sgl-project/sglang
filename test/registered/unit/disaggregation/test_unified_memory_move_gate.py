@@ -112,6 +112,25 @@ class TestPrefillMoveGate(CustomTestCase):
         scheduler.disagg_prefill_inflight_queue.clear()
         self.assertTrue(gate())
 
+    def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
+        """A request aborted after a middle chunk never reaches a `last_chunk`
+        send, so its rid is only dropped by the abort/release cleanup. Without
+        that discard the gate stays closed for the process lifetime and lazy
+        compaction never packs the free list again -- a liveness leak that ends
+        in allocation failure despite reclaimable space.
+        """
+        scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
+        gate = unified_memory_disagg_move_gate(scheduler)
+
+        scheduler.chunked_req = object()
+        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
+        self.assertFalse(gate())
+
+        # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
+        scheduler.chunked_req = None
+        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        self.assertTrue(gate(), "abort cleanup must let compaction resume")
+
 
 class TestMoveGateRejectsNonPdNode(CustomTestCase):
     def test_null_mode_is_rejected(self):

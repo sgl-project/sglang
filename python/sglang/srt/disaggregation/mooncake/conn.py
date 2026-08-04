@@ -59,7 +59,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -784,29 +784,31 @@ class MooncakeKVManager(CommonKVManager):
     def _validate_envelope_kv_layout(
         self, dst_kv_ptrs: list[int], dst_kv_item_len: Optional[int]
     ) -> None:
-        """Reject a peer whose KV registration shape differs from ours when
-        either side registered ONE whole-envelope region.
+        """Reject a peer whose KV registration shape differs from ours.
 
-        The envelope form addresses the destination as
-        ``dst_ptr + page_id * item_len`` using OUR ``item_len``, so a peer on a
-        different page size / spec, or without unified memory, would take
-        envelope-sized blocks at the wrong offsets. Must run before the first
-        RDMA write.
+        The unified memory pool registers ONE whole-envelope region and
+        addresses the destination as ``dst_ptr + page_id * item_len`` using OUR
+        ``item_len``, so a peer on a different page size / spec, or without
+        unified memory, would take envelope-sized blocks at the wrong offsets.
+        Must run before the first RDMA write.
+
+        Scoped to unified memory by config, not by region count: a non-unified
+        PP stage owning a single full-attention layer also registers one region,
+        and `_send_kvcache_generic` pairs that with the peer by layer id.
         """
-        src_is_envelope = len(self.kv_args.kv_data_ptrs) == 1
-        dst_is_envelope = len(dst_kv_ptrs) == 1
-        if not (src_is_envelope or dst_is_envelope):
+        if not get_memory().enable_unified_memory:
             return
-        src_item_len = self.kv_args.kv_item_lens[0] if src_is_envelope else None
+        src_item_lens = self.kv_args.kv_item_lens
         if (
-            src_is_envelope != dst_is_envelope
+            len(src_item_lens) != 1
+            or len(dst_kv_ptrs) != 1
             or dst_kv_item_len is None
-            or src_item_len != dst_kv_item_len
+            or src_item_lens[0] != dst_kv_item_len
         ):
             raise RuntimeError(
                 "PD KV layout mismatch on the whole-envelope path: prefill has "
-                f"{len(self.kv_args.kv_data_ptrs)} KV region(s) with item_len="
-                f"{src_item_len}, decode has {len(dst_kv_ptrs)} with item_len="
+                f"{len(src_item_lens)} KV region(s) with item_lens="
+                f"{src_item_lens}, decode has {len(dst_kv_ptrs)} with item_len="
                 f"{dst_kv_item_len}. With --enable-unified-memory both sides "
                 "must enable it and use the same page size and model spec."
             )

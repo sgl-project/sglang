@@ -834,6 +834,8 @@ class UnifiedMambaPool(MambaPool):
     # must build identical mamba specs (equal attn TP, pp=1).
 
     def get_contiguous_buf_infos(self):
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         spec = self._unified_buffer.mamba_spec(self._sub_pool_name)
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [spec.entry_bytes()]
