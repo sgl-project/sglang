@@ -271,28 +271,54 @@ ITL 92ms 下，每 100 个输出 token ≈ 9.2s。**E2E<10s 只对短输出任�
 
 ### 9.2 tool call 提取上下文（目标 TTFT<1s / E2E<10s）
 
+推荐配置（new API 侧）：
+
+```json
+{
+    "chat_template_kwargs": {"enable_thinking": false},
+    "temperature": 0.0,
+    "repetition_penalty": 1.0,
+    "max_completion_tokens": 512,
+    "max_tokens": 512
+}
+```
+
 | 参数 | 建议值 | 理由 |
 |------|--------|------|
 | `enable_thinking` | `false` | 提取是确定性任务，thinking 是纯开销；若误选工具再开 `thinking_budget ≤ 128` |
-| `max_tokens` | 128（长参数工具放宽到 256） | 工具调用 JSON 通常 50~100 token |
+| `max_tokens` | 512（严格 <10s 目标用 256） | 工具调用 JSON 典型 50~160 token；512 覆盖长参数工具，256 保 E2E |
 | `temperature` | 0.0 | 确定性 |
 | `repetition_penalty` | 1.0 | |
-| 预期 | TTFT 0.3~0.8s（前缀命中后）；E2E ≈ 10s（临界） | 想留余量就把输出压到 64~80 token |
 
-`thinking_budget` 通过 `chat_template_kwargs` 传递（如 `{"enable_thinking": true, "thinking_budget": 128}`），先发一个请求验证模板是否支持该字段。
+`thinking_budget` 通过 `chat_template_kwargs` 传递，先发一个请求验证模板是否支持该字段。
 
-### 9.3 代码检视（目标 E2E 30~60s）
+### 9.3 代码检视（质量-延迟权衡）
 
-| 参数 | 常规档 | 快速档 |
-|------|--------|--------|
-| `enable_thinking` | `true` | `true` |
-| `thinking_budget` | 256~512 | 128 |
-| `max_tokens` | 1024~2048 | 512 |
-| `temperature` | 0.1 | 0.1 |
-| `repetition_penalty` | 1.05 | 1.05 |
-| 预期 E2E | ~85s | ~34s |
+推荐配置（new API 侧，默认档）：
 
-说明：输入长、输出数百 token，E2E<10s 不现实；只有"输出 ≤100 token 的要点式结论"才可能，代价是丢失细节。
+```json
+{
+    "chat_template_kwargs": {
+        "enable_thinking": true,
+        "thinking_budget": 1024
+    },
+    "temperature": 0.1,
+    "top_p": 0.95,
+    "repetition_penalty": 1.05,
+    "max_completion_tokens": 2048,
+    "max_tokens": 2048
+}
+```
+
+| 档位 | thinking_budget | max_tokens | 单请求 decode | 适用 |
+|------|----------------|------------|--------------|------|
+| 快速档 | 512 | 1024 | ~33s | 简单审查/格式检查 |
+| **默认档** | **1024** | **2048** | ~50s | 常规代码检视（先跑 A/B 再调） |
+| 深度档 | 2048 | 3072 | ~82s | 复杂/安全/跨模块检视，接受长 E2E |
+
+- **质量-延迟是同一杠杆两端**：budget 越低延迟越低、复杂场景精度越可能下降；用"budget vs bug 检出率"的 A/B 曲线决定档位，不要凭感觉；
+- `max_tokens` **暂勿超过 4096**：在加卡/换 H20-H100 或质量分级落地前，这是防队列爆炸的安全上限；
+- `thinking_budget` 是模板级约束（模型提前知道预算、主动压缩推理），优于 max_tokens 硬截断；先验证模板支持该字段，不支持则退化为硬截断（质量略差）。
 
 ### 9.4 通用配置（压低 TTFT）
 
