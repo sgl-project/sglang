@@ -156,10 +156,20 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&active_load)),
     ));
 
+    let extra_fwd = sgl_router::server::header_utils::ExtraForwardHeaders::from_iter(
+        &cfg.proxy.forward_headers,
+    );
+    if !extra_fwd.is_empty() {
+        tracing::info!(
+            forward_headers = ?cfg.proxy.forward_headers,
+            "extra request headers will be forwarded to upstream workers",
+        );
+    }
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
-            cfg.proxy.request_timeout_secs,
-        ))
+        sgl_router::proxy::Proxy::with_extra_headers(
+            std::time::Duration::from_secs(cfg.proxy.request_timeout_secs),
+            extra_fwd,
+        )
         .context("build proxy client")?,
     );
 

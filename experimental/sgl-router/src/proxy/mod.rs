@@ -7,7 +7,7 @@ pub mod sse;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
-use crate::server::header_utils::should_forward_request_header;
+use crate::server::header_utils::{should_forward_request_header, ExtraForwardHeaders};
 use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -36,6 +36,9 @@ pub struct Proxy {
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+    /// Additional header names that should be forwarded to upstream workers,
+    /// populated from `--forward-headers`.
+    pub extra_forward_headers: ExtraForwardHeaders,
 }
 
 impl Proxy {
@@ -43,6 +46,15 @@ impl Proxy {
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
+        Self::with_extra_headers(request_timeout, ExtraForwardHeaders::default())
+    }
+
+    /// Build a proxy that forwards the given extra headers in addition to the
+    /// built-in whitelist.
+    pub fn with_extra_headers(
+        request_timeout: Duration,
+        extra_forward_headers: ExtraForwardHeaders,
+    ) -> Result<Self, anyhow::Error> {
         let client = Client::builder()
             .pool_max_idle_per_host(64)
             .connect_timeout(Duration::from_secs(5))
@@ -51,6 +63,7 @@ impl Proxy {
         Ok(Self {
             client,
             request_timeout,
+            extra_forward_headers,
         })
     }
 
@@ -107,7 +120,7 @@ impl Proxy {
         })?;
         let mut req = self.client.post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if should_forward_request_header(k, &self.extra_forward_headers) {
                 req = req.header(k, v);
             }
         }
@@ -189,7 +202,7 @@ impl Proxy {
         })?;
         let mut req = self.client.post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if should_forward_request_header(k, &self.extra_forward_headers) {
                 req = req.header(k, v);
             }
         }

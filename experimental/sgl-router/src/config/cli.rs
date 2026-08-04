@@ -125,6 +125,14 @@ pub struct Cli {
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
 
+    // ---- header forwarding ----
+    /// Extra request headers to forward to upstream workers (in addition to
+    /// the built-in whitelist: authorization, x-request-id, traceparent, etc.).
+    /// Specify header names separated by spaces, e.g.
+    /// `--forward-headers x-cloudwalk-info x-custom-label`.
+    #[arg(long, num_args = 0..)]
+    pub forward_headers: Vec<String>,
+
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -271,6 +279,7 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                forward_headers: self.forward_headers,
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
