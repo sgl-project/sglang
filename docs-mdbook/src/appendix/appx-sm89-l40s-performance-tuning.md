@@ -764,7 +764,7 @@ python3.12 -m pip list | grep -iE "fastapi|uvicorn|httpx"
   - 代理启动后自检：120s 内 `/health` 未就绪打警告（不阻塞主服务）；
   - chat/messages 查询串（如 `?stream=true`）已透传；
   - 上线前做 diff 验证：同一请求直连 8000 与走 8080，响应（body+headers）应完全一致。
-- **一次性能收脚本**：[proxy_acceptance.sh](appendix/proxy_acceptance.sh) 自动跑完无缝清单——body 一致性（归一化 id/created）、`/health` 与 `/metrics`、流式 SSE、tool call priority=10 注入、可选 429 上限测试（`--test-429`，瞬时影响生产需低峰）、代理进程/孤儿检查；输出 PASS/FAIL/SKIP 汇总，全绿即闭环。
+- **一次性能收脚本**：[proxy_acceptance.sh](appendix/proxy_acceptance.sh) 自动跑完无缝清单——body 一致性（归一化 id/created）、`/health` 与 `/metrics`、流式 SSE、tool call priority=10 注入、可选 429 上限测试（`--test-429`，瞬时影响生产需低峰）、代理进程/孤儿检查；输出 PASS/FAIL/SKIP 汇总，全绿即闭环。K8s 场景从 pod 外验收时用 `--host <IP>`（后端与代理同 IP）或 `--backend-host` / `--proxy-host` 分别指定。
 
 **请求侧**：
 
