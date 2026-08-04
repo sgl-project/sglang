@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import copy
 import doctest
+import importlib.util
 import inspect
 import json
 import logging
@@ -182,6 +183,22 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def build_vlm_image_prompt(processor, question: str) -> str:
+    # Take the image placeholder from the model's own HF chat template: a
+    # hand-written one silently degrades to a text-only prompt on any model
+    # whose placeholder differs.
+    return processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": question}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -200,6 +217,23 @@ def is_blackwell_system():
 def is_h200_system():
     """Return whether it is running on an H200 system."""
     return envs.IS_H200.get()
+
+
+def is_rust_server_built():
+    """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
+    is importable.
+
+    ``sglang/srt/server/`` is not in the source tree — it is produced by
+    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
+    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
+    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
+    this at class-definition time, so letting that escape would fail the whole
+    module import instead of skipping the one class.
+    """
+    try:
+        return importlib.util.find_spec("sglang.srt.server._core") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _use_cached_default_models(model_repo: str):
@@ -229,6 +263,9 @@ if is_blackwell_system():
 
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+
+if is_in_ci() and is_xpu():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -1044,6 +1081,27 @@ def popen_launch_server(
     if "exited" in error_msg:
         raise Exception(error_msg + ". Check server logs for errors.")
     raise TimeoutError(error_msg)
+
+
+def terminate_and_kill_process_tree(
+    process,
+    terminate_timeout: float = 60,
+    **kill_kwargs,
+) -> None:
+    """Shut a launched server down gracefully, then SIGKILL whatever is left.
+
+    A bare ``kill_process_tree`` leaves the kernel to unwind the CUDA context
+    and unpin the host memory during process reclaim, which can hold GPU memory
+    for minutes on a busy host -- long enough to trip the per-class GPU-idle
+    gate in the next ``setUpClass``. SIGTERM first so the server releases those
+    resources in userspace.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_process_tree(process.pid, **kill_kwargs)
 
 
 def popen_launch_pd_server(

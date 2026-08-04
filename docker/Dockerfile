@@ -342,7 +342,7 @@ FROM torch_deps AS hpc_ops_builder
 # HPC-Ops (https://github.com/Tencent/hpc-ops, MIT): fused attention / MoE /
 # RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
 # hpc_ops attention and MoE runner backends.
-ARG HPC_OPS_COMMIT=2404f09766269d9533b66709f705c8eeb01421fc
+ARG HPC_OPS_COMMIT=6e2ecede9d6d47b2e680e839cc7ad7422bc8d88b
 
 WORKDIR /build
 

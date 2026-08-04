@@ -56,6 +56,8 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3p7Config,
@@ -109,6 +111,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        Qwen3_5TextConfig,
+        Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
@@ -485,12 +489,13 @@ def get_generation_config(
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.warning(
-            "Failed to load generation config for %s: %s. "
-            "Proceeding without generation config.",
+    except (FileNotFoundError, OSError) as e:
+        # A missing generation_config.json is normal for many checkpoints and
+        # is surfaced by HF as a generic OSError (not FileNotFoundError). Treat
+        # it as benign — proceed without a generation config, at DEBUG level so
+        # normal startup logs stay quiet.
+        logger.debug(
+            "No generation config for %s: %s. Proceeding without it.",
             model,
             e,
         )
