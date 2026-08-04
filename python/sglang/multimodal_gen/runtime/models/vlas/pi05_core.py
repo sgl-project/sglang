@@ -1336,6 +1336,8 @@ class Pi05CoreModel(nn.Module):
             att_masks += [0] * num_image_embs
 
         lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+        # Match OpenPI's Pi0.5 prefix embedding semantics.
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
         embs.append(lang_emb)
         pad_masks.append(token_masks)
         att_masks += [0] * lang_emb.shape[1]
