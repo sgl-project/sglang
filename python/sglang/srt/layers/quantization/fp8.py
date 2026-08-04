@@ -1073,20 +1073,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
-    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+    def is_deepgemm_moe_runner_backend_enabled(
+        moe_runner_backend=None, moe_a2a_backend=None
+    ) -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend is None:
+            moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
             return True
         if moe_runner_backend.is_auto():
-            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or get_moe_a2a_backend().is_nixl()
-            )
+            if moe_a2a_backend is None:
+                moe_a2a_backend = get_moe_a2a_backend()
+            if not (
+                moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_mooncake()
+                or moe_a2a_backend.is_nixl()
+            ):
+                return False
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
     @staticmethod
