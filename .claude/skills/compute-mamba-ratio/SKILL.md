@@ -35,7 +35,7 @@ token_equiv  =  state_bytes_per_slot / kv_bytes_per_token
      - `Mamba Cache is allocated. ... ssm_state size X GB` with `max_mamba_cache_size: N` → `state_bytes_per_slot = X / N`
      - `KV Cache is allocated. #tokens: M, KV size: Y GB` → `kv_bytes_per_token = Y / M`
    - **(b) derived** — model arch (linear-layer count + state dims `d_state/d_conv/heads/head_dim`; attention type + KV dims: MLA latent dim, or GQA `kv_heads·head_dim·layers`) **× the dtypes** below.
-3. **`S`** — from `--mamba-radix-cache-strategy` / scheduler (table below).
+3. **`S`** — from `--mamba-radix-cache-strategy`, the overlap scheduler, and `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` (table below).
 4. **`D`** — `--speculative-num-draft-tokens` (0 if NOSPEC; **also 0 when ReplaySSM spec-verify is enabled** — see caveats).
 5. **`dcp_size`** — `--dcp-size` (1 if no DCP). If DCP **and** spec with a replicated draft KV, apply the draft caveat (below).
 6. **KV dtype** (bf16 / fp8) and **ssm dtype** (fp32 / bf16) — they set the two byte constants (see the `token_equiv` 2×2).
@@ -43,15 +43,19 @@ token_equiv  =  state_bytes_per_slot / kv_bytes_per_token
 
 ### `S` (state slots per running request), set by `--mamba-radix-cache-strategy`
 
-All strategies keep prefix caching on; they differ in the track buffer that snapshots chunk-boundary state under the overlap scheduler. `S = base 3 (live state + radix retention/COW headroom) + ping-pong`, where ping-pong = 2 (overlap on, non-lazy) / 1 (lazy, **or** overlap off) / 0 (no track buffer at all). This mirrors `kv_cache_configurator._calculate_mamba_ratio`; read it there if a release moves the constants.
+All strategies keep prefix caching on; they differ in the track buffer that snapshots chunk-boundary state under the overlap scheduler. `S = base + ping-pong`, where base is 3 (live state + radix retention/COW headroom), and ping-pong = 2 (overlap on, non-lazy) / 1 (lazy, **or** overlap off) / 0 (no track buffer at all). This mirrors `kv_cache_configurator._calculate_mamba_ratio`; read it there if a release moves the constants.
 
-| strategy | S | notes |
-|---|---|---|
-| `--disable-radix-cache` | 1 | prefix cache off entirely; most concurrency, no reuse |
-| `no_buffer` | 3 | no track buffer; requires overlap **off** (+ `page_size 1`) → lower decode throughput |
-| `extra_buffer` (default), overlap on | 5 | track buffer reserved per running request |
-| `extra_buffer`, overlap off | 4 | same buffer, but ping-pong costs 1 slot instead of 2 |
-| `extra_buffer_lazy` (recommended) | 4 | track buffer allocated lazily at the boundary → 1 fewer slot/req; requires overlap **on** |
+`SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` takes the base to 2, since the decode-time skip frees one resident slot per running request. `no_buffer` is the exception and stays at an effective 3: it adds that slot straight back, because its binding limit is the prefill-to-decode peak, which a decode-time change does not shrink.
+
+| strategy | S | S with decode-lock skip | notes |
+|---|---|---|---|
+| `--disable-radix-cache` | 1 | 1 | prefix cache off entirely; most concurrency, no reuse |
+| `no_buffer` | 3 | 3 | no track buffer; requires overlap **off** (+ `page_size 1`) → lower decode throughput |
+| `extra_buffer` (default), overlap on | 5 | 4 | track buffer reserved per running request |
+| `extra_buffer`, overlap off | 4 | 3 | same buffer, but ping-pong costs 1 slot instead of 2 |
+| `extra_buffer_lazy` (recommended) | 4 | 3 | track buffer allocated lazily at the boundary → 1 fewer slot/req; requires overlap **on** |
+
+The skip is a real concurrency lever, not a rounding detail: at the default strategy it takes `S` from 5 to 4, so the same state budget admits 25% more requests and `r*` drops by the same factor.
 
 Overlap counts as off when `--disable-overlap-schedule` is passed **or** `--pp-size > 1` (pipeline parallelism turns it off for you). So a PP deployment left on the default strategy sits on the `S = 4` row, not `S = 5` — using 5 there overstates the state cost and starves KV.
 
@@ -109,7 +113,7 @@ Constants (from boot logs): `state_bytes_per_slot ≈ 56.4 MB` (fp32 ssm), `kv_b
 - **TP (dcp_size=1)**: `r = 4 · 4080 · 1 / 9216 ≈ 1.8`. Measured: clamp 88, KV cap 87 → balanced. ✅
 - **DCP8 (dcp_size=8)**: `r = 4 · 4080 · 8 / 9216 ≈ 14`. Measured at r=14: clamp 125, KV cap 129 → balanced. ✅ (At the naive r=1.8 the DCP KV pool is ~8× over-provisioned — cap 683 vs clamp 86 — wasting budget that should go to the state pool.)
 
-`predict_clamp` on the same model at the **default** `extra_buffer` (`S = 5`), three boot logs:
+`predict_clamp` on the same model at the **default** `extra_buffer`, overlap on and the decode-lock skip off (`S = 5`), three boot logs:
 
 | config | `max_mamba_cache_size` | `mmcs // S` | measured `max_running_requests` |
 |---|---|---|---|
