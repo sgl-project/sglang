@@ -26,6 +26,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -60,7 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -84,22 +85,20 @@ class MlaBmmFusionPlan:
     attn_output_buf: torch.Tensor
 
 
+def _select_local_dcp_heads_for_autotune(
+    attn_output: torch.Tensor, num_local_heads: int
+) -> torch.Tensor:
+    """Select this rank's head shard without communicating dummy outputs."""
+    rank = get_parallel().attn_dcp_rank
+    return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
+
+
 def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     if not get_parallel().dcp_enabled:
         return False
-    if forward_batch.forward_mode.is_decode():
-        return True
-    if not forward_batch.forward_mode.is_target_verify() or not _is_cuda:
-        return False
-
-    server_args = get_server_args()
-    decode_backend = (
-        server_args.decode_attention_backend or server_args.attention_backend
-    )
     return (
-        get_spec().speculative_algorithm == "DSPARK"
-        and get_spec().speculative_attention_mode == "decode"
-        and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
     )
 
 
@@ -760,25 +759,35 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            dcp_comm_backend = get_parallel().dcp_comm_backend
-            is_lse_base_on_e = is_mla_dcp_lse_base_on_e(self.current_attention_backend)
-            if dcp_comm_backend in ("a2a", "fi_a2a"):
-                # A2A exchange of head partials + LSE, then local Triton combine.
-                attn_output = dcp_a2a_lse_reduce(
-                    attn_output.contiguous(),
-                    lse.contiguous(),
-                    get_parallel().dcp_group,
-                    is_lse_base_on_e=is_lse_base_on_e,
-                    comm_backend=dcp_comm_backend,
+            if get_in_autotune_dummy_run():
+                # The synthetic FlashInfer MoE autotune pass discards model
+                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
+                # zero attention partials.
+                attn_output = _select_local_dcp_heads_for_autotune(
+                    attn_output, self.num_local_heads
                 )
             else:
-                attn_output = cp_lse_ag_out_rs_mla(
-                    attn_output,
-                    lse,
-                    get_parallel().dcp_group,
-                    is_lse_base_on_e=is_lse_base_on_e,
+                dcp_comm_backend = get_parallel().dcp_comm_backend
+                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
+                    self.current_attention_backend
                 )
-                attn_output = attn_output.transpose(0, 1)
+                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    attn_output = dcp_a2a_lse_reduce(
+                        attn_output.contiguous(),
+                        lse.contiguous(),
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        comm_backend=dcp_comm_backend,
+                    )
+                else:
+                    attn_output = cp_lse_ag_out_rs_mla(
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None

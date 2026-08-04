@@ -30,6 +30,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -46,6 +47,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
     is_mla_dcp_lse_base_on_e,
     should_defer_dsa_cp_kv_gather,
@@ -704,25 +706,35 @@ class DeepseekMLAAbsorbRocmForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            dcp_comm_backend = get_parallel().dcp_comm_backend
-            is_lse_base_on_e = is_mla_dcp_lse_base_on_e(self.current_attention_backend)
-            if dcp_comm_backend in ("a2a", "fi_a2a"):
-                # A2A exchange of head partials + LSE, then local Triton combine.
-                attn_output = dcp_a2a_lse_reduce(
-                    attn_output.contiguous(),
-                    lse.contiguous(),
-                    get_parallel().dcp_group,
-                    is_lse_base_on_e=is_lse_base_on_e,
-                    comm_backend=dcp_comm_backend,
+            if get_in_autotune_dummy_run():
+                # The synthetic FlashInfer MoE autotune pass discards model
+                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
+                # zero attention partials.
+                attn_output = _select_local_dcp_heads_for_autotune(
+                    attn_output, self.num_local_heads
                 )
             else:
-                attn_output = cp_lse_ag_out_rs_mla(
-                    attn_output,
-                    lse,
-                    get_parallel().dcp_group,
-                    is_lse_base_on_e=is_lse_base_on_e,
+                dcp_comm_backend = get_parallel().dcp_comm_backend
+                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
+                    self.current_attention_backend
                 )
-                attn_output = attn_output.transpose(0, 1)
+                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                    # A2A exchange of head partials + LSE, then local Triton combine.
+                    attn_output = dcp_a2a_lse_reduce(
+                        attn_output.contiguous(),
+                        lse.contiguous(),
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        comm_backend=dcp_comm_backend,
+                    )
+                else:
+                    attn_output = cp_lse_ag_out_rs_mla(
+                        attn_output,
+                        lse,
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
