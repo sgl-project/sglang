@@ -1090,14 +1090,15 @@ class ComposedPipelineBase(ABC):
             server_args,
         )
 
-    @torch.no_grad()
-    def prepare_batch_sequentially(
+    def prepare_async_ar_prefetch(
         self,
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Run the grouped preparation stage for sequential DiT execution."""
-        return self.executor.execute_group(self.stages[:1], batches, server_args)
+        """Prepare AR outputs in a thread-safe pipeline-specific fast path."""
+        raise NotImplementedError(
+            f"{self.pipeline_name} does not support async AR prefetch"
+        )
 
     @torch.no_grad()
     def forward_prepared_batch_sequentially(

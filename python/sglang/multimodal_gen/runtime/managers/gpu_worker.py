@@ -432,7 +432,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def prepare_forward_sequential_group(self, batch: list[Req]) -> list[Req]:
         """Run grouped preparation before per-request DiT/VAE execution."""
         assert self.pipeline is not None
-        return self.pipeline.prepare_batch_sequentially(batch, self.server_args)
+        return self.pipeline.prepare_async_ar_prefetch(batch, self.server_args)
 
     def execute_prepared_forward_sequentially(
         self, batch: list[Req]

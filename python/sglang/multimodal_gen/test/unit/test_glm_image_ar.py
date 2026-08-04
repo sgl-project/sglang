@@ -42,6 +42,9 @@ class _FakeResponse:
     def raise_for_status(self):
         return None
 
+    def raise_for_status(self):
+        pass
+
     def json(self):
         data = {"output_ids": self._output_ids}
         if self._meta_info is not None:
@@ -55,6 +58,9 @@ class _FakeBatchResponse:
 
     def raise_for_status(self):
         return None
+
+    def raise_for_status(self):
+        pass
 
     def json(self):
         return self._outputs
@@ -418,6 +424,38 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
             [batch.prior_token_id.shape for batch in prepared],
             [(1, 4096), (1, 4096)],
         )
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.get_local_torch_device",
+        return_value=torch.device("cuda"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.requests.post"
+    )
+    def test_single_srt_ar_prefetch_uses_cpu_batch_path(self, mock_post, _mock_device):
+        set_global_server_args(self._server_args())
+        mock_post.return_value = _FakeBatchResponse([list(range(1025))])
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        batches = [
+            SimpleNamespace(
+                prompt="A simple product sketch",
+                image_path=None,
+                num_outputs_per_prompt=1,
+                seed=42,
+                height=1024,
+                width=1024,
+                metrics=None,
+            )
+        ]
+
+        prepared = stage.prepare_external_ar_group(batches, self._server_args())
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(len(payload["input_ids"]), 1)
+        self.assertEqual(prepared[0].prior_token_id.device.type, "cpu")
+        self.assertEqual(prepared[0].prior_token_id.shape, (1, 4096))
 
 
 if __name__ == "__main__":

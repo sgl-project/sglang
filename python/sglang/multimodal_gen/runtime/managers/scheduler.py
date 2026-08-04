@@ -420,6 +420,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             and self._dynamic_batching_enabled()
             and pipeline_config.supports_native_grouped_requests()
             and pipeline_config.supports_sequential_dit_inference()
+            and pipeline_config.supports_async_ar_prefetch()
         )
 
     def _get_next_sequential_prefetch_items(
@@ -528,6 +529,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ) -> tuple[list[tuple[bytes | None, Req]], _SequentiallyReturnedOutputs] | None:
         prefetch = self._sequential_prefetch
         if prefetch is None:
+            return None
+        if not prefetch.future.done():
             return None
 
         self._sequential_prefetch = None
@@ -1370,6 +1373,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if prefetched is not None:
                 items, handler_result = prefetched
             else:
+                if self._sequential_prefetch is not None:
+                    if self.receiver is not None:
+                        self._poller.poll(timeout=10)
+                    else:
+                        time.sleep(0.01)
+                    continue
                 items = self.get_next_batch_to_run()
                 handler_result = None
             if not items:
