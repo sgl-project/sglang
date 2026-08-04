@@ -2686,6 +2686,60 @@ class KimiK3LinearForCausalLM(nn.Module):
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
 
+    def _load_gguf_residual_score(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> bool:
+        """Install a converter-fused attention-residual score vector.
+
+        llama.cpp stores ``res_norm.weight * res_proj.weight`` as one FP32
+        vector.  The regular checkpoint has two BF16 parameters, while all K3
+        serving kernels consume their cached FP32 product.  Reconstruct benign
+        BF16 factors for eager fallbacks and seed the exact FP32/BF16 caches so
+        the serving kernels preserve the serialized GGUF value.
+        """
+
+        if not name.endswith("_res_score_gguf"):
+            return False
+
+        if name == "model.output_attn_res_score_gguf":
+            if not self.pp_group.is_last_rank:
+                return True
+            score_proj = self.model.output_attn_res_proj
+            score_norm = self.model.output_attn_res_norm
+        else:
+            parts = name.split(".")
+            if len(parts) != 4 or parts[:2] != ["model", "layers"]:
+                raise ValueError(f"invalid K3 GGUF residual score name: {name!r}")
+            layer_id = int(parts[2])
+            layer = self.model.layers[layer_id]
+            if isinstance(layer, PPMissingLayer):
+                return True
+            role = parts[3]
+            if role == "self_attention_res_score_gguf":
+                score_proj = layer.self_attention_res_proj
+                score_norm = layer.self_attention_res_norm
+            elif role == "mlp_res_score_gguf":
+                score_proj = layer.mlp_res_proj
+                score_norm = layer.mlp_res_norm
+            else:
+                raise ValueError(f"invalid K3 GGUF residual score role: {role!r}")
+
+        value = loaded_weight.reshape(-1)
+        if value.numel() != self.config.hidden_size or not torch.isfinite(value).all():
+            raise ValueError(f"invalid K3 GGUF residual score tensor: {name!r}")
+        cw_fp32 = value.to(
+            device=score_proj.weight.device, dtype=torch.float32, copy=True
+        ).contiguous()
+        score_norm.weight.data.fill_(1)
+        score_proj.weight.data.copy_(
+            cw_fp32.to(score_proj.weight.dtype).reshape_as(score_proj.weight)
+        )
+        score_proj._attn_res_cw_cache = {
+            torch.float32: cw_fp32,
+            torch.bfloat16: cw_fp32.to(torch.bfloat16),
+        }
+        return True
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
@@ -2757,6 +2811,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                 _lid = name.split(".layers.")[1].split(".")[0]
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
+
+            if self._load_gguf_residual_score(name, loaded_weight):
+                continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
             if "weight_packed" in name:

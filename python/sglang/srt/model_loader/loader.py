@@ -3036,6 +3036,8 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "command-r"
         elif model_type == "qwen3_moe":
             model_type = "qwen3moe"
+        elif model_type == "kimi_k3":
+            model_type = "kimi-k3"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -3043,7 +3045,7 @@ class GGUFModelLoader(BaseModelLoader):
                 break
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        num_layers = config.num_hidden_layers
+        num_layers = model_config.hf_text_config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
         with torch.device("meta"):
             dummy_model = AutoModelForCausalLM.from_config(config)
@@ -3072,21 +3074,39 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
-            model_config.hf_config.update({"tie_word_embeddings": True})
+        from sglang.srt.model_loader.kimi_k3_gguf_adapter import (
+            KimiK3GGUFAdapter,
+            is_kimi_k3_gguf_config,
+        )
+
+        kimi_k3_adapter = None
+        if is_kimi_k3_gguf_config(model_config):
+            # This parses metadata and the tensor table only. It fails before
+            # model allocation if the adjacent config, protected inventory, or
+            # converter transform contract differs from Kimi K3.
+            kimi_k3_adapter = KimiK3GGUFAdapter(local_model_path, model_config)
+            gguf_weights_map = None
+        else:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
+            # we can only know if tie word embeddings after mapping weights
+            if "lm_head.weight" in get_gguf_extra_tensor_names(
+                local_model_path, gguf_weights_map
+            ):
+                model_config.hf_config.update({"tie_word_embeddings": True})
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        if kimi_k3_adapter is not None:
+            quant_config = kimi_k3_adapter.quant_config()
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            weights_iterator = (
+                kimi_k3_adapter.weights_iterator()
+                if kimi_k3_adapter is not None
+                else self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
+            model.load_weights(weights_iterator)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
