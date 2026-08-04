@@ -748,6 +748,7 @@ def _pre_permute_standard_contig(
         q_scale,
         topk_ids,
         counts_aligned,
+        counts,
         expert_start_loc,
         input_tensor,
         input_tensor_scale,
