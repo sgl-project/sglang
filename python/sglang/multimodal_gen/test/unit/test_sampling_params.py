@@ -41,6 +41,18 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
+    def test_quality_defaults_to_lossless(self):
+        self.assertEqual(SamplingParams().quality, "lossless")
+
+    def test_quality_accepts_the_two_validated_levels(self):
+        self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
+        self.assertEqual(SamplingParams(quality="high").quality, "high")
+
+    def test_quality_rejects_invalid_values(self):
+        for bad in ("ultra", "draft", "fast", "", True, 1):
+            with self.assertRaisesRegex(ValueError, r"quality must be one of"):
+                SamplingParams(quality=bad)  # type: ignore[arg-type]
+
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
         self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
@@ -223,6 +235,12 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(
             self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
             [7, 8],
+        )
+
+    def test_quality_is_request_scoped_cli_arg(self):
+        self.assertNotIn("quality", self._parse_cli_kwargs([]))
+        self.assertEqual(
+            self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
         )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):

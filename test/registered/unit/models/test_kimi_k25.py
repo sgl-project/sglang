@@ -3,10 +3,12 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -14,9 +16,19 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+from sglang.srt.models.kimi_k25 import (
+    KimiK25ForConditionalGeneration,
+    mm_projection_auto,
+)
+from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.processors.kimi_k25 import (
+    KimiGPUProcessorWrapper,
+    _ensure_chw_rgb,
+    _expand_image_token_ids,
+    _resize_bicubic_if_needed,
     _resize_images_by_source_shape,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -63,14 +75,12 @@ def _image_item(feature, grid_thw):
 def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     torch.manual_seed(0)
     indexed_images = [
-        (0, torch.randn(3, 32, 24)),
-        (1, torch.randn(3, 32, 24)),
-        (2, torch.randn(3, 28, 20)),
+        (0, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
+        (1, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
+        (2, torch.randint(0, 256, (3, 28, 20), dtype=torch.uint8)),
     ]
     expected = [
-        F.interpolate(
-            image.unsqueeze(0), size=(16, 12), mode="bicubic", align_corners=False
-        )
+        _resize_bicubic_if_needed(image.unsqueeze(0), 16, 12)
         for _, image in indexed_images
     ]
     real_interpolate = F.interpolate
@@ -90,6 +100,209 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
+
+
+def test_kimi_resize_tracks_the_checkpoint_processors_pil_bicubic():
+    # Plain F.interpolate skips PIL's implicit antialiasing on downscale and
+    # drifts far outside 8-bit rounding; photo-like content, not pure noise.
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:512, 0:512].astype(np.float32)
+    plane = np.clip(
+        128
+        + 90 * np.sin(xx / 40) * np.cos(yy / 55)
+        + 40 * ((xx // 37 + yy // 41) % 2)
+        + rng.normal(0, 6, (512, 512)),
+        0,
+        255,
+    )
+    array = np.stack([plane, np.roll(plane, 7, 0), np.roll(plane, 13, 1)], -1).astype(
+        np.uint8
+    )
+    pil = torch.from_numpy(
+        np.asarray(Image.fromarray(array).resize((252, 252), Image.BICUBIC)).astype(
+            np.float32
+        )
+    ).permute(2, 0, 1)
+    source = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+
+    resized = _resize_bicubic_if_needed(source, 252, 252)
+
+    assert resized.shape == (1, 3, 252, 252)
+    torch.testing.assert_close(resized, resized.round())
+    assert resized.min() >= 0.0 and resized.max() <= 255.0
+    # Within a couple of 8-bit levels of PIL; the non-antialiased resize is off
+    # by an order of magnitude more, which is the regression this guards.
+    assert (resized[0] - pil).abs().max() <= 4.0
+    naive = F.interpolate(
+        source.float(), size=(252, 252), mode="bicubic", align_corners=False
+    )
+    assert (naive[0] - pil).abs().max() > 20.0
+
+
+def test_kimi_resize_is_a_dtype_only_cast_when_already_at_target():
+    image = torch.randint(0, 256, (1, 3, 16, 12), dtype=torch.uint8)
+
+    resized = _resize_bicubic_if_needed(image, 16, 12)
+
+    assert resized.dtype == torch.float32
+    torch.testing.assert_close(resized, image.float())
+
+
+def test_kimi_expands_one_placeholder_per_image_from_existing_ids():
+    # 7 is the placeholder; the two images claim 3 and 2 tokens.
+    input_ids = [1, 7, 2, 7, 3]
+
+    expanded = _expand_image_token_ids(
+        input_ids, image_token_id=7, image_token_counts=[3, 2]
+    )
+
+    assert expanded.tolist() == [[1, 7, 7, 7, 2, 7, 7, 3]]
+
+
+def test_kimi_expansion_rejects_a_placeholder_count_mismatch():
+    with pytest.raises(ValueError, match="placeholder"):
+        _expand_image_token_ids([1, 7, 2], image_token_id=7, image_token_counts=[3, 2])
+
+
+def test_kimi_expansion_matches_the_base_retokenize_avoidance_rebuild():
+    # preserve_processor_input_ids skips the base rebuild, which is only safe
+    # while both produce the same sequence. Reference is the original loop.
+    def reference(original_ids, counts, placeholder):
+        rebuilt, next_image = [], 0
+        for token_id in original_ids:
+            if token_id == placeholder:
+                rebuilt.extend([placeholder] * counts[next_image])
+                next_image += 1
+            else:
+                rebuilt.append(token_id)
+        return rebuilt
+
+    rng = np.random.default_rng(0)
+    for n_images in (1, 3, 8):
+        # Placeholder 7 is below the random range, so only the inserted
+        # positions count as placeholders.
+        ids = rng.integers(100, 5000, 400).tolist()
+        for slot in range(n_images):
+            ids.insert(slot * 37 + 5, 7)
+        counts = rng.integers(1, 400, n_images).tolist()
+        expected = reference(ids, counts, 7)
+
+        assert BaseMultimodalProcessor._expand_input_ids(ids, counts, 7) == expected
+        wrapper = _expand_image_token_ids(
+            ids, image_token_id=7, image_token_counts=counts
+        )
+        assert wrapper.flatten().tolist() == expected
+
+
+def test_kimi_cpu_fallback_keeps_the_request_tokens():
+    # preserve_processor_input_ids disables the base rebuild on every path.
+    hf_processor = Mock()
+    hf_processor.media_processor.media_tokens_calculator = Mock(return_value=3)
+    hf_processor.return_value = {"input_ids": torch.tensor([[99, 99, 99]])}
+
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._hf_processor = hf_processor
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 7
+
+    out = wrapper._cpu_call(
+        "a<|media_pad|>b", ["img"], original_input_ids=[1, 7, 2], medias=None
+    )
+
+    # Not the [99, 99, 99] the HF processor returned.
+    assert out["input_ids"].flatten().tolist() == [1, 7, 7, 7, 2]
+
+
+def test_kimi_cpu_fallback_falls_back_to_the_hf_tokens_without_request_ids():
+    hf_processor = Mock()
+    hf_processor.media_processor.media_tokens_calculator = Mock(return_value=3)
+    hf_processor.return_value = {"input_ids": torch.tensor([[99, 99, 99]])}
+
+    wrapper = KimiGPUProcessorWrapper.__new__(KimiGPUProcessorWrapper)
+    wrapper._hf_processor = hf_processor
+    wrapper._image_token = "<|media_pad|>"
+    wrapper._image_token_id = 7
+
+    out = wrapper._cpu_call("a<|media_pad|>b", ["img"], medias=None)
+
+    assert out["input_ids"].flatten().tolist() == [99, 99, 99]
+
+
+def test_kimi_refuses_already_normalized_float_pixels():
+    with pytest.raises(ValueError, match="uint8"):
+        _ensure_chw_rgb(torch.rand(3, 8, 8))
+
+
+def test_kimi_placeholder_count_only_reads_real_token_ids():
+    count = KimiGridMMDataMixin.count_image_placeholders
+
+    assert count([1, 7, 2, 7], 7) == 2
+    assert count(torch.tensor([[1, 7, 2]]), 7) == 1
+    assert count([1, 2, 3], 7) == 0
+    # A prompt string carries no token IDs, so the caller must not take the
+    # tokenized fast path.
+    assert count("<|media_pad|>", 7) is None
+
+
+def test_kimi_single_frame_pool_matches_the_temporal_mean():
+    torch.manual_seed(0)
+    x = torch.randn(1 * 4 * 4, 8)
+    grid_thws = torch.tensor([[1, 4, 4]])
+
+    (merged,) = tpool_patch_merger(x, grid_thws)
+
+    # t == 1 skips the mean; it must stay bit-identical to averaging one frame.
+    reference = (
+        x.view(1, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+    )
+    assert torch.equal(merged, reference.view(4, 4, 8))
+
+
+def test_kimi_multi_frame_pool_still_averages_across_frames():
+    torch.manual_seed(0)
+    x = torch.randn(3 * 4 * 4, 8)
+    grid_thws = torch.tensor([[3, 4, 4]])
+
+    (merged,) = tpool_patch_merger(x, grid_thws)
+
+    reference = (
+        x.view(3, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
+    )
+    assert merged.shape == (4, 4, 8)
+    torch.testing.assert_close(merged, reference.view(4, 4, 8))
+
+
+class _IdentityProjector(nn.Module):
+    """Stands in for K2VLMultiModalProjector, which is never None in production."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def forward(self, x):
+        self.seen = x
+        return x
+
+
+def test_kimi_projection_returns_one_flattened_feature_tensor():
+    torch.manual_seed(0)
+    per_image = [torch.randn(4, 2, 8), torch.randn(6, 2, 8)]
+
+    packed = mm_projection_auto(_IdentityProjector(), per_image)
+
+    assert packed.shape == (20, 8)
+    torch.testing.assert_close(packed, torch.cat(per_image, dim=0).reshape(-1, 8))
+
+
+def test_kimi_projection_does_not_copy_a_single_image():
+    single = torch.randn(4, 2, 8)
+    projector = _IdentityProjector()
+
+    packed = mm_projection_auto(projector, [single])
+
+    # The projector must receive the tensor itself, not a one-element cat of it.
+    assert projector.seen.data_ptr() == single.data_ptr()
+    assert packed.data_ptr() == single.data_ptr()
 
 
 def test_dp_helper_supports_moonvit3d_packed_embeddings_on_tp1():
@@ -126,9 +339,20 @@ def test_dp_helper_can_lazily_load_kimi_features_on_tp1():
 
 
 def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
+    # Single image, so this empty rank takes the broadcast fast path: the
+    # buffer it allocates is shaped from config.hidden_size, then filled by
+    # the owner rank.
+    owner_embedding = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+    broadcast_src = []
+
     class _GatherGroup:
         def all_gather(self, tensor, dim):
             return torch.cat([torch.ones_like(tensor), tensor], dim=dim)
+
+        def broadcast(self, tensor, src):
+            broadcast_src.append(src)
+            tensor.copy_(owner_embedding)
+            return tensor
 
     tower = _MoonViT3dTower()
     parallel = SimpleNamespace(
@@ -146,7 +370,40 @@ def test_dp_helper_uses_config_hidden_size_for_empty_moonvit3d_rank():
         )
 
     assert output.shape == (1, 4, 2)
+    assert torch.equal(output, owner_embedding)
+    assert broadcast_src == [0]
     assert tower.grid_thws is None
+
+
+def test_dp_helper_broadcasts_a_single_image_from_its_owner_rank():
+    broadcast_src = []
+
+    class _GatherGroup:
+        def all_gather(self, tensor, dim):
+            raise AssertionError("a single image must not reach the all-gather")
+
+        def broadcast(self, tensor, src):
+            broadcast_src.append(src)
+            return tensor
+
+    tower = _MoonViT3dTower()
+    pixel_values = torch.randn(4, 2)
+    parallel = SimpleNamespace(
+        attn_tp_size=2,
+        attn_tp_rank=0,
+        attn_tp_group=_GatherGroup(),
+    )
+
+    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
+        output = run_dp_sharded_mrope_vision_model(
+            tower,
+            pixel_values,
+            [[1, 2, 2]],
+            rope_type="rope_2d_packed",
+        )
+
+    assert torch.equal(output, pixel_values.reshape(1, 4, 2))
+    assert broadcast_src == [0]
 
 
 def test_dp_helper_lazily_loads_only_its_local_image_shard():
@@ -202,6 +459,28 @@ def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     assert grid_thws == [[1, 2, 2]]
     assert run_dp.call_args.kwargs["rope_type"] == "rope_2d_packed"
     assert callable(run_dp.call_args.kwargs["load_local_pixel_values"])
+
+
+def test_kimi_non_dp_keeps_grid_thws_on_the_host():
+    model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = False
+    model.vision_tower = _MoonViT3dTower()
+    # Not the host, so a stray .to(tower.device) shows up without a GPU.
+    model.vision_tower.device = torch.device("meta")
+    model.mm_projector = _IdentityProjector()
+    items = [_image_item(torch.randn(4, 2), [[1, 2, 2]])]
+
+    with get_parallel().override(
+        tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+    ), patch(
+        "sglang.srt.models.kimi_k25.get_server_args",
+        return_value=SimpleNamespace(tp_size=1),
+    ):
+        model.get_image_feature(items)
+
+    # A device copy would cost one sync per .tolist() inside MoonViT3d.
+    assert model.vision_tower.grid_thws.device.type == "cpu"
 
 
 def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():
