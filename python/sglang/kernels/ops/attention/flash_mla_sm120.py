@@ -479,6 +479,13 @@ _noted_bucket_pad = False
 _warned_triton_fb = False
 
 
+def _next_topk_bucket(topk: int) -> Optional[int]:
+    """Smallest instantiated topk width >= ``topk``, or ``None`` if wider than
+    every kernel. The pad target for a request whose indexer topk (e.g. DSpark's
+    192) is not itself an instantiated width."""
+    return next((w for w in _SUPPORTED_TOPK_WIDTHS if w >= topk), None)
+
+
 def _flash_mla_flashinfer(
     q,
     k_cache,
@@ -556,7 +563,7 @@ def _flash_mla_flashinfer(
     _topk = idx.shape[-1]
     _d_qk = q.shape[-1]
     if _d_qk == 512 and _topk not in _SUPPORTED_TOPK_WIDTHS:
-        _next_w = next((t for t in _SUPPORTED_TOPK_WIDTHS if t >= _topk), None)
+        _next_w = _next_topk_bucket(_topk)
         if _next_w is not None:
             if topk_length is None:
                 # Cap the scan at the true width so the -1 padding is
