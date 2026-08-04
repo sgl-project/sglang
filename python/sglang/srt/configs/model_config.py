@@ -129,6 +129,14 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_nemotron_h(config) -> bool:
+    return _hf_arch(config) in (
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "NemotronHForCausalLMMTP",
+    )
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -494,7 +502,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -1494,20 +1502,6 @@ class ModelConfig:
                         f"method specified in the `quantization` argument "
                         f"({self.quantization})."
                     )
-
-            # Warn if DeepGemm is enabled for a non-ue8m0 checkpoint on Blackwell.
-            # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
-            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if (
-                not self.use_scale_ue8m0
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and self.quantization != "mxfp8"
-            ):
-                logger.warning(
-                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
-                )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:

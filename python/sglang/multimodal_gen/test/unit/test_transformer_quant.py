@@ -55,10 +55,15 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    _warn_if_expected_param_dtype_missing,
+)
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
+    _resolve_quant_config,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -107,6 +112,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             ),
             nunchaku_config=None,
             quantization=None,
+            quantization_ignored_layers=None,
             tp_size=1,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,
@@ -211,6 +217,24 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(plan.weight_postprocess_device, device)
         self.assertTrue(plan.defer_component_cpu_offload)
 
+    def test_mixed_model_with_expected_dtype_does_not_warn(self):
+        model = torch.nn.Module()
+        model.fp32 = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        model.bf16 = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+
+        with patch.object(transformer_loader.logger, "warning") as warning:
+            _warn_if_expected_param_dtype_missing(model, torch.bfloat16)
+
+        warning.assert_not_called()
+
+    def test_model_without_expected_dtype_warns(self):
+        model = torch.nn.Linear(1, 1, dtype=torch.float32)
+
+        with patch.object(transformer_loader.logger, "warning") as warning:
+            _warn_if_expected_param_dtype_missing(model, torch.bfloat16)
+
+        warning.assert_called_once()
+
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
         self.assertFalse(
@@ -232,6 +256,23 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 _make_quant_config("mxfp4_npu", is_checkpoint_mxfp4_npu_serialized=True)
             )
         )
+
+    def test_online_fp8_receives_cli_ignored_layer_patterns(self):
+        ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
+        server_args = self._make_server_args(
+            quantization="fp8",
+            quantization_ignored_layers=ignored_layers,
+        )
+
+        quant_config = _resolve_quant_config(
+            hf_config={},
+            server_args=server_args,
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+        )
+
+        self.assertIsInstance(quant_config, Fp8Config)
+        self.assertEqual(quant_config.ignored_layers, ignored_layers)
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
