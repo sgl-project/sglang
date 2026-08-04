@@ -21,6 +21,7 @@ What turns these cases red:
 """
 
 import math
+import sys
 
 import pytest
 import torch
@@ -204,3 +205,7 @@ def test_flux2_attn_vproj_fold_math():
     ref = m.to_out[0](torch.bmm(attn, m.to_v(x)))
     fast = torch.bmm(attn, F.linear(x, w)) + b
     assert _psnr(ref, fast) > 40.0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
