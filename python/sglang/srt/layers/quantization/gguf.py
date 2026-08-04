@@ -52,6 +52,7 @@ if _is_cuda:
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -213,10 +214,16 @@ def fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
         if activation == "silu":
             return silu_and_mul(x)
+        elif activation == "situ":
+            if situ_beta is None:
+                raise ValueError("SiTU requires gemm1_alpha (beta).")
+            return situ_and_mul(x, None, situ_beta, situ_linear_beta)
         elif activation == "gelu":
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
@@ -547,9 +554,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "situ",
+        ), "Only SiLU and SiTU activations are supported."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -566,6 +574,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             qweight_type=layer.w13_qweight_type.weight_type,
             qweight_type2=layer.w2_qweight_type.weight_type,
             activation=moe_runner_config.activation,
+            situ_beta=moe_runner_config.gemm1_alpha,
+            situ_linear_beta=moe_runner_config.gemm1_clamp_limit,
         )
         return StandardCombineInput(hidden_states=output)
 
