@@ -458,7 +458,7 @@ class ModelRunner:
                 join_effective_ep_size,
             )
         join_scale_process_group()
-        self.server_args.override(
+        get_context().override(
             "elastic_ep.scale_join", ep_size=join_effective_ep_size
         )
 
@@ -486,7 +486,7 @@ class ModelRunner:
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
         )
-        self.server_args.override(
+        get_context().override(
             "elastic_ep.scale_join", dp_size=join_effective_ep_size
         )
         self.dp_size = join_effective_ep_size
@@ -557,7 +557,7 @@ class ModelRunner:
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
         )
-        self.server_args.override(
+        get_context().override(
             "elastic_ep.scale_join", dp_size=join_effective_ep_size
         )
         self.dp_size = join_effective_ep_size
@@ -1937,7 +1937,7 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
         )
-        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+        get_context().override("elastic_ep.scale", dp_size=target_size)
         # update_dp_attention_post_scale only touches module-level
         # globals; self.dp_size must also be updated so direct readers
         # (DP-attention-aware kernels, DPC accounting) see fresh state.
@@ -1961,6 +1961,7 @@ class ModelRunner:
                 effective_ep_size=target_size,
                 slot_offset=effective_size,
                 slot_count=target_size - effective_size,
+                direction="grow",
             )
 
             logger.info(
@@ -1971,13 +1972,19 @@ class ModelRunner:
                 ranks_to_join,
             )
 
+    def _fail_scale(self, error: str, effective_size: int) -> None:
+        """Fail-scale helper: fail_scale + rearm EPLB + notify DPC."""
+        ElasticEPStateManager.fail_scale(error)
+        self._rearm_eplb_after_elastic_scale()
+        self._report_elastic_scale_failure(error, effective_size)
+
     def maybe_join_ep_ranks(self) -> None:
         """Admit inactive ranks for pending scale/recover operations.
 
         Diverges from upstream in three deliberate ways:
         1. Per-rank monotonic timeout (no WORLD all_reduce). WORLD may
-           include os._exit'd retirees; a Gloo/NCCL collective would
-           hang waiting for peers that will never respond.
+           include exited retirees; a Gloo/NCCL collective would hang
+           waiting for peers that will never respond.
         2. Iterates [0:effective_ep_size] (not the full max_ep_size
            slot table) so retired trailing slots don't get spuriously
            fed into try_recover_ranks.
@@ -2022,8 +2029,7 @@ class ModelRunner:
             error = (
                 f"Timed out waiting for ranks to join target EP size {pending_size}"
             )
-            ElasticEPStateManager.fail_scale(error)
-            self._report_elastic_scale_failure(error, effective_size)
+            self._fail_scale(error, effective_size)
             if self._elastic_global_rank() == 0:
                 logger.error("[Elastic EP] %s", error)
             return
@@ -2043,18 +2049,16 @@ class ModelRunner:
                         f"Requested target EP size {pending_size} does not match "
                         f"joining cohort target {cohort_target}"
                     )
-                    ElasticEPStateManager.fail_scale(error)
-                    self._report_elastic_scale_failure(error, effective_size)
+                    self._fail_scale(error, effective_size)
                     if self._elastic_global_rank() == 0:
                         logger.error("[Elastic EP] %s", error)
                     return
                 if not ElasticEPStateManager.begin_scale():
                     return
 
-        if pending_recover:
-            ranks_to_join = list(pending_recover)
-        else:
-            ranks_to_join = list(range(effective_size, pending_size))
+        ranks_to_join = list(
+            pending_recover if pending_recover else range(effective_size, pending_size)
+        )
         if not ranks_to_join:
             return
 
@@ -2084,8 +2088,7 @@ class ModelRunner:
             )
             if self._elastic_global_rank() == 0:
                 logger.exception("[Elastic EP] %s", error)
-            ElasticEPStateManager.fail_scale(error)
-            self._report_elastic_scale_failure(error, effective_size)
+            self._fail_scale(error, effective_size)
 
     def _maybe_rebalance_after_rank_fault(
         self,
@@ -2237,7 +2240,7 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=my_rank,
         )
-        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+        get_context().override("elastic_ep.scale", dp_size=target_size)
         self.dp_size = target_size
 
         # Publish authoritative random_seed via TCPStore for the joiner
@@ -2252,16 +2255,32 @@ class ModelRunner:
             log_tag="JOINER" if self.server_args.is_ep_offset_joiner else "PRIMARY",
         )
         ElasticEPStateManager.commit_scale()
+        self._rearm_eplb_after_elastic_scale()
 
         # Gate on global rank 0 (see _finalize_scale_up).
         if self._elastic_global_rank() == 0:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
+            # DPC.add_elastic_workers takes (slot_offset, slot_count) so
+            # ranks_to_recover MUST be a contiguous run. The scheduler
+            # produces contiguous suffixes today (retirement is always
+            # a contiguous suffix); assert here so any future change
+            # that allows non-contiguous retire fails loudly instead
+            # of silently mis-routing.
+            slot_offset = min(ranks_to_recover)
+            slot_count = len(ranks_to_recover)
+            assert sorted(ranks_to_recover) == list(
+                range(slot_offset, slot_offset + slot_count)
+            ), (
+                "ranks_to_recover must be a contiguous run for the "
+                "DPC add_elastic_workers(slot_offset, slot_count) API; "
+                f"got {ranks_to_recover}"
+            )
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
-                slot_offset=min(ranks_to_recover),
-                slot_count=len(ranks_to_recover),
+                slot_offset=slot_offset,
+                slot_count=slot_count,
                 direction="grow",
             )
 
@@ -2335,8 +2354,7 @@ class ModelRunner:
                 f"Timed out waiting for cohort to reach retire barrier "
                 f"(target_ep_size={pending_size})"
             )
-            ElasticEPStateManager.fail_scale(error)
-            self._report_elastic_scale_failure(error, effective_size)
+            self._fail_scale(error, effective_size)
             self._scale_down_sm = None
             if self._elastic_global_rank() == 0:
                 logger.error("[Elastic EP][retire] %s", error)
@@ -2371,8 +2389,7 @@ class ModelRunner:
 
         if sm.is_failed():
             error = sm.last_error or "unknown scale-down FSM failure"
-            ElasticEPStateManager.fail_scale(error)
-            self._report_elastic_scale_failure(error, effective_size)
+            self._fail_scale(error, effective_size)
             self._scale_down_sm = None
             return
 
@@ -2428,7 +2445,7 @@ class ModelRunner:
         if new_num_physical >= old_num_physical:
             return
 
-        self.server_args.override("elastic_ep.scale", ep_size=effective_size)
+        get_context().override("elastic_ep.scale", ep_size=effective_size)
 
         shrunk_p2l = metadata.physical_to_logical_map[:, :new_num_physical].contiguous()
 
@@ -2543,15 +2560,25 @@ class ModelRunner:
             new_dp_size=target_size,
             new_dp_rank=self._elastic_global_rank(),
         )
-        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+        get_context().override("elastic_ep.scale", dp_size=target_size)
         self.dp_size = target_size
 
         ElasticEPStateManager.mark_syncing_new_world()
+        # Drain any lingering GPU work that may still hold a Mooncake
+        # RDMA slot to a retiree before the WORLD barrier. try_retire
+        # _ranks already flipped active_ranks + refreshed EPBuffer,
+        # but a survivor batch admitted just before DRAIN could still
+        # have a tail collective enqueued on the survivor. Syncing
+        # here guarantees the barrier's mask read is authoritative
+        # and prevents rare deadlocks when the retiree's sys.exit
+        # outraces a stale survivor collective's peer wait.
+        torch.cuda.synchronize()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
             log_tag="SURVIVOR",
         )
         ElasticEPStateManager.commit_scale()
+        self._rearm_eplb_after_elastic_scale()
 
         # Gate on global rank 0 (see _finalize_scale_up).
         if self._elastic_global_rank() == 0:
@@ -2585,18 +2612,12 @@ class ModelRunner:
         mask is not yet populated."""
         rejoining_set = set(rejoining_ranks) if rejoining_ranks is not None else set()
 
-        active_cpu = None
-        try:
-            inst = ElasticEPStateManager.instance()
-            if inst is not None and inst.active_ranks_cpu is not None:
-                active_cpu = inst.active_ranks_cpu.detach().numpy()
-        except Exception as exc:
-            logger.debug(
-                "[Elastic EP] src-rank election: state manager not "
-                "available (%s); falling back to WORLD all_gather_object",
-                exc,
-            )
-            active_cpu = None
+        inst = ElasticEPStateManager.instance()
+        active_cpu = (
+            inst.active_ranks_cpu.detach().numpy()
+            if inst is not None and inst.active_ranks_cpu is not None
+            else None
+        )
 
         if active_cpu is not None:
             for global_rank in range(len(active_cpu)):
@@ -2649,7 +2670,10 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
         retire_barrier_consume(handle)
 
     def on_nixl_retire_pre(self, sm: ScaleDownStateMachine) -> None:
-        _pre_nixl_retire(sm.ranks_to_retire)
+        _pre_nixl_retire(
+            sm.ranks_to_retire,
+            my_elastic_global_rank=self._mr._elastic_global_rank(),
+        )
 
     def post_nixl_retire_barrier(self, sm: ScaleDownStateMachine):
         return nixl_retire_barrier_post(sm.ranks_to_retire)

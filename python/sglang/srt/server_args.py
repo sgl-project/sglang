@@ -8574,11 +8574,9 @@ class ServerArgs:
         """True if this joiner slots into a specific global rank
         (scale append OR recover with offset>0). Offset=0 recover is
         implicit fault recovery inside the current cohort."""
-        if self.ep_join_mode == "scale":
-            return True
-        if self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0:
-            return True
-        return False
+        return self.ep_join_mode == "scale" or (
+            self.ep_join_mode == "recover" and self.ep_join_rank_offset > 0
+        )
 
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
@@ -9574,7 +9572,13 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_offset_joiner:
+                # Offset joiners (scale-append OR recover-into-retired-slot)
+                # co-locate with the primary and would collide on the
+                # primary's dist_init_port+1 port_base; derive from
+                # server_args.port instead. Fault-recovery joiners
+                # (recover with offset=0) replace a dead primary so its
+                # port is free -- fall through to the standard derivation.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

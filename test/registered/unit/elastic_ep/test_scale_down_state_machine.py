@@ -95,7 +95,7 @@ class _RecordingDriver(ScaleDownStateMachineDriver):
         self._maybe_raise("local_cleanup")
 
     def on_exit(self, sm):
-        # Real driver never returns from this (``os._exit`` inside
+        # Real driver never returns from this (``sys.exit`` inside
         # ``ModelRunner._retire_and_exit``); the test stub just records
         # it and lets tick() complete normally.
         self.events.append("exit")

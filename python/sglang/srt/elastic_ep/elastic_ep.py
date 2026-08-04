@@ -58,6 +58,12 @@ class ElasticEPState:
     # 0->1 during the pending grow (grow-into-retired-slot). Empty
     # when the pending grow is an append-only scale-up.
     pending_recover_ranks: List[int] = field(default_factory=list)
+    # True once try_retire_ranks / try_recover_ranks / try_admit_scale_ranks
+    # has committed per-group + WORLD-backend mask flips. Signals to
+    # fail_scale that the bitmap already mirrors Mooncake ground truth
+    # and must NOT be overwritten by reset() -- otherwise SPMD view
+    # diverges from Mooncake C++ state.
+    mask_dirty: bool = False
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -77,6 +83,7 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+            self.mask_dirty = False
 
     def _set_active_bits(self, global_ranks: List[int], value: int) -> None:
         if self.active_ranks is None:
@@ -87,6 +94,7 @@ class ElasticEPState:
                 self.active_ranks[global_rank] = value
         self.snapshot_active_to_last()
         self.sync_active_to_cpu()
+        self.mask_dirty = True
 
     def activate_ranks(self, global_ranks: List[int]) -> None:
         """Flip ``active_ranks[g] = 1`` for each g in ``global_ranks``,
@@ -362,7 +370,14 @@ class ElasticEPStateManager:
         inst.last_error = error
         inst.pending_since = None
         inst.pending_recover_ranks = []
-        inst.reset()
+        # Skip reset() once per-group / WORLD-backend masks have already
+        # committed a partial flip -- the bitmap now mirrors Mooncake
+        # ground truth (retirees=0 or joiners=1). reset() would restore
+        # active_ranks[:effective_ep_size]=1 using the *pre-scale*
+        # effective_ep_size, leaving SPMD out of sync with Mooncake.
+        # See ElasticEPState.mask_dirty docstring for the invariant.
+        if not inst.mask_dirty:
+            inst.reset()
 
     @classmethod
     def fail_recovery(cls, error: str) -> None:
@@ -571,14 +586,22 @@ class _NixlRetireBarrierState:
     first_check: bool = True
 
 
-def _pre_nixl_retire(retiree_global_ranks: List[int]) -> None:
+def _pre_nixl_retire(
+    retiree_global_ranks: List[int],
+    my_elastic_global_rank: Optional[int] = None,
+) -> None:
     """Survivor-side NIXL peer disconnect before the retire barrier.
 
     Called once on DRAIN -> NIXL_RETIRE. Updates NixlEPBuffer's
     _connected_ep_size / _scale_to / _dispatch_ep_size to the new
     size so the lazy-disconnect on the next dispatch is a no-op.
     No-op on the retiree itself and when NIXL a2a is not active
-    (Mooncake a2a uses EPBuffer.update_ep_member instead)."""
+    (Mooncake a2a uses EPBuffer.update_ep_member instead).
+
+    Prefer ``my_elastic_global_rank`` (tp_rank + ep_join_rank_offset)
+    over ``torch.distributed.get_rank()``; the two coincide for
+    single-TP elastic-EP but diverge under TP > 1.
+    """
     from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
     if NixlEPBuffer._state().buffer is None:
@@ -587,7 +610,11 @@ def _pre_nixl_retire(retiree_global_ranks: List[int]) -> None:
     if not torch.distributed.is_initialized():
         return
 
-    my_rank = torch.distributed.get_rank()
+    my_rank = (
+        my_elastic_global_rank
+        if my_elastic_global_rank is not None
+        else torch.distributed.get_rank()
+    )
     if my_rank in retiree_global_ranks:
         return
 
@@ -717,9 +744,16 @@ def nixl_retire_barrier_post(
     if epoch is None:
         # Cannot derive a cohort-consistent epoch; skip the barrier so
         # the FSM falls back to its outer scale timeout (bounded failure
-        # beats indefinite epoch split). Leader rolls back ARRIVAL_KEY
-        # so the next cycle can still elect a leader.
-        if arrival == 1:
+        # beats indefinite epoch split). ARRIVAL_KEY needs a reset here
+        # because ``post`` returns None (no state -> no consume() runs
+        # -> ARRIVAL leaks forward and every subsequent cycle observes
+        # arrival >= 2, silently disabling the barrier). The elected
+        # cleaner is the arrival==1 leader (always if it bumped) or
+        # arrival==2 (earliest follower) when the leader crashed
+        # between ARRIVAL bump and CYCLE bump. All ranks are still
+        # inside ``post`` here -- no fast peer can start a new cycle
+        # yet, so ``store.set(..., "0")`` is race-safe.
+        if arrival == 1 or arrival == 2:
             _rollback_arrival_counter(
                 store, my_rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY
             )
@@ -733,12 +767,20 @@ def nixl_retire_barrier_post(
         )
         return None
 
+    prev_local_cycle_id = _last_local_nixl_retire_cycle_id
     _last_local_nixl_retire_cycle_id = epoch
     ready_key = f"sglang_nixl_retire_barrier_e{epoch}_posted"
 
     try:
         posted = int(store.add(ready_key, 1))
     except Exception as exc:
+        # Leader rollback: CYCLE_KEY and ARRIVAL_KEY were both bumped
+        # above; without rollback the next cycle sees arrival >= 2 for
+        # every rank, no leader is elected, and the barrier is silently
+        # skipped forever (the exact hazard _rollback_arrival_counter
+        # was written for). Followers cannot safely rollback ARRIVAL
+        # (see _rollback_arrival_counter docstring) -- rely on a later
+        # successful cycle's consume() to reset it.
         logger.warning(
             "[Elastic EP][retire] rank=%d TCPStore add failed for e=%d (%s); "
             "skipping NIXL retire barrier",
@@ -746,6 +788,15 @@ def nixl_retire_barrier_post(
             epoch,
             exc,
         )
+        if arrival == 1:
+            try:
+                store.add(_NIXL_RETIRE_CYCLE_KEY, -1)
+            except Exception:
+                pass
+            _rollback_arrival_counter(
+                store, my_rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY
+            )
+        _last_local_nixl_retire_cycle_id = prev_local_cycle_id
         return None
 
     logger.info(
@@ -795,14 +846,25 @@ def nixl_retire_barrier_check(
     except Exception as exc:
         logger.debug(
             "[Elastic EP][retire] rank=%d get_global_tcp_store() raised (%s) "
-            "in NIXL retire barrier check; treating as ready",
+            "in NIXL retire barrier check; retrying next tick",
             state.rank,
             exc,
         )
         store = None
     if store is None:
-        # Store went away since post; treat as ready so we don't wedge.
-        return True
+        # Store went away since post; return False so the FSM keeps
+        # ticking. Returning True here would let survivors advance
+        # past the barrier while retirees are still doing NIXL RDMA,
+        # crashing the peer state. The outer scale-timeout catches
+        # the case where the store never recovers.
+        if time.monotonic() - state.posted_at > _NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:
+            raise TimeoutError(
+                f"[Elastic EP][retire] rank={state.rank} NIXL retire "
+                f"store barrier e={state.epoch} (arrival={state.arrival})"
+                f" store unavailable for "
+                f"{_NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:.0f}s"
+            )
+        return False
 
     catch_up_window_s = (
         _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FIRST_S
@@ -1242,6 +1304,27 @@ class _RetireBarrierState:
     ready_key: str
     rank: int
     arrival: int = 0
+    # True once this rank's ready_key increment landed in the shared
+    # store. When False, retire_barrier_check skips the store fast
+    # path (this rank's count will never reach world_size, so probing
+    # is wasted work and burns the DRAIN_BARRIER_MAX_POLLS budget
+    # before falling through to handle.wait()) and goes straight to
+    # handle.is_completed() / handle.wait().
+    store_confirmed: bool = True
+    # True when the shared-store leader-election path failed and this
+    # rank fell through to the per-process epoch. Signals to consume
+    # that ARRIVAL_KEY needs a designated-cleaner reset to prevent
+    # follower-timeout leaks from permanently disabling the barrier
+    # (see :func:`_derive_shared_retire_barrier_epoch` follower path).
+    used_fallback_epoch: bool = False
+    # Set by ``retire_barrier_check`` when the store fast-path
+    # observed count >= world_size. ``retire_barrier_consume`` only
+    # swallows a ``handle.wait()`` error when this is True, because
+    # the store has independently confirmed every rank posted. If
+    # ``check`` returned True via the flaky ``handle.is_completed()``
+    # fallback (Mooncake WORLD), a subsequent wait() error is a hard
+    # failure -- we cannot swallow it.
+    check_confirmed_via_store: bool = False
 
 
 # Per-process fallback epoch counter, used only when the shared
@@ -1389,10 +1472,12 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
 
     epoch: Optional[int] = None
     arrival = 0
+    used_fallback_epoch = False
     if store is not None:
         epoch, arrival = _derive_shared_retire_barrier_epoch(store, rank)
 
     if epoch is None:
+        used_fallback_epoch = True
         _RETIRE_BARRIER_EPOCH += 1
         epoch = _RETIRE_BARRIER_EPOCH
 
@@ -1408,6 +1493,7 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
     )
 
     ready_key = _retire_barrier_ready_key(epoch)
+    store_confirmed = True
     if store is not None:
         try:
             store.add(ready_key, 1)
@@ -1420,6 +1506,9 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
                 epoch,
                 exc,
             )
+            store_confirmed = False
+    else:
+        store_confirmed = False
 
     return _RetireBarrierState(
         handle=handle,
@@ -1428,6 +1517,8 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
         ready_key=ready_key,
         rank=rank,
         arrival=arrival,
+        store_confirmed=store_confirmed,
+        used_fallback_epoch=used_fallback_epoch,
     )
 
 
@@ -1442,23 +1533,28 @@ def retire_barrier_check(
     if state is None:
         return True
 
-    try:
-        from sglang.srt.distributed.utils import get_global_tcp_store
+    # If our ready_key add faulted, the store counter can never reach
+    # world_size on this rank. Skip the store probe entirely so we
+    # don't burn DRAIN_BARRIER_MAX_POLLS on it.
+    if state.store_confirmed:
+        try:
+            from sglang.srt.distributed.utils import get_global_tcp_store
 
-        store = get_global_tcp_store()
-        if store is not None:
-            raw = store.get(state.ready_key)
-            count = int(raw.decode() if isinstance(raw, bytes) else raw)
-            if count >= state.world_size:
-                return True
-    except Exception as exc:
-        logger.debug(
-            "[Elastic EP][retire] rank=%d outer retire drain-barrier "
-            "TCPStore probe transient error (%s); falling back to "
-            "handle.is_completed()",
-            state.rank,
-            exc,
-        )
+            store = get_global_tcp_store()
+            if store is not None:
+                raw = store.get(state.ready_key)
+                count = int(raw.decode() if isinstance(raw, bytes) else raw)
+                if count >= state.world_size:
+                    state.check_confirmed_via_store = True
+                    return True
+        except Exception as exc:
+            logger.debug(
+                "[Elastic EP][retire] rank=%d outer retire drain-barrier "
+                "TCPStore probe transient error (%s); falling back to "
+                "handle.is_completed()",
+                state.rank,
+                exc,
+            )
 
     if state.handle is None:
         return True
@@ -1495,20 +1591,47 @@ def retire_barrier_consume(
             state.handle.wait()
         except Exception as exc:
             elapsed = time.monotonic() - t0
-            logger.warning(
-                "[Elastic EP][retire_barrier] rank=%d handle.wait(e=%d) "
-                "raised after %.1fs (%s); store counter already "
-                "confirmed all posts -- proceeding",
-                state.rank,
-                state.epoch,
-                elapsed,
-                exc,
-            )
+            if state.check_confirmed_via_store:
+                logger.warning(
+                    "[Elastic EP][retire_barrier] rank=%d handle.wait(e=%d) "
+                    "raised after %.1fs (%s); store counter already "
+                    "confirmed all posts -- proceeding",
+                    state.rank,
+                    state.epoch,
+                    elapsed,
+                    exc,
+                )
+            else:
+                # check() returned True via handle.is_completed() (flaky
+                # on Mooncake WORLD) without store confirmation. A
+                # wait() error here is a real hard failure -- raise so
+                # the FSM aborts the shrink cleanly instead of proceeding
+                # past a barrier that never actually completed.
+                raise RuntimeError(
+                    f"[Elastic EP][retire_barrier] rank={state.rank} "
+                    f"handle.wait(e={state.epoch}) failed after "
+                    f"{elapsed:.1f}s ({exc}); store did NOT confirm "
+                    f"barrier completion so this is a hard fault"
+                ) from exc
     # Leader-only arrival-counter reset -- letting followers reset
     # would race a fast peer's next-cycle store.add and re-elect a
     # third rank as leader on top of the peer's cycle. arrival=0
     # cycles (fallback path) never touched the store.
-    if state.arrival == 1:
+    #
+    # Fallback-path designated cleaner: when the shared-store leader
+    # election failed AND this rank was a follower (arrival >= 2),
+    # ARRIVAL_KEY is left elevated because the crashed / catch-up-
+    # timed-out leader never ran the reset. Without cleanup no future
+    # cycle can elect a leader (every store.add returns > 1) and the
+    # barrier is silently disabled for the process lifetime. All
+    # ranks on this fallback path reach ``consume`` in lockstep
+    # (handle.wait() is a WORLD barrier), so a fast peer cannot have
+    # started a new cycle between here and the reset. Elect the
+    # ``arrival == 2`` follower (unique per cycle) to run it.
+    should_reset_arrival = state.arrival == 1 or (
+        state.used_fallback_epoch and state.arrival == 2
+    )
+    if should_reset_arrival:
         try:
             from sglang.srt.distributed.utils import get_global_tcp_store
 
@@ -1517,9 +1640,9 @@ def retire_barrier_consume(
                 store.set(_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY, "0")
         except Exception as exc:
             logger.debug(
-                "[Elastic EP][retire_barrier] rank=%d (leader) TCPStore "
-                "reset failed for e=%d (%s); next cycle's arrival counter "
-                "may be stale",
+                "[Elastic EP][retire_barrier] rank=%d (leader/cleaner) "
+                "TCPStore reset failed for e=%d (%s); next cycle's "
+                "arrival counter may be stale",
                 state.rank,
                 state.epoch,
                 exc,
@@ -1534,7 +1657,7 @@ def retire_barrier_consume(
 
 
 def retiree_local_cleanup() -> None:
-    """Local CUDA quiesce, run by retirees just before os._exit(0).
+    """Local CUDA quiesce, run by retirees just before sys.exit(0).
 
     Only torch.cuda.synchronize() + empty_cache(). Deliberately does
     NOT call destroy_process_group() or tear down NIXL/Mooncake

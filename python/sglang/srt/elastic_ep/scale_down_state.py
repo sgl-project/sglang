@@ -7,7 +7,7 @@ failures retry, and observability tools can report per-tick progress.
     Survivor:  PREPARE -> DRAIN --barrier-- NIXL_RETIRE --barrier--
                FLIP_MASK -> RECONFIG -> COMPLETE
     Retiree:   PREPARE -> DRAIN --barrier-- NIXL_RETIRE --barrier--
-               FLIP_MASK -> LOCAL_CLEANUP -> EXIT (os._exit 0)
+               FLIP_MASK -> LOCAL_CLEANUP -> EXIT (sys.exit 0)
 
 Both cohort barriers (DRAIN and NIXL_RETIRE) are async because a
 blocking WORLD wait would deadlock against mlp_sync (same PG). FLIP_MASK
@@ -39,7 +39,7 @@ class ScaleDownSurvivorState(Enum):
 
 
 class ScaleDownRetireeState(Enum):
-    """Retiree lifecycle; terminal EXIT calls os._exit(0). NIXL_RETIRE
+    """Retiree lifecycle; terminal EXIT calls sys.exit(0). NIXL_RETIRE
     prevents retirees from exiting mid-RDMA op on survivors."""
 
     PREPARE = auto()

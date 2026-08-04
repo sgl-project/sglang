@@ -333,11 +333,16 @@ class DataParallelController:
         """Route grow vs. shrink completion into the right slot mutator."""
         if not msg.success:
             return
-        direction = getattr(msg, "direction", "grow")
+        direction = msg.direction
         if direction == "shrink":
             self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
-        else:
+        elif direction == "grow":
             self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+        else:
+            raise ValueError(
+                "ElasticScaleUpdateReq.direction must be 'grow' or "
+                f"'shrink'; got {direction!r}"
+            )
 
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
