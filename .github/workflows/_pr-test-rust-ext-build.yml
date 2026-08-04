@@ -26,7 +26,7 @@ on:
         type: string
         default: rust-ext-x86_64
       cache_key_prefix:
-        description: 'Cache key prefix. Callers share it on purpose so at most one of them compiles; it encodes the arch, since the modules are not portable across architectures.'
+        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch, since the modules are not portable across architectures.'
         type: string
         default: rust-ext-x86_64
       max_glibc:
@@ -42,7 +42,7 @@ on:
         default: false
     outputs:
       artifact_name:
-        description: 'Artifact holding the built modules. Empty when the build did not run or failed; stages then compile them during install.'
+        description: 'Artifact holding the built modules. Empty when the build was skipped or failed; consumers that still run compile them during install.'
         value: ${{ jobs.build.outputs.artifact_name }}
 
 # Reusable workflows do not inherit the caller's env; mirror what
