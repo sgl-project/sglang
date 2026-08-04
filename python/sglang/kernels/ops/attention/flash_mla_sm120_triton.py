@@ -59,10 +59,19 @@ def _e4m3_scaled(b, sc):
     """
     e = (b >> 3) & 0xF
     m = b & 0x7
-    v = (((e + sc - 7) << 23) | (m << 20)).to(tl.float32, bitcast=True)
+    # Clamp the assembled exponent to the finite float32 range: garbage scale
+    # bytes (e.g. from a masked/never-written slot) would otherwise assemble
+    # exponent <= 0 (sign-bit garbage) or >= 255 (inf/NaN). The true value in
+    # both regimes underflows/overflows anyway, and masked lanes are zeroed by
+    # the caller, so clamping is exact for all reachable inputs.
+    exp_n = tl.minimum(tl.maximum(e + sc - 7, 1), 254)
+    v = ((exp_n << 23) | (m << 20)).to(tl.float32, bitcast=True)
     # Subnormal: m * 2^(sc-136). Exponent field is sc-136+127 = sc-9; build that
-    # power of two and scale it by m.
-    sub = m.to(tl.float32) * ((sc - 9) << 23).to(tl.float32, bitcast=True)
+    # power of two and scale it by m. For sc <= 9 the true value underflows to
+    # zero; clamp instead of assembling a garbage exponent.
+    exp_s = tl.minimum(tl.maximum(sc - 9, 0), 254)
+    sub = m.to(tl.float32) * (exp_s << 23).to(tl.float32, bitcast=True)
+    sub = tl.where(sc <= 9, 0.0, sub)
     v = tl.where(e == 0, sub, v)
     return tl.where((b >> 7) & 1 == 1, -v, v)
 
@@ -234,13 +243,18 @@ def _tiled_sparse_decode_kernel_mh(
         # per-token base and the 576-byte stride are multiples of 4, so the
         # alignment holds.
         w_ptrs = cache_i32_ptr + (token_data_bases // 4)
-        kv_w = tl.load(w_ptrs[:, None] + w_offs[None, :])  # [BLOCK_T, 128] int32
+        kv_w = tl.load(
+            w_ptrs[:, None] + w_offs[None, :], mask=idx_valid[:, None], other=0
+        )  # [BLOCK_T, 128] int32
         # Zero the tail past NOPE_DIM_RT on the packed word instead of on the four
         # decoded slices: one select replaces four. A zero byte decodes through the
         # subnormal branch to exactly 0.0, so this is not an approximation -- and it
         # must stay a mask rather than be dropped, because the bytes past the nope
         # section are rope bf16 reinterpreted as E4M3 and can decode to inf, which
-        # would turn a 0 * inf product into NaN.
+        # would turn a 0 * inf product into NaN. The row mask above matters for the
+        # same reason: invalid lanes are clamped to slot 0, and if that slot was
+        # never written the garbage bytes can decode to inf/NaN, which p=0 cannot
+        # cancel in the PV dot (0 * inf = NaN).
         kv_w = tl.where((w_offs < (NOPE_DIM_RT // 4))[None, :], kv_w, 0)
         b0 = kv_w & 0xFF
         b1 = (kv_w >> 8) & 0xFF
@@ -256,7 +270,9 @@ def _tiled_sparse_decode_kernel_mh(
         # broadcasting cuts that to a sixteenth.
         # The broadcast expands [BLOCK_T, 8] -> [BLOCK_T, 8, 16] -> [BLOCK_T, 128].
         s8 = tl.load(
-            scale_base_ptrs[:, None] + tl.arange(0, 8)[None, :]
+            scale_base_ptrs[:, None] + tl.arange(0, 8)[None, :],
+            mask=idx_valid[:, None],
+            other=127,
         )  # [BLOCK_T, 8]
         scale_raw = tl.reshape(
             tl.broadcast_to(s8[:, :, None], (BLOCK_T, 8, NOPE_PAD // 4 // 8)),
@@ -276,7 +292,11 @@ def _tiled_sparse_decode_kernel_mh(
         kv3 = _e4m3_scaled(b3, sc_i).to(tl.bfloat16)
 
         rope_base_ptrs = cache_bf16_ptr + ((token_data_bases + 448) // 2)
-        kv_rope = tl.load(rope_base_ptrs[:, None] + rope_offs[None, :])
+        kv_rope = tl.load(
+            rope_base_ptrs[:, None] + rope_offs[None, :],
+            mask=idx_valid[:, None],
+            other=0.0,
+        )
 
         # ---- QK: [BLOCK_H, BLOCK_T], 4 nope slices plus 1 rope slice ----
         scores = tl.dot(q_n0, tl.trans(kv0))
