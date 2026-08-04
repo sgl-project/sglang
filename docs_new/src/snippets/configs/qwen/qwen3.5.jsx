@@ -112,9 +112,9 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} \\
   --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} \\
-  --max-concurrency {{MAX_CONCURRENCY}} \\
-  --request-rate inf`,
+  --random-range-ratio 1.0 \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# Run from the sglang repo root
@@ -123,7 +123,7 @@ python3 benchmark/gsm8k/bench_sglang.py --port {{CURL_PORT}}`,
 `# Run from the sglang repo root
 python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port {{CURL_PORT}} --max-new-tokens 512`,
     },
-    numPromptsByConc: { 1: 10, 100: 1000 },
+    numPromptsByConc: { 1: 8, 16: 64, 1024: 2048, 4096: 8192 },
   },
 
   // The page's measured evals are GSM8K + MMMU (vision) — not the engine's
