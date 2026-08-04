@@ -16,7 +16,8 @@ export const config = {
     { id: "fp8", label: "FP8" },
   ],
   strategies: [
-    { id: "balanced", label: "Balanced" },
+    { id: "low-latency", label: "Low-Latency" },
+    { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
     { id: "single", label: "Single Node" },
@@ -95,7 +96,7 @@ sgl-eval run gsm8k \\
 
   cells: [
     {
-      match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -109,7 +110,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -123,7 +124,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h800", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h800", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -137,7 +138,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -151,7 +152,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -165,7 +166,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -179,7 +180,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -193,7 +194,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -207,7 +208,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -221,7 +222,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -229,6 +230,136 @@ sgl-eval run gsm8k \\
         "--tp 4",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h800", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
