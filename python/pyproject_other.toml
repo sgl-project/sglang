@@ -30,7 +30,7 @@ runtime_common = [
   "einops",
   "fastapi",
   "gguf",
-  "helion==0.2.6",
+  "helion==1.4",
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",
