@@ -8,6 +8,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.moe.moe_align import moe_align_block_size
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+    moe_align_block_size as runtime_moe_align_block_size,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -357,6 +360,43 @@ def test_moe_align_block_size_v2_large_num_experts(
             f"Block {b} sorted_ids mismatch for num_experts={num_experts}, "
             f"num_tokens={num_tokens}"
         )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,topk,num_experts,with_invalid_routes",
+    [
+        (128, 2, 32, False),
+        (4097, 16, 128, False),
+        (2048, 8, 128, True),
+    ],
+)
+def test_runtime_moe_align_block_size_deterministic(
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    with_invalid_routes: bool,
+):
+    torch.manual_seed(42)
+    topk_ids = torch.topk(
+        torch.randn(num_tokens, num_experts, device="cuda"), topk, dim=-1
+    ).indices.to(torch.int32)
+    if with_invalid_routes:
+        topk_ids[:, topk // 2 :] = -1
+
+    results = [
+        runtime_moe_align_block_size(
+            topk_ids,
+            block_size=64,
+            num_experts=num_experts,
+            deterministic=True,
+        )
+        for _ in range(20)
+    ]
+    torch.cuda.synchronize()
+
+    for result in results[1:]:
+        for expected, actual in zip(results[0], result):
+            assert torch.equal(expected, actual)
 
 
 if __name__ == "__main__":
