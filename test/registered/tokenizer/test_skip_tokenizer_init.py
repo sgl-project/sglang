@@ -91,9 +91,13 @@ class TestSkipTokenizerInit(CustomTestCase):
                 self.assertEqual(item["meta_info"]["prompt_tokens"], len(input_ids))
 
                 if return_logprob:
-                    num_input_logprobs = len(input_ids) - request["logprob_start_len"]
-                    if num_input_logprobs > len(input_ids):
-                        num_input_logprobs -= len(input_ids)
+                    # -1 resolves to the prompt end, so no input logprob is returned.
+                    if request["logprob_start_len"] == -1:
+                        num_input_logprobs = 0
+                    else:
+                        num_input_logprobs = (
+                            len(input_ids) - request["logprob_start_len"]
+                        )
                     self.assertEqual(
                         len(item["meta_info"]["input_token_logprobs"]),
                         num_input_logprobs,
