@@ -1187,6 +1187,106 @@ async def _await_realtime_task(task: asyncio.Task | None) -> None:
         logger.debug("realtime task exited with error: %s", e)
 
 
+async def _refresh_latest_queued_controls(
+    session: GenerateSession,
+    event_kind: str,
+    event_id: int | None,
+) -> None:
+    chunk = session.latest_active_chunk
+    if chunk is None or session.adapter is None:
+        return
+    current_batch = session.active_batches.get(chunk.index)
+    if current_batch is None:
+        return
+    replacement = session.adapter.refresh_queued_request(
+        session,
+        get_global_server_args(),
+        chunk,
+        current_batch,
+        event_kind,
+    )
+    if replacement is None:
+        return
+    try:
+        output = await asyncio.wait_for(
+            async_scheduler_client.forward(
+                ReplaceQueuedRealtimeReq(
+                    session_id=session.id,
+                    generation_id=session.generation_id,
+                    chunk_index=chunk.index,
+                    request_id=chunk.request_id,
+                    replacement=replacement,
+                )
+            ),
+            timeout=_REALTIME_CONTROL_REFRESH_TIMEOUT_S,
+        )
+    except TimeoutError:
+        output = OutputBatch(
+            output={
+                "replaced": False,
+                "buffered": False,
+                "too_late": False,
+                "invalid": False,
+                "timeout": True,
+            }
+        )
+    result = output.output if isinstance(output, OutputBatch) else None
+    result = result if isinstance(result, dict) else {}
+    replaced = bool(result.get("replaced"))
+    buffered = bool(result.get("buffered"))
+    if (
+        (replaced or buffered)
+        and session.active_chunks.get(chunk.index) == chunk
+        and session.active_batches.get(chunk.index) is current_batch
+    ):
+        session.active_batches[chunk.index] = replacement
+    log_realtime_trace(
+        logger,
+        session,
+        "server.queued_controls_refresh",
+        request_id=chunk.request_id,
+        chunk_index=chunk.index,
+        event_id=event_id,
+        kind=event_kind,
+        replaced=replaced,
+        buffered=buffered,
+        too_late=bool(result.get("too_late")),
+        invalid=bool(result.get("invalid")),
+        timeout=bool(result.get("timeout")),
+    )
+
+
+async def _drain_queued_control_refreshes(session: GenerateSession) -> None:
+    while session.pending_control_refresh is not None:
+        event_kind, event_id = session.pending_control_refresh
+        session.pending_control_refresh = None
+        try:
+            await _refresh_latest_queued_controls(session, event_kind, event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "failed to refresh queued realtime controls, session_id=%s, "
+                "event_id=%s, error=%s",
+                session.id,
+                event_id,
+                exc,
+            )
+
+
+def _schedule_queued_control_refresh(
+    session: GenerateSession,
+    event_kind: str,
+    event_id: int | None,
+) -> None:
+    session.pending_control_refresh = (event_kind, event_id)
+    task = session.control_refresh_task
+    if task is None or task.done():
+        session.control_refresh_task = asyncio.create_task(
+            _drain_queued_control_refreshes(session)
+        )
+
+
 async def _listen_events(ws: WebSocket, session: GenerateSession):
     """listen for user events: usually condition inputs"""
     async for message in ws.iter_bytes():
@@ -1220,76 +1320,9 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             event_log = session.adapter.ingest_event(session, realtime_event)
             session.mark_event_version(realtime_event.kind)
             session.mark_client_activity()
-            chunk = session.latest_active_chunk
-            if chunk is not None:
-                current_batch = session.active_batches.get(chunk.index)
-                if current_batch is not None:
-                    replacement = session.adapter.refresh_queued_request(
-                        session,
-                        get_global_server_args(),
-                        chunk,
-                        current_batch,
-                        realtime_event.kind,
-                    )
-                    if replacement is not None:
-                        try:
-                            output = await asyncio.wait_for(
-                                async_scheduler_client.forward(
-                                    ReplaceQueuedRealtimeReq(
-                                        session_id=session.id,
-                                        generation_id=session.generation_id,
-                                        chunk_index=chunk.index,
-                                        request_id=chunk.request_id,
-                                        replacement=replacement,
-                                    )
-                                ),
-                                timeout=_REALTIME_CONTROL_REFRESH_TIMEOUT_S,
-                            )
-                        except TimeoutError:
-                            output = OutputBatch(
-                                output={
-                                    "replaced": False,
-                                    "buffered": False,
-                                    "too_late": False,
-                                    "invalid": False,
-                                    "timeout": True,
-                                }
-                            )
-                        replaced = bool(
-                            isinstance(output, OutputBatch)
-                            and isinstance(output.output, dict)
-                            and output.output.get("replaced")
-                        )
-                        buffered = bool(
-                            isinstance(output, OutputBatch)
-                            and isinstance(output.output, dict)
-                            and output.output.get("buffered")
-                        )
-                        too_late = bool(
-                            isinstance(output, OutputBatch)
-                            and isinstance(output.output, dict)
-                            and output.output.get("too_late")
-                        )
-                        invalid = bool(
-                            isinstance(output, OutputBatch)
-                            and isinstance(output.output, dict)
-                            and output.output.get("invalid")
-                        )
-                        if replaced or buffered:
-                            session.active_batches[chunk.index] = replacement
-                        log_realtime_trace(
-                            logger,
-                            session,
-                            "server.queued_controls_refresh",
-                            request_id=chunk.request_id,
-                            chunk_index=chunk.index,
-                            event_id=realtime_event.event_id,
-                            kind=realtime_event.kind,
-                            replaced=replaced,
-                            buffered=buffered,
-                            too_late=too_late,
-                            invalid=invalid,
-                        )
+            _schedule_queued_control_refresh(
+                session, realtime_event.kind, realtime_event.event_id
+            )
             log_realtime_trace(
                 logger,
                 session,
@@ -1424,10 +1457,11 @@ async def _cleanup_realtime_session(
 ) -> None:
     log_realtime_trace(logger, session, "server.session_cleanup_start")
     logger.info("terminating session, session_id=%s", session.id)
-    for task in (generate_task, listen_task):
+    refresh_task = session.control_refresh_task
+    for task in (generate_task, listen_task, refresh_task):
         if task and not task.done():
             task.cancel()
-    for task in (generate_task, listen_task):
+    for task in (generate_task, listen_task, refresh_task):
         if task is None:
             continue
         await _await_realtime_task(task)

@@ -67,6 +67,8 @@ class GenerateSession:
         self.output_pace_next_send_at: float | None = None
         self.output_pace_last_event_id: int | None = None
         self.vae_client: Any = None
+        self.pending_control_refresh: tuple[str, int | None] | None = None
+        self.control_refresh_task: Any = None
 
     def set_adapter(self, adapter: BaseRealtimeModelAdapter):
         self.adapter = adapter
@@ -96,6 +98,8 @@ class GenerateSession:
         self.output_pace_next_send_at = None
         self.output_pace_last_event_id = None
         self.vae_client = None
+        self.pending_control_refresh = None
+        self.control_refresh_task = None
         self.denoise_intervals.clear()
         self.vae_intervals.clear()
         self.realtime_session.dispose()

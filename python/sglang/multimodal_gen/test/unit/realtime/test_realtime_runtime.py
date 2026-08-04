@@ -768,6 +768,91 @@ def test_generate_session_targets_latest_active_chunk_for_control_refresh():
     assert session.latest_active_chunk == second
 
 
+def test_event_listener_ingests_new_controls_while_scheduler_refresh_is_pending(
+    monkeypatch,
+):
+    asyncio.run(_assert_event_listener_does_not_block_on_scheduler_refresh(monkeypatch))
+
+
+async def _assert_event_listener_does_not_block_on_scheduler_refresh(monkeypatch):
+    second_ingested = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class BlockingSchedulerClient:
+        async def forward(self, request):
+            del request
+            await release_refresh.wait()
+            return OutputBatch(
+                output={
+                    "replaced": False,
+                    "buffered": False,
+                    "too_late": True,
+                    "invalid": False,
+                }
+            )
+
+    class Adapter:
+        def __init__(self):
+            self.event_ids = []
+
+        def ingest_event(self, session, event):
+            del session
+            self.event_ids.append(event.event_id)
+            if len(self.event_ids) == 2:
+                second_ingested.set()
+            return "camera state updated"
+
+        def refresh_queued_request(
+            self, session, server_args, chunk, batch, event_kind
+        ):
+            del session, server_args, chunk, event_kind
+            return copy(batch)
+
+    class WebSocket:
+        async def iter_bytes(self):
+            for event_id in (1, 2):
+                yield msgspec.msgpack.encode(
+                    {
+                        "type": "event",
+                        "kind": "camera_actions",
+                        "event_id": event_id,
+                        "payload": {
+                            "mode": "state",
+                            "transitions": [{"actions": ["w"]}],
+                        },
+                    }
+                )
+
+    session = GenerateSession()
+    adapter = Adapter()
+    session.adapter = adapter
+    chunk = session.new_chunk()
+    batch = SimpleNamespace(
+        condition_inputs={},
+        realtime_chunk_size=4,
+        realtime_action_version=0,
+        realtime_prompt_version=0,
+    )
+    session.bind_chunk_request(chunk, batch)
+    monkeypatch.setattr(
+        realtime_video_api, "async_scheduler_client", BlockingSchedulerClient()
+    )
+    monkeypatch.setattr(
+        realtime_video_api, "get_global_server_args", lambda: SimpleNamespace()
+    )
+
+    listen_task = asyncio.create_task(realtime_video_api._listen_events(WebSocket(), session))
+    try:
+        await asyncio.wait_for(second_ingested.wait(), timeout=0.1)
+        assert adapter.event_ids == [1, 2]
+    finally:
+        release_refresh.set()
+        await asyncio.wait_for(listen_task, timeout=1.0)
+        refresh_task = getattr(session, "control_refresh_task", None)
+        if refresh_task is not None:
+            await asyncio.wait_for(refresh_task, timeout=1.0)
+
+
 def test_scheduler_attaches_actual_realtime_metadata_to_output():
     request = Req.__new__(Req)
     request.realtime_session_id = "session-1"
