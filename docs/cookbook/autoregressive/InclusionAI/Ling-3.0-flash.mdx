@@ -58,7 +58,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
 - The chat template enables thinking by default. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}`; to disable it server-wide, launch with `--default-chat-template-kwargs '{"enable_thinking":false}'` (see §3.1).
 - The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
-- Native context is 128K. The recipes set `--context-length 262144` and apply YaRN with factor 2.0 to extend it to 256K.
+- Native context is 128K. The recipes set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` to acknowledge the longer context explicitly, then use `--context-length 262144` and YaRN with factor 2.0 to extend it to 256K.
 
 ## 3. Advanced Usage
 

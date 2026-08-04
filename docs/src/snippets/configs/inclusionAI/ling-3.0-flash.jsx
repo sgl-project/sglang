@@ -99,7 +99,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -113,7 +113,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -127,7 +127,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -141,7 +141,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -155,7 +155,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -169,7 +169,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -183,7 +183,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -197,7 +197,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -211,7 +211,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -225,7 +225,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -239,7 +239,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -252,7 +252,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -265,7 +265,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -278,7 +278,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
@@ -291,7 +291,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -304,7 +304,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -317,7 +317,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -330,7 +330,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h800", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -343,7 +343,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
@@ -356,7 +356,7 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
