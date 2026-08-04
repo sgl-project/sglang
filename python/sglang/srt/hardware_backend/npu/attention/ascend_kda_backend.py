@@ -10,10 +10,6 @@ from sglang.srt.hardware_backend.npu.kernels.kda_target_verify import (
     kda_target_verify_npu,
 )
 from sglang.srt.hardware_backend.npu.kernels.kda_gate import fused_kda_gate_npu
-from sglang.srt.hardware_backend.npu.k3_graph_row_trace import (
-    capture_graph_exact_rows,
-    capture_graph_row_stats,
-)
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
@@ -144,40 +140,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
-        active_cache_indices = cache_indices[:batch_size]
-        capture_graph_exact_rows(
-            forward_batch=forward_batch,
-            layer_id=layer.layer_id,
-            stage="mamba_indices",
-            tensor=active_cache_indices,
-            row_dim=0,
-            row_kind="request",
-        )
-        # Graph capture pads inactive request slots with cache index -1.
-        # Trace buffers keep the padded shape but are trimmed to raw_bs when
-        # dumped, so redirect only ignored padding reads to slot zero.  Real
-        # request indices and the model's cache path remain unchanged.
-        trace_cache_indices = active_cache_indices.clamp_min(0).to(torch.int64)
-        capture_graph_row_stats(
-            forward_batch=forward_batch,
-            layer_id=layer.layer_id,
-            stage="ssm_state_read",
-            tensor=cache.temporal.index_select(
-                0, trace_cache_indices
-            ),
-            row_dim=0,
-            row_kind="request",
-        )
-        capture_graph_row_stats(
-            forward_batch=forward_batch,
-            layer_id=layer.layer_id,
-            stage="conv_state_read",
-            tensor=cache.conv[0].index_select(
-                0, trace_cache_indices
-            ),
-            row_dim=0,
-            row_kind="request",
-        )
         processed_qkv = causal_conv1d_linear_verify_npu(
             dense_qkv.transpose(1, 2).contiguous(),
             cache.conv[0],
@@ -199,25 +161,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        for stage, value in (("kda_q", q), ("kda_k", k), ("kda_v", v)):
-            capture_graph_row_stats(
-                forward_batch=forward_batch,
-                layer_id=layer.layer_id,
-                stage=stage,
-                tensor=value,
-                row_dim=1,
-                row_kind="dense_verify",
-            )
-        for stage, value in (("kda_a", dense_a), ("kda_b", dense_b)):
-            capture_graph_row_stats(
-                forward_batch=forward_batch,
-                layer_id=layer.layer_id,
-                stage=stage,
-                tensor=value,
-                row_dim=(1 if value.ndim > 1 and value.shape[0] == 1 else 0),
-                row_kind="dense_verify",
-            )
-
         # Match the proven 0728 target-verify contract exactly: activate the
         # forget gate and beta in FP32 before entering the recurrent kernel.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
@@ -229,19 +172,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             lower_bound=layer.lower_bound,
         )
         preactivated_b = dense_b.float().sigmoid()
-        for stage, value in (
-            ("kda_a_preactivated", preactivated_a),
-            ("kda_b_preactivated", preactivated_b),
-        ):
-            capture_graph_row_stats(
-                forward_batch=forward_batch,
-                layer_id=layer.layer_id,
-                stage=stage,
-                tensor=value,
-                row_dim=(1 if value.ndim > 1 and value.shape[0] == 1 else 0),
-                row_kind="dense_verify",
-            )
-
         out = kda_target_verify_npu(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
@@ -257,14 +187,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             cache_steps=draft_token_num,
             lower_bound=None,
             gates_are_preactivated=True,
-        )
-        capture_graph_row_stats(
-            forward_batch=forward_batch,
-            layer_id=layer.layer_id,
-            stage="kda_output",
-            tensor=out,
-            row_dim=1,
-            row_kind="dense_verify",
         )
         if dense_token_indices is None:
             return out

@@ -1,5 +1,4 @@
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Optional
@@ -668,14 +667,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
-        self._trace_verify_accept_rows(
-            batch=batch,
-            verify_ids_2d=verify_ids_2d,
-            draft_tokens=draft_tokens,
-            target_logits=logits_output.next_token_logits,
-            layout=layout,
-            accept=accept,
-        )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -744,131 +735,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
 
-    def _trace_verify_accept_rows(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_ids_2d: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        target_logits: torch.Tensor,
-        layout,
-        accept,
-    ) -> None:
-        """Map every draft/accepted token to its predictor verify row."""
-        marker = os.environ.get(
-            "SGLANG_K3_TRACE_HIDDEN_FILE"
-        ) or os.environ.get("SGLANG_K3_TRACE_STATE_FILE")
-        if not marker or not os.path.exists(marker) or self.ps.tp_rank != 0:
-            return
-
-        replay_id = int(getattr(self, "_k3_verify_accept_trace_id", 0))
-        self._k3_verify_accept_trace_id = replay_id + 1
-        rank = (
-            int(torch.distributed.get_rank())
-            if torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            else 0
-        )
-
-        try:
-            bs = int(verify_ids_2d.shape[0])
-            stride = int(verify_ids_2d.shape[1])
-            if layout is None:
-                verify_lens = [stride] * bs
-            else:
-                verify_lens = layout.verify_lens[:bs].detach().cpu().tolist()
-
-            verify_ids = verify_ids_2d.detach().cpu().tolist()
-            draft_ids = draft_tokens.detach().cpu().tolist()
-            target_top1 = (
-                target_logits.detach().float().argmax(dim=-1).reshape(-1).cpu().tolist()
-            )
-            correct_lens = accept.correct_len.detach().cpu().tolist()
-            bonus_ids = accept.bonus.detach().cpu().tolist()
-            commit_lens = accept.commit_lens.detach().cpu().tolist()
-            out_tokens = accept.out_tokens.detach().cpu().tolist()
-            req_pool_indices = batch.req_pool_indices[:bs].detach().cpu().tolist()
-
-            compact_starts = []
-            cursor = 0
-            for verify_len in verify_lens:
-                compact_starts.append(cursor)
-                cursor += int(verify_len)
-
-            for req_row in range(bs):
-                verify_len = int(verify_lens[req_row])
-                compact_start = compact_starts[req_row]
-                candidates = []
-                for candidate_idx, token_id in enumerate(draft_ids[req_row]):
-                    predictor_step = candidate_idx
-                    if predictor_step >= verify_len:
-                        break
-                    compact_row = compact_start + predictor_step
-                    candidates.append(
-                        {
-                            "candidate_index": candidate_idx,
-                            "token_id": int(token_id),
-                            "predictor_verify_step": predictor_step,
-                            "predictor_compact_row": compact_row,
-                            "predictor_dense_row": req_row * stride + predictor_step,
-                            "candidate_input_verify_step": (
-                                candidate_idx + 1
-                                if candidate_idx + 1 < verify_len
-                                else None
-                            ),
-                            "target_top1": (
-                                int(target_top1[compact_row])
-                                if compact_row < len(target_top1)
-                                else None
-                            ),
-                        }
-                    )
-
-                accepted = []
-                commit_len = int(commit_lens[req_row])
-                correct_len = int(correct_lens[req_row])
-                for output_index in range(commit_len):
-                    predictor_step = output_index
-                    compact_row = compact_start + predictor_step
-                    accepted.append(
-                        {
-                            "output_index": output_index,
-                            "token_id": int(out_tokens[req_row][output_index]),
-                            "source": (
-                                "draft" if output_index < correct_len else "bonus"
-                            ),
-                            "predictor_verify_step": predictor_step,
-                            "predictor_compact_row": (
-                                compact_row if predictor_step < verify_len else None
-                            ),
-                            "predictor_dense_row": (
-                                req_row * stride + predictor_step
-                                if predictor_step < verify_len
-                                else None
-                            ),
-                        }
-                    )
-
-                logger.warning(
-                    "K3_VERIFY_ACCEPT_ROW_TRACE rank=%d replay_id=%d req_row=%d "
-                    "req_pool_index=%d "
-                    "verify_len=%d verify_input_ids=%s correct_len=%d "
-                    "commit_len=%d bonus_id=%d candidates=%s accepted=%s",
-                    rank,
-                    replay_id,
-                    req_row,
-                    int(req_pool_indices[req_row]),
-                    verify_len,
-                    verify_ids[req_row][:verify_len],
-                    correct_len,
-                    commit_len,
-                    int(bonus_ids[req_row]),
-                    candidates,
-                    accepted,
-                )
-        except Exception:
-            logger.warning("K3 verify accept-row trace failed", exc_info=True)
-
     def _commit_target_mamba_states_after_verify(
         self,
         *,
@@ -889,20 +755,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
-
-        trace_marker = os.environ.get(
-            "SGLANG_K3_TRACE_STATE_FILE"
-        ) or os.environ.get("SGLANG_K3_TRACE_HIDDEN_FILE")
-        if trace_marker and os.path.exists(trace_marker) and self.gpu_id == 0:
-            logger.warning(
-                "K3_STATE_TRACE stage=verify_commit_meta req_pool_indices=%s "
-                "seq_lens_pre=%s seq_lens_post=%s commit_lens=%s last_steps=%s",
-                batch.req_pool_indices.detach().cpu().tolist(),
-                seq_lens_pre_verify.detach().cpu().tolist(),
-                seq_lens_post_verify.detach().cpu().tolist(),
-                commit_lens.detach().cpu().tolist(),
-                last_correct_step_indices.detach().cpu().tolist(),
-            )
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = get_exec().mamba.mamba_track_interval

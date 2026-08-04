@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -126,210 +125,6 @@ _k3_shared_experts_attn_tp = get_bool_env_var(
     "SGLANG_K3_SHARED_EXPERTS_ATTN_TP"
 )
 _k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
-
-
-def _capture_graph_row_state(
-    layer_id: int,
-    stage: str,
-    value: Optional[torch.Tensor],
-    forward_batch: Optional[ForwardBatch],
-    *,
-    row_dim: int = 0,
-    row_kind: str = "token",
-) -> None:
-    """Register a device-side per-row result during target-verify capture."""
-    if forward_batch is None or value is None:
-        return
-    from sglang.srt.hardware_backend.npu.k3_graph_row_trace import (
-        capture_graph_row_stats,
-    )
-
-    row_start = 0
-    if row_kind == "token" and row_dim == 0:
-        input_ids = getattr(forward_batch, "input_ids", None)
-        total_rows = int(input_ids.shape[0]) if input_ids is not None else 0
-        local_rows = int(value.shape[0]) if value.ndim > 0 else 1
-        group = get_parallel().attn_tp_group
-        if (
-            0 < local_rows < total_rows
-            and total_rows % group.world_size == 0
-            and local_rows == total_rows // group.world_size
-        ):
-            row_start = group.rank_in_group * local_rows
-    capture_graph_row_stats(
-        forward_batch=forward_batch,
-        layer_id=layer_id,
-        stage=stage,
-        tensor=value,
-        row_dim=row_dim,
-        row_kind=row_kind,
-        row_start=row_start,
-    )
-
-
-def _trace_hidden_state(
-    layer_id: int,
-    stage: str,
-    hidden_states: torch.Tensor,
-    forward_batch: Optional[ForwardBatch] = None,
-    positions: Optional[torch.Tensor] = None,
-) -> None:
-    """Capture graph-replay rows and emit eager per-row checksums.
-
-    The marker file lets operators enable tracing only after server warmup.  All
-    attention-TP ranks participate so token-sharded tensors are comparable with
-    the 0728 implementation, while only the group leader writes a log line.  A
-    single checksum over the whole verify batch can hide row-selection bugs, so
-    retain one abs/signed/squared checksum per token row.  The graph capture
-    path registers a small device result unconditionally when
-    SGLANG_K3_GRAPH_ROW_TRACE=1; the replay runner logs it later.
-    """
-    _capture_graph_row_state(
-        layer_id,
-        stage,
-        hidden_states,
-        forward_batch,
-        row_dim=0,
-        row_kind="token",
-    )
-    marker = os.environ.get("SGLANG_K3_TRACE_HIDDEN_FILE")
-    if not marker or not os.path.exists(marker):
-        return
-
-    with torch.no_grad():
-        value = hidden_states.detach().float()
-        row_count = value.shape[0] if value.ndim > 1 else 1
-        if value.numel() == 0 or row_count == 0:
-            group = get_parallel().attn_tp_group
-            if group.rank_in_group == 0:
-                logger.warning(
-                    "K3_HIDDEN_ROW_TRACE layer_id=%d stage=%s mode=%s "
-                    "shape=%s empty_rows=True",
-                    layer_id,
-                    stage,
-                    (
-                        getattr(
-                            forward_batch.forward_mode,
-                            "name",
-                            str(forward_batch.forward_mode),
-                        )
-                        if forward_batch is not None
-                        else None
-                    ),
-                    tuple(hidden_states.shape),
-                )
-            return
-        flat = value.reshape(row_count, -1)
-        row_stats = torch.stack(
-            (
-                flat.abs().sum(dim=-1),
-                flat.sum(dim=-1),
-                (flat * flat).sum(dim=-1),
-            )
-        )
-        group = get_parallel().attn_tp_group
-        row_stats = group.all_reduce(row_stats)
-        if group.rank_in_group == 0:
-            mode = None
-            seq_lens = None
-            if forward_batch is not None:
-                mode = getattr(
-                    forward_batch.forward_mode,
-                    "name",
-                    str(forward_batch.forward_mode),
-                )
-                seq_lens_value = getattr(forward_batch, "seq_lens", None)
-                if seq_lens_value is not None:
-                    seq_lens = seq_lens_value.detach().cpu().tolist()
-            position_values = (
-                positions.detach().cpu().tolist() if positions is not None else None
-            )
-            logger.warning(
-                "K3_HIDDEN_ROW_TRACE layer_id=%d stage=%s mode=%s shape=%s "
-                "positions=%s seq_lens=%s row_abs=%s row_sum=%s row_sq=%s",
-                layer_id,
-                stage,
-                mode,
-                tuple(hidden_states.shape),
-                position_values,
-                seq_lens,
-                row_stats[0].cpu().tolist(),
-                row_stats[1].cpu().tolist(),
-                row_stats[2].cpu().tolist(),
-            )
-
-
-def _trace_forward_input(
-    input_ids: Optional[torch.Tensor],
-    positions: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-) -> None:
-    """Log the exact token/position mapping for an eager trace request."""
-    marker = os.environ.get("SGLANG_K3_TRACE_HIDDEN_FILE")
-    if not marker or not os.path.exists(marker):
-        return
-    group = get_parallel().attn_tp_group
-    if group.rank_in_group != 0:
-        return
-    seq_lens = getattr(forward_batch, "seq_lens", None)
-    seq_lens = seq_lens.detach().cpu().tolist() if seq_lens is not None else None
-    spec_info = getattr(forward_batch, "spec_info", None)
-    input_id_values = (
-        input_ids.detach().cpu().tolist() if input_ids is not None else None
-    )
-    position_values = (
-        positions.detach().cpu().tolist() if positions is not None else None
-    )
-    logger.warning(
-        "K3_FORWARD_ROW_TRACE mode=%s input_ids=%s positions=%s seq_lens=%s "
-        "draft_token_num=%s ragged_verify=%s",
-        getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
-        input_id_values,
-        position_values,
-        seq_lens,
-        getattr(spec_info, "draft_token_num", None),
-        getattr(spec_info, "ragged_verify_layout", None) is not None,
-    )
-
-
-def _trace_logits(logits: Optional[torch.Tensor], forward_batch: ForwardBatch) -> None:
-    """Log per-row top logits after LM-head row selection."""
-    marker = os.environ.get("SGLANG_K3_TRACE_HIDDEN_FILE")
-    if logits is None or not marker or not os.path.exists(marker):
-        return
-    group = get_parallel().attn_tp_group
-    if group.rank_in_group != 0:
-        return
-    with torch.no_grad():
-        values, indices = torch.topk(logits.detach().float(), k=5, dim=-1)
-    logger.warning(
-        "K3_LOGITS_ROW_TRACE mode=%s shape=%s top_ids=%s top_values=%s",
-        getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
-        tuple(logits.shape),
-        indices.cpu().tolist(),
-        values.cpu().tolist(),
-    )
-
-
-def _trace_moe_state(
-    layer_id: int,
-    stage: str,
-    value: torch.Tensor,
-    forward_batch: Optional[ForwardBatch] = None,
-) -> None:
-    """Trace only the selected MoE layer using the common reduced checksum."""
-    _capture_graph_row_state(
-        layer_id,
-        f"moe_{stage}",
-        value,
-        forward_batch,
-        row_dim=0,
-        row_kind="token",
-    )
-    trace_layer = os.environ.get("SGLANG_K3_TRACE_MOE_LAYER")
-    if trace_layer is None or int(trace_layer) != layer_id:
-        return
-    _trace_hidden_state(layer_id, f"moe_{stage}", value, forward_batch)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1206,8 +1001,6 @@ class KimiK3MoE(nn.Module):
         # bandwidth away from the critical path.
         shared_output = None
         shared_event = None
-        _trace_moe_state(self.layer_idx, "input", hidden_states, forward_batch)
-
         def issue_shared():
             nonlocal shared_output, shared_event
             if self.shared_experts is None or hidden_states.shape[0] == 0:
@@ -1236,19 +1029,6 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            _trace_moe_state(
-                self.layer_idx, "router_logits", router_logits, forward_batch
-            )
-            _trace_moe_state(
-                self.layer_idx,
-                "topk_weights",
-                topk_output.topk_weights,
-                forward_batch,
-            )
-            _trace_moe_state(
-                self.layer_idx, "topk_ids", topk_output.topk_ids, forward_batch
-            )
-
         issue_shared()
 
         if not self.use_latent_moe:
@@ -1279,16 +1059,10 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        _trace_moe_state(
-            self.layer_idx, "routed_input", routed_input, forward_batch
-        )
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
-        )
-        _trace_moe_state(
-            self.layer_idx, "expert_output", expert_output, forward_batch
         )
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
@@ -1297,20 +1071,13 @@ class KimiK3MoE(nn.Module):
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
             latent = self._reduce_latent(expert_output)
-            _trace_moe_state(
-                self.layer_idx, "routed_latent", latent, forward_batch
-            )
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
-            _trace_moe_state(self.layer_idx, "routed_up", out, forward_batch)
         if shared_event is not None:
             # SBO join: as late as possible, so the side-stream shared experts
             # get the whole routed a2a + latent tail to hide under.
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
-            _trace_moe_state(
-                self.layer_idx, "shared_output", shared_output, forward_batch
-            )
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
             if (
@@ -1320,10 +1087,8 @@ class KimiK3MoE(nn.Module):
             ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             out = _add3(out, shared_output, prefix_sum)
-            _trace_moe_state(self.layer_idx, "final", out, forward_batch)
             return out
         out = out if prefix_sum is None else out + prefix_sum
-        _trace_moe_state(self.layer_idx, "final", out, forward_batch)
         return out
 
     @cached_property
@@ -1559,9 +1324,6 @@ class KimiK3MoE(nn.Module):
             dp_scatter(out, global_out, forward_batch)
             if dp_prefix_sum is not None:
                 out = out + dp_prefix_sum
-        _trace_hidden_state(
-            self.layer_idx, "moe_output", out, forward_batch=forward_batch
-        )
         return out.view(num_tokens, hidden_size)
 
 
@@ -2528,13 +2290,6 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        _trace_hidden_state(
-            self.layer_idx,
-            "attention_input_hidden",
-            hidden_states,
-            forward_batch,
-            positions,
-        )
         result = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -2581,42 +2336,13 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
-        _trace_hidden_state(
-            self.layer_idx,
-            "attention_output",
-            hidden_states,
-            forward_batch,
-            positions,
-        )
         # standard path returns a full-size residual to the next layer, so
         # complete the deferred o_proj reduction as a plain all-reduce
         hidden_states, _, _ = self._finish_attn_reduce(
             hidden_states, allow_scatter=False
         )
-        _trace_hidden_state(
-            self.layer_idx, "attn_out", hidden_states, forward_batch, positions
-        )
-
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        _trace_hidden_state(
-            self.layer_idx,
-            "attention_residual",
-            hidden_states,
-            forward_batch,
-            positions,
-        )
-        if residual is not None:
-            _trace_hidden_state(
-                self.layer_idx,
-                "attention_residual_prefix",
-                residual,
-                forward_batch,
-                positions,
-            )
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        _trace_hidden_state(
-            self.layer_idx, "mlp_out", hidden_states, forward_batch, positions
-        )
         return hidden_states, residual, False
 
     def _forward_attn_residual(
@@ -2680,13 +2406,6 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self._run_self_attn(
             hidden_states, positions, forward_batch, zero_allocator
         )
-        _trace_hidden_state(
-            self.layer_idx,
-            "attention_output",
-            hidden_states,
-            forward_batch,
-            positions,
-        )
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
@@ -2742,10 +2461,6 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states = k3_ar_fusion.all_reduce(hidden_states, prefix_sum)
             prefix_sum = None
 
-        _trace_hidden_state(
-            self.layer_idx, "attn_out", hidden_states, forward_batch, positions
-        )
-
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
         if not agg2_fused:
             hidden_states, prefix_sum = attn_res.forward(
@@ -2757,29 +2472,10 @@ class KimiK3DecoderLayer(nn.Module):
                 rows=rows,
             )
 
-        _trace_hidden_state(
-            self.layer_idx,
-            "attention_residual",
-            hidden_states,
-            forward_batch,
-            positions,
-        )
-        if prefix_sum is not None:
-            _trace_hidden_state(
-                self.layer_idx,
-                "attention_residual_prefix",
-                prefix_sum,
-                forward_batch,
-                positions,
-            )
-
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
         out = self.mlp(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
-        _trace_hidden_state(
-            self.layer_idx, "mlp_out", out, forward_batch, positions
         )
         if shard_lo >= 0:
             if keep_sharded:
@@ -2931,26 +2627,6 @@ class KimiK3LinearModel(nn.Module):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
-            trace_positions = (
-                positions
-                if positions.shape[0] == hidden_states.shape[0]
-                else None
-            )
-            _trace_hidden_state(
-                i,
-                "layer_input_hidden",
-                hidden_states,
-                forward_batch,
-                trace_positions,
-            )
-            if residual is not None:
-                _trace_hidden_state(
-                    i,
-                    "layer_input_residual",
-                    residual,
-                    forward_batch,
-                    trace_positions,
-                )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual, sp_sharded = self.layers[i](
                     positions=positions,
@@ -2961,26 +2637,6 @@ class KimiK3LinearModel(nn.Module):
                     zero_allocator=zero_allocator,
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
-                )
-            trace_positions = (
-                positions
-                if positions.shape[0] == hidden_states.shape[0]
-                else None
-            )
-            _trace_hidden_state(
-                i,
-                "layer_output_hidden",
-                hidden_states,
-                forward_batch,
-                trace_positions,
-            )
-            if residual is not None:
-                _trace_hidden_state(
-                    i,
-                    "layer_output_residual",
-                    residual,
-                    forward_batch,
-                    trace_positions,
                 )
             if (
                 self.dspark_layers_to_capture is not None
@@ -3136,7 +2792,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
-        _trace_forward_input(input_ids, positions, forward_batch)
         hidden_states = self.model(
             input_ids, positions, forward_batch, embeds, pp_proxy_tensors
         )
@@ -3151,7 +2806,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 forward_batch,
                 aux_hidden_states,
             )
-            _trace_logits(logits_output.next_token_logits, forward_batch)
             return logits_output
         return hidden_states
 
