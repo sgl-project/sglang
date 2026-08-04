@@ -253,6 +253,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(
         _GlobalState(
@@ -794,6 +795,7 @@ async def server_info():
                 dataclasses.asdict(server_args)
             ),
             **_global_state.scheduler_info,
+            "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
@@ -2521,7 +2523,12 @@ def _setup_and_run_http_server(
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:
