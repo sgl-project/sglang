@@ -179,8 +179,24 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # The DSPARK draft's KV never passes through _set_kv_buffer: dspark_kv_inject
+        # writes it with draft_model.write_target_hidden_kv() at the RAW cache_loc,
+        # so it is skipped by both the `loc // dcp_size` shard transform and the
+        # dcp_kv_mask owner filter and every rank ends up with a FULL copy. Running
+        # the DCP attention paths over a replicated pool is not just wasteful, it is
+        # wrong: _forward_extend_dcp merges the per-rank partials as if they covered
+        # disjoint keys, which inflates the prefix LSE by log(W) and over-weights the
+        # committed prefix against the in-hand window by a factor of W. Measured on
+        # gsm8k(200) at dcp8 that costs accept len 4.8 -> 2.5. A replicated pool is
+        # exactly the non-DCP case, so drive these paths with dcp_size = 1.
+        spec_alg = model_runner.spec_algorithm
+        self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        if self.is_dspark_draft:
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        else:
+            self.dcp_size = get_parallel().attn_dcp_size
+            self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
