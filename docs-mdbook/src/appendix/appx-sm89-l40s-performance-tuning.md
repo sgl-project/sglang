@@ -743,6 +743,8 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - 落地：`sglang_start.sh` 已内置 `--priority-scheduling` 开关（启用时自动切 `--schedule-policy priority` 并加 `--enable-priority-scheduling --default-priority-value 0`）。
 - **只改启动脚本层的完整方案**：`sglang_start.sh --proxy-port 8080` 会在脚本内同时拉起 [sglang_proxy.py](appendix/sglang_proxy.py) 前置代理——客户端连代理端口，代理按类型限并发（tool call 8 / thinking 12，超时 429）、给 tool call 注入 `priority=10` 后转发到本机 SGLang；流式响应期间持续占用槽位。代理代码与脚本同目录，随镜像持久化。
 - **限并发运行时可调（不用重启）**：`curl -X POST http://127.0.0.1:8080/admin/limits -H 'Content-Type: application/json' -d '{"tool_call": 12, "thinking": 16}'` 即时生效（重建信号量，在途请求不受影响）；启动默认值用脚本 `--proxy-tool-call-limit` / `--proxy-thinking-limit` 设置。调大后盯 TTFT 趋势，`num_queue_reqs` 上涨即回落。
+- **其它接口透传**：代理只对 `/v1/chat/completions` 做限并发 + priority；`/health`、`/metrics`、`/v1/completions`、`/v1/embeddings` 等其它接口由兜底路由原样转发（含查询串与流式），健康检查和指标采集可直接走代理端口（8080）。
+- **Anthropic 风格接口**：`/v1/messages` 按 `thinking.type == "enabled"` 分类并限并发（tool call / thinking 同信号量）；但 Anthropic 协议无 priority 字段，SGLang 的 anthropic 入口会拒绝未知字段，**无法注入 priority**——Anthropic 入口下 tool call 不能插队，只能靠限并发保底。
 
 **请求侧**：
 

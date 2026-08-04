@@ -72,6 +72,51 @@ async def chat(request: Request):
     )
 
 
+@app.post("/v1/messages")
+async def messages(request: Request):
+    """Anthropic 风格接口：按 thinking 字段分类限并发。
+    注意：Anthropic 协议无 priority 字段，无法注入（SGLang anthropic 入口会拒绝未知字段）。"""
+    body = await request.json()
+    kind = "thinking" if body.get("thinking", {}).get("type") == "enabled" else "tool_call"
+
+    try:
+        await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "too many requests",
+                },
+            },
+            status_code=429,
+        )
+
+    client = httpx.AsyncClient(timeout=None)
+    req = client.build_request("POST", BACKEND + "/v1/messages", json=body)
+    resp = await client.send(req, stream=True)
+    if resp.status_code >= 400:
+        sems[kind].release()
+        err = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        return JSONResponse(err, status_code=resp.status_code)
+
+    async def stream():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            sems[kind].release()
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream(), media_type=resp.headers.get("content-type", "application/json")
+    )
+
+
 @app.get("/v1/models")
 async def models():
     async with httpx.AsyncClient(timeout=10) as client:
@@ -95,6 +140,38 @@ async def set_limits(payload: dict):
                 sems[k] = asyncio.Semaphore(v)  # 重建信号量，在途请求不受影响
                 updated[k] = v
     return {"limits": LIMITS, "updated": updated}
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def passthrough(path: str, request: Request):
+    """兜底透传：/health /metrics /v1/completions /v1/embeddings 等其它接口，
+    不参与限并发/priority，原样转发给 SGLang。"""
+    target = f"{BACKEND}/{path}"
+    if request.url.query:
+        target += "?" + request.url.query
+    body = await request.body()
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "connection")
+    }
+    client = httpx.AsyncClient(timeout=None)
+    req = client.build_request(request.method, target, content=body, headers=headers)
+    resp = await client.send(req, stream=True)
+
+    async def stream():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream(),
+        media_type=resp.headers.get("content-type") or "application/json",
+        status_code=resp.status_code,
+    )
 
 
 if __name__ == "__main__":
