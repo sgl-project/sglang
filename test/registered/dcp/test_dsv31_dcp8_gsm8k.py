@@ -5,6 +5,7 @@ Test classes:
     TestDSV31DCP8TP8GSM8K          — CI gate: DCP=8 + TP=8 GSM8K accuracy + decode sanity
     TestDSV31DCP8LogprobParity     — (manual) DCP=8 vs non-DCP logprob equivalence
     TestDSV31DCP4TP8GSM8K          — (manual) DCP=4 + TP=8, different all-gather path
+    TestDSV31DCP8A2ASymmMemGSM8K   — (manual) DCP=8 + a2a backend + symm-mem, GSM8K accuracy
 
 CI coverage & known gaps
 ------------------------
@@ -92,6 +93,21 @@ _DCP8_ARGS = [
 _DCP4_ARGS = [
     "--dcp-size",
     "4",
+]
+
+# a2a DCP backend: fused NCCL All-to-All exchange of (output + LSE) followed by a
+# local Triton LSE combine, in place of the default AllGather + ReduceScatter.
+_A2A_ARGS = [
+    "--dcp-comm-backend",
+    "a2a",
+]
+
+# NCCL symmetric memory: allocate the a2a send/recv buffers from the ncclMemAlloc
+# pool and register them (ncclCommWindowRegister), letting all_to_all_single take
+# the registered fast path. This is the only knob the symm-mem test toggles; the
+# collective math is identical with it on or off.
+_SYMM_MEM_ARGS = [
+    "--enable-symm-mem",
 ]
 
 # Prompts used for logprob parity verification between DCP and non-DCP.
@@ -402,6 +418,60 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         )
         # Store max_total_num_tokens for DCP activation verification.
         # With DCP=4, this should be ~4x the non-DCP value.
+        cls._dcp_max_total_num_tokens = _get_max_total_num_tokens(cls.base_url)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid, wait_timeout=60)
+
+    def test_dcp_activation_check(self):
+        """Verify DCP is active by checking max_total_num_tokens is nonzero."""
+        self.assertGreater(
+            self._dcp_max_total_num_tokens,
+            0,
+            "max_total_num_tokens should be positive",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: DCP=8 + a2a backend + symmetric memory — accuracy gate (manual-only)
+# ---------------------------------------------------------------------------
+@unittest.skipIf(
+    is_in_ci(),
+    "Requires 8 GPUs + NCCL symmetric-memory support; run locally for a2a/symm-mem coverage.",
+)
+class TestDSV31DCP8A2ASymmMemGSM8K(
+    GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestCase
+):
+    """DCP=8 + TP=8 on the a2a backend with NCCL symmetric memory enabled.
+
+    Same accuracy gate as ``TestDSV31DCP8TP8GSM8K`` but exercises the a2a DCP
+    decode combine (``dcp_a2a_lse_reduce``: fused NCCL All-to-All of output+LSE
+    + local Triton LSE combine) with the send/recv buffers allocated from the
+    symmetric-memory pool. Confirms the a2a+symm-mem path is correct end-to-end
+    (accuracy on par with the default ag+rs backend). Manual-only: requires
+    8 GPUs + symmetric-memory support.
+    """
+
+    model = DEEPSEEK_V31_MODEL_PATH
+    base_url = "http://127.0.0.1:31502"
+
+    gsm8k_accuracy_thres = 0.90
+    gsm8k_num_questions = 200
+    gsm8k_num_threads = 128
+    gsm8k_num_shots = 5
+
+    @classmethod
+    def setUpClass(cls):
+        env = os.environ.copy()
+        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=_DCP8_ARGS + _A2A_ARGS + _SYMM_MEM_ARGS + _COMMON_SERVER_ARGS,
+            env=env,
+        )
         cls._dcp_max_total_num_tokens = _get_max_total_num_tokens(cls.base_url)
 
     @classmethod

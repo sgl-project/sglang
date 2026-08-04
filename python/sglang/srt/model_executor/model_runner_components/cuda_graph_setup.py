@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
+import torch
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -88,32 +89,61 @@ def capture_cuda_graphs(
         model_runner
     )
 
-    # The eager (no-cuda-graph) phase runner, built AFTER the attention
-    # backend so its __init__ can warm up kernels (run-once) and allocate the
-    # fixed-max static buffer — both before the cuda-graph runners, so that
-    # buffer is canonical in the shared pool and the cg runners coalesce onto
-    # it. Always built: it serves both the fully-disabled case (decode/prefill
-    # runners point at it) and the eager fallback when a cg runner can't run a
-    # batch.
-    eager_runner = EagerRunner(model_runner)
+    # Dedicated stream for cuda-graph capture, created up front so the
+    # symmetric-memory arena (prealloc below) and the decode graph capture
+    # allocate on the SAME stream. CCA matches free blocks by stream, so the
+    # captured symm buffers can only reuse the prealloc'd arena when both are
+    # allocated on this stream.
+    model_runner.graph_capture_stream = torch.get_device_module(
+        model_runner.device
+    ).Stream()
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
-    prefill_runner = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
+    # Reserve the symmetric-memory pool BEFORE any symmetric-memory op runs
+    # (eager warmup, prefill/decode capture), on the capture stream so the
+    # decode capture carves from this arena instead of growing the pool.
+    prealloc_symmetric_memory_pool(
+        is_draft_worker=model_runner.is_draft_worker,
+        enable_symm_mem=model_runner.server_args.enable_symm_mem,
+        device=model_runner.device,
+        capture_stream=model_runner.graph_capture_stream,
     )
 
-    decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
-    if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
-    else:
-        decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
+    # Run the eager warmup AND all graph captures on the capture stream, so
+    # every symmetric-memory allocation (warmup forwards + prefill/decode
+    # capture) lands on the same stream as the prealloc'd arena and can reuse
+    # it — CCA reuse is stream-matched, so an off-stream arena is dead weight.
+    # Static buffers allocated here are persistent (never freed), so their
+    # allocation-stream tag is irrelevant at serving.
+    with torch.get_device_module(model_runner.device).stream(
+        model_runner.graph_capture_stream
+    ):
+        # The eager (no-cuda-graph) phase runner, built AFTER the attention
+        # backend so its __init__ can warm up kernels (run-once) and allocate
+        # the fixed-max static buffer — both before the cuda-graph runners, so
+        # that buffer is canonical in the shared pool and the cg runners
+        # coalesce onto it. Always built: it serves both the fully-disabled
+        # case (decode/prefill runners point at it) and the eager fallback when
+        # a cg runner can't run a batch.
+        eager_runner = EagerRunner(model_runner)
+
+        # cuda-graph capture: prefill before decode, so both coalesce onto the
+        # eager buffer allocated above. (capture_prefill_graph routes prefill
+        # to the eager runner when the prefill graph is disabled.)
+        prefill_runner = capture_prefill_graph(
+            model_runner=model_runner, eager_runner=eager_runner
+        )
+
+        decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
+        if capture_decode_cuda_graph:
+            if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+                decode = capture_decode_graph(model_runner=model_runner)
+            elif (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            ):
+                decode = capture_decode_graph(model_runner=model_runner)
+        else:
+            decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
@@ -123,13 +153,6 @@ def capture_cuda_graphs(
         register_forward_hooks(
             model_runner.model, model_runner.server_args.forward_hooks
         )
-
-    prealloc_symmetric_memory_pool(
-        is_draft_worker=model_runner.is_draft_worker,
-        enable_symm_mem=model_runner.server_args.enable_symm_mem,
-        device=model_runner.device,
-        forward_stream=model_runner.forward_stream,
-    )
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()

@@ -180,23 +180,41 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             autotune_cache,
         )
 
-    # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-    # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-    mr.forward_stream.wait_stream(torch.cuda.current_stream())
-    with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        maybe_skip_logits = contextlib.nullcontext()
-        if skip_logits:
-            from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+    # The warmup runs on whatever stream is current: the caller owns stream
+    # selection. During cuda-graph capture the whole region runs on
+    # `graph_capture_stream`, which lets the symmetric-memory buffers this warmup
+    # allocates reuse the prealloc'd arena (CCA free-block reuse is
+    # stream-matched, and the arena is allocated on that same stream).
+    #
+    # Under --enable-symm-mem the current stream MUST NOT be the default stream:
+    # NCCL 2.29+ issues cudaMemcpyBatchAsync, which CUDA does not support on the
+    # default stream and which crashes the process. The caller is responsible for
+    # establishing a non-default stream (cuda-graph and non-cuda-graph paths
+    # alike); assert it here so a violation fails loudly with an actionable
+    # message instead of a cryptic error deep inside NCCL.
+    if mr.server_args.enable_symm_mem:
+        device_module = torch.get_device_module(mr.device)
+        if torch.cuda.current_stream() == device_module.default_stream():
+            raise RuntimeError(
+                "FlashInfer autotune is running on the default CUDA stream while "
+                "--enable-symm-mem is enabled. NCCL 2.29+ issues "
+                "cudaMemcpyBatchAsync, which CUDA does not support on the default "
+                "stream and which will crash the process. The caller must run "
+                "autotune on a non-default stream."
+            )
 
-            maybe_skip_logits = autotune_dummy_run_mode()
-        skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with torch.inference_mode(), autotune(
-            True,
-            cache=str(autotune_cache),
-            skip_ops=skip_ops,
-        ), maybe_skip_logits:
-            yield
-    torch.cuda.current_stream().wait_stream(mr.forward_stream)
+    maybe_skip_logits = contextlib.nullcontext()
+    if skip_logits:
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
+        maybe_skip_logits = autotune_dummy_run_mode()
+    skip_ops = get_flashinfer_autotune_skip_ops(mr)
+    with torch.inference_mode(), autotune(
+        True,
+        cache=str(autotune_cache),
+        skip_ops=skip_ops,
+    ), maybe_skip_logits:
+        yield
     logger.info("FlashInfer autotune completed.")
 
 

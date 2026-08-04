@@ -408,6 +408,27 @@ class NCCLLibrary:
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
+    exported_functions_all_to_all = [
+        # ncclResult_t ncclAlltoAll(
+        #   const void* sendbuff, void* recvbuff, size_t count,
+        #   ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream);
+        # Native all-to-all collective (NCCL >= 2.28). Older NCCL lacks the
+        # symbol, so this is bound only when present; callers fall back to
+        # grouped ncclSend/ncclRecv otherwise.
+        Function(
+            "ncclAlltoAll",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
+    ]
+
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
     path_to_library_cache: Dict[str, Any] = {}
@@ -441,9 +462,13 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            # Copy so optional-symbol extends below don't mutate the class-level
+            # list (which would duplicate entries if constructed for a 2nd .so).
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            # ncclAlltoAll is always present under the pinned NCCL (>= 2.28).
+            exported_functions.extend(NCCLLibrary.exported_functions_all_to_all)
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
@@ -587,6 +612,24 @@ class NCCLLibrary:
         # by ctypes automatically
         self.NCCL_CHECK(
             self._funcs["ncclAllGather"](
+                sendbuff, recvbuff, count, datatype, comm, stream
+            )
+        )
+
+    def ncclAlltoAll(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        # Native all-to-all (NCCL >= 2.28). `count` is the per-peer element
+        # count: sendbuff holds world_size*count elements, the j-th block is
+        # sent to rank j and the i-th received block lands at recvbuff+i*count.
+        self.NCCL_CHECK(
+            self._funcs["ncclAlltoAll"](
                 sendbuff, recvbuff, count, datatype, comm, stream
             )
         )

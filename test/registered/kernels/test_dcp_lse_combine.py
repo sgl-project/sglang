@@ -265,8 +265,8 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
 
-class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
-    """Test dcp_a2a_lse_reduce with pre-allocated CUDA graph buffers."""
+class TestDCPA2AReduce(CustomTestCase):
+    """Test dcp_a2a_lse_reduce end-to-end with a mocked (identity) a2a group."""
 
     @classmethod
     def setUpClass(cls):
@@ -284,120 +284,11 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
         group.all_to_all_single = MagicMock(side_effect=identity_a2a)
         return group
 
-    def _make_cuda_graph_buffers(self, N, max_bs, H_per_rank, D, lpd=2):
-        """Create fused CUDA graph buffers matching dcp_a2a_lse_reduce API."""
-        return {
-            "send_combined": torch.empty(
-                N, max_bs, H_per_rank, D + lpd, dtype=torch.bfloat16, device=self.device
-            ),
-            "recv_combined": torch.empty(
-                N, max_bs, H_per_rank, D + lpd, dtype=torch.bfloat16, device=self.device
-            ),
-            "send_lse": torch.empty(
-                N, max_bs, H_per_rank, dtype=torch.float32, device=self.device
-            ),
-            "recv_lse": torch.empty(
-                N, max_bs, H_per_rank, dtype=torch.float32, device=self.device
-            ),
-        }
-
-    def test_cuda_graph_buffers_same_as_dynamic(self):
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        torch.manual_seed(123)
-        N, B, H_per_rank, D = 2, 4, 8, 128
-        H = H_per_rank * N
-        max_bs = 16
-
-        group = self._make_mock_group(N)
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        result_dynamic = dcp_a2a_lse_reduce(
-            attn_out.clone(), attn_lse.clone(), group, is_lse_base_on_e=True
-        )
-
-        cuda_graph_buffers = self._make_cuda_graph_buffers(N, max_bs, H_per_rank, D)
-
-        result_graph = dcp_a2a_lse_reduce(
-            attn_out.clone(),
-            attn_lse.clone(),
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=cuda_graph_buffers,
-        )
-
-        torch.testing.assert_close(
-            result_graph.float().cpu(),
-            result_dynamic.float().cpu(),
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-    def test_cuda_graph_buffers_n4(self):
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        torch.manual_seed(456)
-        N, B, H_per_rank, D = 4, 2, 4, 64
-        H = H_per_rank * N
-        max_bs = 8
-
-        group = self._make_mock_group(N)
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        result_dynamic = dcp_a2a_lse_reduce(
-            attn_out.clone(), attn_lse.clone(), group, is_lse_base_on_e=True
-        )
-
-        cuda_graph_buffers = self._make_cuda_graph_buffers(N, max_bs, H_per_rank, D)
-
-        result_graph = dcp_a2a_lse_reduce(
-            attn_out.clone(),
-            attn_lse.clone(),
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=cuda_graph_buffers,
-        )
-
-        torch.testing.assert_close(
-            result_graph.float().cpu(),
-            result_dynamic.float().cpu(),
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-    def test_cuda_graph_buffers_partial_batch(self):
-        """Buffer max_bs > actual B -- should correctly slice."""
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        torch.manual_seed(789)
-        N, B, H_per_rank, D = 2, 3, 8, 128
-        H = H_per_rank * N
-        max_bs = 32
-
-        group = self._make_mock_group(N)
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        cuda_graph_buffers = self._make_cuda_graph_buffers(N, max_bs, H_per_rank, D)
-
-        result = dcp_a2a_lse_reduce(
-            attn_out,
-            attn_lse,
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=cuda_graph_buffers,
-        )
-
-        self.assertEqual(result.shape, (B, H_per_rank, D))
-        self.assertFalse(torch.isnan(result).any())
-
-    def test_a2a_reduce_allocates_when_no_buffers(self):
-        """Without cuda_graph_buffers, dcp_a2a_lse_reduce still works (eager mode)."""
+    def test_a2a_reduce_dynamic_alloc(self):
+        """dcp_a2a_lse_reduce packs output+LSE, exchanges (identity a2a here),
+        unpacks and combines to the right shape with per-call symmetric-memory
+        allocation -- the only path now that the pre-allocated cuda_graph_buffers
+        variant is gone (buckets reuse the max-batch buffer under graph)."""
         from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
 
         N, B, H_per_rank, D = 2, 4, 8, 64
@@ -413,39 +304,10 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
             attn_lse,
             group,
             is_lse_base_on_e=True,
-            cuda_graph_buffers=None,
         )
 
         self.assertEqual(result.shape, (B, H_per_rank, D))
         self.assertFalse(torch.isnan(result).any())
-
-    def test_buffers_have_fixed_data_ptrs(self):
-        """Pre-allocated buffer data_ptr must not change -- required for graph replay."""
-        from sglang.srt.layers.dcp import dcp_a2a_lse_reduce
-
-        N, B, H_per_rank, D = 2, 4, 8, 64
-        H = H_per_rank * N
-        max_bs = 16
-
-        group = self._make_mock_group(N)
-
-        buffers = self._make_cuda_graph_buffers(N, max_bs, H_per_rank, D)
-        send_ptr = buffers["send_combined"].data_ptr()
-        recv_ptr = buffers["recv_combined"].data_ptr()
-
-        attn_out = torch.randn(B, H, D, device=self.device, dtype=torch.bfloat16)
-        attn_lse = torch.randn(B, H, device=self.device, dtype=torch.float32)
-
-        dcp_a2a_lse_reduce(
-            attn_out,
-            attn_lse,
-            group,
-            is_lse_base_on_e=True,
-            cuda_graph_buffers=buffers,
-        )
-
-        self.assertEqual(buffers["send_combined"].data_ptr(), send_ptr)
-        self.assertEqual(buffers["recv_combined"].data_ptr(), recv_ptr)
 
 
 if __name__ == "__main__":

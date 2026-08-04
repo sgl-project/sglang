@@ -825,11 +825,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
+                # Capture on the shared graph-capture stream created in
+                # capture_cuda_graphs, so the symmetric-memory buffers allocated
+                # during capture can reuse the prealloc'd arena (CCA reuse is
+                # stream-matched).
+                with graph_capture(
+                    stream=self.model_runner.graph_capture_stream
+                ) as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
             else:
+                # NOTE: under PD-Multiplexing each stream group captures on its
+                # own green-context stream (sg[1]), none of which is
+                # graph_capture_stream. Since CCA free-block reuse is
+                # stream-matched, symmetric-memory buffers captured here cannot
+                # reuse the prealloc'd arena, so the symm pool grows per stream
+                # group under pdmux + --enable-symm-mem.
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
                     with (

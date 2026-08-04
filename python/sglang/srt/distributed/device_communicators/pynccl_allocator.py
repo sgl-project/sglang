@@ -88,10 +88,35 @@ static std::mutex g_segment_mutex;
 // Key: comm_ptr, Value: the next segment index to register for this comm.
 static std::unordered_map<uintptr_t, size_t> g_comm_registration_index;
 
+// Prealloc-budget accounting. The pool never frees individual segments, so
+// g_total_allocated (cumulative ncclMemAlloc bytes) mirrors the pool's reserved
+// size. If it grows past the preallocated arena we log ONCE (never crash -- a
+// hard cap would OOM legitimate multi-stream / spec-verify usage). Limit and
+// warn-rank are set from Python via nccl_allocator_set_prealloc_limit.
+static size_t g_total_allocated = 0;
+static size_t g_prealloc_limit = 0;
+static bool g_warned_exceed = false;
+static int g_warn_rank = 0;
+
 // Add a segment to the tracking (appends to end, maintaining FIFO order)
 static void track_segment(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
     g_segments.emplace_back(ptr, size);
+    g_total_allocated += size;
+    // Small structural overshoot is expected (CCA's ~2 MiB small-pool segments,
+    // plus symmetric collectives running on a stream other than the arena's), so
+    // only warn once the pool exceeds the arena by a meaningful margin.
+    const size_t slack = 128UL * 1024 * 1024;
+    if (!g_warned_exceed && g_warn_rank && g_prealloc_limit > 0 &&
+        g_total_allocated > g_prealloc_limit + slack) {
+        fprintf(stderr,
+            "WARNING: [SymmMem] NCCL symmetric-memory pool grew to %zu MiB, past the "
+            "preallocated %zu MiB (SGLANG_SYMM_MEM_PREALLOC_GB_SIZE). Symmetric "
+            "allocations are spilling beyond the prealloc'd arena into extra device "
+            "memory; raise SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to contain them.\\n",
+            g_total_allocated / (1024 * 1024), g_prealloc_limit / (1024 * 1024));
+        g_warned_exceed = true;
+    }
 }
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
@@ -114,6 +139,16 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
     g_segments = std::vector<Segment>();
     g_comm_registration_index = std::unordered_map<uintptr_t, size_t>();
+    g_total_allocated = 0;
+    g_warned_exceed = false;
+}
+
+// Set the prealloc budget (bytes) and which rank should emit the overshoot
+// warning. Called once from Python after the pool is created.
+void nccl_allocator_set_prealloc_limit(size_t limit_bytes, int warn_rank) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    g_prealloc_limit = limit_bytes;
+    g_warn_rank = warn_rank;
 }
 
 // Register all tracked segments with a communicator.
@@ -153,8 +188,9 @@ _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
 
-# Reference to the C registration function (with arg types set)
+# References to C functions (with arg types set)
 _register_func = None
+_set_prealloc_limit_func = None
 
 
 def is_symmetric_memory_enabled():
@@ -190,6 +226,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     Comm registration is handled at context exit time.
     """
     global _allocator, _mem_pool, _cur_device, _register_func
+    global _set_prealloc_limit_func
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -227,6 +264,12 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
         _register_func = nccl_allocator_lib.nccl_allocator_register_segments_with_comm
         _register_func.restype = ctypes.c_int
         _register_func.argtypes = [ctypes.c_uint64]
+
+        # Setup the C function that tells the allocator the prealloc budget so it
+        # can log (never crash) if the pool later grows past the arena.
+        _set_prealloc_limit_func = nccl_allocator_lib.nccl_allocator_set_prealloc_limit
+        _set_prealloc_limit_func.restype = None
+        _set_prealloc_limit_func.argtypes = [ctypes.c_size_t, ctypes.c_int]
 
     return _mem_pool
 
@@ -412,7 +455,7 @@ def prealloc_symmetric_memory_pool(
     is_draft_worker: bool,
     enable_symm_mem: bool,
     device: str,
-    forward_stream: torch.cuda.Stream,
+    capture_stream: torch.cuda.Stream,
 ):
     # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
     if (
@@ -424,8 +467,22 @@ def prealloc_symmetric_memory_pool(
 
     from sglang.srt.distributed import get_tp_group
 
-    # Memory allocation is tied to a cuda stream, use the forward stream
-    with torch.get_device_module(device).stream(forward_stream):
+    # Tell the allocator the prealloc budget + which rank should log, so it can
+    # warn (never crash) whenever a symmetric allocation later grows the pool
+    # past this arena -- covers eager, cuda-graph, and runtime growth alike, since
+    # every physical growth goes through the allocator. get_nccl_mem_pool() first
+    # ensures the C lib is loaded and _set_prealloc_limit_func is wired.
+    get_nccl_mem_pool()
+    prealloc_bytes = envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024
+    is_first_rank = not (
+        torch.distributed.is_initialized() and torch.distributed.get_rank() != 0
+    )
+    _set_prealloc_limit_func(prealloc_bytes, 1 if is_first_rank else 0)
+
+    # Allocation is tied to a cuda stream; use the graph-capture stream so the
+    # symm buffers captured on that stream can reuse this arena (CCA matches
+    # free blocks by stream).
+    with torch.get_device_module(device).stream(capture_stream):
         logger.info(
             f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
         )

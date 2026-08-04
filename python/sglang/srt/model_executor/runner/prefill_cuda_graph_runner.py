@@ -1291,7 +1291,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            with graph_capture() as graph_capture_context:
+            # Capture on the shared graph-capture stream (created in
+            # capture_cuda_graphs) so prefill's symmetric-memory buffers can
+            # reuse the prealloc'd arena, same as the decode runner. Prefill and
+            # decode capture sequentially, so sharing the stream is safe.
+            with graph_capture(
+                stream=self.model_runner.graph_capture_stream
+            ) as graph_capture_context:
                 self.stream = graph_capture_context.stream
                 with self.backend.capture_session(self.stream):
                     self._capture_one_stream()
