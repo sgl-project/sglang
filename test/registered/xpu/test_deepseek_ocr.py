@@ -113,34 +113,42 @@ class TestDeepSeekOCR(CustomTestCase):
         self.run_decode()
 
 
-@unittest.skipUnless(
-    hasattr(torch, "xpu") and torch.xpu.is_available(),
-    "requires an available XPU device",
-)
+def _device_available(device: str) -> bool:
+    if device == "cpu":
+        return True
+    if device == "cuda":
+        return torch.cuda.is_available()
+    if device == "xpu":
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    return False
+
+
 class TestDeepSeekOCRProcessImageInputBatchedUnequalCrops(CustomTestCase):
     """Regression: `_process_image_input` used to `torch.stack` `images_crop`
     across `mm_items`, which crashed when two OCR requests in the same batch
     had different `num_patches` (e.g. 6 vs 4). Guards against reintroducing
-    the stack. Runs on XPU to match the intended deployment target."""
+    the stack. Runs on each device the host provides (CPU / XPU / CUDA)."""
 
-    def _make_item(self, num_patches, tiles_w, tiles_h):
+    def _make_item(self, device, num_patches, tiles_w, tiles_h):
         item = MultimodalDataItem(modality=Modality.IMAGE)
-        item.feature = torch.zeros(3, 640, 640, dtype=torch.float32, device=self.device)
+        item.feature = torch.zeros(3, 640, 640, dtype=torch.float32, device=device)
         item.images_crop = torch.zeros(
-            1, num_patches, 3, 640, 640, dtype=torch.float32, device=self.device
+            1, num_patches, 3, 640, 640, dtype=torch.float32, device=device
         )
         item.images_spatial_crop = torch.tensor(
-            [[[tiles_w, tiles_h]]], dtype=torch.long, device=self.device
+            [[[tiles_w, tiles_h]]], dtype=torch.long, device=device
         )
         item.has_local_crops = True
         return item
 
-    def test_batched_unequal_num_patches_no_crash(self):
-        self.device = torch.device("xpu")
+    def _run_batched_unequal_num_patches(self, device: str):
+        if not _device_available(device):
+            self.skipTest(f"device {device!r} not available on this host")
+        torch_device = torch.device(device)
 
         items = [
-            self._make_item(num_patches=6, tiles_w=3, tiles_h=2),
-            self._make_item(num_patches=4, tiles_w=2, tiles_h=2),
+            self._make_item(torch_device, num_patches=6, tiles_w=3, tiles_h=2),
+            self._make_item(torch_device, num_patches=4, tiles_w=2, tiles_h=2),
         ]
 
         def fake_pixel_values_to_embedding(
@@ -149,16 +157,16 @@ class TestDeepSeekOCRProcessImageInputBatchedUnequalCrops(CustomTestCase):
             self.assertEqual(pixel_values.shape[0], 1)
             self.assertEqual(images_crop.dim(), 6)
             self.assertEqual(images_spatial_crop.dim(), 3)
-            self.assertEqual(pixel_values.device.type, "xpu")
-            self.assertEqual(images_crop.device.type, "xpu")
-            self.assertEqual(images_spatial_crop.device.type, "xpu")
+            self.assertEqual(pixel_values.device.type, torch_device.type)
+            self.assertEqual(images_crop.device.type, torch_device.type)
+            self.assertEqual(images_spatial_crop.device.type, torch_device.type)
             n_patches = images_crop.shape[2]
-            return [torch.zeros(n_patches, 8, dtype=torch.float32, device=self.device)]
+            return [torch.zeros(n_patches, 8, dtype=torch.float32, device=torch_device)]
 
         instance = DeepseekOCRForCausalLM.__new__(DeepseekOCRForCausalLM)
         instance.is_ocr2 = False
 
-        stub_param = torch.zeros(1, dtype=torch.float32, device=self.device)
+        stub_param = torch.zeros(1, dtype=torch.float32, device=torch_device)
 
         class _Stub:
             dtype = torch.float32
@@ -181,7 +189,16 @@ class TestDeepSeekOCRProcessImageInputBatchedUnequalCrops(CustomTestCase):
         # Feature sequences from both items must be concatenated in order.
         # 6 rows for item A + 4 rows for item B = 10 rows.
         self.assertEqual(out.shape, (10, 8))
-        self.assertEqual(out.device.type, "xpu")
+        self.assertEqual(out.device.type, torch_device.type)
+
+    def test_batched_unequal_num_patches_no_crash_cpu(self):
+        self._run_batched_unequal_num_patches("cpu")
+
+    def test_batched_unequal_num_patches_no_crash_xpu(self):
+        self._run_batched_unequal_num_patches("xpu")
+
+    def test_batched_unequal_num_patches_no_crash_cuda(self):
+        self._run_batched_unequal_num_patches("cuda")
 
 
 if __name__ == "__main__":
