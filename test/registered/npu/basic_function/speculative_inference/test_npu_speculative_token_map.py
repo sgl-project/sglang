@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     FR_SPEC_TOKEN_MAP_PATH,
     LLAMA_3_8B_EAGLE_WEIGHTS_PATH,
@@ -69,6 +70,19 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
                 "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
+        if _is_pr_pipeline:
+            process = popen_launch_server(
+                QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+                other_args=args,
+                env=env,
+            )
+            try:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            finally:
+                kill_process_tree(process.pid)
+            return
         process = popen_launch_server(
             QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
             DEFAULT_URL_FOR_TEST,
@@ -94,7 +108,6 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
 
     def test_eagle_with_valid_token_map_gsm8k(self):
         """EAGLE (EAGLE-2) with valid token map; GSM8K accuracy should meet threshold."""
-
         args = [
             "--trust-remote-code",
             "--attention-backend",
@@ -127,6 +140,19 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
                 "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
+        if _is_pr_pipeline:
+            process = popen_launch_server(
+                LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH,
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+                other_args=args,
+                env=env,
+            )
+            try:
+                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            finally:
+                kill_process_tree(process.pid)
+            return
         process = popen_launch_server(
             LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH,
             DEFAULT_URL_FOR_TEST,

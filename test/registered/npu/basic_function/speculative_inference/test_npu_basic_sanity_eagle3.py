@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_8B_EAGLE3_WEIGHTS_PATH,
     QWEN3_8B_WEIGHTS_PATH,
@@ -67,6 +68,12 @@ class TestBasicSanityEagle3(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
+        super().test_gsm8k()
 
 
 if __name__ == "__main__":

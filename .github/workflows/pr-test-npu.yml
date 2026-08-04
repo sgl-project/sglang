@@ -105,6 +105,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -133,7 +134,7 @@ jobs:
   stage-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-2-
+    runs-on: linux-aarch64-a3-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -145,6 +146,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -183,7 +185,7 @@ jobs:
   stage-b-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-2-
+    runs-on: linux-aarch64-a3-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -195,6 +197,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -233,7 +236,7 @@ jobs:
   stage-b-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-4-
+    runs-on: linux-aarch64-a3-4
     strategy:
       fail-fast: false
       matrix:
@@ -249,6 +252,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -287,7 +291,7 @@ jobs:
   stage-b-test-8-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-8-
+    runs-on: linux-aarch64-a3-8
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -299,6 +303,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -336,7 +341,7 @@ jobs:
   stage-b-test-16-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a3-16-
+    runs-on: linux-aarch64-a3-16
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -348,6 +353,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -387,7 +393,7 @@ jobs:
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-2
+    runs-on: linux-aarch64-a3-800t-2
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -397,6 +403,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -444,7 +451,7 @@ jobs:
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-800t-16
     container:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
     steps:
@@ -454,6 +461,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+      - uses: ./.github/actions/check-pr-test-health
 
       - name: Install dependencies
         env:
@@ -504,108 +512,108 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 3
       matrix:
         test_config:
           # qwen3_6_27b performance tests
           - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
-            runner: linux-aarch64-a3-2
+            runner: linux-aarch64-a3-800t-2
             test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
             test_type: 'perf'
 
           - name: qwen3_6_27b_1p_in1024x1024_30_out1024_50ms
-            runner: linux-aarch64-a3-2
+            runner: linux-aarch64-a3-800t-2
             test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1024x1024_30_out1024_50ms.py
             test_type: 'perf'
 
           # qwen3_8b performance tests
           - name: qwen3_8b_w8a8_1p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-2
+            runner: linux-aarch64-a3-800t-2
             test_case: test/registered/npu/performance/qwen3-8b/test_npu_qwen3_8b_w8a8_1p_in3k5_out1k5_50ms.py
             test_type: 'perf'
 
           # qwen3_30b_a3b performance tests
           - name: qwen3_30b_w8a8_1p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-2
+            runner: linux-aarch64-a3-800t-2
             test_case: test/registered/npu/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in3k5_out1k5_50ms.py
             test_type: 'perf'
 
           # qwen3_6_35b_a3b performance tests
           - name: qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms
-            runner: linux-aarch64-a3-2
+            runner: linux-aarch64-a3-800t-2
             test_case: test/registered/npu/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms.py
             test_type: 'perf'
 
           # qwen3_vl_8b_thinking accuracy tests
           - name: qwen3_vl_8b_thinking_1p_mmmu
-            runner: linux-aarch64-a3-2-
+            runner: linux-aarch64-a3-2
             test_case: test/registered/npu/accuracy/qwen3_vl_8b_thinking/test_npu_qwen3_vl_8b_thinking_1p_mmmu.py
             test_type: 'accuracy'
 
           # qwen3_32b performance tests
           - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-4
+            runner: linux-aarch64-a3-800t-4
             test_case: test/registered/npu/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms.py
             test_type: 'perf'
 
           # qwen3_next_80b_a3b performance tests
           - name: qwen3_next_80b_w8a8_2p_in6k_out1k5_bs16
-            runner: linux-aarch64-a3-4
+            runner: linux-aarch64-a3-800t-4
             test_case: test/registered/npu/performance/qwen3_next_80b_a3b_instruct/test_npu_qwen3_next_80b_w8a8_2p_in6k_out1k5_bs16.py
             test_type: 'perf'
 
           # minimax_m2_5 performance tests
           - name: minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms
-            runner: linux-aarch64-a3-8
+            runner: linux-aarch64-a3-800t-8
             test_case: test/registered/npu/performance/minimax_m2_5/test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms.py
             test_type: 'perf'
 
           # deepseek_v4_flash performance tests
           - name: deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms
-            runner: linux-aarch64-a3-16
+            runner: linux-aarch64-a3-800t-16
             test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms.py
             test_type: 'perf'
 
           # kimi_k2_6 performance tests
           - name: kimi_k2_6_w4a8_8p_in3k5_out1k5_20ms
-            runner: linux-aarch64-a3-16
+            runner: linux-aarch64-a3-800t-16
             test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_8p_in3k5_out1k5_20ms.py
             test_type: 'perf'
 
           # qwen3_235b performance tests
           - name: qwen3_235b_w8a8_8p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-16
+            runner: linux-aarch64-a3-800t-16
             test_case: test/registered/npu/performance/qwen3_235b_a22b/test_npu_qwen3_235b_w8a8_8p_in3k5_out1k5_50ms.py
             test_type: 'perf'
 
           # qwen3_5_397b performance tests
           - name: qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms
-            runner: linux-aarch64-a3-16
+            runner: linux-aarch64-a3-800t-16
             test_case: test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms.py
             test_type: 'perf'
           # NPU accuracy tests
           - name: glm4_7_flash_1p_gsm8k
-            runner: linux-aarch64-a3-2-
+            runner: linux-aarch64-a3-2
             test_case: test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_vl_30b_a3b_bf16_2p_gsm8k
-            runner: linux-aarch64-a3-4-
+            runner: linux-aarch64-a3-4
             test_case: test/registered/npu/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
             test_type: 'accuracy'
           - name: glm5_top64_pruned_bf16_8p_gsm8k
-            runner: linux-aarch64-a3-16-
+            runner: linux-aarch64-a3-16
             test_case: test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
             test_type: 'accuracy'
           - name: moonshotai_moonlight_16b_a3b_bf16_1p_gsm8k
-            runner: linux-aarch64-a3-2-
+            runner: linux-aarch64-a3-2
             test_case: test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_5_9b_bf16_1p_gsm8k
-            runner: linux-aarch64-a3-2-
+            runner: linux-aarch64-a3-2
             test_case: test/registered/npu/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
             test_type: 'accuracy'
           - name: qwen3_vl_8b_bf16_2p_gsm8k
-            runner: linux-aarch64-a3-4-
+            runner: linux-aarch64-a3-4
             test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
             test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml

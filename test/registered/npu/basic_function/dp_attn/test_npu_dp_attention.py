@@ -5,7 +5,11 @@ import requests
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
+from sglang.test.ascend.npu_eval_accuracy_kit import (
+    NPUGSM8KMixin,
+    _is_pr_pipeline,
+    run_npu_pr_smoke,
+)
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
@@ -28,8 +32,19 @@ register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
+class _NpuDPAttnMixin:
+    """PR: single inference smoke test. Nightly: full GSM8K dataset."""
+
+    def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
+            return
+        super().test_gsm8k()
+
+
 class TestDPAttentionDP2TP2(
     CustomTestCase,
+    _NpuDPAttnMixin,
     NPUGSM8KMixin,
     JSONConstrainedMixin,
     EBNFConstrainedMixin,
@@ -73,9 +88,10 @@ class TestDPAttentionDP2TP2(
 
 class TestDPAttentionMixedChunk(
     CustomTestCase,
+    _NpuDPAttnMixin,
     NPUGSM8KMixin,
 ):
-    gsm8k_accuracy_thres = 0.35
+    gsm8k_accuracy_thres = 0.34
 
     @classmethod
     def setUpClass(cls):

@@ -60,6 +60,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - uses: ./.github/actions/check-pr-test-health
+
       - name: Check npu info
         run: |
           npu-smi info

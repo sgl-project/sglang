@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -43,6 +44,23 @@ class TestAscendTp2Bf16(CustomTestCase):
         ]
 
     def test_a_gsm8k(self):
+        if _is_pr_pipeline:
+            for model in self.models:
+                with self.subTest(model=model):
+                    process = popen_launch_server(
+                        model,
+                        self.base_url,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        other_args=[
+                            *self.common_args,
+                        ],
+                    )
+
+                    try:
+                        run_npu_pr_smoke(self.base_url)
+                    finally:
+                        kill_process_tree(process.pid)
+            return
         for model in self.models:
             with self.subTest(model=model):
                 print(f"##=== Testing accuracy: {model} ===##")
