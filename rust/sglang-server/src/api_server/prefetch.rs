@@ -3,15 +3,20 @@
 //! The MM worker pool is fixed and core-pinned CPU capacity: a slow image
 //! host — or a file on a hanging network mount — must never occupy it, and
 //! images within a request must download concurrently (not
-//! `n * REQUEST_TIMEOUT`). URLs and file paths resolve here — bounded
-//! globally, via `sglang-mm`'s `fetch_bytes` so proxy/timeout/cap semantics
-//! have one owner — and ride out-of-band as [`MmData::prefetched`];
+//! `n * REQUEST_TIMEOUT`). URLs and file paths resolve here — bounded globally
+//! and per request, via `sglang-mm`'s `fetch_bytes_budgeted` so
+//! proxy/timeout/cap semantics have one owner — and ride out-of-band as
+//! [`crate::message::MmData::prefetched`];
 //! [`crate::message::mm_payload::parse`] swaps them back in.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
+use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
 use tokio::sync::Semaphore;
 
-use crate::message::mm_payload::io_sources;
+use crate::message::mm_payload::{io_sources, item_count};
 use crate::message::{GenerateRequest, MmData};
 
 /// Global bound on concurrent media fetches across all in-flight requests;
@@ -21,14 +26,32 @@ static PERMITS: Semaphore = Semaphore::const_new(32);
 /// Fill [`MmData::prefetched`] for every request; every fetch across the
 /// batch runs concurrently. Any failure rejects the call (fetch errors are
 /// per-request 400s, as on the Python path).
+///
+/// The driver's per-request budgets ([`MAX_ITEMS_PER_REQUEST`],
+/// [`MAX_REQUEST_BYTES`]) are enforced *here*, not left to
+/// `sglang_mm::driver::process` — by then 64 sources of 64 MiB would already be
+/// resident. The driver keeps its checks as the backstop for callers without a
+/// prefetch layer, and because base64 sources are counted only there.
 pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String> {
-    let sources_of = |mm: &Option<Box<MmData>>| {
-        mm.as_deref()
-            .and_then(|m| m.image_data.as_ref())
-            .map(io_sources)
-            .unwrap_or_default()
+    // The item budget rejects before a single byte is fetched.
+    let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
+        let Some(image_data) = mm.as_deref().and_then(|m| m.image_data.as_ref()) else {
+            return Ok(Vec::new());
+        };
+        if item_count(image_data) > MAX_ITEMS_PER_REQUEST {
+            return Err(format!(
+                "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
+            ));
+        }
+        Ok(io_sources(image_data))
     };
-    let fetches = requests.iter().map(|r| fetch_ordered(sources_of(&r.mm)));
+    let plans = requests
+        .iter()
+        .map(|r| plan(&r.mm))
+        .collect::<Result<Vec<_>, String>>()?;
+    let fetches = plans
+        .into_iter()
+        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES));
     let fetched = futures::future::try_join_all(fetches).await?;
     for (req, bytes) in requests.iter_mut().zip(fetched) {
         if !bytes.is_empty() {
@@ -38,24 +61,33 @@ pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String
     Ok(())
 }
 
-/// Resolve every source concurrently (globally bounded), preserving order.
-async fn fetch_ordered(sources: Vec<String>) -> Result<Vec<Bytes>, String> {
-    futures::future::try_join_all(sources.into_iter().map(|src| async move {
-        let _permit = PERMITS.acquire().await.expect("semaphore never closed");
-        // `fetch_bytes` is blocking I/O; tokio's blocking pool threads are
-        // unpinned and lazily spawned, so they never contend with CPU stages.
-        tokio::task::spawn_blocking(move || sglang_mm::common::fetch::fetch_bytes(&src))
-            .await
-            .map_err(|e| format!("media prefetch: {e}"))?
-            .map(Bytes::from)
+/// Resolve every source of one request concurrently (globally bounded),
+/// preserving order, against one shared `total_bytes` allowance. Overflow
+/// rejects mid-download and `try_join_all` drops the remaining futures, so
+/// queued sources never acquire a permit and never start.
+async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Bytes>, String> {
+    let budget = Arc::new(ByteBudget::new(total_bytes));
+    futures::future::try_join_all(sources.into_iter().map(|src| {
+        let budget = Arc::clone(&budget);
+        async move {
+            let _permit = PERMITS.acquire().await.expect("semaphore never closed");
+            // `fetch_bytes_budgeted` is blocking I/O; tokio's blocking pool
+            // threads are unpinned and lazily spawned, so they never contend
+            // with CPU stages.
+            tokio::task::spawn_blocking(move || fetch_bytes_budgeted(&src, &budget))
+                .await
+                .map_err(|e| format!("media prefetch: {e}"))?
+                .map(Bytes::from)
+        }
     }))
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rmpv::Value;
+
+    use super::*;
 
     fn serve(bodies: Vec<Vec<u8>>) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -124,5 +156,47 @@ mod tests {
         let mut requests = vec![mm_request(Value::from("http://127.0.0.1:1/nope.png"))];
         let err = prefetch_all(&mut requests).await.err().unwrap();
         assert!(err.contains("media fetch"), "{err}");
+    }
+
+    /// The item budget rejects before any source is touched: these sources
+    /// would all fail to fetch, so a fetch error would mean fetching started.
+    #[tokio::test]
+    async fn item_budget_rejects_before_fetching() {
+        let sources: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
+            .map(|i| Value::from(format!("/definitely/not/here-{i}.png")))
+            .collect();
+        let mut requests = vec![mm_request(Value::Array(sources))];
+        let err = prefetch_all(&mut requests).await.err().unwrap();
+        assert_eq!(
+            err,
+            format!("multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items")
+        );
+        assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
+    }
+
+    /// Sources that are legal alone but collectively over the limit are
+    /// rejected while downloading, not once every body is resident.
+    #[tokio::test]
+    async fn byte_budget_is_shared_across_sources() {
+        let addr = serve(vec![vec![b'a'; 4096], vec![b'b'; 4096]]);
+        let sources = vec![
+            format!("http://{addr}/a.png"),
+            format!("http://{addr}/b.png"),
+        ];
+        // Room for one body, not both.
+        let err = fetch_ordered(sources, 6144).await.err().unwrap();
+        assert!(err.contains("request media byte budget"), "{err}");
+    }
+
+    /// ...and a fitting set still fetches: the budget never over-rejects.
+    #[tokio::test]
+    async fn byte_budget_admits_a_fitting_request() {
+        let addr = serve(vec![vec![b'a'; 4096], vec![b'b'; 4096]]);
+        let sources = vec![
+            format!("http://{addr}/a.png"),
+            format!("http://{addr}/b.png"),
+        ];
+        let fetched = fetch_ordered(sources, MAX_REQUEST_BYTES).await.unwrap();
+        assert_eq!(fetched.iter().map(|b| b.len()).sum::<usize>(), 8192);
     }
 }

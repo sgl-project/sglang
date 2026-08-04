@@ -39,6 +39,16 @@ pub fn io_sources(value: &Value) -> Vec<String> {
     out
 }
 
+/// How many media items an `image_data` value contributes, in the same walk
+/// [`collect_images`] uses — so the item budget can reject before fetching.
+pub fn item_count(value: &Value) -> usize {
+    match value {
+        Value::Nil => 0,
+        Value::Array(values) => values.iter().map(item_count).sum(),
+        _ => 1,
+    }
+}
+
 /// `work.prefetched` holds the already-resolved bytes of the I/O-backed
 /// sources (in [`io_sources`] order); those sources are swapped for their
 /// bytes, and one left without an entry is an internal error, not a fetch.
