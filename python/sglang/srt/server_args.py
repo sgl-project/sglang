@@ -2596,12 +2596,10 @@ class ServerArgs:
         bool,
         "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
         "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
-        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
-        "is numerically correct, but KDA decode is SLOWER than the packed "
-        "baseline (the per-K g_cache is K x larger and the reconstruction "
-        "refolds the per-K decay every step), so it is not recommended for KDA "
-        "models. Requires the Triton linear-attn decode implementation; KDA "
-        "with the Helion backend delegates ReplaySSM decode to Triton. Requires "
+        "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
+        "but its per-K gate ring is larger and ReplaySSM is typically slower "
+        "than packed KDA decode; benchmark before enabling it. Requires the "
+        "Triton linear-attn decode backend, or Helion for KDA, and "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
@@ -6160,8 +6158,7 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # ReplaySSM buffered decode guards. Runs on the Triton implementation;
-        # KDA's Helion adapter delegates this mode to its Triton fallback.
+        # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
         # cuda-graph is supported (slice 1b: CUDA-graph-safe static
         # write-cursor buffers). The RADIX prefix cache is now supported (slice
         # 2b: the decode kernel force-flushes the ring into temporal[slot] on
@@ -6178,9 +6175,8 @@ class ServerArgs:
         if self.enable_linear_replayssm:
             if decode not in {"triton", "helion"}:
                 raise ValueError(
-                    "--enable-linear-replayssm requires the Triton decode "
-                    "implementation (directly or through the KDA Helion "
-                    "fallback), got "
+                    "--enable-linear-replayssm requires Triton, or Helion for "
+                    "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             from sglang.srt.arg_groups.overrides import (

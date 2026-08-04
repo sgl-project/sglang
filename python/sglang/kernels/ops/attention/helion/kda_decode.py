@@ -6,12 +6,11 @@ import helion
 import helion.language as hl
 import torch
 
+from sglang.kernels.ops.attention.helion import KDA_SMALL_VALUE_HEAD_THRESHOLD
+
 # SGLang initializes torch.distributed, but this kernel has no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
 _LOG2_E = 1.4426950408889634
-# K3 exposes 12 local value heads at TP=8. Lower value-head counts share the
-# same low-occupancy decode regime.
-_DECODE_SMALL_VALUE_HEAD_THRESHOLD = 12
 
 # Tile V on the CUDA x axis so tensor-parallel head counts do not change the
 # grid width.
@@ -204,7 +203,7 @@ def _select_decode_kernel(
     if (
         is_bf16_state
         and use_lower_bound
-        and num_v_heads <= _DECODE_SMALL_VALUE_HEAD_THRESHOLD
+        and num_v_heads <= KDA_SMALL_VALUE_HEAD_THRESHOLD
     ):
         return _helion_fused_recurrent_kda_packed_decode_bf16_small_head
     if is_bf16_state:
@@ -212,7 +211,7 @@ def _select_decode_kernel(
     return _helion_fused_recurrent_kda_packed_decode
 
 
-def _validate_packed_decode_inputs(
+def validate_packed_decode_inputs(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -350,7 +349,7 @@ def helion_fused_recurrent_kda_packed_decode(
     * The return is the same ``(out, initial_state)`` object pair supplied by the
       caller.
     """
-    _, _, num_v_heads, _, _ = _validate_packed_decode_inputs(
+    _, _, num_v_heads, _, _ = validate_packed_decode_inputs(
         mixed_qkv,
         a,
         b,
