@@ -823,6 +823,17 @@ class WaitingImageRequest:
                         )
                     else:
                         logger.debug(f"Request {i} succeeded.")
+                failed = [r for r in results if isinstance(r, BaseException)]
+                if failed:
+                    # A rank without a registered receive URL can never be
+                    # pushed to; fail via the normal completion path now
+                    # instead of pending until the embedding wait times out.
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.error_msg = (
+                        f"Failed to register receive URL with encoder: {failed[0]!r}"
+                    )
+                    self.error_code = int(HTTPStatus.BAD_GATEWAY)
+                    self.recv_socket.close()
 
         asyncio.run(
             send_embedding_port(
@@ -1661,7 +1672,7 @@ class MMReceiverBase(ABC):
                 f"modalities={modalities}, num_items={len(mm_data)}"
             )
             send_time = time.monotonic()
-            asyncio.create_task(
+            encode_task = asyncio.create_task(
                 self.encode(
                     req_id,
                     mm_data,
@@ -1670,9 +1681,33 @@ class MMReceiverBase(ABC):
                     encode_urls=encode_urls,
                 )
             )
-            result = await asyncio.wait_for(
-                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
+            # Parts stream onto the socket while other parts are still
+            # encoding, so receive concurrently with the dispatch; the dispatch
+            # result only matters for failing fast when nothing will arrive.
+            recv_task = asyncio.create_task(
+                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt)
+            )
+            done, _ = await asyncio.wait(
+                {encode_task, recv_task},
                 timeout=self.recv_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if (
+                done
+                and recv_task not in done
+                and (
+                    encode_task.exception() is not None or encode_task.result() is False
+                )
+            ):
+                logger.warning(
+                    f"[{req_id}] Encoder dispatch failed; skipping embedding wait"
+                )
+                recv_task.cancel()
+                self._cleanup_mooncake_buffer(req_id)
+                return None
+            result = await asyncio.wait_for(
+                recv_task,
+                timeout=self.recv_timeout - (time.monotonic() - send_time),
             )
             elapsed = time.monotonic() - send_time
             logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")

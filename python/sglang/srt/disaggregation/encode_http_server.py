@@ -524,7 +524,8 @@ async def handle_encode_request(request: dict):
 
 @app.post("/send")
 async def handle_send_request(request: dict):
-    # mooncake backend
+    """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
+    backends deliver embeddings inline during /encode and never call /send."""
     req_id = request["req_id"]
     receive_count = request.get("receive_count")
     if dp_dispatcher is not None:
