@@ -189,6 +189,8 @@ E2E 里 decode 段长          → CUDA graph；投机解码
 3. OOM 用 peak soak + 显存余量 2~3GB 兜底，而不是靠降低并发来"预防"；
 4. 真正的结构性收益在 CUDA graph（驱动升级）与投机解码，配置层优化做完后再评估。
 
+> 生产数据验证已补充到第 8 节：线上最终采用 0.85/12/98304，实测稳定（见下）。
+
 ### 建议线上配置
 
 ```bash
@@ -220,3 +222,145 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python3.12 -m sglang.launch_server \
 ```
 
 > 去掉 `--skip-server-warmup` 前先确认 warmup 不再 OOM；若仍 OOM，保留该参数但在放量前用几个代表性请求预热。
+
+## 8. 生产数据验证（Qwen3.6-27B-FP8，6 卡 DP=3）
+
+> 数据源：sglang_data.log；线上配置 `context-length=98304`、`mem-fraction-static=0.85`、`max-running-requests=12/worker`、`chunked-prefill-size=4096`。
+
+### 8.1 关键指标
+
+| 指标 | 值 | 判断 |
+|------|-----|------|
+| TTFT (stream) | 3.75s（全量加权 4.37s） | 达标（<10s 目标） |
+| ITL | 92.2ms/tok（聚合约 390 tok/s） | 接近该卡/模型组合的可达区间 |
+| E2E | 89.2s ≈ 935 tok/req × 92ms | 输出长度固有开销，非服务问题 |
+| Cache 命中率 | 43.2%（3 worker：43.0 / 45.4 / 40.9%） | 良好 |
+| 队列 | 0 | 并发充足 |
+| Abort | 2.2%（50/2294） | 可接受（需确认原因分布） |
+| 负载均衡 | 3 worker 请求差 <3% | 很好 |
+| 剩余显存 | 6.09 GB/卡 | 0.85 经 2294 请求实测稳定 |
+
+### 8.2 对前面结论的验证
+
+1. **0.85/12 已被实测验证**：2294 请求、0 排队、TTFT 3.75s、Abort 2.2%、每卡 6.09GB 余量——第 4 节"0.85 没验证过"的担心可以划掉。
+2. **旧 0.78/8 的 45.4s TTFT + queue=29 + Abort 13.2%** 印证第 3.1 节判断：当时慢的主因是并发/排队，而非缓存容量。
+3. **E2E 大头是输出长度**：89.2s 中 decode 占约 95%（935 tok × 92ms）。配置层调参（chunk、mem-fraction、并发）几乎不影响 E2E；真正杠杆在业务侧（`max_tokens` / `thinking_budget` / 关 thinking）与投机解码。
+4. **ITL 的可优化空间取决于模型 active 参数规模**：92ms 对应聚合约 390 tok/s。若 27B 是 A3B 结构，理论带宽上限还有余量，值得排查 decode 侧额外开销（mamba triton、KV 读取、无 CUDA graph）；若接近 active 权重带宽上限，则只能靠投机解码或业务侧砍输出。
+5. **"Evict 105%" 是误导性口径**：淘汰次数与 prompt tokens 对比无意义。池子总共约 2.38M token（793K×3），30.3M 次淘汰 ≈ 13 次全量周转，是"池子小 + 流量大"的固有现象。**43.2% 命中率才是有效指标**；DP=3 相比单实例 55% 的下降是缓存分片的固有代价，Prefix-Aware Router 已在缓解。
+6. **KV 池满载（99.7% evictable）是健康状态**：缓存装满才可能命中，重点看命中率而不是"满不满"。
+
+### 8.3 E2E 优化杠杆（按收益排序）
+
+| 方向 | 预期收益 | 说明 |
+|------|---------|------|
+| 业务侧：`max_tokens` / `thinking_budget` / 关 thinking | E2E 随输出 token 线性下降 | 935 tok/req 是 E2E 89s 的根本原因 |
+| 投机解码（EAGLE 等） | decode 大收益 | 唯一能显著压有效 decode 步数的系统侧手段；需验证 Qwen3.6 支持 |
+| CUDA graph（驱动升级后） | ITL 10~20% | 减每步固定开销，不改变带宽上限 |
+
+### 8.4 后续补充数据
+
+- 会话总时长与聚合吞吐（tok/s）——评估容量的头条指标；
+- Abort 原因分布（客户端断开 vs 超时 vs 错误）；
+- stream=true/false 各自的 prompt 长度分布（解释 TTFT 3.75s vs 5.94s 的差异）。
+
+## 9. 场景化请求参数建议（代码场景）
+
+### 9.1 硬约束回顾
+
+ITL 92ms 下，每 100 个输出 token ≈ 9.2s。**E2E<10s 只对短输出任务成立**；代码检视这类长输出任务要先调整预期，而不是压服务器配置。
+
+### 9.2 tool call 提取上下文（目标 TTFT<1s / E2E<10s）
+
+| 参数 | 建议值 | 理由 |
+|------|--------|------|
+| `enable_thinking` | `false` | 提取是确定性任务，thinking 是纯开销；若误选工具再开 `thinking_budget ≤ 128` |
+| `max_tokens` | 128（长参数工具放宽到 256） | 工具调用 JSON 通常 50~100 token |
+| `temperature` | 0.0 | 确定性 |
+| `repetition_penalty` | 1.0 | |
+| 预期 | TTFT 0.3~0.8s（前缀命中后）；E2E ≈ 10s（临界） | 想留余量就把输出压到 64~80 token |
+
+`thinking_budget` 通过 `chat_template_kwargs` 传递（如 `{"enable_thinking": true, "thinking_budget": 128}`），先发一个请求验证模板是否支持该字段。
+
+### 9.3 代码检视（目标 E2E 30~60s）
+
+| 参数 | 常规档 | 快速档 |
+|------|--------|--------|
+| `enable_thinking` | `true` | `true` |
+| `thinking_budget` | 256~512 | 128 |
+| `max_tokens` | 1024~2048 | 512 |
+| `temperature` | 0.1 | 0.1 |
+| `repetition_penalty` | 1.05 | 1.05 |
+| 预期 E2E | ~85s | ~34s |
+
+说明：输入长、输出数百 token，E2E<10s 不现实；只有"输出 ≤100 token 的要点式结论"才可能，代价是丢失细节。
+
+### 9.4 通用配置（压低 TTFT）
+
+- `--schedule-policy lpm`；
+- system prompt / tool schema / 仓库上下文**固定且放请求开头**，变化内容（diff、当前文件）放最后，提高前缀命中率；
+- 放量前预热（去掉 `--skip-server-warmup` 或先发几个代表性请求）；
+- `context-length` 按实际最大输入收紧，不要一直挂 98304。
+
+## 10. 投机解码（MTP/NEXTN）可行性核查
+
+> 结论先行：MTP 是解 Decode 显存带宽瓶颈的正确方向，源码确认 Qwen3Next（Qwen3.6 系）存在原生 MTP 路径，但**对本部署不是开箱即用**，落地前必须通过 10.3 的四项核查。
+
+### 10.1 源码核对结果
+
+- `NEXTN` 是 SGLang 内置投机算法（`--speculative-algorithm`），内部解析为 EAGLE 系；`--speculative-eagle-topk 1` 即 NEXTN/MTP 模式（走拒绝采样）。
+- [model_config.py](/home/atituiset/Projects/sglang/python/sglang/srt/configs/model_config.py:654) 中 `Qwen3NextForCausalLM` 在 draft 模式下切换为 `Qwen3NextForCausalLMMTP`，draft 仅 **1 个 hidden layer**，权重从同一 checkpoint 加载。
+- 参数名纠错：正确写法是 `--speculative-algorithm NEXTN`，**不是** `--speculative-algo`；`--speculative-num-steps`、`--speculative-eagle-topk`、`--speculative-num-draft-tokens` 均存在。
+- **投机 worker 全部基于 CUDA graph runner**（`eagle_draft_cuda_graph_runner`、`init_cuda_graphs`）——与必须的 `--disable-cuda-graph` 存在冲突风险，是最大未知数。
+
+### 10.2 落地前四项核查（按重要性排）
+
+| # | 核查项 | 状态 |
+|---|--------|------|
+| 1 | 部署版本（0.5.17.dev459）是否包含 Qwen3Next MTP 路径（以下核对基于当前主线源码，比线上版本新） | 待查 |
+| 2 | FP8 checkpoint 是否保留 MTP 权重（量化转档通常丢弃，是最可能的拦路虎） | ✅ 已确认：模型目录存在 `mtp.safetensors`；张量命名待启动加载验证 |
+| 3 | 关闭 CUDA graph 时投机解码能否运行（可能启动报错，或退化为 eager 低效模式） | 待测 |
+| 4 | hybrid SSM（mamba）+ MTP + DP=3 组合兼容性（代码中有 `mamba_track_interval >= speculative_num_draft_tokens` 断言，路径有人维护，仍需实测） | 待测 |
+
+核查命令：
+
+```bash
+# 1) 版本支持
+python3.12 -m sglang.launch_server --help | grep -E "speculative-algorithm|speculative-num"
+python3.12 -c "import sglang.srt.models.qwen3_next_mtp; print('MTP model class OK')"
+
+# 2) MTP 权重与张量命名
+ls /usr1/project/models/Qwen3.6-27B-FP8/ | grep -i mtp
+python3.12 -c "
+from safetensors import safe_open
+f = safe_open('/usr1/project/models/Qwen3.6-27B-FP8/mtp.safetensors', framework='pt')
+ks = list(f.keys())
+print(len(ks), 'tensors'); print('\n'.join(ks[:3]))
+"  # 预期 key 带 model.mtp.* 前缀
+```
+
+> 试点结果（ITL / TTFT / 输出一致性）验证后回填本节状态。
+
+### 10.3 对常见说法（如 AI 生成的建议）的修正
+
+| 说法 | 修正 |
+|------|------|
+| 提速 1.4~2.2x，ITL 45~60ms | 合理区间但别信上限；L40S + FP8 + 无 CUDA graph + 混合 SSM 按 1.3~1.8x 预期 |
+| mem-fraction 从 0.85 降到 0.78 | 错误建议：draft 仅 1 层，显存开销几百 MB~1GB，不需要降 0.07；且 KV 池已 99.7% 满载，降了只会让命中率更低 |
+| 并发降到 6~8/worker 给 MTP 留算力 | 无依据：先保持 12/worker 直接测，draft 1 层开销小 |
+| 准确率无损 | 拒绝采样理论上保持分布，但 topk=1 是贪心验证路径，实际输出有差异，需抽检 |
+
+### 10.4 试点方案（先小流量 A/B，不上生产）
+
+```bash
+# 检查项见 10.2；试点参数：
+--speculative-algorithm NEXTN \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4
+```
+
+对比同一批请求的 ITL、TTFT 与输出一致性。若 checkpoint 无 MTP 权重（10.2-2 为空），则需重新准备带 MTP 的 FP8 checkpoint，并确认量化流程保留 MTP 层——这是投入最大的前置条件。
+
+### 10.5 预期与提醒
+
+- 即使 MTP 全通、ITL 从 92ms 压到 50~60ms，935 token 输出的 E2E 仍在 50 秒级——MTP 是系统侧最大优化，但 E2E<10s 的物理前提依然是限制输出长度（见第 9 节），两者要一起做。
