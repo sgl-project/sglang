@@ -14,6 +14,10 @@
 // WITH it (0.5.16). B200 35B-A3B NVFP4 is PENDING: config shows the 0.5.16 target (with the
 // flag), but our only numbers are 0.5.15 on the plain path — dropped until re-benched on
 // 0.5.16 with the flag. (27B NVFP4 is dense, unaffected.)
+// NOTE: the nvidia/Qwen3.6-*-NVFP4 checkpoints quantize the MoE experts as W4A16 (4-bit
+// weights, 16-bit activations) — memory-oriented (~half the weight VRAM), NOT a throughput
+// win: the expert matmuls run in 16-bit and don't hit the NVFP4 (W4A4) tensor-core path.
+// So NVFP4 speed ~ FP8, with a smaller footprint. See the Qwen3.6.mdx §3.2 NVFP4 note.
 //
 // h200 35B-A3B bf16 high-throughput is PENDING: config updated to --mem-fraction-static
 // 0.92 (+13% A/B at conc 1024); re-bench conc 1024+4096 at 0.92 before marking verified.

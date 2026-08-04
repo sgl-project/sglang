@@ -125,6 +125,15 @@ This section provides deployment configurations optimized for different hardware
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
     - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
+- **NVFP4 is memory-oriented, not a throughput win.** In the `nvidia/Qwen3.6-*-NVFP4`
+  checkpoints the MoE expert + shared-expert layers are quantized as **W4A16** (4-bit
+  weights, 16-bit activations, group_size 16; attention stays FP8) — a `MIXED_PRECISION`
+  config. W4A16 roughly **halves the weight VRAM** but the matmuls still run in 16-bit, so
+  it does **not** engage the NVFP4 (W4A4) tensor-core fast path. Expect NVFP4 to let the
+  model fit on fewer/smaller GPUs, **not** to beat FP8/BF16 on throughput — the expert
+  layers (the bulk of MoE FLOPs) get no 4-bit compute acceleration in this checkpoint. On
+  35B-A3B NVFP4, also pass `--moe-runner-backend flashinfer_cutlass` (the default runner
+  rejects NVFP4-MoE on recent releases).
 
 All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
 
