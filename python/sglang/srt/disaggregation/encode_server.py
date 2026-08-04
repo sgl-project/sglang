@@ -209,15 +209,12 @@ def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
     attrs = _mm_grid_attrs[modality]
     model_type = (model_type or "").lower()
     if modality == Modality.IMAGE:
-        # Kimi K2.5 emits grid_thws, while Kimi-VL emits image_grid_hws.
-        if model_type == "kimi_k25":
+        # Kimi K2.5/K3 emit grid_thws, while Kimi-VL emits image_grid_hws.
+        # Other model types keep the generic attr order above.
+        if model_type in ("kimi_k25", "kimi_k3"):
             attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
         elif model_type == "kimi_vl":
             attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
-        elif model_type == "kimi_k3":
-            attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
-        else:
-            raise ValueError(f"Unknown model_type {model_type} for modality {modality}")
 
     for attr in attrs:
         if attr in mm_inputs and mm_inputs[attr] is not None:
