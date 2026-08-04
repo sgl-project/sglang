@@ -1,6 +1,6 @@
 ---
 title: Ling-3.0-flash
-description: "Deploy Ling-3.0-flash with SGLang — 124B total / 5.1B active hybrid KDA + MLA MoE with thinking mode, Ling3 parsers, and NEXTN / DSpark speculative decoding."
+description: "Deploy Ling-3.0-flash with SGLang — 124B total / 5.1B active hybrid KDA + MLA MoE in BF16 or FP8, with thinking mode, Ling3 parsers, and NEXTN / DSpark speculative decoding."
 tag: NEW
 ---
 
@@ -67,6 +67,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 **Available Models:**
 
 - **BF16**: [inclusionAI/Ling-3.0-flash](https://huggingface.co/inclusionAI/Ling-3.0-flash) — 124B total / 5.1B active
+- **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-flash-fp8](https://huggingface.co/inclusionAI/Ling-3.0-flash-fp8)
 
 **License:** MIT
 
@@ -76,6 +77,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 
 - `--trust-remote-code` is required for the `BailingMoeV3ForCausalLM` implementation.
 - Tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and Blackwell (B200); `--tp 8` on 80 GB cards (H100, H800).
+- The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activation scaling; SGLang detects it from the checkpoint's `quantization_config`, so the launch flags are identical to BF16.
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
 - The chat template enables thinking by default. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}`; to disable it server-wide, launch with `--default-chat-template-kwargs '{"enable_thinking":false}'` (see §3.1).
 - The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Balanced recipes have it on. Pick between NEXTN and DSPARK in the **Speculative Decoding** card of the [Playground](#playground).
