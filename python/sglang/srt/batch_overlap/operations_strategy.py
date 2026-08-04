@@ -191,19 +191,9 @@ def _compute_moe_deepseek_v4_prefill(layer, use_cp: bool = False):
             "DSA prefill CP + TBO is only wired for the non-EP TP-MoE path "
             "(moe_a2a_backend == none)."
         )
-        from sglang.srt.models.deepseek_v4 import cp_tbo_attn_overlap_enabled
-
-        if cp_tbo_attn_overlap_enabled():
-            attn_ops = [
-                layer.self_attn.op_attn_prep,
-                operations.YieldOperation(),
-                layer.self_attn.op_attn_core,
-            ]
-        else:
-            attn_ops = [layer.self_attn.op_attn]
         ops = [
             layer.op_mhc_prepare_attn,
-            *attn_ops,
+            layer.self_attn.op_attn,
             layer.op_mhc_post_attn_pre_mlp,
             layer.op_cp_gather_a,
             operations.YieldOperation(),
