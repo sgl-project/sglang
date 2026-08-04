@@ -137,7 +137,11 @@ class _V2Timer:
                 st["n"] += 1
                 logger.info(
                     "[V2-TIMING] call=%d %s=%.1fms cum(dispatch=%.2fs combine=%.2fs)",
-                    st["n"], self.kind, dt * 1e3, st["dispatch_s"], st["combine_s"],
+                    st["n"],
+                    self.kind,
+                    dt * 1e3,
+                    st["dispatch_s"],
+                    st["combine_s"],
                 )
             else:
                 logger.info("[V2-TIMING] %s=%.1fms", self.kind, dt * 1e3)
@@ -403,6 +407,35 @@ class DeepEPBuffer:
         if num_max_dispatch_tokens_per_rank <= 0:
             num_max_dispatch_tokens_per_rank = (
                 envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        # V2 sizes its internal slots from `num_max_tokens_per_rank` and
+        # HARD-asserts `num_tokens <= num_max_tokens_per_rank` on every
+        # dispatch (csrc/elastic/buffer.hpp:684). The env default (128)
+        # was tuned for the V1 low-latency DECODE path; in normal mode a
+        # chunked-prefill batch dispatches up to `chunked_prefill_size`
+        # tokens from a rank in one shot (measured: concurrency 8 x
+        # ISL 512 aborts all ranks on the assert). Bound by the server's
+        # prefill chunk so prefill batches always fit.
+        if deepep_mode.enable_normal():
+            # The scheduler packs multiple prefill chunks into one forward
+            # batch bounded by `max_prefill_tokens` (default 16384), which
+            # exceeds `chunked_prefill_size` (8192) — measured: an 8192
+            # buffer still hit the assert under concurrency 8. Bound by the
+            # larger of the two packing caps.
+            chunk, max_prefill = None, None
+            try:
+                from sglang.srt.managers.schedule_batch import (
+                    global_server_args_dict,
+                )
+
+                chunk = global_server_args_dict.get("chunked_prefill_size")
+                max_prefill = global_server_args_dict.get("max_prefill_tokens")
+            except Exception:
+                pass
+            num_max_dispatch_tokens_per_rank = max(
+                num_max_dispatch_tokens_per_rank,
+                chunk or 8192,
+                max_prefill or 16384,
             )
         # `num_topk` is not known at buffer-construction time in SGLang
         # (the router choice is per-forward). DeepEP V2 accepts
@@ -733,6 +766,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 except Exception:
                     _prev_evt = None
             previous_event = _prev_evt
+            _num_tokens = (x[0] if isinstance(x, tuple) else x).shape[0]
+            _cap = getattr(buffer, "num_max_tokens_per_rank", -1)
+            if _num_tokens > 0.75 * _cap:
+                logger.warning(
+                    "[V2-SIZE] dispatch num_tokens=%d approaching/exceeding "
+                    "buffer num_max_tokens_per_rank=%d",
+                    _num_tokens,
+                    _cap,
+                )
             _deepep_precompile_tp_barrier()
             with _V2Timer("dispatch"), torch.no_grad():
                 (
@@ -742,14 +784,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     self.handle,
                     event,
                 ) = buffer.dispatch(
-                x,
+                    x,
                     topk_idx=topk_ids,
                     topk_weights=topk_weights,
                     num_experts=self.num_experts,
-                    num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                    # Do NOT pass num_max_tokens_per_rank here: elastic.py's
+                    # dispatch resolves `value_or(passed, ctor_value)`, so the
+                    # dispatcher's decode-tuned value (128) would override the
+                    # prefill-sized ctor capacity and re-trip the
+                    # buffer.hpp:684 assert on large prefill batches.
+                    num_max_tokens_per_rank=None,
                     expert_alignment=(
-                    128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
-                ),
+                        128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+                    ),
                     num_sms=0,
                     num_qps=0,
                     previous_event=previous_event,
