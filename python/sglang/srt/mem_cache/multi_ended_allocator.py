@@ -166,7 +166,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
         self.num_virtual_ids = self.num_pages
 
-        self._peer: Optional[MultiEndedAllocator] = None
+        # N-pool chain neighbors: the adjacent sub-pool toward byte 0
+        # (`low_peer`) and toward `total_bytes` (`high_peer`). End pools have
+        # exactly one (wired via `bind_peer`); float middles have both (wired
+        # explicitly via `bind_low_peer`/`bind_high_peer`).
+        self.low_peer: Optional[MultiEndedAllocator] = None
+        self.high_peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
         self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
@@ -251,14 +256,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.num_pages - self.min_page_index,
         )
 
-    # -- peer binding --
+    # -- chain-neighbor binding --
 
     def bind_peer(self, peer: MultiEndedAllocator) -> None:
-        self._peer = peer
+        """2-pool END-pair compat: bind the OTHER end as this end's growth-side
+        neighbor (grow-up's neighbor sits above; grow-down's below). Float
+        middles must be wired explicitly — calling this on/with one raises.
+        """
+        assert self.grow_direction in ("up", "down") and peer.grow_direction in (
+            "up",
+            "down",
+        ), (
+            f"bind_peer is END-pool-only; got {self.sub_pool_name!r} "
+            f"({self.grow_direction}) <-> {peer.sub_pool_name!r} "
+            f"({peer.grow_direction}); wire floats via bind_low_peer/bind_high_peer"
+        )
+        if self.grow_direction == "up":
+            self.high_peer = peer
+        else:
+            self.low_peer = peer
 
-    @property
-    def peer(self) -> Optional[MultiEndedAllocator]:
-        return self._peer
+    def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
+        self.low_peer = peer
+
+    def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
+        self.high_peer = peer
 
     # -- state --
 
@@ -373,19 +395,57 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return self.min_page_index * self.entry_bytes_per_page
         return (self.watermark_physical + 1) * self.entry_bytes_per_page
 
+    # -- chain frontier walk --
+
+    def _is_frontier_transparent(self) -> bool:
+        """Whether neighbors' frontier walks may see THROUGH this pool.
+
+        End pools are always opaque (an empty end's frontier already sits at
+        its buffer end, so opacity yields the correct gap). Float middles
+        override: an empty float occupies no bytes anywhere and must never
+        wall off free space.
+        """
+        return False
+
+    def _chain_low_frontier_above_bytes(self) -> int:
+        """Byte low-frontier of the nearest NON-transparent chain member above
+        this pool; the buffer top if none."""
+        p = self.high_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.high_peer
+        if p is None:
+            return self.unified_buffer.total_bytes
+        return p._byte_low_frontier()
+
+    def _chain_high_frontier_below_bytes(self) -> int:
+        """Byte high-frontier of the nearest NON-transparent chain member below
+        this pool; 0 if none."""
+        p = self.low_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.low_peer
+        if p is None:
+            return 0
+        return p._byte_high_frontier()
+
+    def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
+        """Nearest NON-transparent chain member on this pool's GROWTH side —
+        the one whose compaction/flush releases bytes reachable at this pool's
+        frontier."""
+        p = self.high_peer if self.grow_direction == "up" else self.low_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.high_peer if self.grow_direction == "up" else p.low_peer
+        return p
+
     def _current_gap_bytes(self) -> int:
-        """Free byte band between this side's frontier and the peer's CURRENT frontier."""
+        """Free byte band between this side's frontier and the nearest
+        non-transparent chain frontier (2-pool: the peer's, byte-identical)."""
         if self.grow_direction == "up":
-            my_high = self._byte_high_frontier()
-            peer_low = (
-                self._peer._byte_low_frontier()
-                if self._peer is not None
-                else self.unified_buffer.total_bytes
+            return max(
+                0, self._chain_low_frontier_above_bytes() - self._byte_high_frontier()
             )
-            return max(0, peer_low - my_high)
-        my_low = self._byte_low_frontier()
-        peer_high = self._peer._byte_high_frontier() if self._peer is not None else 0
-        return max(0, my_low - peer_high)
+        return max(
+            0, self._byte_low_frontier() - self._chain_high_frontier_below_bytes()
+        )
 
     def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
         """Tokens allocatable given `extra_gap_bytes` of ADDED gap room
@@ -413,33 +473,41 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return self._available_tokens()
 
     def _peer_drainable_hole_bytes(self) -> int:
-        """Gap bytes a peer urgent flush would release. Only `_free_phys_pages`
-        count — NOT `_pending_reuse` (awaiting an event) — so the credit is realizable.
+        """Gap bytes an urgent flush of the growth-side chain neighbor would
+        release. Only `_free_phys_pages` count — NOT `_pending_reuse` (awaiting
+        an event) — so the credit is realizable. (2-pool: the peer's holes,
+        byte-identical.)
         """
-        peer = self._peer
-        if peer is None or not peer.lazy_compaction:
+        neighbor = self._growth_side_neighbor()
+        if neighbor is None or not neighbor.lazy_compaction:
             return 0
-        if peer.disagg_move_gate is not None and not peer.disagg_move_gate():
-            # The peer cannot compact while a PD transfer is in flight, so these
-            # holes are not realizable. Crediting them would let the scheduler
-            # admit work that `_flush_peer_for_alloc` then cannot satisfy, and
-            # the caller treats a failed alloc as a memory-estimation bug.
+        if neighbor.disagg_move_gate is not None and not neighbor.disagg_move_gate():
+            # The neighbor cannot compact while a PD transfer is in flight, so
+            # these holes are not realizable. Crediting them would let the
+            # scheduler admit work that `_flush_peer_for_alloc` then cannot
+            # satisfy, and the caller treats a failed alloc as a
+            # memory-estimation bug.
             return 0
-        return len(peer._free_phys_pages) * peer.entry_bytes_per_page
+        return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
     def schedulable_available_size(self) -> int:
-        """Tokens allocatable AFTER a peer urgent-flush (realizable-with-compaction).
-        Used by composite views; alloc gates use `available_size()`.
+        """Tokens allocatable AFTER a neighbor urgent-flush (realizable-with-
+        compaction). Used by composite views; alloc gates use `available_size()`.
         """
         return self._available_tokens(extra_gap_bytes=self._peer_drainable_hole_bytes())
 
-    def _flush_peer_for_alloc(self, need_tokens: int) -> bool:
-        """One urgent peer-flush on alloc shortfall; returns whether THIS side now
-        has enough. Only PEER compaction releases gap bytes (own compaction is net 0).
+    def _flush_chain_for_alloc(self, need_tokens: int) -> bool:
+        """One urgent flush of the growth-side chain neighbor on alloc
+        shortfall; returns whether THIS side now has enough. Only a NEIGHBOR's
+        compaction releases gap bytes (own compaction is net 0: each move
+        trades one hole for one gap byte on our own side).
         """
-        if not (self.lazy_compaction and self._peer is not None):
+        if not self.lazy_compaction:
             return False
-        self._peer._flush(urgent=True)
+        neighbor = self._growth_side_neighbor()
+        if neighbor is None:
+            return False
+        neighbor._flush(urgent=True)
         return need_tokens <= self.available_size()
 
     # -- physical-slot / physical-page primitives --
@@ -533,32 +601,37 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def _extend_watermark(self, num_pages: int) -> bool:
         """Advance the watermark by `num_pages` (lazy-path helper). Returns False
-        on index-space overflow OR crossing the PEER's byte frontier.
+        on index-space overflow OR crossing the nearest non-transparent chain
+        frontier. (Unbound chain side degenerates to the index-space check: the
+        walk returns the buffer end, whose page conversion equals `num_pages` /
+        0 exactly — byte-identical to the old peerless branch.)
         """
         if self.grow_direction == "up":
             new_wm = self.watermark_physical + num_pages
             if new_wm > self.num_pages:
                 return False
-            # Peer (grow-down) sits ABOVE; don't extend past its low frontier.
-            if self._peer is not None:
-                peer_low_pages = (
-                    self._peer._byte_low_frontier() // self.entry_bytes_per_page
-                )
-                if new_wm > peer_low_pages:
-                    return False
+            # The chain above; don't extend past its low frontier.
+            chain_low_pages = (
+                self._chain_low_frontier_above_bytes() // self.entry_bytes_per_page
+            )
+            if new_wm > chain_low_pages:
+                return False
             self.watermark_physical = new_wm
         else:
             new_wm = self.watermark_physical - num_pages
             if new_wm < self.min_page_index - 1:
                 return False
-            # Peer (grow-up) sits BELOW; `new_wm + 1` (our new lowest live page)
-            # must stay strictly above the peer's high frontier.
-            if self._peer is not None:
-                peer_high_pages = (
-                    self._peer._byte_high_frontier() // self.entry_bytes_per_page
-                )
-                if new_wm + 1 < peer_high_pages:
-                    return False
+            # The chain below; `new_wm + 1` (our new lowest live page) must
+            # stay strictly above its high frontier. FLOOR conversion kept
+            # byte-identical to the pre-chain code: this check is a backstop —
+            # callers gate on `available_size()`, whose floor'd gap already
+            # guarantees an in-gap extension — so the floor's partial-page
+            # imprecision on misaligned frontiers is unreachable by contract.
+            chain_high_pages = (
+                self._chain_high_frontier_below_bytes() // self.entry_bytes_per_page
+            )
+            if new_wm + 1 < chain_high_pages:
+                return False
             self.watermark_physical = new_wm
         return True
 
@@ -809,7 +882,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # Shortfall: flush the PEER, not own. Own compaction is net 0
                 # (each move trades 1 hole for +1 gap byte); only peer compaction
                 # releases bytes into the shared gap that own extension consumes.
-                if not self._flush_peer_for_alloc(need_size):
+                if not self._flush_chain_for_alloc(need_size):
                     return None
             num_pages = need_size // self.page_size
             v_pages = self.free_virtual_ids[:num_pages]
@@ -880,7 +953,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # compaction is internal — see `alloc`).
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_peer_for_alloc(need_tokens):
+                if not self._flush_chain_for_alloc(need_tokens):
                     return None
             bs = len(prefix_lens)
             if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
@@ -948,7 +1021,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # Lazy: physical-capacity pre-check; on shortfall flush PEER.
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_peer_for_alloc(need_tokens):
+                if not self._flush_chain_for_alloc(need_tokens):
                     return None
             if self.need_sort and bs > len(self.free_virtual_ids):
                 self.merge_and_sort_free()
@@ -2403,7 +2476,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.swa_attn_allocator.schedulable_available_size()
 
     def _flush_both_for_alloc(self, need_tokens: int) -> bool:
-        """SWA analogue of `_flush_peer_for_alloc`. Each composite alloc consumes a
+        """SWA analogue of `_flush_chain_for_alloc`. Each composite alloc consumes a
         full AND a swa page and either side's compaction opens gap for the other,
         so flush BOTH (one urgent pass each).
         """

@@ -2499,5 +2499,174 @@ class TestO3FusedAllocBind(unittest.TestCase):
             self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
 
 
+class _ChainStub:
+    """Duck-typed chain member for frontier-walk tests: only the attributes the
+    walk itself touches. Lets the tests position an (opaque|transparent) middle
+    at exact byte coordinates without the full allocator machinery (the real
+    float allocator lands in a later commit)."""
+
+    def __init__(self, *, low_byte: int, high_byte: int, transparent: bool):
+        self._low_byte = low_byte
+        self._high_byte = high_byte
+        self.transparent = transparent
+        self.low_peer = None
+        self.high_peer = None
+        self.lazy_compaction = False
+        self._free_phys_pages = torch.empty(0, dtype=torch.int64)
+        self.entry_bytes_per_page = 1
+        self.sub_pool_name = "stub"
+        self.grow_direction = "float"
+
+    def _is_frontier_transparent(self):
+        return self.transparent
+
+    def _byte_low_frontier(self):
+        return self._low_byte
+
+    def _byte_high_frontier(self):
+        return self._high_byte
+
+
+class TestChainFrontierWalk(unittest.TestCase):
+    """N-pool chain walk: 2-pool byte-identity to the old single-peer formulas,
+    transparent-middle skipping, and growth-side-neighbor credit routing.
+
+    Guarded failure modes: (a) a rewrite of the walk silently changes the
+    2-pool gap math (golden identity); (b) an empty/parked middle walls off
+    free space it does not occupy; (c) drainable-hole credit reads the wrong
+    chain member.
+    """
+
+    def _build_pair(self):
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        total = full.entry_bytes() * 64 + mamba.entry_bytes() * 16
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        fa = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("full")),
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        ma = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        fa.bind_peer(ma)
+        ma.bind_peer(fa)
+        return pool, fa, ma
+
+    def test_bind_peer_mirrors_growth_side(self):
+        _, fa, ma = self._build_pair()
+        self.assertIs(fa.high_peer, ma)  # grow-up's neighbor sits above
+        self.assertIsNone(fa.low_peer)
+        self.assertIs(ma.low_peer, fa)  # grow-down's neighbor sits below
+        self.assertIsNone(ma.high_peer)
+
+    def test_bind_peer_rejects_float_members(self):
+        _, fa, ma = self._build_pair()
+        stub = _ChainStub(low_byte=0, high_byte=0, transparent=True)
+        with self.assertRaisesRegex(AssertionError, "END-pool-only"):
+            fa.bind_peer(stub)
+        fa.grow_direction = "float"
+        try:
+            with self.assertRaisesRegex(AssertionError, "END-pool-only"):
+                fa.bind_peer(ma)
+        finally:
+            fa.grow_direction = "up"
+
+    def test_two_pool_gap_equals_old_single_peer_formula(self):
+        # Golden identity: with no middles, the chain walk must reproduce the
+        # pre-chain closed form  gap_up = peer_low - my_high ;
+        # gap_down = my_low - peer_high  at every allocation state.
+        _, fa, ma = self._build_pair()
+        for n_full, n_mamba in ((0, 0), (8, 0), (8, 4), (32, 16)):
+            fa.clear()
+            ma.clear()
+            if n_full:
+                self.assertIsNotNone(fa.alloc(n_full))
+            if n_mamba:
+                self.assertIsNotNone(ma.alloc(n_mamba))
+            self.assertEqual(
+                fa._current_gap_bytes(),
+                max(0, ma._byte_low_frontier() - fa._byte_high_frontier()),
+            )
+            # Old down-side closed form: my_low - peer_high (symmetric band).
+            self.assertEqual(
+                ma._current_gap_bytes(),
+                max(0, ma._byte_low_frontier() - fa._byte_high_frontier()),
+            )
+
+    def test_transparent_middle_is_skipped(self):
+        pool, fa, ma = self._build_pair()
+        mid_lo = fa.entry_bytes_per_page * 8
+        mid_hi = fa.entry_bytes_per_page * 12
+        stub = _ChainStub(low_byte=mid_lo, high_byte=mid_hi, transparent=True)
+        fa.bind_high_peer(stub)
+        stub.low_peer = fa
+        stub.high_peer = ma
+        ma.bind_low_peer(stub)
+
+        # Transparent: both ends see straight through to each other.
+        self.assertEqual(
+            fa._current_gap_bytes(),
+            ma._byte_low_frontier() - fa._byte_high_frontier(),
+        )
+        self.assertEqual(
+            ma._current_gap_bytes(),
+            ma._byte_low_frontier() - fa._byte_high_frontier(),
+        )
+
+        # Opaque: each end's gap stops at the middle's near frontier.
+        stub.transparent = False
+        self.assertEqual(fa._current_gap_bytes(), mid_lo - fa._byte_high_frontier())
+        self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - mid_hi)
+
+    def test_multi_hop_walk_stops_at_first_opaque(self):
+        _, fa, ma = self._build_pair()
+        t1 = _ChainStub(low_byte=100, high_byte=100, transparent=True)
+        t2 = _ChainStub(low_byte=200, high_byte=260, transparent=False)
+        fa.bind_high_peer(t1)
+        t1.low_peer = fa
+        t1.high_peer = t2
+        t2.low_peer = t1
+        t2.high_peer = ma
+        ma.bind_low_peer(t2)
+        self.assertEqual(fa._current_gap_bytes(), 200 - fa._byte_high_frontier())
+        self.assertIs(fa._growth_side_neighbor(), t2)
+        t2.transparent = True
+        self.assertIs(fa._growth_side_neighbor(), ma)
+        self.assertEqual(
+            fa._current_gap_bytes(),
+            ma._byte_low_frontier() - fa._byte_high_frontier(),
+        )
+
+    def test_drainable_credit_reads_walked_neighbor(self):
+        _, fa, ma = self._build_pair()
+        stub = _ChainStub(low_byte=64, high_byte=128, transparent=True)
+        fa.bind_high_peer(stub)
+        stub.low_peer = fa
+        stub.high_peer = ma
+        ma.bind_low_peer(stub)
+
+        # Walked-through to the far end: its holes are credited iff lazy.
+        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)  # ma not lazy
+        ma.lazy_compaction = True
+        ma._free_phys_pages = torch.arange(3, dtype=torch.int64)
+        self.assertEqual(fa._peer_drainable_hole_bytes(), 3 * ma.entry_bytes_per_page)
+        # Opaque non-lazy middle blocks the far end's credit.
+        stub.transparent = False
+        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
