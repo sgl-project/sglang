@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # 3D convolution for the MiniMax H3 visual VAE.
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _weight_is_channels_last_3d(weight):
-    return (
-        hasattr(torch, "channels_last_3d")
-        and weight.dim() == 5
-        and weight.is_contiguous(memory_format=torch.channels_last_3d)
-    )
-
-
-def _match_conv3d_input_format(x, weight):
-    if x.dim() == 5 and _weight_is_channels_last_3d(weight):
-        return x.contiguous(memory_format=torch.channels_last_3d)
-    return x
 
 
 class BaseConv3d(nn.Conv3d):
@@ -84,12 +69,10 @@ class BaseConv3d(nn.Conv3d):
         return x
 
     def forward(self, x):
-        x = _match_conv3d_input_format(x, self.weight)
         if sum(self.padding) == 0:
             return super().forward(x)
 
         x = self._apply_padding(x)
-        x = _match_conv3d_input_format(x, self.weight)
         return F.conv3d(
             x,
             self.weight,

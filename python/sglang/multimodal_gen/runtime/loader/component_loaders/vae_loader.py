@@ -69,22 +69,15 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
 def _should_use_channels_last_3d(
     server_args: ServerArgs | None, component_name: str
 ) -> bool:
-    if component_name not in ("vae", "video_vae"):
-        return False
-    supported_platform = (
-        current_platform.is_cuda()
-        or current_platform.is_rocm()
-        or current_platform.is_xpu()
-    )
-    if not supported_platform:
+    if component_name not in (
+        "vae",
+        "video_vae",
+    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
         return False
 
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
     if override is not None and override.strip().lower() != "auto":
         return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
-
-    if current_platform.is_xpu():
-        return False
 
     if server_args is None:
         return False
