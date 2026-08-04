@@ -2,7 +2,7 @@
 // Static guard for the cookbook deployment/playground engines and their configs.
 // Zero dependencies, no browser, no Mintlify — plain `node`.
 //
-//   node docs_new/scripts/check_cookbook_configs.mjs
+//   node docs/scripts/check_cookbook_configs.mjs
 //
 // What it protects, in order of how expensive the bug is to find by hand:
 //
