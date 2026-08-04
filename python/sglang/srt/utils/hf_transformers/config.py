@@ -224,6 +224,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_uses_adjacent_config = False
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -238,6 +239,8 @@ def get_config(
         # GGUF metadata converter does (for example Kimi K3).
         if not (model / "config.json").is_file():
             kwargs["gguf_file"] = gguf_file
+        else:
+            gguf_uses_adjacent_config = True
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
         model_config_parser = "hf"
@@ -269,7 +272,7 @@ def get_config(
             else:
                 setattr(config, key, value)
 
-    if is_gguf:
+    if is_gguf and not gguf_uses_adjacent_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
