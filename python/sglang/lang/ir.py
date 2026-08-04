@@ -473,7 +473,7 @@ class SglGen(SglExpr):
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
     ):
-        """Call the model to generate. See the meaning of the arguments in docs_new/docs/basic_usage/sampling_params.mdx"""
+        """Call the model to generate. See the meaning of the arguments in docs/docs/basic_usage/sampling_params.mdx"""
         super().__init__()
         self.name = name
         self.sampling_params = SglSamplingParams(
