@@ -7,15 +7,16 @@ from packaging.version import InvalidVersion, Version
 
 from sglang.srt.environ import envs
 
-_MIN_MLX_VERSION = Version("0.32.0")
-_MIN_TORCH_VERSION = Version("2.13.0")
+_SUPPORTED_MLX_SERIES = (0, 32)
+_SUPPORTED_TORCH_SERIES = (2, 13)
 
 
-def _version_at_least(raw_version: object, minimum: Version) -> bool:
+def _is_stable_series(raw_version: object, series: tuple[int, int]) -> bool:
     try:
-        return Version(str(raw_version)) >= minimum
+        version = Version(str(raw_version))
     except InvalidVersion:
         return False
+    return not version.is_prerelease and (version.major, version.minor) == series
 
 
 @lru_cache(maxsize=1)
@@ -24,17 +25,25 @@ def _validate_runtime() -> None:
         import mlx.core as mx
     except ImportError:
         raise RuntimeError(
-            "SGLANG_USE_MLX requires MLX >= 0.32.0, but MLX is not installed"
+            "SGLANG_USE_MLX requires the tested stable Torch 2.13.x + MLX "
+            "0.32.x runtime pair, but MLX is not installed; reinstall with "
+            "the srt_mps extra"
         ) from None
-    if not _version_at_least(mx.__version__, _MIN_MLX_VERSION):
+    mlx_version = getattr(mx, "__version__", None)
+    torch_version = getattr(torch, "__version__", None)
+    if not _is_stable_series(
+        torch_version, _SUPPORTED_TORCH_SERIES
+    ) or not _is_stable_series(mlx_version, _SUPPORTED_MLX_SERIES):
         raise RuntimeError(
-            f"SGLANG_USE_MLX requires MLX >= 0.32.0; found MLX {mx.__version__}"
+            "SGLANG_USE_MLX requires the tested stable Torch 2.13.x + MLX "
+            "0.32.x runtime pair; found "
+            f"Torch {torch_version or 'unknown'} + MLX {mlx_version or 'unknown'}; "
+            "reinstall with the srt_mps extra"
         )
-    if not _version_at_least(torch.__version__, _MIN_TORCH_VERSION):
-        raise RuntimeError(
-            f"SGLANG_USE_MLX requires Torch >= 2.13.0; found Torch {torch.__version__}"
-        )
-    if not torch.backends.mps.is_available():
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    is_mps_available = getattr(mps_backend, "is_available", None)
+    if not callable(is_mps_available) or not is_mps_available():
         raise RuntimeError("SGLANG_USE_MLX requires an available PyTorch MPS device")
 
     metal = getattr(mx, "metal", None)
