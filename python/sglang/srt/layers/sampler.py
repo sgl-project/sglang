@@ -576,10 +576,13 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
+    # Keep every token tied at the k-th largest probability, instead of
+    # truncating by rank. The CUDA kernels (sgl_kernel.top_k_renorm_prob,
+    # flashinfer) keep ties at the k-th boundary, so truncating by rank here
+    # can sample from a strictly smaller set than the kernel backends.
+    kth_idx = (top_ks - 1).clamp(min=0, max=probs_sort.shape[-1] - 1).view(-1, 1)
+    kth_val = probs_sort.gather(1, kth_idx)
+    probs_sort[probs_sort < kth_val] = 0.0
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
