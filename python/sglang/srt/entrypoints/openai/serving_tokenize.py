@@ -144,6 +144,10 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     return self.create_error_response(
                         "Invalid input: 'tokens' must be a list of integers."
                     )
+                if not all(t >= 0 for t in request.tokens):
+                    return self.create_error_response(
+                        "Invalid input: 'tokens' must be non-negative integers."
+                    )
                 tokens_to_decode = [int(t) for t in request.tokens]
                 text = tokenizer.decode(
                     tokens_to_decode, skip_special_tokens=request.skip_special_tokens
@@ -159,6 +163,10 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     if not all(isinstance(t, int) for t in token_list):
                         return self.create_error_response(
                             f"Invalid input: Sublist in 'tokens' must contain only integers. Found: {token_list}"
+                        )
+                    if not all(t >= 0 for t in token_list):
+                        return self.create_error_response(
+                            f"Invalid input: Sublist in 'tokens' must contain only non-negative integers. Found: {token_list}"
                         )
                     decoded_text = tokenizer.decode(
                         [int(t) for t in token_list],

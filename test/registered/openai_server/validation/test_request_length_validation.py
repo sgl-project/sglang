@@ -169,6 +169,19 @@ class TestRequestLengthValidation(CustomTestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+    def test_detokenize_negative_token_id(self):
+        # A negative id would otherwise reach the HF tokenizer and raise an
+        # OverflowError that is misclassified as a 500.
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for tokens in ([-1], [[1], [-1]]):
+            response = requests.post(
+                f"{self.base_url}/v1/detokenize",
+                headers=headers,
+                json={"tokens": tokens},
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("non-negative", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()
