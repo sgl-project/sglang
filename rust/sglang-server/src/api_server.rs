@@ -9,6 +9,7 @@ mod guard;
 mod log;
 mod native_api;
 mod openai;
+mod pd_bootstrap;
 mod submit;
 
 use std::sync::Arc;
@@ -19,19 +20,20 @@ use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 
-/// Shared handler state: the submit machinery (`senders`, `egress_buf`)
-/// + shared tokenizer.
+/// Shared handler state: submission handles, immutable server configuration,
+/// and the API-owned chat formatter.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    chat_formatter: Option<openai::ChatFormatter>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
 }
 
 pub async fn serve(
-    socket: tokio::net::TcpSocket,
+    listener: std::net::TcpListener,
     senders: Senders,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
@@ -41,14 +43,16 @@ pub async fn serve(
     // releases.
     shutdown: flume::Receiver<()>,
 ) {
+    let chat_formatter = openai::load_chat_support(&server_args);
     let state = AppState {
         senders,
         egress_buf,
         server_args: server_args.clone(),
+        chat_formatter,
         egress_activity,
     };
     // Each endpoint module registers its own routes and merges here.
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
         .merge(openai::routes())
@@ -59,14 +63,22 @@ pub async fn serve(
         // No body limit, matching the Python server.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
+    if server_args.enable_pd_bootstrap() {
+        // Merged after `with_state` (the registry carries its own state) and
+        // before `log::apply`, so bootstrap traffic shows in the access log.
+        let (bootstrap_routes, sweeper) = pd_bootstrap::router_and_sweeper();
+        tokio::spawn(sweeper); // cancelled with the runtime on shutdown
+        app = app.merge(bootstrap_routes);
+        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+    }
     let app = log::apply(app, &server_args);
 
-    // The socket was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); start listening here, on the api runtime.
-    let listener = match socket.listen(1024) {
+    // The listener was already bound synchronously in `runtime::start` (so a port
+    // conflict fails startup); adopt it into the tokio reactor here.
+    let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, "listen failed");
+            tracing::error!(error = %e, "failed to adopt pre-bound listener");
             return;
         }
     };

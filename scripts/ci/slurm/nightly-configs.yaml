@@ -356,3 +356,36 @@ kimik26-fp8-mi355x-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
+
+# Kimi-K2.6 MXFP4 wide-EP16 2P1D: aiter MoE path, needs only the wide-EP launcher, not #32048.
+kimik26-mxfp4-mi355x-ep16-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: mxfp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/2p1d-ep16-mxfp4.yaml
+
+kimik26-mxfp4-mi355x-ep16-mtp-sglang:
+  model: amd/Kimi-K2.6-MXFP4
+  model-prefix: kimik26
+  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
+  runner: mi355x
+  precision: mxfp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/2p1d-ep16-mtp-mxfp4.yaml

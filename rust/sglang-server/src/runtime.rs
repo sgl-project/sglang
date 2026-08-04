@@ -19,7 +19,7 @@ mod config;
 mod runnable;
 mod threads;
 
-pub use config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+pub use config::{DefaultSamplingParams, RuntimeConfig, RustServerServerArgs, ServerArgs};
 
 use crate::message::DetokMsg;
 use crate::ring::{
@@ -93,22 +93,31 @@ impl Drop for Runtime {
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Bind the API server port before spawning any thread, so an unavailable
-    // port (EADDRINUSE) is a hard startup error.
+    // port (EADDRINUSE) is a hard startup error. socket2 rather than
+    // `std::net::TcpListener` so SO_RCVBUF can be set before `listen`.
     let addr = cfg.rust_server_args.http_addr;
-    let socket = match addr {
-        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
-        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
-    }
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
     .map_err(|e| format!("socket for {addr} failed: {e}"))?;
     socket
-        .set_reuseaddr(true)
+        .set_reuse_address(true)
         .map_err(|e| format!("set_reuseaddr failed: {e}"))?;
     if let Err(e) = socket.set_recv_buffer_size(16 * 1024 * 1024) {
         eprintln!("warning: set_recv_buffer_size on listener failed: {e}");
     }
     socket
-        .bind(addr)
+        .bind(&addr.into())
         .map_err(|e| format!("bind {addr} failed: {e}"))?;
+    socket
+        .listen(1024)
+        .map_err(|e| format!("listen on {addr} failed: {e}"))?;
+    let listener: std::net::TcpListener = socket.into();
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
 
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
@@ -277,7 +286,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(api_server::serve(
-                    socket,
+                    listener,
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
