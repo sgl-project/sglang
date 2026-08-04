@@ -366,6 +366,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        # Pre-seed the dropped-tokens series at 0 per pool
+        if self.metrics_collector is not None and self.cache_controller is not None:
+            for ct in self.tree_components:
+                self.metrics_collector.increment_dropped_tokens(
+                    num_tokens=0,
+                    reason="host_pressure",
+                    pool=_COMPONENT_POOL_LABEL[ct],
+                )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 

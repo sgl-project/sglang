@@ -900,6 +900,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["mode"],
         )
+        # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
+        for mode in ("input", "device_hit", "host_hit", "storage_hit"):
+            self.prefill_effective_tokens_total.labels(**labels, mode=mode)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
