@@ -208,8 +208,31 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # =============================================== Rust extensions ====================================================
+
+  # Unlike sgl-kernel, not gated on source changes: the cache key is the source
+  # hash, so the job always runs but only compiles on a miss.
+  rust-ext-build:
+    needs: [check-changes, call-gate]
+    # Ungated on the event, unlike the jobs above: a cache entry is visible to
+    # every PR only if it was written from the default branch's ref, so every
+    # main-ref run - schedule, dispatch, workflow_call - has to seed it.
+    #
+    # !cancelled() so a skipped call-gate does not take this job with it, since a
+    # docs-only PR still installs sglang in every stage.
+    if: |
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: 1-gpu-5090
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   call-sgl-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: |
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
@@ -221,12 +244,13 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
     # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
@@ -246,13 +270,14 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   # =============================================== primary ====================================================
 
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -262,89 +287,29 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '10'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-a-test-cpu:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, call-gate, rust-ext-build]
     if: |
       always() &&
       needs.check-changes.result == 'success' &&
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      (needs.check-changes.outputs.main_package == 'true')
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    env:
-      HF_HOME: ${{ github.workspace }}/.hf-cache
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].arr }}
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -h
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-pr-test-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      # Needed by setuptools-rust to build the bundled native gRPC extension
-      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      - name: Install protoc + Rust toolchain
-        timeout-minutes: 10
-        run: bash scripts/ci/utils/install_rust_protoc.sh
-
-      - name: Rust cache (rust/ workspace)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-          shared-key: "sglang-grpc-cpu"
-          save-if: ${{ matrix.partition == 0 }}
-
-      # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
-      - name: Install dependencies
-        timeout-minutes: 20
-        env:
-          UV_SYSTEM_PYTHON: "1"
-        run: |
-          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
-
-      # Hosted runners are ephemeral, so models are re-fetched every run and the
-      # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
-      # storage (rolling key + restore-keys) so warm runs never hit the network.
-      - name: Cache HF hub
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.hf-cache
-          key: hf-cpu-${{ matrix.partition }}-${{ github.run_id }}
-          restore-keys: hf-cpu-${{ matrix.partition }}-
-
-      - name: Run test
-        timeout-minutes: 10
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled()))
+    uses: ./.github/workflows/_pr-test-stage-cpu.yml
+    with:
+      self_name: base-a-test-cpu
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '15'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
+    # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -354,11 +319,12 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -369,10 +335,11 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-b-test-2-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -382,10 +349,11 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -395,10 +363,11 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '40'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   call-multimodal-gen-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: |
       always() &&
       !cancelled() &&
@@ -415,10 +384,11 @@ jobs:
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -428,10 +398,11 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -448,10 +419,11 @@ jobs:
       # Server CUDA Graph warmup is combined into this step (warmup_server_models unset).
       warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8'
       warmup_timeout_minutes: '60'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -461,10 +433,11 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -476,10 +449,11 @@ jobs:
       run_timeout_minutes: '30'
       warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-deepep-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -490,10 +464,11 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -504,10 +479,11 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -518,23 +494,28 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  # temporarily disabled due to runner availability
-#   base-c-test-4-gpu-gb300:
-#     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-#     if: ${{ !failure() && !cancelled() }}
-#     uses: ./.github/workflows/_pr-test-stage.yml
-#     with:
-#       self_name: base-c-test-4-gpu-gb300
-#       runner_config: 4-gpu-gb300
-#       check_changes: ${{ toJson(needs.check-changes.outputs) }}
-#       caller_inputs: ${{ toJson(inputs) }}
-#       partitions: ${{ needs.check-changes.outputs.partitions }}
-#       run_timeout_minutes: '30'
-#       timeout_per_file: '1800'
-#     secrets: inherit
+  base-c-test-4-gpu-gb300:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-4-gpu-gb300
+      runner_config: 4-gpu-gb300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
+      timeout_per_file: '1800'
+      # aarch64 has no prebuild, so this stage compiles during install - which also
+      # makes it the only stage still covering that path. Keep it that way.
+      rust_ext_artifact: ''
+    secrets: inherit
 
+  # List every build and test job: `skipped` passes here, so an omission turns that
+  # job's failure into a green run with no tests.
   pr-test-finish:
     needs:
       [
@@ -544,6 +525,8 @@ jobs:
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
         call-sgl-kernel-tests,
+
+        rust-ext-build,
 
         wait-for-base-a,
         wait-for-base-b,
@@ -565,7 +548,7 @@ jobs:
         base-c-test-deepep-4-gpu-b200,
         base-c-test-deepep-8-gpu-h200,
         base-c-test-4-gpu-b200,
-#         base-c-test-4-gpu-gb300,  # temporarily disabled due to runner availability
+        base-c-test-4-gpu-gb300,
       ]
     if: always()
     runs-on: ubuntu-latest
