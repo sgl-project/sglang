@@ -94,6 +94,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
@@ -990,6 +991,35 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return processes, names
 
+    @staticmethod
+    def _set_startup_time(
+        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        scheduler_init_result: SchedulerInitResult,
+        startup_tic: float,
+    ) -> None:
+        startup_time = build_engine_startup_time(
+            (
+                info.get("startup_time")
+                for info in scheduler_init_result.scheduler_infos
+            ),
+            tokenizer_e2e=time.perf_counter() - startup_tic,
+        )
+        tokenizer_manager.set_startup_time(startup_time)
+        cuda_graph_timings = ", ".join(
+            f"{phase}={duration:.2f}"
+            for phase, duration in startup_time["cuda_graph"].items()
+        )
+        logger.info(
+            "Engine startup timings (s): load_weight=%.2f, "
+            "kv_cache_allocation=%.2f, scheduler_e2e=%.2f, "
+            "cuda_graph={%s}, tokenizer_e2e=%.2f",
+            startup_time["load_weight"],
+            startup_time["kv_cache_allocation"],
+            startup_time["scheduler_e2e"],
+            cuda_graph_timings,
+            startup_time["tokenizer_e2e"],
+        )
+
     @classmethod
     def _launch_subprocesses(
         cls,
@@ -1010,6 +1040,8 @@ class Engine(EngineScoreMixin, EngineBase):
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog, weight_cache_daemon_procs).
         """
+        startup_tic = time.perf_counter()
+
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
@@ -1144,6 +1176,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()
 
+        cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
             "max_req_input_len"
@@ -1275,6 +1309,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     dataclasses.asdict(self.tokenizer_manager.server_args)
                 ),
                 **self._scheduler_init_result.scheduler_infos[0],
+                "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
             }

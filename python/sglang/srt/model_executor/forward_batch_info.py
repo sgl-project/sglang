@@ -1265,11 +1265,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_padding_mode = DpPaddingMode.SUM_LEN
         # Prefill breakable CUDA graph requires every DP rank to run the SAME
         # captured shape. Under SUM_LEN each rank pads to its own local token
-        # count and can select a different capture bucket, so the in-graph DP
-        # collectives (all_gather / reduce_scatter) mismatch across ranks and
-        # corrupt the output. Force MAX_LEN so every rank pads to the global
-        # max and picks the same bucket (mirrors the decode cuda graph
-        # contract, which always runs MAX_LEN).
+        # count and can select a different capture bucket. This mismatches the
+        # rank-coupled communication geometry: DP gather/combine uses
+        # all_gather_into_tensor / reduce_scatter_tensor, while MoE backends may
+        # use A2A dispatch/combine. Force MAX_LEN so every rank pads to the global
+        # max and picks the same bucket.
         #
         # Only force MAX_LEN when the batch fits a captured breakable prefill
         # graph; larger prefills fall back to eager and keep the
