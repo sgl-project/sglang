@@ -696,6 +696,10 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # Tri-state tensor-descriptor path in the Triton extend-attention kernel.
+    # Unset -> platform auto-select (on for XPU, off elsewhere); True/False force
+    # it on/off regardless of platform (for A/B-testing on the same device).
+    SGLANG_TRITON_ATTN_USE_TENSOR_DESC = EnvBool(None)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
