@@ -15,8 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-# Shapes a handler can legitimately be handed: empty, too short to index, and
-# well-formed framing carrying a payload that will not parse.
+# Shapes a handler can legitimately be handed off a live socket.
 MALFORMED = [
     [],
     [b""],
@@ -59,8 +58,7 @@ class TestBootstrapMessageGuard(unittest.TestCase):
         self.assertIn("session-a", mgr.failed_sessions)
 
     def test_mooncake_fail_handler_skips_frames_without_a_session_at_3(self):
-        # STAGING_RSP holds the staging offset at 3 (session at 6) and ABORT holds
-        # the decode port, so neither may be recorded as a failed session.
+        # Frame 3 is the staging offset for STAGING_RSP, the decode port for ABORT.
         for msg in (
             [b"STAGING_RSP", b"7", b"0", b"4096", b"1", b"1", b"session-a"],
             [b"ABORT", b"7", b"10.0.0.1", b"31337"],

@@ -2689,8 +2689,7 @@ class NixlKVManager(CommonKVManager):
             self.update_status(room, KVPoll.WaitingForInput)
 
     def _fail_bootstrap_message(self, waiting_req_bytes: List[bytes]):
-        # Foreign or malformed traffic reaches this socket (see the GUARD check);
-        # it must not take the bootstrap loop down with it.
+        # Foreign or malformed traffic reaches this socket -- see the GUARD check.
         self._log_message_failure(waiting_req_bytes, "bootstrap")
 
     def _start_bootstrap_thread(self):
