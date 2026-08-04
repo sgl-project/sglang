@@ -254,7 +254,15 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # A plain update() setattrs a dict-valued override straight onto the
+        # config, so '{"text_config": {...}}' on a VLM would replace the whole
+        # sub-config with a dict and break attribute access downstream.
+        for key, value in model_override_args.items():
+            current = getattr(config, key, None)
+            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                current.update(value)
+            else:
+                setattr(config, key, value)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
