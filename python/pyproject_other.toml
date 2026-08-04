@@ -169,7 +169,7 @@ diffusion_musa = [
 
 # https://docs.sglang.io/hardware-platforms/apple_metal
 srt_mps = [
-    "mlx>=0.32.0",
+    "mlx>=0.32.0,<0.33.0",
     "mlx-lm",
     "sglang[runtime_common]",
     "torch==2.13.0",
