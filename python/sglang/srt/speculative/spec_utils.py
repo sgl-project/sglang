@@ -880,7 +880,7 @@ def commit_mamba_states_after_verify(
                 req_pool_indices=batch.req_pool_indices,
                 mamba_map=req_pool.req_index_to_mamba_index_mapping,
                 draft_token_num=draft_token_num,
-                track_interval=get_server_args().mamba_track_interval,
+                track_interval=get_exec().mamba.mamba_track_interval,
             )
         )
         commit_gdn_replayssm_fold_after_verify(
