@@ -27,6 +27,7 @@
 //! | `sgl_router_itl_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
+//! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_cache_aware_query_blocks_total` | Counter | `model_id` |
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
@@ -337,6 +338,30 @@ pub enum CacheAwareDecision {
     BelowThreshold,
     MatchedNodeUnowned,
     MatchedWorkersIneligible,
+    /// Every worker holding the prefix already had at least
+    /// `--worker-queue-limit` requests waiting, AND the min-load fallback
+    /// landed on a non-owner, so affinity was genuinely given up to avoid
+    /// queueing. A fallback that lands back on a queueing owner is recorded as
+    /// [`Self::CacheHit`] instead — routing is identical to affinity there, and
+    /// counting it here would overstate the gate's effect.
+    ///
+    /// [`Self::MatchedWorkersIneligible`] is the neighbouring case: the prefix
+    /// owners were not in the candidate set at all. Note that bucket is not
+    /// purely non-load — with admission enabled, `try_claim` filters candidates
+    /// by `active_load()` before the policy runs, so an owner already at the
+    /// router's per-worker cap is excluded upstream and lands there. Read the
+    /// two together when attributing locality loss to load.
+    CacheWorkerQueued,
+    /// Every prefix owner was over the queue limit AND so was every other
+    /// candidate, so the min-load fallback landed back on the cache home.
+    /// Routing is identical to a cache hit — which is why this is not
+    /// [`Self::CacheWorkerQueued`] — but it is reachable only when NO worker in
+    /// the fleet is unqueued, so it carries its own label: folded into
+    /// `cache_hit` it would make a fully saturated fleet read as a healthy one,
+    /// which is the opposite of what an operator sizing the limit needs.
+    ///
+    /// Count it with `cache_hit` for locality; alert on it for saturation.
+    CacheHitAllQueued,
 }
 
 impl CacheAwareDecision {
@@ -353,6 +378,8 @@ impl CacheAwareDecision {
             Self::BelowThreshold => "below_threshold",
             Self::MatchedNodeUnowned => "matched_node_unowned",
             Self::MatchedWorkersIneligible => "matched_workers_ineligible",
+            Self::CacheWorkerQueued => "cache_worker_queued",
+            Self::CacheHitAllQueued => "cache_hit_all_queued",
         }
     }
 }
@@ -391,6 +418,7 @@ pub struct MetricsRegistry {
     // CatchPanicLayer-synthesized 500).
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     cache_aware_query_blocks_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
@@ -468,6 +496,7 @@ impl Default for MetricsRegistry {
             itl_seconds: Default::default(),
             responses_total: Default::default(),
             overlap_blocks: Default::default(),
+            diverted_overlap_blocks: Default::default(),
             cache_aware_query_blocks_total: Default::default(),
             cache_aware_decisions_total: Default::default(),
             active_load: Default::default(),
@@ -649,6 +678,30 @@ impl MetricsRegistry {
     /// Observe an overlap-blocks count for `sgl_router_overlap_blocks`.
     pub fn observe_overlap_blocks(&self, model_id: &str, blocks: u64) {
         let mut guard = self.overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
+    /// Observe the prefix a queue-gated request GAVE UP, for
+    /// `sgl_router_diverted_overlap_blocks`.
+    ///
+    /// Shares [`OVERLAP_BLOCKS_BUCKETS`] with `sgl_router_overlap_blocks` so the
+    /// two are directly comparable: that one is the overlap distribution of
+    /// every cache-aware selection, this one the distribution of the subset the
+    /// queue gate sent elsewhere. The gate is a binary test on queue length and
+    /// ignores how much prefix is at stake, so these two curves are how you find
+    /// out whether that bluntness is costing anything. If the diverted curve
+    /// tracks the overall one, the gate is diverting a representative sample and
+    /// the simple test is fine. If it skews high, the gate is throwing away
+    /// large cached prefixes to dodge a queue — the signal to weigh forgone
+    /// prefill against expected wait instead of thresholding on the queue alone.
+    ///
+    /// Only recorded for a real diversion. A fallback that lands back on the
+    /// cache home gave up nothing and is deliberately absent.
+    pub fn observe_diverted_overlap_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.diverted_overlap_blocks.lock();
         let hist = guard
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
@@ -1231,6 +1284,27 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
+        }
+        drop(guard);
+
+        // diverted_overlap_blocks histogram — the subset of the above that the
+        // queue gate sent away from its cache home.
+        out.push_str(
+            "# HELP sgl_router_diverted_overlap_blocks Overlap-block count of requests the per-worker queue gate diverted off their cache home.\n",
+        );
+        out.push_str("# TYPE sgl_router_diverted_overlap_blocks histogram\n");
+        let guard = self.diverted_overlap_blocks.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_diverted_overlap_blocks",
+                &label_body,
+                hist,
+            );
         }
         drop(guard);
 
@@ -2134,6 +2208,38 @@ mod tests {
         assert!(
             !out.contains("sgl_router_stream_outcome_total{"),
             "no series until an outcome is recorded; got:\n{out}",
+        );
+    }
+
+    /// The two overlap histograms must share buckets, or the diverted curve
+    /// cannot be read against the all-selections one — which is the only reason
+    /// the diverted one exists.
+    #[test]
+    fn diverted_overlap_blocks_shares_buckets_with_overlap_blocks() {
+        let reg = MetricsRegistry::new();
+        reg.observe_overlap_blocks("tiny", 3);
+        reg.observe_diverted_overlap_blocks("tiny", 3);
+        let out = reg.render();
+        assert!(out.contains(r#"sgl_router_diverted_overlap_blocks_count{model_id="tiny"} 1"#));
+        assert!(out.contains(r#"sgl_router_diverted_overlap_blocks_sum{model_id="tiny"} 3"#));
+        let buckets_of = |name: &str| {
+            out.lines()
+                .filter(|l| l.starts_with(&format!("{name}_bucket")))
+                .map(|l| {
+                    l.split("le=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            buckets_of("sgl_router_overlap_blocks"),
+            buckets_of("sgl_router_diverted_overlap_blocks"),
+            "identical bucket ladders are what makes the two comparable",
         );
     }
 

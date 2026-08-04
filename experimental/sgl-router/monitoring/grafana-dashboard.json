@@ -1989,7 +1989,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible\"}[$__rate_interval])) or 0 * sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "(sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "B",
           "legendFormat": "{{model_id}} lookup coverage",
@@ -1998,9 +1998,55 @@
       ]
     },
     {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Queue gate: prefix given up vs prefix available (p50 blocks)",
+      "description": "The queue gate is a binary test on num_waiting_reqs and ignores how much cached prefix a request would lose, so these two curves are how you tell whether that simplification is costing anything. Blue is the overlap of every cache-aware selection; orange is the overlap of just the ones the gate sent elsewhere (cache_worker_queued). Tracking together means the gate diverts a representative sample and the simple test is fine. Orange sitting materially above blue means it is trading large cached prefixes to dodge short queues \u2014 the signal to weigh forgone prefill against expected wait instead of thresholding on the queue alone, not to retune --worker-queue-limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "legendFormat": "all selections \u2014 {{model_id}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (model_id, le) (rate(sgl_router_diverted_overlap_blocks_bucket{model_id=~\"$model_id\"}[$__rate_interval])))",
+          "legendFormat": "diverted by gate \u2014 {{model_id}}",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
       "type": "timeseries",
       "title": "Cache-aware routing decisions (all replicas)",
-      "description": "Fleet-wide terminal cache-aware routing decisions summed across router replicas, one outcome per policy evaluation rather than per request: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Read this for the outcome mix and its trend; drop to \"Cache-aware policy evaluations by replica\" only to test whether a single replica is responsible. cache_hit falling while below_threshold or matched_workers_ineligible rises is the signature of locality loss.",
+      "description": "Fleet-wide terminal cache-aware routing decisions summed across router replicas, one outcome per policy evaluation rather than per request: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Read this for the outcome mix and its trend; drop to \"Cache-aware policy evaluations by replica\" only to test whether a single replica is responsible. cache_hit falling while below_threshold, matched_workers_ineligible or cache_worker_queued rises is the signature of locality loss.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2128,7 +2174,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible\"}[$__rate_interval])) or 0 * sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
+          "expr": "(sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\",decision=~\"cache_hit|below_threshold|matched_node_unowned|matched_workers_ineligible|cache_worker_queued|cache_hit_all_queued\"}[$__rate_interval])) or 0 * sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval]))) / (sum by (instance, model_id) (rate(sgl_router_cache_aware_decisions_total{model_id=~\"$model_id\"}[$__rate_interval])) > 0)",
           "range": true,
           "refId": "B",
           "legendFormat": "{{instance}} {{model_id}} lookup coverage",
@@ -2139,7 +2185,7 @@
     {
       "type": "timeseries",
       "title": "Cache-aware policy evaluations by replica",
-      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; matched_workers_ineligible commonly means cached owners were at capacity; hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
+      "description": "Per-replica terminal policy-evaluation rate, not request rate: admission races can evaluate repeatedly and parked hand-offs skip evaluation. Series are unstacked so each decision reads its own rate off the axis; use \"Cache-aware routing decisions (all replicas)\" for the fleet-wide mix. below_threshold isolates tree/hash misses; load_imbalance is intentional; matched_node_unowned identifies tree lifecycle state; cache_worker_queued means every worker holding the prefix was over --worker-queue-limit and the request went elsewhere; cache_hit_all_queued means EVERY worker in the fleet was over it so the request went back to the cache home anyway (routing equals a cache hit, but it is the fleet-saturation signal \u2014 alert on it); matched_workers_ineligible means the owners were not candidates at all (wrong pool, unhealthy, breaker open, or already at the router admission cap); hash_config_unknown and tokenization_unavailable identify routing-input failures. request_body_unavailable or request_json_invalid indicates a broken ingress invariant and emits an error log.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

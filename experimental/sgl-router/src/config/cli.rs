@@ -15,8 +15,8 @@ use crate::config::{
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
     AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
-    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, RetryConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -112,6 +112,26 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+    /// Queued-request count at or above which a worker stops winning
+    /// selections on cache affinity: the request is sent to another worker
+    /// holding the same prefix, or to the least-loaded worker if there is
+    /// none. Counts `num_waiting_reqs` only, so it measures whether the
+    /// request would wait rather than how busy the worker is.
+    ///
+    /// Start at 4 on a single-rank worker — low enough to catch a real
+    /// backlog, high enough not to chase a queue of 1 that drains
+    /// immediately — and scale it with `dp_size`: the count is summed across
+    /// a worker's dp ranks while a request lands on one of them, so on a
+    /// dp-8 worker a queue of one on four ranks already sums to 4.
+    ///
+    /// Requires engines that publish load (same enablement as KV events).
+    /// With no fresh load snapshot the gate has nothing to read, fails open,
+    /// and never fires — and because it REPLACES the fleet-spread check
+    /// rather than layering on it, the router then has no load override at
+    /// all. Mutually exclusive with `--balance-abs-threshold` /
+    /// `--balance-rel-threshold`.
+    #[arg(long)]
+    pub worker_queue_limit: Option<NonZeroUsize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -292,12 +312,24 @@ impl Cli {
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.kv_bootstrap_timeout_ms.is_some()
-            || self.kv_peer_selector.is_some();
+            || self.kv_peer_selector.is_some()
+            || self.worker_queue_limit.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
-                 --balance-rel-threshold / --kv-bootstrap-timeout-ms / --kv-peer-selector) \
-                 requires --policy cache_aware_zmq"
+                 --balance-rel-threshold / --kv-bootstrap-timeout-ms / --kv-peer-selector / \
+                 --worker-queue-limit) requires --policy cache_aware_zmq"
+            ));
+        }
+        // The queue gate replaces the fleet-spread check rather than layering on
+        // it, so accepting both would leave the operator believing a knob is
+        // live when the policy never reads it.
+        if self.worker_queue_limit.is_some()
+            && (self.balance_abs_threshold.is_some() || self.balance_rel_threshold.is_some())
+        {
+            return Err(anyhow!(
+                "--worker-queue-limit replaces the fleet-spread check, so it cannot be \
+                 combined with --balance-abs-threshold / --balance-rel-threshold; pass only one"
             ));
         }
         // `peer_selector` is only carried on the k8s discovery backend (it needs a
@@ -409,14 +441,22 @@ impl Cli {
         // defaults. Unset knobs fall back to the per-field defaults.
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
+            // `validate` has already rejected the combination, so the queue
+            // limit alone decides which gate is built.
+            let load_gate = match self.worker_queue_limit {
+                Some(limit) => LoadGate::PerWorkerQueue(limit),
+                None => LoadGate::FleetSpread {
+                    abs_threshold: self
+                        .balance_abs_threshold
+                        .unwrap_or(LoadGate::DEFAULT_ABS_THRESHOLD),
+                    rel_threshold: self
+                        .balance_rel_threshold
+                        .unwrap_or(LoadGate::DEFAULT_REL_THRESHOLD),
+                },
+            };
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                balance_abs_threshold: self
-                    .balance_abs_threshold
-                    .unwrap_or(d.balance_abs_threshold),
-                balance_rel_threshold: self
-                    .balance_rel_threshold
-                    .unwrap_or(d.balance_rel_threshold),
+                load_gate,
                 bootstrap_timeout_ms: self
                     .kv_bootstrap_timeout_ms
                     .unwrap_or(d.bootstrap_timeout_ms),
@@ -1091,7 +1131,13 @@ mod tests {
         let ca = c.model.cache_aware.expect("cache_aware set");
         assert_eq!(ca.cache_threshold, 0.7);
         // Untouched knobs fall back to defaults.
-        assert_eq!(ca.balance_abs_threshold, 32);
+        assert!(matches!(
+            ca.load_gate,
+            LoadGate::FleetSpread {
+                abs_threshold: 32,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1168,6 +1214,83 @@ mod tests {
             err.contains("requires --policy cache_aware_zmq"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn worker_queue_limit_reaches_the_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "4",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.load_gate.queue_limit(), Some(4));
+        // The gate REPLACES the spread strategy — the spread knobs must not
+        // survive alongside it in the built config.
+        assert!(matches!(ca.load_gate, LoadGate::PerWorkerQueue(_)));
+    }
+
+    /// A limit of 0 would make every worker ineligible, silently degrading the
+    /// policy to pure min-load. `NonZeroUsize` makes that unrepresentable.
+    #[test]
+    fn rejects_zero_worker_queue_limit() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-queue-limit",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("worker-queue-limit"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_worker_queue_limit_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--worker-queue-limit",
+            "4",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("requires --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    /// The queue gate replaces the fleet-spread check rather than layering
+    /// on it, so accepting both would leave the spread knob silently dead.
+    #[test]
+    fn rejects_worker_queue_limit_combined_with_balance_threshold() {
+        for spread in [
+            ["--balance-abs-threshold", "32"],
+            // The relative knob alone is just as dead, and is the arm a
+            // `&&`-instead-of-`||` slip would let through.
+            ["--balance-rel-threshold", "1.5"],
+        ] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                "cache_aware_zmq",
+                "--worker-queue-limit",
+                "4",
+                spread[0],
+                spread[1],
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot be combined"), "{spread:?} got: {err}");
+        }
     }
 
     #[test]
