@@ -13,7 +13,7 @@ from sglang.test.ascend.npu_eval_accuracy_kit import (
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
-    QWEN3_32B_WEIGHTS_PATH,
+    QWEN3_32B_WEIGHTS_PATH, IMAGES_EXAMPLE_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
@@ -168,7 +168,7 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
     def setUpClass(cls):
         cls.model = KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.image_url = DEFAULT_IMAGE_URL
+        cls.image_url = IMAGES_EXAMPLE_PATH
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

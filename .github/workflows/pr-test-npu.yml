@@ -497,7 +497,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 6
       matrix:
         test_config:
           # qwen3_6_27b performance tests
