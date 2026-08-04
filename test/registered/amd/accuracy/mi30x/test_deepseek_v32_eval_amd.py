@@ -118,7 +118,7 @@ def get_answer_value(answer_str):
 
 def run_gsm8k_benchmark(
     base_url: str,
-    num_questions: int = 200,
+    num_questions: int = 1319,
     num_shots: int = 5,
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
@@ -170,7 +170,7 @@ class TestDeepSeekV32EvalAMD(unittest.TestCase):
     def setUpClass(cls):
         cls.models = DEEPSEEK_V32_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_deepseek_v32_accuracy(self):
         """Test DeepSeek-V3.2 models with GSM8K completion benchmark."""
