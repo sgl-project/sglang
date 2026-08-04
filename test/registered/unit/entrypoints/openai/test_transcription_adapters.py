@@ -53,9 +53,7 @@ class TestTranscriptionAdapterResolution(CustomTestCase):
         self.assertIsInstance(
             resolve_adapter(["WhisperForConditionalGeneration"]), WhisperAdapter
         )
-        self.assertIsInstance(
-            resolve_adapter([]), WhisperAdapter
-        )
+        self.assertIsInstance(resolve_adapter([]), WhisperAdapter)
 
 
 class TestSpeechLMAdapterContract(CustomTestCase):
@@ -107,14 +105,10 @@ class TestSpeechLMAdapterContract(CustomTestCase):
             below_s = knee_s - 1.0
             above_s = knee_s + 1.0
             with self.subTest(adapter=cls.__name__):
-                below = cls().build_sampling_params(
-                    self._request(duration=below_s)
-                )
+                below = cls().build_sampling_params(self._request(duration=below_s))
                 self.assertEqual(below["max_new_tokens"], floor)
 
-                above = cls().build_sampling_params(
-                    self._request(duration=above_s)
-                )
+                above = cls().build_sampling_params(self._request(duration=above_s))
                 self.assertEqual(
                     above["max_new_tokens"], int(above_s * _TOKENS_PER_SECOND)
                 )
