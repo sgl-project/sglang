@@ -45,6 +45,28 @@ def resolve_torch_compile_mode(
     return default
 
 
+def compile_matching_submodules(
+    module: nn.Module,
+    *,
+    compile_kwargs: dict[str, object],
+) -> int:
+    conditions = getattr(module, "_compile_conditions", ())
+    matches = [
+        submodule
+        for name, submodule in module.named_modules()
+        if name and any(condition(name, submodule) for condition in conditions)
+    ]
+    if not matches:
+        raise ValueError(
+            "regional compile found no matching submodules; "
+            f"check {type(module).__name__}._compile_conditions"
+        )
+
+    for submodule in matches:
+        submodule.compile(**compile_kwargs)
+    return len(matches)
+
+
 @dataclass
 class CompiledModuleRegistry:
     module_ids: set[int] = field(default_factory=set)
@@ -64,6 +86,22 @@ class CompiledModuleRegistry:
         module.compile(**compile_kwargs)
         self.module_ids.add(module_id)
         return True
+
+    def compile_regions_once(
+        self,
+        module: nn.Module,
+        *,
+        compile_kwargs: dict[str, object],
+    ) -> int:
+        module_id = id(module)
+        if module_id in self.module_ids:
+            return 0
+        compiled_count = compile_matching_submodules(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
+        self.module_ids.add(module_id)
+        return compiled_count
 
 
 class CallableModule(nn.Module):

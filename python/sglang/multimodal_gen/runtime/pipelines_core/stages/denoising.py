@@ -76,6 +76,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -227,7 +230,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         num_attention_heads = (
             self.server_args.pipeline_config.dit_config.num_attention_heads
         )
-        attn_head_size = hidden_size // num_attention_heads
+        attn_head_size = getattr(
+            self.server_args.pipeline_config.dit_config,
+            "attention_head_dim",
+            hidden_size // num_attention_heads,
+        )
 
         # torch compile
         # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
@@ -341,10 +348,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not args.enable_torch_compile
             or not args.offload_during_compile
             or not args.warmup
-            # a subclass with its own forward would never run the restore
-            or type(self).forward is not DenoisingStage.forward
+            or not self._owns_compile_warmup_lifecycle()
             or args.use_fsdp_inference
-            or envs.SGLANG_CACHE_DIT_ENABLED
+            or self._cache_dit_requested()
             or not isinstance(module, LayerwiseOffloadableModuleMixin)
             or is_layerwise_offloaded_module(module)
         ):
@@ -352,6 +358,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         module.configure_layerwise_offload(args)
         if is_layerwise_offloaded_module(module):
             self._offloaded_dit_modules_for_compile.append(module)
+
+    def _owns_compile_warmup_lifecycle(self) -> bool:
+        """Whether ``forward`` enters ``_offload_for_torch_compile_warmup``.
+
+        Custom denoising loops opt in explicitly after wiring the same restore
+        lifecycle. This keeps the safety guard without silently disabling the
+        optimization solely because a model overrides ``forward``.
+        """
+        return type(self).forward is DenoisingStage.forward
 
     def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
         """Move resident non-DiT components off-device while the warmup
@@ -365,6 +380,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 isinstance(module, torch.nn.Module)
                 and id(module) not in dit_ids
+                and not is_fsdp_managed_module(module)
                 and not is_layerwise_offloaded_module(module)
             ):
                 param = next(module.parameters(), None)
@@ -386,7 +402,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.server_args, "enable_torch_compile", False
         ) or not isinstance(module, nn.Module):
             return
-        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+        if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
         if self._torch_compile_registry.is_compiled(module):
@@ -406,11 +422,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        self._torch_compile_registry.compile_once(
-            module,
-            compile_kwargs=compile_kwargs,
-        )
+        if getattr(self.server_args, "regional_compile", False):
+            compiled_count = self._torch_compile_registry.compile_regions_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
+            logger.info(
+                "Enabled regional torch.compile for %d submodules in %s",
+                compiled_count,
+                type(module).__name__,
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            self._torch_compile_registry.compile_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -422,6 +449,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
+
+    def _cache_dit_requested(self) -> bool:
+        return envs.SGLANG_CACHE_DIT_ENABLED
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
@@ -593,7 +623,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
         # warmup to mount cache-dit before Dynamo traces the transformer.
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
+        if not self._cache_dit_requested():
             return
         if batch.is_warmup and not getattr(
             self.server_args, "enable_torch_compile", False
@@ -681,9 +711,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
                 primary_num_steps,
-                envs.SGLANG_CACHE_DIT_FN,
-                envs.SGLANG_CACHE_DIT_BN,
-                envs.SGLANG_CACHE_DIT_RDT,
+                primary_config.Fn_compute_blocks,
+                primary_config.Bn_compute_blocks,
+                primary_config.residual_diff_threshold,
             )
 
         self._cache_dit_enabled = True

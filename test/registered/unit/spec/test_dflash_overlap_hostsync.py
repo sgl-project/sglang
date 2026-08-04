@@ -231,6 +231,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            model_config=SimpleNamespace(context_len=2048),
         )
         return HybridAttnBackend(runner, backend(prefill_flag), backend(decode_flag))
 

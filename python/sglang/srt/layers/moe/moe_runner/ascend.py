@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
@@ -87,7 +88,15 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if get_moe_a2a_backend().is_deepep():
+        if isinstance(kernel, NPUMXFP8MoEMethod):
+            # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
+            # separate activation step — run() skips it. Left None on purpose so
+            # that reaching for it fails loudly instead of silently applying an
+            # unfused swiglu to already-requantised activations. This holds for
+            # both dispatchers: ascend_tp gets its activation quant fused into
+            # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
+            self.activation = None
+        elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
@@ -134,29 +143,43 @@ class AscendRunnerCore(MoeRunnerCore):
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
-        # --- w13 (gate & up) projection ---
-        hidden_states = self.config.layer.w13_kernel.apply(
-            quant_info,
-            x,
-            expert_tokens,
-            pertoken_scale=runner_input.hidden_states_scale,
-            output_dtype=original_dtype,
-            weight_prefix="w13",
-            group_list_type=group_list_type,
-        )
+        w13_kernel = self.config.layer.w13_kernel
 
-        # --- Activation ---
-        # The DeepEP kernel expects extra dispatch metadata
-        if isinstance(self.activation, NPUSwigluDeepEPKernel):
-            hidden_states, pertoken_scale = self.activation._apply_activation(
-                hidden_states,
-                group_list=expert_tokens,
+        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+            # --- w13 projection + activation, fused into one kernel ---
+            # MXFP8 gmm1 returns activations already requantised for gmm2, so
+            # there is no separate activation step to run.
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
                 group_list_type=group_list_type,
             )
         else:
-            hidden_states, pertoken_scale = self.activation._apply_activation(
-                hidden_states
+            # --- w13 (gate & up) projection ---
+            hidden_states = w13_kernel.apply(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                output_dtype=original_dtype,
+                weight_prefix="w13",
+                group_list_type=group_list_type,
             )
+
+            # --- Activation ---
+            # The DeepEP kernel expects extra dispatch metadata
+            if isinstance(self.activation, NPUSwigluDeepEPKernel):
+                hidden_states, pertoken_scale = self.activation._apply_activation(
+                    hidden_states,
+                    group_list=expert_tokens,
+                    group_list_type=group_list_type,
+                )
+            else:
+                hidden_states, pertoken_scale = self.activation._apply_activation(
+                    hidden_states
+                )
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
