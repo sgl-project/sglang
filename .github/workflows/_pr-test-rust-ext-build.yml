@@ -167,6 +167,9 @@ jobs:
           # Per-job path: these runners are persistent and shared, so a fixed one
           # both inherits the previous job's venv and races a concurrent build.
           venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
+          # would fail the step, and nothing here is worth keeping for a postmortem.
+          trap 'rm -rf "${venv}" || true' EXIT
           uv venv "${venv}" --python python3.10 --seed
           # shellcheck disable=SC1091
           source "${venv}/bin/activate"
