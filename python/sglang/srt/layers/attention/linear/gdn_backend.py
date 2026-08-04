@@ -114,6 +114,18 @@ class GDNKernelDispatcher:
         self.tree_verify_kernel = triton_kernel
 
         cutedsl_kernel = None
+        flydsl_kernel = None
+
+        def _get_flydsl_kernel():
+            nonlocal flydsl_kernel
+            if flydsl_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+                    FlyDSLGDNKernel,
+                )
+
+                flydsl_kernel = FlyDSLGDNKernel()
+            return flydsl_kernel
+
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -134,6 +146,19 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
+        elif decode_backend.is_flydsl():
+            # FlyDSL recurrent decode (flydsl_gdr_decode), CUDA-graph-safe via
+            # need_shuffle_state=False + view-only reshapes + lru_cache warmup.
+            # Falls back to Triton if the aiter flydsl decode kernel is absent.
+            fk = _get_flydsl_kernel()
+            if fk.supports_flydsl_decode:
+                self.decode_kernel = fk
+            else:
+                rank0_log(
+                    "FlyDSL GDN decode kernel unavailable (aiter flydsl not "
+                    "importable). Falling back to Triton for decode."
+                )
+                self.decode_kernel = triton_kernel
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -173,6 +198,20 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_flydsl():
+            # FlyDSL prefill: chunk_gated_delta_rule_fwd_h swapped for aiter's
+            # FlyDSL fwd_h (~1.8-3x faster at TP-sharded shapes, bit-identical to
+            # Triton). Reuses the decode instance if already created. Falls back
+            # to Triton internally if aiter flydsl is absent.
+            fk = _get_flydsl_kernel()
+            if fk.supports_flydsl_extend:
+                self.extend_kernel = fk
+            else:
+                rank0_log(
+                    "FlyDSL GDN prefill kernel unavailable (aiter flydsl not "
+                    "importable). Falling back to Triton for prefill."
+                )
+                self.extend_kernel = triton_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
