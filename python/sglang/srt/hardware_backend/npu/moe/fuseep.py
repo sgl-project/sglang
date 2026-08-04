@@ -8,7 +8,7 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,54 @@ def _get_fuseep_buffer(layer: FusedMoE, normal_mode: bool = False):
     )
 
 
+def _prepare_routing_inputs(
+    layer: FusedMoE,
+    hidden_states: torch.Tensor,
+    topk_output: TopKOutput,
+    is_idle_dp_rank: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    #Select routing inputs, substituting a zero-weighted dummy route when idle.
+    if is_idle_dp_rank:
+        hidden_states = hidden_states.new_zeros((1, layer.hidden_size))
+        topk_ids = torch.zeros(
+            (1, topk_output.topk_ids.shape[1]),
+            dtype=topk_output.topk_ids.dtype,
+            device=hidden_states.device,
+        )
+        topk_weights = torch.ones(
+            (1, topk_output.topk_weights.shape[1]),
+            dtype=topk_output.topk_weights.dtype,
+            device=hidden_states.device,
+        )
+    else:
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+    topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
+    return hidden_states, topk_ids, topk_weights
+
+
+def _prepare_normal_inputs(
+    layer: FusedMoE,
+    hidden_states: torch.Tensor,
+    topk_output: TopKOutput,
+    use_dp_attention: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    #Prepare normal-mode (DispatchFFNCombine) inputs and output bounds.
+    num_output_tokens = hidden_states.shape[0]
+    global_num_tokens = get_dp_global_num_tokens() if use_dp_attention else None
+    num_input_tokens = max(num_output_tokens, sum(global_num_tokens) if global_num_tokens is not None else 0)
+    hidden_states, topk_ids, topk_weights = _prepare_routing_inputs(
+        layer, hidden_states, topk_output, num_output_tokens == 0
+    )
+    if use_dp_attention:
+        hidden_states = hidden_states.clone()
+        topk_ids = topk_ids.contiguous()
+        topk_weights = topk_weights.contiguous()
+    tp_size = 1 if use_dp_attention else get_tp_group().device_group.size()
+    max_output_size = max(num_input_tokens, 1) * topk_ids.shape[1] * tp_size
+    return hidden_states, topk_ids, topk_weights, num_output_tokens, max_output_size
+
+
 def forward_fuseep(
     layer: FusedMoE,
     hidden_states: torch.Tensor,
@@ -61,48 +109,17 @@ def forward_fuseep(
         up_clamp_max,
         up_add,
     ) = fuseep_activation.kernel_args()
-    fuse_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+    # if fuseep_normal_mode set, prefill->DISPATCH_FFN_COMBINE, decode->FUSED_DEEP_MOE; else use global config
     if fuseep_normal_mode is None:
-        fuseep_normal_mode = fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+        fuseep_normal_mode = get_exec().moe.fuseep_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
 
-    if (
-        fuseep_normal_mode
-        and fuse_mode == FusedMoEMode.DISPATCH_FFN_COMBINE.value
-    ):
+    if fuseep_normal_mode:
         buf = _get_fuseep_buffer(layer, normal_mode=True)
-        num_input_tokens = hidden_states.shape[0]
-        if is_dp_attention_enabled():
-            global_num_tokens = get_dp_global_num_tokens()
-            if global_num_tokens is not None:
-                num_input_tokens = max(num_input_tokens, sum(global_num_tokens))
-        num_output_tokens = hidden_states.shape[0]
-        is_idle_dp_rank = num_output_tokens == 0
-        if is_idle_dp_rank:
-            # The custom operator does not accept an empty input tensor. A zero
-            # weighted dummy route keeps every EP rank in the collective; discard
-            # its zero output before returning to the idle scheduler.
-            hidden_states = hidden_states.new_zeros((1, layer.hidden_size))
-            topk_ids = torch.zeros(
-                (1, topk_output.topk_ids.shape[1]),
-                dtype=topk_output.topk_ids.dtype,
-                device=hidden_states.device,
+        hidden_states, topk_ids, topk_weights, num_output_tokens, max_output_size = (
+            _prepare_normal_inputs(
+                layer, hidden_states, topk_output, is_dp_attention_enabled()
             )
-            topk_weights = torch.ones(
-                (1, topk_output.topk_weights.shape[1]),
-                dtype=topk_output.topk_weights.dtype,
-                device=hidden_states.device,
-            )
-        else:
-            topk_ids = topk_output.topk_ids
-            topk_weights = topk_output.topk_weights
-        topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
-        if is_dp_attention_enabled():
-            hidden_states = hidden_states.clone()
-            topk_ids = topk_ids.contiguous()
-            topk_weights = topk_weights.contiguous()
-        max_output_size = max(num_input_tokens, 1) * topk_ids.shape[1]
-        if not is_dp_attention_enabled():
-            max_output_size *= get_tp_group().device_group.size()
+        )
         hidden_states, _ = buf.fused_deep_moe(
             hidden_states,
             topk_idx=topk_ids,
@@ -113,7 +130,7 @@ def forward_fuseep(
             gmm2_weight_scale=layer.w2_weight_scale,
             num_max_dispatch_tokens_per_rank=max_output_size,
             num_experts=layer.num_experts,
-            fuse_mode=fuse_mode,
+            fuse_mode=FusedMoEMode.DISPATCH_FFN_COMBINE.value,
             activation_type=activation_type,
             activation_alpha=activation_alpha,
             gate_clamp_max=gate_clamp_max,
@@ -124,25 +141,9 @@ def forward_fuseep(
         return hidden_states[:num_output_tokens]
 
     is_idle_dp_rank = is_dp_attention_enabled() and hidden_states.shape[0] == 0
-    if is_idle_dp_rank:
-        # All EP ranks must enter the low-latency collective. Use a valid
-        # expert-0 route and discard its result for idle DP ranks.
-        hidden_states = hidden_states.new_zeros((1, layer.hidden_size))
-        topk_ids = torch.zeros(
-            (1, topk_output.topk_ids.shape[1]),
-            dtype=topk_output.topk_ids.dtype,
-            device=hidden_states.device,
-        )
-        topk_weights = torch.ones(
-            (1, topk_output.topk_weights.shape[1]),
-            dtype=topk_output.topk_weights.dtype,
-            device=hidden_states.device,
-        )
-    else:
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-    # Low-latency routing also indexes every expert id, including masked tokens.
-    topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)
+    hidden_states, topk_ids, topk_weights = _prepare_routing_inputs(
+        layer, hidden_states, topk_output, is_idle_dp_rank
+    )
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
