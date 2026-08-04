@@ -16,7 +16,6 @@ export const config = {
     { id: "fp8", label: "FP8" },
   ],
   strategies: [
-    { id: "low-latency", label: "Low-Latency" },
     { id: "balanced", label: "Balanced" },
   ],
   nodesOptions: [
@@ -31,7 +30,6 @@ export const config = {
   placeholders: {
     HOST_IP:      { target: "command", label: "Bind host",          default: "0.0.0.0"              },
     PORT:         { target: "command", label: "Bind port",          default: "30000"                },
-    DSPARK_DRAFT: { target: "command", label: "DSpark draft model", default: "<dspark-draft-model>" },
     HF_TOKEN:     { target: "command", label: "HF token (Docker)",  default: "<your-hf-token>"      },
     CURL_HOST:    { target: "curl",    label: "Server host",        default: "localhost"            },
     CURL_PORT:    { target: "curl",    label: "Server port",        default: "30000"                },
@@ -91,8 +89,6 @@ sgl-eval run gsm8k \\
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off (greedy)" },
         { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
-        { id: "dspark", label: "DSPARK",
-          flags: ["--speculative-algorithm DSPARK", "--speculative-draft-model-path {{DSPARK_DRAFT}}"] },
       ],
     },
   },
@@ -233,21 +229,6 @@ sgl-eval run gsm8k \\
         "--tp 4",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
-        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      env: ["SGLANG_RAGGED_VERIFY_MODE=static"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--context-length 262144",
-        "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path {{DSPARK_DRAFT}}",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
