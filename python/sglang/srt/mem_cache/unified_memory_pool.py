@@ -710,8 +710,9 @@ class UnifiedMambaPool(MambaPool):
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
         self.num_mamba_layers = spec.layer_num
-        # GDN/KDA ReplaySSM unsupported; replicate parent's disabled-state attrs so
-        # paths guarded by `replayssm_write_pos is not None` don't AttributeError.
+        # GDN/KDA ReplaySSM / spec unsupported; replicate parent's disabled-state
+        # attrs so unconditional reads (e.g. `replayssm_cache_base is not None` in
+        # the req-slot alloc path) and `... is not None` guards don't AttributeError.
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None

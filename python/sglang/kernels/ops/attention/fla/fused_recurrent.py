@@ -353,6 +353,40 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
+    # Batched-decode CUDA fast path:
+    # row-streaming state update reaches the in-place R+W bandwidth of the
+    # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
+    # [BV, K] register tile per warp. ULP-level output differences only
+    # (reduction order); small batches keep triton (launch-bound anyway).
+    if use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
+
+        if kda_decode_cuda.covered(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+            H,
+        ):
+            kda_decode_cuda.kda_packed_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                out,
+                ssm_state_indices,
+                H,
+                None,  # plain GDN gate: no lower bound
+            )
+            return out, initial_state
+
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
         raise ValueError(

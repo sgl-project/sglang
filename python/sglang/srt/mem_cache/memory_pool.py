@@ -344,7 +344,7 @@ class MambaPool:
         #   replayssm_rawv: [num_layers, num_slots, HV, L, V]  (conv/activation dtype)
         #   replayssm_rawk: [num_layers, num_slots, H,  L, K]  (conv/activation dtype)
         #   replayssm_beta: [num_layers, num_slots, HV, L]     (fp32)
-        # The raw rings + beta exist only under --enable-gdn-replayssm-spec: the
+        # The raw rings + beta exist only under --enable-linear-replayssm-spec: the
         # closed-loop exact fold sequentially replays them through the recurrent
         # update at flush -- bit-identical to the recurrent baseline -- instead
         # of folding the chunked `d` records open-loop (which accumulates error
@@ -380,7 +380,7 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
+        # None under --enable-linear-replayssm-spec: the spec ring owns rollback
         # (verify writes ring records, commit moves cursors), so the per-draft
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
@@ -489,7 +489,8 @@ class MambaPool:
         # chunked (d, k) records + write_pos; the spec-verify flag
         # (--enable-gdn-replayssm-spec) always uses fold-every-commit and
         # allocates only the raw (v, k, g, beta) window -- no chunked records,
-        # no cursors. The shared g allocation gates on `_replayssm_on`.
+        # no cursors (KDA additionally keeps d/k, see the allocation below).
+        # The shared g allocation gates on `_replayssm_on`.
         self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
         self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
         _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
@@ -570,7 +571,7 @@ class MambaPool:
             # flag is on; otherwise left as None so the legacy State is
             # byte-identical. temporal_state_shape == (HV, V, K). Either the decode
             # ring (--enable-linear-replayssm) or the spec-verify ring
-            # (--enable-gdn-replayssm-spec) shares this allocation.
+            # (--enable-linear-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
             if _replayssm_on:
@@ -580,7 +581,7 @@ class MambaPool:
                 num_slots = size + 1
                 # Ring dtype. DECODE ring (--enable-linear-replayssm): records
                 # follow the SSM dtype -- its flush folds `d` directly into the
-                # state. SPEC-verify ring (--enable-gdn-replayssm-spec): d/k feed
+                # state. SPEC-verify ring (--enable-linear-replayssm-spec): d/k feed
                 # ONLY the one-shot output reconstruction (the closed-loop exact
                 # fold replays the raw rings for state instead), so their
                 # quantization noise stays below the bf16 output cast; keep them
@@ -588,8 +589,15 @@ class MambaPool:
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
                 ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
-                # Fold-every-commit: one verify window, no chunked (d, k) records.
-                if self.replayssm_spec_fold:
+                # Fold-every-commit: one verify window, no chunked (d, k)
+                # records. KDA is the exception on both counts: its window
+                # stays L-sized (the fused verify ring-write drops
+                # absorb-inflated rows past L), and d/k stay allocated --
+                # forward_decode routes on `replayssm_d is None` (fused vs
+                # decode-ring), so skipping them would flip KDA decode to the
+                # fused path, a behavior change needing its own validation
+                # (memory follow-up).
+                if self.replayssm_spec_fold and not cache_params.is_kda:
                     record_len = (
                         speculative_num_draft_tokens
                         if speculative_num_draft_tokens is not None
@@ -597,6 +605,7 @@ class MambaPool:
                     )
                 else:
                     record_len = L
+                if not self.replayssm_spec_fold or cache_params.is_kda:
                     replayssm_d = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, L, v_dim),
                         dtype=ring_dtype,
@@ -627,6 +636,21 @@ class MambaPool:
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
                 if enable_gdn_replayssm_spec:
+                    if cache_params.is_kda:
+                        # Backstop for the KDA ring invariants; this pool is
+                        # sized with the final adaptive-aware draft maximum.
+                        if L & (L - 1) != 0:
+                            raise ValueError(
+                                f"spec-verify ring length must be a power of two, got {L}"
+                            )
+                        if (
+                            speculative_num_draft_tokens is not None
+                            and L < 2 * speculative_num_draft_tokens
+                        ):
+                            raise ValueError(
+                                f"spec-verify ring too small: {L} < "
+                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                            )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=conv_dtype,
@@ -662,6 +686,10 @@ class MambaPool:
                 # The recurrent-verify fallback cannot be reached under the flag
                 # (GDN + linear chain + triton enforced in server_args; the
                 # backend asserts loudly if it ever is).
+                # ReplaySSM skips this dominant scratch (~9GB @ K3 dspark γ=7): the
+                # KDA verify kernel takes intermediate_states_buffer=None (skips the
+                # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
+                # replays the ring into the checkpoint instead. This is the memory win.
                 if enable_gdn_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
@@ -3651,7 +3679,7 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool
-        # is dense over only full-attention layers. Shape discovery does not
+        # is dense over only full-attention layers.  Shape discovery does not
         # need a global layer lookup, so delegate it to that backing pool.
         return self.full_kv_pool.get_kv_buffer_shape()
 

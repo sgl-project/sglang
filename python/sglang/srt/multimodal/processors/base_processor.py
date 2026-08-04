@@ -1510,6 +1510,7 @@ class BaseMultimodalProcessor(ABC):
             # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
             if (
                 envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and not getattr(self, "preserve_processor_input_ids", False)
                 and base_output.input_ids is not None
                 and input_ids is not None
                 and raw_images
