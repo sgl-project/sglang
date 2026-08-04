@@ -14,7 +14,10 @@ import torch
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_mha_extend,
+    filter_dcp_local_kv_indices,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -191,7 +194,7 @@ class DeepseekMHARocmForwardMixin:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        self._set_mla_kv_buffer_rocm(latent_cache, kv_a, k_pe, forward_batch)
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
@@ -221,7 +224,7 @@ class DeepseekMHARocmForwardMixin:
                         k_pe,
                     )
                 else:
-                    kv_a, k_pe = self._get_mla_kv_buffer(
+                    kv_a, k_pe = self._get_mla_kv_buffer_rocm(
                         forward_batch.fetch_mha_one_shot_kv_indices(),
                         q.dtype,
                         forward_batch,
@@ -278,3 +281,44 @@ class DeepseekMHARocmForwardMixin:
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
         return k
+
+    def _set_mla_kv_buffer_rocm(
+        self: DeepseekV2AttentionMLA,
+        latent_cache: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if _use_aiter_gfx95:
+            get_token_to_kv_pool().set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
+        else:
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
+            get_token_to_kv_pool().set_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
+
+    def _get_mla_kv_buffer_rocm(
+        self: DeepseekV2AttentionMLA,
+        kv_indices: torch.Tensor,
+        dst_dtype: torch.dtype,
+        forward_batch: ForwardBatch,
+    ):
+        if _use_aiter_gfx95:
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
+                self.attn_mha, kv_indices, dst_dtype
+            )
+            kv_a = kv_a.squeeze(1)
+        else:
+            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
+                self.attn_mha.layer_id
+            )
+            latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            kv_a, k_pe = latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_a = kv_a.squeeze(1).contiguous()
+        return kv_a, k_pe

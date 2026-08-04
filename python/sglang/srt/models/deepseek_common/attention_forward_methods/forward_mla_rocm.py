@@ -4,8 +4,7 @@
 choice out of the shared `forward_mla.py` and lets non-AMD builds avoid
 importing `aiter` altogether.
 
-The BMM absorb steps stay module level because the fused-RoPE decode path in
-`forward_mla_fused_rope_rocm.py` reuses them.
+The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 """
 
 from __future__ import annotations
@@ -299,6 +298,13 @@ class DeepseekMLAAbsorbRocmForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        q_replicate_active = (
+            get_parallel().dcp_replicate_q_proj
+            and is_dcp_mla_decode_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -387,6 +393,7 @@ class DeepseekMLAAbsorbRocmForwardMixin:
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
+                and not q_replicate_active
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -410,7 +417,14 @@ class DeepseekMLAAbsorbRocmForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj_forward(q)
+                if q_replicate_active:
+                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
+                        -1,
+                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.qk_head_dim,
+                    )
+                else:
+                    q = self.q_b_proj_forward(q)
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
@@ -426,57 +440,75 @@ class DeepseekMLAAbsorbRocmForwardMixin:
                             self.layer_id, prev_topk_indices
                         )
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if q_replicate_active:
+                q = torch.nn.functional.linear(
+                    hidden_states, self.q_b_proj_qrep_weight
+                ).view(
+                    -1,
+                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.qk_head_dim,
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
-        _kvb_q = None
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_q_prepare,
+        if q_replicate_active:
+            q_nope_out = (
+                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
+                .transpose(0, 1)
+                .contiguous()
             )
-
-            _kvb_q = kv_b_lora_q_prepare(self, q_nope)
-
-        if self.use_deep_gemm_bmm:
-            (
-                q_nope_val,
-                q_nope_scale,
-                masked_m,
-                expected_m,
-                aligned_m,
-            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
-            )
-            q_nope_out = q_nope_out[:, :expected_m, :]
         else:
-            q_nope_out = rocm_absorb_q_bmm(
-                self, q_nope, is_capture_mode=get_is_capture_mode()
-            )
+            _kvb_q = None
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_prepare,
+                )
 
-        q_nope_out = q_nope_out.transpose(0, 1)
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_q_apply,
-            )
+                _kvb_q = kv_b_lora_q_prepare(self, q_nope)
 
-            q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-        elif is_kv_b_lora_active(self):
-            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+            if self.use_deep_gemm_bmm:
+                (
+                    q_nope_val,
+                    q_nope_scale,
+                    masked_m,
+                    expected_m,
+                    aligned_m,
+                ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    q_nope.transpose(0, 1)
+                )
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (q_nope_val, q_nope_scale),
+                    (self.w_kc, self.w_scale_k),
+                    q_nope_out,
+                    masked_m,
+                    expected_m,
+                )
+                q_nope_out = q_nope_out[:, :expected_m, :]
+            else:
+                q_nope_out = rocm_absorb_q_bmm(
+                    self, q_nope, is_capture_mode=get_is_capture_mode()
+                )
+
+            q_nope_out = q_nope_out.transpose(0, 1)
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_apply,
+                )
+
+                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+            elif is_kv_b_lora_active(self):
+                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
@@ -522,11 +554,11 @@ class DeepseekMLAAbsorbRocmForwardMixin:
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
             if is_dcp_mla_decode_phase(forward_batch):
-                # if forward_batch.forward_mode is decode, gather q
-                q_nope_out, q_pe = all_gather_q_for_mla_decode(
-                    q_nope_out=q_nope_out,
-                    q_pe=q_pe,
-                )
+                if not q_replicate_active:
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(

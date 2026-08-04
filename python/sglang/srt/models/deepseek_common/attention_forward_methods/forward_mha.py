@@ -23,7 +23,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_musa,
     _is_npu,
-    _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -424,7 +423,7 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda or _use_aiter_gfx95:
+        if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
@@ -449,7 +448,7 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda or _use_aiter_gfx95:
+        if _is_cuda:
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
