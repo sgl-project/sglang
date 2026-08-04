@@ -25,7 +25,7 @@ import unittest
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
     UnsupportedQuantForIPCError,
-    check_ipc_quant_support,
+    WeightCacheQuantStates,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
@@ -33,7 +33,6 @@ from sglang.srt.weight_cache.protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
-    is_ipc_quant_supported,
     recv_msg,
     send_msg,
 )
@@ -216,57 +215,65 @@ class TestGlobalRankAndPaths(CustomTestCase):
 
 class TestIpcQuantAllowlist(CustomTestCase):
     def test_unquantized_is_supported(self):
-        self.assertTrue(is_ipc_quant_supported("", None))
+        self.assertTrue(WeightCacheQuantStates.is_supported("", None))
 
     def test_block_fp8_supported_but_per_tensor_fp8_rejected(self):
         self.assertTrue(
-            is_ipc_quant_supported("fp8", {"weight_block_size": [128, 128]})
+            WeightCacheQuantStates.is_supported(
+                "fp8", {"weight_block_size": [128, 128]}
+            )
         )
         # Per-tensor FP8 (no weight_block_size) transposes the weight during
         # post-processing -> not reproducible by the meta-init client.
-        self.assertFalse(is_ipc_quant_supported("fp8", {}))
-        self.assertFalse(is_ipc_quant_supported("fp8", None))
+        self.assertFalse(WeightCacheQuantStates.is_supported("fp8", {}))
+        self.assertFalse(WeightCacheQuantStates.is_supported("fp8", None))
 
     def test_nvfp4_supported(self):
-        self.assertTrue(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4"}))
         self.assertTrue(
-            is_ipc_quant_supported(
+            WeightCacheQuantStates.is_supported("modelopt_fp4", {"quant_algo": "NVFP4"})
+        )
+        self.assertTrue(
+            WeightCacheQuantStates.is_supported(
                 "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4"}}
             )
         )
 
     def test_non_nvfp4_modelopt_variants_rejected(self):
-        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "FP8"}))
+        self.assertFalse(
+            WeightCacheQuantStates.is_supported("modelopt_fp4", {"quant_algo": "FP8"})
+        )
         # Unsupported yet
         self.assertFalse(
-            is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4_AWQ"})
+            WeightCacheQuantStates.is_supported(
+                "modelopt_fp4", {"quant_algo": "NVFP4_AWQ"}
+            )
         )
         self.assertFalse(
-            is_ipc_quant_supported(
+            WeightCacheQuantStates.is_supported(
                 "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4_AWQ"}}
             )
         )
         # No quantization_config at all: nothing states the checkpoint is NVFP4.
-        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", None))
+        self.assertFalse(WeightCacheQuantStates.is_supported("modelopt_fp4", None))
 
     def test_unknown_method_rejected(self):
-        self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
-        self.assertFalse(is_ipc_quant_supported("awq", None))
+        self.assertFalse(WeightCacheQuantStates.is_supported("gptq_marlin", None))
+        self.assertFalse(WeightCacheQuantStates.is_supported("awq", None))
         # Quantize-on-load NVFP4 reports a different method name and must NOT be
         # picked up by the modelopt_fp4 (serialized) allowlist entry.
-        self.assertFalse(is_ipc_quant_supported("nvfp4_online", None))
+        self.assertFalse(WeightCacheQuantStates.is_supported("nvfp4_online", None))
 
     def test_check_raises_on_unsupported(self):
         with self.assertRaises(UnsupportedQuantForIPCError):
-            check_ipc_quant_support("awq", None, where="client")
+            WeightCacheQuantStates.check_supported("awq", None, where="client")
         # Per-tensor FP8 must also raise even though "fp8" is a known key.
         with self.assertRaises(UnsupportedQuantForIPCError):
-            check_ipc_quant_support("fp8", {}, where="daemon")
+            WeightCacheQuantStates.check_supported("fp8", {}, where="daemon")
 
     def test_check_passes_on_supported(self):
         # Should not raise.
-        check_ipc_quant_support("", None, where="daemon")
-        check_ipc_quant_support(
+        WeightCacheQuantStates.check_supported("", None, where="daemon")
+        WeightCacheQuantStates.check_supported(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
 

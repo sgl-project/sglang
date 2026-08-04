@@ -4,6 +4,8 @@
 Defines CacheConfig for validation and socket message protocol helpers.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -68,7 +70,7 @@ class CacheConfig(msgspec.Struct):
     torch_version: str  # torch.__version__ of the process that built the weights
     fp4_gemm_backend: str
 
-    def matches(self, other: "CacheConfig") -> bool:
+    def matches(self, other: CacheConfig) -> bool:
         """Check if two configs are compatible for weight sharing."""
         return self == other
 
@@ -76,7 +78,7 @@ class CacheConfig(msgspec.Struct):
         return {f: getattr(self, f) for f in self.__struct_fields__}
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "CacheConfig":
+    def from_dict(cls, d: Dict[str, Any]) -> CacheConfig:
         return cls(**d)
 
 
@@ -180,45 +182,6 @@ def _nvfp4_round_trips_via_ipc(quant_config: Any) -> bool:
     return quant_algo == "NVFP4"
 
 
-def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
-    """Whether this method + config is verified for IPC zero-copy sharing.
-
-    The WeightCacheQuantStates registry below is the single source of truth: a
-    method is supported iff it registered a states class (declaring how its
-    post-processing state crosses) and that entry's predicate accepts this
-    particular config. Names resolve at call time, so the registry may be
-    defined after this function.
-    """
-    registered = WeightCacheQuantStates._registry.get(quant_method)
-    return registered is not None and bool(registered.is_supported(quant_config))
-
-
-def check_ipc_quant_support(
-    quant_method: str, quant_config: Any, *, where: str
-) -> None:
-    """Hard-error unless `quant_method` + `quant_config` is verified for IPC.
-
-    `where` is a short tag ("daemon" / "client") used only in the message.
-    """
-    if is_ipc_quant_supported(quant_method, quant_config):
-        return
-
-    verified = ", ".join(
-        (repr(m) if m else "'' (unquantized)") for m in WeightCacheQuantStates._registry
-    )
-    raise UnsupportedQuantForIPCError(
-        f"[weight_cache:{where}] quantization method {quant_method!r} is not "
-        f"verified for CUDA IPC zero-copy weight sharing. Its "
-        f"process_weights_after_loading may stamp Python-side metadata "
-        f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
-        f"meta-initialized client cannot reproduce, which would silently serve "
-        f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
-        f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8; NVFP4 only for quant_algo=NVFP4, not NVFP4_AWQ. "
-        f"Disable the weight cache (--weight-cache-mode off) for this model."
-    )
-
-
 _TRANSFERABLE_ATTR_TYPES = (int, float, bool, str, type(None))
 
 
@@ -235,7 +198,7 @@ class _RegisteredQuant(msgspec.Struct, frozen=True):
     a callable, so this never crosses the socket.
     """
 
-    states_cls: Type["WeightCacheQuantStates"]
+    states_cls: Type[WeightCacheQuantStates]
     is_supported: Callable[[Any], bool]
     capture_attrs: frozenset
 
@@ -250,7 +213,7 @@ class WeightCacheQuantStates:
     here and constructing the base dispatches to it.
     """
 
-    quant_config: "QuantizationConfig"
+    quant_config: QuantizationConfig
     quant_method: str
     module_attrs: Dict[str, Dict[str, Any]]
 
@@ -276,27 +239,55 @@ class WeightCacheQuantStates:
 
         return decorator
 
+    @classmethod
+    def check_supported(
+        cls, quant_method: str, quant_config: Any, *, where: str
+    ) -> None:
+        """Hard-error unless `quant_method` + `quant_config` is verified for IPC.
+
+        Separate from constructing the states object because callers need to
+        gate *before* they know a daemon exists -- and before they have the
+        published server args that __init__ requires.
+
+        `where` is a short tag ("daemon" / "client") used only in the message.
+        """
+        registered = cls._registry.get(quant_method)
+        if registered is not None and bool(registered.is_supported(quant_config)):
+            return
+
+        verified = ", ".join(
+            (repr(m) if m else "'' (unquantized)") for m in cls._registry
+        )
+        raise UnsupportedQuantForIPCError(
+            f"[weight_cache:{where}] quantization method {quant_method!r} is not "
+            f"verified for CUDA IPC zero-copy weight sharing. Its "
+            f"process_weights_after_loading may stamp Python-side metadata "
+            f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
+            f"meta-initialized client cannot reproduce, which would silently serve "
+            f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
+            f"only verified for block-wise configs (weight_block_size set), not "
+            f"per-tensor FP8; NVFP4 only for quant_algo=NVFP4, not NVFP4_AWQ. "
+            f"Disable the weight cache (--weight-cache-mode off) for this model."
+        )
+
     def __new__(
         cls,
-        quant_config: "QuantizationConfig",
+        quant_config: QuantizationConfig,
         quant_method: str,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         *,
         where: str,
-    ) -> "WeightCacheQuantStates":
+    ) -> WeightCacheQuantStates:
         assert cls is WeightCacheQuantStates
-
-        # An unregistered method and a registered one whose config variant was
-        # never verified are equally unsafe to map; both raise here.
-        check_ipc_quant_support(quant_method, quant_config, where=where)
+        cls.check_supported(quant_method, quant_config, where=where)
 
         return object.__new__(cls._registry[quant_method].states_cls)
 
     def __init__(
         self,
-        quant_config: "QuantizationConfig",
+        quant_config: QuantizationConfig,
         quant_method: str,
-        server_args: "ServerArgs",
+        server_args: ServerArgs,
         *,
         where: str,
     ) -> None:
@@ -320,7 +311,7 @@ class WeightCacheQuantStates:
             f"attrs to transfer: {sorted(self._capture_attrs) or 'none'}"
         )
 
-    def capture_module_attrs(self, model: "nn.Module") -> None:
+    def capture_module_attrs(self, model: nn.Module) -> None:
         """Snapshot this method's layout attributes off the post-processed model.
 
         Matched by attribute name alone: the names are method-specific (only an
@@ -342,7 +333,7 @@ class WeightCacheQuantStates:
                 self.module_attrs[name] = captured
 
     def apply_module_attrs(
-        self, model: "nn.Module", module_attrs: Dict[str, Dict[str, Any]]
+        self, model: nn.Module, module_attrs: Dict[str, Dict[str, Any]]
     ) -> int:
         """Stamp the daemon's captured attributes onto this process's modules.
 
@@ -389,7 +380,7 @@ class WeightCacheQuantStates:
         """Whether post-processing changes the shape of exported tensors."""
         raise NotImplementedError
 
-    def ipc_rebind_after_import(self, layer: "nn.Module") -> None:
+    def ipc_rebind_after_import(self, layer: nn.Module) -> None:
         """Re-establish state that depends on tensor identity, per module."""
         raise NotImplementedError
 
@@ -407,7 +398,7 @@ class TensorOnlyQuantStates(WeightCacheQuantStates):
     def ipc_reshapes_weights(self) -> bool:
         return False
 
-    def ipc_rebind_after_import(self, layer: "nn.Module") -> None:
+    def ipc_rebind_after_import(self, layer: nn.Module) -> None:
         return
 
 
@@ -434,7 +425,7 @@ class ModeloptFP4QuantStates(WeightCacheQuantStates):
         # swizzled, so exported shapes differ from what create_weights made.
         return True
 
-    def ipc_rebind_after_import(self, layer: "nn.Module") -> None:
+    def ipc_rebind_after_import(self, layer: nn.Module) -> None:
         """Hand the MoE token dispatcher this layer's input global scale.
 
         The scale is a tensor reference, so a client -- which maps the daemon's

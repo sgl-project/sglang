@@ -27,7 +27,6 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import (
     CacheConfig,
     WeightCacheQuantStates,
-    check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
@@ -97,7 +96,9 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        WeightCacheQuantStates.check_supported(
+            quant_method, engine_quant_config, where="client"
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config)
@@ -396,7 +397,8 @@ class IpcModelLoader(BaseModelLoader):
                 f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
                 f"mismatch between the IPC daemon and the meta-initialized model. "
                 f"The quantization method passed the IPC allowlist gate "
-                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
+                f"(WeightCacheQuantStates.check_supported), so this is NOT an "
+                f"unsupported-quant "
                 f"case — it indicates the daemon's weight fingerprint is "
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
@@ -423,7 +425,10 @@ class IpcModelLoader(BaseModelLoader):
                 f"[IpcModelLoader] Applied daemon module attributes "
                 f"({changed} changed across {len(module_attrs)} modules)"
             )
-        self._rebind_quant_state_after_import(model, quant_states)
+        for _, module in model.named_modules():
+            if getattr(module, "quant_method", None) is None:
+                continue
+            quant_states.ipc_rebind_after_import(module)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -477,21 +482,6 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         return model
-
-    @staticmethod
-    def _rebind_quant_state_after_import(model, quant_states) -> None:
-        """Re-establish state that depends on tensor identity.
-
-        Post-processing may hand other objects references to the tensors it
-        produced (NVFP4 MoE gives the token dispatcher its input global scale).
-        Those are the daemon's objects, so the quant states object redoes that
-        wiring against this process's IPC-mapped tensors; it decides per module
-        whether there is anything to do.
-        """
-        for _, module in model.named_modules():
-            if getattr(module, "quant_method", None) is None:
-                continue
-            quant_states.ipc_rebind_after_import(module)
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
