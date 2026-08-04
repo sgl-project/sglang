@@ -198,6 +198,16 @@ def capture_prefill_graph(
             capture_time=capture_time,
         )
 
+    # CPU graph is currently supported only by the Intel AMX attention backend.
+    if model_runner.device == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return None
+        if model_runner.is_draft_worker and not force_for_draft_worker:
+            return None
+        if not model_runner._uses_cpu_graph_attention_backend():
+            return None
+        return CPUGraphRunner(model_runner)
+
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
             "Disable prefill CUDA graph because cuda_graph_config "
@@ -402,8 +412,15 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         Phase.DECODE, Backend.DISABLED
     ):
         return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+    if model_runner.device == "cpu":
+        if isinstance(model_runner.prefill_cuda_graph_runner, CPUGraphRunner):
+            return DecodeGraphCapture(
+                runner=model_runner.prefill_cuda_graph_runner, graph_mem_usage=0
+            )
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
+        if not model_runner._uses_cpu_graph_attention_backend():
+            return no_capture
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

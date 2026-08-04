@@ -447,6 +447,9 @@ void extend_attention_cpu(
         k_extend_opt.has_value() && v_extend_opt.has_value(),
         "k_extend and v_extend are required for non-cross attention");
   }
+  if (max_len_extend <= 0) {
+    max_len_extend = extend_seq_lens.max().item<int64_t>();
+  }
   // Since k_extend and v_extend are not used for cross attention, they can be initialized as k_buffer and v_buffer
   // here.
   auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;

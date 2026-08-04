@@ -1124,6 +1124,13 @@ class ModelRunner:
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
 
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
+
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
