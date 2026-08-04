@@ -38,6 +38,8 @@ SPECULATIVE_NUM_DRAFT_TOKENS=4
 KILL_EXISTING=false
 SKIP_WARMUP=true
 SCHEDULE_POLICY=lpm
+KEEP_ALIVE=false
+KEEP_ALIVE_INTERVAL=45
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -56,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --kill-existing) KILL_EXISTING=true; shift ;;
         --warmup) SKIP_WARMUP=false; shift ;;
         --schedule-policy) SCHEDULE_POLICY="$2"; shift 2 ;;
+        --keep-alive) KEEP_ALIVE=true; shift ;;
+        --keep-alive-interval) KEEP_ALIVE_INTERVAL="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -138,7 +142,29 @@ echo " 并发: $MAX_RUNNING_REQUESTS/worker × $DP_SIZE = $(( MAX_RUNNING_REQUES
 echo " RadixTree: enabled"
 echo " Speculative(MTP): $ENABLE_SPECULATIVE"
 echo " schedule-policy: $SCHEDULE_POLICY  预热: $([ "$SKIP_WARMUP" = true ] && echo skip || echo on)"
+echo " keep-alive: $([ "$KEEP_ALIVE" = true ] && echo "on 每${KEEP_ALIVE_INTERVAL}s" || echo off)"
 echo "=========================================="
+
+# ==================== 常驻 keep-alive ====================
+# 服务 ready 后每 KEEP_ALIVE_INTERVAL 秒发一个轻量请求（短 prompt、非 thinking、max_tokens 4）
+# 作用: 覆盖懒加载/空闲后首请求开销，兼做健康检查；不能替代 10.7 方案一的启动前预热
+if [ "$KEEP_ALIVE" = true ]; then
+    (
+        for i in $(seq 1 120); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models" && break
+            sleep 5
+        done
+        while true; do
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/chat/completions" \
+                -H 'Content-Type: application/json' \
+                -d "{\"model\":\"$SERVED_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":4}" \
+                || echo "[keep-alive] 请求失败，server 可能未就绪"
+            sleep "$KEEP_ALIVE_INTERVAL"
+        done
+    ) &
+    KEEP_ALIVE_PID=$!
+    trap 'kill $KEEP_ALIVE_PID 2>/dev/null || true' EXIT
+fi
 
 # K8s pod 内 GPU_IDS 为空时沿用环境已有的 CUDA_VISIBLE_DEVICES（否则空值会禁用全部 GPU）
 CUDA_VISIBLE_DEVICES=${GPU_IDS:-$CUDA_VISIBLE_DEVICES} python3.12 -m sglang.launch_server \

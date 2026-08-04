@@ -466,6 +466,7 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 - 作用：覆盖可能存在的懒加载/空闲后首请求开销；保持 autotune 缓存条目常热；兼做健康检查（非 200 即告警）；
 - 成本：每请求毫秒级，可忽略；
 - 注意：keep-alive **不能替代方案一**——它防的是"空闲后首请求慢"，不负责把内核编译完；
+- 落地：`sglang_start.sh` 已内置 `--keep-alive`（默认 45s 间隔，`--keep-alive-interval` 可调）；K8s 中也可用 sidecar 容器实现；
 - 部署：任意常驻进程/cron 均可（如 gateway 或独立 systemd timer）。
 
 **方案三：autotune 缓存稳定后加 `--disable-flashinfer-autotune`**
