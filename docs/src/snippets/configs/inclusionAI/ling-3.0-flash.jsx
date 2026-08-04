@@ -245,6 +245,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--context-length 262144",
         "--speculative-algorithm DSPARK",
         "--speculative-draft-model-path {{DSPARK_DRAFT}}",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
