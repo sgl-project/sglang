@@ -2691,8 +2691,7 @@ class NixlKVManager(CommonKVManager):
     def _fail_bootstrap_message(self, waiting_req_bytes: List[bytes]):
         # Foreign or malformed traffic reaches this socket (see the GUARD check);
         # it must not take the bootstrap loop down with it.
-        header = waiting_req_bytes[0][:32] if waiting_req_bytes else b""
-        logger.exception(f"Failed to handle bootstrap message (header={header!r}).")
+        self._log_message_failure(waiting_req_bytes, "bootstrap")
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():

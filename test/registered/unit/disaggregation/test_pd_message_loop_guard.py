@@ -52,6 +52,25 @@ class TestBootstrapMessageGuard(unittest.TestCase):
         mgr._fail_bootstrap_message([b"7", b"ep", b"0", b"\xff\xfe"])
         self.assertEqual(len(mgr.failed_sessions), 1)
 
+    def test_mooncake_fail_handler_attributes_watermark_session(self):
+        # [b"WATERMARK", round, tail, session] -- frame 3 really is the session.
+        mgr = _mooncake_mgr()
+        mgr._fail_bootstrap_message([b"WATERMARK", b"1", b"2", b"session-a"])
+        self.assertIn("session-a", mgr.failed_sessions)
+
+    def test_mooncake_fail_handler_skips_frames_without_a_session_at_3(self):
+        # STAGING_RSP holds the staging offset at 3 (session at 6) and ABORT holds
+        # the decode port, so neither may be recorded as a failed session.
+        for msg in (
+            [b"STAGING_RSP", b"7", b"0", b"4096", b"1", b"1", b"session-a"],
+            [b"ABORT", b"7", b"10.0.0.1", b"31337"],
+        ):
+            with self.subTest(tag=msg[0]):
+                mgr = _mooncake_mgr()
+                mgr._fail_bootstrap_message(msg)
+                self.assertEqual(mgr.failed_sessions, set())
+                self.assertEqual(dict(mgr.session_failures), {})
+
     def test_mooncake_decode_fail_handler_never_raises(self):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         for msg in MALFORMED:

@@ -325,6 +325,11 @@ class CommonKVManager(BaseKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
+    def _log_message_failure(self, msg: List[bytes], kind: str) -> None:
+        """One log shape across backends for a message no server loop could handle."""
+        header = msg[0][:32] if msg else b""
+        logger.exception(f"Failed to handle {kind} message (header={header!r}).")
+
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason

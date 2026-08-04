@@ -1907,18 +1907,29 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 self.update_status(room, KVPoll.WaitingForInput)
 
+    @staticmethod
+    def _bootstrap_message_session(waiting_req_bytes: List[bytes]) -> Optional[str]:
+        """Session id at frame 3, or None when this message shape has none there.
+
+        STAGING_RSP carries the staging offset at 3 (its session is at 6) and
+        ABORT carries the decode port, so attributing either would mark a
+        made-up session and leave the real peer unflagged.
+        """
+        if len(waiting_req_bytes) <= 3:
+            return None
+        if waiting_req_bytes[0] in (b"STAGING_RSP", b"ABORT"):
+            return None
+        return waiting_req_bytes[3].decode("ascii", errors="replace")
+
     def _fail_bootstrap_message(self, waiting_req_bytes: List[bytes]):
-        session_id = (
-            waiting_req_bytes[3].decode("ascii", errors="replace")
-            if len(waiting_req_bytes) > 3
-            else None
-        )
+        session_id = self._bootstrap_message_session(waiting_req_bytes)
+        if session_id is None:
+            self._log_message_failure(waiting_req_bytes, "bootstrap")
+            return
         logger.exception(
             f"Failed to handle bootstrap message (session={session_id}). "
             "Marking the session failed so pending rooms abort instead of hanging."
         )
-        if session_id is None:
-            return
         with self.session_lock:
             self.session_failures[session_id] += 1
             self.failed_sessions.add(session_id)
@@ -2003,11 +2014,9 @@ class MooncakeKVManager(CommonKVManager):
             self.update_status(bootstrap_room, status)
 
     def _fail_decode_message(self, msg: List[bytes]):
-        # A message we could not parse carries no recoverable room, so the sending
-        # request still falls back to its own timeout. Containing the failure here
-        # keeps every other room on this instance alive.
-        header = msg[0][:32] if msg else b""
-        logger.exception(f"Failed to handle decode message (header={header!r}).")
+        # No recoverable room in a message that would not parse; the sender still
+        # falls back to its own timeout, but every other room survives.
+        self._log_message_failure(msg, "decode")
 
     def start_decode_thread(self):
         def decode_thread():
