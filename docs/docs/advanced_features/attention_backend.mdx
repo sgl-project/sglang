@@ -704,17 +704,17 @@ python3 -m sglang.launch_server \
 ```
 
 - Moonmath MLA (AMD ROCm, MI300X)
-  - Requires `pip install moonmath-attention` ([github.com/moonmath-ai/amd-kernels](https://github.com/moonmath-ai/amd-kernels))
-  - Pure decode A16W8 (bf16 Q / fp8 KV) for H≤16 on gfx942. Prefill and spec-verify fall back to aiter.
+  - Requires `moonmath-attention` from [github.com/moonmath-ai/amd-kernels](https://github.com/moonmath-ai/amd-kernels) (branch `mla-decode-a16w8-multiq`), and `--kv-cache-dtype fp8_e4m3`
+  - Serves absorbed MLA decode with A16W8 (bf16 Q / fp8 KV) at H≤16.
+  - Prefill falls back to aiter, with Q zero-padded to aiter's 16-head minimum at head counts it cannot serve (Kimi-K3 has 12 per rank at TP8).
 ```bash Command
 python3 -m sglang.launch_server \
-  --tp 4 \
-  --model moonshotai/Kimi-K2.7 \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
   --attention-backend moonmath_mla \
   --kv-cache-dtype fp8_e4m3 \
   --trust-remote-code
 ```
-
 - FlexAttention
 ```bash Command
 python3 -m sglang.launch_server \

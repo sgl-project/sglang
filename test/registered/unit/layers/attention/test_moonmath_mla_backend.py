@@ -53,35 +53,41 @@ def _make_fb(batch_size=4, forward_mode="decode", spec_info=None):
     return fb
 
 
+def _fake_aiter_init(self, model_runner):
+    """Stand-in for AiterAttnBackend.__init__: set only what the subclass reads."""
+    self.use_mla = model_runner.use_mla
+    self.kv_cache_dtype = model_runner.kv_cache_dtype
+    self.num_head = model_runner.num_head
+    self.token_to_kv_pool = model_runner.token_to_kv_pool
+
+
 def _make_backend(kv_cache_dtype=None, use_mla=True):
-    """Create a MoonmathMLABackend with mocked dependencies."""
-    with patch(
-        "sglang.srt.layers.attention.aiter_backend.AiterAttnBackend.__init__"
-    ), patch("moonmath_attention.mla") as mock_mla:
+    """Construct a real MoonmathMLABackend with the aiter base __init__ stubbed.
+
+    The kernel selection under test is `__init__`'s own, not a copy of it: only
+    the base class and the moonmath_attention import are replaced.
+    """
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.moonmath_mla_backend import MoonmathMLABackend
+
+    runner = MagicMock()
+    runner.use_mla = use_mla
+    runner.kv_cache_dtype = kv_cache_dtype
+    runner.num_head = 16
+    runner.device = "cpu"
+    runner.token_to_kv_pool.size = 8192
+    runner.model_config.context_len = 131072
+
+    with patch.object(AiterAttnBackend, "__init__", _fake_aiter_init), patch(
+        "moonmath_attention.mla"
+    ) as mock_mla:
         mock_mla.mla_decode_a16w8_plan_parts_capped.return_value = 1
-        from sglang.srt.layers.attention.moonmath_mla_backend import (
-            MoonmathMLABackend,
-        )
+        backend = MoonmathMLABackend(runner)
 
-        runner = MagicMock()
-        runner.use_mla = use_mla
-        runner.device = torch.device("cuda")
-        runner.model_config.context_len = 131072
-
-        backend = MoonmathMLABackend.__new__(MoonmathMLABackend)
-        backend._mla = mock_mla
-        backend._mla_ok = use_mla
-        backend._disabled = False
-        backend._fp8_dtype = torch.float8_e4m3fnuz
-        backend._fp8_kv = use_mla and (kv_cache_dtype == torch.float8_e4m3fnuz)
-        backend._dec_parts = {}
-        backend._mla_max_ctx = 131072
-        backend._mla_seqlen_i32 = torch.zeros(8192, dtype=torch.int32, device="cpu")
-        backend.kv_cache_dtype = kv_cache_dtype
-        backend.forward_metadata = MagicMock()
-        backend.forward_metadata.kv_indices = torch.zeros(1, dtype=torch.int32)
-        backend.forward_metadata.kv_indptr = torch.zeros(1, dtype=torch.int32)
-        return backend
+    backend.forward_metadata = MagicMock()
+    backend.forward_metadata.kv_indices = torch.zeros(1, dtype=torch.int32)
+    backend.forward_metadata.kv_indptr = torch.zeros(1, dtype=torch.int32)
+    return backend
 
 
 class TestMoonmathMLAEligibility(unittest.TestCase):
@@ -104,11 +110,12 @@ class TestMoonmathMLAEligibility(unittest.TestCase):
         self.assertFalse(backend._decode_eligible(q, layer, fb))
 
     def test_reject_bf16_kv(self):
-        """bf16 KV should fall back to aiter (A16W8 requires fp8 KV)."""
+        """The A16W8 kernels read an fp8 pool; a bf16 KV cache falls back."""
         backend = _make_backend(kv_cache_dtype=torch.bfloat16)
         layer = _make_layer(q_head_num=16)
         fb = _make_fb(batch_size=4, forward_mode="decode")
         q = torch.zeros(1, dtype=torch.bfloat16)
+        self.assertFalse(backend._enabled)
         self.assertFalse(backend._decode_eligible(q, layer, fb))
 
     def test_reject_extend(self):
@@ -127,15 +134,6 @@ class TestMoonmathMLAEligibility(unittest.TestCase):
         q = torch.zeros(1, dtype=torch.bfloat16)
         self.assertFalse(backend._decode_eligible(q, layer, fb))
 
-    def test_reject_disabled(self):
-        """SGLANG_MOONMATH_MLA_DISABLE=1 should fall back to aiter."""
-        backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
-        backend._disabled = True
-        layer = _make_layer(q_head_num=16)
-        fb = _make_fb(batch_size=4, forward_mode="decode")
-        q = torch.zeros(1, dtype=torch.bfloat16)
-        self.assertFalse(backend._decode_eligible(q, layer, fb))
-
     def test_reject_wrong_dims(self):
         """Non-MLA dims (e.g. head_dim=128) should fall back to aiter."""
         backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
@@ -151,6 +149,36 @@ class TestMoonmathMLAEligibility(unittest.TestCase):
         fb = _make_fb(batch_size=4, forward_mode="decode")
         q = torch.zeros(1, dtype=torch.bfloat16)
         self.assertFalse(backend._decode_eligible(q, layer, fb))
+
+
+class TestMoonmathMLAVerifyGate(unittest.TestCase):
+    """The multi-query window serves q_len 4..8 only; everything else falls back."""
+
+    def _fb(self, q_len):
+        spec = MagicMock()
+        spec.num_tokens_per_req = q_len
+        return _make_fb(batch_size=4, forward_mode="target_verify", spec_info=spec)
+
+    def test_window_accepted(self):
+        backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
+        layer = _make_layer(q_head_num=12)  # Kimi-K3 at TP8
+        q = torch.zeros(1, dtype=torch.bfloat16)
+        for q_len in (4, 5, 6, 7, 8):
+            self.assertTrue(backend._verify_eligible(q, layer, self._fb(q_len)))
+
+    def test_window_bounds_rejected(self):
+        backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
+        layer = _make_layer(q_head_num=12)
+        q = torch.zeros(1, dtype=torch.bfloat16)
+        for q_len in (1, 3, 9, 16):
+            self.assertFalse(backend._verify_eligible(q, layer, self._fb(q_len)))
+
+    def test_decode_gate_rejects_verify(self):
+        """The two arms are disjoint: verify never reaches forward_decode."""
+        backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
+        layer = _make_layer(q_head_num=12)
+        q = torch.zeros(1, dtype=torch.bfloat16)
+        self.assertFalse(backend._decode_eligible(q, layer, self._fb(8)))
 
 
 def _has_moonmath():
