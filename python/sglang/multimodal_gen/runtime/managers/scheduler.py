@@ -284,6 +284,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             DiffStage.SCHEDULER_DISPATCH,
             thread_finish_flag=True,
         ):
+            if (
+                len(reqs) == 1
+                and self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and max(1, int(req.num_outputs_per_prompt or 1)) > 1
+            ):
+                return _SequentiallyReturnedOutputs(
+                    self._iter_grouped_outputs_sequentially(reqs)
+                )
+
             if len(reqs) == 1 or not allow_dynamic_batching:
                 return self.worker.execute_forward(reqs)
 
@@ -436,10 +445,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         except Exception:
             return None
 
+        exclude_num_outputs = (
+            self.server_args.pipeline_config.supports_sequential_dit_inference()
+        )
         return [
             (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
             for f in sp_fields
             if not f.metadata.get("batch_sig_exclude", False)
+            and not (exclude_num_outputs and f.name == "num_outputs_per_prompt")
         ]
 
     def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
@@ -448,13 +461,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
         """Build the request compatibility signature for dynamic batching.
 
-        The signature is built from `SamplingParams` fields, excluding fields
-        marked with `batch_sig_exclude`, plus generation-affecting
-        `extra.diffusers_kwargs`.
+        The signature is built from batch-shared `SamplingParams` fields, plus
+        generation-affecting `extra.diffusers_kwargs` and profiling settings
+        used by grouped execution.
         """
         signature_items = self._sampling_param_signature_items(req)
         if signature_items is None:
             return None
+
+        profile_signature = (
+            (True, req.profile_all_stages, req.num_profiled_timesteps)
+            if req.profile
+            else (False,)
+        )
+        signature_items.append(("profiling", profile_signature))
 
         if req.extra:
             diffusers_kwargs = req.extra.get("diffusers_kwargs")
@@ -501,6 +521,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         if base_diffusers_kwargs != candidate_diffusers_kwargs:
             return "extra.diffusers_kwargs"
+
+        if base_req.profile:
+            base_profile = (
+                True,
+                base_req.profile_all_stages,
+                base_req.num_profiled_timesteps,
+            )
+        else:
+            base_profile = (False,)
+
+        if candidate_req.profile:
+            candidate_profile = (
+                True,
+                candidate_req.profile_all_stages,
+                candidate_req.num_profiled_timesteps,
+            )
+        else:
+            candidate_profile = (False,)
+        if base_profile != candidate_profile:
+            return "profiling"
 
         return None
 
@@ -572,20 +612,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _record_batch_dispatch_metrics(
         self,
-        batch_size: int,
+        request_count: int,
+        output_count: int,
         queue_wait_ms: float,
-        effective_max_batch_size: int,
+        effective_max_output_count: int,
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
         if not self._batch_metrics_enabled:
             return
 
-        effective_max_batch_size = max(1, effective_max_batch_size)
+        effective_max_output_count = max(1, effective_max_output_count)
         logger.info(
-            "Dynamic batch dispatch: size=%d/%d, user_max=%d, queue_wait=%.2fms, stop_reason=%s",
-            batch_size,
-            effective_max_batch_size,
+            "Dynamic batch dispatch: requests=%d, outputs=%d/%d, "
+            "user_max_outputs=%d, queue_wait=%.2fms, stop_reason=%s",
+            request_count,
+            output_count,
+            effective_max_output_count,
             self._batching_max_size,
             max(queue_wait_ms, 0.0),
             stop_reason or "unspecified",
@@ -593,11 +636,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         window = self._batch_metrics_window
         window.dispatches += 1
-        window.total_requests += batch_size
-        window.total_capacity += effective_max_batch_size
-        if batch_size > 1:
+        window.total_requests += request_count
+        window.total_outputs += output_count
+        window.total_capacity += effective_max_output_count
+        if request_count > 1:
             window.merged_dispatches += 1
-        if self._dynamic_batching_enabled() and batch_size >= effective_max_batch_size:
+        if (
+            self._dynamic_batching_enabled()
+            and output_count >= effective_max_output_count
+        ):
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
         if reject_reasons:
@@ -614,8 +661,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if window.dispatches == 0:
             return
 
-        avg_size = window.total_requests / window.dispatches
-        utilization = window.total_requests / max(1, window.total_capacity)
+        avg_requests = window.total_requests / window.dispatches
+        avg_outputs = window.total_outputs / window.dispatches
+        utilization = window.total_outputs / max(1, window.total_capacity)
         avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
         p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
         merged_rate = window.merged_dispatches / window.dispatches
@@ -628,9 +676,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             top_rejects = "none"
 
         logger.info(
-            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_rejects=%s",
+            "Dynamic batch stats (last %d dispatches): avg_requests=%.2f, "
+            "avg_outputs=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, "
+            "utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, "
+            "top_rejects=%s",
             window.dispatches,
-            avg_size,
+            avg_requests,
+            avg_outputs,
             merged_rate * 100.0,
             full_rate * 100.0,
             utilization * 100.0,
@@ -704,30 +756,46 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         outputs: Iterator[OutputBatch],
     ) -> None:
         output_iter = iter(outputs)
-        for index, item in enumerate(items):
-            try:
-                output_batch = next(output_iter)
-            except StopIteration:
-                error = (
-                    "Grouped execution returned fewer outputs than requests "
-                    "while processing sequentially."
-                )
-                logger.error(error)
-                for remaining_item in items[index:]:
-                    self._return_item_result(remaining_item, OutputBatch(error=error))
-                return
-            except Exception as e:
-                logger.error(
-                    "Failed to execute grouped requests sequentially: %s",
-                    e,
-                    exc_info=True,
-                )
-                error = f"Failed to execute grouped requests sequentially: {e}"
-                for remaining_item in items[index:]:
-                    self._return_item_result(remaining_item, OutputBatch(error=error))
-                return
+        try:
+            for index, item in enumerate(items):
+                output_batch, error = self._fetch_next_output(output_iter)
+                if error is not None:
+                    self._return_sequential_errors(items[index:], error)
+                    return
 
-            self._return_item_result(item, output_batch)
+                assert output_batch is not None
+                self._return_item_result(item, output_batch)
+                del output_batch
+        finally:
+            close = getattr(output_iter, "close", None)
+            if close is not None:
+                close()
+
+    @staticmethod
+    def _fetch_next_output(
+        output_iter: Iterator[OutputBatch],
+    ) -> tuple[OutputBatch | None, str | None]:
+        try:
+            return next(output_iter), None
+        except StopIteration:
+            error = (
+                "Grouped execution returned fewer outputs than requests "
+                "while processing sequentially."
+            )
+            logger.error(error)
+            return None, error
+        except Exception as e:
+            error = f"Failed to execute grouped requests sequentially: {e}"
+            logger.error(error, exc_info=True)
+            return None, error
+
+    def _return_sequential_errors(
+        self,
+        items: list[tuple[bytes | None, Any]],
+        error: str,
+    ) -> None:
+        for item in items:
+            self._return_item_result(item, OutputBatch(error=error))
 
     @contextmanager
     def _record_return_stage(
@@ -914,10 +982,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if not self._dynamic_batching_enabled():
             identity, req, enqueue_time = self.waiting_queue.popleft()
             if isinstance(req, Req):
+                output_count = max(1, int(req.num_outputs_per_prompt or 1))
                 self._record_batch_dispatch_metrics(
-                    batch_size=1,
+                    request_count=1,
+                    output_count=output_count,
                     queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
-                    effective_max_batch_size=1,
+                    effective_max_output_count=output_count,
                     stop_reason="dynamic_disabled",
                 )
             return [(identity, req)]
@@ -936,10 +1006,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 reason = self._get_dynamic_batch_reject_reason(req, req)
                 if reason is not None:
                     reject_reasons.append(f"head:{reason}")
+            output_count = max(1, int(req.num_outputs_per_prompt or 1))
             self._record_batch_dispatch_metrics(
-                batch_size=1,
+                request_count=1,
+                output_count=output_count,
                 queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
-                effective_max_batch_size=1,
+                effective_max_output_count=output_count,
                 reject_reasons=reject_reasons,
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
@@ -1000,9 +1072,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             else:
                 stop_reason = "ready"
         self._record_batch_dispatch_metrics(
-            batch_size=batch_len,
+            request_count=batch_len,
+            output_count=sum(
+                max(1, int(req.num_outputs_per_prompt or 1)) for req in compatible_reqs
+            ),
             queue_wait_ms=oldest_wait_s * 1000.0,
-            effective_max_batch_size=self._batch_admission.max_admissible_batch_size(
+            effective_max_output_count=self._batch_admission.max_admissible_batch_size(
                 compatible_reqs[0]
             ),
             reject_reasons=reject_reasons,

@@ -6,6 +6,7 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, List
 
@@ -266,24 +267,36 @@ class PipelineExecutor(ABC):
         batches: list[Req],
         server_args: ServerArgs,
     ):
-        """Yield outputs after batched AR and per-request DiT/VAE inference."""
+        """Yield outputs after batched AR and sequential DiT/VAE inference."""
         batches = self.execute_group(stages[:1], batches, server_args)
 
         remaining_stages = stages[1:]
-        for batch in batches:
-            try:
-                yield self.execute(remaining_stages, batch, server_args)
-            except Exception as e:
-                logger.error(
-                    "Per-request DiT/VAE inference failed for request %s: %s",
-                    batch.request_id,
-                    e,
-                    exc_info=True,
-                )
-                yield OutputBatch(
-                    error=f"Error executing grouped request {batch.request_id}: {e}",
-                    metrics=batch.metrics,
-                )
+        sequential_start_time = time.monotonic()
+        for parent_batch in batches:
+            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "PipelineExecutor.sequential_wait",
+                        time.monotonic() - sequential_start_time,
+                    )
+                try:
+                    output = self.execute(remaining_stages, batch, server_args)
+                except Exception as e:
+                    logger.error(
+                        "Sequential DiT/VAE inference failed for request %s: %s",
+                        batch.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    output = OutputBatch(
+                        error=f"Error executing grouped request {batch.request_id}: {e}",
+                        metrics=batch.metrics,
+                    )
+                yield output
+                del output
+                del batch
+                if current_platform.is_npu():
+                    torch.get_device_module().empty_cache()
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):

@@ -8,13 +8,11 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
 import zmq
-from transformers import AutoProcessor
-from zmq.utils.monitor import recv_monitor_message
-
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
 )
@@ -36,12 +34,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
-from sglang.multimodal_gen.runtime.dynamic_batching import (
-    can_dynamic_batch,
-    merge_generation_reqs,
-    slice_generation_req,
-)
+from sglang.multimodal_gen.runtime.dynamic_batching import can_dynamic_batch
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from transformers import AutoProcessor
+from zmq.utils.monitor import recv_monitor_message
 
 logger = logging.getLogger(__name__)
 
@@ -491,34 +487,28 @@ class DiffusionServer:
 
         base = self._glm_ar_queue[0]
         indices = [0]
+        output_slots = max(1, int(base.req.num_outputs_per_prompt or 1))
         for index in range(1, len(self._glm_ar_queue)):
-            if len(indices) >= self._glm_batch_max_size:
+            if output_slots >= self._glm_batch_max_size:
                 break
             candidate = self._glm_ar_queue[index]
             if can_dynamic_batch(base.req, candidate.req):
+                candidate_outputs = max(
+                    1, int(candidate.req.num_outputs_per_prompt or 1)
+                )
+                if output_slots + candidate_outputs > self._glm_batch_max_size:
+                    continue
                 indices.append(index)
+                output_slots += candidate_outputs
 
         waited = time.monotonic() - base.enqueue_time
-        if (
-            len(indices) < self._glm_batch_max_size
-            and waited < self._glm_batch_delay_s
-        ):
+        if output_slots < self._glm_batch_max_size and waited < self._glm_batch_delay_s:
             return
 
         clients = [self._glm_ar_queue[index] for index in indices]
         for index in reversed(indices):
             del self._glm_ar_queue[index]
-        merged = merge_generation_reqs([entry.req for entry in clients])
-        if merged is None:
-            for client in clients:
-                self._complete_with_error(
-                    client.request_id,
-                    "GLM AR fan-out could not merge compatible requests",
-                )
-            return
 
-        group_id = f"glm-fanout::{time.monotonic_ns()}"
-        merged.request_id = group_id
         self._glm_ar_clients = clients
         for client in clients:
             try:
@@ -528,27 +518,37 @@ class DiffusionServer:
             except ValueError:
                 pass
         self._glm_ar_future = self._glm_ar_executor.submit(
-            self._execute_glm_ar_batch, merged
+            self._execute_glm_ar_batch, clients
         )
-        logger.info("GLM AR fan-out dispatched batch size=%d", len(clients))
+        logger.info(
+            "GLM AR fan-out dispatched batch size=%d requests, %d outputs",
+            len(clients),
+            output_slots,
+        )
 
-    def _execute_glm_ar_batch(self, merged_req):
+    def _execute_glm_ar_batch(self, clients: list[_GlmClientEntry]):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
-            _expand_prompts_and_seeds,
+            _num_outputs_per_prompt,
+            _seed_for_output,
         )
 
-        prompts, seeds = _expand_prompts_and_seeds(merged_req)
-        prior_token_ids = self._glm_ar_stage.generate_prior_tokens_batch(
+        requests = [client.req for client in clients]
+        prompts = [
+            req.prompt for req in requests for _ in range(_num_outputs_per_prompt(req))
+        ]
+        seeds = [
+            _seed_for_output(req.seed, output_index)
+            for req in requests
+            for output_index in range(_num_outputs_per_prompt(req))
+        ]
+        return self._glm_ar_stage.generate_prior_tokens_batch(
             prompts=prompts,
             seeds=seeds,
-            height=merged_req.height,
-            width=merged_req.width,
+            height=requests[0].height,
+            width=requests[0].width,
             server_args=self._server_args,
             device=torch.device("cpu"),
         )
-        merged_req.prior_token_id = torch.cat(prior_token_ids, dim=0)
-        merged_req.prior_token_image_ids = None
-        return merged_req
 
     def _poll_glm_ar_result(self) -> None:
         future = self._glm_ar_future
@@ -558,10 +558,22 @@ class DiffusionServer:
         self._glm_ar_future = None
         self._glm_ar_clients = []
         try:
-            merged = future.result()
+            prior_token_ids = future.result()
         except Exception as error:
             for client in clients:
                 self._complete_with_error(client.request_id, f"GLM AR error: {error}")
+            return
+
+        expected_outputs = sum(
+            max(1, int(client.req.num_outputs_per_prompt or 1)) for client in clients
+        )
+        if len(prior_token_ids) != expected_outputs:
+            for client in clients:
+                self._complete_with_error(
+                    client.request_id,
+                    "GLM AR output count mismatch: "
+                    f"got {len(prior_token_ids)}, expected {expected_outputs}",
+                )
             return
 
         for client in clients:
@@ -573,25 +585,30 @@ class DiffusionServer:
             except ValueError:
                 pass
 
-        total = len(clients)
+        group_id = f"glm-fanout::{time.monotonic_ns()}"
         output_start = 0
-        for start, client in enumerate(clients):
-            end = start + 1
-            output_count = client.req.num_outputs_per_prompt
+        sequential_multi_output = self._server_args.pipeline_config.supports_sequential_multi_output_inference()
+        for client_index, client in enumerate(clients):
+            output_count = max(1, int(client.req.num_outputs_per_prompt or 1))
             output_end = output_start + output_count
-            shard_req = slice_generation_req(merged, start, end, total)
-            shard_req.prior_token_id = merged.prior_token_id[output_start:output_end]
-            output_paths = merged.extra.get("dynamic_batch_output_paths")
-            if isinstance(output_paths, list):
-                shard_req.extra["dynamic_batch_output_paths"] = output_paths[
-                    output_start:output_end
-                ]
+            shard_req = deepcopy(client.req)
+            shard_req.extra = dict(shard_req.extra or {})
+            shard_req.request_id = f"{group_id}::shard::{client_index}"
+            shard_req.prior_token_id = torch.cat(
+                prior_token_ids[output_start:output_end], dim=0
+            )
+            shard_req.prior_token_image_ids = None
             shard_id = shard_req.request_id
             shard_clients = [client]
             shard_req.extra["fanout_child_request_ids"] = [
                 client.request_id for client in shard_clients
             ]
-            shard = _GlmShardEntry(shard_id, shard_req, shard_clients, output_count)
+            shard = _GlmShardEntry(
+                shard_id,
+                shard_req,
+                shard_clients,
+                1 if sequential_multi_output else output_count,
+            )
             self._glm_shards[shard_id] = shard
             self._glm_shard_queue.append(shard)
             output_start = output_end

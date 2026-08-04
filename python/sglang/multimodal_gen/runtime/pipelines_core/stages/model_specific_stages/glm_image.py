@@ -1,7 +1,8 @@
 import inspect
 import re
 import time
-from typing import Any, List, Optional, Tuple, Union
+from copy import copy, deepcopy
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -523,9 +524,7 @@ class GlmImageAR(PipelineStage):
             len(batches) > 1
             and server_args.srt_encoder_url is not None
             and all(
-                isinstance(batch.prompt, str)
-                and batch.image_path is None
-                and _num_outputs_per_prompt(batch) == 1
+                isinstance(batch.prompt, str) and batch.image_path is None
                 for batch in batches
             )
         )
@@ -538,27 +537,94 @@ class GlmImageAR(PipelineStage):
             return super().run_grouped_requests(batches, server_args)
 
         start_time = time.time()
+        output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
+        prompts = [
+            batch.prompt
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for _ in range(output_count)
+        ]
+        seeds = [
+            _seed_for_output(batch.seed, output_idx)
+            for batch, output_count in zip(batches, output_counts, strict=True)
+            for output_idx in range(output_count)
+        ]
         prior_token_ids = self.generate_prior_tokens_batch(
-            prompts=[batch.prompt for batch in batches],
-            seeds=[_seed_for_output(batch.seed, 0) for batch in batches],
+            prompts=prompts,
+            seeds=seeds,
             height=height,
             width=width,
             server_args=server_args,
         )
         duration = time.time() - start_time
         logger.info(
-            "generate_prior_tokens_batch time: %.3fs for %d requests",
+            "generate_prior_tokens_batch time: %.3fs for %d requests (%d outputs)",
             duration,
             len(batches),
+            len(prior_token_ids),
         )
 
         stage_name = self._active_profile_stage_name()
-        for batch, prior_token_id in zip(batches, prior_token_ids, strict=True):
-            batch.prior_token_id = prior_token_id
+        output_offset = 0
+        for batch, output_count in zip(batches, output_counts, strict=True):
+            batch.prior_token_id = torch.cat(
+                prior_token_ids[output_offset : output_offset + output_count], dim=0
+            )
             batch.prior_token_image_ids = None
             if batch.metrics is not None:
                 batch.metrics.record_stage(stage_name, duration)
+            output_offset += output_count
         return batches
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        output_count = _num_outputs_per_prompt(batch)
+        if output_count == 1:
+            return iter((batch,))
+
+        prior_token_ids = batch.prior_token_id
+        if not isinstance(prior_token_ids, torch.Tensor) or (
+            prior_token_ids.shape[0] != output_count
+        ):
+            actual_count = (
+                prior_token_ids.shape[0]
+                if isinstance(prior_token_ids, torch.Tensor)
+                else type(prior_token_ids).__name__
+            )
+            raise RuntimeError(
+                "Cannot split GLM-Image AR output for sequential inference: "
+                f"expected {output_count} token rows, got {actual_count}."
+            )
+
+        return map(
+            lambda output_index: self._make_sequential_request(
+                batch, prior_token_ids, output_index
+            ),
+            range(output_count),
+        )
+
+    @staticmethod
+    def _make_sequential_request(
+        batch: Req, prior_token_ids: torch.Tensor, output_index: int
+    ) -> Req:
+        output_req = copy(batch)
+        output_req.sampling_params = copy(batch.sampling_params)
+        output_req.extra = dict(batch.extra)
+        output_req.condition_inputs = dict(batch.condition_inputs)
+        output_req.metrics = deepcopy(batch.metrics)
+        output_req.num_outputs_per_prompt = 1
+        output_req.seed = _seed_for_output(batch.seed, output_index)
+        output_req.seeds = None
+        output_req.generator = None
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        if batch.request_id is not None:
+            output_req.request_id = f"{batch.request_id}:{output_index}"
+            if output_req.metrics is not None:
+                output_req.metrics.request_id = output_req.request_id
+        return output_req
 
     @torch.no_grad()
     def forward(
@@ -595,27 +661,25 @@ class GlmImageAR(PipelineStage):
             rng_devices.append(torch.npu.current_device())
             rng_device_type = "npu"
 
-        prior_token_ids = []
         prior_token_image_ids = None
-        for output_idx in range(num_outputs):
-            output_seed = _seed_for_output(seed, output_idx)
-            if output_seed is None:
-                prior_token_id, output_prior_token_image_ids = (
-                    self.generate_prior_tokens(
-                        prompt=prompt,
-                        image=ar_condition_images,
-                        height=height,
-                        width=width,
-                        server_args=server_args,
-                    )
-                )
-            else:
-                with torch.random.fork_rng(
-                    devices=rng_devices,
-                    enabled=True,
-                    device_type=rng_device_type,
-                ):
-                    torch.manual_seed(output_seed)
+        if (
+            num_outputs > 1
+            and getattr(server_args, "srt_encoder_url", None) is not None
+            and isinstance(prompt, str)
+            and ar_condition_images is None
+        ):
+            prior_token_ids = self.generate_prior_tokens_batch(
+                prompts=[prompt] * num_outputs,
+                seeds=[_seed_for_output(seed, i) for i in range(num_outputs)],
+                height=height,
+                width=width,
+                server_args=server_args,
+            )
+        else:
+            prior_token_ids = []
+            for output_idx in range(num_outputs):
+                output_seed = _seed_for_output(seed, output_idx)
+                if output_seed is None:
                     prior_token_id, output_prior_token_image_ids = (
                         self.generate_prior_tokens(
                             prompt=prompt,
@@ -623,12 +687,28 @@ class GlmImageAR(PipelineStage):
                             height=height,
                             width=width,
                             server_args=server_args,
-                            seed=output_seed,
                         )
                     )
-            prior_token_ids.append(prior_token_id)
-            if prior_token_image_ids is None:
-                prior_token_image_ids = output_prior_token_image_ids
+                else:
+                    with torch.random.fork_rng(
+                        devices=rng_devices,
+                        enabled=True,
+                        device_type=rng_device_type,
+                    ):
+                        torch.manual_seed(output_seed)
+                        prior_token_id, output_prior_token_image_ids = (
+                            self.generate_prior_tokens(
+                                prompt=prompt,
+                                image=ar_condition_images,
+                                height=height,
+                                width=width,
+                                server_args=server_args,
+                                seed=output_seed,
+                            )
+                        )
+                prior_token_ids.append(prior_token_id)
+                if prior_token_image_ids is None:
+                    prior_token_image_ids = output_prior_token_image_ids
 
         prior_token_id = torch.cat(prior_token_ids, dim=0)
         prior_token_id = prior_token_id.to(device=device)
