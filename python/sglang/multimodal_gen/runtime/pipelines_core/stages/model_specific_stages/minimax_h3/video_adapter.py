@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -104,12 +105,14 @@ class MiniMaxH3VideoModelAdapter:
         request: VideoGenerationsRequest,
         name: str,
     ) -> str | None:
-        value = _parse_extra_value(_extra_value(request, name))
+        value = _extra_value(request, name)
         if value is None:
             return None
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{name} must be a non-empty string")
-        return value.strip().lower()
+        if value not in QUALITY_LEVELS:
+            raise ValueError(
+                f"{name} must be one of {list(QUALITY_LEVELS)}, got {value!r}"
+            )
+        return value
 
     @staticmethod
     def _reject_retired_cfg_fields(kwargs: dict[str, Any]) -> None:
