@@ -75,7 +75,6 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 
 ## 2. Configuration Tips
 
-- `--trust-remote-code` is required for the `BailingMoeV3ForCausalLM` implementation.
 - Tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and Blackwell (B200); `--tp 8` on 80 GB cards (H100, H800).
 - The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activation scaling; SGLang detects it from the checkpoint's `quantization_config`, so the launch flags are identical to BF16.
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).

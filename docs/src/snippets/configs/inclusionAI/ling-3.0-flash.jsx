@@ -103,7 +103,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -127,7 +126,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -151,7 +149,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--enable-cache-report",
@@ -175,7 +172,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--enable-cache-report",
@@ -199,7 +195,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -223,7 +218,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -247,7 +241,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -271,7 +264,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--enable-cache-report",
@@ -295,7 +287,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--enable-cache-report",
@@ -319,7 +310,6 @@ sgl-eval run gsm8k \\
       verified: false,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--enable-cache-report",
@@ -343,14 +333,12 @@ sgl-eval run gsm8k \\
       verified: false,
       env: ["SGLANG_RAGGED_VERIFY_MODE=static"],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--speculative-algorithm DSPARK",
         "--speculative-draft-model-path {{DSPARK_DRAFT}}",
         "--disable-radix-cache",
         "--mem-fraction-static 0.8",
-        "--max-total-tokens 1048576",
         "--flashinfer-allreduce-fusion-backend auto",
         "--scheduler-recv-interval 16",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
