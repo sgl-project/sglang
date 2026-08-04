@@ -1,8 +1,9 @@
 """Numerics for the NVFP4 FusedMoE runner backends (--moe-runner-backend).
 
-Runs the real FusedMoE layer path (construct -> fill NVFP4 checkpoint-format
-weights -> process_weights_after_loading -> forward) per backend against a
-dequantized torch MoE reference, covering the per-backend weight preparation
+Runs the real FusedMoE layer path (construct -> load NVFP4 checkpoint-format
+shards through the real weight_loader -> process_weights_after_loading ->
+forward) per backend against a dequantized torch MoE reference, covering
+the per-backend weight preparation
 (TRTLLM shuffle / CUTLASS swizzle / CuteDSL v2 interleave + MMA blockscales)
 and the MoE runner dispatch. Single GPU, tp=ep=1.
 """
@@ -122,32 +123,39 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 gate_up_interleaved=False,
             ).cuda()
 
-            w13_ref = torch.zeros(E, 2 * I, H, dtype=torch.float32, device="cuda")
-            w2_ref = torch.zeros(E, H, I, dtype=torch.float32, device="cuda")
-            for e in range(E):
-                w13 = torch.randn(2 * I, H, dtype=torch.bfloat16, device="cuda") / 10
-                w2 = torch.randn(H, I, dtype=torch.bfloat16, device="cuda") / 10
-                w13_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w13.abs().max().float()
-                w2_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2.abs().max().float()
-                w13_q, w13_sf = fp4_quantize(w13, w13_gs)
-                w2_q, w2_sf = fp4_quantize(w2, w2_gs)
-                layer.w13_weight.data[e].copy_(w13_q)
-                layer.w2_weight.data[e].copy_(w2_q)
-                layer.w13_weight_scale.data[e].copy_(
-                    convert_swizzled_to_linear(
-                        w13_sf.view(torch.float8_e4m3fn), 2 * I, H
-                    )
-                )
-                layer.w2_weight_scale.data[e].copy_(
-                    convert_swizzled_to_linear(w2_sf.view(torch.float8_e4m3fn), H, I)
-                )
-                layer.w13_weight_scale_2.data[e].fill_(1.0 / w13_gs)
-                layer.w2_weight_scale_2.data[e].fill_(1.0 / w2_gs)
-                w13_ref[e] = dequant_nvfp4(w13_q, w13_sf, w13_gs, 2 * I, H)
-                w2_ref[e] = dequant_nvfp4(w2_q, w2_sf, w2_gs, H, I)
+            # Feed checkpoint-format shards through the real weight_loader so
+            # gate/up placement and scale gathering stay the loader's job.
+            refs = {
+                "w1": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
+                "w3": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
+                "w2": torch.zeros(E, H, I, dtype=torch.float32, device="cuda"),
+            }
             act_scale = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
-            layer.w13_input_scale.data.fill_(act_scale)
-            layer.w2_input_scale.data.fill_(act_scale)
+            for e in range(E):
+                for shard_id in ("w1", "w3", "w2"):
+                    rows, cols = (I, H) if shard_id in ("w1", "w3") else (H, I)
+                    w = (
+                        torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+                        / 10
+                    )
+                    gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w.abs().max().float()
+                    w_q, w_sf = fp4_quantize(w, gs)
+                    sf_linear = convert_swizzled_to_linear(
+                        w_sf.view(torch.float8_e4m3fn), rows, cols
+                    )
+                    prefix = "w13" if shard_id in ("w1", "w3") else "w2"
+                    for suffix, loaded in (
+                        ("weight", w_q),
+                        ("weight_scale", sf_linear),
+                        ("weight_scale_2", (1.0 / gs).clone()),
+                        ("input_scale", torch.tensor(act_scale, device="cuda")),
+                    ):
+                        name = f"{prefix}_{suffix}"
+                        param = getattr(layer, name)
+                        layer.weight_loader(
+                            param, loaded, name, shard_id=shard_id, expert_id=e
+                        )
+                    refs[shard_id][e] = dequant_nvfp4(w_q, w_sf, gs, rows, cols)
 
             layer.quant_method.process_weights_after_loading(layer)
 
@@ -169,7 +177,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
             ref = self._torch_moe_reference(
-                layer, x, topk_weights, topk_ids, w13_ref, w2_ref
+                x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
             )
 
             self.assertEqual(out.shape, (M, H))
@@ -179,7 +187,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             self.assertGreater(cos, 0.99)
 
     @staticmethod
-    def _torch_moe_reference(layer, x, topk_weights, topk_ids, w13_ref, w2_ref):
+    def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
@@ -188,15 +196,11 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
         # The kernels quantize the input and the GEMM1->GEMM2 intermediate to
         # NVFP4; mirror both round trips or the comparison carries ~7% noise.
+        # Shards were fed through the real weight_loader, so the reference
+        # stays in checkpoint semantics (w1=gate, w3=up); physical gate/up
+        # placement is the loader's job.
         act_gs = torch.tensor(
             FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, dtype=torch.float32, device="cuda"
-        )
-        # TRTLLM consumes w13 as [up; gate] (GEMM1 scales are applied on that
-        # assumption); CUTLASS / CuteDSL-v2 load up first as well via
-        # load_up_proj_weight_first.
-        up_first = (
-            layer.quant_method.load_up_proj_weight_first
-            or layer.quant_method.enable_flashinfer_trtllm_moe
         )
         x_dq = quant_roundtrip(x.float(), act_gs)
         m, h = x.shape
@@ -204,11 +208,8 @@ class TestNvFp4MoeBackends(CustomTestCase):
         for t in range(m):
             for j in range(topk_ids.shape[1]):
                 e = int(topk_ids[t, j])
-                gu = x_dq[t] @ w13_ref[e].T
-                if up_first:
-                    up, gate = gu[:I], gu[I:]
-                else:
-                    gate, up = gu[:I], gu[I:]
+                gate = x_dq[t] @ w1_ref[e].T
+                up = x_dq[t] @ w3_ref[e].T
                 act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
                 ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
