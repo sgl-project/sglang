@@ -3,7 +3,7 @@
 Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 """
 
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -39,12 +39,10 @@ class KimiGridMMDataMixin:
         ]
 
     @staticmethod
-    def validate_tokenized_image_placeholders(
-        input_ids, image_token_id: int, expected_image_count: int
-    ) -> bool:
-        """Validate structural image tokens, returning whether IDs were supplied."""
+    def count_image_placeholders(input_ids, image_token_id: int) -> Optional[int]:
+        """Structural image tokens in a pre-tokenized prompt, None if it is text."""
         if not isinstance(input_ids, (list, torch.Tensor)):
-            return False
+            return None
 
         token_ids = np.asarray(
             (
@@ -54,13 +52,7 @@ class KimiGridMMDataMixin:
             ),
             dtype=np.int64,
         )
-        placeholder_count = int(np.count_nonzero(token_ids == image_token_id))
-        if placeholder_count != expected_image_count:
-            raise ValueError(
-                "Kimi image placeholders must map one-to-one to image data: "
-                f"expected {expected_image_count}, found {placeholder_count} token(s)"
-            )
-        return True
+        return int(np.count_nonzero(token_ids == image_token_id))
 
     def _num_image_tokens_from_grid(
         self, grid_thw: Union[torch.Tensor, np.ndarray, list, tuple]

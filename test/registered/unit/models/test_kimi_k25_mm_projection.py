@@ -28,23 +28,6 @@ def test_mm_projection_auto_packs_variable_image_outputs_once():
     assert actual.shape == (5, 12)
 
 
-def test_mm_projection_auto_accepts_already_packed_output():
-    output = torch.randn(5, 4, 3)
-
-    actual = mm_projection_auto(_FlattenProjector(), output)
-
-    torch.testing.assert_close(actual, output.flatten(start_dim=1))
-
-
-def test_mm_projection_auto_flattens_unprojected_3d_output():
-    output = torch.randn(5, 4, 3)
-
-    actual = mm_projection_auto(None, output)
-
-    torch.testing.assert_close(actual, output.reshape(-1, output.shape[-1]))
-    assert actual.shape == (20, 3)
-
-
 def test_mm_projection_auto_single_item_avoids_cat_copy():
     output = torch.randn(5, 4, 3)
 

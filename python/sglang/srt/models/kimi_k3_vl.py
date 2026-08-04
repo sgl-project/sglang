@@ -32,7 +32,8 @@ from sglang.srt.layers.attention.vision import (
     prepare_flashinfer_cudnn_vision_attention_metadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.models.kimi_vl_moonvit import concat_or_single, tpool_patch_merger
+from sglang.srt.models.kimi_vl_moonvit import tpool_patch_merger
+from sglang.srt.multimodal.mm_utils import concat_or_single
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once
 

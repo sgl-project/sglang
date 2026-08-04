@@ -340,9 +340,15 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             raise ValueError("Kimi-K3 supports image input only")
 
         expected_image_count = len(image_data or [])
-        if self.validate_tokenized_image_placeholders(
-            input_text, self.mm_tokens.image_token_id, expected_image_count
-        ):
+        placeholder_count = self.count_image_placeholders(
+            input_text, self.mm_tokens.image_token_id
+        )
+        if placeholder_count is not None:
+            if placeholder_count != expected_image_count:
+                raise ValueError(
+                    "Kimi image placeholders must map one-to-one to image data: "
+                    f"expected {expected_image_count}, found {placeholder_count} token(s)"
+                )
             # Keep structural media tokens distinct from user text that happens to
             # spell ``<|media_pad|>``. Decoding the whole prompt and matching the
             # resulting string would lose that distinction and could bind an image

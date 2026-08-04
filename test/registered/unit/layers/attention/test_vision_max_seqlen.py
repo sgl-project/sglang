@@ -209,7 +209,8 @@ def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
     encoder.blocks = nn.ModuleList([CapturingBlock()])
     encoder.final_layernorm = nn.Identity()
 
-    hidden_states = torch.ones(7, 4)
+    # The fused path is gated on the q/k dtype; fp32 stays on the portable one.
+    hidden_states = torch.ones(7, 4, dtype=torch.bfloat16)
     encoder(hidden_states, torch.tensor([[1, 1, 7]], dtype=torch.int32))
 
     cos_sin_cache, positions = recorded["rope_freqs_cis"]
