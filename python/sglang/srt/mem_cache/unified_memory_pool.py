@@ -11,13 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""UnifiedKVPool — one physical `uint8` byte buffer shared by 2 sub-pools.
+"""UnifiedKVPool — one physical `uint8` byte buffer shared by N sub-pools.
 
-Two `MultiEndedAllocator`s grow from opposite ends; eager-compacting `free`
-keeps each pool's byte range hole-free. Layout is envelope-major (a slot's data
-for all its layers in one contiguous byte envelope) so a freed slot vacates a
-region the peer can grow into. Everything above the allocator stores virtual
-slot IDs; the allocator owns the per-sub-pool virtual<->physical tables and
+Two END `MultiEndedAllocator`s grow inward from opposite ends; optional
+"float" MIDDLE pools live between their frontiers (chain order
+`[up end, floats..., down end]`). Eager- or lazy-compacting `free` keeps each
+pool's byte range reclaimable. Layout is envelope-major (a slot's data for all
+its layers in one contiguous byte envelope) so a freed slot vacates a region a
+neighbor can grow into. Everything above the allocator stores virtual slot
+IDs; the allocator owns the per-sub-pool virtual<->physical tables and
 compaction only mutates those (no reference rewriting).
 """
 
@@ -26,7 +28,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -73,17 +75,28 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
 
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
+    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
+
+    ``grow_direction`` places the sub-pool in the buffer's chain: the two
+    ``"up"``/``"down"`` END pools own the buffer's two ends and grow inward;
+    ``"float"`` middles live between the ends' frontiers (a float's position is
+    carried entirely by its allocator's two watermarks — every view spans the
+    whole buffer, so relocation never rebuilds views).
+    """
+
+    # Grow directions this subclass accepts. Scratch-class specs (e.g. the
+    # spec-decode band) narrow this to ("float",).
+    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down", "float")
 
     name: str
     layer_num: int
-    grow_direction: str  # "up" | "down"
+    grow_direction: str  # "up" | "down" | "float"
 
     def __post_init__(self):
-        assert self.grow_direction in (
-            "up",
-            "down",
-        ), f"grow_direction must be 'up' or 'down'; got {self.grow_direction!r}"
+        assert self.grow_direction in self._allowed_grow_directions, (
+            f"{type(self).__name__}.grow_direction must be one of "
+            f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
+        )
         assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
 
     @abstractmethod
@@ -239,8 +252,10 @@ def _reserved_floor_bytes(sub_pool_specs: List[SubPoolSpec], page_size: int) -> 
 
 
 class UnifiedKVPool:
-    """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
-    strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
+    """One physical `uint8` byte buffer shared by N sub-pools, each exposing
+    strided per-layer views. Two END pools (one grow-up, one grow-down) own the
+    buffer's ends; optional "float" MIDDLE pools live between their frontiers.
+    Allocators keep byte ranges disjoint; no usage tracking here.
     """
 
     def __init__(
@@ -254,21 +269,34 @@ class UnifiedKVPool:
         view_tail_pad_bytes: int = 0,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
-        assert len(sub_pool_specs) == 2, (
-            f"UnifiedKVPool currently supports exactly 2 sub-pools; got "
-            f"{len(sub_pool_specs)} (N>2 is not yet implemented)"
-        )
+        assert (
+            len(sub_pool_specs) >= 2
+        ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
         names = [s.name for s in sub_pool_specs]
-        assert len(set(names)) == 2, f"sub-pool names must be unique; got {names}"
-        directions = sorted(s.grow_direction for s in sub_pool_specs)
-        assert directions == ["down", "up"], (
-            f"UnifiedKVPool needs one grow-up and one grow-down sub-pool; "
-            f"got {directions}"
+        assert len(set(names)) == len(
+            names
+        ), f"sub-pool names must be unique; got {names}"
+        # Per-spec direction validity already ran in each spec's __post_init__.
+        up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
+        down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
+        float_specs = [s for s in sub_pool_specs if s.grow_direction == "float"]
+        assert len(up_specs) == 1 and len(down_specs) == 1, (
+            f"UnifiedKVPool needs exactly one grow-up and one grow-down END "
+            f"sub-pool; got directions "
+            f"{[s.grow_direction for s in sub_pool_specs]}"
         )
 
         self.device = device
         self.total_bytes = total_bytes
-        self.sub_pool_specs = sub_pool_specs
+        # Canonical chain order, low byte end -> high byte end: the grow-up end
+        # pool, float middles (input order preserved), the grow-down end pool.
+        # Input list order is otherwise irrelevant (all access is by-name); the
+        # chain order is what the allocators' neighbor wiring follows.
+        self.sub_pool_specs: List[SubPoolSpec] = [
+            up_specs[0],
+            *float_specs,
+            down_specs[0],
+        ]
         self._page_size = page_size
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
@@ -310,9 +338,9 @@ class UnifiedKVPool:
         # For a page-aware sub-pool the slot-0 write touches layer blocks spread
         # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
         # just one slot envelope — reserve the max of both.
-        reserved_floor = _reserved_floor_bytes(sub_pool_specs, page_size)
+        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
 
-        for spec in sub_pool_specs:
+        for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
             max_slots = total_bytes // entry_bytes
             min_slot_index = (reserved_floor + entry_bytes - 1) // entry_bytes  # ceil
@@ -352,9 +380,9 @@ class UnifiedKVPool:
             "%d sub-pool(s)",
             total_bytes / GB,
             total_bytes,
-            len(sub_pool_specs),
+            len(self.sub_pool_specs),
         )
-        for s in sub_pool_specs:
+        for s in self.sub_pool_specs:
             logger.info(
                 "[unified-memory-pool]   sub-pool %r: kind=%s, layer_num=%d, grow=%s, "
                 "entry_bytes=%d, max_slots=%d, min_slot_index=%d (slots [0,%d) reserved)",
