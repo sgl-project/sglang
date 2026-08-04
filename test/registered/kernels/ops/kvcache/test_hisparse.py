@@ -380,16 +380,22 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
 
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="CUDA transfer_item_warp assumes 16B-aligned items with no sub-8B remainder.",
+)
 @pytest.mark.parametrize(
     "kv_dim,miss_token",
     [
         # Tokens 0..3 are resident, so the queried token must be >= 4 to miss.
-        (4, 6),  # 16B item, source at byte 96 -> 16B-aligned
-        (5, 4),  # 20B item, source at byte 80 -> 16B-aligned, wide copy + 4B tail
-        (5, 9),  # 20B item, source at byte 180 -> not 16B-aligned
-        (6, 4),  # 24B item, source at byte 96 -> 16B-aligned, wide copy + 8B tail
-        (6, 9),  # 24B item, source at byte 216 -> not 16B-aligned
-        (10, 4),  # 40B item, source at byte 160 -> 16B-aligned, 2 wide steps + 8B tail
+        # The destination is always slot 0, so the source offset
+        # (miss_token * item size) is what decides the 16B-alignment check.
+        (256, 4),  # 1024B, exactly the gate: one 16B step per lane, no remainder
+        (257, 4),  # 1028B: wide path + 4B byte tail
+        (258, 4),  # 1032B: wide path + one 64-bit word
+        (260, 4),  # 1040B: two wide iterations on lane 0
+        (257, 5),  # 1028B, source at 5140: unaligned, wide path skipped
+        (5, 4),  # 20B: below the gate, 64-bit loop + 4B byte tail
     ],
 )
 def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
@@ -397,10 +403,10 @@ def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
 ) -> None:
     """A miss must copy the item byte-exactly for any item size and alignment.
 
-    Every other case in this file uses an item size that is an exact multiple of
-    16 bytes, so none of them exercises the boundary between a wide vector copy
-    and the narrower loops that handle whatever is left over, nor the path taken
-    when the source is not 16B-aligned. These sizes cover both.
+    Every other ROCm case in this file uses a 32B item, far below the
+    WARP_SIZE * 16 wide-copy gate, so none of them reaches the wide path at all,
+    let alone the seam between it and the remainder loops. These sizes sit on
+    both sides of the gate and cover each remainder shape.
     """
     item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
 
