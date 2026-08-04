@@ -167,8 +167,8 @@ build artifacts, run the builder, install the only generated wheel, verify
 `import deep_ep`, and run:
 
 ```bash
-python3 -m unittest \
-  test.registered.models_e2e.test_deepseek_v4_flash_fp4_b200.TestDSV4FlashFP4B200Balanced
+python3 test/registered/models_e2e/test_deepseek_v4_flash_fp4_b200.py \
+  TestDSV4FlashFP4B200Balanced
 ```
 
 - [ ] **Step 3: Validate aarch64 + CUDA 12**

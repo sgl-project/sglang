@@ -287,6 +287,34 @@ def test_install_apt_packages_rejects_failed_install_with_missing_package(
     assert "Required package package-two is not installed" in result.stderr
 
 
+def test_install_python_dependencies_uses_selected_python(tmp_path: Path):
+    python_log = tmp_path / "python.log"
+    fake_python = tmp_path / "python"
+    write_executable(
+        fake_python,
+        'printf "%s\\n" "$*" > "$PYTHON_LOG"\n',
+    )
+    env = os.environ.copy()
+    env["PYTHON_LOG"] = str(python_log)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; PYTHON_BIN="$2"; install_python_dependencies',
+            "bash",
+            str(SCRIPT),
+            str(fake_python),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert python_log.read_text().strip() == "-m pip install setuptools wheel ninja"
+
+
 def test_cli_rejects_more_than_one_output_directory():
     result = subprocess.run(
         ["bash", str(SCRIPT), "first-output", "second-output"],

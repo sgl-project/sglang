@@ -209,6 +209,11 @@ install_system_dependencies() {
 }
 
 
+install_python_dependencies() {
+    "${PYTHON_BIN}" -m pip install setuptools wheel ninja
+}
+
+
 install_gdrcopy() {
     local gdrcopy_dir="/opt/gdrcopy"
     local arch="$1"
@@ -353,6 +358,9 @@ main() {
 
     echo "--- Removing an existing DeepEP installation ---"
     "${PYTHON_BIN}" -m pip uninstall -y deep_ep || true
+
+    echo "--- Installing Python build dependencies ---"
+    install_python_dependencies
 
     echo "--- Installing system dependencies ---"
     install_system_dependencies
