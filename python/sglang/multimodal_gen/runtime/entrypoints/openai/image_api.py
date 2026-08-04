@@ -6,7 +6,7 @@ import contextlib
 import json
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -39,6 +39,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.managers.job_registry import (
+    CancelReq,
+    JobStatusReq,
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -234,7 +239,7 @@ async def generations(
     request: ImageGenerationsRequest,
     raw_request: Request,
 ):
-    request_id = generate_request_id()
+    request_id = request.request_id or generate_request_id()
     server_args = get_global_server_args()
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
     ext = (
@@ -301,10 +306,12 @@ async def generations(
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
-
-        save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
-        )
+        try:
+            save_file_path_list, result = await process_generation_batch(
+                async_scheduler_client, batch
+            )
+        except RequestCancelledError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
         if (
@@ -365,31 +372,31 @@ async def generations(
 @router.post("/edits", response_model=ImageResponse)
 async def edits(
     raw_request: Request,
-    image: Optional[List[UploadFile]] = File(None),
-    image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
-    url: Optional[List[str]] = Form(None),
-    url_array: Optional[List[str]] = Form(None, alias="url[]"),
+    image: list[UploadFile] | None = File(None),
+    image_array: list[UploadFile] | None = File(None, alias="image[]"),
+    url: list[str] | None = Form(None),
+    url_array: list[str] | None = Form(None, alias="url[]"),
     prompt: str = Form(...),
-    mask: Optional[UploadFile] = File(None),
-    model: Optional[str] = Form(None),
-    n: Optional[int] = Form(1),
-    response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form(None),
-    output_format: Optional[str] = Form(None),
-    background: Optional[str] = Form("auto"),
-    seed: Optional[int] = Form(None),
-    generator_device: Optional[str] = Form("cuda"),
-    user: Optional[str] = Form(None),
-    negative_prompt: Optional[str] = Form(None),
-    guidance_scale: Optional[float] = Form(None),
-    true_cfg_scale: Optional[float] = Form(None),
-    num_inference_steps: Optional[int] = Form(None),
-    output_quality: Optional[str] = Form("default"),
-    output_compression: Optional[int] = Form(None),
-    enable_teacache: Optional[bool] = Form(False),
-    enable_upscaling: Optional[bool] = Form(False),
-    upscaling_model_path: Optional[str] = Form(None),
-    upscaling_scale: Optional[int] = Form(4),
+    mask: UploadFile | None = File(None),
+    model: str | None = Form(None),
+    n: int | None = Form(1),
+    response_format: str | None = Form(None),
+    size: str | None = Form(None),
+    output_format: str | None = Form(None),
+    background: str | None = Form("auto"),
+    seed: int | None = Form(None),
+    generator_device: str | None = Form("cuda"),
+    user: str | None = Form(None),
+    negative_prompt: str | None = Form(None),
+    guidance_scale: float | None = Form(None),
+    true_cfg_scale: float | None = Form(None),
+    num_inference_steps: int | None = Form(None),
+    output_quality: str | None = Form("default"),
+    output_compression: int | None = Form(None),
+    enable_teacache: bool | None = Form(False),
+    enable_upscaling: bool | None = Form(False),
+    upscaling_model_path: str | None = Form(None),
+    upscaling_scale: int | None = Form(4),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -424,7 +431,7 @@ async def edits(
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Failed to process image source: {str(e)}",
+                detail=f"Failed to process image source: {e!s}",
             )
 
         ext = choose_output_image_ext(output_format, background)
@@ -456,9 +463,12 @@ async def edits(
             sampling_params=sampling,
             external_trace_header=trace_headers,
         )
-        save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
-        )
+        try:
+            save_file_path_list, result = await process_generation_batch(
+                async_scheduler_client, batch
+            )
+        except RequestCancelledError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         save_file_path = save_file_path_list[0]
         resp_format = (response_format or "b64_json").lower()
 
@@ -515,7 +525,7 @@ async def edits(
 
 @router.get("/{image_id}/content")
 async def download_image_content(
-    image_id: str = Path(...), variant: Optional[str] = Query(None)
+    image_id: str = Path(...), variant: str | None = Query(None)
 ):
     item = await IMAGE_STORE.get(image_id)
     if not item:
@@ -551,3 +561,25 @@ async def download_image_content(
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )
+
+
+def _require_job_control() -> None:
+    if not get_global_server_args().job_control_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="job control requires a single-rank scheduler in v1",
+        )
+
+
+@router.get("/jobs/{request_id}")
+async def job_status(request_id: str):
+    """Observable job status from the scheduler's job-control channel."""
+    _require_job_control()
+    return await async_scheduler_client.job_control(JobStatusReq(request_id=request_id))
+
+
+@router.delete("/jobs/{request_id}")
+async def cancel_job(request_id: str):
+    """Cancel a job by request id."""
+    _require_job_control()
+    return await async_scheduler_client.job_control(CancelReq(request_id=request_id))

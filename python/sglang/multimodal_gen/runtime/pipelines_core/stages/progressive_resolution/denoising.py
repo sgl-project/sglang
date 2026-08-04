@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -298,7 +299,6 @@ class ProgressiveDenoisingStage(DenoisingStage):
         new_w_pixel: int,
     ) -> None:
         """Called after each stage transition. Update resolution-dependent state."""
-        pass
 
     def _refresh_cache_dit_context(
         self, n_remaining: int, scm_preset: str | None
@@ -439,6 +439,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> None:
         """Run denoising steps [start_step, end_step) using the parent infrastructure."""
         for step_index in range(start_step, end_step):
+            check_current_step(step_index, ctx.num_inference_steps)
             t_host = timesteps_cpu[step_index]
             step = self._prepare_step_state(
                 ctx, batch, server_args, step_index, t_host, timesteps_cpu

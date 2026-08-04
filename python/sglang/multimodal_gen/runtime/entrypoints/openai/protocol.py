@@ -58,6 +58,7 @@ class ImageGenerationsRequest(BaseModel):
     upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
+    request_id: Optional[str] = None
     perf_dump_path: Optional[str] = None
     # Progressive resolution generation
     progressive_mode: Optional[str] = None

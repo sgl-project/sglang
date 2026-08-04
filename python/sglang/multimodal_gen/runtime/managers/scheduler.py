@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import pickle
+import threading
 import time
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -42,6 +44,15 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.job_registry import (
+    CANCELLED,
+    CancelReq,
+    JobRegistry,
+    JobStatusReq,
+    clear_current_jobs,
+    contains_file_refs,
+    set_current_jobs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
@@ -167,6 +178,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
+        self.jobs: JobRegistry | None = None
+        self._job_control_thread: threading.Thread | None = None
+        self._job_control_socket: zmq.Socket | None = None
+        if gpu_id == 0 and server_args.job_control_enabled:
+            self._start_job_control()
+
         self._init_disagg_state(server_args, local_rank)
 
         if self._batch_metrics_enabled:
@@ -181,14 +198,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return None
         return self._disagg_metrics.snapshot().to_dict()
 
-    def _handle_get_disagg_stats(self, _reqs: List[Any]) -> OutputBatch:
+    def _handle_get_disagg_stats(self, _reqs: list[Any]) -> OutputBatch:
         """Handle stats request — return disagg metrics via OutputBatch.output."""
         stats = self.get_disagg_metrics()
         return OutputBatch(
             output=stats or {"role": "monolithic", "message": "not in disagg mode"}
         )
 
-    def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
+    def _handle_set_lora(self, reqs: list[Any]) -> OutputBatch:
         # TODO: return set status
         # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
@@ -200,26 +217,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             req.merge_mode,
         )
 
-    def _handle_merge_lora(self, reqs: List[Any]):
+    def _handle_merge_lora(self, reqs: list[Any]):
         req = reqs[0]
         return self.worker.merge_lora_weights(req.target, req.strength)
 
-    def _handle_unmerge_lora(self, reqs: List[Any]) -> OutputBatch:
+    def _handle_unmerge_lora(self, reqs: list[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.unmerge_lora_weights(req.target)
 
-    def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
+    def _handle_list_loras(self, _reqs: list[Any]) -> OutputBatch:
         return self.worker.list_loras()
 
-    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+    def _handle_shutdown(self, _reqs: list[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
 
-    def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
+    def _handle_release_realtime_session(self, reqs: list[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
 
-    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+    def _handle_update_weights_from_disk(self, reqs: list[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
         if self.worker.is_sleeping():
             raise RuntimeError(
@@ -300,6 +317,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
                         error_msg=output_batch.error,
+                        cancelled=output_batch.cancelled,
                     )
 
                 split_outputs = self._split_batched_output(output_batch, reqs)
@@ -310,6 +328,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
                         error_msg="Dynamic batching failed: could not split merged output.",
+                        cancelled=output_batch.cancelled,
                     )
 
                 logger.info(
@@ -330,7 +349,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     error_msg=f"Dynamic batching failed: {e}",
                 )
 
-    def _execute_generation_grouped(self, reqs: List[Req]) -> List[OutputBatch]:
+    def _execute_generation_grouped(self, reqs: list[Req]) -> list[OutputBatch]:
         batch_size = len(reqs)
         try:
             output_batch = self.worker.execute_forward(reqs)
@@ -342,6 +361,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
                     error_msg=output_batch.error,
+                    cancelled=output_batch.cancelled,
                 )
 
             split_outputs = self._split_batched_output(output_batch, reqs)
@@ -352,6 +372,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
                     error_msg="Native grouped execution failed: could not split output.",
+                    cancelled=output_batch.cancelled,
                 )
 
             logger.info(
@@ -372,7 +393,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 error_msg=f"Native grouped execution failed: {e}",
             )
 
-    def _execute_generation_sequential(self, reqs: List[Req]) -> List[OutputBatch]:
+    def _execute_generation_sequential(self, reqs: list[Req]) -> list[OutputBatch]:
         return [self.worker.execute_forward([req]) for req in reqs]
 
     @staticmethod
@@ -618,10 +639,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
     def _build_dynamic_batch_error_outputs(
         self,
-        reqs: List[Req],
+        reqs: list[Req],
         error_msg: str,
-    ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg) for _ in reqs]
+        *,
+        cancelled: bool = False,
+    ) -> list[OutputBatch]:
+        return [OutputBatch(error=error_msg, cancelled=cancelled) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
@@ -671,7 +694,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 stage_name, time.perf_counter() - start_time
             )
 
-    def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
+    def _try_merge_generation_reqs(self, reqs: list[Req]) -> Req | None:
         """Create a batched generation request from compatible requests.
 
         Per-request seeds and output paths are stored in `extra` so downstream
@@ -742,8 +765,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         return deepcopy(value)
 
     def _split_batched_output(
-        self, output_batch: OutputBatch, reqs: List[Req]
-    ) -> List[OutputBatch] | None:
+        self, output_batch: OutputBatch, reqs: list[Req]
+    ) -> list[OutputBatch] | None:
         """Split a merged result only when outputs map one-to-one to requests."""
         per_req_counts = [req.num_outputs_per_prompt for req in reqs]
         total_items = sum(per_req_counts)
@@ -802,6 +825,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     output_batch.trajectory_decoded, start, end, total_items
                 ),
                 error=output_batch.error,
+                cancelled=output_batch.cancelled,
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
@@ -961,7 +985,147 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return [(identity, reqs)]
         return [(identity, req) for req in reqs]
 
-    def recv_reqs(self) -> List[tuple[bytes, Any]]:
+    def _start_job_control(self) -> None:
+        """Bind the side channel before creating the registry: a failed bind
+        must leave job control fully off (self.jobs is None, so admission is a
+        passthrough), not a live registry behind a dead cancel channel."""
+        socket = self.context.socket(zmq.REP)
+        try:
+            socket.bind(self.server_args.scheduler_cancel_endpoint)
+        except zmq.ZMQError as e:
+            logger.error(
+                "job-control channel failed to bind %s; job control disabled: %s",
+                self.server_args.scheduler_cancel_endpoint,
+                e,
+            )
+            socket.close(linger=0)
+            return
+        self._job_control_socket = socket
+        self.jobs = JobRegistry()
+        self._job_control_thread = threading.Thread(
+            target=self._job_control_loop, daemon=True, name="job-control"
+        )
+        self._job_control_thread.start()
+
+    def _job_control_loop(self) -> None:
+        """Side channel serving cancel/status while the event loop is blocked
+        inside a forward."""
+        socket = self._job_control_socket
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        while self._running:
+            try:
+                if not poller.poll(timeout=1000):
+                    continue
+                # drain all frames so REP alternation survives multipart input
+                payload = socket.recv_multipart()[-1]
+                try:
+                    request = pickle.loads(payload)
+                    if isinstance(request, CancelReq):
+                        reply = self.jobs.cancel(request.request_id)
+                    elif isinstance(request, JobStatusReq):
+                        reply = self.jobs.status(request.request_id)
+                    else:
+                        reply = {
+                            "error": f"unknown job control request: {type(request)}"
+                        }
+                except Exception as e:  # never kill the channel
+                    reply = {"error": str(e)}
+                socket.send(pickle.dumps(reply))
+            except zmq.ZMQError:
+                break  # context shut down
+        socket.close(linger=0)
+
+    def _admit_new_reqs(
+        self, new_reqs: list[tuple[bytes, Any]]
+    ) -> list[tuple[bytes, Any]]:
+        """Idempotency before dispatch: duplicates of a live job wait on it,
+        duplicates of a finished job replay its cached result."""
+        if self.jobs is None:
+            return new_reqs
+        admitted = []
+        for identity, req in new_reqs:
+            if not isinstance(req, Req) or is_warmup_req(req) or not req.request_id:
+                admitted.append((identity, req))
+                continue
+            verdict, payload = self.jobs.admit(req.request_id, identity)
+            if verdict == "new":
+                admitted.append((identity, req))
+            elif verdict == "cancelled":
+                output = OutputBatch(
+                    error="request cancelled before dispatch", cancelled=True
+                )
+                self.jobs.finish(req.request_id, output)
+                self._try_return(output, identity)
+            elif verdict == "replay":
+                if payload is None or contains_file_refs(payload.output):
+                    payload = OutputBatch(
+                        error=(
+                            f"request {req.request_id} already finished; "
+                            "result not replayable"
+                        ),
+                        cancelled=(
+                            self.jobs.status(req.request_id)["status"] == CANCELLED
+                        ),
+                    )
+                self._try_return(payload, identity)
+        return admitted
+
+    def _try_return(self, output_batch: OutputBatch, identity: bytes | None) -> None:
+        """Out-of-band replies must not kill the loop on one dead client."""
+        try:
+            self.return_result(output_batch, identity)
+        except zmq.ZMQError as e:
+            logger.warning("job-control reply failed: %s", e)
+
+    def _drop_cancelled_items(
+        self, items: list[tuple[bytes | None, Any]]
+    ) -> list[tuple[bytes | None, Any]]:
+        """Cancelled-while-queued requests are answered without dispatch."""
+        if self.jobs is None:
+            return items
+        kept = []
+        for identity, req in items:
+            if (
+                isinstance(req, Req)
+                and not is_warmup_req(req)
+                and req.request_id
+                and self.jobs.is_cancelled(req.request_id)
+            ):
+                output = OutputBatch(
+                    error="request cancelled before dispatch", cancelled=True
+                )
+                self._try_return(output, identity)
+                for waiter in self.jobs.finish(req.request_id, output):
+                    self._try_return(output, waiter)
+            else:
+                kept.append((identity, req))
+        return kept
+
+    def _set_running_jobs(self, items: list[tuple[bytes | None, Any]]) -> None:
+        if self.jobs is None:
+            return
+        handles = [
+            handle
+            for _, req in items
+            if isinstance(req, Req)
+            and req.request_id
+            and not is_warmup_req(req)
+            and (handle := self.jobs.mark_running(req.request_id)) is not None
+        ]
+        set_current_jobs(handles)
+
+    def _job_waiters(
+        self, req: Any, output_batch: OutputBatch, is_warmup: bool
+    ) -> list[bytes]:
+        """Terminal registry transition. Returns waiter identities owed a reply."""
+        if self.jobs is None or is_warmup or not isinstance(req, Req):
+            return []
+        if not req.request_id:
+            return []
+        return self.jobs.finish(req.request_id, output_batch)
+
+    def recv_reqs(self) -> list[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
         """
@@ -985,6 +1149,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
                 raise
+            recv_reqs = self._admit_new_reqs(recv_reqs)
         else:
             recv_reqs = None
 
@@ -1077,6 +1242,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            items = self._drop_cancelled_items(items)
+            if not items:
+                continue
+
+            self._set_running_jobs(items)
             try:
                 handler_result = self._dispatch_items(items)
             except Exception as e:
@@ -1085,6 +1255,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     exc_info=True,
                 )
                 handler_result = OutputBatch(error=str(e))
+            finally:
+                clear_current_jobs()
 
             if isinstance(handler_result, list):
                 output_batches = handler_result
@@ -1107,17 +1279,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     for _ in items
                 ]
 
-            # 3. return results
-            try:
-                for (identity, processed_req), output_batch in zip(
-                    items, output_batches, strict=True
-                ):
-                    is_warmup = is_warmup_req(processed_req)
-                    self._log_warmup_result(output_batch, processed_req, is_warmup)
+            for (identity, processed_req), output_batch in zip(
+                items, output_batches, strict=True
+            ):
+                is_warmup = is_warmup_req(processed_req)
+                self._log_warmup_result(output_batch, processed_req, is_warmup)
+                waiters = self._job_waiters(processed_req, output_batch, is_warmup)
+                pre_spill_output = output_batch.output
 
-                    should_return_lightweight_warmup_result = (
-                        self._should_return_lightweight_warmup_result(processed_req)
-                    )
+                should_return_lightweight_warmup_result = (
+                    self._should_return_lightweight_warmup_result(processed_req)
+                )
+                try:
                     if should_return_lightweight_warmup_result:
                         # internal prewarm is a real-path request; reply but drop payloads
                         output_batch.drop_payload_for_warmup()
@@ -1128,13 +1301,22 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         self.return_result(
                             output_batch, identity, should_not_return=is_warmup
                         )
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
-                continue
+                except zmq.ZMQError as e:
+                    # Reply failed. Log and keep loop alive to accept future requests.
+                    logger.error(f"ZMQ error sending reply: {e}")
+                for waiter in waiters:
+                    try:
+                        self.return_result(
+                            dataclasses.replace(output_batch, output=pre_spill_output),
+                            waiter,
+                        )
+                    except zmq.ZMQError as e:
+                        logger.error(f"ZMQ error sending duplicate reply: {e}")
 
         self._log_batch_metrics_summary()
 
+        if self._job_control_thread is not None:
+            self._job_control_thread.join(timeout=2.0)
         if self.receiver is not None:
             self.receiver.close()
         self._cleanup_disagg()
@@ -1148,17 +1330,17 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         for pipe in self.task_pipes_to_slaves:
             pipe.send(task)
 
-    def _collect_slave_results(self) -> List[dict[str, Any]]:
+    def _collect_slave_results(self) -> list[dict[str, Any]]:
         """Collect results from all slave worker processes."""
         results = []
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
 
-    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+    def _handle_release_memory_occupation(self, _reqs: list[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
         return OutputBatch(output=self.worker.release_memory_occupation())
 
-    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+    def _handle_resume_memory_occupation(self, _reqs: list[Any]) -> OutputBatch:
         logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
         return OutputBatch(output=self.worker.resume_memory_occupation())

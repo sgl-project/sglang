@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CAUSAL_BLOCK_PROMPTS_KEY,
@@ -93,7 +94,7 @@ class LongLive2TextEncodingStage(TextEncodingStage):
             scene_cut_prefix=(
                 LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX
                 if getattr(batch, "scene_cut_prefix", None) is None
-                else getattr(batch, "scene_cut_prefix")
+                else batch.scene_cut_prefix
             ),
         )
         batch.extra[CAUSAL_BLOCK_PROMPTS_KEY] = block_prompts
@@ -606,6 +607,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
+            check_current_step(current_timestep, len(timesteps))
             with self._denoise_step_profiler(batch, start_frame, current_timestep):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent
@@ -703,6 +705,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
+            check_current_step(current_timestep, len(timesteps))
             with self._denoise_step_profiler(batch, start_frame, current_timestep):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent

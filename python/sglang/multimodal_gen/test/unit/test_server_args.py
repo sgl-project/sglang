@@ -2184,6 +2184,57 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
         self.assertEqual(args.disagg_role, RoleType.DENOISER)
 
 
+class TestJobControlEnabled(unittest.TestCase):
+    """`job_control_enabled` gates on the resolved single-rank config: the
+    registry-based admission and queued-request drops are only correct when
+    every rank sees identical decisions, so any multi-rank dimension (or the
+    explicit opt-out) must turn the property off."""
+
+    def _args(
+        self,
+        *,
+        disable_job_control=False,
+        disagg_role=None,
+        sp_degree=1,
+        enable_cfg_parallel=False,
+        tp_size=1,
+        dp_size=1,
+    ):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.disable_job_control = disable_job_control
+        sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
+        sa.sp_degree = sp_degree
+        sa.enable_cfg_parallel = enable_cfg_parallel
+        sa.tp_size = tp_size
+        sa.dp_size = dp_size
+        return sa
+
+    def test_enabled_for_single_rank_monolithic_defaults(self):
+        self.assertTrue(self._args().job_control_enabled)
+
+    def test_disable_flag_turns_it_off(self):
+        self.assertFalse(self._args(disable_job_control=True).job_control_enabled)
+
+    def test_dp_size_gt_one_turns_it_off(self):
+        self.assertFalse(self._args(dp_size=2).job_control_enabled)
+
+    def test_disabled_for_tensor_parallel(self):
+        self.assertFalse(self._args(tp_size=2).job_control_enabled)
+
+    def test_disabled_for_sequence_parallel(self):
+        self.assertFalse(self._args(sp_degree=2).job_control_enabled)
+
+    def test_disabled_for_cfg_parallel(self):
+        self.assertFalse(self._args(enable_cfg_parallel=True).job_control_enabled)
+
+    def test_disabled_for_non_monolithic_disagg_role(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        self.assertFalse(self._args(disagg_role=RoleType.DENOISER).job_control_enabled)
+
+
 class TestDisaggTransferBackendArgs(unittest.TestCase):
     def test_transfer_backend_defaults_to_auto(self):
         args = _from_dict_without_model_resolution({"model_path": "/fake"})

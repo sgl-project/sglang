@@ -1,6 +1,6 @@
 import pickle
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Set
 
 import zmq
 import zmq.asyncio
@@ -59,7 +59,7 @@ class SchedulerClient:
         self.context = None
         self.scheduler_socket = None
         self.server_args = None
-        self.request_logger: Optional[DiffusionRequestLogger] = None
+        self.request_logger: DiffusionRequestLogger | None = None
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -149,7 +149,7 @@ class AsyncSchedulerClient:
     def __init__(self):
         self.context = None
         self.server_args = None
-        self.request_logger: Optional[DiffusionRequestLogger] = None
+        self.request_logger: DiffusionRequestLogger | None = None
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -190,6 +190,24 @@ class AsyncSchedulerClient:
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
+        finally:
+            socket.close()
+
+    async def job_control(self, request: Any) -> Any:
+        """Cancel/status round trip on the job-control side channel."""
+        if self.context is None:
+            raise RuntimeError(
+                "AsyncSchedulerClient is not initialized. Call initialize() first."
+            )
+        socket = self.context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, 5000)
+        socket.connect(self.server_args.scheduler_cancel_endpoint)
+        try:
+            await socket.send(pickle.dumps(request))
+            return pickle.loads(await socket.recv())
+        except zmq.error.Again:
+            raise TimeoutError("Scheduler job-control channel did not respond.")
         finally:
             socket.close()
 

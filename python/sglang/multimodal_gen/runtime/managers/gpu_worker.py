@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, List, Optional, Set, Union
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
 )
+from sglang.multimodal_gen.runtime.managers.job_registry import RequestCancelledError
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
@@ -478,6 +479,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     meta={"model": self.server_args.model_path},
                     tag="server_perf_dump",
                 )
+        except RequestCancelledError as e:
+            logger.info(f"Cancelled {error_context}: {e}")
+            if output_batch is None:
+                output_batch = OutputBatch()
+            output_batch.error = f"request cancelled: {e}"
+            output_batch.cancelled = True
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         except Exception as e:
             logger.error(
                 f"Error executing {error_context}: {e}",

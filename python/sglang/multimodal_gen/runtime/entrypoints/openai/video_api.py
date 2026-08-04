@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.managers.job_registry import RequestCancelledError
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -282,9 +283,9 @@ def _resolve_sound_duration(
 
 def _cosmos3_sampling_param_kwargs(
     req: VideoGenerationsRequest, *, num_frames: int, fps: int
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Map HTTP/API aliases to Cosmos3SamplingParams field names."""
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
 
     sound_duration = _resolve_sound_duration(req, num_frames=num_frames, fps=fps)
     if sound_duration is not None:
@@ -389,7 +390,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
     request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
     return {
@@ -488,6 +489,11 @@ async def _dispatch_job_async(
         )
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
+    except RequestCancelledError as e:
+        logger.info(f"video {job_id} cancelled: {e}")
+        await VIDEO_STORE.update_fields(
+            job_id, {"status": "cancelled", "error": {"message": str(e)}}
+        )
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
@@ -706,7 +712,7 @@ async def create_video(
             body = {}
         try:
             # If client uses extra_body, merge it into the top-level payload
-            payload: Dict[str, Any] = dict(body or {})
+            payload: dict[str, Any] = dict(body or {})
             extra = payload.pop("extra_body", None)
             if isinstance(extra, str):
                 extra = json.loads(extra)
@@ -753,7 +759,7 @@ async def create_video(
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Failed to process image source: {str(e)}",
+                        detail=f"Failed to process image source: {e!s}",
                     )
                 payload["input_reference"] = input_path
             req = VideoGenerationsRequest(**payload)
@@ -838,9 +844,9 @@ async def create_video(
 
 @router.get("", response_model=VideoListResponse)
 async def list_videos(
-    after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    after: str | None = Query(None),
+    limit: int | None = Query(None, ge=1, le=100),
+    order: str | None = Query("desc"),
 ):
     # Normalize order
     order = (order or "desc").lower()
@@ -872,14 +878,21 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
-    job["status"] = "deleted"
+    from sglang.multimodal_gen.runtime.managers.job_registry import CancelReq
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+
+    if get_global_server_args().job_control_enabled:
+        try:
+            await async_scheduler_client.job_control(CancelReq(request_id=video_id))
+        except (TimeoutError, RuntimeError):
+            pass
+    job = await VIDEO_STORE.pop(video_id) or job
+    job["status"] = "cancelled"
     return VideoResponse(**job)
 
 

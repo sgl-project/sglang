@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import PIL.Image
 import torch
-import torch.nn as nn
+from torch import nn
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -985,6 +986,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         )
 
         for i, t in progress_bar:
+            check_current_step(i, len(timesteps))
             timestep = t.unsqueeze(0) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).

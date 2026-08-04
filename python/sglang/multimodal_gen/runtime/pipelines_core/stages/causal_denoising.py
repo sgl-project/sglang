@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CrossAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.job_registry import check_current_step
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
     pred_noise_to_pred_video,
@@ -773,6 +774,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attn_metadata = None
 
         for i, timestep in enumerate(timesteps):
+            check_current_step(i, len(timesteps))
             noise_latents = noise_latents_btchw
             latent_model_input = prepare_model_input(current_latents).to(target_dtype)
             x0_btchw, attn_metadata = self._predict_x0_btchw(
