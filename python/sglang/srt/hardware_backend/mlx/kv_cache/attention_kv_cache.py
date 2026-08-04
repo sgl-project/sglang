@@ -5,11 +5,29 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+from mlx_lm.models.base import create_causal_mask
 
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
         MlxAttentionKVPool,
     )
+
+
+def make_attention_mask(N, offset, return_array=False, window_size=None):
+    """Mirror mlx_lm ``cache.create_attention_mask`` for cache shims.
+
+    Containers delegate mask creation to ``cache.make_mask`` whenever the
+    cache exposes it, so the shims must honor ``window_size`` (sliding-window
+    layers pass it, including for N == 1) or windowed models silently fall
+    back to full attention.
+    """
+    if window_size is not None:
+        return create_causal_mask(N, offset, window_size=window_size)
+    if N == 1:
+        return None
+    if return_array:
+        return create_causal_mask(N, offset)
+    return "causal"
 
 
 class AttentionOffsetCache:
@@ -25,8 +43,10 @@ class AttentionOffsetCache:
     def state(self):
         return ()  # Empty — safe for mx.eval unpacking
 
-    def make_mask(self, N, **kwargs):
-        return None if N == 1 else "causal"
+    def make_mask(self, N, return_array=False, window_size=None, **kwargs):
+        return make_attention_mask(
+            N, self.offset, return_array=return_array, window_size=window_size
+        )
 
     def update_and_fetch(self, keys, values):
         raise RuntimeError("AttentionOffsetCache should not store data")
@@ -60,6 +80,11 @@ class ContiguousAttentionKVCache:
         self.offset = 0
         self.max_seq_len = max_seq_len
 
+    def make_mask(self, N, return_array=False, window_size=None, **kwargs):
+        return make_attention_mask(
+            N, self.offset, return_array=return_array, window_size=window_size
+        )
+
     def _allocate(self, keys: mx.array) -> None:
         """Allocate buffers matching the first key tensor's shape."""
         B, n_kv_heads, _, head_dim = keys.shape
@@ -76,9 +101,6 @@ class ContiguousAttentionKVCache:
         if self.keys is None:
             return ()
         return (self.keys, self.values)
-
-    def make_mask(self, N, **kwargs):
-        return None if N == 1 else "causal"
 
     def _grow(self, required: int) -> None:
         """Double the buffer until it can hold *required* tokens."""
@@ -173,8 +195,10 @@ class PoolBackedAttentionKVCache:
             return (self._full_keys, self._full_values)
         return ()
 
-    def make_mask(self, N, **kwargs):
-        return None if N == 1 else "causal"
+    def make_mask(self, N, return_array=False, window_size=None, **kwargs):
+        return make_attention_mask(
+            N, self.offset, return_array=return_array, window_size=window_size
+        )
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
