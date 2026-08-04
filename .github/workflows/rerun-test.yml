@@ -104,29 +104,14 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # The stages get these as an artifact from rust-ext-build, which a
-      # workflow_dispatch cannot reach - artifacts are per-run. The cache behind it
-      # is not: a run reads its own branch's entries plus the default branch's, so
-      # both seed-rust-ext-cache.yml (main) and this PR's own rust-ext-build hit
-      # here. Key must match _pr-test-rust-ext-build.yml's default cache_key_prefix.
-      - name: Restore prebuilt Rust extensions
-        id: rust_ext
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: python/sglang/srt/*/_core*.so
-          key: rust-ext-x86_64-${{ hashFiles('rust/**', 'python/setup.py') }}
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own,
+      # so the cache is the only source here.
+      - uses: ./.github/actions/download-rust-ext
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
         env:
           GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
-          # require_prebuilt_rust_exts re-checks the modules against this
-          # interpreter's EXT_SUFFIX, which carries both the minor version and the
-          # arch, and clears this back to a source build on any mismatch. So an
-          # aarch64 or 3.12 pool restoring these x86_64/3.10 modules falls back
-          # rather than importing nothing.
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outputs.cache-hit == 'true' && 'none' || '' }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -214,18 +199,10 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      - name: Restore prebuilt Rust extensions
-        id: rust_ext
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: python/sglang/srt/*/_core*.so
-          key: rust-ext-x86_64-${{ hashFiles('rust/**', 'python/setup.py') }}
+      - uses: ./.github/actions/download-rust-ext
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
-        env:
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outputs.cache-hit == 'true' && 'none' || '' }}
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
@@ -299,45 +276,17 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      # Worth more here than on the GPU jobs: this runner is hosted, so it has no
-      # persistent CARGO_TARGET_DIR to fall back on and every run compiles cold.
-      # Its setup-python pins the same 3.10 the modules were built against.
-      - name: Restore prebuilt Rust extensions
+      # Worth the most here of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir to fall back on and every dispatch compiled
+      # cold. Its setup-python pins the same 3.10 the modules were built against.
+      - uses: ./.github/actions/download-rust-ext
         id: rust_ext
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: python/sglang/srt/*/_core*.so
-          key: rust-ext-x86_64-${{ hashFiles('rust/**', 'python/setup.py') }}
-
-      # This job installs with plain uv rather than ci_install_dependency.sh, so
-      # require_prebuilt_rust_exts never runs; do its check here. A partial entry
-      # must not reach SGLANG_BUILD_RUST_EXTS=none - that would install with a
-      # module missing and silently skip the tests needing it. Exact EXT_SUFFIX,
-      # not a _core*.so glob: the import system ignores a module built for another
-      # version or arch, which the glob would still count as present.
-      - name: Decide whether the restored modules are usable
-        id: prebuilt
-        run: |
-          set -uo pipefail
-          suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
-          missing=()
-          for pkg in server grpc multimodal; do
-              [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
-          done
-          if [ ${#missing[@]} -gt 0 ]; then
-              echo "::notice::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
-              echo "usable=false" >> "$GITHUB_OUTPUT"
-          else
-              echo "Using prebuilt Rust extension modules; skipping the cargo build."
-              echo "usable=true" >> "$GITHUB_OUTPUT"
-          fi
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
-      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      # Skipped when the prebuilt modules cover it, since then nothing compiles.
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source, so
+      # nothing needs it once the prebuilt modules are in place.
       - name: Install protoc + Rust toolchain
-        if: steps.prebuilt.outputs.usable != 'true'
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
@@ -345,7 +294,6 @@ jobs:
         timeout-minutes: 20
         env:
           UV_SYSTEM_PYTHON: "1"
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.prebuilt.outputs.usable == 'true' && 'none' || '' }}
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 

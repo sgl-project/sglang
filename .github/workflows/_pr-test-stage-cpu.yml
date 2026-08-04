@@ -85,26 +85,23 @@ jobs:
       # This stage compiled the workspace too - 7+ minutes per partition on
       # billable hosted minutes. rust-ext-build's modules need an older glibc than
       # this runner has, which is the safe direction, and both pin Python 3.10.
-      - name: Download prebuilt Rust extensions
+      - uses: ./.github/actions/download-rust-ext
         id: rust_ext
-        if: ${{ inputs.rust_ext_artifact != '' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.rust_ext_artifact }}
-          path: python/sglang/srt/
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       # Both only serve the fallback where this stage compiles the extensions
-      # itself, so they follow the download's outcome, not the job output: an
-      # expired artifact still needs cargo and a warm target dir here. Otherwise
-      # rust-cache restores ~1 GB per partition for nothing, on an over-quota cache.
+      # itself, so they follow whether the modules actually arrived, not the
+      # producer job's output: with the artifact expired and the cache evicted,
+      # cargo and a warm target dir are still needed here. Otherwise rust-cache
+      # restores ~1 GB per partition for nothing, on an over-quota cache.
       - name: Install protoc + Rust toolchain
-        if: ${{ steps.rust_ext.outcome != 'success' }}
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Rust cache (rust/ workspace)
-        if: ${{ steps.rust_ext.outcome != 'success' }}
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -116,7 +113,6 @@ jobs:
         timeout-minutes: 20
         env:
           UV_SYSTEM_PYTHON: "1"
-          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
