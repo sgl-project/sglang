@@ -79,6 +79,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# effort tiers the openai sdk's event models accept; we serve the wider api set
+_SDK_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _sanitize_response_dict(d: dict) -> dict:
+    """Drop response fields the installed openai sdk's event models reject."""
+    d["tools"] = []
+    reasoning = d.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is not None and effort not in _SDK_REASONING_EFFORTS:
+            reasoning["effort"] = "high" if effort in ("xhigh", "max") else None
+    return d
+
 
 class _MediaInputValidationError(ValueError):
     pass
@@ -1736,21 +1750,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # OpenAI SDK's Tool union may not know extended types; drop echo.
         response_dict["tools"] = []
 
-        # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
-
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
                 type="response.completed",
@@ -1794,10 +1793,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic
         # validation failures on extended tool types.
-        def _sanitize_response_dict(d: dict) -> dict:
-            d["tools"] = []
-            return d
-
         initial_response = _sanitize_response_dict(
             ResponsesResponse.from_request(
                 request,
@@ -2338,19 +2333,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[final_response.id] = final_response
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": cached_tokens,
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": reasoning_tokens_meta,
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
+        usage_dict = response_dict.get("usage")
+        if usage_dict:
+            usage_dict["input_tokens_details"]["cached_tokens"] = cached_tokens
+            usage_dict["output_tokens_details"][
+                "reasoning_tokens"
+            ] = reasoning_tokens_meta
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(

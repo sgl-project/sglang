@@ -48,6 +48,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -1713,6 +1714,23 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_serializer("usage")
+    def _serialize_usage(self, usage: Optional[UsageInfo]) -> Optional[Dict[str, Any]]:
+        # the api specifies input_tokens/output_tokens here; UsageInfo stays
+        # chat-shaped internally so metrics and final_usage_info are unchanged
+        if usage is None:
+            return None
+        details = usage.prompt_tokens_details
+        return {
+            "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": {
+                "cached_tokens": getattr(details, "cached_tokens", 0) or 0
+            },
+            "output_tokens": usage.completion_tokens or 0,
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "total_tokens": usage.total_tokens,
+        }
 
     @classmethod
     def from_request(
