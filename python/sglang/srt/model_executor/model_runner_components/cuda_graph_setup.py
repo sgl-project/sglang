@@ -90,6 +90,15 @@ def capture_cuda_graphs(
         model_runner
     )
 
+    # The eager (no-cuda-graph) phase runner, built AFTER the attention
+    # backend so its __init__ can warm up kernels (run-once) and allocate the
+    # fixed-max static buffer — both before the cuda-graph runners, so that
+    # buffer is canonical in the shared pool and the cg runners coalesce onto
+    # it. Always built: it serves both the fully-disabled case (decode/prefill
+    # runners point at it) and the eager fallback when a cg runner can't run a
+    # batch.
+    eager_runner = EagerRunner(model_runner)
+
     moe_runner_backend = (
         model_runner.server_args.speculative_moe_runner_backend
         if model_runner.is_draft_worker
@@ -113,23 +122,13 @@ def capture_cuda_graphs(
             cpu_group=world_group.cpu_group,
         )
         budget_bytes = set_masked_standard_layout_memory_budget(
-            model_runner.gpu_id, int(available_memory_gb * (1 << 30))
+            int(available_memory_gb * (1 << 30))
         )
         logger.info(
-            "DeepGEMM masked standard-layout budget: %.2f GiB from %.2f GiB "
-            "of free non-static memory.",
+            "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
             budget_bytes / (1 << 30),
             available_memory_gb,
         )
-
-    # The eager (no-cuda-graph) phase runner, built AFTER the attention
-    # backend so its __init__ can warm up kernels (run-once) and allocate the
-    # fixed-max static buffer — both before the cuda-graph runners, so that
-    # buffer is canonical in the shared pool and the cg runners coalesce onto
-    # it. Always built: it serves both the fully-disabled case (decode/prefill
-    # runners point at it) and the eager fallback when a cg runner can't run a
-    # batch.
-    eager_runner = EagerRunner(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill

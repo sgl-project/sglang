@@ -159,7 +159,7 @@ def test_compact_all_tokens_uses_tight_routing_independent_bound(
     )
 
 
-def test_standard_layout_memory_policy_and_overrides(monkeypatch):
+def test_standard_layout_auto_memory_policy(monkeypatch):
     config = MoeRunnerConfig(
         num_experts=512,
         num_local_experts=512,
@@ -173,30 +173,21 @@ def test_standard_layout_memory_policy_and_overrides(monkeypatch):
         use_fp8=True,
         block_shape=[128, 128],
     )
-    budget_bytes = int(42.5 * (1 << 30))
     monkeypatch.setattr(
         deep_gemm_runner,
-        "_get_masked_standard_layout_memory_budget",
-        lambda device_index: budget_bytes,
+        "_masked_standard_layout_memory_budget_bytes",
+        int(42.5 * (1 << 30)),
     )
 
-    hidden_states_8k = torch.empty((8192, 4096), device="meta")
-    hidden_states_16k = torch.empty((16384, 4096), device="meta")
     with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
-        assert deep_gemm_runner._should_use_masked_standard_layout(
-            config, quant_info, hidden_states_8k
-        )
-        assert not deep_gemm_runner._should_use_masked_standard_layout(
-            config, quant_info, hidden_states_16k
-        )
-    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("masked"):
-        assert deep_gemm_runner._should_use_masked_standard_layout(
-            config, quant_info, hidden_states_16k
-        )
-    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("compact"):
-        assert not deep_gemm_runner._should_use_masked_standard_layout(
-            config, quant_info, hidden_states_8k
-        )
+        for num_tokens, expected in ((8192, True), (16384, False)):
+            hidden_states = torch.empty((num_tokens, 4096), device="meta")
+            assert (
+                deep_gemm_runner._should_use_masked_standard_layout(
+                    config, quant_info, hidden_states
+                )
+                is expected
+            )
 
 
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])

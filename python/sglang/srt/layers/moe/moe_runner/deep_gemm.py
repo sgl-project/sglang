@@ -72,7 +72,7 @@ else:
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
-_masked_standard_layout_memory_budget_bytes: dict[int, int] = {}
+_masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -100,66 +100,47 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
-def _masked_standard_layout_mode() -> str:
-    mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
-    if mode not in ("auto", "masked", "compact"):
-        raise ValueError(
-            "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
-        )
-    return mode
-
-
 def set_masked_standard_layout_memory_budget(
-    device_index: int, available_memory_bytes: int
+    available_memory_bytes: int,
 ) -> int:
     """Cache the masked-layout share of free non-static device memory."""
+    global _masked_standard_layout_memory_budget_bytes
     fraction = envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.get()
     if not 0.0 < fraction <= 1.0:
         raise ValueError(
             "SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION must be in (0, 1]"
         )
-    budget_bytes = int(available_memory_bytes * fraction)
-    _masked_standard_layout_memory_budget_bytes[device_index] = budget_bytes
-    return budget_bytes
-
-
-def _get_masked_standard_layout_memory_budget(device_index: int) -> int:
-    cached_budget = _masked_standard_layout_memory_budget_bytes.get(device_index)
-    if cached_budget is not None:
-        return cached_budget
-
-    # Serving initializes the all-rank budget before graph setup. Keep direct
-    # eager callers usable, but never query or synchronize memory in capture.
-    if get_is_capture_mode():
-        return 0
-    free_memory, _ = torch.cuda.mem_get_info(device_index)
-    return set_masked_standard_layout_memory_budget(device_index, free_memory)
+    _masked_standard_layout_memory_budget_bytes = int(available_memory_bytes * fraction)
+    return _masked_standard_layout_memory_budget_bytes
 
 
 def _estimate_masked_standard_layout_peak_bytes(
-    *,
-    num_tokens: int,
-    num_local_experts: int,
-    hidden_size: int,
-    gateup_size: int,
-    down_output_size: int,
-    activation_dtype: torch.dtype,
-    block_k: int,
-    packed_scales: bool,
+    runner_config: MoeRunnerConfig,
+    quant_info: DeepGemmMoeQuantInfo,
+    hidden_states: torch.Tensor,
 ) -> int:
-    padded_m = (num_tokens // 256 + 1) * 256
+    padded_m = (hidden_states.shape[0] // 256 + 1) * 256
+    activation_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
+    hidden_size = hidden_states.shape[1]
+    gateup_size = quant_info.w13_weight.shape[1]
     gateup_row_bytes = gateup_size * torch.bfloat16.itemsize
-    down_output_row_bytes = down_output_size * torch.bfloat16.itemsize
+    down_output_row_bytes = quant_info.w2_weight.shape[1] * torch.bfloat16.itemsize
+    input_row_bytes = hidden_size * activation_dtype.itemsize
+    down_input_row_bytes = gateup_size // 2 * activation_dtype.itemsize
 
     if activation_dtype == torch.bfloat16:
-        input_row_bytes = hidden_size * torch.bfloat16.itemsize
-        down_input_row_bytes = gateup_size
         input_scale_row_bytes = 0
         down_scale_row_bytes = 0
     else:
-        input_row_bytes = hidden_size * activation_dtype.itemsize
-        down_input_row_bytes = gateup_size // 2 * activation_dtype.itemsize
-        scale_item_bytes = 1 if packed_scales else torch.float32.itemsize
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        scale_item_bytes = (
+            torch.uint8.itemsize if packed_scales else torch.float32.itemsize
+        )
         input_scale_row_bytes = ceil_div(hidden_size, block_k) * scale_item_bytes
         down_scale_row_bytes = ceil_div(gateup_size // 2, block_k) * scale_item_bytes
 
@@ -168,7 +149,7 @@ def _estimate_masked_standard_layout_peak_bytes(
         gateup_row_bytes + down_input_row_bytes + down_scale_row_bytes,
         down_input_row_bytes + down_scale_row_bytes + down_output_row_bytes,
     )
-    return num_local_experts * padded_m * peak_row_bytes
+    return runner_config.num_local_experts * padded_m * peak_row_bytes
 
 
 def _should_use_masked_standard_layout(
@@ -176,33 +157,28 @@ def _should_use_masked_standard_layout(
     quant_info: DeepGemmMoeQuantInfo,
     hidden_states: torch.Tensor,
 ) -> bool:
-    mode = _masked_standard_layout_mode()
-    if mode == "masked":
-        return True
-    if mode == "compact":
-        return False
+    mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
+    if mode not in ("auto", "masked", "compact"):
+        raise ValueError(
+            "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
+        )
+    if mode != "auto":
+        return mode == "masked"
 
-    activation_dtype = (
-        torch.bfloat16
-        if quant_info.w13_weight.dtype == torch.bfloat16
-        else torch.float8_e4m3fn
-    )
-    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-    estimated_peak_bytes = _estimate_masked_standard_layout_peak_bytes(
-        num_tokens=hidden_states.shape[0],
-        num_local_experts=runner_config.num_local_experts,
-        hidden_size=hidden_states.shape[1],
-        gateup_size=quant_info.w13_weight.shape[1],
-        down_output_size=quant_info.w2_weight.shape[1],
-        activation_dtype=activation_dtype,
-        block_k=block_k,
-        packed_scales=(quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0),
-    )
-    device_index = hidden_states.device.index
-    if device_index is None:
-        device_index = 0
-    return estimated_peak_bytes <= _get_masked_standard_layout_memory_budget(
-        device_index
+    global _masked_standard_layout_memory_budget_bytes
+    if _masked_standard_layout_memory_budget_bytes is None:
+        # Serving sets an all-rank budget before capture. Direct eager callers
+        # fall back to this rank's free memory without querying inside capture.
+        if get_is_capture_mode():
+            return False
+        free_memory, _ = torch.cuda.mem_get_info(hidden_states.device)
+        set_masked_standard_layout_memory_budget(free_memory)
+
+    return (
+        _estimate_masked_standard_layout_peak_bytes(
+            runner_config, quant_info, hidden_states
+        )
+        <= _masked_standard_layout_memory_budget_bytes
     )
 
 
