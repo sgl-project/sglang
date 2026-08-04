@@ -595,5 +595,105 @@ class TestMultiItemScoringClassificationAdvanced(CustomTestCase):
                     )
 
 
+class TestMultiItemScoringRejectsGenerate(CustomTestCase):
+    """Regression for sgl-project/sglang#25414.
+
+    Under --enable-mis the scheduler / attention / logits paths assume
+    every batch member is MIS-structured. Mixing in a non-MIS /generate
+    request used to crash the scheduler with `AssertionError: MIS batch
+    must have delimiter indices on every request`. The fix rejects
+    non-MIS GenerateReqInputs at tokenizer_manager.generate_request so
+    they never reach the scheduler.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = Engine(
+            model_path=TEST_MODEL_NAME,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            mem_fraction_static=0.15,
+            log_level="error",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine is not None:
+            cls.engine.shutdown()
+        torch.cuda.empty_cache()
+
+    def test_generate_rejected_under_mis(self):
+        """Engine.generate() must raise instead of crashing the scheduler."""
+        with self.assertRaises(ValueError) as cm:
+            self.engine.generate(
+                prompt="The capital of France is",
+                sampling_params={"max_new_tokens": 4, "temperature": 0},
+            )
+        self.assertIn("enable-mis", str(cm.exception))
+
+    def test_score_still_works_after_generate_rejected(self):
+        """A rejected /generate must not poison subsequent /v1/score calls."""
+        try:
+            self.engine.generate(
+                prompt="anything",
+                sampling_params={"max_new_tokens": 1, "temperature": 0},
+            )
+        except ValueError:
+            pass
+
+        scores = self.engine.score(
+            query="Rate each option:",
+            items=["alpha", "beta", "gamma"],
+            label_token_ids=[9454, 2753],
+            apply_softmax=True,
+        ).scores
+        self.assertEqual(len(scores), 3)
+        for sl in scores:
+            self.assertAlmostEqual(sum(sl), 1.0, places=5)
+
+    def test_concurrent_score_and_rejected_generate(self):
+        """Concurrent score + rejected generate: scheduler must stay healthy."""
+        score_query = "Rate each option:"
+        score_items = ["alpha", "beta", "gamma"]
+        score_labels = [9454, 2753]
+
+        async def _run():
+            score_tasks = [
+                self.engine.async_score(
+                    query=score_query,
+                    items=score_items,
+                    label_token_ids=score_labels,
+                    apply_softmax=True,
+                )
+                for _ in range(8)
+            ]
+            gen_tasks = [
+                self.engine.async_generate(
+                    prompt=f"prompt {i}",
+                    sampling_params={"max_new_tokens": 4, "temperature": 0},
+                )
+                for i in range(8)
+            ]
+            return await asyncio.gather(
+                *score_tasks, *gen_tasks, return_exceptions=True
+            )
+
+        results = self.engine.loop.run_until_complete(_run())
+        score_results = results[:8]
+        gen_results = results[8:]
+
+        for r in score_results:
+            self.assertFalse(isinstance(r, BaseException), f"score raised: {r!r}")
+            self.assertEqual(len(r.scores), len(score_items))
+            for sl in r.scores:
+                self.assertAlmostEqual(sum(sl), 1.0, places=5)
+
+        for r in gen_results:
+            self.assertIsInstance(r, ValueError, f"expected ValueError, got {r!r}")
+            self.assertIn("enable-mis", str(r))
+
+
 if __name__ == "__main__":
     unittest.main()
