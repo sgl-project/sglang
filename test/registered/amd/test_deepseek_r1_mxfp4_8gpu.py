@@ -36,6 +36,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
         other_args = [
             "--tp",
             "8",
+            "--disable-overlap-schedule",
             "--chunked-prefill-size",
             "131072",
             "--model-loader-extra-config",
