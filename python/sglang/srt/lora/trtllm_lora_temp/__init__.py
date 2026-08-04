@@ -35,16 +35,23 @@ def is_two_stream_active(x: torch.Tensor) -> bool:
     return x.shape[0] <= lora_envs.SGLANG_TWO_STREAM_MAX_TOKENS.get()
 
 
+def supports_two_stream_dense_lora(lora_a: torch.Tensor, lora_b: torch.Tensor) -> bool:
+    """Keep the temporary shrink kernel within its safe combined-rank tile."""
+    return lora_a.shape[-2] <= 128 and lora_b.shape[-1] <= 64
+
+
+# One side stream per consumer stream: routed (main/capture) and InklingMoE's sink (alt
+# stream) run concurrently; sharing one side stream is a premature-reuse WAR -> IMA.
+_LORA_SIDE_STREAMS: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
+
+
 def get_lora_side_stream() -> torch.cuda.Stream:
-    """Lazily allocate a single shared LoRA side stream.
-
-    Within one decode layer the three sites (qkv → attn → o_proj → moe_gate_up)
-    run sequentially, so one stream suffices and avoids extra graph-capture
-    nodes from per-site streams.
-    """
-    from sglang.srt.runtime_context import get_stream
-
-    return get_stream("lora_side")
+    # Lazy creation is capture-safe: graph warmup runs on the capture stream
+    # (graph_capture() sets it), so every key exists before any capture region.
+    consumer = torch.cuda.current_stream()
+    if consumer not in _LORA_SIDE_STREAMS:
+        _LORA_SIDE_STREAMS[consumer] = torch.cuda.Stream()
+    return _LORA_SIDE_STREAMS[consumer]
 
 
 def init_lora_two_stream_resources(device: Optional[torch.device] = None) -> None:
@@ -210,6 +217,7 @@ def install_two_stream_overrides() -> None:
 
 __all__ = [
     "is_two_stream_active",
+    "supports_two_stream_dense_lora",
     "get_lora_side_stream",
     "init_lora_two_stream_resources",
     "get_original_qkv_forward",

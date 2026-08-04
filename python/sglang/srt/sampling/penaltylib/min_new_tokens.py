@@ -31,7 +31,11 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                             (req.sampling_params.stop_token_ids or set())
                             | (req.eos_token_ids or set())
                             | (req.tokenizer.additional_stop_token_ids or set())
-                            | {req.tokenizer.eos_token_id}
+                            | (
+                                {req.tokenizer.eos_token_id}
+                                if req.tokenizer.eos_token_id is not None
+                                else set()
+                            )
                         )
                         if token_id is not None
                     ],
