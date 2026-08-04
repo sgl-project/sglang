@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -87,6 +89,38 @@ def capture_cuda_graphs(
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner
     )
+
+    moe_runner_backend = (
+        model_runner.server_args.speculative_moe_runner_backend
+        if model_runner.is_draft_worker
+        and model_runner.server_args.speculative_moe_runner_backend is not None
+        else model_runner.server_args.moe_runner_backend
+    )
+    if (
+        model_runner.device == "cuda"
+        and moe_runner_backend == "deep_gemm"
+        and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
+    ):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            set_masked_standard_layout_memory_budget,
+        )
+
+        world_group = get_world_group()
+        available_memory_gb = get_available_gpu_memory(
+            model_runner.device,
+            model_runner.gpu_id,
+            distributed=world_group.world_size > 1,
+            cpu_group=world_group.cpu_group,
+        )
+        budget_bytes = set_masked_standard_layout_memory_budget(
+            model_runner.gpu_id, int(available_memory_gb * (1 << 30))
+        )
+        logger.info(
+            "DeepGEMM masked standard-layout budget: %.2f GiB from %.2f GiB "
+            "of free non-static memory.",
+            budget_bytes / (1 << 30),
+            available_memory_gb,
+        )
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
     # backend so its __init__ can warm up kernels (run-once) and allocate the
