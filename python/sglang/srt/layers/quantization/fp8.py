@@ -484,7 +484,6 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_parallel().tp_size
         block_n, block_k = (
             quant_config.weight_block_size[0],
             quant_config.weight_block_size[1],
@@ -495,6 +494,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
+            tp_size = get_parallel().tp_size
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:

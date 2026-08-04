@@ -844,6 +844,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
