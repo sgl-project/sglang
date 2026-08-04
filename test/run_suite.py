@@ -82,6 +82,7 @@ PER_COMMIT_SUITES = {
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
+        "base-c-test-8-gpu-b300",
         "base-c-test-deepep-4-gpu-h100",
         "base-c-test-deepep-4-gpu-b200",
         "base-c-test-deepep-8-gpu-h200",
