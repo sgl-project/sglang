@@ -40,20 +40,15 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-<Warning>
-`--reasoning-parser ling3`, `--tool-call-parser ling3`, and the DSpark recipe depend on the Ling-3.0 runtime support PR for SGLang and are not available on current SGLang releases. Deploy these recipes from a build that includes that PR.
-</Warning>
-
 Pick your hardware + recipe to generate the launch command. Two serving strategies are covered:
 
-- **Balanced** — the standard NEXTN recipe for typical multi-user serving (all listed GPUs).
-- **Low-Latency** — the DSpark target/draft recipe for the fastest single-user replies (B200).
+- **Low-Latency** — fastest reply for a single user. Pick for chat. On B200 this switches to the DSpark target/draft speculative recipe.
+- **Balanced** — good speed with several users at once. Use for typical multi-user serving. These are the standard NEXTN recipes.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash.jsx";
-import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} />
 
 ## Playground
 
@@ -67,7 +62,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Ling-3.0-flash is a hybrid-attention Mixture-of-Experts (MoE) language model from the BailingMoeV3 family. It interleaves Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers, on top of a fine-grained MoE feed-forward network. This keeps per-token inference cost close to a small model — **124B total parameters with only 5.1B active** — while retaining large-model capacity.
 
-It is a hybrid-reasoning model with a switchable thinking mode, and it supports structured tool calling. Native context length is 128K, extendable to 256K with YaRN.
+It is a hybrid-reasoning model with thinking enabled by default, and it supports structured tool calling. Native context length is 128K, extendable to 256K with YaRN.
 
 **Available Models:**
 
@@ -81,8 +76,8 @@ It is a hybrid-reasoning model with a switchable thinking mode, and it supports 
 
 - `--trust-remote-code` is required for the `BailingMoeV3ForCausalLM` implementation.
 - Tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and Blackwell (B200); `--tp 8` on 80 GB cards (H100, H800).
-- `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing. Both parsers ship in the Ling-3.0 runtime support PR (see the warning in the Deployment section).
-- The chat template does not enable thinking by default. To make thinking the server-wide default, launch with `--default-chat-template-kwargs '{"enable_thinking":true}'`; a single request can opt in with `"chat_template_kwargs": {"enable_thinking": true}` (see §3.1).
+- `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
+- The chat template enables thinking by default. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}`; to disable it server-wide, launch with `--default-chat-template-kwargs '{"enable_thinking":false}'` (see §3.1).
 - `--speculative-algorithm NEXTN` enables the NEXTN speculative decoding path on the Balanced recipes.
 - The B200 Low-Latency recipe uses DSpark speculative decoding (`--speculative-algorithm DSPARK`) with a separate draft checkpoint; replace `<dspark-draft-model>` with the published draft repository.
 - Native context is 128K. The Balanced recipes set `--context-length 262144` and apply YaRN with factor 2.0 to extend it to 256K.
@@ -91,7 +86,7 @@ It is a hybrid-reasoning model with a switchable thinking mode, and it supports 
 
 ### 3.1 Reasoning
 
-With thinking enabled and `--reasoning-parser ling3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)), the chain-of-thought is returned in `message.reasoning_content` and the final answer in `message.content`:
+Ling-3.0-flash thinks by default. With `--reasoning-parser ling3` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)), the chain-of-thought is returned in `message.reasoning_content` and the final answer in `message.content`:
 
 <Accordion title="Thinking-mode request">
 
@@ -100,8 +95,7 @@ curl -s http://localhost:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "inclusionAI/Ling-3.0-flash",
-    "messages": [{"role": "user", "content": "What is 15% of 240?"}],
-    "chat_template_kwargs": {"enable_thinking": true}
+    "messages": [{"role": "user", "content": "What is 15% of 240?"}]
   }'
 ```
 
@@ -128,7 +122,7 @@ curl -s http://localhost:30000/v1/chat/completions \
 </Accordion>
 
 <Note>
-Thinking is controlled by the chat template's `enable_thinking` kwarg and is off by default. Enable it per request with `"chat_template_kwargs": {"enable_thinking": true}`, or make it the server-wide default by launching with `--default-chat-template-kwargs '{"enable_thinking":true}'`.
+Thinking is controlled by the chat template's `enable_thinking` kwarg and is on by default. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`, or server-wide by launching with `--default-chat-template-kwargs '{"enable_thinking":false}'`.
 </Note>
 
 ### 3.2 Tool Calling
@@ -143,7 +137,6 @@ curl -s http://localhost:30000/v1/chat/completions \
   -d '{
     "model": "inclusionAI/Ling-3.0-flash",
     "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
-    "chat_template_kwargs": {"enable_thinking": true},
     "tools": [{
       "type": "function",
       "function": {

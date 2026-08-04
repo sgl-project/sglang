@@ -47,6 +47,27 @@ export const config = {
     "b200": "lmsysorg/sglang:dev",
   },
 
+  benchmarkCommands: {
+    speed: `python3 -m sglang.bench_serving \\
+  --backend sglang \\
+  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+  --model {{MODEL_NAME}} \\
+  --dataset-name {{DATASET}} \\
+  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
+    accuracy: {
+      gsm8k_pct: `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gsm8k \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --num-threads 32`,
+    },
+  },
+
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
+
   github: {
     cookbookModel: "inclusionAI/Ling-3.0-flash",
   },
@@ -89,8 +110,6 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--allow-auto-truncate",
         "--enable-trace",
-        "--tool-call-parser ling3",
-        "--reasoning-parser ling3",
         "--context-length 262144",
         "--max-mamba-cache-size 320",
         "--speculative-algorithm NEXTN",
@@ -115,8 +134,6 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--allow-auto-truncate",
         "--enable-trace",
-        "--tool-call-parser ling3",
-        "--reasoning-parser ling3",
         "--context-length 262144",
         "--max-mamba-cache-size 320",
         "--speculative-algorithm NEXTN",
@@ -141,8 +158,6 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--allow-auto-truncate",
         "--enable-trace",
-        "--tool-call-parser ling3",
-        "--reasoning-parser ling3",
         "--context-length 262144",
         "--max-mamba-cache-size 320",
         "--speculative-algorithm NEXTN",
@@ -167,8 +182,6 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--allow-auto-truncate",
         "--enable-trace",
-        "--tool-call-parser ling3",
-        "--reasoning-parser ling3",
         "--context-length 262144",
         "--max-mamba-cache-size 320",
         "--speculative-algorithm NEXTN",
@@ -193,8 +206,6 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--allow-auto-truncate",
         "--enable-trace",
-        "--tool-call-parser ling3",
-        "--reasoning-parser ling3",
         "--context-length 262144",
         "--max-mamba-cache-size 320",
         "--speculative-algorithm NEXTN",
@@ -206,7 +217,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_RAGGED_VERIFY_MODE=static"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
