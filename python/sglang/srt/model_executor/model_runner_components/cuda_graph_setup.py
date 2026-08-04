@@ -373,12 +373,8 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
         GraphRunnerCls = current_platform.get_graph_runner_cls()
         runner = GraphRunnerCls(model_runner)
     else:
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-            DecodeCudaGraphRunner,
-        )
-
         graph_runners = defaultdict(
-            lambda: DecodeCudaGraphRunner,
+            model_runner._decode_cuda_graph_runner_cls,
             {
                 "cpu": CPUGraphRunner,
                 "npu": NPUGraphRunner,
