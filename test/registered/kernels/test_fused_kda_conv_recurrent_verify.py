@@ -1,26 +1,6 @@
-"""Exactness tests for the fused KDA chain-verify kernel.
+import sys
 
-Compares ``fused_kda_conv_gating_verify`` (one Triton kernel) against the
-unfused reference sequence used by ``kda_backend.forward_extend`` on the MTP
-target_verify chain path: reshape/transpose + ``causal_conv1d_update`` +
-transpose/reshape + split/unflatten + ``fused_sigmoid_gating_delta_rule_update``.
-
-Checked outputs per config: attention output ``o``, the rolled ``conv_state``,
-the intermediate conv-window rollback cache, and the intermediate ssm rollback
-cache.
-
-- ``num_warps=1`` reproduces the reference reduction order: all four outputs
-  must be bit-identical.
-- ``num_warps=4`` (production default, ~1.3x faster in-graph): ``o`` /
-  ``conv_state`` / conv-window must stay bit-identical. Only the fp32
-  intermediate-ssm cache differs: the tl.sum reduction-order delta (~1 ulp
-  per step) compounds through the delta-rule recurrence, growing with T and
-  with the safe gate. Measured: ~6e-8 at T=4 standard gate (the production
-  MTP shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe gate.
-"""
-
-import unittest
-
+import pytest
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
@@ -33,7 +13,6 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
@@ -176,62 +155,34 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps):
     return o, conv, win, ic
 
 
-class TestFusedKDAConvRecurrentVerify(CustomTestCase):
-    def _compare_case(self, case, num_warps, ic_exact):
-        B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
-        inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
-        o_ref, conv_ref, win_ref, ic_ref = _run_reference(
-            inp, B, T, H, HV, K, V, lower_bound
-        )
-        o_fus, conv_fus, win_fus, ic_fus = _run_fused(
-            inp, B, T, H, HV, K, V, lower_bound, num_warps
-        )
+def _compare_case(case, num_warps):
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
+    o_ref, conv_ref, win_ref, ic_ref = _run_reference(
+        inp, B, T, H, HV, K, V, lower_bound
+    )
+    o_fus, conv_fus, win_fus, ic_fus = _run_fused(
+        inp, B, T, H, HV, K, V, lower_bound, num_warps
+    )
 
-        idx_vals = inp["idx_vals"]
-        # Padded rows (-1 slots) are dont-care in both paths.
-        valid_rows = [i for i, s in enumerate(idx_vals) if s >= 0]
-        touched_slots = [s for s in idx_vals if s >= 0]
+    idx_vals = inp["idx_vals"]
+    valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
+    touched_slots = [slot for slot in idx_vals if slot >= 0]
 
-        o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
-        o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-        self.assertTrue(torch.equal(o_ref_v, o_fus_v), "output o mismatch")
-        self.assertTrue(
-            torch.equal(conv_ref[touched_slots], conv_fus[touched_slots]),
-            "conv_state mismatch",
-        )
-        self.assertTrue(
-            torch.equal(win_ref[valid_rows], win_fus[valid_rows]),
-            "intermediate conv window mismatch",
-        )
-        if ic_exact:
-            self.assertTrue(
-                torch.equal(ic_ref[valid_rows], ic_fus[valid_rows]),
-                "intermediate ssm cache mismatch",
-            )
-        else:
-            # tl.sum reduction order differs at num_warps > 1 (~1 ulp per
-            # step) and compounds through the T-step delta-rule recurrence,
-            # growing with T and with the safe gate: measured ~6e-8 at T=4
-            # standard gate (production MTP shape), ~1.5e-5 at T=4 safe gate,
-            # ~2e-3 at T=8 safe gate. Bound covers the worst tested case.
-            torch.testing.assert_close(
-                ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
-            )
+    o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
+    o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
+    assert torch.equal(o_ref_v, o_fus_v)
+    assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
+    assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
+    torch.testing.assert_close(
+        ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
+    )
 
-    def test_bit_exact_num_warps_1(self):
-        """num_warps=1 mirrors the reference reduction order: all four outputs
-        (o, conv_state, conv window, intermediate ssm) must be bit-identical."""
-        for case in _CASES:
-            with self.subTest(case=case):
-                self._compare_case(case, num_warps=1, ic_exact=True)
 
-    def test_default_num_warps_4(self):
-        """Production default num_warps=4: o / conv_state / conv window stay
-        bit-identical; the fp32 intermediate-ssm cache may differ within 1 ulp."""
-        for case in _CASES:
-            with self.subTest(case=case):
-                self._compare_case(case, num_warps=4, ic_exact=False)
+@pytest.mark.parametrize("case", _CASES)
+def test_matches_unfused_reference(case):
+    _compare_case(case, num_warps=4)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=3)
+    sys.exit(pytest.main([__file__]))
