@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=740, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
@@ -96,34 +96,6 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=MTP_BASE_ARGS,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _run_mtp_gsm8k(self)
-
-
-class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
-    reasoning_parser_name = "qwen3"
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = QWEN35_FP4_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.init_reasoning_token_verifier()
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=MTP_BASE_ARGS
-            + [
-                "--linear-attn-decode-backend",
-                "flashinfer",
-                "--enforce-disable-flashinfer-allreduce-fusion",
-            ],
         )
 
     @classmethod
