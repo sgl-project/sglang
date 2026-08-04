@@ -203,7 +203,10 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
+                # Kimi-K3 precision baseline (0728): the fused split+RMSNorm
+                # kernel is not numerically equivalent on Ascend.  Keep the
+                # proven unfused NPU path until that kernel is corrected.
+                if False and qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
                     forward_batch
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
@@ -245,7 +248,8 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -304,7 +308,15 @@ def forward_mla_core_npu(
     )
 
     attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
+    # Kimi-K3.  Match the validated 0728 Ascend path.
+    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+        attn_output,
+        m.w_vc,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
@@ -380,7 +392,7 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
+            if False and fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
                 forward_batch
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(

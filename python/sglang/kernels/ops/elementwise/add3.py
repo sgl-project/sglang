@@ -43,7 +43,7 @@ def covered(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> bool:
         and a.is_contiguous()
         and b.is_contiguous()
         and c.is_contiguous()
-        and a.is_cuda
+        and a.device.type == "cuda"
         and a.numel() > 0
         and a.numel() % _MAX_VEC_ELEMS == 0
     )

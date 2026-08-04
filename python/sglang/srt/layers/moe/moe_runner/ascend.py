@@ -10,6 +10,7 @@ import torch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
+    NPUSituDeepEPKernel,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
@@ -97,11 +98,25 @@ class AscendRunnerCore(MoeRunnerCore):
             # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
         elif get_moe_a2a_backend().is_deepep():
-            # DeepEP path: use a unified kernel that decides quantisation
+            # DeepEP path: preserve the model's activation contract while
+            # fusing the activation with per-token requantization.
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
-            self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
+            if config.activation == "situ":
+                self.activation = NPUSituDeepEPKernel(
+                    need_quant=is_quant_kernel,
+                    beta=(
+                        config.gemm1_alpha
+                        if config.gemm1_alpha is not None
+                        else 4.0
+                    ),
+                    linear_beta=config.gemm1_clamp_limit,
+                )
+            else:
+                self.activation = NPUSwigluDeepEPKernel(
+                    need_quant=is_quant_kernel
+                )
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
@@ -170,7 +185,10 @@ class AscendRunnerCore(MoeRunnerCore):
 
             # --- Activation ---
             # The DeepEP kernel expects extra dispatch metadata
-            if isinstance(self.activation, NPUSwigluDeepEPKernel):
+            if isinstance(
+                self.activation,
+                (NPUSwigluDeepEPKernel, NPUSituDeepEPKernel),
+            ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
                     group_list=expert_tokens,

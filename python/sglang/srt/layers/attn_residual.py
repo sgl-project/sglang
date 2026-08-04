@@ -208,6 +208,12 @@ def _mix_fused(
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
+    # Idle DP ranks carry an empty token dimension.  Triton treats a zero
+    # launch grid as a no-op on CUDA, but some runtimes reject it before the
+    # kernel is launched.  Preserve the natural empty-tensor result without
+    # dispatching either kernel.
+    if T == 0:
+        return prefix_sum
     cw = get_cw(score_proj, score_norm)
     n_h_blocks = H // _BLOCK_H
 
@@ -354,6 +360,10 @@ def _aggregate(
     into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
     the caller (AttnResidual.forward) owns that fallback.
     """
+    # In addition to avoiding a zero-grid score launch in _mix_fused, this
+    # skips the downstream RMSNorm kernel for idle DP ranks.
+    if prefix_sum.shape[0] == 0:
+        return prefix_sum
     if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,

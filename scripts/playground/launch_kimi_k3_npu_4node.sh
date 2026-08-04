@@ -13,6 +13,12 @@ MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/RadixArk-Kimi-K3-DSpark}"
 DIST_INIT_ADDR="${DIST_INIT_ADDR:-192.168.25.209:29600}"
 SERVER_PORT="${SERVER_PORT:-30000}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.72}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-64}"
+read -ra cuda_graph_bs_decode <<<"${CUDA_GRAPH_BS_DECODE:-1 4 16}"
+MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-deepep}"
+FUSEEP_MODE="${FUSEEP_MODE:-3}"
+LINEAR_ATTN_VERIFY_BACKEND="${LINEAR_ATTN_VERIFY_BACKEND:-triton}"
 HCCL_IFNAME="${HCCL_IFNAME:-enp196s0f0}"
 CUSTOM_OPP_ROOT="${CUSTOM_OPP_ROOT:-/home/z30071866/cann9.1.0/cann-9.1.0-beta.3/opp/vendors/custom_transformer}"
 NODE_IPS=(
@@ -49,6 +55,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 export SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_K3_SHARED_EXPERTS_ATTN_TP="${SGLANG_K3_SHARED_EXPERTS_ATTN_TP:-1}"
+export SGLANG_K3_DENSE_MLP_ATTN_TP="${SGLANG_K3_DENSE_MLP_ATTN_TP:-1}"
 export SGLANG_RAGGED_VERIFY_MODE=static
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_SOCKET_IFNAME="${HCCL_IFNAME}"
@@ -56,18 +65,49 @@ export GLOO_SOCKET_IFNAME="${HCCL_IFNAME}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-2000}"
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
+# DeepEP keeps DP-local verify rows scattered; graph bs16 * 8 rows = 128.
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-128}"
 export DEEPEP_NORMAL_LONG_SEQ_ROUND="${DEEPEP_NORMAL_LONG_SEQ_ROUND:-64}"
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS="${DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS:-512}"
-export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_ROOT}"
-export LD_LIBRARY_PATH="${CUSTOM_OPP_ROOT}/op_api/lib/:${LD_LIBRARY_PATH:-}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ASCEND_LAUNCH_BLOCKING
-unset SGLANG_NPU_FUSED_MOE_MODE
+speculative_args=()
+if [[ "${ENABLE_DSPARK:-1}" == "1" ]]; then
+  speculative_args=(
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+    --speculative-dspark-block-size 7
+    --speculative-draft-attention-backend ascend
+    --speculative-eagle-topk 1
+    --speculative-draft-model-quantization unquant
+  )
+fi
+
+cuda_graph_args=(--cuda-graph-bs-decode "${cuda_graph_bs_decode[@]}")
+if [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  cuda_graph_args=(--disable-cuda-graph)
+fi
+
+cache_args=()
+if [[ "${DISABLE_RADIX_CACHE:-0}" == "1" ]]; then
+  cache_args=(--disable-radix-cache)
+fi
+
+moe_args=(--moe-a2a-backend "${MOE_A2A_BACKEND}")
+if [[ "${MOE_A2A_BACKEND}" == "ascend_fuseep" ]]; then
+  moe_args+=(--fuseep-mode "${FUSEEP_MODE}")
+else
+  # This legacy variable is translated to --fuseep-mode by server_args.  It
+  # must not leak into the regular DeepEP path.
+  unset SGLANG_NPU_FUSED_MOE_MODE
+fi
 
 # The 20260723 base image may contain the pre-MegaMoe DeepEP Python ABI.
-# Fail before loading K3's weights instead of four minutes into graph capture.
-python - <<'PY'
+# Only mode-3 Ascend FuseEP needs this ABI; regular DeepEP does not.
+if [[ "${MOE_A2A_BACKEND}" == "ascend_fuseep" && "${FUSEEP_MODE}" == "3" ]]; then
+  export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_ROOT}"
+  export LD_LIBRARY_PATH="${CUSTOM_OPP_ROOT}/op_api/lib/:${LD_LIBRARY_PATH:-}"
+  python - <<'PY'
 import inspect
 
 from cann_ops_transformer.ops import mega_moe
@@ -85,6 +125,7 @@ if missing:
         f"missing fused_deep_moe parameters: {', '.join(missing)}"
     )
 PY
+fi
 
 log_file="${LOG_DIR}/kimi_k3_tp64_rank${node_rank}_$(date +%Y-%m-%d_%H-%M-%S).log"
 sglang serve \
@@ -103,20 +144,16 @@ sglang serve \
   --enable-dp-attention \
   --dp-size 4 \
   --enable-dp-lm-head \
-  --mem-fraction-static 0.78 \
+  --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --chunked-prefill-size 8192 \
-  --cuda-graph-bs-decode 1 4 16 \
-  --max-running-requests 64 \
+  "${cuda_graph_args[@]}" \
+  "${cache_args[@]}" \
+  --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --host 0.0.0.0 \
   --port "${SERVER_PORT}" \
   --reasoning-parser kimi_k3 \
-  --moe-a2a-backend ascend_fuseep \
-  --fuseep-mode 3 \
+  --linear-attn-verify-backend "${LINEAR_ATTN_VERIFY_BACKEND}" \
+  "${moe_args[@]}" \
   --deepep-mode auto \
-  --speculative-algorithm DSPARK \
-  --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
-  --speculative-dspark-block-size 7 \
-  --speculative-draft-attention-backend ascend \
-  --speculative-eagle-topk 1 \
-  --speculative-draft-model-quantization unquant \
+  "${speculative_args[@]}" \
   --watchdog-timeout 9000 2>&1 | tee "${log_file}"

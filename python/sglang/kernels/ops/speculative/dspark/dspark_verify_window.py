@@ -766,6 +766,12 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        # The 0728 Ascend path intentionally used the torch implementation.
+        # BiShengIR cannot compile the nested tl.where below because its mask
+        # lowering mixes i1 and i8. Keep CUDA on the Triton kernel without
+        # introducing a platform-name check.
+        if not torch.cuda.is_available():
+            return cls.torch(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)

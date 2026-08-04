@@ -206,6 +206,175 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
+    def _trace_mamba_graph_boundary(
+        self, forward_batch: ForwardBatch, stage: str
+    ) -> None:
+        """Trace persistent Mamba caches at the Python graph-replay boundary."""
+        marker = os.environ.get("SGLANG_K3_TRACE_STATE_FILE") or os.environ.get(
+            "SGLANG_K3_TRACE_HIDDEN_FILE"
+        )
+        if not marker or not os.path.exists(marker):
+            return
+        try:
+            backend = self.attn_backend
+            select_backend = getattr(backend, "_select_backend", None)
+            if select_backend is not None:
+                backend = select_backend(forward_batch.forward_mode)
+            linear_backend = getattr(backend, "linear_attn_backend", None)
+            if linear_backend is None:
+                return
+
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                _state_trace_enabled,
+                _trace_selected_state,
+            )
+
+            if not _state_trace_enabled():
+                return
+            req_pool_indices = forward_batch.req_pool_indices[
+                : forward_batch.batch_size
+            ]
+            mamba_indices = linear_backend.req_to_token_pool.get_mamba_indices(
+                req_pool_indices
+            )
+            caches = (
+                linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            mode = forward_batch.forward_mode.name.lower()
+            logger.warning(
+                "K3_GRAPH_STATE stage=%s mode=%s req_pool_indices=%s "
+                "mamba_indices=%s seq_lens=%s",
+                stage,
+                mode,
+                req_pool_indices.detach().cpu().tolist(),
+                mamba_indices.detach().cpu().tolist(),
+                forward_batch.seq_lens.detach().cpu().tolist(),
+            )
+            _trace_selected_state(
+                stage=f"{stage}_{mode}",
+                tensor_name="ssm_persistent",
+                tensor=caches.temporal,
+                slot_indices=mamba_indices,
+            )
+            _trace_selected_state(
+                stage=f"{stage}_{mode}",
+                tensor_name="conv_persistent",
+                tensor=caches.conv[0],
+                slot_indices=mamba_indices,
+            )
+        except Exception:
+            logger.warning("K3 graph-boundary state trace failed", exc_info=True)
+
+    def _trace_k3_verify_rows(self, forward_batch: ForwardBatch) -> None:
+        """Dump live verify-row metadata and captured per-layer row buffers."""
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+        try:
+            from sglang.srt.hardware_backend.npu.k3_graph_row_trace import (
+                dump_graph_row_traces,
+                graph_row_trace_marker_enabled,
+            )
+
+            if not graph_row_trace_marker_enabled():
+                return
+
+            replay_id = int(getattr(self, "_k3_graph_trace_replay_id", 0))
+            self._k3_graph_trace_replay_id = replay_id + 1
+            rank = (
+                int(torch.distributed.get_rank())
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0
+            )
+
+            raw_bs = int(self.raw_bs)
+            raw_num_tokens = int(self.raw_num_token)
+            spec_info = forward_batch.spec_info
+            draft_token_num = int(spec_info.draft_token_num)
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            if ragged_layout is None:
+                verify_lens = [draft_token_num] * raw_bs
+                capture_num_tokens = int(self.bs) * draft_token_num
+            else:
+                verify_lens = (
+                    ragged_layout.verify_lens[:raw_bs].detach().cpu().tolist()
+                )
+                capture_num_tokens = int(ragged_layout.graph_num_tokens)
+
+            input_ids = (
+                forward_batch.input_ids.reshape(-1)[:raw_num_tokens]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            positions = (
+                forward_batch.positions.reshape(-1)[:raw_num_tokens]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            seq_lens = (
+                forward_batch.seq_lens[:raw_bs].detach().cpu().tolist()
+            )
+            req_pool_indices = (
+                forward_batch.req_pool_indices[:raw_bs].detach().cpu().tolist()
+            )
+            rows = []
+            compact_row = 0
+            for req_row, verify_len in enumerate(verify_lens):
+                for verify_step in range(int(verify_len)):
+                    if compact_row >= raw_num_tokens:
+                        break
+                    rows.append(
+                        {
+                            "compact_row": compact_row,
+                            "dense_row": req_row * draft_token_num + verify_step,
+                            "req_row": req_row,
+                            "req_pool_index": req_pool_indices[req_row],
+                            "verify_step": verify_step,
+                            "input_id": input_ids[compact_row],
+                            "position": positions[compact_row],
+                            "seq_len": seq_lens[req_row],
+                        }
+                    )
+                    compact_row += 1
+
+            logger.warning(
+                "K3_GRAPH_VERIFY_ROW_MAP rank=%d replay_id=%d mode=%s "
+                "capture_bs=%d "
+                "capture_num_tokens=%d raw_bs=%d "
+                "raw_num_tokens=%d draft_token_num=%d verify_lens=%s rows=%s",
+                rank,
+                replay_id,
+                getattr(
+                    forward_batch.forward_mode,
+                    "name",
+                    str(forward_batch.forward_mode),
+                ).lower(),
+                int(self.bs),
+                capture_num_tokens,
+                raw_bs,
+                raw_num_tokens,
+                draft_token_num,
+                verify_lens,
+                rows,
+            )
+            dump_graph_row_traces(
+                replay_id=replay_id,
+                mode=getattr(
+                    forward_batch.forward_mode,
+                    "name",
+                    str(forward_batch.forward_mode),
+                ).lower(),
+                capture_bs=int(self.bs),
+                capture_num_tokens=capture_num_tokens,
+                raw_bs=raw_bs,
+                raw_num_tokens=raw_num_tokens,
+                dense_verify_tokens=raw_bs * draft_token_num,
+            )
+        except Exception:
+            logger.warning("K3 graph verify-row trace failed", exc_info=True)
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -235,6 +404,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
+        self._trace_mamba_graph_boundary(forward_batch, "graph_replay_before")
+
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
@@ -254,6 +425,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
         else:
             output = self.backend.replay(graph_key, forward_batch)
+
+        self._trace_mamba_graph_boundary(forward_batch, "graph_replay_after")
+        self._trace_k3_verify_rows(forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

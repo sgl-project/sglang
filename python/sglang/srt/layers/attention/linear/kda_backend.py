@@ -663,18 +663,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
+        g, beta, extend_A_log, extend_dt_bias = self._prepare_extend_gate_inputs(
+            layer, a, b
+        )
         track_ssm = self.forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
-            g=a,
-            beta=b,
+            g=g,
+            beta=beta,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
+            A_log=extend_A_log,
+            dt_bias=extend_dt_bias,
             lower_bound=layer.lower_bound,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
@@ -722,6 +725,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             seq_lens_cpu=seq_lens_cpu,
         ).transpose(0, 1)
+
+    def _prepare_extend_gate_inputs(
+        self,
+        layer: RadixLinearAttention,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        """Return the gate contract consumed by the extend kernel.
+
+        Shared GPU backends keep the current raw-gate contract. Platform
+        backends may override this hook when their proven kernel path expects
+        model-side gate activation instead.
+        """
+        return g, beta, layer.A_log, layer.dt_bias
 
     def _forward_target_verify(
         self,

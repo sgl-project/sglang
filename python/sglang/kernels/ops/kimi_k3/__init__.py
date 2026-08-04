@@ -65,12 +65,13 @@ def kimi_k3_tiny_gemm(
 
     m, k = x.shape
     n, _ = w.shape
-    if max_num_tokens := _K3_N_GEMM_DISPATCH_MAP.get((n, k)):
-        if 0 < m <= max_num_tokens:
-            return tiny_n_gemm_bf16(x, w)
-    if max_num_tokens := _K3_K_GEMM_DISPATCH_MAP.get((n, k)):
-        if 0 < m <= max_num_tokens:
-            return tiny_k_gemm_bf16(x, w)
+    if x.device.type == "cuda" and w.device == x.device:
+        if max_num_tokens := _K3_N_GEMM_DISPATCH_MAP.get((n, k)):
+            if 0 < m <= max_num_tokens:
+                return tiny_n_gemm_bf16(x, w)
+        if max_num_tokens := _K3_K_GEMM_DISPATCH_MAP.get((n, k)):
+            if 0 < m <= max_num_tokens:
+                return tiny_k_gemm_bf16(x, w)
     return torch.nn.functional.linear(x, w)
 
 

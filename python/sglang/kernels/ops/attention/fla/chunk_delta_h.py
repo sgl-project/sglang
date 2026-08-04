@@ -326,6 +326,29 @@ def chunk_gated_delta_rule_fwd_h(
     assert not (
         use_exp2 and g is not None
     ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
+
+    # The CUDA kernel below keeps its chunk states in VxK layout and uses
+    # transpose-heavy recurrences.  Ascend uses the compact KxV implementation
+    # carried by the NPU backend; Intel replaces this symbol in its backend.
+    if not torch.cuda.is_available():
+        from sglang.srt.hardware_backend.npu.kernels.kda_chunk_delta_h import (
+            chunk_gated_delta_rule_fwd_h_npu,
+        )
+
+        return chunk_gated_delta_rule_fwd_h_npu(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            save_new_value=save_new_value,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=use_exp2,
+        )
+
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
