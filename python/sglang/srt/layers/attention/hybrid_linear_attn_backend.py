@@ -99,6 +99,11 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
+        # Resolve the tracked-row selection once per forward
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -198,10 +203,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -214,11 +216,6 @@ class MambaAttnBackendBase(AttentionBackend):
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
-
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
@@ -800,6 +797,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
         )
+        # `forward` slices the track destinations from ([-num_decodes:])
+        assert (
+            self.forward_metadata.num_decodes == forward_batch.batch_size
+        ), f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -831,17 +832,12 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             output=output,
             layer_cache=layer_cache,
             metadata=self.forward_metadata,
-            forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
         )
 
         if forward_batch.mamba_track_mask is not None:
-            if (
-                intermediate_states is not None
-                and forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
+            if intermediate_states is not None:
                 self._track_mamba_state_extend(
                     forward_batch,
                     intermediate_states,
