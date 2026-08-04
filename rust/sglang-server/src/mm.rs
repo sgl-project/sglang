@@ -122,12 +122,22 @@ fn apply_caller_hashes(hashes: &mut [u64], caller: &[String]) {
         return;
     }
     for (hash, entry) in hashes.iter_mut().zip(caller) {
-        let hex = entry.strip_prefix("0x").unwrap_or(entry);
-        match u64::from_str_radix(hex, 16) {
-            Ok(v) => *hash = v,
-            Err(_) => tracing::warn!(%entry, "malformed mm_hashes entry; keeping computed hash"),
+        match parse_caller_hash(entry) {
+            Some(v) => *hash = v,
+            None => tracing::warn!(%entry, "malformed mm_hashes entry; keeping computed hash"),
         }
     }
+}
+
+/// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
+/// is the common case), keeping the low 64 bits: only the low 30 are observable,
+/// via `_compute_pad_value` (`MM_PAD_SHIFT_VALUE + hash % (1 << 30)`).
+fn parse_caller_hash(entry: &str) -> Option<u64> {
+    let hex = entry.strip_prefix("0x").unwrap_or(entry);
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&hex[hex.len().saturating_sub(16)..], 16).ok()
 }
 
 /// One parked sidecar entry: the feature/aux buffers the drain-time Python
@@ -350,6 +360,22 @@ mod tests {
 
         apply_caller_hashes(&mut hashes, &["ff".into(), "not-hex".into(), "0x10".into()]);
         assert_eq!(hashes, [0xff, 2, 0x10]);
+    }
+
+    /// A full SHA-256 (what routers send) keeps its low 64 bits instead of
+    /// falling back, so the pad value still matches Python's wide `int`.
+    #[test]
+    fn caller_hashes_accept_arbitrary_width() {
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let mut hashes = vec![1];
+        apply_caller_hashes(&mut hashes, &[sha256.into()]);
+        assert_eq!(hashes, [0xa495991b7852b855]);
+        assert_eq!(hashes[0] % (1 << 30), 944_945_237); // int(sha256, 16) % (1 << 30)
+
+        // Width alone is never malformed; a non-hex digit still is.
+        assert_eq!(parse_caller_hash(&"f".repeat(64)), Some(u64::MAX));
+        assert_eq!(parse_caller_hash("0x"), None);
+        assert_eq!(parse_caller_hash(""), None);
     }
 
     fn shm_path(name: &str) -> std::path::PathBuf {
