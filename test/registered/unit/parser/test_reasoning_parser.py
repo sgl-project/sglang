@@ -391,7 +391,7 @@ class TestLing3Detector(CustomTestCase):
 
     def test_init(self):
         self.assertEqual(self.detector.tool_start_token, "<tool_call>")
-        self.assertEqual(self.detector.reasoning_default, "explicit_enable_thinking")
+        self.assertEqual(self.detector.reasoning_default, "enable_thinking")
         self.assertTrue(self.detector.thinks_internally)
         self.assertTrue(self.detector._force_nonempty_content)
         self.assertFalse(self.detector._in_reasoning)
