@@ -2789,6 +2789,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._request_has_grammar(state.obj),
                 cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
+                is_streaming=getattr(state.obj, "stream", False),
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

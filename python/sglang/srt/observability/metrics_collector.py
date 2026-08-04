@@ -1481,12 +1481,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["is_streaming"],
         )
         self.generation_tokens_total = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["is_streaming"],
         )
         self.spec_verify_calls_total = Counter(
             name="sglang:spec_verify_calls_total",
@@ -1566,7 +1566,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["is_streaming"],
         )
 
         self.get_loads_duration_seconds = Histogram(
@@ -1666,8 +1666,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
-            # "stream" splits streaming vs non-streaming requests.
-            labelnames=[*labels.keys(), "stream"],
+            # "is_streaming" splits streaming vs non-streaming requests (named to
+            # match downstream storage dimensions exactly - "stream" is a
+            # reserved thrift keyword, so schema columns cannot carry it).
+            labelnames=[*labels.keys(), "is_streaming"],
             buckets=bucket_time_to_first_token,
         )
 
@@ -1681,7 +1683,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
-            labelnames=labels.keys(),
+            labelnames=list(labels.keys()) + ["is_streaming"],
             buckets=bucket_e2e_request_latency,
         )
 
@@ -1713,9 +1715,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         spec_verify_ct: int = 0,
+        is_streaming: bool = False,
     ):
-        self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
-        self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+        stream_labels = {
+            **labels,
+            "is_streaming": "true" if is_streaming else "false",
+        }
+        self.prompt_tokens_total.labels(**stream_labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
         if spec_verify_ct > 0:
             self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
 
@@ -1744,10 +1751,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
-        self.num_requests_total.labels(**labels).inc(1)
+        self.num_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
-        self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
+        self.histogram_e2e_request_latency.labels(**stream_labels).observe(
+            float(e2e_latency)
+        )
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
         self.uncached_prompt_tokens_histogram.labels(**labels).observe(
             float(prompt_tokens - cached_tokens)
@@ -1760,11 +1769,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self, labels: Dict[str, str], value: float, *, stream: bool
     ):
         self.histogram_time_to_first_token.labels(
-            **labels, stream="true" if stream else "false"
+            **labels, is_streaming="true" if stream else "false"
         ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
-        his = self.histogram_time_to_first_token.labels(**self.labels, stream="true")
+        his = self.histogram_time_to_first_token.labels(
+            **self.labels, is_streaming="true"
+        )
         total_observations = sum(bucket._value for bucket in his._buckets)
         if total_observations < 100:
             return False
