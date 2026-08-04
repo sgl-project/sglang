@@ -41,6 +41,7 @@ SCHEDULE_POLICY=lpm
 KEEP_ALIVE=false
 KEEP_ALIVE_INTERVAL=45
 LOAD_BALANCE_METHOD=round_robin
+ENABLE_PRIORITY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --keep-alive) KEEP_ALIVE=true; shift ;;
         --keep-alive-interval) KEEP_ALIVE_INTERVAL="$2"; shift 2 ;;
         --load-balance-method) LOAD_BALANCE_METHOD="$2"; shift 2 ;;
+        --priority-scheduling) ENABLE_PRIORITY=true; shift ;;
         *) shift ;;
     esac
 done
@@ -119,6 +121,13 @@ if [ "$MAX_RUNNING_REQUESTS" -eq 0 ]; then
     MAX_RUNNING_REQUESTS=12
 fi
 
+# 优先级调度（启用时把 schedule-policy 切到 priority；请求侧需带 priority 字段才生效）
+PRIORITY_ARGS=""
+if [ "$ENABLE_PRIORITY" = true ]; then
+    SCHEDULE_POLICY=priority
+    PRIORITY_ARGS="--enable-priority-scheduling --default-priority-value 0"
+fi
+
 SERVED_NAME=$(basename "$MODEL_PATH")
 
 # ==================== 环境 ====================
@@ -146,6 +155,7 @@ echo " Speculative(MTP): $ENABLE_SPECULATIVE"
 echo " schedule-policy: $SCHEDULE_POLICY  预热: $([ "$SKIP_WARMUP" = true ] && echo skip || echo on)"
 echo " keep-alive: $([ "$KEEP_ALIVE" = true ] && echo "on 每${KEEP_ALIVE_INTERVAL}s" || echo off)"
 echo " load-balance: $LOAD_BALANCE_METHOD (DP 路由; round_robin 避免前缀粘滞热点)"
+echo " priority-scheduling: $([ "$ENABLE_PRIORITY" = true ] && echo on || echo off)"
 echo "=========================================="
 
 # ==================== 常驻 keep-alive ====================
@@ -185,6 +195,7 @@ CUDA_VISIBLE_DEVICES=${GPU_IDS:-$CUDA_VISIBLE_DEVICES} python3.12 -m sglang.laun
     --kv-cache-dtype $KV_CACHE_DTYPE \
     --chunked-prefill-size $CHUNKED_PREFILL_SIZE \
     --max-running-requests $MAX_RUNNING_REQUESTS \
+    $PRIORITY_ARGS \
     --mamba-radix-cache-strategy $MAMBA_RADIX_CACHE_STRATEGY \
     --mamba-backend $MAMBA_BACKEND \
     --enable-flashinfer \

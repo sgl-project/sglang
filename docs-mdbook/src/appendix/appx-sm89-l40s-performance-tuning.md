@@ -740,6 +740,7 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 
 - 语义：priority 值越高越先调度（默认）；可选 `--disable-priority-preemption` 控制是否抢占；
 - 注意：priority **只改队列顺序，不改 GPU 计算份额**，网关限并发不能省。
+- 落地：`sglang_start.sh` 已内置 `--priority-scheduling` 开关（启用时自动切 `--schedule-policy priority` 并加 `--enable-priority-scheduling --default-priority-value 0`）。
 
 **请求侧**：
 
