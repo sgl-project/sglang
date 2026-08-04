@@ -2673,6 +2673,10 @@ class ServerArgs:
         bool,
         "Start the EngineInfoBootstrapServer and register per-rank parallelism config WITHOUT the mooncake/verbs P2P transfer-engine seeding. Used by RDT (NIXL) weight sync, which needs /parallelism_config but not P2P memory registration.",
     ] = False
+    enable_rdt_weight_sync: A[
+        bool,
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync from an external trainer job. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+    ] = False
     engine_info_bootstrap_port: A[
         int,
         "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
@@ -2931,6 +2935,8 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_rdt_weight_sync()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3163,6 +3169,14 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _handle_rdt_weight_sync(self):
+        if not self.enable_rdt_weight_sync:
+            return
+        assert (
+            self.use_ray
+        ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through named SchedulerActors."
+        self.enable_engine_info_bootstrap = True
 
     def _handle_pd_disaggregation(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

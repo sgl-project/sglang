@@ -200,13 +200,15 @@ def _create_scheduler_actor(
         server_args, tp_rank
     )
 
+    rdt = server_args.enable_rdt_weight_sync
+
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
         # run_event_loop() blocks its worker thread for the actor's lifetime; allow
-        # extra threads so a concurrent pull_weights() (RDT weight sync) is not
+        # one extra thread so a concurrent pull_weights() (RDT weight sync) is not
         # starved. Safe because generation is paused during the pull.
-        max_concurrency=4,
+        max_concurrency=2 if rdt else 1,
         # The http `port` is unique per engine and known to the trainer, so it lets
         # RDT discover this engine's scheduler actors by name (ray list_named_actors)
         # without an HTTP round-trip, even when several engines share one node.
@@ -219,15 +221,13 @@ def _create_scheduler_actor(
         # list_named_actors / get_actor for RDT pull_weights. Non-detached named
         # actors are not listed cross-job. RayEngine.shutdown ray.kills them, so they
         # don't leak past the engine's lifetime.
-        lifetime="detached",
+        lifetime="detached" if rdt else None,
         # scheduler_actor uses the absolute GPU id from get_accelerator_ids(); that
         # requires Ray NOT to remap CUDA_VISIBLE_DEVICES (else set_device(absolute)
         # -> invalid device ordinal). The trainer job sets this in its runtime_env,
         # but these actors are created by the sglang subprocess's job, so set it on
         # the actor directly.
-        runtime_env={
-            "env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
-        },
+        runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=bundle_idx,
