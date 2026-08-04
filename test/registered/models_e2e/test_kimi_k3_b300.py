@@ -95,7 +95,6 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
                 "8",
                 "--dcp-size",
                 "8",
-                "--disable-custom-all-reduce",
                 "--mem-fraction-static",
                 "0.85",
                 "--weight-loader-prefetch-checkpoints",
