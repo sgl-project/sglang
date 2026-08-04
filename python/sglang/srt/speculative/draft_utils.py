@@ -1,3 +1,4 @@
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -112,7 +113,7 @@ class DraftBackendFactory:
         }
         backend_name = (
             "decode_attention_backend"
-            if self.server_args.speculative_attention_mode == "decode"
+            if get_spec().speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
         backend = self._create_backend(

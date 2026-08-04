@@ -30,7 +30,7 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -204,9 +204,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
@@ -1513,7 +1511,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_server_args().disable_chunked_prefix_cache
+                    assert not get_schedule().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
