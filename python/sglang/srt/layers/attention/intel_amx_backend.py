@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -59,7 +60,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.num_kv_splits = 8
 
         # speculative decoding params
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
     def _build_extend_metadata(self, forward_batch: ForwardBatch):
         """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
