@@ -2588,11 +2588,7 @@ class ServerArgs:
     # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
     enable_gdn_replayssm_spec: A[
         bool,
-        Arg(
-            help="Enable the ReplaySSM spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
-            cli_name="--enable-linear-replayssm-spec",
-            aliases=["--enable-gdn-replayssm-spec"],
-        ),
+        "Enable the ReplaySSM spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
 

@@ -50,16 +50,6 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.fp8_gemm_runner_backend, "triton")
         self.assertEqual(sa.fp4_gemm_runner_backend, "marlin")
 
-    def test_linear_replayssm_spec_cli_name(self):
-        """The public ReplaySSM flag and its legacy alias share one field."""
-        for option in (
-            "--enable-linear-replayssm-spec",
-            "--enable-gdn-replayssm-spec",
-        ):
-            with self.subTest(option=option):
-                args = self.parser.parse_args(["--model", "dummy", option])
-                self.assertTrue(args.enable_gdn_replayssm_spec)
-
     def test_nargs_question_with_const(self):
         """nargs='?' + const='' for --model-checksum."""
         self.assertIsNone(self._parse([]).model_checksum)
