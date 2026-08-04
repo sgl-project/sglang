@@ -42,7 +42,7 @@ Pages are `.mdx` files with YAML frontmatter. Navigation is defined in `docs.jso
 # Install the CLI
 npm i -g mint
 
-# From docs_new/ (where docs.json lives), start the dev server (hot reload)
+# From docs/ (where docs.json lives), start the dev server (hot reload)
 mint dev
 ```
 
@@ -71,7 +71,7 @@ We welcome contributions! Whether you want to add a recipe for a new model, impr
 ```bash
 # 1. Fork sgl-project/sglang and clone your fork
 git clone https://github.com/<YOUR_USERNAME>/sglang.git
-cd sglang/docs_new
+cd sglang/docs
 
 # 2. Create a branch
 git checkout -b my-changes
@@ -130,7 +130,7 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
 ```
 
 Keep `tag: NEW` on the new page and strip it from same-vendor siblings (≤1 per vendor), then
-validate from `docs_new/`: `mint validate`, `mint broken-links`, and `mint dev` for a visual
+validate from `docs/`: `mint validate`, `mint broken-links`, and `mint dev` for a visual
 smoke test.
 
 > Diffusion / omni / specbundle pages follow their own category structure — don't force the
