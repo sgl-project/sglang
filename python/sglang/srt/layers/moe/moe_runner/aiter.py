@@ -300,7 +300,7 @@ def _pre_permute_deepep_to_aiter(
     quant_type = quant_info.quant_type
 
     if is_mori:
-        from sglang.srt.layers.moe.rocm_moe_utils import upscale, upscale_mxfp4
+        from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
 
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert

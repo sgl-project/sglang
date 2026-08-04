@@ -137,6 +137,9 @@ class VideoGenerationsRequest(BaseModel):
     # OmniDreams / HDMap conditioning (Phase 4)
     hdmap_path: Optional[Union[str, List[str]]] = None
     num_views: Optional[int] = Field(default=None, ge=1, le=64)
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
 
 
 class VideoListResponse(BaseModel):

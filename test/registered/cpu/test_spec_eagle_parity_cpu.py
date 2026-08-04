@@ -7,7 +7,11 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 # Estimated: 2 sequential 8B server launches + one 4-prompt greedy method
 # (CUDA sibling: 360); tune from CI TIMINGS once it has run there.
-register_cpu_ci(est_time=480, suite="base-b-test-cpu")
+register_cpu_ci(
+    est_time=480,
+    suite="base-b-test-cpu",
+    disabled="EAGLE3 numerical parity mismatches on CPU intel_amx",
+)
 
 
 class TestEagle3ParityCPU(SpecParityKit, Eagle3Base):

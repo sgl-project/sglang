@@ -31,7 +31,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
-    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+    from sglang.kernels.ops.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 
 class QuarkW8A8FP8MoE(QuarkMoEScheme):

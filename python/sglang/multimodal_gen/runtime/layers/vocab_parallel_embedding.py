@@ -446,8 +446,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size // param.packed_factor
             )
-            start_idx = start_idx // packed_factor
-            shard_size = shard_size // packed_factor
+            start_idx = round(start_idx // packed_factor)
+            shard_size = round(shard_size // packed_factor)
         else:
             assert loaded_weight.shape[output_dim] == self.org_vocab_size
 

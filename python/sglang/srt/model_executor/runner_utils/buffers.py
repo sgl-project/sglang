@@ -99,7 +99,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         require_mlp_tp_gather: bool,
         seq_len_fill_value: int,
         encoder_len_fill_value: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
@@ -116,7 +116,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
                 dtype=torch.bool,
             )
             mamba_track_indices = (
@@ -220,7 +220,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         bs: int,
         seq_len_fill_value: int,
         require_gathered_buffer: bool,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
         dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -290,12 +290,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_req)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_req)
 
         if enable_num_token_non_padded_flag:
             if require_gathered_buffer and not dsa_enable_prefill_cp:
-                num_tokens_per_dp = bs * num_tokens_per_bs
+                num_tokens_per_dp = bs * num_tokens_per_req
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
