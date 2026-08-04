@@ -18,8 +18,9 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             torch.float8_e5m2,
         }
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
         self.cuda_graph_kv_indices = None
         self.cuda_graph_mla_metadata = None
@@ -102,8 +103,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
         # Static K-lens buffer bound by the draft-extend graph kernel.
         self.cuda_graph_draft_extend_seq_lens_k = None
-        # Preallocated tree-mask scratch (see get_verify_buffers_to_fill_after_draft).
-        self.cuda_graph_custom_mask = None
+        self._verify_mask = None
         self._eager_kv_indices_buf = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -285,17 +285,22 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
             )
-            if not self.skip_prefill and not self.is_draft_runner:
-                # Worst-case FULL_MASK tree-mask scratch (bool); build_tree
-                # writes it in-place so the GPU-only path needs no seq_lens_sum.
-                self.cuda_graph_custom_mask = torch.zeros(
-                    max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                    dtype=torch.bool,
-                    device="cuda",
-                )
+            # Target verify never reaches the parent's mask read: every
+            # init_forward_metadata* branch handles is_target_verify() itself and
+            # only falls through to super() otherwise.
+            self._verify_mask = maybe_create_verify_mask(
+                is_draft_runner=self.is_draft_runner,
+                skip_prefill=self.skip_prefill,
+                max_bs=max_bs,
+                max_context_len=self.max_context_len,
+                num_draft_tokens=self.num_draft_tokens,
+                device=self.device,
+                is_read=False,
+            )
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
 
     def _apply_decode_target_verify_metadata(
         self,

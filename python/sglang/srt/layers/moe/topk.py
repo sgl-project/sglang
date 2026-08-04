@@ -32,7 +32,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 
 try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
@@ -130,6 +130,17 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+
+# Epsilon added to the top-k weight sum before renormalization, matching the
+# DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
+# and flashinfer's trtllm routing kernels (mSumEpsilon). With sigmoid scoring
+# plus a selection bias, a token whose selected experts all have deeply negative
+# router logits can have every gathered sigmoid weight underflow to exactly
+# zero; a bare division then yields 0/0 = NaN and poisons the token's output
+# row. For healthy tokens the sum is >= sigmoid(logit_max) >> 1e-20, so results
+# are unchanged. The renormalization is performed in float32 (the reference gate
+# computes the whole gate in fp32); the epsilon underflows to zero in float16.
+_RENORMALIZE_SUM_EPSILON = 1e-20
 
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
 # Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
@@ -491,10 +502,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        from sglang.srt.runtime_context import get_server_args
 
         self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_server_args().enable_waterfill
+            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
 
         self.waterfill_balancer = None
@@ -568,9 +578,8 @@ class TopK(MultiPlatformOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-                from sglang.srt.runtime_context import get_server_args
 
-                use_standard_for_lora = bool(get_server_args().enable_lora)
+                use_standard_for_lora = bool(get_lora().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
             output_format = (
@@ -768,7 +777,13 @@ def fused_topk_torch_native(
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
+        topk_weights = topk_weights / (
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+            + _RENORMALIZE_SUM_EPSILON
+        )
     return topk_weights, topk_ids
 
 
@@ -1055,12 +1070,15 @@ def grouped_topk_gpu(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1181,8 +1199,11 @@ def kimi_k2_biased_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if renormalize:
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights / topk_weights_sum
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1237,12 +1258,15 @@ def biased_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1366,12 +1390,15 @@ def biased_grouped_topk_impl(
             )
 
     if renormalize:
+        # fp32 like the reference gate (the epsilon is not representable in
+        # fp16); the sum dtype and the division's type promotion upcast inside
+        # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -1405,9 +1432,9 @@ def _eplb_remap_enabled() -> bool:
         # there is no EPLB mapping, so the remap must be skipped.
         return False
     return (
-        server_args.enable_eplb
-        or server_args.init_expert_location != "trivial"
-        or server_args.ep_num_redundant_experts > 0
+        get_exec().moe.enable_eplb
+        or get_exec().moe.init_expert_location != "trivial"
+        or get_exec().moe.ep_num_redundant_experts > 0
     )
 
 

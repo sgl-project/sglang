@@ -728,3 +728,69 @@ def fill_draft_extend_prepare_buffers_triton(
         BLOCK_HIDDEN=BLOCK_HIDDEN,
         GLOBAL_BLOCK=global_block,
     )
+
+
+def fill_draft_extend_prepare_buffers_native(
+    input_ids,
+    positions,
+    out_cache_loc,
+    src_input_ids,
+    src_positions,
+    src_out_cache_loc,
+    seq_lens,
+    req_pool_indices,
+    num_correct_drafts,
+    num_accept_tokens,
+    select_index,
+    temperatures,
+    src_seq_lens,
+    src_req_pool_indices,
+    src_num_correct_drafts,
+    src_num_accept_tokens,
+    src_temperatures,
+    hidden_states,
+    src_hidden_states,
+    global_num_tokens,
+    global_num_tokens_for_logprob,
+    raw_bs,
+    bs,
+    num_tokens_per_bs,
+    num_front_tokens,
+    seq_len_fill_value,
+):
+    """Native PyTorch implementation of fill_draft_extend_prepare_buffers.
+
+    Used on NPU where the triton mega-kernel triggers CCU errors.
+    Mirrors the triton kernel's semantics exactly.
+    """
+    num_tokens = src_input_ids.shape[0]
+
+    # Token buffers: copy real rows, leave padding untouched.
+    input_ids[:num_tokens].copy_(src_input_ids)
+    positions[:num_tokens].copy_(src_positions)
+    out_cache_loc[:num_tokens].copy_(src_out_cache_loc)
+
+    # Per-request buffers.
+    seq_lens[:bs].fill_(seq_len_fill_value)
+    seq_lens[:raw_bs].copy_(src_seq_lens)
+    req_pool_indices[:raw_bs].copy_(src_req_pool_indices)
+
+    num_correct_drafts[:raw_bs].copy_(src_num_correct_drafts)
+    num_accept_tokens[:bs].fill_(-1)
+    num_accept_tokens[:raw_bs].copy_(src_num_accept_tokens)
+
+    # select_index = i * num_tokens_per_bs + num_front_tokens + num_correct_drafts
+    idx = torch.arange(bs, device=select_index.device, dtype=torch.int64)
+    select_index[:bs] = idx * num_tokens_per_bs + num_front_tokens
+    select_index[:bs] += num_correct_drafts[:bs].to(torch.int64)
+
+    if temperatures is not None:
+        temperatures[:bs].fill_(1.0)
+        temperatures[:raw_bs].copy_(src_temperatures)
+
+    if global_num_tokens is not None:
+        global_num_tokens.fill_(bs * num_tokens_per_bs)
+        global_num_tokens_for_logprob.fill_(bs * num_tokens_per_bs)
+
+    if src_hidden_states is not None:
+        hidden_states[:num_tokens].copy_(src_hidden_states)
