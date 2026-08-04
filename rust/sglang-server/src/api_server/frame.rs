@@ -188,11 +188,14 @@ pub(super) fn frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Value {
     let Some(ex) = out.extras.as_deref() else {
         return v;
     };
-    if !ex.out_lp_val.is_empty() {
+    // Python (`add_logprob_to_meta_info`) always sets input+output token
+    // logprobs together, empty lists included. A PD decode node never receives
+    // input logprobs (they belong to prefill), yet its response must still
+    // carry the key — the PD router keys its merge of prefill's
+    // `input_token_logprobs` on its presence.
+    if !ex.out_lp_val.is_empty() || !ex.in_lp_val.is_empty() {
         v["meta_info"]["output_token_logprobs"] =
             logprob_tuples(&ex.out_lp_val, &ex.out_lp_idx, opt_texts(&ex.out_lp_txt));
-    }
-    if !ex.in_lp_val.is_empty() {
         v["meta_info"]["input_token_logprobs"] =
             logprob_tuples(&ex.in_lp_val, &ex.in_lp_idx, opt_texts(&ex.in_lp_txt));
     }
@@ -269,7 +272,12 @@ pub(super) fn cumulative_frame_json(
     if let Some(v) = &acc.in_tid_json {
         let _ = write!(m, ",\"input_token_ids_logprobs\":{v}");
     }
-    if let Some(v) = &acc.in_lp_json {
+    // Input+output token logprobs are emitted as a PAIR whenever either side has
+    // data (empty list included), matching `frame_value` byte for byte — see the
+    // PD-router rationale there.
+    let lp_pair = acc.in_lp_json.is_some() || !acc.out_lp_json.is_empty();
+    if lp_pair {
+        let v = acc.in_lp_json.as_deref().unwrap_or("[]");
         let _ = write!(m, ",\"input_token_logprobs\":{v}");
     }
     if let Some(v) = &acc.in_top_json {
@@ -280,7 +288,7 @@ pub(super) fn cumulative_frame_json(
     if !acc.out_tid_json.is_empty() {
         let _ = write!(m, ",\"output_token_ids_logprobs\":[{}]", acc.out_tid_json);
     }
-    if !acc.out_lp_json.is_empty() {
+    if lp_pair {
         let _ = write!(m, ",\"output_token_logprobs\":[{}]", acc.out_lp_json);
     }
     if !acc.out_top_json.is_empty() {

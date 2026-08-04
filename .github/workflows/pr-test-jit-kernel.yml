@@ -9,6 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this job compiles them during install.'
+        type: string
+        default: ''
       runner_config:
         required: true
         type: string
@@ -67,8 +71,19 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -105,8 +120,19 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -145,8 +171,19 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -185,8 +222,19 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 

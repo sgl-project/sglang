@@ -1737,6 +1737,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 decode_attention_backend=None,
                 prefill_attention_backend=None,
+                speculative_draft_attention_backend=None,
                 page_size=1,
             )
             defaults.update(kw)
