@@ -826,48 +826,42 @@ class UnifiedRadixCache(BasePrefixCache):
             # Incremental component backup is currently write-through only.
             if write_back and self.tree_core.is_backuped(node_id):
                 continue
-            backup_spec = self.tree_core.build_backup_spec(node_id)
-            if backup_spec.is_empty:
+            device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            if device_value.numel() == 0 and not comp_xfers:
                 continue
-            sidecar_xfers = self._build_backup_sidecar(backup_spec)
-            if not self._execute_kv_backup(node_id, backup_spec, sidecar_xfers):
+            sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
+            host_indices = self._execute_kv_backup(
+                node_id, device_value, comp_xfers, sidecar_xfers
+            )
+            if host_indices is None:
                 return 0
-            self.tree_core.commit_backup(node_id, backup_spec)
+            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
-            written = self._backup_base_token_count(backup_spec)
+            written = len(host_indices)
         return written
 
-    def _backup_base_token_count(self, backup_spec) -> int:
-        if backup_spec.base_xfer is None:
-            return 0
-        assert backup_spec.base_xfer.device_indices is not None
-        return len(backup_spec.base_xfer.device_indices)
-
-    def _build_backup_sidecar(self, backup_spec):
+    def _build_backup_sidecar(self, device_value, comp_xfers):
         """Gather sidecar transfer spec."""
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
         return self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_HOST,
-            backup_spec.base_xfer,
-            backup_spec.component_xfers,
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-    def _execute_kv_backup(self, node_id, backup_spec, sidecar_xfers) -> bool:
+    def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
-        kv_tokens = self._backup_base_token_count(backup_spec)
+        kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             if self.evict_host(needed) < needed:
-                return False
-        aux_xfers = [x for xfers in backup_spec.component_xfers.values() for x in xfers]
+                return None
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        return self.cache_controller.submit_backup(
-            backup_spec.base_xfer,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
+        return self.cache_controller.write(
+            device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
 
     def _track_write_through_node(
@@ -1027,14 +1021,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def _build_sidecar_transfers(
         self,
         phase: CacheTransferPhase,
-        kv_xfer: Optional[PoolTransfer],
+        kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> list[PoolTransfer]:
         transfers: list[PoolTransfer] = []
         for spec in self.sidecar_pool_specs:
             if spec.indices_from_pool == PoolName.KV:
-                if kv_xfer is None:
-                    continue
                 indices_source = kv_xfer
             else:
                 source_component = {

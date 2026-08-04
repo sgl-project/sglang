@@ -1641,8 +1641,8 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) backup
-        if host_indices is not None:
-            assert device_indices is not None
+        # A zero-length anchor denotes a component-only backup.
+        if host_indices.numel() > 0:
             self.anchor_entry.host_pool.backup_from_device_all_layer(
                 self.anchor_entry.device_pool,
                 host_indices,
