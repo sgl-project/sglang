@@ -11,12 +11,12 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
     build_inv_indices,
     fused_pack_qkv,
     fused_scatter_to_padded,
 )
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _ipc_input_a2a_qkv,
     _usp_input_all_to_all,
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
@@ -619,6 +620,7 @@ class USPAttention(nn.Module):
         num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
+        qkv_pre_all_to_all: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -769,10 +771,14 @@ class USPAttention(nn.Module):
                 )
 
             sp_size = get_ulysses_parallel_world_size()
-            if sp_size > 1:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+            if sp_size > 1 and not qkv_pre_all_to_all:
+                qkv_fast = _ipc_input_a2a_qkv(q, k, v)
+                if qkv_fast is not None:
+                    q, k, v = qkv_fast
+                else:
+                    q = _usp_input_all_to_all(q, head_dim=2)
+                    k = _usp_input_all_to_all(k, head_dim=2)
+                    v = _usp_input_all_to_all(v, head_dim=2)
 
             if (
                 _VARLEN_FA_ENABLED
@@ -953,7 +959,7 @@ class USPAttention(nn.Module):
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
-        if sp_size > 1:
+        if sp_size > 1 and not qkv_pre_all_to_all:
             # -> [B, S, H_local, D]
             if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(

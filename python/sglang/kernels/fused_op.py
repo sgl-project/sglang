@@ -28,7 +28,7 @@ implementations with a single switch.
 
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
-``sglang.jit_kernel``) or triggers JIT compilation; backends are imported
+``sglang.kernels.jit``) or triggers JIT compilation; backends are imported
 lazily inside the ``forward_<backend>`` methods.
 """
 
@@ -70,6 +70,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
+    KernelBackend.SGL_KERNEL_NPU: "forward_sgl_kernel_npu",
     KernelBackend.TORCH_NPU: "forward_npu",
 }
 
@@ -83,6 +84,7 @@ DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.DEEPGEMM,
     KernelBackend.CUTE_DSL,
     KernelBackend.AITER,
+    KernelBackend.SGL_KERNEL_NPU,
     KernelBackend.TORCH_NPU,
     KernelBackend.TRITON,
     KernelBackend.TORCH,
@@ -270,6 +272,9 @@ class BaseFusedOp(ABC):
 
     def forward_aiter(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no aiter backend")
+
+    def forward_sgl_kernel_npu(self, *args, **kwargs):
+        raise NotImplementedError(f"{self.op}: no sgl_kernel_npu backend")
 
     def forward_npu(self, *args, **kwargs):
         raise NotImplementedError(f"{self.op}: no npu backend")

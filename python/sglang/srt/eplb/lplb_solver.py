@@ -185,7 +185,7 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
         _ipm_warmup(nc, nv, num_iters=5, device=device)
 
@@ -261,7 +261,7 @@ class LPLBSolver:
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
         Raises if the JIT CUDA backend is unavailable.
         """
-        from sglang.jit_kernel.lplb import cuda_solver
+        from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(
             self._A_full,

@@ -100,6 +100,7 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
+        top_k = topk_weights.shape[-1]
 
         (
             permuted_hidden_states,
@@ -110,7 +111,7 @@ class AscendTPDispatcher(BaseDispatcher):
             hidden_states,
             topk_ids,
             self.num_experts,
-            self.top_k,
+            top_k,
         )
 
         self._dispatch_output = AscendTPDispatchOutput(

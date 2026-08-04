@@ -5,7 +5,8 @@ pure-``torch`` reference (``forward_native``) plus optimized per-device backends
 all behind one signature. The public module-level functions are thin wrappers
 over module-level instances; auto-selection follows the production default for
 the live device: AOT ``sgl_kernel`` on CUDA, ``aiter`` (or rocm-triton for
-gemma) on ROCm, ``torch_npu`` on Ascend, native reference otherwise.
+gemma) on ROCm, ``torch_npu`` on Ascend (``sgl_kernel_npu`` for gemma, whose
+implementation is SoC-specific), native reference otherwise.
 Pick a specific backend with e.g.
 ``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
 ``SGLANG_FORCE_FUSED_OP_BACKEND``.
@@ -13,6 +14,7 @@ Pick a specific backend with e.g.
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -35,15 +37,34 @@ _NPU = frozenset({CapabilityRequirement.NPU})
 # an ``aiter`` path, and Ascend a ``torch_npu`` path — a clean illustration that
 # the same ``AOT`` provenance covers different devices per op.
 # Priority (best -> fallback) is device-agnostic; per-op CapabilityRequirement
-# decides eligibility, so on CUDA this resolves to AOT, on HIP to AITER, on NPU
-# to TORCH_NPU, each matching the production default for that device.
+# decides eligibility, so on CUDA this resolves to AOT, on HIP to AITER, and on
+# NPU to the provider implemented by each operator.
 _NORM_PRIORITY = (
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.AITER,
+    KernelBackend.SGL_KERNEL_NPU,
     KernelBackend.TORCH_NPU,
     KernelBackend.TORCH,
 )
+
+
+def _sgl_kernel_npu_gemma(module: str, symbol: str):
+    """Resolve a Gemma kernel from ``sgl_kernel_npu``, or explain what is missing.
+
+    The Gemma provider is picked when the sgl-kernel-npu wheel is built (native
+    ``torch_npu`` operator on Ascend 910, ACLNN on Ascend 950), so an older or
+    mismatched wheel shows up here as a plain ImportError. Unlike
+    ``srt/layers/layernorm.py``, this path does not fall back to ``torch_npu``:
+    a backend selected by name must not silently run a different provenance.
+    """
+    try:
+        return getattr(importlib.import_module(module), symbol)
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "Gemma RMSNorm on Ascend requires a target-specific sgl-kernel-npu "
+            f"wheel that provides {module}.{symbol}"
+        ) from error
 
 
 class RMSNormOp(BaseFusedOp):
@@ -66,7 +87,7 @@ class RMSNormOp(BaseFusedOp):
     )
     descriptions = {
         KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.JIT: "RMS normalization (sglang.kernels.jit).",
         KernelBackend.AITER: "RMS normalization (aiter rmsnorm2d_fwd, ROCm).",
         KernelBackend.TORCH_NPU: "RMS normalization (torch_npu, Ascend).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
@@ -113,7 +134,7 @@ class RMSNormOp(BaseFusedOp):
     ) -> torch.Tensor:
         import torch
 
-        from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+        from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 
         if out is None:
             out = torch.empty_like(input)
@@ -180,7 +201,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
         ),
         KernelBackend.JIT: (
-            "Fused residual-add + RMS normalization (sglang.jit_kernel)."
+            "Fused residual-add + RMS normalization (sglang.kernels.jit)."
         ),
         KernelBackend.AITER: ("Fused residual-add + RMS normalization (aiter, ROCm)."),
         KernelBackend.TORCH_NPU: (
@@ -227,7 +248,9 @@ class FusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+        from sglang.kernels.ops.layernorm.norm import (
+            fused_add_rmsnorm as jit_fused_add_rmsnorm,
+        )
 
         return jit_fused_add_rmsnorm(input, residual, weight, eps)
 
@@ -273,12 +296,12 @@ class GemmaRMSNormOp(BaseFusedOp):
     op = "layernorm.gemma_rmsnorm"
     priority = _NORM_PRIORITY
     # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path
-    # (sglang.jit_kernel.minimax_m3) — a JIT provenance pinned to HIP, distinct
-    # from the CUDA-only JIT on the plain rmsnorm ops; torch_npu on Ascend.
+    # (sglang.kernels.ops.moe.minimax_m3_swiglu) — a JIT provenance pinned to HIP, distinct
+    # from the CUDA-only JIT on the plain rmsnorm ops; sgl_kernel_npu on Ascend.
     capabilities = {
         KernelBackend.AOT: _CUDA,
         KernelBackend.JIT: _HIP,
-        KernelBackend.TORCH_NPU: _NPU,
+        KernelBackend.SGL_KERNEL_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -287,9 +310,11 @@ class GemmaRMSNormOp(BaseFusedOp):
     descriptions = {
         KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
         KernelBackend.JIT: (
-            "Gemma-style RMS normalization (rocm-triton, sglang.jit_kernel)."
+            "Gemma-style RMS normalization (rocm-triton, sglang.kernels.jit)."
         ),
-        KernelBackend.TORCH_NPU: ("Gemma-style RMS normalization (torch_npu, Ascend)."),
+        KernelBackend.SGL_KERNEL_NPU: (
+            "Gemma-style RMS normalization (sgl_kernel_npu, Ascend)."
+        ),
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
     }
 
@@ -332,7 +357,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
         )
 
@@ -342,7 +367,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_npu(
+    def forward_sgl_kernel_npu(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -350,9 +375,10 @@ class GemmaRMSNormOp(BaseFusedOp):
         out: Optional[torch.Tensor] = None,
         enable_pdl: Optional[bool] = None,
     ) -> torch.Tensor:
-        import torch_npu
-
-        result = torch_npu.npu_gemma_rms_norm(input, weight, eps)[0]
+        npu_gemma_rms_norm = _sgl_kernel_npu_gemma(
+            "sgl_kernel_npu.norm.gemma_rmsnorm", "npu_gemma_rms_norm"
+        )
+        result, _ = npu_gemma_rms_norm(input, weight, eps)
         if out is None:
             return result
         out.copy_(result)
@@ -365,11 +391,12 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
     op = "layernorm.gemma_fused_add_rmsnorm"
     priority = _NORM_PRIORITY
     # AOT (sgl_kernel) on CUDA; JIT is the ROCm rocm-triton path on HIP.
-    # NPU here would use ``sgl_kernel_npu.add_gemma_rms_norm`` (a distinct AOT-npu
-    # wheel provenance, not torch_npu) — deferred until that provenance lands.
+    # NPU uses ``sgl_kernel_npu.norm.add_rmsnorm_bias.add_gemma_rms_norm`` — the
+    # SGL_KERNEL_NPU provenance, not torch_npu.
     capabilities = {
         KernelBackend.AOT: _CUDA,
         KernelBackend.JIT: _HIP,
+        KernelBackend.SGL_KERNEL_NPU: _NPU,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -380,7 +407,11 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
         KernelBackend.JIT: (
             "Gemma-style fused residual-add + RMS normalization "
-            "(rocm-triton, sglang.jit_kernel)."
+            "(rocm-triton, sglang.kernels.jit)."
+        ),
+        KernelBackend.SGL_KERNEL_NPU: (
+            "Gemma-style fused residual-add + RMS normalization "
+            "(sgl_kernel_npu, Ascend)."
         ),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization "
@@ -426,7 +457,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         eps: float = 1e-6,
         enable_pdl: Optional[bool] = None,
     ) -> None:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+        from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
         )
 
@@ -434,6 +465,22 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         norm_out, residual_out = rocm_triton_gemma_fused_add_rmsnorm(
             input, residual, weight, eps
         )
+        input.copy_(norm_out)
+        residual.copy_(residual_out)
+
+    def forward_sgl_kernel_npu(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        add_gemma_rms_norm = _sgl_kernel_npu_gemma(
+            "sgl_kernel_npu.norm.add_rmsnorm_bias", "add_gemma_rms_norm"
+        )
+        # sgl_kernel_npu returns (normed, new_residual); honor the in-place contract.
+        norm_out, residual_out = add_gemma_rms_norm(input, weight, residual, eps)
         input.copy_(norm_out)
         residual.copy_(residual_out)
 
@@ -510,8 +557,6 @@ from sglang.kernels.spec import KernelSpec
 # Triton / TileLang kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 _PHASE25_KERNELS = [
-    ("elementwise", "fused_dual_residual_rmsnorm", "triton"),
-    ("elementwise", "fused_rmsnorm", "triton"),
     ("gemma4_fused_ops", "gemma4_fused_routing", "triton"),
     ("gemma4_fused_ops", "gemma_qkv_rmsnorm", "triton"),
     ("mhc_head", "fused_hc_head", "triton"),
@@ -525,3 +570,15 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
         )
     )
 del _mod, _fn, _bk
+
+# The fused-rmsnorm variants physically live in the shared fused-pointwise
+# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
+for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+        )
+    )
+del _fn
