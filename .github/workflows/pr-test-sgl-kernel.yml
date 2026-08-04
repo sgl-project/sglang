@@ -7,7 +7,7 @@ on:
         required: true
         type: string
       rust_ext_artifact:
-        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this job compiles them during install.'
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
         type: string
         default: ''
       runner_config:
