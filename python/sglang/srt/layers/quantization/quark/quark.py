@@ -143,10 +143,10 @@ class QuarkConfig(QuantizationConfig):
         )
 
     def _dense_fp8_enabled(self) -> bool:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_exec
 
         try:
-            return get_global_server_args().enable_dense_fp8
+            return get_exec().kernel.enable_dense_fp8
         except ValueError:
             return False
 

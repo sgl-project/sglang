@@ -953,6 +953,7 @@ class ServerArgs:
         "online w8a8 FP8, and fuse their SiluAndMul + per-token activation quant into "
         "a single aiter kernel. Requires SGLANG_USE_AITER and "
         "SGLANG_USE_AITER_FP8_PER_TOKEN. Default off.",
+        NS("exec.kernel"),
     ] = False
 
     # -------------------------------------------------------------------------

@@ -210,7 +210,7 @@ class Qwen2MoeMLP(nn.Module):
         # per-token quant into one aiter kernel feeding the (fp8, scale) tuple to
         # down_proj. Aiter-only; default off.
         self._fp8_silu_fuse = False
-        if _use_aiter and get_server_args().enable_dense_fp8:
+        if _use_aiter and get_exec().kernel.enable_dense_fp8:
             quant_method = getattr(self.down_proj, "quant_method", None)
             # Gate on use_aiter_fp8_per_token (set in __init__): it implies the
             # bpreshuffle per-token path the tuple needs; use_per_token_if_dynamic is
