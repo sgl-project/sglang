@@ -342,6 +342,7 @@ class CompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -403,6 +404,17 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SpecTokensDetails(BaseModel):
+    """Per-request speculative decoding statistics."""
+
+    spec_accept_rate: float = 0.0
+    spec_accept_length: float = 0.0
+    spec_num_correct_drafts: int = 0
+    spec_num_proposed_drafts: int = 0
+    spec_verify_ct: int = 0
+    spec_correct_drafts_histogram: List[int] = Field(default_factory=list)
+
+
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
 
@@ -412,6 +424,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    spec_tokens_details: Optional[SpecTokensDetails] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -775,6 +788,7 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
