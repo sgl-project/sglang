@@ -280,6 +280,9 @@ class DSV4AttnMetadata:
 
     def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
         assert self.page_table.dim() == 2
+        # CP-v2 pads causal metadata for per-rank partitioning, while cache-write
+        # locations remain one-per-logical-token. num_tokens tracks that unpadded
+        # length; legacy paths use the metadata length.
         if num_tokens is None:
             num_tokens = self.seq_lens_casual.shape[0]
         assert (

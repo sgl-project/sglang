@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=600, stage="extra-b", runner_config="deepep-8-gpu-h200")
 
-MODEL_PATH = "/home/t4/models/deepseek-v4-flash-fp8/sgl-project/DeepSeek-V4-Flash-FP8/"
+MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
