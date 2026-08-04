@@ -164,11 +164,11 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
     (server args are fixed after startup)."""
     global _aiter_topk_fuse_shared_max_tokens_cache
     if _aiter_topk_fuse_shared_max_tokens_cache is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         try:
-            sa = get_global_server_args()
-        except Exception:
+            sa = get_server_args()
+        except ValueError:
             # Global server args not published yet (e.g. a unit test or offline
             # init that reaches the aiter grouped-topk path before startup).
             # Degrade gracefully instead of crashing -- this value only bounds
