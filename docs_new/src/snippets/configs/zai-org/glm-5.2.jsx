@@ -887,7 +887,7 @@ sgl-eval run aime25 \\
         "--dp 4",
         "--enable-dp-attention",
         "--chunked-prefill-size 16384",
-        "--mem-fraction-static 0.92",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

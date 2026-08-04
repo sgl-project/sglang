@@ -286,12 +286,12 @@ export const benchmarks = [
   },
     {
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.15.post1",
+    sglang_version: "0.5.16",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 92241, tpot_ms: 171.61, tokens_per_sec_per_gpu: 8782 },
+        ttft_ms: 86899, tpot_ms: 155.08, tokens_per_sec_per_gpu: 8706 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 692010, tpot_ms: 204.35, tokens_per_sec_per_gpu: 9455 },
+        ttft_ms: 770145, tpot_ms: 171.35, tokens_per_sec_per_gpu: 9054 },
     ],
   },
     {
