@@ -22,13 +22,14 @@ TIMEOUT = 10.0
 
 
 def classify(body: dict) -> str:
-    # 方法1：按 chat_template_kwargs 区分
-    if body.get("chat_template_kwargs", {}).get("enable_thinking") is False:
-        return "tool_call"
-    # 方法2：带 tools 字段也是 tool call
+    # 显式 enable_thinking 优先：false -> tool_call，true -> thinking（即使带 tools）
+    ctk = body.get("chat_template_kwargs")
+    if isinstance(ctk, dict) and "enable_thinking" in ctk:
+        return "tool_call" if ctk.get("enable_thinking") is False else "thinking"
+    # 无显式标志时：带 tools 视为 tool call
     if body.get("tools"):
         return "tool_call"
-    # 注意：不带 enable_thinking/tools 的请求默认归入 thinking 桶（12 并发、无 priority）
+    # 兜底归入 thinking 桶（12 并发、无 priority）
     return "thinking"
 
 
@@ -63,7 +64,10 @@ async def _forward(
     except Exception as e:  # noqa: BLE001 后端不可达：释放槽位，避免泄漏导致全量 429
         sems[kind].release()
         await client.aclose()
-        return JSONResponse({"error": "backend unreachable", "detail": str(e)}, status_code=502)
+        return JSONResponse(
+            {"error": {"message": f"backend unreachable: {e}", "type": "upstream_error", "code": 502}},
+            status_code=502,
+        )
 
     resp_headers = {
         k: v
@@ -100,7 +104,13 @@ async def _forward(
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": {"message": "invalid JSON body", "type": "invalid_request_error", "code": 400}},
+            status_code=400,
+        )
     kind = classify(body)
     forwarded = dict(body)
     if kind == "tool_call":
@@ -113,7 +123,7 @@ async def chat(request: Request):
         path,
         forwarded,
         "text/event-stream",
-        {"error": "too many requests", "type": "concurrency_limit"},
+        {"error": {"message": "too many requests", "type": "concurrency_limit", "code": 429}},
         headers=request.headers,
     )
 
@@ -122,8 +132,15 @@ async def chat(request: Request):
 async def messages(request: Request):
     """Anthropic 风格接口：按 thinking 字段分类限并发。
     注意：Anthropic 协议无 priority 字段，无法注入（SGLang anthropic 入口会拒绝未知字段）。"""
-    body = await request.json()
-    kind = "thinking" if body.get("thinking", {}).get("type") == "enabled" else "tool_call"
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON body"}},
+            status_code=400,
+        )
+    thinking = body.get("thinking")
+    kind = "thinking" if isinstance(thinking, dict) and thinking.get("type") == "enabled" else "tool_call"
     path = "/v1/messages"
     if request.url.query:
         path += "?" + request.url.query
@@ -140,13 +157,6 @@ async def messages(request: Request):
     )
 
 
-@app.get("/v1/models")
-async def models():
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(BACKEND + "/v1/models")
-        return JSONResponse(r.json(), status_code=r.status_code)
-
-
 @app.post("/admin/limits")
 async def set_limits(payload: dict):
     """运行时限并发调整，无需重启。示例:
@@ -157,7 +167,10 @@ async def set_limits(payload: dict):
     updated = {}
     for k, v in payload.items():
         if k in LIMITS:
-            v = int(v)
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
             if v > 0:
                 LIMITS[k] = v
                 sems[k] = asyncio.Semaphore(v)  # 重建信号量，在途请求不受影响
@@ -179,8 +192,12 @@ async def passthrough(path: str, request: Request):
         if k.lower() not in ("host", "content-length", "connection")
     }
     client = httpx.AsyncClient(timeout=None)
-    req = client.build_request(request.method, target, content=body, headers=headers)
-    resp = await client.send(req, stream=True)
+    try:
+        req = client.build_request(request.method, target, content=body, headers=headers)
+        resp = await client.send(req, stream=True)
+    except Exception as e:  # noqa: BLE001 后端不可达：关闭 client，返回 502
+        await client.aclose()
+        return JSONResponse({"error": "backend unreachable", "detail": str(e)}, status_code=502)
 
     async def stream():
         try:
@@ -210,7 +227,7 @@ if __name__ == "__main__":
     ap.add_argument("--thinking-limit", type=int, default=12)
     ap.add_argument("--timeout", type=float, default=10.0)
     args = ap.parse_args()
-    BACKEND = args.backend
+    BACKEND = args.backend.rstrip("/")
     TIMEOUT = args.timeout
     LIMITS["tool_call"] = args.tool_call_limit
     LIMITS["thinking"] = args.thinking_limit
