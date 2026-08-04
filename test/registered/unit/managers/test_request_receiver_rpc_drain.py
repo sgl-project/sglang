@@ -1,11 +1,11 @@
-"""The scheduler's rpc channel must survive rust-server mode.
+"""Regression tests for the scheduler's rpc channel under rust-server mode.
 
-Rank 0 has two input channels: the tokenizer channel (which the embedded Rust
-server replaces with an in-process ring) and the rpc channel (a zmq DEALER pair
-with the offline ``Engine``, which Rust has no equivalent for). A regression
-made ``_pull_raw_reqs`` return as soon as it had drained the ring, so the rpc
-socket was created and wired up but never read, and the matching reply branch in
-``process_input_requests`` was shadowed by the rust branch.
+Rank 0 has two input channels. The embedded Rust server replaces the tokenizer
+channel with an in-process ring, but it has no equivalent for the rpc channel, a
+zmq DEALER pair with the offline ``Engine``. ``_pull_raw_reqs`` used to return as
+soon as it had drained the ring, so the rpc socket was created and wired up but
+never read, and the rust branch in ``process_input_requests`` shadowed the reply
+that should have gone back over zmq.
 """
 
 import unittest
@@ -34,16 +34,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeSocket:
-    """A zmq socket holding a fixed queue, then empty.
+    """A zmq socket yielding a fixed queue, then raising ``zmq.Again``.
 
-    Yields each queued object once and then raises ``zmq.Again``, which is what a
-    real socket does under ``zmq.NOBLOCK`` with nothing queued. Both receive
-    methods are implemented so the test holds under either IPC encoding
-    (``sock_recv`` picks between them on ``SGLANG_USE_PICKLE_IPC``).
-
-    A fake rather than a real socket pair on purpose: a freshly connected
-    ``inproc://`` / ``ipc://`` pair races an immediate non-blocking ``recv``, so
-    a real pair would make this test flaky.
+    This is a fake rather than a real socket pair because a freshly connected
+    pair races an immediate non-blocking ``recv``. Both receive methods exist
+    because ``sock_recv`` picks between them on ``SGLANG_USE_PICKLE_IPC``.
     """
 
     def __init__(self, objs=()):
@@ -62,10 +57,10 @@ class _FakeSocket:
 
 
 class _FakeRing:
-    """Stand-in for ``RustServer`` as the receiver's ingress source.
+    """Stand-in for ``RustServer`` as the ingress source.
 
-    ``RustServer.drain`` returns already-decoded request objects, so what they
-    are is the ring's business, not the receiver's — hence plain sentinels.
+    ``drain`` returns objects that are already decoded, so their contents are the
+    ring's concern rather than the receiver's. Plain sentinels are enough here.
     """
 
     def __init__(self, objs=()):
@@ -87,7 +82,7 @@ def _make_receiver(*, recv_from_tokenizer, recv_from_rpc) -> SchedulerRequestRec
         input_blocker=None,
         mm_receiver=None,
         # All-defaults: pp_rank / attn_tp_rank / attn_cp_rank are 0, which is the
-        # rank-zero branch of _pull_raw_reqs — the only one that owns sockets.
+        # rank-zero branch of _pull_raw_reqs, the only one that owns sockets.
         ps=ParallelState.trivial(),
         tp_group=group,
         tp_cpu_group=group,
@@ -109,9 +104,9 @@ def _make_receiver(*, recv_from_tokenizer, recv_from_rpc) -> SchedulerRequestRec
 
 class TestRequestReceiverRpcDrain(unittest.TestCase):
     def test_rust_mode_drains_rpc_socket(self):
-        """Rust mode must read the rpc socket, not just the ingress ring.
+        """Rust mode reads the rpc socket as well as the ingress ring.
 
-        Draining only the ring leaves rpc requests queued forever, and
+        If it drains only the ring, rpc requests stay queued and
         ``collective_rpc`` blocks on a reply that is never sent.
         """
         ring_req = object()
@@ -133,11 +128,10 @@ class TestRequestReceiverRpcDrain(unittest.TestCase):
         self.assertEqual(recv_reqs[1], rpc_req)
 
     def test_rust_mode_does_not_read_the_zmq_tokenizer_socket(self):
-        """The ring replaces the tokenizer socket; both must not be drained.
+        """The ring replaces the tokenizer socket instead of adding to it.
 
-        Guards the branch that makes the ring an *alternative* to the tokenizer
-        socket rather than an addition — reading both would double-admit work in
-        any deployment that still has a producer on the zmq side.
+        Reading both would double-admit work in any deployment that still has a
+        producer on the zmq side.
         """
         ring = _FakeRing([object()])
         receiver = _make_receiver(recv_from_tokenizer=ring, recv_from_rpc=_FakeSocket())
@@ -153,10 +147,10 @@ class TestRequestReceiverRpcDrain(unittest.TestCase):
         self.assertEqual(ring.drain_calls, [-1])
 
     def test_zmq_mode_still_drains_both_sockets(self):
-        """The non-rust path keeps draining tokenizer *and* rpc into one list.
+        """The non-rust path drains the tokenizer socket and then the rpc socket.
 
-        The rust branch sits directly above these two loops, so restructuring it
-        can silently drop either one.
+        The rust branch sits directly above both loops, so restructuring it can
+        silently drop either one.
         """
         tokenizer_req = RpcReqInput(method="tokenizer_channel_sentinel")
         rpc_req = RpcReqInput(
@@ -192,11 +186,11 @@ class TestRpcReplyRouting(unittest.TestCase):
         return scheduler
 
     def test_rust_mode_replies_to_rpc_over_zmq(self):
-        """An RpcReqOutput must go back down the DEALER pair, not the egress ring.
+        """An RpcReqOutput goes back down the DEALER pair, not the egress ring.
 
         The Rust egress routes by a rust-minted rid, which an rpc request that
-        arrived over zmq does not carry — so pushing the reply there asserts and
-        takes the scheduler down.
+        arrived over zmq does not carry, so pushing the reply there trips an
+        assert and takes the scheduler down.
         """
         rpc_req = RpcReqInput(method="save_remote_model", parameters={"url": "s3://x"})
         rpc_out = RpcReqOutput(success=True, message="")
@@ -213,8 +207,8 @@ class TestRpcReplyRouting(unittest.TestCase):
     def test_rust_mode_still_routes_other_control_output_to_the_ring(self):
         """Only RpcReqOutput is special-cased; the rust branch keeps the rest.
 
-        Without this, hoisting the RpcReqOutput check could just as easily have
-        been written to swallow every control response.
+        A hoisted RpcReqOutput check could have been written to swallow every
+        control response instead of only that one type.
         """
         recv_req = SimpleNamespace(rid="abc", http_worker_ipc=None)
         output = SimpleNamespace()
