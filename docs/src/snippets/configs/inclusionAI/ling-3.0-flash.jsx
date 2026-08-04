@@ -212,7 +212,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
