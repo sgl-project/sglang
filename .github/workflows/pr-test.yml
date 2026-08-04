@@ -330,8 +330,8 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       # This stage compiled the workspace too - 7+ minutes per partition on
-      # billable hosted minutes. rust-ext-build builds on jammy against this newer
-      # runner (the safe glibc direction) and both pin Python 3.10, matching ABI.
+      # billable hosted minutes. rust-ext-build's modules need an older glibc than
+      # this runner has, which is the safe direction, and both pin Python 3.10.
       - name: Download prebuilt Rust extensions
         id: rust_ext
         if: ${{ needs.rust-ext-build.outputs.artifact_name != '' }}

@@ -7,12 +7,12 @@ name: PR Test - Build Rust Extensions
 # build, cargo included, so CUDA jobs on one host serialize on it - and once the
 # Rust build passed a few minutes, the queue's tail hit uv's lock timeout.
 #
-# Cache and artifact are not interchangeable:
-# - The cache, keyed by a source hash, decides whether to compile - no version to
+# The win is compiling once per run instead of in all ~25 install steps; the two
+# layers below only decide who pays for it.
+# - The cache, keyed by a source hash, carries a build across runs - no version to
 #   bump, unlike sgl-kernel, which publishes one because it ships to users.
-# - The artifact delivers them, which the cache cannot: this pool and the GPU pools
-#   do not share a cache backend (a key this job had just saved restored empty in
-#   0.2s), whereas artifacts already move sgl-kernel wheels between these pools.
+# - The artifact hands it to the stages, which the cache cannot: it is best-effort,
+#   evictable, and this repo is at its 10 GB limit. Artifacts are durable per run.
 #
 # Two jobs, because only compiling needs the build node: exactly one runner carries
 # that label and it also serves the sgl-kernel and docker builds, so queueing there
@@ -40,7 +40,7 @@ on:
         type: string
         default: rust-ext-x86_64
       max_glibc:
-        description: 'Highest GLIBC symbol version the built .so files may require. Test runners are Ubuntu 22.04 (jammy, glibc 2.35).'
+        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
         type: string
         default: '2.35'
       git_ref:
