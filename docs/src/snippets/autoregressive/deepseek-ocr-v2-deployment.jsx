@@ -10,6 +10,7 @@ export const DeepSeekOCR2Deployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'Arc B', label: 'BMG', default: false },
       ]
     },
     quantization: {
@@ -25,14 +26,15 @@ export const DeepSeekOCR2Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'Arc B', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' || v.hardware === 'Arc B', disabledReason: 'Only Tensor Parallel (TP) is supported on this hardware' }
       ]
     },
   };
 
   const generateCommand = (values) => {
     const { hardware, strategy } = values;
+    const isArcB = hardware === 'Arc B';
 
     const strategyArray = Array.isArray(strategy) ? strategy : [];
 
@@ -42,6 +44,8 @@ export const DeepSeekOCR2Deployment = () => {
     cmd += `  --model-path ${modelPath}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
+    } else if (isArcB) {
+      cmd += ` \\\n  --device xpu`;
     }
     cmd += ` \\\n  --enable-multimodal`;
 
@@ -272,9 +276,8 @@ export const DeepSeekOCR2Deployment = () => {
               ) : option.type === 'checkbox' ? (
                 (option.items || []).map((item) => {
                   const isChecked = (values[option.name] || []).includes(item.id);
-                  const isDisabled =
-                    item.required ||
-                    (typeof item.disabledWhen === 'function' && item.disabledWhen(values));
+                  const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                  const isDisabled = item.required || dynDisabled;
                   return (
                     <label
                       key={item.id}
@@ -289,9 +292,11 @@ export const DeepSeekOCR2Deployment = () => {
                         type="checkbox"
                         checked={isChecked}
                         disabled={isDisabled}
-                        onChange={(event) =>
-                          handleCheckboxChange(option.name, item.id, event.target.checked)
-                        }
+                        onChange={(event) => {
+                          if (!dynDisabled) {
+                            handleCheckboxChange(option.name, item.id, event.target.checked);
+                          }
+                        }}
                         style={{ display: 'none' }}
                       />
                       {item.label}

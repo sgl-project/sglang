@@ -15,7 +15,8 @@ export const FluxDeployment = () => {
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'a2', label: 'A2', default: false },
-          { id: 'a3', label: 'A3', default: false }
+          { id: 'a3', label: 'A3', default: false },
+          { id: 'Arc B', label: 'BMG', default: false },
         ]
       },
       version: {
@@ -24,6 +25,21 @@ export const FluxDeployment = () => {
         items: [
           { id: 'flux1-dev', label: 'FLUX.1-dev', subtitle: '12B', default: true },
           { id: 'flux2-dev', label: 'FLUX.2-dev', subtitle: '32B', default: false }
+        ],
+        getDynamicItems: (values) => [
+          {
+            id: 'flux1-dev',
+            label: 'FLUX.1-dev',
+            subtitle: '12B',
+            default: values.hardware !== 'Arc B',
+            disabled: values.hardware === 'Arc B',
+          },
+          {
+            id: 'flux2-dev',
+            label: 'FLUX.2-dev',
+            subtitle: '32B',
+            default: values.hardware === 'Arc B',
+          },
         ]
       }
     },
@@ -56,6 +72,14 @@ sglang serve \\
   --tp-size 2 \\
   --model-path ${config.repoId} \\
   --num-gpus 2`;
+      }
+
+      if (hardware === 'Arc B') {
+        return `sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 4 \\
+  --tp-size 4 \\
+  --dit-cpu-offload False`;
       }
 
       return `sglang serve \\
@@ -145,7 +169,13 @@ sglang serve \\
   }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const nextValues = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B' && nextValues.version === 'flux1-dev') {
+        nextValues.version = 'flux2-dev';
+      }
+      return nextValues;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

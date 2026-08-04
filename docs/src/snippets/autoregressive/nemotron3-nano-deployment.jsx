@@ -8,27 +8,34 @@ export const Nemotron3NanoDeployment = () => {
       items: [
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
-        { id: 'b300', label: 'B300', default: false }
+        { id: 'b300', label: 'B300', default: false },
+        { id: 'Arc B', label: 'BMG', default: false }
       ]
     },
     modelVariant: {
       name: 'modelVariant',
       title: 'Model Variant',
-      items: [
-        { id: 'bf16', label: 'BF16', default: true },
-        { id: 'fp8', label: 'FP8', default: false },
-        { id: 'nvfp4', label: 'NVFP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: 'bf16', label: 'BF16', default: true },
+          { id: 'fp8', label: 'FP8', default: false, disabled: isArcB },
+          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isArcB }
+        ];
+      }
     },
     tp: {
       name: 'tp',
       title: 'Tensor Parallel (TP)',
-      items: [
-        { id: '1', label: 'TP=1', default: true },
-        { id: '2', label: 'TP=2', default: false },
-        { id: '4', label: 'TP=4', default: false },
-        { id: '8', label: 'TP=8', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: '1', label: 'TP=1', default: !isArcB, disabled: isArcB },
+          { id: '2', label: 'TP=2', default: false, disabled: isArcB },
+          { id: '4', label: 'TP=4', default: isArcB, disabled: false },
+          { id: '8', label: 'TP=8', default: false, disabled: isArcB }
+        ];
+      }
     },
     kvcache: {
       name: 'kvcache',
@@ -74,6 +81,10 @@ export const Nemotron3NanoDeployment = () => {
     cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
     if (hardware === 'b300') {
       cmd += `  --attention-backend flashinfer \\\n`;
+    }
+
+    if (hardware === 'Arc B') {
+      cmd += `  --device xpu \\n`;
     }
 
     // Add thinking parser and tool call parser if enabled
@@ -153,7 +164,14 @@ export const Nemotron3NanoDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        next.modelVariant = 'bf16';
+        next.tp = '4';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
