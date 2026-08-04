@@ -1,0 +1,31 @@
+name: Seed Rust Ext Cache
+
+# A cache entry only reaches every PR when it was written from the default branch's
+# ref, and pr-test.yml has no push trigger - so a merge that moves the key leaves
+# every PR compiling for itself until the next scheduled run, up to 12h later.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'python/setup.py'
+  workflow_dispatch:
+
+# Only the newest merge needs to seed; earlier ones are already stale.
+concurrency:
+  group: seed-rust-ext-cache
+  cancel-in-progress: true
+
+# Declaring permissions at all drops everything not listed, and check-maintenance
+# needs issues: read to reach the maintenance issue.
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  seed:
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: 1-gpu-5090
+    secrets: inherit
