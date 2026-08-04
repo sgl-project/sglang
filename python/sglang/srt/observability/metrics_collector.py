@@ -1716,7 +1716,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
-        his = self.histogram_time_to_first_token.labels(**self.labels, is_streaming="true")
+        his = self.histogram_time_to_first_token.labels(
+            **self.labels, is_streaming="true"
+        )
         total_observations = sum(bucket._value for bucket in his._buckets)
         if total_observations < 100:
             return False
