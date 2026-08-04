@@ -15,6 +15,7 @@ multimodal mode.
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import re
 from collections.abc import Generator, Iterable
@@ -96,6 +97,92 @@ class _Transform:
     kind: str
     source_name: str | None = None
     partner_name: str | None = None
+
+
+class _MMapRangeReleaser:
+    """Bound the resident working set of the monolithic K3 GGUF mmap.
+
+    The adapter deliberately yields zero-copy views into one 851 GiB mapping.
+    A yielded view is consumed synchronously by SGLang's weight loader before
+    the generator is resumed.  At that resume boundary it is safe to discard
+    the source pages: all retained expert data already belongs to the CUDA
+    parameter device.
+
+    ``MADV_DONTNEED`` is mandatory.  ``POSIX_FADV_DONTNEED`` is an additional
+    best-effort page-cache hint; failure of that optional hint falls back to
+    the successful mmap advice rather than silently disabling eviction.
+    """
+
+    def __init__(self, path: str, reader) -> None:
+        mapped = getattr(getattr(reader, "data", None), "_mmap", None)
+        madvise = getattr(mapped, "madvise", None)
+        if (
+            mapped is None
+            or not callable(madvise)
+            or not hasattr(mmap, "MADV_DONTNEED")
+        ):
+            raise RuntimeError(
+                "Kimi K3 GGUF loading requires mmap MADV_DONTNEED support to "
+                "bound host page-cache residency"
+            )
+        try:
+            mapped_size = int(mapped.size())
+        except (OSError, TypeError, ValueError) as error:
+            raise RuntimeError("Kimi K3 GGUF mmap size is unavailable") from error
+        if mapped_size <= 0:
+            raise RuntimeError("Kimi K3 GGUF mmap is empty")
+
+        self._path = path
+        self._mapped = mapped
+        self._mapped_size = mapped_size
+        self._page_size = int(mmap.PAGESIZE)
+        self._fd: int | None = None
+        self._fadvise_enabled = hasattr(os, "posix_fadvise") and hasattr(
+            os, "POSIX_FADV_DONTNEED"
+        )
+
+    def _aligned_range(self, offset: int, length: int) -> tuple[int, int]:
+        offset = int(offset)
+        length = int(length)
+        if offset < 0 or length <= 0 or offset + length > self._mapped_size:
+            raise ValueError(
+                "Kimi K3 GGUF release range is outside the mmap: "
+                f"offset={offset}, length={length}, size={self._mapped_size}"
+            )
+        start = offset - (offset % self._page_size)
+        raw_end = offset + length
+        end = min(
+            self._mapped_size,
+            ((raw_end + self._page_size - 1) // self._page_size) * self._page_size,
+        )
+        return start, end - start
+
+    def release(self, offset: int, length: int) -> None:
+        start, aligned_length = self._aligned_range(offset, length)
+        try:
+            self._mapped.madvise(mmap.MADV_DONTNEED, start, aligned_length)
+        except (OSError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Kimi K3 GGUF could not evict a consumed mmap range"
+            ) from error
+
+        if not self._fadvise_enabled:
+            return
+        try:
+            if self._fd is None:
+                self._fd = os.open(self._path, os.O_RDONLY)
+            os.posix_fadvise(self._fd, start, aligned_length, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            # The mmap advice above already discarded this process's pages.
+            # Some FUSE filesystems reject fadvise; remember that proven
+            # fallback instead of retrying a rejected hint for every tensor.
+            self._fadvise_enabled = False
+            self.close()
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
 
 def _strip_language_prefix(name: str) -> str:
@@ -199,6 +286,7 @@ class KimiK3GGUFAdapter:
         self.config = model_config.hf_config
         self.text_config = model_config.hf_text_config
         self.reader = gguf.GGUFReader(self.gguf_file)
+        self._range_releaser = _MMapRangeReleaser(self.gguf_file, self.reader)
         self._verify_config_and_metadata()
 
         arch = _find_arch(gguf)
@@ -420,6 +508,25 @@ class KimiK3GGUFAdapter:
     def quant_config(self):
         return KimiK3GGUFQuantConfig.create()
 
+    def _release_tensor_range(
+        self, tensor, *, relative_offset: int = 0, length: int | None = None
+    ) -> None:
+        relative_offset = int(relative_offset)
+        tensor_bytes = int(tensor.n_bytes)
+        if length is None:
+            length = tensor_bytes - relative_offset
+        length = int(length)
+        if (
+            relative_offset < 0
+            or length <= 0
+            or relative_offset + length > tensor_bytes
+        ):
+            raise ValueError(
+                f"invalid release subrange for K3 GGUF tensor {tensor.name!r}: "
+                f"offset={relative_offset}, length={length}, bytes={tensor_bytes}"
+            )
+        self._range_releaser.release(int(tensor.data_offset) + relative_offset, length)
+
     def _iter_expert_types(self) -> Iterable[tuple[str, torch.Tensor]]:
         num_experts = int(self.text_config.num_experts)
         for tensor, layer, projection in self.experts:
@@ -434,77 +541,93 @@ class KimiK3GGUFAdapter:
     def _iter_dense(self) -> Iterable[tuple[str, torch.Tensor]]:
         for tensor in self.reader.tensors:
             if tensor.name in self.regular:
-                yield self.regular[tensor.name], _dense_tensor(tensor)
+                try:
+                    yield self.regular[tensor.name], _dense_tensor(tensor)
+                finally:
+                    self._release_tensor_range(tensor)
                 continue
             transform = self.transforms.get(tensor.name)
             if transform is None:
                 continue
             if transform.kind == "kv_b_partner":
                 continue
-            value = _dense_tensor(tensor)
-            if transform.kind == "direct":
-                assert transform.source_name is not None
-                yield transform.source_name, value
-            elif transform.kind == "a_log":
-                if not torch.isfinite(value).all() or not torch.all(value < 0):
-                    raise ValueError(f"encoded K3 A_log is invalid: {tensor.name!r}")
-                assert transform.source_name is not None
-                yield transform.source_name, torch.log(-value.float())
-            elif transform.kind == "conv1d":
-                if value.ndim != 4 or value.shape[0] != 1 or value.shape[2] != 1:
-                    raise ValueError(
-                        f"K3 conv tensor has unexpected shape: {tensor.name!r} "
-                        f"{tuple(value.shape)!r}"
+            release_tensors = [tensor]
+            try:
+                value = _dense_tensor(tensor)
+                if transform.kind == "direct":
+                    assert transform.source_name is not None
+                    yield transform.source_name, value
+                elif transform.kind == "a_log":
+                    if not torch.isfinite(value).all() or not torch.all(value < 0):
+                        raise ValueError(
+                            f"encoded K3 A_log is invalid: {tensor.name!r}"
+                        )
+                    assert transform.source_name is not None
+                    yield transform.source_name, torch.log(-value.float())
+                elif transform.kind == "conv1d":
+                    if value.ndim != 4 or value.shape[0] != 1 or value.shape[2] != 1:
+                        raise ValueError(
+                            f"K3 conv tensor has unexpected shape: {tensor.name!r} "
+                            f"{tuple(value.shape)!r}"
+                        )
+                    assert transform.source_name is not None
+                    yield (
+                        transform.source_name,
+                        value.reshape(value.shape[1], 1, value.shape[3]),
                     )
-                assert transform.source_name is not None
-                yield (
-                    transform.source_name,
-                    value.reshape(value.shape[1], 1, value.shape[3]),
-                )
-            elif transform.kind == "kv_b":
-                assert transform.partner_name is not None
-                partner = _dense_tensor(self.tensors[transform.partner_name])
-                n_heads = int(self.text_config.num_key_value_heads)
-                kv_rank = int(self.text_config.kv_lora_rank)
-                qk_dim = int(self.text_config.qk_nope_head_dim)
-                v_dim = int(self.text_config.v_head_dim)
-                if tuple(value.shape) != (n_heads, kv_rank, qk_dim):
-                    raise ValueError(
-                        f"K3 k_b shape differs from config: {tuple(value.shape)!r}"
+                elif transform.kind == "kv_b":
+                    assert transform.partner_name is not None
+                    partner_tensor = self.tensors[transform.partner_name]
+                    release_tensors.append(partner_tensor)
+                    partner = _dense_tensor(partner_tensor)
+                    n_heads = int(self.text_config.num_key_value_heads)
+                    kv_rank = int(self.text_config.kv_lora_rank)
+                    qk_dim = int(self.text_config.qk_nope_head_dim)
+                    v_dim = int(self.text_config.v_head_dim)
+                    if tuple(value.shape) != (n_heads, kv_rank, qk_dim):
+                        raise ValueError(
+                            f"K3 k_b shape differs from config: {tuple(value.shape)!r}"
+                        )
+                    if tuple(partner.shape) != (n_heads, v_dim, kv_rank):
+                        raise ValueError(
+                            f"K3 v_b shape differs from config: "
+                            f"{tuple(partner.shape)!r}"
+                        )
+                    combined = torch.cat((value.transpose(1, 2), partner), dim=1)
+                    assert transform.source_name is not None
+                    yield (
+                        transform.source_name,
+                        combined.reshape(n_heads * (qk_dim + v_dim), kv_rank),
                     )
-                if tuple(partner.shape) != (n_heads, v_dim, kv_rank):
-                    raise ValueError(
-                        f"K3 v_b shape differs from config: {tuple(partner.shape)!r}"
-                    )
-                combined = torch.cat((value.transpose(1, 2), partner), dim=1)
-                assert transform.source_name is not None
-                yield (
-                    transform.source_name,
-                    combined.reshape(n_heads * (qk_dim + v_dim), kv_rank),
-                )
-            elif transform.kind == "residual_score":
-                if value.numel() != int(self.text_config.hidden_size):
-                    raise ValueError(
-                        f"K3 residual score has unexpected size: {tensor.name!r}"
-                    )
-                if not torch.isfinite(value).all():
-                    raise ValueError(
-                        f"K3 residual score is non-finite: {tensor.name!r}"
-                    )
-                if tensor.name == "output_res_score.weight":
-                    name = "language_model.model.output_attn_res_score_gguf"
-                elif tensor.name.endswith(".attn_res_score.weight"):
-                    layer = int(tensor.name.split(".")[1])
-                    name = (
-                        f"language_model.model.layers.{layer}."
-                        "self_attention_res_score_gguf"
-                    )
+                elif transform.kind == "residual_score":
+                    if value.numel() != int(self.text_config.hidden_size):
+                        raise ValueError(
+                            f"K3 residual score has unexpected size: {tensor.name!r}"
+                        )
+                    if not torch.isfinite(value).all():
+                        raise ValueError(
+                            f"K3 residual score is non-finite: {tensor.name!r}"
+                        )
+                    if tensor.name == "output_res_score.weight":
+                        name = "language_model.model.output_attn_res_score_gguf"
+                    elif tensor.name.endswith(".attn_res_score.weight"):
+                        layer = int(tensor.name.split(".")[1])
+                        name = (
+                            f"language_model.model.layers.{layer}."
+                            "self_attention_res_score_gguf"
+                        )
+                    else:
+                        layer = int(tensor.name.split(".")[1])
+                        name = f"language_model.model.layers.{layer}.mlp_res_score_gguf"
+                    yield name, value.float().reshape(-1)
                 else:
-                    layer = int(tensor.name.split(".")[1])
-                    name = f"language_model.model.layers.{layer}.mlp_res_score_gguf"
-                yield name, value.float().reshape(-1)
-            else:  # pragma: no cover - inventory construction owns this enum
-                raise AssertionError(f"unknown K3 GGUF transform {transform.kind!r}")
+                    # Inventory construction owns this enum.
+                    raise AssertionError(
+                        f"unknown K3 GGUF transform {transform.kind!r}"
+                    )
+            finally:
+                for release_tensor in release_tensors:
+                    self._release_tensor_range(release_tensor)
 
     def _iter_expert_weights(self) -> Iterable[tuple[str, torch.Tensor]]:
         num_experts = int(self.text_config.num_experts)
@@ -516,13 +639,30 @@ class KimiK3GGUFAdapter:
                     f"language_model.model.layers.{layer}.block_sparse_moe."
                     f"experts.{expert}.{ckpt_projection}.qweight"
                 )
+                expert_weight = weight[expert]
+                if not expert_weight.flags.c_contiguous:
+                    raise ValueError(
+                        f"K3 GGUF expert tensor is not row-contiguous: {tensor.name!r}"
+                    )
+                relative_offset = expert * int(weight.strides[0])
                 # Zero-copy mmap view. FusedMoE's GGUF loader immediately owns
-                # only the local TP shard on the parameter device.
-                yield name, torch.from_numpy(weight[expert])
+                # only the local TP shard on the parameter device. The finally
+                # runs when that synchronous consumer requests the next weight.
+                try:
+                    yield name, torch.from_numpy(expert_weight)
+                finally:
+                    self._release_tensor_range(
+                        tensor,
+                        relative_offset=relative_offset,
+                        length=int(expert_weight.nbytes),
+                    )
 
     def weights_iterator(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         # Qtypes must precede packed weights; the FusedMoE loader uses them to
         # compute the byte-axis TP shard without materializing the full expert.
-        yield from self._iter_expert_types()
-        yield from self._iter_dense()
-        yield from self._iter_expert_weights()
+        try:
+            yield from self._iter_expert_types()
+            yield from self._iter_dense()
+            yield from self._iter_expert_weights()
+        finally:
+            self._range_releaser.close()
