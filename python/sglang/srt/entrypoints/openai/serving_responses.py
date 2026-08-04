@@ -668,7 +668,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             if mode in ("thinking", "enable_thinking"):
                 return effort != "none"
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                return False
+                # effort is the explicit opt-in here; chat_template_kwargs never reaches this endpoint
+                return effort is not None and effort != "none"
             return False
         if config.special_case == "always":
             return True
