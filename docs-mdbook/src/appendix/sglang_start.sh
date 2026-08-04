@@ -145,9 +145,9 @@ export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 export NO_COLOR=1
 export TERM=dumb
 
-if [ "$KILL_EXISTING" = true ] && pgrep -f "sglang.launch_server" > /dev/null 2>&1; then
-    echo "终止残留进程..."
-    pkill -9 -f sglang.launch_server 2>/dev/null || true
+if [ "$KILL_EXISTING" = true ] && pgrep -f "sglang.launch_server|sglang_proxy.py" > /dev/null 2>&1; then
+    echo "终止残留进程（server + proxy）..."
+    pkill -9 -f "sglang.launch_server|sglang_proxy.py" 2>/dev/null || true
     sleep 5
 fi
 
@@ -174,7 +174,7 @@ echo "=========================================="
 if [ "$KEEP_ALIVE" = true ]; then
     (
         for i in $(seq 1 120); do
-            curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models" && break
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/health" && break
             sleep 5
         done
         while true; do
@@ -193,13 +193,21 @@ fi
 if [ "$PROXY_PORT" != "0" ]; then
     (
         for i in $(seq 1 120); do
-            curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models" && break
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/health" && break
             sleep 5
         done
         exec python3.12 "$PROXY_SCRIPT" --backend "http://127.0.0.1:$PORT" --listen "$PROXY_PORT" \
             --tool-call-limit "$PROXY_TOOL_CALL_LIMIT" --thinking-limit "$PROXY_THINKING_LIMIT"
     ) &
     PROXY_PID=$!
+    # 代理自检：等它就绪，失败则告警（不阻塞主服务）
+    (
+        for i in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PROXY_PORT/health" && { echo "[proxy] 就绪: 端口 $PROXY_PORT"; exit 0; }
+            sleep 2
+        done
+        echo "[proxy] 警告: 120s 内未就绪，检查端口 $PROXY_PORT 是否被占用"
+    ) &
 fi
 
 MANAGED_PIDS=""

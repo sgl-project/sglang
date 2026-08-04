@@ -105,9 +105,12 @@ async def chat(request: Request):
     forwarded = dict(body)
     if kind == "tool_call":
         forwarded["priority"] = 10  # 注入 priority，配合服务端 --priority-scheduling
+    path = "/v1/chat/completions"
+    if request.url.query:
+        path += "?" + request.url.query
     return await _forward(
         kind,
-        "/v1/chat/completions",
+        path,
         forwarded,
         "text/event-stream",
         {"error": "too many requests", "type": "concurrency_limit"},
@@ -121,9 +124,12 @@ async def messages(request: Request):
     注意：Anthropic 协议无 priority 字段，无法注入（SGLang anthropic 入口会拒绝未知字段）。"""
     body = await request.json()
     kind = "thinking" if body.get("thinking", {}).get("type") == "enabled" else "tool_call"
+    path = "/v1/messages"
+    if request.url.query:
+        path += "?" + request.url.query
     return await _forward(
         kind,
-        "/v1/messages",
+        path,
         body,
         "application/json",
         {

@@ -757,6 +757,13 @@ python3.12 -m pip list | grep -iE "fastapi|uvicorn|httpx"
 判断：三个都有 → 代理直接用，无需安装；仅 httpx 缺失 → `pip install httpx` 后固化镜像；fastapi/uvicorn 缺失 → 镜像构建不完整，先查构建。
 - **代理健壮性（已测试）**：后端不可达返回 502 且释放槽位（不会泄漏导致全量 429）；上游 4xx/5xx 原样透传（bytes，不走 JSONResponse 序列化）；并发满返回 429；流式期间持续占槽位、流结束释放。
 - **请求/响应头透传（已测试）**：chat/messages 路由转发 Authorization 等请求头（剥离 host/content-length/connection）；响应头（如 x-request-id）原样回传；流式与非流式均逐块透传，body 不做解析改写。
+- **无缝使用检查清单（配合脚本联动）**：
+  - 客户端 / K8s Service 指向代理端口（8080），就绪与存活探针用代理 `/health`（透传后端）；`/metrics` 走 `8080/metrics`；
+  - SGLang 开 `--api-key` 不受影响：Authorization 请求头已透传；就绪探测改用 `/health`（免鉴权），避免 `/v1/models` 探测因鉴权失败；
+  - `--kill-existing` 会连 `sglang_proxy.py` 一起清理，防止 kill -9 残留的孤儿代理占住 8080；
+  - 代理启动后自检：120s 内 `/health` 未就绪打警告（不阻塞主服务）；
+  - chat/messages 查询串（如 `?stream=true`）已透传；
+  - 上线前做 diff 验证：同一请求直连 8000 与走 8080，响应（body+headers）应完全一致。
 
 **请求侧**：
 
