@@ -7,7 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
