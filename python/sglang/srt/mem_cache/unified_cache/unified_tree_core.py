@@ -1536,7 +1536,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._build_backup_spec(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
-        """Build transfers for data not already available in Host."""
+        """Gather device value backup spec."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         assert device_value is not None
         if node.backuped:

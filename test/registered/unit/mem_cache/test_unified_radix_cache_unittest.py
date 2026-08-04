@@ -3075,7 +3075,6 @@ class UnifiedRadixCacheSuite:
         cache.sanity_check()
 
     def test_hicache_shorter_prefix_mamba_incremental_backup(self):
-        """A shorter shared prefix gains Mamba in both L1 and L2 after a split."""
         if not self.cfg.has_mamba or self.cfg.has_swa:
             self.skipTest("requires Full+Mamba")
 
