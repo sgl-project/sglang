@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from copy import copy
+from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
@@ -523,13 +523,9 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         batch,
         event_kind: str,
     ):
-        if event_kind not in {
-            "camera_actions",
-            "action_labels",
-            "action_weights",
-            "prompt",
-            "scene_cut",
-        }:
+        # Only keyboard state is safe to preview without consuming a scripted
+        # action or prompt queue. Other controls apply at the next chunk boundary.
+        if event_kind != "camera_actions":
             return None
         request = session.request
         if request is None:
@@ -542,53 +538,21 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             or self.get_chunk_size(session, server_args, chunk)
         )
         state = self._state(session)
-
-        if event_kind in {"camera_actions", "action_labels", "action_weights"}:
-            replacement.condition_inputs.pop(MINWM_ACTION_LABELS_CONDITION, None)
-            replacement.condition_inputs.pop(MINWM_ACTION_WEIGHTS_CONDITION, None)
-            t2v_first_block = self._is_t2v_request(request) and chunk.index == 0
-            if state.action_mode == "weights":
-                temporal_factor = int(
-                    server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
-                )
-                rows = (
-                    [[0.0] * 8] * (chunk_size * temporal_factor)
-                    if t2v_first_block
-                    else state.sample_action_weights(chunk_size * temporal_factor)
-                )
-                replacement.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] = [
-                    rows[start : start + temporal_factor]
-                    for start in range(0, len(rows), temporal_factor)
-                ]
-            else:
-                replacement.condition_inputs[MINWM_ACTION_LABELS_CONDITION] = (
-                    [0] * chunk_size
-                    if t2v_first_block
-                    else state.sample_action_labels(chunk_size)
-                )
-        else:
-            if not state.prompt_queue.has_events("condition_switch"):
-                return None
-            prompt, switch_kind = state.sample_prompt()
-            request.prompt = prompt
-            replacement.condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] = True
-            replacement.condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] = (
-                switch_kind
-            )
-            replacement.sampling_params = self.build_sampling_params(
-                session,
-                server_args,
-                chunk,
-                RealtimeChunkInputs(
-                    prompt=prompt,
-                    condition_inputs=replacement.condition_inputs,
-                ),
-                chunk_size,
-            )
+        if state.action_mode != "camera":
+            return None
+        preview_state = deepcopy(state)
+        replacement.condition_inputs.pop(MINWM_ACTION_LABELS_CONDITION, None)
+        replacement.condition_inputs.pop(MINWM_ACTION_WEIGHTS_CONDITION, None)
+        t2v_first_block = self._is_t2v_request(request) and chunk.index == 0
+        replacement.condition_inputs[MINWM_ACTION_LABELS_CONDITION] = (
+            [0] * chunk_size
+            if t2v_first_block
+            else preview_state.sample_action_labels(chunk_size)
+        )
 
         replacement.realtime_action_version = session.action_version
         replacement.realtime_prompt_version = session.prompt_version
-        replacement.realtime_event_id = self.get_realtime_event_id(session)
+        replacement.realtime_event_id = self._get_state_realtime_event_id(preview_state)
         return replacement
 
     def build_sampling_params(
@@ -613,7 +577,10 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         )
 
     def get_realtime_event_id(self, session: GenerateSession) -> int | None:
-        state = self._state(session)
+        return self._get_state_realtime_event_id(self._state(session))
+
+    @staticmethod
+    def _get_state_realtime_event_id(state: MinWMRealtimeState) -> int | None:
         # Realtime clients issue monotonically increasing event IDs and the
         # playback cutover waits for frame.event_id >= the pending event.
         # A chunk can sample prompt and action state together, so report the

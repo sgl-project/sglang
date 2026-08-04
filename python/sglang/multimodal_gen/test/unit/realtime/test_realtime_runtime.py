@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections import deque
+from copy import copy
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -219,6 +220,26 @@ def test_scheduler_session_release_retries_transient_failures(monkeypatch):
 
         assert released
         assert len(calls) == 3
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_session_release_has_a_short_per_attempt_timeout(monkeypatch):
+    async def scenario():
+        async def forward(_request):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(realtime_video_api.async_scheduler_client, "forward", forward)
+        started = time.perf_counter()
+        released = await realtime_video_api._release_scheduler_realtime_session(
+            "session-a",
+            attempts=1,
+            retry_delay_s=0,
+            timeout_s=0.01,
+        )
+
+        assert not released
+        assert time.perf_counter() - started < 0.2
 
     asyncio.run(scenario())
 
@@ -632,8 +653,164 @@ def test_scheduler_applies_realtime_replacement_that_arrives_before_request():
     assert queued_request is replacement
     assert queued_at == 100.1
     assert replies == [
-        ({"replaced": False, "buffered": True}, b"update", False)
+        (
+            {
+                "replaced": False,
+                "buffered": True,
+                "too_late": False,
+                "invalid": False,
+            },
+            b"update",
+            False,
+        )
     ]
+
+
+def test_scheduler_reports_realtime_replacement_after_dispatch_as_too_late():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.waiting_queue = deque()
+    replies = []
+    scheduler.return_result = lambda output, identity, should_not_return: replies.append(
+        (output.output, identity, should_not_return)
+    )
+    dispatched = Req.__new__(Req)
+    dispatched.request_id = "request-1"
+    dispatched.realtime_session_id = "session-1"
+    dispatched.realtime_generation_id = "generation-1"
+    dispatched.block_idx = 4
+    dispatched.realtime_action_version = 1
+    dispatched.realtime_prompt_version = 2
+    replacement = copy(dispatched)
+    replacement.realtime_action_version = 3
+    scheduler._mark_realtime_requests_dispatched(
+        [(b"request", dispatched)], now=100.0
+    )
+
+    scheduler._enqueue_received_reqs(
+        [
+            (
+                b"update",
+                ReplaceQueuedRealtimeReq(
+                    session_id="session-1",
+                    generation_id="generation-1",
+                    chunk_index=4,
+                    request_id="request-1",
+                    replacement=replacement,
+                ),
+            )
+        ],
+        now=100.1,
+    )
+
+    assert scheduler.waiting_queue == deque()
+    assert replies == [
+        (
+            {
+                "replaced": False,
+                "buffered": False,
+                "too_late": True,
+                "invalid": False,
+            },
+            b"update",
+            False,
+        )
+    ]
+
+
+def test_scheduler_rejects_replacement_with_mismatched_envelope_identity():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.waiting_queue = deque()
+    replies = []
+    scheduler.return_result = lambda output, identity, should_not_return: replies.append(
+        output.output
+    )
+    replacement = Req.__new__(Req)
+    replacement.request_id = "other-request"
+    replacement.realtime_session_id = "session-1"
+    replacement.realtime_generation_id = "generation-1"
+    replacement.block_idx = 4
+    replacement.realtime_action_version = 3
+    replacement.realtime_prompt_version = 2
+
+    scheduler._enqueue_received_reqs(
+        [
+            (
+                b"update",
+                ReplaceQueuedRealtimeReq(
+                    session_id="session-1",
+                    generation_id="generation-1",
+                    chunk_index=4,
+                    request_id="request-1",
+                    replacement=replacement,
+                ),
+            )
+        ],
+        now=100.0,
+    )
+
+    assert replies == [
+        {
+            "replaced": False,
+            "buffered": False,
+            "too_late": False,
+            "invalid": True,
+        }
+    ]
+
+
+def test_generate_session_targets_latest_active_chunk_for_control_refresh():
+    session = GenerateSession(max_inflight_chunks=2)
+    first = session.new_chunk()
+    second = session.new_chunk()
+    session.bind_chunk_request(first, object())
+    session.bind_chunk_request(second, object())
+
+    assert session.latest_active_chunk == second
+
+
+def test_scheduler_attaches_actual_realtime_metadata_to_output():
+    request = Req.__new__(Req)
+    request.realtime_session_id = "session-1"
+    request.realtime_generation_id = "generation-1"
+    request.request_id = "request-1"
+    request.block_idx = 4
+    request.realtime_event_id = 17
+    request.realtime_action_version = 5
+    request.realtime_prompt_version = 3
+    output = OutputBatch()
+
+    Scheduler._attach_realtime_request_metadata(output, request)
+
+    assert output.realtime_request_metadata == {
+        "session_id": "session-1",
+        "generation_id": "generation-1",
+        "request_id": "request-1",
+        "chunk_index": 4,
+        "event_id": 17,
+        "action_version": 5,
+        "prompt_version": 3,
+    }
+
+
+def test_gateway_uses_metadata_from_the_request_scheduler_actually_dispatched():
+    batch = SimpleNamespace(
+        realtime_event_id=11,
+        realtime_action_version=2,
+        realtime_prompt_version=1,
+    )
+    result = OutputBatch(
+        realtime_request_metadata={
+            "event_id": 17,
+            "action_version": 5,
+            "prompt_version": 3,
+        }
+    )
+
+    realtime_video_api._sync_batch_realtime_metadata(batch, result)
+
+    assert batch.realtime_event_id == 17
+    assert batch.realtime_action_version == 5
+    assert batch.realtime_prompt_version == 3
 
 
 def test_generate_session_does_not_advance_past_out_of_order_completion():

@@ -1137,6 +1137,42 @@ def test_minwm_refreshes_queued_chunk_with_latest_camera_state():
     assert refreshed.realtime_event_id == 2
 
 
+def test_minwm_does_not_consume_prompt_while_previewing_queued_chunk():
+    adapter = MinWMRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="old prompt",
+            first_frame="/tmp/reference.png",
+            max_chunks=4,
+        )
+    )
+    state = adapter._state(session)
+    state.receive_prompt("new prompt", event_id=7, switch_kind="scene_cut")
+    chunk = session.new_chunk()
+    batch = SimpleNamespace(
+        condition_inputs={},
+        realtime_chunk_size=4,
+        realtime_action_version=0,
+        realtime_prompt_version=0,
+        realtime_event_id=1,
+    )
+
+    refreshed = adapter.refresh_queued_request(
+        session,
+        SimpleNamespace(),
+        chunk,
+        batch,
+        "scene_cut",
+    )
+
+    assert refreshed is None
+    assert state.prompt_queue.has_events("condition_switch")
+    assert session.request.prompt == "old prompt"
+
+
 def test_minwm_t2v_first_latent_is_noop_without_consuming_pixel_actions():
     state = MinWMRealtimeState()
     first_action = [0.8, 0, 0, 0, 0, 0, 0, 0]

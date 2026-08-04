@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 logger = init_logger(__name__)
+
+_REALTIME_CONTROL_REFRESH_TIMEOUT_S = 1.0
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
 _TRACE_EVENT_QUEUE_LIMIT = 256
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
@@ -119,6 +121,21 @@ def _log_previous_chunk_overlap(
             calculate_overlap_ratio(vae_interval, denoise_interval), 4
         ),
     )
+
+
+def _sync_batch_realtime_metadata(batch: "Req", result: OutputBatch) -> None:
+    metadata = getattr(result, "realtime_request_metadata", None) or getattr(
+        result, "realtime_handoff", None
+    )
+    if not isinstance(metadata, dict):
+        return
+    for batch_field, metadata_field in (
+        ("realtime_event_id", "event_id"),
+        ("realtime_action_version", "action_version"),
+        ("realtime_prompt_version", "prompt_version"),
+    ):
+        if metadata_field in metadata:
+            setattr(batch, batch_field, metadata[metadata_field])
 
 
 class _LockedRealtimeWebSocket:
@@ -826,6 +843,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
             )
             denoise_started = time.perf_counter()
             _, result = await process_generation_batch(async_scheduler_client, batch)
+            _sync_batch_realtime_metadata(batch, result)
             denoise_completed = time.perf_counter()
             session.denoise_intervals[chunk.index] = (
                 denoise_started,
@@ -968,6 +986,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
             )
 
             _, result = await process_generation_batch(async_scheduler_client, batch)
+            _sync_batch_realtime_metadata(batch, result)
             scheduler_forward_ms = timer.mark_ms()
             log_realtime_trace(
                 logger,
@@ -1201,7 +1220,7 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             event_log = session.adapter.ingest_event(session, realtime_event)
             session.mark_event_version(realtime_event.kind)
             session.mark_client_activity()
-            chunk = session.current_chunk
+            chunk = session.latest_active_chunk
             if chunk is not None:
                 current_batch = session.active_batches.get(chunk.index)
                 if current_batch is not None:
@@ -1213,15 +1232,29 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                         realtime_event.kind,
                     )
                     if replacement is not None:
-                        output = await async_scheduler_client.forward(
-                            ReplaceQueuedRealtimeReq(
-                                session_id=session.id,
-                                generation_id=session.generation_id,
-                                chunk_index=chunk.index,
-                                request_id=chunk.request_id,
-                                replacement=replacement,
+                        try:
+                            output = await asyncio.wait_for(
+                                async_scheduler_client.forward(
+                                    ReplaceQueuedRealtimeReq(
+                                        session_id=session.id,
+                                        generation_id=session.generation_id,
+                                        chunk_index=chunk.index,
+                                        request_id=chunk.request_id,
+                                        replacement=replacement,
+                                    )
+                                ),
+                                timeout=_REALTIME_CONTROL_REFRESH_TIMEOUT_S,
                             )
-                        )
+                        except TimeoutError:
+                            output = OutputBatch(
+                                output={
+                                    "replaced": False,
+                                    "buffered": False,
+                                    "too_late": False,
+                                    "invalid": False,
+                                    "timeout": True,
+                                }
+                            )
                         replaced = bool(
                             isinstance(output, OutputBatch)
                             and isinstance(output.output, dict)
@@ -1231,6 +1264,16 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                             isinstance(output, OutputBatch)
                             and isinstance(output.output, dict)
                             and output.output.get("buffered")
+                        )
+                        too_late = bool(
+                            isinstance(output, OutputBatch)
+                            and isinstance(output.output, dict)
+                            and output.output.get("too_late")
+                        )
+                        invalid = bool(
+                            isinstance(output, OutputBatch)
+                            and isinstance(output.output, dict)
+                            and output.output.get("invalid")
                         )
                         if replaced or buffered:
                             session.active_batches[chunk.index] = replacement
@@ -1244,6 +1287,8 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
                             kind=realtime_event.kind,
                             replaced=replaced,
                             buffered=buffered,
+                            too_late=too_late,
+                            invalid=invalid,
                         )
             log_realtime_trace(
                 logger,
@@ -1347,11 +1392,15 @@ async def _release_scheduler_realtime_session(
     *,
     attempts: int = 3,
     retry_delay_s: float = 0.05,
+    timeout_s: float = 2.0,
 ) -> bool:
     for attempt in range(max(1, attempts)):
         try:
-            await async_scheduler_client.forward(
-                ReleaseRealtimeSessionReq(session_id=session_id)
+            await asyncio.wait_for(
+                async_scheduler_client.forward(
+                    ReleaseRealtimeSessionReq(session_id=session_id)
+                ),
+                timeout=max(0.001, timeout_s),
             )
             return True
         except Exception as exc:

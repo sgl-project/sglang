@@ -156,6 +156,22 @@ def record_action_latency(
         action_sent_at.pop(event_id, None)
 
 
+def aggregate_measurement_seconds(sessions: list[dict]) -> float:
+    starts = [
+        float(session["measured_started_at"])
+        for session in sessions
+        if session.get("measured_started_at") is not None
+    ]
+    completions = [
+        float(session["measured_completed_at"])
+        for session in sessions
+        if session.get("measured_completed_at") is not None
+    ]
+    if not starts or not completions:
+        return 0.0
+    return max(0.0, max(completions) - min(starts))
+
+
 async def stream_actions(
     websocket,
     *,
@@ -195,6 +211,8 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     action_sent_at: dict[int, float] = {}
     action_latencies: list[float] = []
     pending_raw_header = None
+    measured_started_at: float | None = None
+    measured_completed_at: float | None = None
 
     async with websockets.connect(
         url,
@@ -236,13 +254,25 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                         message.get("content") or "realtime server error"
                     )
                 if message_type == "trace_event":
-                    trace_events.append(dict(message.get("trace") or {}))
+                    trace = dict(message.get("trace") or {})
+                    trace_events.append(trace)
+                    trace_chunk = trace.get("chunk_index")
+                    if (
+                        measured_started_at is None
+                        and trace.get("event") == "server.scheduler_forward_start"
+                        and trace_chunk is not None
+                        and int(trace_chunk) >= args.warmup_chunks
+                    ):
+                        measured_started_at = time.perf_counter()
                     continue
                 if message_type == "frame_batch_header":
                     pending_raw_header = message
                 if message_type in {"frame_batch", "frame_batch_header"}:
                     chunk = int(message.get("chunk_index") or 0)
-                    first_frame_at.setdefault(chunk, time.perf_counter())
+                    observed_at = time.perf_counter()
+                    first_frame_at.setdefault(chunk, observed_at)
+                    if chunk >= args.warmup_chunks and measured_started_at is None:
+                        measured_started_at = observed_at
                     record_action_latency(
                         message,
                         first_frame_at=first_frame_at,
@@ -255,7 +285,12 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                     continue
 
                 chunk = int(message["chunk_index"])
+                observed_at = time.perf_counter()
                 stats[chunk] = dict(message)
+                if chunk >= args.warmup_chunks:
+                    if measured_started_at is None:
+                        measured_started_at = first_frame_at.get(chunk, observed_at)
+                    measured_completed_at = observed_at
                 record_action_latency(
                     message,
                     first_frame_at=first_frame_at,
@@ -275,7 +310,11 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     measured = [stats[index] for index in range(args.warmup_chunks, total_chunks)]
     chunk_total = [float(item["chunk_total_ms"]) for item in measured]
     frame_count = sum(int(item.get("num_frames") or 0) for item in measured)
-    measured_seconds = sum(chunk_total) / 1000.0
+    measured_seconds = (
+        max(0.0, measured_completed_at - measured_started_at)
+        if measured_started_at is not None and measured_completed_at is not None
+        else 0.0
+    )
     return {
         "session_index": index,
         "trace_id": trace_id,
@@ -283,6 +322,8 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
         "action_to_first_frame_ms": action_latencies,
         "frames": frame_count,
         "measured_seconds": measured_seconds,
+        "measured_started_at": measured_started_at,
+        "measured_completed_at": measured_completed_at,
         "stage_values": stage_values(
             trace_events, min_chunk_index=args.warmup_chunks
         ),
@@ -305,9 +346,7 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
         for name, values in session["stage_values"].items():
             stages[name].extend(values)
     total_frames = sum(session["frames"] for session in sessions)
-    wall_seconds = max(
-        (session["measured_seconds"] for session in sessions), default=0.0
-    )
+    wall_seconds = aggregate_measurement_seconds(sessions)
     session_fps = [
         session["frames"] / session["measured_seconds"]
         for session in sessions

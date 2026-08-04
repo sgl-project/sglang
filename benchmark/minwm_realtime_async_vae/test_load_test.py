@@ -1,6 +1,11 @@
 from argparse import Namespace
 
-from load_test import init_request, record_action_latency, stage_values
+from load_test import (
+    aggregate_measurement_seconds,
+    init_request,
+    record_action_latency,
+    stage_values,
+)
 
 
 def test_init_request_keeps_t2v_frame_count_aligned_with_chunk_count():
@@ -96,3 +101,12 @@ def test_action_latency_discards_warmup_samples_without_recording_them():
 
     assert action_latencies == []
     assert action_sent_at == {}
+
+
+def test_aggregate_measurement_seconds_uses_real_overlapping_wall_window():
+    sessions = [
+        {"measured_started_at": 10.0, "measured_completed_at": 12.0},
+        {"measured_started_at": 10.5, "measured_completed_at": 13.0},
+    ]
+
+    assert aggregate_measurement_seconds(sessions) == 3.0

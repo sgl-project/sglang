@@ -512,16 +512,19 @@ GPU 的 Chunk 所携带的旧条件。
 Gateway 与 Scheduler 使用独立 ZMQ 连接，因此更新消息可能早于原始 Chunk 到达。Scheduler
 为这种乱序保留最多 1024 条、有效期 5 秒的 pending replacement；原请求到达后按
 `(session_id, generation_id, chunk_index, request_id)` 原子匹配并保持原 FIFO 时间戳。
-匹配不到的更新在 TTL 后丢弃，避免控制消息无限占用内存。
+匹配不到的更新在 TTL 后丢弃，避免控制消息无限占用内存。已经 dispatch 的请求保留短期
+tombstone，迟到更新返回 `too_late`，不会错误缓存并影响后续 Chunk；replacement envelope
+与 payload identity 不一致时返回 `invalid`。
 
 `W+A` 等组合键以一个完整 Action Vector 表示，由模型 Adapter 映射成 label 或 weight。
 持续按住一个键时，服务端保留最新完整状态，不依赖浏览器 key-repeat 才能持续生效。
 
 ### 9.2 动态 Prompt / VLM Prompt
 
-Prompt 使用相同的单调版本规则，但只在 Chunk 边界生效。未进入 GPU 的排队 Chunk 可以
-重新快照最新 Prompt；运行中的 Chunk 使用已经记录的旧版本执行完成。`scene_cut` 仍是
-显式模型事件，由 MinWM Adapter 决定需要重置的条件状态。
+Prompt 使用相同的单调版本规则，但只在下一个 Chunk 创建边界生效。已经构造并提交给
+Scheduler 的 Chunk 不会预消费 Prompt/scene-cut 队列，也不会在排队期间被原地替换；这样
+可避免一次控制更新既被当前 Chunk 预览又在下一 Chunk 丢失。运行中的 Chunk 使用已经记录
+的旧版本执行完成。`scene_cut` 仍是显式模型事件，由 MinWM Adapter 决定需要重置的条件状态。
 
 每个 Frame 都携带实际采样的 Action event ID、Action version 和 Prompt version，保证
 Trace/Dump 可以精确还原“用户发送了什么”和“SGLang 实际使用了什么”。

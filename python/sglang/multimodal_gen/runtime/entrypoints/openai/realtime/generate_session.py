@@ -116,6 +116,12 @@ class GenerateSession:
             return None
         return self.active_chunks[min(self.active_chunks)]
 
+    @property
+    def latest_active_chunk(self) -> RealtimeChunkContext | None:
+        if not self.active_chunks:
+            return None
+        return self.active_chunks[max(self.active_chunks)]
+
     def can_schedule_chunk(self) -> bool:
         if len(self.active_chunks) >= self.max_inflight_chunks:
             return False

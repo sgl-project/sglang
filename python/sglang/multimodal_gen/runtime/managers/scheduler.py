@@ -73,6 +73,8 @@ _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
 _MAX_PENDING_REALTIME_REPLACEMENTS = 1024
 _REALTIME_REPLACEMENT_TTL_S = 5.0
+_MAX_DISPATCHED_REALTIME_REQUESTS = 4096
+_DISPATCHED_REALTIME_REQUEST_TTL_S = 10.0
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -153,6 +155,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._pending_realtime_replacements: dict[
             tuple[str, str, int, str], tuple[ReplaceQueuedRealtimeReq, float]
         ] = {}
+        self._dispatched_realtime_requests: dict[tuple[str, str, int, str], float] = {}
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
@@ -277,6 +280,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             >= current.realtime_prompt_version
         )
 
+    def _replacement_matches_envelope(self, update: ReplaceQueuedRealtimeReq) -> bool:
+        return self._realtime_request_key(update.replacement) == self._realtime_request_key(
+            update
+        )
+
     def _find_waiting_realtime_request(
         self, update: ReplaceQueuedRealtimeReq
     ) -> Req | None:
@@ -300,6 +308,34 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             pending.pop(key, None)
         while len(pending) > _MAX_PENDING_REALTIME_REPLACEMENTS:
             pending.pop(next(iter(pending)))
+
+    def _prune_dispatched_realtime_requests(self, now: float) -> None:
+        dispatched = getattr(self, "_dispatched_realtime_requests", None)
+        if dispatched is None:
+            dispatched = self._dispatched_realtime_requests = {}
+        expired = [key for key, deadline in dispatched.items() if deadline <= now]
+        for key in expired:
+            dispatched.pop(key, None)
+        while len(dispatched) > _MAX_DISPATCHED_REALTIME_REQUESTS:
+            dispatched.pop(next(iter(dispatched)))
+
+    def _mark_realtime_requests_dispatched(
+        self, items: list[tuple[bytes | None, Any]], *, now: float
+    ) -> None:
+        self._prune_dispatched_realtime_requests(now)
+        for _identity, request in items:
+            if not isinstance(request, Req) or not request.realtime_session_id:
+                continue
+            self._dispatched_realtime_requests[self._realtime_request_key(request)] = (
+                now + _DISPATCHED_REALTIME_REQUEST_TTL_S
+            )
+        self._prune_dispatched_realtime_requests(now)
+
+    def _realtime_request_was_dispatched(
+        self, update: ReplaceQueuedRealtimeReq, *, now: float
+    ) -> bool:
+        self._prune_dispatched_realtime_requests(now)
+        return self._realtime_request_key(update) in self._dispatched_realtime_requests
 
     def _buffer_realtime_replacement(
         self, update: ReplaceQueuedRealtimeReq, *, now: float
@@ -335,15 +371,29 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         now: float,
     ) -> None:
         self._prune_pending_realtime_replacements(now)
+        self._prune_dispatched_realtime_requests(now)
         for identity, req in new_reqs:
             if isinstance(req, ReplaceQueuedRealtimeReq):
-                waiting_request = self._find_waiting_realtime_request(req)
-                replaced = self._replace_waiting_realtime_request(req)
+                invalid = not self._replacement_matches_envelope(req)
+                waiting_request = (
+                    None if invalid else self._find_waiting_realtime_request(req)
+                )
+                replaced = False if invalid else self._replace_waiting_realtime_request(req)
                 buffered = False
-                if waiting_request is None:
+                too_late = False
+                if not invalid and waiting_request is None:
+                    too_late = self._realtime_request_was_dispatched(req, now=now)
+                if not invalid and waiting_request is None and not too_late:
                     buffered = self._buffer_realtime_replacement(req, now=now)
                 self.return_result(
-                    OutputBatch(output={"replaced": replaced, "buffered": buffered}),
+                    OutputBatch(
+                        output={
+                            "replaced": replaced,
+                            "buffered": buffered,
+                            "too_late": too_late,
+                            "invalid": invalid,
+                        }
+                    ),
                     identity,
                     should_not_return=False,
                 )
@@ -351,6 +401,20 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             if isinstance(req, Req):
                 req = self._take_pending_realtime_replacement(req, now=now)
             self.waiting_queue.append((identity, req, now))
+
+    @staticmethod
+    def _attach_realtime_request_metadata(output: OutputBatch, request: Any) -> None:
+        if not isinstance(request, Req) or not request.realtime_session_id:
+            return
+        output.realtime_request_metadata = {
+            "session_id": request.realtime_session_id,
+            "generation_id": request.realtime_generation_id,
+            "request_id": request.request_id,
+            "chunk_index": request.block_idx,
+            "event_id": request.realtime_event_id,
+            "action_version": request.realtime_action_version,
+            "prompt_version": request.realtime_prompt_version,
+        }
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -1148,6 +1212,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            self._mark_realtime_requests_dispatched(items, now=time.monotonic())
+
             try:
                 handler_result = self._dispatch_items(items)
             except Exception as e:
@@ -1183,6 +1249,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 for (identity, processed_req), output_batch in zip(
                     items, output_batches, strict=True
                 ):
+                    self._attach_realtime_request_metadata(output_batch, processed_req)
                     is_warmup = is_warmup_req(processed_req)
                     self._log_warmup_result(output_batch, processed_req, is_warmup)
 
