@@ -351,6 +351,18 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
     )
 
 
+# Fork order for the side-stream overlaps in this file
+# ----------------------------------------------------
+# Under CUDA-graph capture, the branch that enqueues its first kernel after
+# ``alt.wait_stream(cur)`` keeps the main chain's graph-internal stream. Issue
+# the region's main-stream kernel *before* the ``with torch.cuda.stream(alt)``
+# block, or the main chain is handed a fresh internal stream every layer:
+# measured on 8xB300, a bs=1 decode graph went from 98 distinct GPU streams to
+# 29 by fixing the two sites below. Joining the region right after the side
+# block matters too -- a region left open across later main-stream work costs
+# one stream per layer no matter how it is ordered.
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -861,11 +873,13 @@ class KimiK3MoE(nn.Module):
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        # Main-stream kernel first (see the fork-order note above); the gate and
+        # top-k still run on the side stream and join below, so the overlap is
+        # unchanged.
+        routed_input, _ = self.routed_expert_down_proj(hidden_states)
         with torch.cuda.stream(self.alt_stream):
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-
-        routed_input, _ = self.routed_expert_down_proj(hidden_states)
         current_stream.wait_stream(self.alt_stream)
         # Top-k tensors were allocated on alt_stream but are consumed by the
         # routed experts on current_stream. Tell the caching allocator about
@@ -1612,11 +1626,12 @@ class KimiK3DeltaAttention(nn.Module):
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
+                    # Main-stream kernel first (see the fork-order note above).
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
                         forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
