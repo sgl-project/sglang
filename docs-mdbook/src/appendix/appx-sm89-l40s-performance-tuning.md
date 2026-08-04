@@ -364,3 +364,36 @@ print(len(ks), 'tensors'); print('\n'.join(ks[:3]))
 ### 10.5 预期与提醒
 
 - 即使 MTP 全通、ITL 从 92ms 压到 50~60ms，935 token 输出的 E2E 仍在 50 秒级——MTP 是系统侧最大优化，但 E2E<10s 的物理前提依然是限制输出长度（见第 9 节），两者要一起做。
+
+### 10.6 上线实测与 TTFT 定位（MTP）
+
+线上约 2000 请求实测（MTP 开启，6 卡 DP=3）：
+
+| 指标 | 无 MTP（基线） | 有 MTP | 变化 |
+|------|--------------|--------|------|
+| E2E | 89.2s | 41.1s | **2.17x 提升** |
+| TTFT | 3.75s | 10.63s | 变差 2.8x |
+| 等效 ITL | 92ms | ≈33ms（按 935 tok/req 折算） | **2.8x 加速** |
+
+结论：MTP 在 decode 侧效果显著（E2E 减半、等效 ITL ~33ms，优于 10.5 预估的 45~60ms），问题集中在 TTFT。
+
+**TTFT 变差的三个候选原因（按可能性排序）**
+
+1. **冷启动被摊进均值**：MTP 新增 draft extend / verify 内核 + `--skip-server-warmup` + prompt 长度多变 → triton 按 shape 逐个 JIT、flashinfer 按 shape 逐个 autotune，可能持续到前几百个请求。判据：TTFT 是否随时间下降。
+2. **排队**：E2E 变短后同一批压测的到达节奏/并发变化，队列时间被算进 TTFT。看 `queue_time_seconds` 占比。
+3. **prefill 结构性开销**：draft extend 若在 eager 模式下未吃上 chunked batching，长 prompt（平均 12.5K token）的 prefill 明显变慢；或 draft extend 破坏前缀缓存命中（`cache_hit_rate` 下降 → 重复 prefill）。
+
+**定位命令**
+
+```bash
+curl -s http://127.0.0.1:8000/metrics | grep -E "queue_time_seconds|cache_hit_rate|time_to_first_token_seconds|prefill"
+```
+
+| 现象 | 判定 | 修法 |
+|------|------|------|
+| `queue_time_seconds` 占 TTFT 大头 | 排队问题，非 MTP 的锅 | 调并发/到达节奏 |
+| `cache_hit_rate` 明显低于基线 43.2% | 前缀命中被破坏 | 查 draft extend 是否绕过 radix cache |
+| TTFT 高桶占比随时间下降 | 冷启动 | 预热 + keep-alive + `--disable-flashinfer-autotune` |
+| prefill 段变长且稳定 | draft extend 结构性开销 | 版本实现问题，短期接受 tradeoff 或等新版优化 |
+
+**决策点**：TTFT 影响 tool call 场景（短交互、要快），E2E 影响代码检视（长输出、能等）。MTP 当前 E2E 大胜、TTFT 小败；若 tool call 的 TTFT<1s 是硬指标，先区分冷启动 vs 结构性问题，再决定是否保留一条非 MTP 路径。
