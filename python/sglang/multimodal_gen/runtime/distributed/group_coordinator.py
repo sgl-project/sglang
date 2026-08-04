@@ -361,8 +361,8 @@ class GroupCoordinator:
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
                 and op is torch.distributed.ReduceOp.SUM
+                and hasattr(torch.ops.sgl_kernel, "shm_allreduce")
             ):
-                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
                 torch.ops.sgl_kernel.shm_allreduce(
                     input_, int(torch.distributed.ReduceOp.SUM)
                 )
@@ -393,8 +393,10 @@ class GroupCoordinator:
         )
 
         # All-gather.
-        if current_platform.is_cpu() and is_shm_available(
-            input_.dtype, self.world_size, len(self.ranks)
+        if (
+            current_platform.is_cpu()
+            and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+            and hasattr(torch.ops.sgl_kernel, "shm_allgather")
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
