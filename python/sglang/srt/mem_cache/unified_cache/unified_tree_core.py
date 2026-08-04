@@ -894,9 +894,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
-    def _needs_incremental_mamba_backup(self, state: _InsertWalkState) -> bool:
+    def _needs_incremental_mamba_backup(self, node: UnifiedTreeNode) -> bool:
         """Whether a Host-backed node has a device Mamba state missing from Host."""
-        node = state.target_node
         return (
             self.enable_hicache
             and not self.is_write_back
@@ -905,6 +904,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and node.component_data[ComponentType.MAMBA].value is not None
             and node.component_data[ComponentType.MAMBA].host_value is None
         )
+
+    def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
+        """Check whether the insert target needs a Host backup."""
+        if state.is_new_leaf:
+            return self._inc_hit_count_and_check(
+                state.target_node, state.params.chunked
+            )
+
+        return self._needs_incremental_mamba_backup(state.target_node)
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
         """Refresh the LRUs and append terminal backup actions."""
@@ -916,13 +924,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if state.is_new_leaf:
-            backup_due = self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
-            )
-        else:
-            backup_due = self._needs_incremental_mamba_backup(state)
-        if backup_due:
+        if self._should_backup_after_insert(state):
             state.pending_actions.append(
                 self._build_backup_kv_action(state.target_node)
             )
