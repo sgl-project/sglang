@@ -5,6 +5,7 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -56,7 +57,6 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -115,7 +115,9 @@ def match_prefix_for_req(
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(tree_cache, match_result)
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
     (
         req.prefix_indices,
         req.last_node,
@@ -193,7 +195,7 @@ class SchedulePolicy:
         if (
             not isinstance(policy, CacheAwarePolicy)
             and self.tree_cache.supports_fast_match_prefix()
-            and get_server_args().disaggregation_mode != "decode"
+            and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
@@ -290,7 +292,7 @@ class SchedulePolicy:
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
                     match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result
+                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
@@ -328,7 +330,8 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            last_node = tree_cache.resolve_node_handle(req.last_node)
+            last_node_to_reqs[last_node].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:
@@ -819,6 +822,9 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # match locks this node's components, so clear any stale skip set
+        # carried from a previous scheduling of this req.
+        req.skip_lock_node_ids = {}
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -997,7 +1003,11 @@ class PrefillAdder:
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
             )
         ):
             return AddReqResult.OTHER

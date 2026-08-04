@@ -32,7 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -223,7 +223,7 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_server_args().enable_aiter_allreduce_fusion:
+            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
@@ -425,7 +425,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
@@ -532,7 +532,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -593,7 +593,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_server_args().rl_on_policy_target == "fsdp"
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
@@ -720,7 +720,10 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if residual is not None or get_server_args().rl_on_policy_target == "fsdp":
+            if (
+                residual is not None
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+            ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -1058,22 +1061,43 @@ class Gemma3RMSNorm(MultiPlatformOp):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward_native(self, x):
+    def forward_native(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None:
+            residual = x + residual
+            x = residual
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        output = output.type_as(x)
+        return output if residual is None else (output, residual)
 
-    def forward_cpu(self, x):
+    def forward_cpu(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None:
+            return self.forward_native(x, residual)
         if _is_cpu_amx_available and x.stride(-1) == 1:
             return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
         return self.forward_native(x)
 
-    def forward_cuda(self, x):
+    def forward_cuda(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None:
+            # The decoder residual is token-major and contiguous. The fused
+            # kernel updates both tensors in place: x becomes the normalized
+            # output and residual becomes x + residual for the next layer.
+            gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
+            return x, residual
+        if x.dim() == 2:
+            return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
 
-    def forward_npu(self, x):
+    def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
+        # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
+        # ROCm; delegate to the pure-PyTorch implementation.
+        return self.forward_native(x, residual)
+
+    def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None:
+            return self.forward_native(x, residual)
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 

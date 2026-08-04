@@ -6,11 +6,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -56,9 +55,6 @@ class DFlashDraftInputV2(SpecInput):
     future_indices: Optional[torch.Tensor] = None
 
     verify_token_budget: Optional[int] = None
-
-    # Stamped by generate_token_bitmask during verify, read back to apply the mask.
-    grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -138,7 +134,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_server_args().speculative_num_draft_tokens)
+        block_size = int(get_spec().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."

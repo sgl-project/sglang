@@ -54,7 +54,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
         return False
-    if getattr(sampling_info, "vocab_mask", None) is not None:
+    if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
