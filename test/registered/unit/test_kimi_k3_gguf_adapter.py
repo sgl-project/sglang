@@ -93,7 +93,7 @@ def _tensors():
         "blk.0.ffn_routed_down.weight": np.ones((2, 4), dtype=np.float32),
         "blk.0.ffn_routed_up.weight": np.ones((4, 2), dtype=np.float32),
         "blk.0.ffn_routed_norm.weight": np.ones(2, dtype=np.float32),
-        "blk.0.exp_probs_b": np.ones(2, dtype=np.float32),
+        "blk.0.exp_probs_b.bias": np.ones(2, dtype=np.float32),
     }
     tensors = [_Tensor(name, value) for name, value in dense.items()]
     for role in ("gate", "down", "up"):

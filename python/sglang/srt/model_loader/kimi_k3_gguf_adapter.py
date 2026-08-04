@@ -346,7 +346,7 @@ class KimiK3GGUFAdapter:
             return True
         if tail == "block_sparse_moe.gate.e_score_correction_bias":
             self._record_transform(
-                f"{prefix}.exp_probs_b", _Transform("direct", source_name)
+                f"{prefix}.exp_probs_b.bias", _Transform("direct", source_name)
             )
             return True
         return False
