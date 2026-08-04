@@ -159,8 +159,10 @@ def fused_paged_mqa_logits(
     )  # [B, 4, H, 32]
     w32 = weight if weight.dtype == torch.float32 else weight.float()
 
-    logits = torch.full(
-        (batch_size, max_seq_len), float("-inf"), dtype=torch.float32, device=device
+    # empty, not full(-inf): consumers bound reads by seq_lens (see the
+    # torch-path comment); a full-width fill is pure ceiling tax per call.
+    logits = torch.empty(
+        (batch_size, max_seq_len), dtype=torch.float32, device=device
     )
     grid = lambda meta: (batch_size, triton.cdiv(padded_eff, meta["BN"]))
     _fused_paged_indexer_kernel[grid](

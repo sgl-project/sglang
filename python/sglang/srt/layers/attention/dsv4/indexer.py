@@ -357,13 +357,20 @@ def fp8_paged_mqa_logits_torch_sm120(
     # transient in the chunked path: without it every 1024-row sub-call
     # allocates its own [chunk, max_seq_len] fp32 before the copy -- the third
     # and final allocation site the 1M OOM walked to.
+    # No full-width -inf fill: every consumer downstream (topk_transform and
+    # the fused path's own callers) bounds its reads by seq_lens, so values
+    # past each row's length are never observed. The fused prefill kernel has
+    # shipped with garbage past PADDED_EFF from day one and the topk output
+    # is bit-identical -- that is the production proof. Filling (and below,
+    # masking) the whole max_seq_len row cost O(max_ctx) bandwidth per layer
+    # per decode step: at a 1M --context-length that tax halved single-stream
+    # decode throughput (12.5 vs 27.3 tok/s measured with the only variable
+    # being the configured ceiling).
     if out is not None:
         logits = out
-        logits.fill_(float("-inf"))
     else:
-        logits = torch.full(
+        logits = torch.empty(
             (batch_size, max_seq_len),
-            float("-inf"),
             dtype=torch.float32,
             device=q_fp8.device,
         )
@@ -441,9 +448,8 @@ def fp8_paged_mqa_logits_torch_sm120(
             logits[:, _s0:_e] = _sc[:, : _e - _s0]
         del _g, _kvv, _kvs, _sc
 
-    positions = torch.arange(max_seq_len, device=device)
-    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
-    logits.masked_fill_(invalid_mask, float("-inf"))
+    # Invalid-region masking intentionally omitted -- see the allocation
+    # comment above: consumers are seq_lens-bounded.
 
     return logits
 
@@ -923,13 +929,17 @@ class C4IndexerBackendMixin:
                 ):
                     # Explicitly lossy; costs documented at the implementation.
                     fn = fold_paged_mqa_logits_approx
-                elif q_indexer.shape[0] >= 128:
-                    # Prefill-sized calls take the fused Triton kernel: same
-                    # operator, but the [B, S, num_heads] intermediate is never
-                    # materialised. Decode stays on the torch variant — those
-                    # calls run under CUDA graph capture, where Triton
-                    # autotuning cannot, and their batches are too small for
-                    # the fusion to matter.
+                else:
+                    # Every call takes the fused Triton kernel: same operator,
+                    # but neither the [B, S, num_heads] intermediate nor the
+                    # torch path's [B, max_pages, 8448] KV gather is ever
+                    # materialised. That gather made decode pay for the
+                    # configured context ceiling on every step (~553 MB/layer
+                    # at a 1M ceiling; single-stream decode measured 12.5 vs
+                    # 27.3 tok/s with the ceiling as the only variable). The
+                    # kernel reads pages in-kernel, is shape-static, and has
+                    # no d2h sync, so CUDA graph capture takes it fine — the
+                    # path proved to be exactly the ceiling tax.
                     from sglang.kernels.ops.attention.dsv4.fused_paged_indexer import (
                         fused_paged_mqa_logits,
                     )

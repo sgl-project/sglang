@@ -219,7 +219,11 @@ def _tiled_sparse_decode_kernel_mh(
 
     t_offs = tl.arange(0, BLOCK_T)
 
-    for tile_start in tl.range(0, topk, BLOCK_T, num_stages=LOOP_STAGES):
+    # 循环界用 valid_topk(真实有效数)而非全宽 topk:mask 语义与原先逐位一致
+    # (t_valid 本就按 valid_topk 截断),只是不再为纯 masked 尾部空转。
+    # 全宽 32K token 而实际内容几百 token 时,该内核吃掉 74% GPU 时间。
+    loop_end = ((valid_topk + BLOCK_T - 1) // BLOCK_T) * BLOCK_T
+    for tile_start in tl.range(0, loop_end, BLOCK_T, num_stages=LOOP_STAGES):
         t_idx = tile_start + t_offs
         t_in_bounds = t_idx < topk
         t_valid = t_idx < valid_topk
