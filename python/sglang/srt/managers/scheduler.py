@@ -1796,14 +1796,24 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
+                if isinstance(output, RpcReqOutput):
+                    # The rpc channel is a bidirectional zmq DEALER pair with
+                    # the offline `Engine`, and it exists in rust-server mode
+                    # too: the reply goes back down that socket, never through
+                    # the Rust egress ring (which routes by a rust-minted rid
+                    # that an rpc request does not carry). Checked before the
+                    # rust branch for exactly that reason.
+                    #
+                    # Only rank 0 holds the socket, so the None check is what
+                    # keeps the other ranks from answering -- every rank runs
+                    # `handle_rpc_request`, but one reply is owed.
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif self.rust_server is not None:
+                    # Embedded Rust server: every other control-request response
+                    # goes back through the egress ring (the zmq tokenizer socket
+                    # is not consumed); the Rust api_server shapes it per-endpoint.
+                    self.rust_server.push_control_output(recv_req, output)
                 else:
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
