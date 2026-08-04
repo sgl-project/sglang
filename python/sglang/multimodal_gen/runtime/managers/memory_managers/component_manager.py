@@ -447,9 +447,11 @@ class ComponentResidencyManager:
         if should_keep:
             return
         strategy = self.strategy_for(use.component_name, module)
-        was_on_cuda = self._module_on_cuda(module)
+        was_on_local_accelerator = self._module_on_local_accelerator(module)
         strategy.finish_use(module, use, self.state)
-        self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
+        self._empty_cache_after_large_release(
+            use, strategy, module, was_on_local_accelerator
+        )
 
     def finish_request(self) -> None:
         # 1. Close the currently active sequential use.
@@ -472,10 +474,10 @@ class ComponentResidencyManager:
             if preferred and not self.state.batch_is_warmup:
                 strategy.prepare_after_request(module, use, self.state)
             else:
-                was_on_cuda = self._module_on_cuda(module)
+                was_on_local_accelerator = self._module_on_local_accelerator(module)
                 strategy.finish_request(module, use, self.state, preferred=preferred)
                 self._empty_cache_after_large_release(
-                    use, strategy, module, was_on_cuda
+                    use, strategy, module, was_on_local_accelerator
                 )
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
@@ -603,22 +605,25 @@ class ComponentResidencyManager:
         buffer = next(module.buffers(), None)
         return buffer.device.type if buffer is not None else None
 
-    def _module_on_cuda(self, module: nn.Module | None) -> bool:
-        return self._module_device(module) == "cuda"
+    def _module_on_local_accelerator(self, module: nn.Module | None) -> bool:
+        device_type = self._module_device(module)
+        return device_type == current_platform.device_type and device_type != "cpu"
 
     def _empty_cache_after_large_release(
         self,
         use: ComponentUse,
         strategy: ComponentResidencyStrategy,
         module: nn.Module,
-        was_on_cuda: bool,
+        was_on_local_accelerator: bool,
     ) -> None:
         """explicitly empty cache after potential release of large component"""
         if not use.memory_intensive:
             return
-        released_cuda_storage = was_on_cuda and not self._module_on_cuda(module)
+        released_accelerator_storage = (
+            was_on_local_accelerator and not self._module_on_local_accelerator(module)
+        )
         released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
-        if not (released_cuda_storage or released_layerwise_storage):
+        if not (released_accelerator_storage or released_layerwise_storage):
             return
         if not torch.get_device_module().is_available():
             return

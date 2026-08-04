@@ -376,6 +376,25 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.device.type == "npu":
+        from sglang.kernels.ops.diffusion.triton.npu_fallback import (
+            apply_rotary_embedding_native,
+        )
+
+        half = cos_sin_cache.shape[-1] // 2
+        cos, sin = cos_sin_cache.split(half, dim=-1)
+        rot_dim = half * 2
+        q_rot = apply_rotary_embedding_native(
+            q[..., :rot_dim].contiguous(), cos, sin
+        )
+        k_rot = apply_rotary_embedding_native(
+            k[..., :rot_dim].contiguous(), cos, sin
+        )
+        return (
+            torch.cat((q_rot, q[..., rot_dim:]), dim=-1),
+            torch.cat((k_rot, k[..., rot_dim:]), dim=-1),
+        )
+
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
         cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
