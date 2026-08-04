@@ -286,8 +286,8 @@ sgl-eval run aime25 \\
     },
     {
       // Memory-bound: FP8 weights + KV fill each H200. No max-running cap, but the CUDA-graph
-      // capture is bounded (--cuda-graph-max-bs 256, with a matching DeepEP dispatch buffer)
-      // since uncapping it OOMs. Throughput saturates at conc 256; higher conc just queues.
+      // capture is bounded (--cuda-graph-max-bs 128) since uncapping it OOMs. Throughput
+      // saturates at conc 256; higher conc just queues.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
