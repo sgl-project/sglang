@@ -7,8 +7,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_bool_env_var
 
 # Opt-in: dispatch GDN to the fused vLLM SYCL op in sgl-kernel-xpu
-# (torch.ops.sgl_kernel.gdn_attention). Default OFF -> Triton path unchanged.
-_xpu_fused_gdn_enabled = get_bool_env_var("SGLANG_XPU_FUSED_GDN", "False")
+# (torch.ops.sgl_kernel.gdn_attention). Default ON. Set to OFF to use the triton path.
+_xpu_fused_gdn_enabled = get_bool_env_var("SGLANG_XPU_FUSED_GDN", "True")
 
 
 class XpuGDNAttnBackend(GDNAttnBackend):

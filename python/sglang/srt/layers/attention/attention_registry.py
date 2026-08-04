@@ -348,17 +348,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             is_xpu,
         )
 
-        if is_npu():
-            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
-                AscendGDNAttnBackend as GDNAttnBackend,
-            )
-            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
-                AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
-            )
-            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
-                AscendMamba2AttnBackend as Mamba2AttnBackend,
-            )
-        else:
+        if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend,
                 Mamba2AttnBackend,
@@ -372,6 +362,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                AscendGDNAttnBackend as GDNAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendMamba2AttnBackend as Mamba2AttnBackend,
+            )
 
         check_environments()
         prefill_default = None
