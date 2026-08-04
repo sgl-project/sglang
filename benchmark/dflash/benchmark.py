@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import math
 import os
 import statistics
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -22,29 +24,27 @@ CACHE_DIR = Path(
         Path.home() / ".cache" / "sglang" / "dflash-benchmark",
     )
 ).expanduser()
-SUPPORTED_WORKLOADS = ("gsm8k", "math500", "humaneval", "mbpp", "mt-bench")
+SUPPORTED_WORKLOADS = (
+    "gsm8k",
+    "math500",
+    "humaneval",
+    "humaneval-long",
+    "mbpp",
+    "mt-bench",
+    "longbench-v2",
+)
 DEFAULT_WORKLOADS = "gsm8k"
 DEFAULT_TARGET_MODEL = "moonshotai/Kimi-K3"
 DEFAULT_TARGET_MODEL_REVISION = "9f62e4e9fffbd0a83ddd60e1c209d828994b3569"
-DEFAULT_DFLASH_DRAFT_MODEL = "/tmp/dflash/draft-epoch-10"
+DEFAULT_DFLASH_DRAFT_MODEL = "modal-labs/Kimi-K3-DFlash"
 DEFAULT_DFLASH_DRAFT_ATTENTION_BACKEND = "trtllm_mha"
 DEFAULT_DFLASH_DRAFT_KV_CACHE_DTYPE = "bf16"
 DEFAULT_LINEAR_ATTN_PREFILL_BACKEND = "ptx_kda"
 DEFAULT_LINEAR_ATTN_DECODE_BACKEND = "triton"
 DEFAULT_LINEAR_ATTN_VERIFY_BACKEND = "nv_cutedsl"
 DEFAULT_CUDA_GRAPH_BACKEND_PREFILL = "breakable"
-DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL = 4096
-DEFAULT_CUDA_GRAPH_BS_PREFILL = (
-    128,
-    256,
-    512,
-    768,
-    1024,
-    1536,
-    2048,
-    3072,
-    4096,
-)
+DEFAULT_CUDA_GRAPH_MAX_BS_PREFILL = 16_384
+DEFAULT_CUDA_GRAPH_BS_PREFILL: tuple[int, ...] = ()
 LINEAR_ATTN_PREFILL_BACKEND_CHOICES = (
     "triton",
     "cutedsl",
@@ -69,10 +69,17 @@ DEFAULT_TRTLLM_GEN_MOE_CUBIN_POOL = os.environ.get(
 )
 DEFAULT_DFLASH_BLOCK_SIZES = "default"
 DEFAULT_RANDOM_SEED = 42
+DEFAULT_MEM_FRACTION_STATIC = 0.88
+DEFAULT_CONTEXT_LENGTH = 1_048_576
+DEFAULT_MAX_MAMBA_CACHE_SIZE = 5
 DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_TIMEOUT_S = 3600
 SERVER_SHUTDOWN_DRAIN_TIMEOUT_S = 30.0
 SERVER_SHUTDOWN_TIMEOUT_S = 120.0
+LONGBENCH_V2_DATASET = "zai-org/LongBench-v2"
+LONGBENCH_V2_DATASET_REVISION = "2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9"
+LONGBENCH_V2_MAX_PROMPT_TOKENS = 128 * 1024
+HUMANEVAL_LONG_PREFIX_TOKENS = 64 * 1024
 GSM8K_TEST_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 MT_BENCH_QUESTION_URL = (
     "https://raw.githubusercontent.com/lm-sys/FastChat/main/"
@@ -84,10 +91,11 @@ MT_BENCH_QUESTION_URL = (
 class SharedServerConfig:
     tp_size: int = 8
     attention_backend: str = "auto"
-    mem_fraction_static: Optional[float] = 0.85
-    max_running_requests: int = 128
+    mem_fraction_static: Optional[float] = DEFAULT_MEM_FRACTION_STATIC
+    max_running_requests: int = 1
+    max_mamba_cache_size: Optional[int] = DEFAULT_MAX_MAMBA_CACHE_SIZE
     cuda_graph_max_bs_decode: int = 128
-    context_length: int = 131072
+    context_length: int = DEFAULT_CONTEXT_LENGTH
     moe_runner_backend: str = "flashinfer_mxfp4"
     model_loader_num_threads: int = 64
     load_format: str = "auto"
@@ -128,13 +136,20 @@ class SharedServerConfig:
             self.cuda_graph_backend_prefill,
             "--cuda-graph-max-bs-prefill",
             str(self.cuda_graph_max_bs_prefill),
-            "--cuda-graph-bs-prefill",
-            *(str(size) for size in self.cuda_graph_bs_prefill),
             "--skip-server-warmup",
             "--enable-metrics",
         ]
+        if self.cuda_graph_bs_prefill:
+            args.extend(
+                [
+                    "--cuda-graph-bs-prefill",
+                    *(str(size) for size in self.cuda_graph_bs_prefill),
+                ]
+            )
         if self.mem_fraction_static is not None:
             args.extend(["--mem-fraction-static", str(self.mem_fraction_static)])
+        if self.max_mamba_cache_size is not None:
+            args.extend(["--max-mamba-cache-size", str(self.max_mamba_cache_size)])
         for flag, backend in (
             ("--linear-attn-prefill-backend", self.linear_attn_prefill_backend),
             ("--linear-attn-decode-backend", self.linear_attn_decode_backend),
@@ -148,6 +163,7 @@ class SharedServerConfig:
             f"tp:{self.tp_size},mem_fraction:{self.mem_fraction_static},"
             f"attention_backend:{self.attention_backend},"
             f"max_running_requests:{self.max_running_requests},"
+            f"max_mamba_cache_size:{self.max_mamba_cache_size},"
             f"cuda_graph_max_bs_decode:{self.cuda_graph_max_bs_decode},"
             f"context_length:{self.context_length},"
             f"moe_runner_backend:{self.moe_runner_backend},"
@@ -160,7 +176,7 @@ class SharedServerConfig:
             f"cuda_graph_backend_prefill:{self.cuda_graph_backend_prefill},"
             f"cuda_graph_max_bs_prefill:{self.cuda_graph_max_bs_prefill},"
             "cuda_graph_bs_prefill:"
-            f"{' '.join(str(size) for size in self.cuda_graph_bs_prefill)}"
+            f"{' '.join(str(size) for size in self.cuda_graph_bs_prefill) or 'auto'}"
         )
 
 
@@ -440,6 +456,7 @@ def _shared_server_config_to_payload(config: SharedServerConfig) -> dict[str, An
         "attention_backend": config.attention_backend,
         "mem_fraction_static": config.mem_fraction_static,
         "max_running_requests": config.max_running_requests,
+        "max_mamba_cache_size": config.max_mamba_cache_size,
         "cuda_graph_max_bs_decode": config.cuda_graph_max_bs_decode,
         "context_length": config.context_length,
         "moe_runner_backend": config.moe_runner_backend,
@@ -456,13 +473,21 @@ def _shared_server_config_to_payload(config: SharedServerConfig) -> dict[str, An
 
 
 def _shared_server_config_from_payload(payload: dict[str, Any]) -> SharedServerConfig:
+    max_mamba_cache_size = payload.get(
+        "max_mamba_cache_size", DEFAULT_MAX_MAMBA_CACHE_SIZE
+    )
     return SharedServerConfig(
         tp_size=int(payload["tp_size"]),
         attention_backend=str(payload.get("attention_backend", "auto")),
-        mem_fraction_static=payload.get("mem_fraction_static"),
-        max_running_requests=int(payload.get("max_running_requests", 128)),
+        mem_fraction_static=payload.get(
+            "mem_fraction_static", DEFAULT_MEM_FRACTION_STATIC
+        ),
+        max_running_requests=int(payload.get("max_running_requests", 1)),
+        max_mamba_cache_size=(
+            None if max_mamba_cache_size is None else int(max_mamba_cache_size)
+        ),
         cuda_graph_max_bs_decode=int(payload.get("cuda_graph_max_bs_decode", 128)),
-        context_length=int(payload.get("context_length", 131072)),
+        context_length=int(payload.get("context_length", DEFAULT_CONTEXT_LENGTH)),
         moe_runner_backend=str(payload.get("moe_runner_backend", "flashinfer_mxfp4")),
         model_loader_num_threads=int(payload.get("model_loader_num_threads", 64)),
         load_format=str(payload.get("load_format", "auto")),
@@ -705,10 +730,380 @@ def _load_hf_dataset_rows(*load_args, **load_kwargs) -> list[dict]:
     return list(load_dataset(*load_args, **load_kwargs))
 
 
+def _render_single_turn_prompt_ids(
+    tokenizer,
+    prompt: str,
+    *,
+    enable_thinking: bool,
+) -> list[int]:
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+        thinking=enable_thinking,
+    )
+
+
+def _prompt_cache_metadata(
+    *,
+    tokenizer,
+    target_model: str,
+    target_model_revision: Optional[str],
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    import transformers
+
+    chat_template = str(getattr(tokenizer, "chat_template", ""))
+    tokenizer_class = type(tokenizer)
+    probe_text = "SGLang tokenizer cache probe:\n```python\nx = 128 * 1024\n```"
+    probe = {
+        "plain": tokenizer.encode(probe_text, add_special_tokens=False),
+        "chat": _render_single_turn_prompt_ids(
+            tokenizer,
+            probe_text,
+            enable_thinking=enable_thinking,
+        ),
+    }
+    return {
+        "target_model": target_model,
+        "target_model_revision": target_model_revision,
+        "tokenizer_class": (
+            f"{tokenizer_class.__module__}.{tokenizer_class.__qualname__}"
+        ),
+        "tokenizer_name_or_path": str(getattr(tokenizer, "name_or_path", target_model)),
+        "chat_template_sha256": hashlib.sha256(
+            chat_template.encode("utf-8")
+        ).hexdigest(),
+        "transformers_version": transformers.__version__,
+        "tokenizer_probe_sha256": hashlib.sha256(
+            json.dumps(probe, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "enable_thinking": bool(enable_thinking),
+    }
+
+
+def _prompt_cache_path(stem: str, metadata: dict[str, Any]) -> Path:
+    cache_key = hashlib.sha256(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return CACHE_DIR / f"{stem}_{cache_key}.jsonl"
+
+
+def _prompt_rows_sha256(rows: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _load_prompt_cache(
+    path: Path, metadata: dict[str, Any]
+) -> Optional[list[dict[str, Any]]]:
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            header = json.loads(next(f))
+            if header.get("metadata") != metadata:
+                return None
+            rows = [json.loads(line) for line in f if line.strip()]
+        rows_sha256 = _prompt_rows_sha256(rows)
+        if (
+            header.get("row_count") != len(rows)
+            or header.get("rows_sha256") != rows_sha256
+        ):
+            raise ValueError("cached prompt row count or digest does not match")
+        if not all(
+            isinstance(row, dict) and isinstance(row.get("prompt"), str) for row in rows
+        ):
+            raise ValueError("cached prompt rows are malformed")
+        print(f"[dataset-cache] hit path={path} rows={len(rows)}")
+        return rows
+    except Exception as exc:
+        print(
+            f"[dataset-cache] ignoring unreadable cache path={path}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _write_prompt_cache(
+    path: Path,
+    metadata: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    rows_sha256 = _prompt_rows_sha256(rows)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            header = {
+                "metadata": metadata,
+                "row_count": len(rows),
+                "rows_sha256": rows_sha256,
+            }
+            f.write(json.dumps(header, ensure_ascii=False) + "\n")
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+    print(f"[dataset-cache] wrote path={path} rows={len(rows)}")
+
+
 def _load_humaneval_user_prompts() -> list[str]:
     rows = _load_hf_dataset_rows("openai/openai_humaneval", split="test")
 
     return [row["prompt"] for row in rows]
+
+
+def _build_humaneval_long_prompt(
+    prompts: list[str],
+    active_idx: int,
+    *,
+    tokenizer,
+    enable_thinking: bool,
+) -> tuple[str, int, int]:
+    active_prompt = prompts[active_idx]
+    short_prompt_len = len(
+        _render_single_turn_prompt_ids(
+            tokenizer,
+            active_prompt,
+            enable_thinking=enable_thinking,
+        )
+    )
+    other_indices = list(range(active_idx + 1, len(prompts))) + list(range(active_idx))
+    archive_header = (
+        f"# Cold Repository Context {active_idx:03d}\n"
+        "# These archived Python specifications are repository context.\n"
+        "# Use only the final Active Task as the request to solve."
+    )
+    archive_blocks: list[str] = []
+    for idx in other_indices:
+        archived_prompt = prompts[idx]
+        prompt_separator = "" if archived_prompt.endswith("\n") else "\n"
+        archive_blocks.append(
+            f"\n\n# === Archived HumanEval task {idx} ===\n"
+            f"{archived_prompt}{prompt_separator}"
+            f"# === End archived task {idx} ==="
+        )
+    archive_block_token_counts = [
+        len(tokenizer.encode(block, add_special_tokens=False))
+        for block in archive_blocks
+    ]
+
+    # Keep every archived task whole. Reserve room for comment-only padding so
+    # exact token sizing never cuts through a function or docstring.
+    filler_reserve_tokens = 2048
+    archive_parts = [archive_header]
+    estimated_tokens = len(tokenizer.encode(archive_header, add_special_tokens=False))
+    block_cursor = 0
+    while True:
+        block_idx = block_cursor % len(archive_blocks)
+        block_tokens = archive_block_token_counts[block_idx]
+        if (
+            estimated_tokens + block_tokens
+            > HUMANEVAL_LONG_PREFIX_TOKENS - filler_reserve_tokens
+        ):
+            break
+        archive_parts.append(archive_blocks[block_idx])
+        estimated_tokens += block_tokens
+        block_cursor += 1
+
+    active_delimiter = "\n\n# === Active Task ===\n"
+    archive_source = "".join(archive_parts)
+
+    def render_with_padding(padding: str) -> tuple[str, int, int]:
+        long_prompt = archive_source + padding + active_delimiter + active_prompt
+        long_prompt_len = len(
+            _render_single_turn_prompt_ids(
+                tokenizer,
+                long_prompt,
+                enable_thinking=enable_thinking,
+            )
+        )
+        return long_prompt, long_prompt_len, long_prompt_len - short_prompt_len
+
+    long_prompt, long_prompt_len, delta = render_with_padding("")
+    while delta > HUMANEVAL_LONG_PREFIX_TOKENS and len(archive_parts) > 1:
+        archive_parts.pop()
+        archive_source = "".join(archive_parts)
+        long_prompt, long_prompt_len, delta = render_with_padding("")
+    if delta == HUMANEVAL_LONG_PREFIX_TOKENS:
+        return long_prompt, long_prompt_len, delta
+    if delta > HUMANEVAL_LONG_PREFIX_TOKENS:
+        raise RuntimeError(
+            "HumanEval-long archive header exceeds the requested prefix length."
+        )
+
+    target_delta = HUMANEVAL_LONG_PREFIX_TOKENS
+    best_under = (long_prompt, long_prompt_len, delta)
+    padding_prefix = "\n\n# Repository context padding: "
+    padding_suffix = "\n"
+    padding_atoms = ("x ", "0 ", "_ ", ". ", "a ", "z ")
+    fast_tails = ("", "x", "0", "_", ".", " xx", " 0", " __", " ..")
+    crossings: list[tuple[str, int]] = []
+
+    def trial(atom: str, count: int, tail: str = "") -> tuple[str, int, int]:
+        nonlocal best_under
+        result = render_with_padding(
+            padding_prefix + atom * max(0, count) + tail + padding_suffix
+        )
+        if best_under[2] < result[2] <= target_delta:
+            best_under = result
+        return result
+
+    # Search source text, not decoded token slices. Full chat-template rendering
+    # is the authoritative length oracle, including every boundary merge.
+    remaining = target_delta - delta
+    for atom in padding_atoms:
+        low = 0
+        high = max(1, remaining)
+        high_result = trial(atom, high)
+        for _ in range(8):
+            if high_result[2] >= target_delta:
+                break
+            high *= 2
+            high_result = trial(atom, high)
+        if high_result[2] < target_delta:
+            continue
+
+        while low < high:
+            middle = (low + high) // 2
+            middle_result = trial(atom, middle)
+            if middle_result[2] < target_delta:
+                low = middle + 1
+            else:
+                high = middle
+        crossings.append((atom, low))
+
+        nearby_counts = [low]
+        for offset in range(1, 9):
+            nearby_counts.extend((low - offset, low + offset))
+        for count in nearby_counts:
+            if count < 0:
+                continue
+            for tail in fast_tails:
+                candidate_prompt, candidate_len, candidate_delta = trial(
+                    atom,
+                    count,
+                    tail,
+                )
+                if candidate_delta == target_delta:
+                    return candidate_prompt, candidate_len, candidate_delta
+
+    # Different short suffixes alter the tokenizer's final merge state. This
+    # bounded fallback covers those states without ever leaving the comment.
+    hex_tails = tuple(f" {value:x}" for value in range(256))
+    for atom, crossing in crossings[:2]:
+        for count in range(max(0, crossing - 2), crossing + 3):
+            for tail in hex_tails:
+                candidate_prompt, candidate_len, candidate_delta = trial(
+                    atom,
+                    count,
+                    tail,
+                )
+                if candidate_delta == target_delta:
+                    return candidate_prompt, candidate_len, candidate_delta
+
+    raise RuntimeError(
+        "Could not construct an exact 65536-token HumanEval-long prefix "
+        f"from source-text padding for source row {active_idx}; "
+        f"closest value at or below the target was {best_under[2]}."
+    )
+
+
+def _load_humaneval_long_user_prompts(
+    *,
+    tokenizer,
+    enable_thinking: bool,
+    target_model: str,
+    target_model_revision: Optional[str],
+) -> list[str]:
+    prompts = _load_humaneval_user_prompts()
+    prompts_sha256 = hashlib.sha256("\0".join(prompts).encode("utf-8")).hexdigest()
+    metadata = {
+        "schema_version": 1,
+        "workload": "humaneval-long",
+        "source_dataset": "openai/openai_humaneval",
+        "source_split": "test",
+        "source_prompts_sha256": prompts_sha256,
+        "prefix_tokens": HUMANEVAL_LONG_PREFIX_TOKENS,
+        "prefix_format_version": 3,
+        **_prompt_cache_metadata(
+            tokenizer=tokenizer,
+            target_model=target_model,
+            target_model_revision=target_model_revision,
+            enable_thinking=enable_thinking,
+        ),
+    }
+    cache_path = _prompt_cache_path("humaneval_long", metadata)
+    cached_rows = _load_prompt_cache(cache_path, metadata)
+    if cached_rows is not None and (
+        [row.get("source_index") for row in cached_rows] == list(range(len(prompts)))
+        and all(
+            isinstance(row.get("prompt_token_count"), int)
+            and isinstance(row.get("prefix_token_count"), int)
+            and row["prefix_token_count"] == HUMANEVAL_LONG_PREFIX_TOKENS
+            for row in cached_rows
+        )
+    ):
+        return [row["prompt"] for row in cached_rows]
+    if cached_rows is not None:
+        print(
+            f"[dataset-cache] regenerating invalid HumanEval-long cache "
+            f"path={cache_path}"
+        )
+
+    cache_rows: list[dict[str, Any]] = []
+    for idx in range(len(prompts)):
+        long_prompt, prompt_token_count, prefix_token_count = (
+            _build_humaneval_long_prompt(
+                prompts,
+                idx,
+                tokenizer=tokenizer,
+                enable_thinking=enable_thinking,
+            )
+        )
+        cache_rows.append(
+            {
+                "source_index": idx,
+                "prompt_token_count": prompt_token_count,
+                "prefix_token_count": prefix_token_count,
+                "prompt": long_prompt,
+            }
+        )
+    _write_prompt_cache(cache_path, metadata, cache_rows)
+    prompt_lengths = [int(row["prompt_token_count"]) for row in cache_rows]
+    prefix_lengths = [int(row["prefix_token_count"]) for row in cache_rows]
+    print(
+        "[dataset] HumanEval-long "
+        f"samples={len(cache_rows)} "
+        f"prefix_tokens_target={HUMANEVAL_LONG_PREFIX_TOKENS} "
+        f"prefix_tokens_min={min(prefix_lengths)} "
+        f"prefix_tokens_max={max(prefix_lengths)} "
+        f"prompt_tokens_min={min(prompt_lengths)} "
+        f"prompt_tokens_max={max(prompt_lengths)}"
+    )
+    return [row["prompt"] for row in cache_rows]
 
 
 def _load_mbpp_user_prompts() -> list[str]:
@@ -717,6 +1112,118 @@ def _load_mbpp_user_prompts() -> list[str]:
     )
 
     return [row["prompt"] for row in rows]
+
+
+def _format_longbench_v2_prompt(row: dict) -> str:
+    """Format one example using LongBench-v2's official zero-shot template."""
+    return (
+        "Please read the following text and answer the question below.\n\n"
+        "<text>\n"
+        f"{row['context'].strip()}\n"
+        "</text>\n\n"
+        f"What is the correct answer to this question: {row['question'].strip()}\n"
+        "Choices:\n"
+        f"(A) {row['choice_A'].strip()}\n"
+        f"(B) {row['choice_B'].strip()}\n"
+        f"(C) {row['choice_C'].strip()}\n"
+        f"(D) {row['choice_D'].strip()}\n\n"
+        'Format your response as follows: "The correct answer is '
+        '(insert answer here)".'
+    )
+
+
+def _load_longbench_v2_user_prompts(
+    *,
+    tokenizer,
+    enable_thinking: bool,
+    target_model: str,
+    target_model_revision: Optional[str],
+) -> list[str]:
+    metadata = {
+        "schema_version": 1,
+        "workload": "longbench-v2",
+        "dataset": LONGBENCH_V2_DATASET,
+        "dataset_revision": LONGBENCH_V2_DATASET_REVISION,
+        "split": "train",
+        "prompt_template": "official_0shot_v1",
+        "max_prompt_tokens": LONGBENCH_V2_MAX_PROMPT_TOKENS,
+        **_prompt_cache_metadata(
+            tokenizer=tokenizer,
+            target_model=target_model,
+            target_model_revision=target_model_revision,
+            enable_thinking=enable_thinking,
+        ),
+    }
+    cache_path = _prompt_cache_path("longbench_v2", metadata)
+    cached_rows = _load_prompt_cache(cache_path, metadata)
+    if (
+        cached_rows is not None
+        and cached_rows
+        and all(
+            isinstance(row.get("_id"), str)
+            and bool(row["_id"])
+            and isinstance(row.get("length"), str)
+            and isinstance(row.get("prompt_token_count"), int)
+            and 0 < row["prompt_token_count"] <= LONGBENCH_V2_MAX_PROMPT_TOKENS
+            for row in cached_rows
+        )
+    ):
+        return [row["prompt"] for row in cached_rows]
+    if cached_rows is not None:
+        print(
+            f"[dataset-cache] regenerating invalid LongBench-v2 cache "
+            f"path={cache_path}"
+        )
+
+    rows = _load_hf_dataset_rows(
+        LONGBENCH_V2_DATASET,
+        split="train",
+        revision=LONGBENCH_V2_DATASET_REVISION,
+    )
+    cache_rows: list[dict[str, Any]] = []
+    total_by_length: dict[str, int] = {}
+    selected_by_length: dict[str, int] = {}
+    for row in rows:
+        length_label = str(row.get("length", "unknown")).strip().lower()
+        total_by_length[length_label] = total_by_length.get(length_label, 0) + 1
+        prompt = _format_longbench_v2_prompt(row)
+        prompt_token_count = len(
+            _render_single_turn_prompt_ids(
+                tokenizer,
+                prompt,
+                enable_thinking=enable_thinking,
+            )
+        )
+        if prompt_token_count > LONGBENCH_V2_MAX_PROMPT_TOKENS:
+            continue
+        selected_by_length[length_label] = selected_by_length.get(length_label, 0) + 1
+        cache_rows.append(
+            {
+                "_id": str(row.get("_id", "")),
+                "length": length_label,
+                "prompt_token_count": prompt_token_count,
+                "prompt": prompt,
+            }
+        )
+
+    if not cache_rows:
+        raise RuntimeError(
+            "LongBench-v2 did not contain any prompts at or below "
+            f"{LONGBENCH_V2_MAX_PROMPT_TOKENS} Kimi tokens."
+        )
+    _write_prompt_cache(cache_path, metadata, cache_rows)
+    labels = sorted(total_by_length)
+    counts = ",".join(
+        f"{label}:{selected_by_length.get(label, 0)}/{total_by_length[label]}"
+        for label in labels
+    )
+    print(
+        "[dataset] LongBench-v2 tokenizer filter "
+        f"total={len(rows)} selected={len(cache_rows)} "
+        f"max_prompt_tokens={LONGBENCH_V2_MAX_PROMPT_TOKENS} "
+        f"selected_by_length={counts}"
+    )
+    return [row["prompt"] for row in cache_rows]
 
 
 def _load_mt_bench_user_turns() -> list[list[str]]:
@@ -741,17 +1248,44 @@ def _load_mt_bench_user_turns() -> list[list[str]]:
     return prompts
 
 
-def _load_user_turns(workload: str) -> list[list[str]]:
+def _load_user_turns(
+    workload: str,
+    *,
+    tokenizer,
+    enable_thinking: bool,
+    target_model: str,
+    target_model_revision: Optional[str],
+) -> list[list[str]]:
     if workload == "gsm8k":
         return [[prompt] for prompt in _load_gsm8k_user_prompts()]
     if workload == "math500":
         return [[prompt] for prompt in _load_math500_user_prompts()]
     if workload == "humaneval":
         return [[prompt] for prompt in _load_humaneval_user_prompts()]
+    if workload == "humaneval-long":
+        return [
+            [prompt]
+            for prompt in _load_humaneval_long_user_prompts(
+                tokenizer=tokenizer,
+                enable_thinking=enable_thinking,
+                target_model=target_model,
+                target_model_revision=target_model_revision,
+            )
+        ]
     if workload == "mbpp":
         return [[prompt] for prompt in _load_mbpp_user_prompts()]
     if workload == "mt-bench":
         return _load_mt_bench_user_turns()
+    if workload == "longbench-v2":
+        return [
+            [prompt]
+            for prompt in _load_longbench_v2_user_prompts(
+                tokenizer=tokenizer,
+                enable_thinking=enable_thinking,
+                target_model=target_model,
+                target_model_revision=target_model_revision,
+            )
+        ]
     raise ValueError(f"Unknown workload: {workload}")
 
 
@@ -1138,8 +1672,14 @@ def _run_sample(
     tokenizer,
     sampling: SamplingConfig,
     timeout_s: int,
+    single_turn_prompt_ids: Optional[list[int]] = None,
 ) -> SampleMetrics:
     from sglang.srt.parser.reasoning_parser import KimiK3Detector
+
+    if single_turn_prompt_ids is not None and len(turns) != 1:
+        raise ValueError(
+            "Pre-tokenized prompt IDs are only supported for single-turn samples."
+        )
 
     messages: list[dict[str, Any]] = []
     total_tokens = 0
@@ -1151,13 +1691,16 @@ def _run_sample(
 
     for turn_idx, user_content in enumerate(turns):
         messages.append({"role": "user", "content": user_content})
-        prompt_ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=False,
-            thinking=sampling.enable_thinking,
-        )
+        if single_turn_prompt_ids is not None:
+            prompt_ids = single_turn_prompt_ids
+        else:
+            prompt_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+                thinking=sampling.enable_thinking,
+            )
         out = _send_generate(
             base_url=base_url,
             prompt=prompt_ids,
@@ -1348,7 +1891,6 @@ def _run_requests(
     timeout_s: int,
     expect_spec: bool,
 ) -> BenchMetrics:
-    start = time.perf_counter()
     total_tokens = 0
     decode_output_tokens = 0
     decode_intervals: list[tuple[float, float]] = []
@@ -1356,36 +1898,67 @@ def _run_requests(
     spec_verify_ct_sum = 0
     accept_lengths_per_request: list[float] = []
     generation_turn_count = 0
+    completed_metrics: list[SampleMetrics] = []
 
-    with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
-        measured_futures = [
-            pool.submit(
-                _run_sample,
-                base_url=base_url,
-                turns=turns,
-                tokenizer=tokenizer,
-                sampling=sampling,
-                timeout_s=timeout_s,
-            )
-            for turns in samples
-        ]
-        for fut in as_completed(measured_futures):
-            sample_metrics = fut.result()
-            total_tokens += sample_metrics.output_tokens
-            decode_output_tokens += sample_metrics.decode_output_tokens
-            decode_intervals.extend(sample_metrics.decode_intervals)
-            if sample_metrics.peak_request_decode_output_toks_per_s is not None:
-                peak_request_decode_output_toks_per_s = max(
-                    peak_request_decode_output_toks_per_s or 0.0,
-                    sample_metrics.peak_request_decode_output_toks_per_s,
+    if int(concurrency) == 1:
+        # Tokenize single-turn samples outside the measured interval. This keeps
+        # overall TPS comparable for short prompts and 64K/128K prompt workloads
+        # without retaining every long prompt as a Python list of token IDs.
+        latency = 0.0
+        for turns in samples:
+            single_turn_prompt_ids = (
+                _render_single_turn_prompt_ids(
+                    tokenizer,
+                    turns[0],
+                    enable_thinking=sampling.enable_thinking,
                 )
-            spec_verify_ct_sum += sample_metrics.spec_verify_ct_sum
-            accept_lengths_per_request.extend(
-                sample_metrics.spec_accept_lengths_per_request
+                if len(turns) == 1
+                else None
             )
-            generation_turn_count += sample_metrics.generation_turn_count
-
+            request_start = time.perf_counter()
+            completed_metrics.append(
+                _run_sample(
+                    base_url,
+                    turns=turns,
+                    tokenizer=tokenizer,
+                    sampling=sampling,
+                    timeout_s=timeout_s,
+                    single_turn_prompt_ids=single_turn_prompt_ids,
+                )
+            )
+            latency += time.perf_counter() - request_start
+    else:
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
+            measured_futures = [
+                pool.submit(
+                    _run_sample,
+                    base_url=base_url,
+                    turns=turns,
+                    tokenizer=tokenizer,
+                    sampling=sampling,
+                    timeout_s=timeout_s,
+                )
+                for turns in samples
+            ]
+            for fut in as_completed(measured_futures):
+                completed_metrics.append(fut.result())
         latency = time.perf_counter() - start
+
+    for sample_metrics in completed_metrics:
+        total_tokens += sample_metrics.output_tokens
+        decode_output_tokens += sample_metrics.decode_output_tokens
+        decode_intervals.extend(sample_metrics.decode_intervals)
+        if sample_metrics.peak_request_decode_output_toks_per_s is not None:
+            peak_request_decode_output_toks_per_s = max(
+                peak_request_decode_output_toks_per_s or 0.0,
+                sample_metrics.peak_request_decode_output_toks_per_s,
+            )
+        spec_verify_ct_sum += sample_metrics.spec_verify_ct_sum
+        accept_lengths_per_request.extend(
+            sample_metrics.spec_accept_lengths_per_request
+        )
+        generation_turn_count += sample_metrics.generation_turn_count
 
     toks_per_s = total_tokens / max(latency, 1e-6)
     decode_active_s = _interval_union_duration(decode_intervals)
@@ -1545,6 +2118,9 @@ def _build_benchmark_jobs(
                         shared_config=replace(
                             shared_config,
                             max_running_requests=int(concurrency),
+                            max_mamba_cache_size=(
+                                DEFAULT_MAX_MAMBA_CACHE_SIZE * int(concurrency)
+                            ),
                             cuda_graph_max_bs_decode=int(concurrency),
                         ),
                     )
@@ -1672,7 +2248,25 @@ def _run_benchmark_job(job: BenchmarkJob) -> JobResult:
                 "TRTLLM-Gen cubin pool does not exist or is not a directory: "
                 f"{cubin_pool}"
             )
-    samples = _load_user_turns(job.workload)
+    base_url = f"http://127.0.0.1:{find_available_port(20000)}"
+    model_path = _resolve_model_reference(job.target_model)
+    model_revision = _effective_model_revision(
+        job.target_model, job.target_model_revision
+    )
+    print(f"model_reference={model_path}")
+    print(f"model_revision={model_revision}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        revision=model_revision,
+        trust_remote_code=True,
+    )
+    samples = _load_user_turns(
+        job.workload,
+        tokenizer=tokenizer,
+        enable_thinking=job.sampling.enable_thinking,
+        target_model=model_path,
+        target_model_revision=model_revision,
+    )
     if not samples:
         raise RuntimeError(f"Workload '{job.workload}' did not produce any prompts.")
 
@@ -1689,18 +2283,6 @@ def _run_benchmark_job(job: BenchmarkJob) -> JobResult:
             "repeating whole workload copies with radix cache enabled."
         )
 
-    base_url = f"http://127.0.0.1:{find_available_port(20000)}"
-    model_path = _resolve_model_reference(job.target_model)
-    model_revision = _effective_model_revision(
-        job.target_model, job.target_model_revision
-    )
-    print(f"model_reference={model_path}")
-    print(f"model_revision={model_revision}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        revision=model_revision,
-        trust_remote_code=True,
-    )
     server_start_timeout_s = int(
         max(SGLANG_DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, job.methodology.timeout_s)
     )
@@ -2095,6 +2677,11 @@ def _print_summary(
 CSV_FIELDS = [
     "workload",
     "backend",
+    "mem_fraction_static",
+    "max_running_requests",
+    "max_mamba_cache_size",
+    "cuda_graph_max_bs_decode",
+    "context_length",
     "linear_attn_prefill_backend",
     "linear_attn_decode_backend",
     "linear_attn_verify_backend",
@@ -2380,6 +2967,11 @@ def _build_csv_rows(
             {
                 "workload": key.workload,
                 "backend": key.backend,
+                "mem_fraction_static": result.deployment.shared_config.mem_fraction_static,
+                "max_running_requests": result.deployment.shared_config.max_running_requests,
+                "max_mamba_cache_size": result.deployment.shared_config.max_mamba_cache_size,
+                "cuda_graph_max_bs_decode": result.deployment.shared_config.cuda_graph_max_bs_decode,
+                "context_length": result.deployment.shared_config.context_length,
                 "linear_attn_prefill_backend": result.deployment.shared_config.linear_attn_prefill_backend,
                 "linear_attn_decode_backend": result.deployment.shared_config.linear_attn_decode_backend,
                 "linear_attn_verify_backend": result.deployment.shared_config.linear_attn_verify_backend,
@@ -2583,10 +3175,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--cuda-graph-bs-prefill",
         type=int,
         nargs="+",
-        default=list(DEFAULT_CUDA_GRAPH_BS_PREFILL),
+        default=None,
         help=(
-            "Captured prefill token buckets "
-            f"(benchmark default: {' '.join(str(size) for size in DEFAULT_CUDA_GRAPH_BS_PREFILL)})."
+            "Optional explicit captured prefill token buckets. "
+            "By default this flag is omitted so SGLang resolves the buckets."
         ),
     )
     parser.add_argument(
@@ -2659,7 +3251,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=1)
-    parser.add_argument("--concurrencies", default="1,32")
+    parser.add_argument("--concurrencies", default="1")
     parser.add_argument(
         "--num-samples",
         type=int,
@@ -2741,17 +3333,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         )
     if args.cuda_graph_max_bs_prefill <= 0:
         parser.error("--cuda-graph-max-bs-prefill must be > 0")
-    if (
-        not args.cuda_graph_bs_prefill
-        or any(size <= 0 for size in args.cuda_graph_bs_prefill)
-        or args.cuda_graph_bs_prefill != sorted(set(args.cuda_graph_bs_prefill))
-    ):
-        parser.error("--cuda-graph-bs-prefill must be unique, positive, and increasing")
-    if args.cuda_graph_bs_prefill[-1] > args.cuda_graph_max_bs_prefill:
-        parser.error(
-            "--cuda-graph-bs-prefill values must not exceed "
-            "--cuda-graph-max-bs-prefill"
-        )
+    if args.cuda_graph_bs_prefill is not None:
+        if any(
+            size <= 0 for size in args.cuda_graph_bs_prefill
+        ) or args.cuda_graph_bs_prefill != sorted(set(args.cuda_graph_bs_prefill)):
+            parser.error(
+                "--cuda-graph-bs-prefill must be unique, positive, and increasing"
+            )
+        if args.cuda_graph_bs_prefill[-1] > args.cuda_graph_max_bs_prefill:
+            parser.error(
+                "--cuda-graph-bs-prefill values must not exceed "
+                "--cuda-graph-max-bs-prefill"
+            )
     mode_keys = DeploymentSweep(
         include_baseline=not args.skip_baseline,
         dflash_draft_model=args.dflash_draft_model,
@@ -2845,7 +3438,7 @@ def build_sweep_config_from_args(args: argparse.Namespace) -> SweepConfig:
         linear_attn_verify_backend=args.linear_attn_verify_backend,
         cuda_graph_backend_prefill=args.cuda_graph_backend_prefill,
         cuda_graph_max_bs_prefill=int(args.cuda_graph_max_bs_prefill),
-        cuda_graph_bs_prefill=tuple(args.cuda_graph_bs_prefill),
+        cuda_graph_bs_prefill=tuple(args.cuda_graph_bs_prefill or ()),
         random_seed=int(args.random_seed),
         workloads=tuple(args.workloads),
         concurrencies=tuple(concurrencies),
