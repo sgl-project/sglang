@@ -162,23 +162,28 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
-            # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
-            # swiglu_limit==0) still run on aiter builds where this module
-            # lives elsewhere / is absent.
-            from aiter.ops.flydsl.moe_common import GateMode
+        # Weights tagged gate/up-interleaved (the a16w4 fp4_bf16 layout) only work
+        # under INTERLEAVE, so take gate_mode from the layout itself. aiter derives
+        # the same thing from is_guinterleave, but only in eager mode -- the
+        # attribute does not survive its torch_compile_guard boundary -- so pass it
+        # explicitly. Cache the guarded import: this is a per-forward hot path and
+        # older aiter builds may not ship the module.
+        _gu_interleave = getattr(quant_info.w13_weight, "is_guinterleave", False)
+        if _gu_interleave or quant_info.swiglu_limit > 0:
+            if not hasattr(self, "_gate_mode_class"):
+                try:
+                    from aiter.ops.flydsl.moe_common import GateMode
 
-            # Default (INTERLEAVE) preserves the pre-fix behavior for paths
-            # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
-            # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
-            )
+                    self._gate_mode_class = GateMode
+                except ImportError:
+                    self._gate_mode_class = None
+            if self._gate_mode_class is not None:
+                extra["gate_mode"] = (
+                    self._gate_mode_class.INTERLEAVE.value
+                    if _gu_interleave or envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else self._gate_mode_class.SEPARATED.value
+                )
+        if quant_info.swiglu_limit > 0:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
