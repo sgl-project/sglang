@@ -397,3 +397,82 @@ curl -s http://127.0.0.1:8000/metrics | grep -E "queue_time_seconds|cache_hit_ra
 | prefill 段变长且稳定 | draft extend 结构性开销 | 版本实现问题，短期接受 tradeoff 或等新版优化 |
 
 **决策点**：TTFT 影响 tool call 场景（短交互、要快），E2E 影响代码检视（长输出、能等）。MTP 当前 E2E 大胜、TTFT 小败；若 tool call 的 TTFT<1s 是硬指标，先区分冷启动 vs 结构性问题，再决定是否保留一条非 MTP 路径。
+
+### 10.7 冷启动解决方案详解（预热）
+
+> 适用前提：10.6 定位确认 TTFT 高桶占比随时间下降（冷启动）。MTP 比非 MTP 多了 draft/verify 内核，冷启动更贵，预热更重要。
+
+**方案一：上线前预热（推荐）**
+
+做法 A——去掉 `--skip-server-warmup`（若不再 OOM）：
+
+- 优点：SGLang 启动阶段统一编译/预热，无需自建脚本；
+- 前提：确认 warmup 不再 OOM。此前 96K 配置下 OOM 过，MTP 后显存占用更高，先小规模验证；若仍 OOM 用做法 B。
+
+做法 B——预热脚本（可控，推荐）：
+
+1. **等服务 ready**：轮询 `/v1/models` 直到返回 200（超时 600s）；
+2. **发送覆盖实际负载形状的请求**：
+   - 2~3 个短 prompt 非 thinking（tool call 形状，`max_tokens 32`）；
+   - 2~3 个长 prompt（覆盖线上最长 prompt 的 50% 与 100% 长度，`max_tokens 16`，避免真生成）；
+   - 1~2 个 thinking 请求（用生产采样参数：temperature 0.1 / top_p 0.95 / repetition_penalty 1.05）；
+   - `stream=true/false` 各覆盖一遍；
+   - 请求间间隔 5~10s，避免挤爆显存/排队；
+3. **验证预热完成**：
+   - 预热请求的 TTFT 显著下降并收敛；
+   - `~/.cache/flashinfer` 下配置不再新增（文件数/时间戳稳定）；
+   - 启动日志不再出现编译/autotune 相关输出；
+4. 验证通过后再放量。
+
+示例骨架：
+
+```bash
+#!/bin/bash
+API=http://127.0.0.1:8000
+MODEL=Qwen3.6-27B-FP8
+# 1) 等服务 ready
+for i in $(seq 1 120); do
+  curl -sf -o /dev/null "$API/v1/models" && break
+  sleep 5
+done
+# 2) 短 prompt 非 thinking
+curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\",
+  \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}],
+  \"chat_template_kwargs\": {\"enable_thinking\": false},
+  \"max_tokens\": 32
+}" -o /dev/null
+sleep 8
+# 3) 长 prompt（用线上最长 prompt 长度的代表文本）
+curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\",
+  \"messages\": [{\"role\": \"user\", \"content\": \"<8000+ token 的代表性代码/上下文>\"}],
+  \"chat_template_kwargs\": {\"enable_thinking\": false},
+  \"max_tokens\": 16
+}" -o /dev/null
+sleep 8
+# 4) thinking 请求（生产采样参数）
+curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\",
+  \"messages\": [{\"role\": \"user\", \"content\": \"<代表性问题>\"}],
+  \"temperature\": 0.1, \"top_p\": 0.95, \"repetition_penalty\": 1.05,
+  \"max_tokens\": 16
+}" -o /dev/null
+```
+
+**方案二：常驻 keep-alive**
+
+- 每 30~60s 发一个轻量请求：短 prompt、非 thinking、`max_tokens 4`、`stream=false`；
+- 作用：覆盖可能存在的懒加载/空闲后首请求开销；保持 autotune 缓存条目常热；兼做健康检查（非 200 即告警）；
+- 成本：每请求毫秒级，可忽略；
+- 注意：keep-alive **不能替代方案一**——它防的是"空闲后首请求慢"，不负责把内核编译完；
+- 部署：任意常驻进程/cron 均可（如 gateway 或独立 systemd timer）。
+
+**方案三：autotune 缓存稳定后加 `--disable-flashinfer-autotune`**
+
+- 流程：先按方案一预热并运行一段时间（覆盖线上主要 shape）→ 确认 `~/.cache/flashinfer` 不再增长 → **重启服务**并加 `--disable-flashinfer-autotune`；
+- 原理：关掉后新 shape 不再触发 autotune（避免偶发卡顿），用启发式回退；
+- 代价：若之后出现新 shape（如更长的 prompt 分块），可能用不到最优 kernel 配置——所以只在 shape 空间稳定后关；
+- 该 flag 是启动参数，不能运行时切换，需要重启生效。
+
+**与 10.6 的关系**：先定位（10.6），确认冷启动后再做本节方案；做完后回填 10.6 状态表，对比稳态 TTFT 是否回落。
