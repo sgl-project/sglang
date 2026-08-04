@@ -755,6 +755,7 @@ python3.12 -m pip list | grep -iE "fastapi|uvicorn|httpx"
 ```
 
 判断：三个都有 → 代理直接用，无需安装；仅 httpx 缺失 → `pip install httpx` 后固化镜像；fastapi/uvicorn 缺失 → 镜像构建不完整，先查构建。
+- **代理健壮性（已测试）**：后端不可达返回 502 且释放槽位（不会泄漏导致全量 429）；上游 4xx/5xx 原样透传（bytes，不走 JSONResponse 序列化）；并发满返回 429；流式期间持续占槽位、流结束释放。
 
 **请求侧**：
 

@@ -11,7 +11,7 @@ import asyncio
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 app = FastAPI()
 
@@ -28,7 +28,49 @@ def classify(body: dict) -> str:
     # 方法2：带 tools 字段也是 tool call
     if body.get("tools"):
         return "tool_call"
+    # 注意：不带 enable_thinking/tools 的请求默认归入 thinking 桶（12 并发、无 priority）
     return "thinking"
+
+
+async def _forward(kind: str, path: str, body: dict, default_media: str, too_many_body: dict):
+    """限并发 + 转发：超时 429、后端不可达 502（释放槽位，不泄漏）、上游错误原样透传。"""
+    try:
+        await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
+    except asyncio.TimeoutError:
+        return JSONResponse(too_many_body, status_code=429)
+
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        req = client.build_request("POST", BACKEND + path, json=body)
+        resp = await client.send(req, stream=True)
+    except Exception as e:  # noqa: BLE001 后端不可达：释放槽位，避免泄漏导致全量 429
+        sems[kind].release()
+        await client.aclose()
+        return JSONResponse({"error": "backend unreachable", "detail": str(e)}, status_code=502)
+
+    if resp.status_code >= 400:
+        sems[kind].release()
+        err = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        return Response(
+            content=err,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type") or "application/json",
+        )
+
+    async def stream():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            sems[kind].release()
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream(), media_type=resp.headers.get("content-type") or default_media
+    )
 
 
 @app.post("/v1/chat/completions")
@@ -38,37 +80,12 @@ async def chat(request: Request):
     forwarded = dict(body)
     if kind == "tool_call":
         forwarded["priority"] = 10  # 注入 priority，配合服务端 --priority-scheduling
-
-    try:
-        await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            {"error": "too many requests", "type": "concurrency_limit"},
-            status_code=429,
-        )
-
-    client = httpx.AsyncClient(timeout=None)
-    req = client.build_request("POST", BACKEND + "/v1/chat/completions", json=forwarded)
-    resp = await client.send(req, stream=True)
-    if resp.status_code >= 400:
-        sems[kind].release()
-        body_err = await resp.aread()
-        await resp.aclose()
-        await client.aclose()
-        return JSONResponse(body_err, status_code=resp.status_code)
-
-    async def stream():
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        finally:
-            # 流结束才释放槽位，长输出期间持续占用
-            sems[kind].release()
-            await resp.aclose()
-            await client.aclose()
-
-    return StreamingResponse(
-        stream(), media_type=resp.headers.get("content-type", "text/event-stream")
+    return await _forward(
+        kind,
+        "/v1/chat/completions",
+        forwarded,
+        "text/event-stream",
+        {"error": "too many requests", "type": "concurrency_limit"},
     )
 
 
@@ -78,42 +95,15 @@ async def messages(request: Request):
     注意：Anthropic 协议无 priority 字段，无法注入（SGLang anthropic 入口会拒绝未知字段）。"""
     body = await request.json()
     kind = "thinking" if body.get("thinking", {}).get("type") == "enabled" else "tool_call"
-
-    try:
-        await asyncio.wait_for(sems[kind].acquire(), TIMEOUT)
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {
-                    "type": "overloaded_error",
-                    "message": "too many requests",
-                },
-            },
-            status_code=429,
-        )
-
-    client = httpx.AsyncClient(timeout=None)
-    req = client.build_request("POST", BACKEND + "/v1/messages", json=body)
-    resp = await client.send(req, stream=True)
-    if resp.status_code >= 400:
-        sems[kind].release()
-        err = await resp.aread()
-        await resp.aclose()
-        await client.aclose()
-        return JSONResponse(err, status_code=resp.status_code)
-
-    async def stream():
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        finally:
-            sems[kind].release()
-            await resp.aclose()
-            await client.aclose()
-
-    return StreamingResponse(
-        stream(), media_type=resp.headers.get("content-type", "application/json")
+    return await _forward(
+        kind,
+        "/v1/messages",
+        body,
+        "application/json",
+        {
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "too many requests"},
+        },
     )
 
 
