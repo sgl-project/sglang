@@ -583,7 +583,7 @@ jobs:
           #   runner: linux-aarch64-a3-800t-16
           #   test_case: test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms.py
           #   test_type: 'perf'
-          
+
           # NPU accuracy tests
           # - name: glm4_7_flash_1p_gsm8k
           #   runner: linux-aarch64-a3-2-
