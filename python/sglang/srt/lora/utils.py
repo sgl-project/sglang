@@ -165,6 +165,10 @@ def get_hidden_dim(
                 if moe_inter is not None and n_shared is not None:
                     inter = moe_inter * n_shared
             return inter, config.hidden_size
+        elif module_name == "linear_fc1":
+            return config.intermediate_size, config.hidden_size
+        elif module_name == "linear_fc2":
+            return config.intermediate_size, config.hidden_size
         elif module_name == "fused_qkv_a_proj_with_mqa":
             q_lora_rank = getattr(config, "q_lora_rank", None) or 0
             kv_lora_rank = config.kv_lora_rank
@@ -254,6 +258,8 @@ def get_normalized_target_modules(
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
         "out_proj": "out_proj",
+        "linear_fc1": "linear_fc1",
+        "linear_fc2": "linear_fc2",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
         "embeddings": "embed_tokens",
@@ -327,6 +333,8 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "o_proj",
     "out_proj",
     "down_proj",
+    "linear_fc1",
+    "linear_fc2",
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
@@ -373,6 +381,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "up_proj",
         "gate_up_proj",
         "down_proj",
+        "linear_fc1",
+        "linear_fc2",
         "fc1_latent_proj",
         "fc2_latent_proj",
         "embed_tokens",
