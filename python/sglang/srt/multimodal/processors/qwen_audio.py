@@ -43,13 +43,32 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         # truncation so long clips are capped to the model's window.
         self.audio_config = {**self.audio_config, "truncation": True}
 
+    # Qwen2-Audio's chat template matches a bare ``audio`` key; the strict instruction
+    # keeps the model from emitting a "The content of this audio is:" preamble
+    # that would otherwise inflate WER.
+    _TRANSCRIPTION_CONVERSATION = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": ""},
+                {
+                    "type": "text",
+                    "text": (
+                        "Transcribe the audio. Output only the exact transcription, "
+                        "with no preamble, prefix, commentary, or quotation marks."
+                    ),
+                },
+            ],
+        }
+    ]
+
     def _build_transcription_prompt(self, input_text) -> str:
         """Fall back to a default ASR prompt for audio-only requests.
 
         The ``/v1/audio/transcriptions`` endpoint sends empty text (and hence
-        empty ``input_ids``), which carries no audio placeholder. Build the
-        standard Qwen2-Audio chat prompt with one audio span so the encoder
-        features have a slot to fill.
+        empty ``input_ids``), which carries no audio placeholder. Render the
+        Qwen2-Audio chat prompt with one audio span so the encoder features have
+        a slot to fill; otherwise the caller-supplied text is used as-is.
         """
         if isinstance(input_text, list):
             input_text = (
@@ -57,23 +76,10 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             )
         if input_text and input_text.strip():
             return input_text
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio_url": ""},
-                    {
-                        "type": "text",
-                        "text": (
-                            "Transcribe the audio. Output only the exact transcription, "
-                            "with no preamble, prefix, commentary, or quotation marks."
-                        ),
-                    },
-                ],
-            }
-        ]
         return self._processor.apply_chat_template(
-            conversation, add_generation_prompt=True, tokenize=False
+            self._TRANSCRIPTION_CONVERSATION,
+            add_generation_prompt=True,
+            tokenize=False,
         )
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
