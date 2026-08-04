@@ -105,6 +105,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -144,6 +145,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -193,6 +195,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -246,6 +249,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -295,6 +299,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -343,6 +348,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -448,6 +454,7 @@ jobs:
       - name: Mark repository safe
         run: |
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
