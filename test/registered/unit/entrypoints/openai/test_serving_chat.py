@@ -42,7 +42,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
 _DSV4_OFFICIAL_ENCODER = (
-    'REASONING_EFFORT_PROMPTS = {"low": "", "high": "h", "max": "m"}\n'
+    "REASONING_EFFORT_PROMPTS: Dict[str, str] = "
+    '{"low": "", "high": "h", "max": "m"}\n'
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
 
@@ -1773,11 +1774,17 @@ class ServingChatTestCase(unittest.TestCase):
             preview_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
         )
         self.assertNotIn("Reasoning Effort:", official_low)
-        self.assertTrue(
-            official_high.startswith(encoding_dsv4.bos_token + absolute_maximum)
+        self.assertEqual(
+            official_high,
+            encoding_dsv4.bos_token
+            + absolute_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
         )
-        self.assertTrue(
-            official_max.startswith(encoding_dsv4.bos_token + beyond_maximum)
+        self.assertEqual(
+            official_max,
+            encoding_dsv4.bos_token
+            + beyond_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
         )
         self.assertEqual(encode("preview", None), preview_high)
         self.assertEqual(encode("official", None), official_low)
@@ -1790,8 +1797,12 @@ class ServingChatTestCase(unittest.TestCase):
         resolve = resolve_dsv4_reasoning_effort_profile
         preview_model_path = _create_dsv4_checkpoint(self, _DSV4_PREVIEW_ENCODER)
         official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        inconclusive_model_path = _create_dsv4_checkpoint(
+            self, 'UNRELATED_METADATA = "value"\n'
+        )
         self.assertEqual(resolve(model_path=preview_model_path), "preview")
         self.assertEqual(resolve(model_path=official_model_path), "official")
+        self.assertEqual(resolve(model_path=inconclusive_model_path), "preview")
 
         self.assertEqual(
             resolve(model_path="renamed/model", override="official"), "official"
