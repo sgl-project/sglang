@@ -20,7 +20,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.15.post1
-ARG MOONCAKE_VERSION=0.3.11.post1
+ARG MOONCAKE_VERSION=0.3.12.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -342,7 +342,7 @@ FROM torch_deps AS hpc_ops_builder
 # HPC-Ops (https://github.com/Tencent/hpc-ops, MIT): fused attention / MoE /
 # RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
 # hpc_ops attention and MoE runner backends.
-ARG HPC_OPS_COMMIT=2404f09766269d9533b66709f705c8eeb01421fc
+ARG HPC_OPS_COMMIT=6e2ecede9d6d47b2e680e839cc7ad7422bc8d88b
 
 WORKDIR /build
 
