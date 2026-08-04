@@ -476,3 +476,52 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 - 该 flag 是启动参数，不能运行时切换，需要重启生效。
 
 **与 10.6 的关系**：先定位（10.6），确认冷启动后再做本节方案；做完后回填 10.6 状态表，对比稳态 TTFT 是否回落。
+
+### 10.8 生产数据全版对比与口径修正（MTP 低/高并发）
+
+> 本节为线上实测数据（Qwen3.6-27B-FP8，6 卡 TP=2 DP=3，NEXTN steps=3 topk=1 draft=4），修正"有效 ITL"口径，并取代 10.6 的初步判断。
+
+**关键指标对比**
+
+| 指标 | 无 MTP (2294 req) | MTP 低并发 (692 req) | MTP 高并发 (2162 req) |
+|------|------------------|---------------------|----------------------|
+| ITL avg | 92.2ms | 34.8ms | 50.6ms |
+| Accept Rate | - | 86.1% | 78.8% |
+| Accept Len | - | 3.58 | 3.36 |
+| TTFT (stream) | 3.75s | 1.35s | 8.76s |
+| E2E | ~89s（实测 89.2s） | ~8s | ~41s（实测 41.1s） |
+| Gen throughput | 112 tok/s | 335 tok/s | 723 tok/s |
+| Cache hit | 43.2% | 59.9% | 37.6% |
+| Abort | 2.2% | 0.3% | 3.3% |
+| KV available | 3~4K | 97K~178K | 1.2~3.9K |
+| KV/card | 793,189 | 746,595 | 746,595（draft 头占 ~46K，-5.9%） |
+
+**有效 ITL 口径修正**
+
+错误算法：`ITL avg ÷ accept_len`（50.6 / 3.36 = 15.1ms）。`ITL avg` 已经是每个输出 token 的实际流延迟——MTP 的收益已包含在内（一轮 verify ~170ms 出 3.36 个 token，平均到每个 token 就是 ~50ms），再除 accept_len 等于重复计算。
+
+验证：
+
+```text
+648 tok/req × 50.6ms + TTFT 8.76s ≈ 41.5s  ← 与实测 E2E 41.1s 吻合
+648 tok/req × 15.1ms + TTFT 8.76s ≈ 18.5s  ← 与实测不符
+723 tok/s ÷ 36 并发 ≈ 20 tok/s/req ≈ 50ms/token  ← 一致
+```
+
+修正后真实收益：**每 token 流延迟 92.2 → 50.6ms（1.8x）；E2E ~90s → ~41s（2.2x）**。聚合吞吐 112→723 tok/s 含负载/并发差异，不能全部归因 MTP。
+
+**低并发 vs 高并发：取舍而非 bug**
+
+- 低并发：TTFT 1.35s、E2E ~8s、accept 86%、命中率 59.9%、abort 0.3%——**TTFT<1s / E2E<10s 目标在此 regime 基本达标**；
+- 高并发：TTFT 8.76s、KV available 1.2~3.9K（紧张）、abort 3.3%、命中率 37.6%——瓶颈是 verify 与 prefill 争 GPU + KV 周转慢；
+- 结论：MTP 高并发让位吞吐（723 tok/s），低并发让位延迟，两者不可兼得。
+
+**建议**
+
+| 问题 | 建议 |
+|------|------|
+| TTFT 高并发恶化 | steps 3→2 A/B（verify 工作量 -25%，accept len 预计 3.36→~2.8） |
+| 目标冲突 | 按 SLA 分层：tool call（短交互）与代码检视（长输出）拆开或限并发 |
+| Worker 1 热点（11 running vs 5/5） | 监控 prefix 分布，排查 prefix-aware 路由倾斜 |
+| Abort 3.3% | 查原因分布（客户端超时 vs 服务端错误） |
+| 冷启动 | 10.6 定位 + 10.7 预热方案仍未回填，先落地再测稳态 TTFT |
