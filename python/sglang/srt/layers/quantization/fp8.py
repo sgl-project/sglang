@@ -139,10 +139,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -617,10 +614,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)
-        elif use_mxfp8:
-            raise ValueError(
-                "MXFP8 requires fp8-serialized checkpoint for linear layers."
-            )
 
     def create_weights(
         self,
@@ -1032,6 +1025,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
+            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
+            # orig_dtype (when present) sets the GEMM output dtype.
+            qx, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else None
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                pre_quant_output_dtype=out_dtype,
+            )
+
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -1409,10 +1420,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
             fp4_weight_dtype = _require_fp4_dtype()
 
-            # CK FP4 MoE kernel requires K_packed divisible by 128
-            # (i.e., K_logical divisible by 256).
-            # Pad intermediate_size_per_partition if needed.
-            fp4_k_align = 256
+            # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
+            # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
+            # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
+            # shuffle_scale also supports non-256 shapes since aiter PR#4130.
+            fp4_k_align = 128
             E, w13_N, w13_K_packed = layer.w13_weight.shape
             _, w2_N, w2_K_packed = layer.w2_weight.shape
             inter_per_part = w13_N // 2
@@ -1606,7 +1618,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
-            from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
@@ -1680,20 +1691,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                if requant_block_scale_ue8m0_for_deepgemm(
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    weight_block_size,
-                    use_deepgemm_runner=will_use_deepgemm,
+                for weight, weight_scale in (
+                    (layer.w13_weight, layer.w13_weight_scale_inv),
+                    (layer.w2_weight, layer.w2_weight_scale_inv),
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
                     requant_block_scale_ue8m0_for_deepgemm(
-                        layer.w2_weight,
-                        layer.w2_weight_scale_inv,
+                        weight,
+                        weight_scale,
                         weight_block_size,
-                        use_deepgemm_runner=True,
+                        use_deepgemm_runner=will_use_deepgemm,
+                        output_dtype=torch.bfloat16,
+                        weight_shape=weight.shape[-2:],
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
@@ -1831,9 +1839,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return qweight.view_as(weight), scale_u8
 
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            _ue8m0_to_fp32,
-        )
+        from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
 
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()

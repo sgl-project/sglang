@@ -50,7 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -96,7 +96,7 @@ class Qwen2MLP(nn.Module):
         x: torch.Tensor,
         forward_batch: ForwardBatch = None,
     ) -> torch.Tensor:
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
@@ -291,9 +291,13 @@ class Qwen2DecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(
+                hidden_states, quant_linear=self.self_attn.qkv_proj
+            )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, quant_linear=self.self_attn.qkv_proj
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -301,7 +305,9 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -330,7 +336,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_server_args().rl_on_policy_target is not None
+                    if get_exec().deterministic.rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -366,7 +372,7 @@ class Qwen2Model(nn.Module):
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_server_args().rl_on_policy_target is not None
+                if get_exec().deterministic.rl_on_policy_target is not None
                 else {}
             )
             self.norm = RMSNorm(
