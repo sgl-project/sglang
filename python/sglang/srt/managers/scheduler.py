@@ -868,31 +868,27 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        from sglang.srt.speculative.draft_worker_common import (
+            draft_server_args_copy,
+        )
+
         # Launch a draft worker for speculative decoding
-        draft_worker_kwargs = dict(
+        draft_server_args = draft_server_args_copy(
             server_args=self.server_args,
+            target_model_config=self.tp_worker.model_runner.model_config,
+        )
+        draft_worker_kwargs = dict(
+            server_args=draft_server_args,
             gpu_id=self.ps.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
 
-        if get_spec().speculative_draft_load_format is not None:
-            # Write the draft load_format onto server_args (not just the bag):
-            # the draft worker is built from a copy of self.server_args and
-            # build_load_config reads server_args.load_format, so a bag-only
-            # override would be ignored and the draft would load in the target's
-            # format.
-            self.server_args.override(
-                "scheduler.draft_load_format",
-                load_format=get_spec().speculative_draft_load_format,
-            )
-            logger.info(
-                f"Using draft model load_format: '{get_spec().speculative_draft_load_format}'"
-            )
-
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
+        with get_context().preserve_config():
+            get_context().set_server_args(draft_server_args)
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -1145,7 +1141,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.max_prefill_bs: int = 0
+        self.max_prefill_bs: float = 0.0
         if get_schedule().enable_prefill_delayer:
             if get_disagg().disaggregation_mode == "decode":
                 logger.info(
@@ -2084,7 +2080,10 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                self.max_total_num_tokens * self.server_args.dcp_size
+                - paged_input_len
+                - self.page_size
+                - 1,
             ),
         )
         # Clipping above can push max_new_tokens below min_new_tokens, which
@@ -3014,6 +3013,11 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
+            # Decay the max-prefill-bs high-watermark once per pass so one
+            # unusually large admission burst does not permanently raise the
+            # slot_condition bar in the delayer (0.998/pass ~= half-life of
+            # ~350 forward passes).
+            self.max_prefill_bs *= 0.998
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -3108,7 +3112,7 @@ class Scheduler(
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            max_prefill_bs=self.max_prefill_bs,
+            max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
@@ -3866,6 +3870,9 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # Flush any health-check signal deferred while the engine was busy.
+        self.maybe_send_health_check_signal()
+
         if not self.is_fully_idle():
             return
 
@@ -3924,6 +3931,14 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+
+        if (
+            for_health_check
+            and not self._engine_paused
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_prealloc_queue is not None
+        ):
+            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -4013,7 +4028,7 @@ class Scheduler(
                 )
             if recv_req.hicache_write_policy is not None:
                 hicache_fields["hicache_write_policy"] = recv_req.hicache_write_policy
-            self.server_args.override("scheduler.attach_hicache", **hicache_fields)
+            get_context().override("scheduler.attach_hicache", **hicache_fields)
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
@@ -4054,7 +4069,7 @@ class Scheduler(
         if ok or (not self.enable_hicache_storage):
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
-            self.server_args.override(
+            get_context().override(
                 "scheduler.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,

@@ -42,6 +42,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +61,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -427,10 +429,33 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -449,10 +474,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+# route_class is per-router, so included routers need it set too.
+v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
+elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
 
@@ -710,12 +738,13 @@ async def model_info():
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
+        "weight_version": _global_state.tokenizer_manager.config_value(
+            "weight_version"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
     embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
@@ -761,7 +790,9 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **_global_state.tokenizer_manager.resolved_config_dict(
+                dataclasses.asdict(server_args)
+            ),
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
@@ -1091,10 +1122,13 @@ async def hicache_storage_backend_status():
         return _admin_api_key_missing_response()
 
     return {
-        "hicache_storage_backend": _global_state.tokenizer_manager.server_args.hicache_storage_backend,
-        "hicache_storage_backend_extra_config": _global_state.tokenizer_manager.server_args.hicache_storage_backend_extra_config,
-        "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
-        "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
+        name: _global_state.tokenizer_manager.config_value(name)
+        for name in (
+            "hicache_storage_backend",
+            "hicache_storage_backend_extra_config",
+            "hicache_storage_prefetch_policy",
+            "hicache_write_policy",
+        )
     }
 
 
@@ -1385,8 +1419,7 @@ async def update_weight_version(
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.override(
+        _global_state.tokenizer_manager.record_config_updates(
             "http.update_weight_version", weight_version=obj.new_version
         )
 
