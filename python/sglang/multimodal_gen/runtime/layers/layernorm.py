@@ -972,8 +972,8 @@ def apply_qk_norm_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: torch.Tensor,
-    freqs_complex: torch.Tensor,
     *,
+    freqs_complex: Optional[torch.Tensor] = None,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
@@ -1094,13 +1094,16 @@ def apply_qk_norm_rope(
         head_size=head_dim,
         rotary_dim=head_dim,
         use_precomputed_cache=False,
-        is_interleaved=True,
-        is_neox_style=False,
+        is_neox_style=is_neox,
+        is_interleaved=not is_neox,
     )
     return rotary_emb(
         query=q,
         key=k,
-        complex_freqs=freqs_complex.unsqueeze(-2),
+        positions=positions,
+        complex_freqs=(
+            freqs_complex.unsqueeze(-2) if freqs_complex is not None else None
+        ),
         cos_sin_cache=cos_sin_cache,
     )
 
