@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+import gc
 import logging
 import multiprocessing as mp
 import os
@@ -1628,8 +1629,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set gc threshold
     if gc_threshold := server_args.gc_threshold:
-        import gc
-
         gc.set_threshold(*gc_threshold)
 
 
