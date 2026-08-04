@@ -63,7 +63,7 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
         timeouts[suite] = int(with_["run_timeout_minutes"])
-    for suite in _INLINE_SUITE_JOBS:
+    for suite in _INLINE_SUITE_JOBS.intersection(jobs):
         budgets = [
             s["timeout-minutes"]
             for s in ((jobs.get(suite) or {}).get("steps") or [])
