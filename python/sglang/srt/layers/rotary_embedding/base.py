@@ -72,7 +72,15 @@ if _is_hip:
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    try:
+        from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        fused_qk_rope_with_cos_sin_cache_inplace = None
+        logger.warning(
+            "sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace is unavailable; "
+            "XPU rotary embedding will use the generic rotary_embedding kernel. "
+            "Upgrade sgl_kernel to enable the fused XPU kernel."
+        )
 
 
 class RotaryEmbedding(BaseFusedOp):
@@ -455,7 +463,11 @@ class RotaryEmbedding(BaseFusedOp):
         self._match_cos_sin_cache_dtype(query)
 
         # Fused_qk_rope only supports aligned head_size
-        if self.head_size in [128, 256, 512]:
+        if fused_qk_rope_with_cos_sin_cache_inplace is not None and self.head_size in [
+            128,
+            256,
+            512,
+        ]:
             num_tokens = positions.size(0)
             q_rope = query.view(num_tokens, -1, self.head_size)
             k_rope = key.view(num_tokens, -1, self.head_size)
