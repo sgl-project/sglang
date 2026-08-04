@@ -90,7 +90,8 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
-- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately.
+- `--dit-cuda-graph {off|breakable|full}`: DiT CUDA-graph mode. `breakable` captures the forward as segments split at attention, which keeps per-step attention metadata live; `full` captures the whole forward as one graph, which removes the remaining per-segment launch overhead but bakes every branch taken at capture time. Both need `--warmup-resolutions` for every served resolution, because each resolution is captured separately. `full` additionally stays off — falling back to eager with a warning — when Cache-DiT is enabled, when the attention backend rebuilds per-step metadata (STA/VSA/SVG2/VMoBA/block-sparse/rain-fusion), or on a sharded run, since a collective recorded into the graph is not replay-safe (see [Multi-GPU and `full`](#multi-gpu-and-full)).
+- `--enable-breakable-cuda-graph {true|false}`: **deprecated**, superseded by `--dit-cuda-graph breakable` and scheduled for removal in the next release. Still accepted: passing it logs `--enable-breakable-cuda-graph is deprecated; use --dit-cuda-graph breakable.` and selects `breakable` unless `--dit-cuda-graph` was set explicitly.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
@@ -185,7 +186,11 @@ HTTP server-only arguments are ignored by `sglang generate`.
 
 For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
 
-For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
+For supported image pipelines, CUDA-graph capture is selected with `--dit-cuda-graph breakable` (or `full`), and you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures. `--enable-breakable-cuda-graph` is the deprecated spelling of `--dit-cuda-graph breakable`.
+
+#### Multi-GPU and `full`
+
+`full` captures the entire DiT forward, so every collective the forward performs is recorded into the graph. A `torch.distributed` NCCL collective is not replay-safe: its host-side per-op bookkeeping advances once at capture and never again, so on replay the ranks disagree about which collective is running and hang. `full` therefore refuses to engage on any sharded run (`sp_size > 1` or `tp_size > 1`) and logs `DiT full CUDA graph disabled: ...`, leaving that run eager — it does not hang, and it does not need to be disabled by hand. Use `breakable` for sharded runs; it splits its segments at attention and keeps the collectives outside the captured regions.
 
 ### Layerwise Offload
 

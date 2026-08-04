@@ -91,7 +91,12 @@ The modes tune residency for native pipeline components declared to the componen
 
 When `torch.compile` is enabled, `--offload-during-compile` stays on by default. During compile warmup it temporarily offloads the DiT and evicts resident non-DiT components so `max-autotune` fits on tighter-memory GPUs, then restores the configured serving residency before real traffic.
 
-Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
+DiT CUDA-graph capture is a separate manual opt-in for supported image pipelines, selected with `--dit-cuda-graph {off|breakable|full}`. Whichever mode you pick, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
+
+- `breakable` captures the forward as segments split at attention, so per-step attention metadata and the collectives of a sharded run stay outside the captured regions. This is the mode to use on more than one GPU.
+- `full` captures the whole forward as a single graph, removing the remaining per-segment launch overhead. It bakes in every branch taken at capture time, so it declines — logging `DiT full CUDA graph disabled: ...` and running eager — under Cache-DiT, under attention backends that rebuild per-step metadata (STA/VSA/SVG2/VMoBA/block-sparse/rain-fusion), and on any sharded run (`sp_size > 1` or `tp_size > 1`), because a `torch.distributed` NCCL collective recorded into a graph is not replay-safe: its host-side per-op bookkeeping advances once at capture, so replays leave the ranks disagreeing about which collective is in flight. Single-GPU runs are where `full` applies today.
+
+`--enable-breakable-cuda-graph` is deprecated in favour of `--dit-cuda-graph breakable` and will be removed in the next release; it is still accepted and logs a warning.
 
 > [!NOTE]
 > The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.
