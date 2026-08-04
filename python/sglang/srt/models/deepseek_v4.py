@@ -237,11 +237,11 @@ def _apply_wo_a_bf16_matmul(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor
     ``batched_gemm_bf16`` for exactly this shape (``Y[i] = X[i] @ W[i]^T``),
     which is the kernel the reference ATOM stack uses. Routing to it is
     numerically bf16-equivalent (validated max rel-err <=5e-4). Opt-in via
-    ``SGLANG_OPT_WO_A_AITER_BATCHED_GEMM`` (default off); any failure falls
+    ``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` (default off); any failure falls
     back to the einsum.
     """
     if (
-        envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.get()
+        envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get()
         and _is_hip
         and _is_gfx95_supported
     ):

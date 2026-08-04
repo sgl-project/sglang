@@ -1,7 +1,7 @@
 """Tests for the DeepSeek-V4 decode ``wo_a`` bf16 batched-matmul routing.
 
 Covers ``deepseek_v4._apply_wo_a_bf16_matmul``, which (opt-in via
-``SGLANG_OPT_WO_A_AITER_BATCHED_GEMM`` on HIP/gfx95) routes the MLA output-absorb
+``SGLANG_OPT_USE_AITER_BATCHED_GEMM`` on HIP/gfx95) routes the MLA output-absorb
 bf16 GEMM off the rocBLAS/Tensile ``Cijk_*`` batched GEMM onto aiter's tuned
 ``batched_gemm_bf16``, with an einsum fallback.
 
@@ -71,7 +71,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
     def test_flag_off_is_bit_identical_to_einsum(self):
         o, wo_a = self._rand(8, 4, 128, 32)
         with (
-            envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.override(False),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(False),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
@@ -83,7 +83,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
         o, wo_a = self._rand(8, 4, 128, 32)
         with (
             mock.patch.object(self.dsv4, "_is_hip", False),
-            envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.override(True),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
@@ -94,7 +94,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
         o, wo_a = self._rand(8, 4, 128, 32)
         with (
             mock.patch.object(self.dsv4, "_is_gfx95_supported", False),
-            envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.override(True),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
             mock.patch("torch.einsum", wraps=torch.einsum) as spy,
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
@@ -117,7 +117,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
             mock.patch.dict(sys.modules, {_AITER_BATCHED_GEMM_MODULE: fake}),
             mock.patch.object(self.dsv4, "_is_hip", True),
             mock.patch.object(self.dsv4, "_is_gfx95_supported", True),
-            envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.override(True),
+            envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True),
         ):
             out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
 
@@ -142,7 +142,7 @@ class TestWoABf16BatchedGemm(unittest.TestCase):
                 o, wo_a = self._rand(T, G, D, R)
                 ref = self._einsum(o, wo_a).float()
 
-                with envs.SGLANG_OPT_WO_A_AITER_BATCHED_GEMM.override(True):
+                with envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.override(True):
                     with mock.patch("torch.einsum", wraps=torch.einsum) as spy:
                         out = self.dsv4._apply_wo_a_bf16_matmul(o, wo_a)
                 # The aiter kernel -- not the einsum fallback -- must have run,
