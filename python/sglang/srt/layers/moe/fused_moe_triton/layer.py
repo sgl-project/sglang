@@ -672,8 +672,13 @@ class FusedMoE(torch.nn.Module):
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
         # the buffer is padded.  Copy into the leading slice and leave the
-        # trailing padding as zeros.
-        if loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]:
+        # trailing padding as zeros.  Rank-mismatched tensors (bias / scalar
+        # scales) don't carry shard_dim; they keep the plain broadcast copy.
+        if (
+            loaded_weight.dim() == expert_data.dim()
+            and shard_dim < expert_data.dim()
+            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
+        ):
             expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
                 loaded_weight
             )
@@ -753,8 +758,13 @@ class FusedMoE(torch.nn.Module):
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
         # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice only.
-        if loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]:
+        # the buffer is padded.  Copy into the leading slice only.  See the
+        # rank-mismatch note in _load_w13.
+        if (
+            loaded_weight.dim() == expert_data.dim()
+            and shard_dim < expert_data.dim()
+            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
+        ):
             expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
                 loaded_weight
             )
