@@ -25,7 +25,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import BumpAllocator, next_power_of_2
 
 if TYPE_CHECKING:
@@ -34,7 +38,7 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.jit_kernel.concat_mla import concat_mla_k
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
 
@@ -126,11 +130,8 @@ def forward_dsa_indexer_for_mha(
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
-        self.disable_chunked_prefix_cache = (
-            get_server_args().disable_chunked_prefix_cache
-        )
+        self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = (
@@ -218,8 +219,8 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_server_args().dsa_decode_backend == "trtllm"
-                    or not get_server_args().dsa_prefill_backend == "trtllm"
+                    not get_exec().kernel.dsa_decode_backend == "trtllm"
+                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
@@ -355,7 +356,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
@@ -398,7 +398,17 @@ class DeepseekMHAForwardMixin:
                 k[..., : self.qk_nope_head_dim] = k_nope
                 k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                # Prefix K/V is independent of the suffix query length. Under
+                # FullCG this is the fixed captured chunk extent; per-request
+                # active lengths remain encoded in the backend metadata.
+                key_value_num_tokens=k.shape[0],
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)

@@ -28,7 +28,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
@@ -200,8 +200,8 @@ class DeepseekMHARocmForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_server_args().dsa_decode_backend == "trtllm"
-                    or not get_server_args().dsa_prefill_backend == "trtllm"
+                    not get_exec().kernel.dsa_decode_backend == "trtllm"
+                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16

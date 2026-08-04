@@ -153,8 +153,6 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -208,6 +206,9 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_pool_host.available_size(),
         )
         super().reset()
+
+    def release_host_resources(self) -> None:
+        self.host_pool_group.destroy()
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
@@ -464,9 +465,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
-
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()
@@ -897,7 +895,12 @@ class HiMambaRadixCache(MambaRadixCache):
             else:
                 if prev_prefix_len < total_prefix_length + prefix_len:
                     start = max(0, prev_prefix_len - total_prefix_length)
-                    self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                    # same as MambaRadixCache._insert_helper: page-exact segment
+                    # at offset total_prefix_length of the kv row
+                    self.token_to_kv_pool_allocator.free_segment(
+                        value[start:prefix_len],
+                        start_pos=total_prefix_length + start,
+                    )
                 total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 

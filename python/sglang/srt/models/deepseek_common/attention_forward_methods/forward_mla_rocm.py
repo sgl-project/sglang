@@ -23,10 +23,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
+    dcp_a2a_lse_reduce,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -44,6 +46,8 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    is_dcp_mla_decode_phase,
+    is_mla_dcp_lse_base_on_e,
     should_defer_dsa_cp_kv_gather,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -53,7 +57,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -493,15 +497,29 @@ class DeepseekMLAAbsorbRocmForwardMixin:
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
-        if (dsa_prefill_cp or mla_prefill_cp) and not defer_kv_gather_until_after_rope:
-            # support allgather+rerrange
+        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
+            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
+
+            k_nope, k_pe = materialize_full_kv_cp(
+                self,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_pe,
+            )
+        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
+            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
+            # backend via the strategy (materialize_full_mla_kv).
             k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+                latent_cache,
+                forward_batch,
+                k_nope,
+                k_pe,
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if forward_batch.forward_mode.is_decode():
+            if is_dcp_mla_decode_phase(forward_batch):
                 # if forward_batch.forward_mode is decode, gather q
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
@@ -619,10 +637,7 @@ class DeepseekMLAAbsorbRocmForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                if (
-                    forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
-                ):
+                if is_dcp_mla_decode_phase(forward_batch):
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -683,16 +698,31 @@ class DeepseekMLAAbsorbRocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+        if is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(
-                attn_output, lse, get_parallel().dcp_group
-            )
-            attn_output = attn_output.transpose(0, 1)
+            dcp_comm_backend = get_parallel().dcp_comm_backend
+            is_lse_base_on_e = is_mla_dcp_lse_base_on_e(self.current_attention_backend)
+            if dcp_comm_backend in ("a2a", "fi_a2a"):
+                # A2A exchange of head partials + LSE, then local Triton combine.
+                attn_output = dcp_a2a_lse_reduce(
+                    attn_output.contiguous(),
+                    lse.contiguous(),
+                    get_parallel().dcp_group,
+                    is_lse_base_on_e=is_lse_base_on_e,
+                    comm_backend=dcp_comm_backend,
+                )
+            else:
+                attn_output = cp_lse_ag_out_rs_mla(
+                    attn_output,
+                    lse,
+                    get_parallel().dcp_group,
+                    is_lse_base_on_e=is_lse_base_on_e,
+                )
+                attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
@@ -757,13 +787,12 @@ class DeepseekMLAAbsorbRocmForwardMixin:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
         """
-        server_args = get_server_args()
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
-                server_args.dsa_decode_backend == "tilelang"
-                or server_args.dsa_prefill_backend == "tilelang"
+                get_exec().kernel.dsa_decode_backend == "tilelang"
+                or get_exec().kernel.dsa_prefill_backend == "tilelang"
             )
         )
 
