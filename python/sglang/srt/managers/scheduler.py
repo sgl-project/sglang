@@ -2080,7 +2080,10 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                self.max_total_num_tokens * self.server_args.dcp_size
+                - paged_input_len
+                - self.page_size
+                - 1,
             ),
         )
         # Clipping above can push max_new_tokens below min_new_tokens, which
