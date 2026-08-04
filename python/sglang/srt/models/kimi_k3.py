@@ -120,10 +120,6 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -199,8 +195,7 @@ def _merge_weights_as_views(
     return merged, sizes
 
 
-# ---------------------------------------------------------------------------
-# DP attention helpers
+# DP attention helpers.
 #
 # K3 cannot use LayerCommunicator: the attn-res aggregation kernels replace
 # input_layernorm / post_attention_layernorm, which the communicator expects
@@ -210,7 +205,6 @@ def _merge_weights_as_views(
 # semantics (its internal all-reduces are unchanged and required — the latent
 # reduce must happen in latent space before the norm), and the delayed
 # prefix_sum add stays local, applied after the scatter back.
-# ---------------------------------------------------------------------------
 
 
 def _dp_local_buffer_group():
@@ -244,12 +238,9 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
-# ---------------------------------------------------------------------------
-# KimiK3MLP — supports both SiLU and SiTU
-# ---------------------------------------------------------------------------
-
-
 class KimiK3MLP(nn.Module):
+    """K3 MLP; SiLU or SiTU activation."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -323,11 +314,6 @@ class KimiK3MLP(nn.Module):
         return hidden_states
 
 
-# ---------------------------------------------------------------------------
-# KimiK3MoE — with Latent MoE support
-# ---------------------------------------------------------------------------
-
-
 def _add3(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -366,6 +352,8 @@ def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Ten
 
 
 class KimiK3MoE(nn.Module):
+    """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -385,7 +373,6 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
-        # Latent MoE
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
@@ -551,7 +538,6 @@ class KimiK3MoE(nn.Module):
             and self.alt_stream is not None
         )
 
-        # Latent MoE projections
         if self.use_latent_moe:
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
@@ -639,7 +625,7 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
-        # NOTE: invalidate the cached properties
+        # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
             "_routing_contract_ok",
@@ -1217,12 +1203,9 @@ class KimiK3MoE(nn.Module):
         return out.view(num_tokens, hidden_size)
 
 
-# ---------------------------------------------------------------------------
-# KimiK3DeltaAttention — KDA with full-rank gate option
-# ---------------------------------------------------------------------------
-
-
 class KimiK3DeltaAttention(nn.Module):
+    """KDA attention; optional full-rank gate."""
+
     def __init__(
         self,
         layer_idx: int,
@@ -1273,7 +1256,6 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate", False
         )
 
-        # Decide fusion strategy
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
@@ -1718,11 +1700,6 @@ class KimiK3DeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
-# ---------------------------------------------------------------------------
-# KimiK3MLAAttention — MLA with optional output gate
-# ---------------------------------------------------------------------------
-
-
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
@@ -1896,12 +1873,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
 
 
-# ---------------------------------------------------------------------------
-# KimiK3DecoderLayer — with Attention Residual
-# ---------------------------------------------------------------------------
-
-
 class KimiK3DecoderLayer(nn.Module):
+    """Decoder layer carrying the K3 attention-residual stream."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2367,12 +2341,9 @@ class KimiK3DecoderLayer(nn.Module):
         return out, None, False
 
 
-# ---------------------------------------------------------------------------
-# KimiK3LinearModel — language model backbone
-# ---------------------------------------------------------------------------
-
-
 class KimiK3LinearModel(nn.Module):
+    """K3 language-model backbone."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2456,7 +2427,6 @@ class KimiK3LinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            # NOTE: assert to bypass the annoying typing errors
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
@@ -2614,12 +2584,9 @@ class KimiK3LinearModel(nn.Module):
         )
 
 
-# ---------------------------------------------------------------------------
-# KimiK3LinearForCausalLM — text-only causal LM
-# ---------------------------------------------------------------------------
-
-
 class KimiK3LinearForCausalLM(nn.Module):
+    """Text-only K3 causal LM."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2963,12 +2930,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             break
 
 
-# ---------------------------------------------------------------------------
-# KimiK3ForConditionalGeneration — multimodal wrapper
-# ---------------------------------------------------------------------------
-
-
 class KimiK3ForConditionalGeneration(nn.Module):
+    """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
         "vision_tower.",
