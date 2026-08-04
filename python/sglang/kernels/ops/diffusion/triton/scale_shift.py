@@ -6,6 +6,81 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @triton.jit
+def _fp32_mul_add_rn(x, scale, residual):
+    """Match separate CUDA FP32 multiply and add rounding (no FMA)."""
+    return tl.inline_asm_elementwise(
+        asm="""{
+            .reg .f32 product;
+            mul.rn.f32 product, $1, $2;
+            add.rn.f32 $0, $3, product;
+        }""",
+        constraints="=f,f,f,f",
+        args=(x, scale, residual),
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fused_scaled_residual_add_exact_kernel(
+    output_ptr,
+    residual_ptr,
+    x_ptr,
+    scale_ptr,
+    numel: tl.constexpr,
+    width: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    scale = tl.load(scale_ptr + offsets % width, mask=mask)
+    residual = tl.load(residual_ptr + offsets, mask=mask)
+    output = _fp32_mul_add_rn(x, scale, residual)
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def try_fused_scaled_residual_add_exact(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor | None:
+    """Fuse ``residual + x * scale`` without changing eager FP32 rounding."""
+    if (
+        not current_platform.is_cuda()
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or residual.dtype != torch.float32
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or scale.dtype != torch.float32
+        or not residual.is_cuda
+        or residual.device != x.device
+        or residual.device != scale.device
+        or residual.shape != x.shape
+        or scale.shape != (x.shape[-1],)
+        or not residual.is_contiguous()
+        or not x.is_contiguous()
+        or not scale.is_contiguous()
+        or x.numel() == 0
+    ):
+        return None
+
+    output = torch.empty_like(residual)
+    block_size = 1024
+    _fused_scaled_residual_add_exact_kernel[(triton.cdiv(x.numel(), block_size),)](
+        output,
+        residual,
+        x,
+        scale,
+        numel=x.numel(),
+        width=x.shape[-1],
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
+@triton.jit
 def _fused_layernorm_scale_shift_gate_select01_kernel(
     output_ptr,
     gate_out_ptr,
