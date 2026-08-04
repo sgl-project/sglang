@@ -78,6 +78,58 @@ class TestMmapAllocator(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
                     mmap_allocator.alloc_mmap((4,), torch.float32)
 
+    def test_memory_available_bytes_hugepage_modes(self):
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            HUGEPAGE_BYTES_2MB,
+            memory_available_bytes,
+        )
+
+        normal_usable_100mb = 100 * 1024 * 1024
+        normal_ram_with_reserve = (
+            HICACHE_HOST_MEMORY_RESERVE_BYTES + normal_usable_100mb
+        )
+        hugetlb_200mb = 100 * HUGEPAGE_BYTES_2MB
+        low_ram = MagicMock(available=normal_ram_with_reserve)
+        with patch.object(
+            mmap_allocator.psutil, "virtual_memory", return_value=low_ram
+        ):
+            with envs.SGLANG_HUGEPAGE_MODE.override("off"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                    self.assertEqual(memory_available_bytes(), normal_usable_100mb)
+            with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator, "hugepage_available_bytes", return_value=0
+                    ):
+                        self.assertEqual(memory_available_bytes(), normal_usable_100mb)
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator,
+                        "hugepage_available_bytes",
+                        return_value=hugetlb_200mb,
+                    ):
+                        self.assertEqual(memory_available_bytes(), hugetlb_200mb)
+
+        hugetlb_bytes = 3 * HUGEPAGE_BYTES_2MB
+        with patch.object(
+            mmap_allocator.psutil,
+            "virtual_memory",
+            return_value=MagicMock(available=1 << 50),
+        ):
+            with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator,
+                        "hugepage_available_bytes",
+                        return_value=hugetlb_bytes,
+                    ):
+                        self.assertEqual(memory_available_bytes(), hugetlb_bytes)
+
     def test_alloc_shm(self):
         dims = (10, 1024)
         dtype = torch.float32
