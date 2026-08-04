@@ -45,7 +45,12 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -417,6 +422,9 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 class MoonViT3dEncoder(nn.Module):
+    # Class-level default so forward() stays usable on instances built with
+    # __new__ (unit tests skip __init__).
+    use_fused_rope = False
 
     def __init__(
         self,
@@ -436,7 +444,9 @@ class MoonViT3dEncoder(nn.Module):
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
         )
-        self.use_fused_rope = _is_cuda and get_server_args().rl_on_policy_target is None
+        self.use_fused_rope = (
+            _is_cuda and get_exec().deterministic.rl_on_policy_target is None
+        )
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
