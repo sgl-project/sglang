@@ -36,6 +36,8 @@ struct OnlineC128MTPWritePrefixParams {
   int64_t layer_bs;
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
+  int64_t kv_score_num_rows;
+  int64_t state_num_rows;
   bool is_ragged;
 };
 
@@ -61,6 +63,7 @@ struct OnlineC128MTPCommitPendingParams {
   int64_t num_verify_tokens;
   int64_t state_slot_stride;
   int64_t max_num_reqs;
+  int64_t state_num_rows;
 };
 
 __global__ void online_c128_mtp_clear_all_pending_kernel(int64_t* pending_seq_lens, int64_t max_num_reqs) {
@@ -97,7 +100,9 @@ online_c128_mtp_commit_pending_kernel(const OnlineC128MTPCommitPendingParams<TSe
   if ((final_seq & 127) == 0) return;
 
   const int64_t slot = req;
-  const BufferFloat* const src = params.state + (slot + accept * params.state_slot_stride) * params.state_stride_b;
+  const int64_t src_slot = slot + accept * params.state_slot_stride;
+  if (src_slot < 0 || src_slot >= params.state_num_rows) return;
+  const BufferFloat* const src = params.state + src_slot * params.state_stride_b;
   BufferFloat* const dst = params.state + slot * params.state_stride_b;
 
   for (int64_t d = static_cast<int64_t>(threadIdx.x); d < kHeadDim * 3; d += blockDim.x) {
@@ -113,17 +118,21 @@ online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, T
 
   const int64_t seq_before = static_cast<int64_t>(params.seq_lens[bid]);
   const int64_t req_idx = static_cast<int64_t>(params.req_pool_indices[bid]);
+  if (seq_before < 0 || req_idx < 0 || req_idx >= params.state_slot_stride) return;
   const int64_t start_pos = seq_before & 127;
   const bool has_partial = seq_before > 0 && start_pos != 0;
   const int64_t row_verify_tokens =
       params.is_ragged ? static_cast<int64_t>(params.verify_lens[bid]) : params.num_verify_tokens;
   const int64_t row_start =
       params.is_ragged ? static_cast<int64_t>(params.extend_start_loc[bid]) : bid * params.num_verify_tokens;
+  if (row_verify_tokens < 0 || row_verify_tokens > params.num_verify_tokens || row_verify_tokens > 8) return;
+  if (row_start < 0 || row_start > params.kv_score_num_rows - row_verify_tokens) return;
 
   int64_t init_slot = 0;
   if (has_partial) {
     init_slot = req_idx;
   }
+  if (init_slot < 0 || init_slot >= params.state_num_rows) return;
 
   const int64_t d = static_cast<int64_t>(threadIdx.x);
   float run_max = 0.0f;
@@ -181,6 +190,7 @@ online_c128_mtp_write_prefix_kernel(const OnlineC128MTPWritePrefixParams<TSeq, T
     const int64_t final_seq = seq_before + step + 1;
     if ((final_seq & 127) != 0) {
       const int64_t slot = req_idx + (step + 1) * params.state_slot_stride;
+      if (slot < 0 || slot >= params.state_num_rows) return;
       if constexpr (std::is_same_v<BufferFloat, float>) {
         float* const out = params.state + slot * params.state_stride_b;
         out[d] = run_max;
@@ -235,6 +245,8 @@ struct OnlineC128MTPWritePrefixKernel {
         .layer_bs = layer_bs,
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
+        .kv_score_num_rows = kv_score_input.shape()[0],
+        .state_num_rows = state.shape()[0],
         .is_ragged = verify_lens.shape()[0] != 0,
     };
 
@@ -273,6 +285,9 @@ struct OnlineC128MTPWritePrefixKernel {
     if (layer_bs <= 0) return;
     RuntimeCheck(num_verify_tokens > 0 && num_verify_tokens <= 8, "unsupported num_verify_tokens=", num_verify_tokens);
     RuntimeCheck(state_slot_stride > 0, "state_slot_stride must be positive");
+    RuntimeCheck(
+        state_slot_stride * (num_verify_tokens + 1) <= state.shape()[0],
+        "state buffer is too small for speculative banks");
     RuntimeCheck(layer_bs <= seq_lens.shape()[0], "layer_bs exceeds seq_lens rows");
     RuntimeCheck(layer_bs <= req_pool_indices.shape()[0], "layer_bs exceeds req_pool_indices rows");
     const bool is_ragged = verify_lens.shape()[0] != 0;
@@ -374,6 +389,7 @@ struct OnlineC128MTPCommitPendingKernel {
         .num_verify_tokens = num_verify_tokens,
         .state_slot_stride = state_slot_stride,
         .max_num_reqs = max_num_reqs,
+        .state_num_rows = state.shape()[0],
     };
 
     constexpr uint32_t kThreads = 256;
@@ -408,6 +424,10 @@ struct OnlineC128MTPCommitPendingKernel {
     RuntimeCheck(cur_bs <= cur_seq_lens.shape()[0], "cur_bs exceeds seq_lens rows");
     RuntimeCheck(cur_bs <= cur_req_pool_indices.shape()[0], "cur_bs exceeds req rows");
     RuntimeCheck(max_num_reqs <= pending_seq_lens.shape()[0], "max_num_reqs exceeds pending rows");
+    RuntimeCheck(max_num_reqs <= state_slot_stride, "max_num_reqs exceeds state slot stride");
+    RuntimeCheck(
+        max_num_reqs + num_verify_tokens * state_slot_stride <= state.shape()[0],
+        "state buffer is too small for pending speculative banks");
 
     launch(
         cur_seq_lens,

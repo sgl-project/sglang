@@ -37,6 +37,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_utils import (
+    record_stream_each,
+    record_stream_for_v2_verify,
+)
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -64,6 +68,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    verify_forward_batch: object
 
 
 class TargetVerifyExecutor:
@@ -267,9 +272,13 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        fwd_stream = torch.get_device_module(self.target_worker.device).current_stream()
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -282,6 +291,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            verify_forward_batch=verify_forward_batch,
         )
 
     def commit_hidden(

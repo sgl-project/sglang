@@ -560,6 +560,10 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
+        # Raw cudaMemcpyAsync in the online-c128 planner is invisible to
+        # PyTorch's pinned-memory allocator. Keep transient metadata alive
+        # until the copy and all metadata copies queued before the event finish.
+        self._online_c128_metadata_keep_alive = []
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = self.online_c128_mtp.enabled() or (
@@ -1499,8 +1503,26 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
+        previous_c128_metadata = capture_metadata.c128_compress_metadata
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        self._retain_online_c128_metadata_until_ready(previous_c128_metadata)
         self.forward_metadata = capture_metadata
+
+    def _retain_online_c128_metadata_until_ready(self, metadata) -> None:
+        if metadata is None or not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            return
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self._online_c128_metadata_keep_alive.append((event, metadata))
+
+        first_pending = 0
+        for pending_event, _ in self._online_c128_metadata_keep_alive:
+            if not pending_event.query():
+                break
+            first_pending += 1
+        if first_pending:
+            del self._online_c128_metadata_keep_alive[:first_pending]
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1549,6 +1571,7 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = temp_metadata
             return
         chosen_metadata.copy_(temp_metadata)
+        self._retain_online_c128_metadata_until_ready(temp_metadata)
         self.forward_metadata = chosen_metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
