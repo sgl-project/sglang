@@ -7,11 +7,16 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
@@ -114,6 +119,17 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     return topk_ids
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_and_remap_expert_ids(
+    topk_ids: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+    logical_to_gpu_index: torch.Tensor,
+) -> torch.Tensor:
+    """Mask CPU expert IDs and remap GPU expert IDs to GPU-local indices."""
+    is_gpu_expert = gpu_experts_mask[topk_ids]
+    return torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
@@ -154,6 +170,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.gpu_experts_mask = torch.empty(0, dtype=torch.bool)
+        self.logical_to_gpu_index = torch.empty(0, dtype=torch.int32)
+        self.gpu_experts_mask_cuda: Optional[torch.Tensor] = None
+        self.logical_to_gpu_index_cuda: Optional[torch.Tensor] = None
         self.tp_rank = get_parallel().tp_rank
 
         # KT wrapper will be initialized in create_weights
@@ -161,6 +183,36 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Store parameters needed for KT initialization
         self._layer_params = None
+
+    def _build_kt_wrapper_kwargs(
+        self,
+        num_experts: int,
+        num_experts_per_tok: int,
+        hidden_size: int,
+        intermediate_size_full: int,
+        layer_max_deferred: int,
+    ) -> dict:
+        wrapper_kwargs = {
+            "layer_idx": self.kt_config.layer_idx,
+            "num_experts": num_experts,
+            "num_experts_per_tok": num_experts_per_tok,
+            "hidden_size": hidden_size,
+            "moe_intermediate_size": intermediate_size_full,
+            "cpuinfer_threads": self.kt_config.cpuinfer_threads,
+            "threadpool_count": self.kt_config.threadpool_count,
+            "weight_path": self.kt_config.weight_path,
+            "chunked_prefill_size": self.kt_config.chunked_prefill_size,
+            "method": self.kt_config.method,
+            "max_deferred_experts_per_token": layer_max_deferred,
+        }
+
+        signature = inspect.signature(KTMoEWrapper)
+        if "gpu_experts_mask" in signature.parameters:
+            wrapper_kwargs["gpu_experts_mask"] = self.gpu_experts_mask
+        else:
+            wrapper_kwargs["num_gpu_experts"] = self.num_gpu_experts
+
+        return wrapper_kwargs
 
     def create_weights(
         self,
@@ -184,6 +236,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.global_num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size_per_partition
+
+        if self.moe_ep_size != 1:
+            raise NotImplementedError(
+                "KTransformers heterogeneous MoE does not currently support expert parallelism. "
+                "Please launch with --expert-parallel-size 1."
+            )
+        if self.num_gpu_experts > num_experts:
+            raise ValueError(
+                f"kt_num_gpu_experts ({self.num_gpu_experts}) exceeds the number of local experts ({num_experts})."
+            )
+
+        self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+        self.gpu_experts_mask[: self.num_gpu_experts] = True
+        gpu_expert_indices = torch.where(self.gpu_experts_mask)[0]
+        self.logical_to_gpu_index = torch.full(
+            (num_experts,), -1, dtype=torch.int32
+        )
+        self.logical_to_gpu_index[gpu_expert_indices] = torch.arange(
+            len(gpu_expert_indices), dtype=torch.int32
+        )
 
         # Get required parameters from layer object
         # top_k: number of experts selected per token
@@ -213,22 +285,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs,
         )
 
+        target_device = next(layer.parameters()).device
+        self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
+        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(
+            device=target_device
+        )
+
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
             self.wrapper = KTMoEWrapper(
-                layer_idx=self.kt_config.layer_idx,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                hidden_size=hidden_size,
-                moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
-                cpuinfer_threads=self.kt_config.cpuinfer_threads,
-                threadpool_count=self.kt_config.threadpool_count,
-                weight_path=self.kt_config.weight_path,
-                chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                method=self.kt_config.method,
-                max_deferred_experts_per_token=layer_max_deferred,
+                **self._build_kt_wrapper_kwargs(
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    hidden_size=hidden_size,
+                    intermediate_size_full=intermediate_size_full,
+                    layer_max_deferred=layer_max_deferred,
+                )
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -250,11 +323,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 get_global_expert_location_metadata,
             )
 
-            physical_to_logical_map_cpu = (
-                get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                .contiguous()
-            )
+            metadata = get_global_expert_location_metadata()
+            if (
+                metadata is not None
+                and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+            ):
+                physical_to_logical_map_cpu = (
+                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                    .contiguous()
+                )
+            else:
+                physical_to_logical_map_cpu = torch.arange(
+                    layer.num_experts, dtype=torch.int64, device="cpu"
+                )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
@@ -267,10 +348,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             moe_runner_config: Configuration for MoE runner
         """
         self.moe_runner_config = moe_runner_config
+        gpu_runner_config = replace(moe_runner_config)
         if self.override_num_local_experts:
-            moe_runner_config.num_local_experts = self.num_gpu_experts
+            gpu_runner_config = replace(
+                gpu_runner_config, num_local_experts=self.num_gpu_experts
+            )
         # Delegate to GPU method to create its runner
-        self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        self.gpu_method.create_moe_runner(layer, gpu_runner_config)
 
     def submit(
         self,
@@ -349,10 +433,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+        # Step 2: Prepare GPU computation by masking CPU experts and remapping GPU experts
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+        masked_topk_ids = mask_and_remap_expert_ids(
+            topk_ids,
+            self.gpu_experts_mask_cuda,
+            self.logical_to_gpu_index_cuda,
+        )
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
