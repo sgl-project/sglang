@@ -3189,9 +3189,7 @@ class DeepseekSparseAttnBackend(
                     "--dsa-prefill-backend tilelang for this checkpoint."
                 )
             cached = (
-                k_scale.detach()
-                .to(device=self.device, dtype=torch.float32)
-                .reshape(())
+                k_scale.detach().to(device=self.device, dtype=torch.float32).reshape(())
             )
             self.aiter_sparse_mla_descale_cache[layer.layer_id] = cached
         return cached
