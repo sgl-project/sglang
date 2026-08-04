@@ -1,12 +1,13 @@
 export const config = {
   modelName: "Ling-3.0-flash",
 
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300"],
   groupHardware: false,
 
   hardware: [
     { id: "h20-3e", label: "H20-3e", vram: "141GB", vendor: "nvidia" },
     { id: "h800", label: "H800", vram: "80GB", vendor: "nvidia" },
+    { id: "gb300", label: "GB300", vram: "288GB", vendor: "nvidia" },
   ],
 
   variants: [
@@ -47,6 +48,7 @@ export const config = {
     "h800": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   benchmarkCommands: {
@@ -177,6 +179,22 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--default-chat-template-kwargs '{\"enable_thinking\":true}'",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
@@ -242,6 +260,22 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--context-length 262144",
+        "--speculative-algorithm NEXTN",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--default-chat-template-kwargs '{\"enable_thinking\":true}'",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
@@ -332,6 +366,21 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--default-chat-template-kwargs '{\"enable_thinking\":true}'",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h20-3e", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
@@ -394,6 +443,21 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: false,
+      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--context-length 262144",
+        "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
+        "--default-chat-template-kwargs '{\"enable_thinking\":true}'",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
