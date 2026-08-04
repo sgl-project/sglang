@@ -443,5 +443,61 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         self.assertEqual(result[1, 4].item(), 0.0)
 
 
+# apply_custom_logit_processor — sampler-side fan-out under speculative decoding
+class _DummySamplingBatchInfo:
+    """Minimal stand-in for SamplingBatchInfo used by apply_custom_logit_processor."""
+
+    def __init__(self, custom_params, custom_logit_processor):
+        self.custom_params = custom_params
+        self.custom_logit_processor = custom_logit_processor
+
+    def __len__(self):
+        return len(self.custom_params)
+
+
+class TestApplyCustomLogitProcessorSpecDecoding(CustomTestCase):
+    """Regression test: params must be expanded per draft-token row.
+
+    With speculative decoding a request occupies num_tokens_in_batch consecutive
+    rows in the logits tensor. Previously the params list was not expanded to
+    match, so a row-consuming processor (e.g. the n-gram one) only saw params for
+    the first row of each request and silently skipped the trailing draft rows.
+    """
+
+    vocab_size = 8
+
+    def test_params_expanded_to_every_draft_row(self):
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        draft_token_num = 2
+        batch_size = 3
+        logits = torch.zeros(
+            (batch_size * draft_token_num, self.vocab_size), dtype=torch.float
+        )
+        original = logits.clone()
+
+        # Repeated bigrams [1,2,3,1,2]; prefix (2) → DeepseekOCR bans token 3.
+        req = _make_req(origin_input_ids=[1, 2, 3, 1, 2])
+        ocr_params = {"__req__": req, "ngram_size": 2, "window_size": 100}
+        custom_params = [None, ocr_params, None]
+        batch_mask = torch.tensor([False, True, False])
+        processor = DeepseekOCRNoRepeatNGramLogitProcessor()
+        sampling_info = _DummySamplingBatchInfo(
+            custom_params=custom_params,
+            custom_logit_processor={1: (processor, batch_mask)},
+        )
+
+        apply_custom_logit_processor(
+            logits, sampling_info, num_tokens_in_batch=draft_token_num
+        )
+
+        # Request at batch index 1 occupies rows 2 and 3 — BOTH must be banned.
+        for row in (2, 3):
+            self.assertTrue(torch.isinf(logits[row, 3]) and logits[row, 3] < 0)
+        # All other rows untouched.
+        untouched = [0, 1, 4, 5]
+        self.assertTrue(torch.equal(logits[untouched], original[untouched]))
+
+
 if __name__ == "__main__":
     unittest.main()
