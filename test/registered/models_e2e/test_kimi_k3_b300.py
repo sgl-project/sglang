@@ -12,6 +12,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    _wait_for_gpu_idle_in_ci,
     popen_launch_server,
 )
 
@@ -23,6 +24,13 @@ MODEL_PATH = (
 )
 DSPARK_DRAFT_MODEL = "RadixArk/Kimi-K3-DSpark"
 SERVER_LAUNCH_TIMEOUT = 3600
+GPU_IDLE_TIMEOUT = 120
+
+
+def _stop_server(process):
+    if process:
+        kill_process_tree(process.pid)
+        _wait_for_gpu_idle_in_ci(timeout=GPU_IDLE_TIMEOUT)
 
 
 class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
@@ -58,14 +66,13 @@ class TestKimiK3B300LowLatency(GSM8KMixin, CustomTestCase):
                 DSPARK_DRAFT_MODEL,
                 "--speculative-dspark-block-size",
                 "7",
-                "--enable-gdn-replayssm-spec",
+                "--enable-linear-replayssm-spec",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+        _stop_server(getattr(cls, "process", None))
 
 
 class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
@@ -104,8 +111,7 @@ class TestKimiK3B300Balanced(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+        _stop_server(getattr(cls, "process", None))
 
 
 if __name__ == "__main__":
