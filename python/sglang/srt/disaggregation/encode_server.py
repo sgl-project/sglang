@@ -2982,7 +2982,12 @@ class EncoderScheduler:
                 logger.info(
                     f"Dispatching batch of {len(group)} {modality.name} requests"
                 )
-                results = await self.encoder.batch_encode(requests, modality, preloaded_images=preloaded_images,images_per_request=images_per_request)
+                results = await self.encoder.batch_encode(
+                    requests,
+                    modality,
+                    preloaded_images=preloaded_images,
+                    images_per_request=images_per_request,
+                )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
