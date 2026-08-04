@@ -2,6 +2,7 @@ export const config = {
   modelName: "Ling-3.0-flash",
 
   supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200"],
+  groupHardware: false,
 
   hardware: [
     { id: "h20-3e", label: "H20-3e", vram: "141GB", vendor: "nvidia" },
@@ -41,11 +42,11 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"What is the capital of France?"}] }'`,
 
   dockerImages: {
-    "h20-3e": "lmsysorg/sglang:dev",
-    "h200": "lmsysorg/sglang:dev",
-    "h800": "lmsysorg/sglang:dev",
-    "h100": "lmsysorg/sglang:dev",
-    "b200": "lmsysorg/sglang:dev",
+    "h20-3e": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "h200": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "h800": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
+    "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   benchmarkCommands: {
