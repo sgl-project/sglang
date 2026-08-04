@@ -47,7 +47,12 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
@@ -258,10 +263,11 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
-                # MTP MoE layers (model.decoder.*) are not NVFP4 quantized.
+                # Draft experts serialized under mtp.* remain source MXFP4.
+                # NextN exposes them as model.decoder.*; DSpark as stages.*.
                 nvfp4_exclude_modules = list(
                     nvfp4_meta.get("exclude_modules") or []
-                ) + ["model.decoder.*"]
+                ) + ["model.decoder.*", "stages.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),
@@ -399,6 +405,14 @@ class DefaultModelLoader(BaseModelLoader):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
+        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
+            allowed_keys.add("enable_gds")
+            if "enable_gds" in extra_config and not isinstance(
+                extra_config["enable_gds"], bool
+            ):
+                raise ValueError(
+                    "enable_gds in --model-loader-extra-config must be a boolean"
+                )
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -487,10 +501,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = model_name_or_path
 
         server_args = get_server_args()
-        if server_args and server_args.model_checksum is not None:
+        if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or model_name_or_path
+            checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
@@ -573,11 +587,11 @@ class DefaultModelLoader(BaseModelLoader):
             )
         elif use_safetensors:
             server_args = get_server_args()
-            weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
-            weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
-            prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
+            weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
+            prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
             weight_loader_drop_cache_after_load = (
-                server_args.weight_loader_drop_cache_after_load
+                get_model().weight_loader_drop_cache_after_load
             )
 
             # Prefetch and multi-threaded loading both read the same shards,
@@ -609,8 +623,11 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    enable_gds=enable_gds,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -868,9 +885,8 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.runtime_context import get_server_args
 
-        torchao_config = get_server_args().torchao_config
+        torchao_config = get_exec().graph.torchao_config
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -1737,16 +1753,16 @@ class PreshardedModelLoader(DefaultModelLoader):
             "dp": _safe(lambda: parallel.moe_dp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
-            "moe_dense_tp_size": server_args.moe_dense_tp_size,
+            "moe_dense_tp_size": parallel.moe_dense_tp_size,
             "moe_dp_size": server_args.moe_dp_size,
-            "enable_dp_lm_head": server_args.enable_dp_lm_head,
-            "enable_fp32_lm_head": server_args.enable_fp32_lm_head,
+            "enable_dp_lm_head": parallel.enable_dp_lm_head,
+            "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
             "model_dtype": str(model_config.dtype),
-            "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
-            "enable_eplb": server_args.enable_eplb,
+            "ep_num_redundant_experts": get_exec().moe.ep_num_redundant_experts,
+            "enable_eplb": get_exec().moe.enable_eplb,
             "init_expert_location": self._normalize_init_expert_location(
-                server_args.init_expert_location
+                get_exec().moe.init_expert_location
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
@@ -3923,10 +3939,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         )
 
         server_args = get_server_args()
-        if server_args and server_args.model_checksum is not None:
+        if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
-            checksums_source = server_args.model_checksum or model_name_or_path
+            checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files = list_safetensors(path=hf_folder)
