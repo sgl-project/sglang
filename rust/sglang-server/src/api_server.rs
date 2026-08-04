@@ -82,23 +82,6 @@ pub async fn serve(
             return;
         }
     };
-    if let Ok(addr) = listener.local_addr() {
-        tracing::info!(%addr, "sglang-server api listening");
-    }
-    // Non-graceful shutdown: on the signal, stop accepting and RETURN without
-    // waiting for in-flight handlers (a `/generate` blocked on egress would wedge
-    // the join). Returning unwinds `block_on` in `runtime::start` → the api tokio
-    // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
-    // `Senders` clones → tok/detok channels close → workers exit. Full drain is
-    // deferred (see `request_shutdown`).
-    // Match Python (asyncio sets TCP_NODELAY); avoids a ~13 ms
-    // Nagle/delayed-ACK penalty on keep-alive connections.
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|io| {
-        if let Err(e) = io.set_nodelay(true) {
-            tracing::debug!(error = %e, "set_nodelay failed");
-        }
-    });
     // `with_connect_info` exposes the peer address to the access-log middleware.
     let serve = axum::serve(
         listener,
