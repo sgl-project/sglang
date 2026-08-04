@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
@@ -148,7 +149,7 @@ def build_kv_cache(
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
-    uses_transformers_backend = (
+    uses_transformers_backend = not use_mlx() and (
         get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
     )
 
