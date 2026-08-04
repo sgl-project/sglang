@@ -59,6 +59,11 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_round_robin_input_ids_v2,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -1073,9 +1078,8 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -1124,9 +1128,8 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
+                    kv = cp_materialize_global_token_order(
                         kv.contiguous(),
-                        self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
@@ -1134,9 +1137,8 @@ class MQALayer(MqaAttentionBase):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
+                kv = cp_materialize_global_token_order(
                     kv.contiguous(),
-                    self.cp_size,
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
@@ -2352,6 +2354,8 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
@@ -2377,11 +2381,16 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
-            input_ids = cp_round_robin_input_ids(input_ids)
+        if use_prefill_cp:
+            if cp_v2_active:
+                input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
+            else:
+                if self.pp_group.is_first_rank:
+                    hidden_states = cp_split_and_rebuild_data(
+                        forward_batch, hidden_states
+                    )
+                positions = cp_split_and_rebuild_position(forward_batch, positions)
+                input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
@@ -2389,7 +2398,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+        if capture_dspark and use_prefill_cp:
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
@@ -2444,7 +2453,7 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if self.pp_group.is_last_rank and use_prefill_cp and not cp_v2_active:
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,

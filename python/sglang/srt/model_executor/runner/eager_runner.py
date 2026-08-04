@@ -371,6 +371,17 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        pre_hc_head = None
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        if isinstance(model, DeepseekV4ForCausalLM):
+            stream = torch.cuda.current_stream()
+            hidden_states, pre_hc_head = hidden_states
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            pre_hc_head = cp_gather_after_forward(pre_hc_head, forward_batch, stream)
+
         hidden_states = cp_gather_after_forward(
             hidden_states, forward_batch, torch.cuda.current_stream()
         )
@@ -380,6 +391,7 @@ class EagerRunner(BaseRunner):
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            hidden_states_before_norm=pre_hc_head,
         )
 
     def _execute_idle(
