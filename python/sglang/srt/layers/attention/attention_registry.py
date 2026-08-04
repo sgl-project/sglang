@@ -317,6 +317,26 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
     from sglang.srt.configs.model_config import is_minimax_sparse
 
+    if (
+        runner.model_config.hf_config.architectures
+        and runner.model_config.hf_config.architectures[0]
+        == "Dot3NoteForCausalLM"
+        and getattr(runner.model_config.hf_config, "index_topk", None) is not None
+    ):
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            DotsHybridAttnBackend,
+        )
+
+        # Dots uses a 512-wide latent cache for full-attention layers but a
+        # 1024-wide one for SWA layers. Keep a separate SWA backend for its
+        # page table and prefill; decode consumes that cache through the
+        # large-kvlora latent fallback in DotsHybridAttnBackend.
+        swa_backend = getattr(full_attn_backend, "prefill_backend", full_attn_backend)
+        return DotsHybridAttnBackend(
+            dsa_backend=create_dsa_backend(runner),
+            swa_backend=swa_backend,
+        )
+
     if is_minimax_sparse(runner.model_config.hf_config):
         from sglang.srt.layers.attention.minimax_sparse_backend import (
             MiniMaxHybridAttnBackend,

@@ -226,6 +226,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         config=None,
+        rope_dim_at_front: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -235,6 +236,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.rope_dim_at_front = rope_dim_at_front
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -388,6 +390,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # index-K cache here matches the fused path that decode reads back.
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
+    def _select_rope_slice(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.rope_dim_at_front:
+            return tensor[..., : self.rope_head_dim]
+        return tensor[..., -self.rope_head_dim :]
+
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # When kv_len <= index_topk the top-k selects ALL valid positions, so the
         # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
@@ -473,11 +480,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ):
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-                q_rope, _ = torch.split(
-                    query,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
+                q_rope = self._select_rope_slice(query)
             with torch.cuda.stream(self.alt_stream):
                 # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
@@ -485,33 +488,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 else:
                     key, _ = self.wk(x)
                 key = self.k_norm(key)
-
-                k_rope, _ = torch.split(
-                    key,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
+                k_rope = self._select_rope_slice(key)
 
             current_stream.wait_stream(self.alt_stream)
         else:
             query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            q_rope, _ = torch.split(
-                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
+            q_rope = self._select_rope_slice(query)
             if self.use_dsa_indexer_fusion:
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
             key = self.k_norm(key)
-            k_rope, _ = torch.split(
-                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
+            k_rope = self._select_rope_slice(key)
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        self._update_rope_guarded(self._select_rope_slice(query), q_rope)
+        self._update_rope_guarded(self._select_rope_slice(key), k_rope)
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -571,12 +565,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Non-fusion path only; self.wk does not exist when fusion is on.
         key, _ = self.wk(x)
         key = self.k_norm(key)
-        k_rope, _ = torch.split(
-            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
+        k_rope = self._select_rope_slice(key)
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        self._update_rope_guarded(self._select_rope_slice(key), k_rope)
         key = rotate_activation(key)
 
         return key

@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
@@ -454,19 +455,48 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._sliding_window_size = kvc.sliding_window_size
         self._page_size = kvc.page_size
 
-        # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        if model_config.attention_arch == AttentionArch.MLA:
+            # MLA stores one latent vector (compressed KV + RoPE) per token.
+            # Dots.note.omni uses different latent ranks for full and SWA
+            # layers, so the generic MHA head geometry is not applicable.
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
 
-        # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+            self._full_per_token = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
+                    server_args=kvc.server_args,
+                )
+                * kv_size
+            )
+            if is_deepseek_dsa(model_config.hf_config):
+                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
+                index_elements = (
+                    index_head_dim
+                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                )
+                self._full_per_token += index_elements * torch._utils._element_size(
+                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+            self._swa_per_token = (
+                model_config.swa_kv_lora_rank + model_config.swa_qk_rope_head_dim
+            ) * kv_size
+        else:
+            # Full layer per-token memory (bytes)
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+
+            # SWA layer per-token memory (bytes)
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32

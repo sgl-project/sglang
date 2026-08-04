@@ -99,8 +99,23 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[-w.shape[0] :].copy_(w)
+        is_scale = name.endswith(".weight_scale_inv")
+        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+            w = _clone_if_runai_streamed_tensor(loaded_weight)
+            fused_param.data[-w.shape[0] :].copy_(w)
+            return True
+
+        entry = pending.setdefault(fused_name + ".weights_proj", {})
+        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+            loaded_weight
+        )
+        if "weight" in entry and "scale" in entry:
+            pending.pop(fused_name + ".weights_proj")
+            block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+            weights_bf16 = block_quant_dequant(
+                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            )
+            fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.

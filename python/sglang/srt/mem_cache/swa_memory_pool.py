@@ -1,4 +1,5 @@
 import logging
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -8,6 +9,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
+    MLATokenToKVPool,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
@@ -31,6 +33,10 @@ class SWAKVPool(BaseSWAKVPool):
         full_attention_layer_ids: List[int],
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        full_kv_pool_class: Optional[type] = None,
+        swa_kv_pool_class: Optional[type] = None,
+        full_kv_pool_kwargs: Optional[dict] = None,
+        swa_kv_pool_kwargs: Optional[dict] = None,
         **kwargs,
     ):
         self.size = size
@@ -46,35 +52,53 @@ class SWAKVPool(BaseSWAKVPool):
         self.page_size = page_size
         self.layer_transfer_counter = None
 
-        kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
-        kwargs["head_num"] = head_num
-        kwargs["head_dim"] = head_dim
-        kwargs["device"] = device
-
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        full_pool_kwargs = kwargs.copy()
-        full_pool_kwargs.pop("swa_head_num", None)
-        full_pool_kwargs.pop("swa_head_dim", None)
-        full_pool_kwargs.pop("swa_v_head_dim", None)
-        self.full_kv_pool = token_to_kv_pool_class(
+        full_kv_pool_class = full_kv_pool_class or token_to_kv_pool_class
+        swa_kv_pool_class = swa_kv_pool_class or token_to_kv_pool_class
+        common_kwargs = {
+            "page_size": page_size,
+            "enable_memory_saver": False,
+            "device": device,
+        }
+        if full_kv_pool_kwargs is None:
+            full_kv_pool_kwargs = {
+                **common_kwargs,
+                "head_num": head_num,
+                "head_dim": head_dim,
+                "allocation_label": "Full",
+                **kwargs,
+            }
+            full_kv_pool_kwargs.pop("swa_head_num", None)
+            full_kv_pool_kwargs.pop("swa_head_dim", None)
+            full_kv_pool_kwargs.pop("swa_v_head_dim", None)
+        if swa_kv_pool_kwargs is None:
+            swa_kv_pool_kwargs = {
+                **common_kwargs,
+                "head_num": head_num,
+                "head_dim": head_dim,
+                "allocation_label": "SWA",
+                **kwargs,
+            }
+
+        self.full_kv_pool = full_kv_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
-            allocation_label="Full",
-            **full_pool_kwargs,
+            **full_kv_pool_kwargs,
         )
-        self.swa_kv_pool = token_to_kv_pool_class(
+        self.swa_kv_pool = swa_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
-            allocation_label="SWA",
-            **kwargs,
+            **swa_kv_pool_kwargs,
         )
+        for attr in ("dsa_kv_cache_store_fp8", "kv_cache_dim", "index_head_dim"):
+            if hasattr(self.full_kv_pool, attr):
+                setattr(self, attr, getattr(self.full_kv_pool, attr))
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
@@ -123,9 +147,18 @@ class SWAKVPool(BaseSWAKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
     def get_kv_size_bytes(self):
-        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
-        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+        def split_size(pool):
+            size = pool.get_kv_size_bytes()
+            return size if isinstance(size, tuple) else (size, 0)
+
+        k_size, v_size = split_size(self.full_kv_pool)
+        k_size_swa, v_size_swa = split_size(self.swa_kv_pool)
         return k_size + k_size_swa, v_size + v_size_swa
+
+    def is_mla(self) -> bool:
+        return isinstance(self.full_kv_pool, MLATokenToKVPool) and isinstance(
+            self.swa_kv_pool, MLATokenToKVPool
+        )
 
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
@@ -194,21 +227,21 @@ class SWAKVPool(BaseSWAKVPool):
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
         if is_swa_layer:
             # swa_loc is the full->SWA translation, computed once per forward by
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
-            self.swa_kv_pool.set_kv_buffer(
-                None,
-                swa_loc,
+            loc = swa_loc
+        if isinstance(pool, MLATokenToKVPool):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=layer_id_pool),
+                loc,
                 cache_k,
                 cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
             )
         else:
-            self.full_kv_pool.set_kv_buffer(
+            pool.set_kv_buffer(
                 None,
                 loc,
                 cache_k,
@@ -217,6 +250,61 @@ class SWAKVPool(BaseSWAKVPool):
                 v_scale,
                 layer_id_override=layer_id_pool,
             )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        loc, swa_loc, _ = unwrap_write_loc(loc_info)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        if is_swa_layer:
+            assert swa_loc is not None
+            loc = swa_loc
+        if not isinstance(pool, MLATokenToKVPool):
+            raise TypeError(f"Layer {layer.layer_id} is not backed by an MLA KV pool")
+        pool.set_mla_kv_buffer(
+            SimpleNamespace(layer_id=layer_id_pool),
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer
+        return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id_pool)
+
+    def get_index_k_continuous(self, layer_id: int, *args, **kwargs):
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer
+        return self.full_kv_pool.get_index_k_continuous(
+            layer_id_pool, *args, **kwargs
+        )
+
+    def get_index_k_scale_continuous(self, layer_id: int, *args, **kwargs):
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer
+        return self.full_kv_pool.get_index_k_scale_continuous(
+            layer_id_pool, *args, **kwargs
+        )
+
+    def get_index_k_scale_buffer(self, layer_id: int, *args, **kwargs):
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer
+        return self.full_kv_pool.get_index_k_scale_buffer(
+            layer_id_pool, *args, **kwargs
+        )
+
+    def set_index_k_scale_buffer(self, layer_id: int, *args, **kwargs):
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer
+        return self.full_kv_pool.set_index_k_scale_buffer(
+            layer_id_pool, *args, **kwargs
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
