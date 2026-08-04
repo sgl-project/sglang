@@ -129,12 +129,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # Under prefill-side pipeline parallelism the target's embed lives on the
+        # first stage and its lm_head on the last, so only one of them reaches a
+        # draft that sits on the last stage. Keep whatever the draft loaded itself
+        # for the half the target cannot share.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
