@@ -94,8 +94,11 @@ class HostKVCache(abc.ABC):
         allocator_type: str = "default",
         dcp_size: int = 1,
         dcp_rank: int = 0,
+        *,
+        pool_label: str = "kv",
     ):
         self.device_pool = device_pool
+        self.pool_label = pool_label
         # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
@@ -127,9 +130,10 @@ class HostKVCache(abc.ABC):
 
         if self.size <= device_pool.size:
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                pool_label,
                 self.size,
                 device_pool.size,
             )
@@ -147,7 +151,10 @@ class HostKVCache(abc.ABC):
             )
         else:
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
+                pool_label,
+                self.size,
+                requested_bytes / 1e9,
             )
 
         self.kv_buffer = self.init_kv_buffer()

@@ -80,6 +80,7 @@ def build_kv_host_pool(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    pool_label: str = "kv",
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -104,6 +105,7 @@ def build_kv_host_pool(
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
+        pool_label=pool_label,
         **kwargs,
     )
 
@@ -253,6 +255,7 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
+        pool_label="full",
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
@@ -261,6 +264,7 @@ def build_hybrid_swa_stack(
         use_mla=use_mla,
         host_size=swa_host_size,
         mtp_draft_device_pools=mtp_swa_device_pools,
+        pool_label="swa",
     )
 
     if mtp_swa_device_pools:
@@ -742,6 +746,7 @@ def build_hybrid_mamba_swa_stack(
         server_args=server_args,
         use_mla=False,
         host_size=kv_host_size,
+        pool_label="full",
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
@@ -749,6 +754,7 @@ def build_hybrid_mamba_swa_stack(
         server_args=server_args,
         use_mla=False,
         host_size=swa_host_size,
+        pool_label="swa",
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
@@ -1298,7 +1304,7 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
             transfer_layer_num=len(full_layer_mapping | swa_layer_mapping),
-            pools_desc="KV + SWA",
+            pools_desc="Full + SWA",
         )
 
 

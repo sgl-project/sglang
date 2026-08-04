@@ -113,6 +113,7 @@ def _register_legacy_hicache_draft(
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
+        pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **host_pool_kwargs)

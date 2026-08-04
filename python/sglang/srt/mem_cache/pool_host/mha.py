@@ -81,7 +81,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
+        pool_label: str = "kv",
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
@@ -94,6 +96,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            pool_label=pool_label,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
