@@ -9,6 +9,7 @@ import torch
 # SGLang initializes torch.distributed, but this kernel has no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
 _LOG2_E = 1.4426950408889634
+_SMALL_HEAD_THRESHOLD = 12
 
 # Tile V on the CUDA x axis so tensor-parallel head counts do not change the
 # grid width.
@@ -46,6 +47,16 @@ _KDA_BF16_CONFIG = helion.Config(
     range_num_stages=[],
     range_unroll_factors=[0],
     range_warp_specializes=[None],
+)
+
+# Bounded-gate, small-head decode benefits from a wider V tile and an XYZ grid.
+_KDA_BF16_SMALL_HEAD_CONFIG = helion.Config(
+    block_sizes=[32],
+    loop_orders=[[2, 1, 0]],
+    num_warps=1,
+    num_stages=1,
+    indexing="pointer",
+    pid_type="xyz",
 )
 
 
@@ -168,6 +179,12 @@ _helion_fused_recurrent_kda_packed_decode_bf16 = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
     static_shapes=False,
     config=_KDA_BF16_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)
+_helion_fused_recurrent_kda_packed_decode_bf16_small_head = helion.kernel(
+    _helion_fused_recurrent_kda_packed_decode_body,
+    static_shapes=False,
+    config=_KDA_BF16_SMALL_HEAD_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
 
@@ -310,7 +327,7 @@ def helion_fused_recurrent_kda_packed_decode(
     * The return is the same ``(out, initial_state)`` object pair supplied by the
       caller.
     """
-    _validate_packed_decode_inputs(
+    _, num_q_heads, _, _, _ = _validate_packed_decode_inputs(
         mixed_qkv,
         a,
         b,
@@ -321,11 +338,16 @@ def helion_fused_recurrent_kda_packed_decode(
         ssm_state_indices,
     )
     is_bf16_state = initial_state.dtype is torch.bfloat16
-    kernel = (
-        _helion_fused_recurrent_kda_packed_decode_bf16
-        if is_bf16_state
-        else _helion_fused_recurrent_kda_packed_decode
-    )
+    if (
+        is_bf16_state
+        and lower_bound is not None
+        and num_q_heads <= _SMALL_HEAD_THRESHOLD
+    ):
+        kernel = _helion_fused_recurrent_kda_packed_decode_bf16_small_head
+    elif is_bf16_state:
+        kernel = _helion_fused_recurrent_kda_packed_decode_bf16
+    else:
+        kernel = _helion_fused_recurrent_kda_packed_decode
     use_lower_bound = lower_bound is not None
     lower_bound_value = 0.0 if lower_bound is None else lower_bound
     result = kernel(

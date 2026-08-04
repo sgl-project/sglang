@@ -27,7 +27,11 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 return_value=helion_kernel,
             ) as constructor,
         ):
-            dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+            dispatcher = KDAKernelDispatcher(
+                decode_backend,
+                prefill_backend,
+                LinearAttnKernelBackend.TRITON,
+            )
         return dispatcher, helion_kernel, constructor
 
     def test_combined_backend_reuses_adapter_and_keeps_triton_verify(self):

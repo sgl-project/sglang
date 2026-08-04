@@ -24,6 +24,7 @@ SOFTPLUS_THRESHOLD = 20.0
 
 # SGLang initializes torch.distributed, but these kernels have no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
+_SMALL_HEAD_THRESHOLD = 12
 
 
 _L2_NORM_CONFIG = helion.Config(
@@ -1000,6 +1001,24 @@ _STATE_VARLEN_CONFIG = helion.Config(
     range_warp_specializes=[None, False],
 )
 
+# Packed small-head workloads benefit from a wider V tile during state propagation.
+_STATE_VARLEN_SMALL_HEAD_CONFIG = helion.Config(
+    atomic_indexing=[],
+    block_sizes=[32],
+    indexing=["pointer"] * 12,
+    l2_groupings=[1],
+    load_eviction_policies=["", "", "", "last", "first", "", "", "", "first"],
+    loop_orders=[[1, 2, 0]],
+    num_stages=3,
+    num_warps=8,
+    pid_type="flat",
+    range_flattens=[None, None],
+    range_multi_buffers=[None, True],
+    range_num_stages=[],
+    range_unroll_factors=[0, 0],
+    range_warp_specializes=[None, None],
+)
+
 
 @helion.kernel(
     static_shapes=False,
@@ -1132,6 +1151,11 @@ def _chunk_state(
 _chunk_state_varlen = helion.kernel(
     static_shapes=False,
     config=_STATE_VARLEN_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)(_chunk_state.fn)
+_chunk_state_varlen_small_head = helion.kernel(
+    static_shapes=False,
+    config=_STATE_VARLEN_SMALL_HEAD_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_chunk_state.fn)
 
@@ -1328,7 +1352,12 @@ def chunk_kda(
     else:
         metadata = torch.empty(0, device=q.device, dtype=torch.int32)
         chunk_offsets = torch.empty(0, device=q.device, dtype=torch.long)
-    state_kernel = _chunk_state_varlen if is_varlen else _chunk_state
+    if is_varlen and q.size(2) <= _SMALL_HEAD_THRESHOLD:
+        state_kernel = _chunk_state_varlen_small_head
+    elif is_varlen:
+        state_kernel = _chunk_state_varlen
+    else:
+        state_kernel = _chunk_state
     h, v_new = state_kernel(
         kg,
         w,
