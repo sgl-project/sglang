@@ -1417,6 +1417,8 @@ class ModelConfig:
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
+            # Keep explicit or inherited modelopt_fp4 for literal FP8 checkpoints
+            # so eligible MoE experts are requantized online.
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8"],
