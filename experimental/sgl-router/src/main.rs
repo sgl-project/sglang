@@ -142,7 +142,17 @@ async fn main() -> Result<()> {
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
-    // Spawn discovery + manager tasks.
+    let proxy = Arc::new(
+        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
+            cfg.proxy.request_timeout_secs,
+        ))
+        .context("construct proxy")?,
+    );
+
+    // Spawn discovery + manager tasks. The manager resolves each worker's wire
+    // protocol from its `/server_info` and stamps it onto the registered
+    // worker; the proxy holds a client per protocol and selects by the worker's
+    // protocol per request, so the manager needs no proxy handle.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
@@ -155,13 +165,6 @@ async fn main() -> Result<()> {
         kv_index_opt,
         Some(Arc::clone(&active_load)),
     ));
-
-    let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
-            cfg.proxy.request_timeout_secs,
-        ))
-        .context("build proxy client")?,
-    );
 
     let ctx = Arc::new(
         sgl_router::server::app_context::AppContext::with_active_load(
