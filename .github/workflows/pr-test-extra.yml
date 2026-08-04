@@ -133,10 +133,9 @@ jobs:
 
   # =============================================== Rust extensions ====================================================
 
-  # Own build job rather than the base run's artifact: artifacts are per-run, so a
-  # standalone `run-ci-extra` run cannot reach one. Only artifact_name is suffixed
-  # - cache_key_prefix stays at the default so the two workflows share one cache
-  # entry and compile at most once between them.
+  # Own build job because artifacts are per-run: a standalone `run-ci-extra` run
+  # cannot reach the base run's. Only artifact_name is suffixed; the cache prefix
+  # stays at the default so the two workflows compile at most once between them.
   rust-ext-build:
     needs: [check-changes, call-gate]
     if: |

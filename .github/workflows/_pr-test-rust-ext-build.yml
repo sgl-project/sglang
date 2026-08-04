@@ -26,7 +26,7 @@ on:
         type: string
         default: rust-ext-x86_64
       cache_key_prefix:
-        description: 'Cache key prefix, deliberately shared across callers so they compile at most once between them. Encodes the arch, since the modules are not portable across them.'
+        description: 'Cache key prefix. Callers share it on purpose so at most one of them compiles; it encodes the arch, since the modules are not portable across architectures.'
         type: string
         default: rust-ext-x86_64
       max_glibc:
@@ -130,8 +130,7 @@ jobs:
           max_allowed="${{ inputs.max_glibc }}"
           status=0
           for so in "${built[@]}"; do
-              # `|| true` because grep exits 1 with no match, and pipefail would
-              # take the whole step down instead of reaching the empty branch.
+              # grep exits 1 with no match; without `|| true` pipefail kills the step.
               needed=$(objdump -T "$so" \
                   | grep -oE 'GLIBC_2\.[0-9]+' \
                   | sed 's/GLIBC_//' \

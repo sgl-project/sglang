@@ -337,11 +337,10 @@ require_prebuilt_rust_exts() {
         return
     fi
 
-    # Match this interpreter's EXT_SUFFIX rather than globbing _core*.so: no crate
-    # sets abi3, so a module built for another minor version still satisfies the
-    # glob while the import system ignores it - which is exactly the silent
-    # is_rust_server_built() skip this check exists to catch. Test runners have no
-    # setup-python, so their interpreter is whatever the image ships.
+    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a
+    # module built for another minor version satisfies the glob while the import
+    # system ignores it - the silent is_rust_server_built() skip this guard exists
+    # to catch. Stages have no setup-python, so the interpreter is the image's.
     local suffix
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
