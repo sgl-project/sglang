@@ -40,8 +40,14 @@ from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+aiter_conv2d = None
 if _use_aiter:
-    from aiter.ops.triton.conv.conv2d import conv2d as aiter_conv2d
+    try:
+        from aiter.ops.triton.conv.conv2d import conv2d as aiter_conv2d
+    except ImportError:
+        # Older aiter builds do not ship this op; the linear fallback below
+        # covers it, so it must not make the model unimportable.
+        pass
 
 _SM103_TRITON_MAX_SEQLEN = 1536
 _SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
@@ -317,7 +323,7 @@ class MoonVision3dPatchEmbed(nn.Module):
     ) -> torch.Tensor:
         # MIOpen can overflow grid_size for some patch shapes. Prefer AITER's
         # Triton convolution on AMD, with an equivalent linear fallback.
-        if _use_aiter:
+        if aiter_conv2d is not None:
             x = aiter_conv2d(
                 x,
                 self.proj.weight,
