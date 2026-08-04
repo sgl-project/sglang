@@ -326,6 +326,47 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
+        # AMD gfx950: FlyDSL fused decode path (conv + delta-rule + RMSNorm in one kernel).
+        # _k3_flydsl_decode_args is stashed by model-side prepare_weights for Kimi-K3 on gfx950.
+        # Falls through to the standard causal_conv1d_update chain if not set.
+        flydsl_static = getattr(layer, "_k3_flydsl_decode_args", None)
+        _onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        if (
+            flydsl_static is not None
+            and _onorm_gate is not None
+            and mixed_qkv.shape[0] == cache_indices.shape[0]
+            and b.ndim == 3
+            and a.ndim == 2
+        ):
+            try:
+                from aiter.ops.flydsl.kimi_k3_kda_decode import flydsl_kimi_k3_kda_decode
+                conv_w, a_log, dt_bias, onorm_w, onorm_eps = flydsl_static
+                B = mixed_qkv.shape[0]
+                core_attn_out = flydsl_kimi_k3_kda_decode(
+                    x=mixed_qkv,
+                    conv_weight=conv_w,
+                    conv_bias=None,
+                    conv_state=conv_states.transpose(-1, -2),
+                    raw_g=a.view(1, B, 12, 128),
+                    raw_beta=b,
+                    A_log=a_log,
+                    dt_bias=dt_bias,
+                    lower_bound=getattr(layer, "lower_bound", None),
+                    state=ssm_states,
+                    state_indices=cache_indices.to(torch.int32),
+                    output_gate=_onorm_gate.view(B, 12, 128),
+                    norm_weight=onorm_w,
+                    norm_eps=onorm_eps,
+                )
+                if hasattr(layer, "_k3_onorm_consumed"):
+                    layer._k3_onorm_consumed = True
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
+                return core_attn_out
+            except Exception:
+                pass  # fall through to standard path
+
         qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
