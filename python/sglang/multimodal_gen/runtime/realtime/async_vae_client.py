@@ -54,6 +54,7 @@ class RemoteDecodeResult:
     latent_send_ms: float
     credit_wait_ms: float
     first_frame_ms: float | None
+    completed_at: float
 
 
 FrameBatchHandler = Callable[[RemoteFrameBatch], Awaitable[None]]
@@ -110,6 +111,7 @@ class RealtimeVAEClient:
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, _PendingDecode] = {}
         self._background_tasks: set[asyncio.Task] = set()
+        self._callback_tail: asyncio.Task | None = None
         self._closed = False
 
     async def open(
@@ -124,6 +126,7 @@ class RealtimeVAEClient:
         self._ws = await self._connect_factory(
             self.url,
             max_size=self.max_message_bytes,
+            compression=None,
             open_timeout=self.timeout_s,
             close_timeout=2,
             ping_interval=20,
@@ -254,7 +257,7 @@ class RealtimeVAEClient:
                             time.perf_counter() - pending.sent_at
                         ) * 1000.0
                     frame_batch = self._decode_frame_batch(message, pending.header)
-                    previous = pending.callback_tail
+                    previous = self._callback_tail
 
                     async def dispatch(
                         previous=previous,
@@ -266,6 +269,7 @@ class RealtimeVAEClient:
                         await pending.on_frame_batch(frame_batch)
 
                     pending.callback_tail = asyncio.create_task(dispatch())
+                    self._callback_tail = pending.callback_tail
                 elif message_type == "chunk_complete":
                     if pending is None:
                         raise ProtocolViolation("completion for unknown VAE request")
@@ -333,11 +337,21 @@ class RealtimeVAEClient:
         )
 
     async def _finish_pending(self, pending: _PendingDecode, message: dict) -> None:
-        if pending.callback_tail is not None:
-            await pending.callback_tail
-        if pending.result.done():
+        completed_at = time.perf_counter()
+        try:
+            if pending.callback_tail is not None:
+                await pending.callback_tail
+        except asyncio.CancelledError:
+            self._pending.pop(pending.header.request_id, None)
+            if not pending.result.done():
+                pending.result.cancel()
+            raise
+        except Exception as exc:
+            self._fail_pending(pending, exc)
             return
         self._pending.pop(pending.header.request_id, None)
+        if pending.result.done():
+            return
         pending.result.set_result(
             RemoteDecodeResult(
                 request_id=pending.header.request_id,
@@ -346,11 +360,12 @@ class RealtimeVAEClient:
                 queue_wait_ms=float(message.get("queue_wait_ms") or 0.0),
                 decode_ms=float(message.get("decode_ms") or 0.0),
                 encode_ms=float(message.get("encode_ms") or 0.0),
-                transfer_ms=(time.perf_counter() - pending.sent_at) * 1000.0,
+                transfer_ms=(completed_at - pending.sent_at) * 1000.0,
                 serialize_ms=pending.serialize_ms,
                 latent_send_ms=pending.latent_send_ms,
                 credit_wait_ms=pending.credit_wait_ms,
                 first_frame_ms=pending.first_frame_ms,
+                completed_at=completed_at,
             )
         )
 
@@ -391,3 +406,4 @@ class RealtimeVAEClient:
         if self._ws is not None:
             await self._ws.close()
         self._ws = None
+        self._callback_tail = None

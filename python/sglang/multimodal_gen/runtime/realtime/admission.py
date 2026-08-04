@@ -25,6 +25,7 @@ class SessionLease:
     generation_id: str
     token: str
     expires_at: float
+    capacity_slot: str | None = None
 
 
 class SessionLeaseStore(Protocol):
@@ -159,13 +160,11 @@ class RealtimeAdmissionController:
 
 
 class DynamoDBSessionLeaseStore:
-    """Optional multi-Gateway lease store with a transactional capacity counter.
+    """Optional multi-Gateway store backed by expiring capacity-slot leases.
 
     The table must use a string partition key named ``lease_key``. This adapter is
     intentionally lazy so boto3 is not required for the default in-memory mode.
     """
-
-    _CAPACITY_KEY = "CAPACITY"
 
     def __init__(
         self,
@@ -178,6 +177,10 @@ class DynamoDBSessionLeaseStore:
     ) -> None:
         if not table_name:
             raise ValueError("table_name is required")
+        if max_active_sessions < 1:
+            raise ValueError("max_active_sessions must be positive")
+        if ttl_s <= 0:
+            raise ValueError("ttl_s must be positive")
         self.table_name = table_name
         self.max_active_sessions = max_active_sessions
         self.ttl_s = ttl_s
@@ -204,6 +207,17 @@ class DynamoDBSessionLeaseStore:
     def _user_key(user_id: str) -> str:
         return f"USER#{user_id}"
 
+    @staticmethod
+    def _slot_key(index: int) -> str:
+        return f"CAPACITY#{index:06d}"
+
+    @staticmethod
+    def _is_active_item(item: dict | None, now_epoch: int) -> bool:
+        if not item:
+            return False
+        expires_at = item.get("expires_at", {}).get("N")
+        return expires_at is not None and int(expires_at) > now_epoch
+
     async def acquire(
         self, user_id: str, session_id: str, generation_id: str
     ) -> SessionLease:
@@ -214,81 +228,127 @@ class DynamoDBSessionLeaseStore:
     def _acquire_sync(
         self, user_id: str, session_id: str, generation_id: str
     ) -> SessionLease:
+        if not user_id or not session_id or not generation_id:
+            raise AdmissionRejected("INVALID_SESSION_IDENTITY")
         now_epoch = int(time.time())
         expires_epoch = now_epoch + max(1, int(self.ttl_s))
         token = uuid4().hex
         client = self._get_client()
-        try:
-            client.transact_write_items(
-                TransactItems=[
-                    {
-                        "Update": {
-                            "TableName": self.table_name,
-                            "Key": {"lease_key": {"S": self._CAPACITY_KEY}},
-                            "UpdateExpression": (
-                                "SET active_count = if_not_exists(active_count, :zero) + :one"
-                            ),
-                            "ConditionExpression": (
-                                "attribute_not_exists(active_count) OR active_count < :max"
-                            ),
-                            "ExpressionAttributeValues": {
-                                ":zero": {"N": "0"},
-                                ":one": {"N": "1"},
-                                ":max": {"N": str(self.max_active_sessions)},
-                            },
-                        }
-                    },
-                    {
-                        "Put": {
-                            "TableName": self.table_name,
-                            "Item": {
-                                "lease_key": {"S": self._user_key(user_id)},
-                                "user_id": {"S": user_id},
-                                "session_id": {"S": session_id},
-                                "generation_id": {"S": generation_id},
-                                "token": {"S": token},
-                                "expires_at": {"N": str(expires_epoch)},
-                            },
-                            "ConditionExpression": "attribute_not_exists(lease_key)",
-                        }
-                    },
-                ]
+        user_key = self._user_key(user_id)
+
+        existing = client.get_item(
+            TableName=self.table_name,
+            Key={"lease_key": {"S": user_key}},
+            ConsistentRead=True,
+        ).get("Item")
+        if self._is_active_item(existing, now_epoch):
+            raise AdmissionRejected("USER_SESSION_LIMIT")
+
+        for slot_index in range(self.max_active_sessions):
+            slot_key = self._slot_key(slot_index)
+            common_values = {":now": {"N": str(now_epoch)}}
+            try:
+                client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "Put": {
+                                "TableName": self.table_name,
+                                "Item": {
+                                    "lease_key": {"S": slot_key},
+                                    "user_id": {"S": user_id},
+                                    "session_id": {"S": session_id},
+                                    "generation_id": {"S": generation_id},
+                                    "token": {"S": token},
+                                    "expires_at": {"N": str(expires_epoch)},
+                                },
+                                "ConditionExpression": (
+                                    "attribute_not_exists(#token) OR expires_at <= :now"
+                                ),
+                                "ExpressionAttributeNames": {"#token": "token"},
+                                "ExpressionAttributeValues": common_values,
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": self.table_name,
+                                "Item": {
+                                    "lease_key": {"S": user_key},
+                                    "user_id": {"S": user_id},
+                                    "session_id": {"S": session_id},
+                                    "generation_id": {"S": generation_id},
+                                    "capacity_slot": {"S": slot_key},
+                                    "token": {"S": token},
+                                    "expires_at": {"N": str(expires_epoch)},
+                                },
+                                "ConditionExpression": (
+                                    "attribute_not_exists(#token) OR expires_at <= :now"
+                                ),
+                                "ExpressionAttributeNames": {"#token": "token"},
+                                "ExpressionAttributeValues": common_values,
+                            }
+                        },
+                    ]
+                )
+            except client.exceptions.TransactionCanceledException as exc:
+                existing = client.get_item(
+                    TableName=self.table_name,
+                    Key={"lease_key": {"S": user_key}},
+                    ConsistentRead=True,
+                ).get("Item")
+                if self._is_active_item(existing, now_epoch):
+                    raise AdmissionRejected("USER_SESSION_LIMIT") from exc
+                continue
+            return SessionLease(
+                user_id=user_id,
+                session_id=session_id,
+                generation_id=generation_id,
+                token=token,
+                expires_at=time.monotonic() + self.ttl_s,
+                capacity_slot=slot_key,
             )
-        except client.exceptions.TransactionCanceledException as exc:
-            existing = client.get_item(
-                TableName=self.table_name,
-                Key={"lease_key": {"S": self._user_key(user_id)}},
-                ConsistentRead=True,
-            ).get("Item")
-            reason = "USER_SESSION_LIMIT" if existing else "CAPACITY_EXHAUSTED"
-            raise AdmissionRejected(reason, retry_after_s=1.0) from exc
-        return SessionLease(
-            user_id=user_id,
-            session_id=session_id,
-            generation_id=generation_id,
-            token=token,
-            expires_at=time.monotonic() + self.ttl_s,
-        )
+
+        raise AdmissionRejected("CAPACITY_EXHAUSTED", retry_after_s=1.0)
 
     async def renew(self, lease: SessionLease) -> SessionLease:
         return await asyncio.to_thread(self._renew_sync, lease)
 
     def _renew_sync(self, lease: SessionLease) -> SessionLease:
+        if lease.capacity_slot is None:
+            raise AdmissionRejected("LEASE_LOST")
         expires_epoch = int(time.time()) + max(1, int(self.ttl_s))
         client = self._get_client()
         try:
-            client.update_item(
-                TableName=self.table_name,
-                Key={"lease_key": {"S": self._user_key(lease.user_id)}},
-                UpdateExpression="SET expires_at = :expires",
-                ConditionExpression="#token = :token",
-                ExpressionAttributeNames={"#token": "token"},
-                ExpressionAttributeValues={
-                    ":token": {"S": lease.token},
-                    ":expires": {"N": str(expires_epoch)},
-                },
+            values = {
+                ":token": {"S": lease.token},
+                ":expires": {"N": str(expires_epoch)},
+            }
+            client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self.table_name,
+                            "Key": {
+                                "lease_key": {"S": self._user_key(lease.user_id)}
+                            },
+                            "UpdateExpression": "SET expires_at = :expires",
+                            "ConditionExpression": "#token = :token",
+                            "ExpressionAttributeNames": {"#token": "token"},
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": self.table_name,
+                            "Key": {"lease_key": {"S": lease.capacity_slot}},
+                            "UpdateExpression": "SET expires_at = :expires",
+                            "ConditionExpression": "#token = :token",
+                            "ExpressionAttributeNames": {"#token": "token"},
+                            "ExpressionAttributeValues": values,
+                        }
+                    },
+                ]
             )
-        except client.exceptions.ConditionalCheckFailedException as exc:
+        except client.exceptions.TransactionCanceledException as exc:
             raise AdmissionRejected("LEASE_LOST") from exc
         return SessionLease(
             user_id=lease.user_id,
@@ -296,12 +356,15 @@ class DynamoDBSessionLeaseStore:
             generation_id=lease.generation_id,
             token=lease.token,
             expires_at=time.monotonic() + self.ttl_s,
+            capacity_slot=lease.capacity_slot,
         )
 
     async def release(self, lease: SessionLease) -> None:
         await asyncio.to_thread(self._release_sync, lease)
 
     def _release_sync(self, lease: SessionLease) -> None:
+        if lease.capacity_slot is None:
+            return
         client = self._get_client()
         try:
             client.transact_write_items(
@@ -318,14 +381,13 @@ class DynamoDBSessionLeaseStore:
                         }
                     },
                     {
-                        "Update": {
+                        "Delete": {
                             "TableName": self.table_name,
-                            "Key": {"lease_key": {"S": self._CAPACITY_KEY}},
-                            "UpdateExpression": "ADD active_count :minus_one",
-                            "ConditionExpression": "active_count > :zero",
+                            "Key": {"lease_key": {"S": lease.capacity_slot}},
+                            "ConditionExpression": "#token = :token",
+                            "ExpressionAttributeNames": {"#token": "token"},
                             "ExpressionAttributeValues": {
-                                ":minus_one": {"N": "-1"},
-                                ":zero": {"N": "0"},
+                                ":token": {"S": lease.token}
                             },
                         }
                     },

@@ -10,7 +10,10 @@ import pytest
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     calculate_overlap_ms,
     calculate_overlap_ratio,
+    log_realtime_trace,
     realtime_trace_payload,
+    register_realtime_trace_sink,
+    unregister_realtime_trace_sink,
 )
 
 
@@ -46,3 +49,51 @@ def test_overlap_ratio_uses_actual_interval_intersection():
 
     assert calculate_overlap_ratio(denoise, vae) == pytest.approx(0.4)
     assert calculate_overlap_ms(denoise, vae) == pytest.approx(200_000)
+
+
+def test_trace_sinks_are_scoped_by_session_even_when_client_trace_ids_collide():
+    first_events = []
+    second_events = []
+    first = SimpleNamespace(
+        id="session-1",
+        generation_id="generation-1",
+        trace_id="client-trace",
+        trace_started_at=0,
+    )
+    second = SimpleNamespace(
+        id="session-2",
+        generation_id="generation-2",
+        trace_id="client-trace",
+        trace_started_at=0,
+    )
+    register_realtime_trace_sink(
+        first.trace_id,
+        first_events.append,
+        session_id=first.id,
+        generation_id=first.generation_id,
+    )
+    register_realtime_trace_sink(
+        second.trace_id,
+        second_events.append,
+        session_id=second.id,
+        generation_id=second.generation_id,
+    )
+    try:
+        log_realtime_trace(SimpleNamespace(info=lambda *args: None), first, "first")
+        log_realtime_trace(SimpleNamespace(info=lambda *args: None), second, "second")
+    finally:
+        unregister_realtime_trace_sink(
+            first.trace_id,
+            first_events.append,
+            session_id=first.id,
+            generation_id=first.generation_id,
+        )
+        unregister_realtime_trace_sink(
+            second.trace_id,
+            second_events.append,
+            session_id=second.id,
+            generation_id=second.generation_id,
+        )
+
+    assert [event["event"] for event in first_events] == ["first"]
+    assert [event["event"] for event in second_events] == ["second"]

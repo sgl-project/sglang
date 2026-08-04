@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
+    realtime_video_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_api import (
     _OrderedDecodeCoordinator,
 )
@@ -68,6 +73,52 @@ def test_coordinator_cancel_stops_pending_decode():
     asyncio.run(scenario())
 
 
+def test_remote_frame_handlers_keep_first_frame_trace_scoped_to_their_chunk():
+    async def scenario():
+        traces = []
+        sends = []
+
+        def fake_trace(_logger, _session, event, **fields):
+            traces.append((event, fields))
+
+        async def fake_send(_ws, _session, batch, frame_batch, send_stats):
+            sends.append((batch.name, frame_batch.chunk_index, send_stats))
+
+        session = SimpleNamespace()
+        chunk_zero = SimpleNamespace(index=0, request_id="request-0")
+        chunk_one = SimpleNamespace(index=1, request_id="request-1")
+        batch_zero = SimpleNamespace(name="batch-0", realtime_event_id=10)
+        batch_one = SimpleNamespace(name="batch-1", realtime_event_id=11)
+        send_stats_zero = {}
+        send_stats_one = {}
+
+        with (
+            patch.object(realtime_video_api, "log_realtime_trace", fake_trace),
+            patch.object(realtime_video_api, "_send_remote_frame_batch", fake_send),
+        ):
+            handler_zero = realtime_video_api._make_remote_frame_batch_handler(
+                object(), session, chunk_zero, batch_zero, send_stats_zero
+            )
+            handler_one = realtime_video_api._make_remote_frame_batch_handler(
+                object(), session, chunk_one, batch_one, send_stats_one
+            )
+            frame_zero = SimpleNamespace(frame_batch_index=0, chunk_index=0)
+            frame_one = SimpleNamespace(frame_batch_index=0, chunk_index=1)
+            await handler_zero(frame_zero)
+            await handler_zero(frame_zero)
+            await handler_one(frame_one)
+
+        first_frame_traces = [fields for _, fields in traces]
+        assert [item["chunk_index"] for item in first_frame_traces] == [0, 1]
+        assert [item["request_id"] for item in first_frame_traces] == [
+            "request-0",
+            "request-1",
+        ]
+        assert [item[0] for item in sends] == ["batch-0", "batch-0", "batch-1"]
+
+    asyncio.run(scenario())
+
+
 def test_remote_vae_client_streams_batches_before_chunk_completion():
     class FakeSocket:
         def __init__(self):
@@ -86,9 +137,11 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
 
     async def scenario():
         socket = FakeSocket()
+        connect_kwargs = {}
 
         async def connect_factory(*args, **kwargs):
-            del args, kwargs
+            del args
+            connect_kwargs.update(kwargs)
             return socket
 
         await socket.received.put(
@@ -106,6 +159,7 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
             connect_factory=connect_factory,
         )
         await client.open(output_format="webp", quality=80, preview_max_width=560)
+        assert connect_kwargs["compression"] is None
         assert decode_message(await socket.sent.get())["type"] == "session_open"
 
         received_batches = []
@@ -172,5 +226,226 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
 
     async def _append_async(items, value):
         items.append(value)
+
+    asyncio.run(scenario())
+
+
+def test_remote_vae_client_orders_frame_callbacks_across_chunks():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = asyncio.Queue()
+            self.received = asyncio.Queue()
+
+        async def send(self, payload):
+            await self.sent.put(payload)
+
+        async def recv(self):
+            return await self.received.get()
+
+        async def close(self):
+            pass
+
+    async def scenario():
+        socket = FakeSocket()
+
+        async def connect_factory(*args, **kwargs):
+            del args, kwargs
+            return socket
+
+        await socket.received.put(
+            encode_message(
+                "session_accepted",
+                session_id="s",
+                generation_id="g",
+                credit_chunk_index=0,
+            )
+        )
+        client = RealtimeVAEClient(
+            "ws://vae",
+            session_id="s",
+            generation_id="g",
+            connect_factory=connect_factory,
+        )
+        await client.open(output_format="webp", quality=80, preview_max_width=560)
+        await socket.sent.get()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def first_callback(_batch):
+            first_started.set()
+            await release_first.wait()
+
+        async def second_callback(_batch):
+            second_started.set()
+
+        async def submit(chunk_index, request_id, callback):
+            task = asyncio.create_task(
+                client.submit(
+                    torch.zeros(1, 48, 1, 2, 2, dtype=torch.bfloat16),
+                    {
+                        "session_id": "s",
+                        "generation_id": "g",
+                        "request_id": request_id,
+                        "chunk_index": chunk_index,
+                    },
+                    on_frame_batch=callback,
+                )
+            )
+            await socket.sent.get()
+            await socket.received.put(
+                encode_message(
+                    "latent_accepted",
+                    session_id="s",
+                    generation_id="g",
+                    request_id=request_id,
+                    chunk_index=chunk_index,
+                )
+            )
+            return await task
+
+        first_handle = await submit(0, "r0", first_callback)
+        second_handle = await submit(1, "r1", second_callback)
+        for chunk_index, request_id in ((0, "r0"), (1, "r1")):
+            await socket.received.put(
+                encode_message(
+                    "frame_batch",
+                    session_id="s",
+                    generation_id="g",
+                    request_id=request_id,
+                    chunk_index=chunk_index,
+                    content_type="image/webp",
+                    width=8,
+                    height=8,
+                    payload_lengths=[1],
+                    num_frames=1,
+                    frame_batch_index=0,
+                    payload=b"x",
+                )
+            )
+
+        await asyncio.wait_for(first_started.wait(), 1)
+        await asyncio.sleep(0.01)
+        assert not second_started.is_set()
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), 1)
+        for chunk_index, request_id in ((0, "r0"), (1, "r1")):
+            await socket.received.put(
+                encode_message(
+                    "chunk_complete",
+                    session_id="s",
+                    generation_id="g",
+                    request_id=request_id,
+                    chunk_index=chunk_index,
+                    num_frames=1,
+                )
+            )
+        await first_handle.wait()
+        await second_handle.wait()
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_remote_vae_client_fails_and_removes_pending_on_frame_callback_error():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = asyncio.Queue()
+            self.received = asyncio.Queue()
+
+        async def send(self, payload):
+            await self.sent.put(payload)
+
+        async def recv(self):
+            return await self.received.get()
+
+        async def close(self):
+            pass
+
+    async def scenario():
+        socket = FakeSocket()
+
+        async def connect_factory(*args, **kwargs):
+            del args, kwargs
+            return socket
+
+        await socket.received.put(
+            encode_message(
+                "session_accepted",
+                session_id="s",
+                generation_id="g",
+                credit_chunk_index=0,
+            )
+        )
+        client = RealtimeVAEClient(
+            "ws://vae",
+            session_id="s",
+            generation_id="g",
+            timeout_s=1,
+            connect_factory=connect_factory,
+        )
+        await client.open(output_format="webp", quality=80, preview_max_width=560)
+        await socket.sent.get()
+
+        async def fail_callback(_batch):
+            raise RuntimeError("downstream send failed")
+
+        submit_task = asyncio.create_task(
+            client.submit(
+                torch.zeros(1, 48, 1, 2, 2, dtype=torch.bfloat16),
+                {
+                    "session_id": "s",
+                    "generation_id": "g",
+                    "request_id": "r0",
+                    "chunk_index": 0,
+                },
+                on_frame_batch=fail_callback,
+            )
+        )
+        await socket.sent.get()
+        await socket.received.put(
+            encode_message(
+                "latent_accepted",
+                session_id="s",
+                generation_id="g",
+                request_id="r0",
+                chunk_index=0,
+            )
+        )
+        handle = await submit_task
+        await socket.received.put(
+            encode_message(
+                "frame_batch",
+                session_id="s",
+                generation_id="g",
+                request_id="r0",
+                chunk_index=0,
+                content_type="image/webp",
+                width=8,
+                height=8,
+                payload_lengths=[1],
+                num_frames=1,
+                frame_batch_index=0,
+                payload=b"x",
+            )
+        )
+        await socket.received.put(
+            encode_message(
+                "chunk_complete",
+                session_id="s",
+                generation_id="g",
+                request_id="r0",
+                chunk_index=0,
+                num_frames=1,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="downstream send failed"):
+            await handle.wait()
+        assert not client._pending
+        await client.close()
+
+    import pytest
 
     asyncio.run(scenario())

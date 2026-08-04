@@ -97,6 +97,40 @@ def compare_profiles(baseline: dict, asynchronous: dict) -> dict:
     base_p95 = float(base_e2e["p95"])
     async_p95 = float(async_e2e["p95"])
     improvement = (base_p95 - async_p95) / base_p95 * 100.0 if base_p95 else 0.0
+    by_concurrency = []
+    for concurrency in common:
+        baseline_run = baseline_runs[concurrency]
+        async_run = async_runs[concurrency]
+        baseline_action = float(
+            (baseline_run.get("action_to_first_frame_ms") or {})["p95"]
+        )
+        async_action = float(
+            (async_run.get("action_to_first_frame_ms") or {})["p95"]
+        )
+        baseline_chunk = float(baseline_run["chunk_total_ms"]["p95"])
+        async_chunk = float(async_run["chunk_total_ms"]["p95"])
+        baseline_throughput = float(baseline_run.get("aggregate_fps") or 0.0)
+        async_throughput = float(async_run.get("aggregate_fps") or 0.0)
+        by_concurrency.append(
+            {
+                "concurrency": concurrency,
+                "baseline_action_p95_ms": baseline_action,
+                "async_action_p95_ms": async_action,
+                "action_improvement_pct": _improvement_pct(
+                    baseline_action, async_action
+                ),
+                "baseline_chunk_p95_ms": baseline_chunk,
+                "async_chunk_p95_ms": async_chunk,
+                "chunk_improvement_pct": _improvement_pct(
+                    baseline_chunk, async_chunk
+                ),
+                "baseline_fps": baseline_throughput,
+                "async_fps": async_throughput,
+                "throughput_improvement_pct": _increase_pct(
+                    baseline_throughput, async_throughput
+                ),
+            }
+        )
     return {
         "comparison_concurrency": comparison_concurrency,
         "baseline_p95_ms": base_p95,
@@ -104,7 +138,16 @@ def compare_profiles(baseline: dict, asynchronous: dict) -> dict:
         "async_improvement_pct": improvement,
         "baseline_fps": float(base.get("aggregate_fps") or 0.0),
         "async_fps": float(current.get("aggregate_fps") or 0.0),
+        "by_concurrency": by_concurrency,
     }
+
+
+def _improvement_pct(baseline: float, current: float) -> float:
+    return (baseline - current) / baseline * 100.0 if baseline else 0.0
+
+
+def _increase_pct(baseline: float, current: float) -> float:
+    return (current - baseline) / baseline * 100.0 if baseline else 0.0
 
 
 def build_report(baseline: dict, asynchronous: dict) -> dict:
@@ -122,6 +165,14 @@ def build_report(baseline: dict, asynchronous: dict) -> dict:
 
 def render_markdown(report: dict) -> str:
     comparison = report["comparison"]
+    baseline_hardware = report["hardware"]["baseline"]
+    async_hardware = report["hardware"]["async"]
+    async_first = report["async"]["runs"][0]
+    stage_ms = async_first.get("stage_ms", {})
+
+    def p95(name: str) -> float:
+        return float((stage_ms.get(name) or {}).get("p95") or 0.0)
+
     lines = [
         "# MinWM 异步 VAE 端到端测试报告",
         "",
@@ -133,10 +184,18 @@ def render_markdown(report: dict) -> str:
         f"{comparison['baseline_p95_ms']:.1f} ms → {comparison['async_p95_ms']:.1f} ms",
         f"- 端到端 P95 改善：{comparison['async_improvement_pct']:.2f}%",
         "",
+        "## 硬件与部署",
+        "",
+        "| 模式 | Denoiser | VAE | 实例/容量 | GPU 使用数 |",
+        "|---|---|---|---|---:|",
+        _hardware_row("baseline", baseline_hardware),
+        _hardware_row("async", async_hardware),
+        "",
         "## 并发压测",
         "",
-        "| 模式 | 并发 | P95 action→首帧 (ms) | 最低单会话 FPS | 集群 FPS | 错误率 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| 模式 | 并发 | P95 action→首帧 (ms) | P95 chunk (ms) | "
+        "最低单会话 FPS | 集群 FPS | 错误率 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for profile_name in ("baseline", "async"):
         for run in report[profile_name]["runs"]:
@@ -144,11 +203,55 @@ def render_markdown(report: dict) -> str:
             lines.append(
                 f"| {profile_name} | {run['concurrency']} | "
                 f"{float(e2e.get('p95') or 0):.1f} | "
+                f"{float((run.get('chunk_total_ms') or {}).get('p95') or 0):.1f} | "
                 f"{float(run.get('min_session_fps') or 0):.2f} | "
                 f"{float(run.get('aggregate_fps') or 0):.2f} | "
                 f"{float(run.get('error_rate') or 0) * 100:.2f}% |"
             )
+    lines.extend(
+        [
+            "",
+            "## 异步收益",
+            "",
+            "| 并发 | action P95 降低 | chunk P95 降低 | 集群吞吐提升 |",
+            "|---:|---:|---:|---:|",
+        ]
+    )
+    for row in comparison["by_concurrency"]:
+        lines.append(
+            f"| {row['concurrency']} | {row['action_improvement_pct']:.2f}% | "
+            f"{row['chunk_improvement_pct']:.2f}% | "
+            f"{row['throughput_improvement_pct']:.2f}% |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 单用户关键阶段 P95",
+            "",
+            f"- Denoising：{p95('denoise_ms'):.1f} ms",
+            f"- 远端 TAEHV decode：{p95('vae_decode_ms'):.1f} ms",
+            f"- WebP encode：{p95('frame_encode_ms'):.1f} ms",
+            f"- Latent send：{p95('latent_send_ms'):.3f} ms",
+            f"- VAE queue wait：{p95('vae_queue_wait_ms'):.3f} ms",
+            f"- 与下一 chunk denoising overlap：{p95('overlap_with_next_denoise_ms'):.1f} ms",
+        ]
+    )
     return "\n".join(lines) + "\n"
+
+
+def _hardware_row(profile: str, hardware: dict) -> str:
+    denoiser = hardware.get("denoiser", {})
+    vae = hardware.get("vae", {})
+    instance = hardware.get("instance_type", "-")
+    capacity = hardware.get("capacity_type", "-")
+    gpu_count = int(denoiser.get("gpu_count") or 0) + int(
+        vae.get("gpu_count") or 0
+    )
+    return (
+        f"| {profile} | {denoiser.get('gpu_type', '-')} | "
+        f"{vae.get('backend', '-')} / {vae.get('placement', vae.get('gpu_type', '-'))} | "
+        f"{instance} / {capacity} | {gpu_count} |"
+    )
 
 
 def parse_args() -> argparse.Namespace:

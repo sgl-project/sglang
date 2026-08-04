@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     ReleaseRealtimeSessionReq,
+    ReplaceQueuedRealtimeReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -70,6 +71,8 @@ logger = init_logger(__name__)
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
+_MAX_PENDING_REALTIME_REPLACEMENTS = 1024
+_REALTIME_REPLACEMENT_TTL_S = 5.0
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -147,6 +150,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self._pending_realtime_replacements: dict[
+            tuple[str, str, int, str], tuple[ReplaceQueuedRealtimeReq, float]
+        ] = {}
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
@@ -218,6 +224,133 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
+
+    def _replace_waiting_realtime_request(
+        self, update: ReplaceQueuedRealtimeReq
+    ) -> bool:
+        replacement = update.replacement
+        for index, (identity, current, enqueue_time) in enumerate(self.waiting_queue):
+            if not isinstance(current, Req):
+                continue
+            if (
+                current.request_id != update.request_id
+                or current.realtime_session_id != update.session_id
+                or current.realtime_generation_id != update.generation_id
+                or current.block_idx != update.chunk_index
+            ):
+                continue
+            if (
+                replacement.realtime_action_version
+                < current.realtime_action_version
+                or replacement.realtime_prompt_version
+                < current.realtime_prompt_version
+            ):
+                return False
+            self.waiting_queue[index] = (identity, replacement, enqueue_time)
+            return True
+        return False
+
+    @staticmethod
+    def _realtime_request_key(
+        request: Req | ReplaceQueuedRealtimeReq,
+    ) -> tuple[str, str, int, str]:
+        if isinstance(request, ReplaceQueuedRealtimeReq):
+            return (
+                request.session_id,
+                request.generation_id,
+                request.chunk_index,
+                request.request_id,
+            )
+        return (
+            request.realtime_session_id,
+            request.realtime_generation_id,
+            request.block_idx,
+            request.request_id,
+        )
+
+    @staticmethod
+    def _replacement_is_current(replacement: Req, current: Req) -> bool:
+        return (
+            replacement.realtime_action_version
+            >= current.realtime_action_version
+            and replacement.realtime_prompt_version
+            >= current.realtime_prompt_version
+        )
+
+    def _find_waiting_realtime_request(
+        self, update: ReplaceQueuedRealtimeReq
+    ) -> Req | None:
+        update_key = self._realtime_request_key(update)
+        for _identity, current, _enqueue_time in self.waiting_queue:
+            if (
+                isinstance(current, Req)
+                and self._realtime_request_key(current) == update_key
+            ):
+                return current
+        return None
+
+    def _prune_pending_realtime_replacements(self, now: float) -> None:
+        pending = getattr(self, "_pending_realtime_replacements", None)
+        if pending is None:
+            pending = self._pending_realtime_replacements = {}
+        expired = [
+            key for key, (_update, deadline) in pending.items() if deadline <= now
+        ]
+        for key in expired:
+            pending.pop(key, None)
+        while len(pending) > _MAX_PENDING_REALTIME_REPLACEMENTS:
+            pending.pop(next(iter(pending)))
+
+    def _buffer_realtime_replacement(
+        self, update: ReplaceQueuedRealtimeReq, *, now: float
+    ) -> bool:
+        self._prune_pending_realtime_replacements(now)
+        key = self._realtime_request_key(update)
+        pending = self._pending_realtime_replacements
+        current_entry = pending.get(key)
+        if current_entry is not None and not self._replacement_is_current(
+            update.replacement, current_entry[0].replacement
+        ):
+            return False
+        pending[key] = (update, now + _REALTIME_REPLACEMENT_TTL_S)
+        self._prune_pending_realtime_replacements(now)
+        return True
+
+    def _take_pending_realtime_replacement(self, request: Req, *, now: float) -> Req:
+        self._prune_pending_realtime_replacements(now)
+        entry = self._pending_realtime_replacements.pop(
+            self._realtime_request_key(request), None
+        )
+        if entry is None:
+            return request
+        replacement = entry[0].replacement
+        if not self._replacement_is_current(replacement, request):
+            return request
+        return replacement
+
+    def _enqueue_received_reqs(
+        self,
+        new_reqs: list[tuple[bytes, Any]],
+        *,
+        now: float,
+    ) -> None:
+        self._prune_pending_realtime_replacements(now)
+        for identity, req in new_reqs:
+            if isinstance(req, ReplaceQueuedRealtimeReq):
+                waiting_request = self._find_waiting_realtime_request(req)
+                replaced = self._replace_waiting_realtime_request(req)
+                buffered = False
+                if waiting_request is None:
+                    buffered = self._buffer_realtime_replacement(req, now=now)
+                self.return_result(
+                    OutputBatch(output={"replaced": replaced, "buffered": buffered}),
+                    identity,
+                    should_not_return=False,
+                )
+                continue
+            if isinstance(req, Req):
+                req = self._take_pending_realtime_replacement(req, now=now)
+            self.waiting_queue.append((identity, req, now))
 
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
@@ -981,9 +1114,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 now = time.monotonic()
-                self.waiting_queue.extend(
-                    [(identity, req, now) for identity, req in new_reqs]
-                )
+                self._enqueue_received_reqs(new_reqs, now=now)
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:

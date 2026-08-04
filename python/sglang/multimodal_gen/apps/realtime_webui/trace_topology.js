@@ -207,6 +207,9 @@
       assignNumber(chunk, "frameTransferMs", event.latent_to_gateway_complete_ms);
       assignNumber(chunk, "overlapMs", event.overlap_with_next_denoise_ms);
       assignNumber(chunk, "overlapRatio", event.overlap_ratio);
+    } else if (event.event === "server.vae_denoise_overlap_complete") {
+      assignNumber(chunk, "overlapMs", event.overlap_with_next_denoise_ms);
+      assignNumber(chunk, "overlapRatio", event.overlap_ratio);
     } else if (event.event === "server.post_decode_complete") {
       assignNumber(chunk, "postDecodeMs", preferredDuration(event));
     } else if (event.event === "server.pipeline_stage_complete") {

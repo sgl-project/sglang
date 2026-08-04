@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
 from sglang.multimodal_gen.runtime.realtime.admission import (
     AdmissionRejected,
+    DynamoDBSessionLeaseStore,
     InMemorySessionLeaseStore,
     RealtimeAdmissionController,
 )
@@ -91,3 +94,96 @@ def test_chunk_snapshots_latest_action_and_prompt_versions():
 
     assert (first.action_version, first.prompt_version) == (1, 0)
     assert (second.action_version, second.prompt_version) == (2, 1)
+
+
+def test_dynamodb_capacity_slot_is_reclaimed_after_gateway_lease_expires(monkeypatch):
+    class TransactionCanceledException(Exception):
+        pass
+
+    class FakeDynamoClient:
+        exceptions = SimpleNamespace(
+            TransactionCanceledException=TransactionCanceledException,
+            ConditionalCheckFailedException=TransactionCanceledException,
+        )
+
+        def __init__(self):
+            self.items = {}
+
+        def get_item(self, *, TableName, Key, ConsistentRead):
+            del TableName, ConsistentRead
+            item = self.items.get(Key["lease_key"]["S"])
+            return {"Item": deepcopy(item)} if item is not None else {}
+
+        def transact_write_items(self, *, TransactItems):
+            staged = deepcopy(self.items)
+            try:
+                for operation in TransactItems:
+                    if "Put" in operation:
+                        request = operation["Put"]
+                        item = deepcopy(request["Item"])
+                        key = item["lease_key"]["S"]
+                        existing = staged.get(key)
+                        now = int(
+                            request["ExpressionAttributeValues"][":now"]["N"]
+                        )
+                        if (
+                            existing is not None
+                            and int(existing["expires_at"]["N"]) > now
+                        ):
+                            raise TransactionCanceledException
+                        staged[key] = item
+                    elif "Update" in operation:
+                        request = operation["Update"]
+                        key = request["Key"]["lease_key"]["S"]
+                        existing = staged.get(key)
+                        token = request["ExpressionAttributeValues"][":token"]["S"]
+                        if existing is None or existing["token"]["S"] != token:
+                            raise TransactionCanceledException
+                        existing["expires_at"] = deepcopy(
+                            request["ExpressionAttributeValues"][":expires"]
+                        )
+                    elif "Delete" in operation:
+                        request = operation["Delete"]
+                        key = request["Key"]["lease_key"]["S"]
+                        existing = staged.get(key)
+                        token = request["ExpressionAttributeValues"][":token"]["S"]
+                        if existing is None or existing["token"]["S"] != token:
+                            raise TransactionCanceledException
+                        staged.pop(key)
+                    else:
+                        raise AssertionError("capacity leases must use fixed slot items")
+            except TransactionCanceledException:
+                raise
+            self.items = staged
+
+        def update_item(self, **kwargs):
+            raise AssertionError(f"renew must update user and slot atomically: {kwargs}")
+
+    now = [1_000]
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.realtime.admission.time.time",
+        lambda: now[0],
+    )
+    client = FakeDynamoClient()
+    store = DynamoDBSessionLeaseStore(
+        "leases",
+        max_active_sessions=1,
+        ttl_s=10,
+    )
+    store._client = client
+
+    first = store._acquire_sync("user-a", "session-a", "generation-a")
+    assert first.capacity_slot == "CAPACITY#000000"
+    with pytest.raises(AdmissionRejected, match="CAPACITY_EXHAUSTED"):
+        store._acquire_sync("user-b", "session-b", "generation-b")
+
+    now[0] = 1_011
+    second = store._acquire_sync("user-b", "session-b", "generation-b")
+    assert second.capacity_slot == first.capacity_slot
+    store._release_sync(first)
+    assert client.items[second.capacity_slot]["token"]["S"] == second.token
+
+    renewed = store._renew_sync(second)
+    assert renewed.capacity_slot == second.capacity_slot
+    store._release_sync(renewed)
+    assert second.capacity_slot not in client.items

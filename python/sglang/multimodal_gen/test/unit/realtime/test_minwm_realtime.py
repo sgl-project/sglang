@@ -19,7 +19,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
 )
 from sglang.multimodal_gen.configs.sample.minwm import MinWMSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    RealtimeEvent,
     RealtimeVideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
+    GenerateSession,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.minwm_realtime_adapter import (
     MinWMRealtimeAdapter,
@@ -1072,6 +1076,65 @@ def test_minwm_realtime_adapter_groups_pixel_weights_by_vae_factor():
     assert all(len(window) == 4 for window in windows)
     assert windows == [[row] * 4] * 4
     assert inputs.condition_inputs[MINWM_TOTAL_CHUNKS_CONDITION] == 8
+
+
+def test_minwm_refreshes_queued_chunk_with_latest_camera_state():
+    adapter = MinWMRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="test",
+            first_frame="/tmp/reference.png",
+            max_chunks=4,
+        )
+    )
+    state = adapter._state(session)
+    state.receive_camera_state(["w"], event_id=1)
+    chunk = session.new_chunk()
+    initial_labels = state.sample_action_labels(4)
+    batch = SimpleNamespace(
+        condition_inputs={MINWM_ACTION_LABELS_CONDITION: initial_labels},
+        realtime_chunk_size=4,
+        realtime_action_version=0,
+        realtime_prompt_version=0,
+        realtime_event_id=1,
+    )
+
+    adapter.ingest_event(
+        session,
+        RealtimeEvent(
+            type="event",
+            kind="camera_actions",
+            event_id=2,
+            payload={
+                "mode": "state",
+                "transitions": [{"actions": ["a"], "client_ts_ms": 10}],
+            },
+        ),
+    )
+    session.mark_event_version("camera_actions")
+    refreshed = adapter.refresh_queued_request(
+        session,
+        SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_config=SimpleNamespace(
+                    arch_config=SimpleNamespace(scale_factor_temporal=4)
+                )
+            )
+        ),
+        chunk,
+        batch,
+        "camera_actions",
+    )
+
+    assert refreshed is not batch
+    assert refreshed.condition_inputs[MINWM_ACTION_LABELS_CONDITION] == [
+        key_state_to_action_label(["a"])
+    ] * 4
+    assert refreshed.realtime_action_version == 1
+    assert refreshed.realtime_event_id == 2
 
 
 def test_minwm_t2v_first_latent_is_noop_without_consuming_pixel_actions():

@@ -288,6 +288,7 @@ class ServerArgs(DisaggServerArgsMixin):
     realtime_session_max_lifetime_s: float = 600.0
     realtime_admission_wait_s: float = 10.0
     realtime_session_lease_table: str | None = None
+    realtime_require_authenticated_user: bool = False
     realtime_vae_worker_url: str | None = None
     realtime_vae_timeout_s: float = 10.0
     realtime_vae_max_message_mb: int = 64
@@ -1624,6 +1625,15 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.realtime_session_lease_table,
             help="Optional DynamoDB lease table for multiple Gateway replicas.",
+        )
+        parser.add_argument(
+            "--realtime-require-authenticated-user",
+            action="store_true",
+            default=ServerArgs.realtime_require_authenticated_user,
+            help=(
+                "Require an authenticated ASGI principal for realtime admission; "
+                "query/header user IDs are ignored in this mode."
+            ),
         )
         parser.add_argument(
             "--realtime-vae-worker-url",

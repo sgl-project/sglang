@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ReleaseRealtimeSessionReq,
+    ReplaceQueuedRealtimeReq,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.realtime.async_vae_client import (
@@ -93,6 +94,31 @@ class _OrderedDecodeCoordinator:
         self.pending.cancel()
         await asyncio.gather(self.pending, return_exceptions=True)
         self.pending = None
+
+
+def _log_previous_chunk_overlap(
+    session: GenerateSession,
+    *,
+    current_chunk_index: int,
+) -> None:
+    previous_chunk_index = current_chunk_index - 1
+    vae_interval = session.vae_intervals.get(previous_chunk_index)
+    denoise_interval = session.denoise_intervals.get(current_chunk_index)
+    if vae_interval is None or denoise_interval is None:
+        return
+    log_realtime_trace(
+        logger,
+        session,
+        "server.vae_denoise_overlap_complete",
+        chunk_index=previous_chunk_index,
+        next_chunk_index=current_chunk_index,
+        overlap_with_next_denoise_ms=round(
+            calculate_overlap_ms(vae_interval, denoise_interval), 3
+        ),
+        overlap_ratio=round(
+            calculate_overlap_ratio(vae_interval, denoise_interval), 4
+        ),
+    )
 
 
 class _LockedRealtimeWebSocket:
@@ -199,21 +225,37 @@ def _install_realtime_trace_sink(session: GenerateSession, sink) -> None:
     trace_id = session.trace_id
     if not trace_id:
         return
-    previous_trace_id = getattr(session, "_trace_sink_trace_id", None)
-    if previous_trace_id == trace_id:
+    sink_key = (trace_id, session.id, session.generation_id)
+    previous_key = getattr(session, "_trace_sink_key", None)
+    if previous_key == sink_key:
         return
-    if previous_trace_id:
-        unregister_realtime_trace_sink(previous_trace_id, sink)
-    register_realtime_trace_sink(trace_id, sink)
-    session._trace_sink_trace_id = trace_id
+    if previous_key:
+        unregister_realtime_trace_sink(
+            previous_key[0],
+            sink,
+            session_id=previous_key[1],
+            generation_id=previous_key[2],
+        )
+    register_realtime_trace_sink(
+        trace_id,
+        sink,
+        session_id=session.id,
+        generation_id=session.generation_id,
+    )
+    session._trace_sink_key = sink_key
 
 
 def _uninstall_realtime_trace_sink(session: GenerateSession, sink) -> None:
-    trace_id = getattr(session, "_trace_sink_trace_id", None)
-    if not trace_id:
+    sink_key = getattr(session, "_trace_sink_key", None)
+    if not sink_key:
         return
-    unregister_realtime_trace_sink(trace_id, sink)
-    session._trace_sink_trace_id = None
+    unregister_realtime_trace_sink(
+        sink_key[0],
+        sink,
+        session_id=sink_key[1],
+        generation_id=sink_key[2],
+    )
+    session._trace_sink_key = None
 
 
 async def _send_realtime_trace_events(
@@ -261,7 +303,11 @@ def _get_admission_controller(server_args) -> RealtimeAdmissionController:
     return _ADMISSION_CONTROLLER
 
 
-def _resolve_realtime_user_id(websocket: WebSocket) -> str:
+def _resolve_realtime_user_id(
+    websocket: WebSocket,
+    *,
+    require_authenticated: bool = False,
+) -> str:
     principal = websocket.scope.get("user")
     if principal is not None:
         for name in ("sub", "id", "username"):
@@ -272,6 +318,8 @@ def _resolve_realtime_user_id(websocket: WebSocket) -> str:
             )
             if value:
                 return f"auth:{str(value)[:240]}"
+    if require_authenticated:
+        raise AdmissionRejected("AUTHENTICATED_USER_REQUIRED")
     query_user = websocket.query_params.get("user_id")
     if query_user:
         return f"query:{query_user[:240]}"
@@ -573,6 +621,39 @@ async def _send_remote_frame_batch(
     _merge_send_stats(send_stats, partial_stats)
 
 
+def _make_remote_frame_batch_handler(
+    ws: WebSocket,
+    session: GenerateSession,
+    chunk: RealtimeChunkContext,
+    batch: "Req",
+    send_stats: RealtimeFrameSendStats,
+):
+    first_remote_batch = True
+
+    async def on_frame_batch(frame_batch: RemoteFrameBatch) -> None:
+        nonlocal first_remote_batch
+        if first_remote_batch:
+            first_remote_batch = False
+            log_realtime_trace(
+                logger,
+                session,
+                "server.remote_first_frame_received",
+                request_id=chunk.request_id,
+                chunk_index=chunk.index,
+                event_id=getattr(batch, "realtime_event_id", None),
+                frame_batch_index=frame_batch.frame_batch_index,
+            )
+        await _send_remote_frame_batch(
+            ws,
+            session,
+            batch,
+            frame_batch,
+            send_stats,
+        )
+
+    return on_frame_batch
+
+
 async def _complete_remote_chunk(
     ws: WebSocket,
     session: GenerateSession,
@@ -586,11 +667,11 @@ async def _complete_remote_chunk(
     vae_started: float,
 ) -> None:
     remote_result = await handle.wait()
-    vae_completed = time.perf_counter()
+    vae_completed = remote_result.completed_at
     session.vae_intervals[chunk.index] = (vae_started, vae_completed)
     next_denoise = session.denoise_intervals.get(chunk.index + 1)
-    overlap_ms = 0.0
-    overlap_ratio = 0.0
+    overlap_ms = None
+    overlap_ratio = None
     if next_denoise is not None:
         overlap_ms = calculate_overlap_ms(
             session.vae_intervals[chunk.index], next_denoise
@@ -638,28 +719,34 @@ async def _complete_remote_chunk(
             else None
         ),
     )
-    log_realtime_trace(
-        logger,
-        session,
-        "server.remote_vae_complete",
-        request_id=chunk.request_id,
-        chunk_index=chunk.index,
-        event_id=getattr(batch, "realtime_event_id", None),
-        vae_queue_wait_ms=round(remote_result.queue_wait_ms, 3),
-        vae_decode_ms=round(remote_result.decode_ms, 3),
-        frame_encode_ms=round(remote_result.encode_ms, 3),
-        latent_to_gateway_complete_ms=round(remote_result.transfer_ms, 3),
-        latent_serialize_ms=round(remote_result.serialize_ms, 3),
-        latent_send_ms=round(remote_result.latent_send_ms, 3),
-        vae_credit_wait_ms=round(remote_result.credit_wait_ms, 3),
-        first_frame_ms=(
+    remote_fields = {
+        "request_id": chunk.request_id,
+        "chunk_index": chunk.index,
+        "event_id": getattr(batch, "realtime_event_id", None),
+        "vae_queue_wait_ms": round(remote_result.queue_wait_ms, 3),
+        "vae_decode_ms": round(remote_result.decode_ms, 3),
+        "frame_encode_ms": round(remote_result.encode_ms, 3),
+        "latent_to_gateway_complete_ms": round(remote_result.transfer_ms, 3),
+        "latent_serialize_ms": round(remote_result.serialize_ms, 3),
+        "latent_send_ms": round(remote_result.latent_send_ms, 3),
+        "vae_credit_wait_ms": round(remote_result.credit_wait_ms, 3),
+        "first_frame_ms": (
             round(remote_result.first_frame_ms, 3)
             if remote_result.first_frame_ms is not None
             else None
         ),
-        overlap_with_next_denoise_ms=round(overlap_ms, 3),
-        overlap_ratio=round(overlap_ratio, 4),
-        num_frames=remote_result.num_frames,
+        "num_frames": remote_result.num_frames,
+    }
+    if overlap_ms is not None and overlap_ratio is not None:
+        remote_fields.update(
+            overlap_with_next_denoise_ms=round(overlap_ms, 3),
+            overlap_ratio=round(overlap_ratio, 4),
+        )
+    log_realtime_trace(
+        logger,
+        session,
+        "server.remote_vae_complete",
+        **remote_fields,
     )
     _log_realtime_chunk_timing(
         session,
@@ -726,6 +813,7 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
             chunk_started = time.perf_counter()
             chunk = session.new_chunk()
             batch = adapter.prepare_next_request(session, server_args, chunk)
+            session.bind_chunk_request(chunk, batch)
             request_prepare_ms = timer.mark_ms()
             log_realtime_trace(
                 logger,
@@ -743,39 +831,23 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
                 denoise_started,
                 denoise_completed,
             )
+            _log_previous_chunk_overlap(
+                session,
+                current_chunk_index=chunk.index,
+            )
             scheduler_forward_ms = timer.mark_ms()
             _emit_realtime_result_stage_traces(session, chunk, batch, result)
             if result.realtime_latents is None or result.realtime_handoff is None:
                 raise RuntimeError("remote VAE path received no latent handoff")
 
             send_stats = empty_frame_send_stats()
-            first_remote_batch = True
-
-            async def on_frame_batch(
-                frame_batch: RemoteFrameBatch,
-                *,
-                batch=batch,
-                send_stats=send_stats,
-            ) -> None:
-                nonlocal first_remote_batch
-                if first_remote_batch:
-                    first_remote_batch = False
-                    log_realtime_trace(
-                        logger,
-                        session,
-                        "server.remote_first_frame_received",
-                        request_id=chunk.request_id,
-                        chunk_index=chunk.index,
-                        event_id=getattr(batch, "realtime_event_id", None),
-                        frame_batch_index=frame_batch.frame_batch_index,
-                    )
-                await _send_remote_frame_batch(
-                    ws,
-                    session,
-                    batch,
-                    frame_batch,
-                    send_stats,
-                )
+            on_frame_batch = _make_remote_frame_batch_handler(
+                ws,
+                session,
+                chunk,
+                batch,
+                send_stats,
+            )
 
             vae_started = time.perf_counter()
             handle = await client.submit(
@@ -875,6 +947,7 @@ async def _generate_loop_local(ws: WebSocket, session: GenerateSession):
                 server_args,
                 chunk,
             )
+            session.bind_chunk_request(chunk, batch)
             if batch.condition_inputs:
                 logger.debug(
                     "consume realtime conditions, session_id=%s, block_idx=%s, kinds=%s",
@@ -1128,6 +1201,50 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             event_log = session.adapter.ingest_event(session, realtime_event)
             session.mark_event_version(realtime_event.kind)
             session.mark_client_activity()
+            chunk = session.current_chunk
+            if chunk is not None:
+                current_batch = session.active_batches.get(chunk.index)
+                if current_batch is not None:
+                    replacement = session.adapter.refresh_queued_request(
+                        session,
+                        get_global_server_args(),
+                        chunk,
+                        current_batch,
+                        realtime_event.kind,
+                    )
+                    if replacement is not None:
+                        output = await async_scheduler_client.forward(
+                            ReplaceQueuedRealtimeReq(
+                                session_id=session.id,
+                                generation_id=session.generation_id,
+                                chunk_index=chunk.index,
+                                request_id=chunk.request_id,
+                                replacement=replacement,
+                            )
+                        )
+                        replaced = bool(
+                            isinstance(output, OutputBatch)
+                            and isinstance(output.output, dict)
+                            and output.output.get("replaced")
+                        )
+                        buffered = bool(
+                            isinstance(output, OutputBatch)
+                            and isinstance(output.output, dict)
+                            and output.output.get("buffered")
+                        )
+                        if replaced or buffered:
+                            session.active_batches[chunk.index] = replacement
+                        log_realtime_trace(
+                            logger,
+                            session,
+                            "server.queued_controls_refresh",
+                            request_id=chunk.request_id,
+                            chunk_index=chunk.index,
+                            event_id=realtime_event.event_id,
+                            kind=realtime_event.kind,
+                            replaced=replaced,
+                            buffered=buffered,
+                        )
             log_realtime_trace(
                 logger,
                 session,
@@ -1225,6 +1342,32 @@ async def _listen_generate_request(
             continue
 
 
+async def _release_scheduler_realtime_session(
+    session_id: str,
+    *,
+    attempts: int = 3,
+    retry_delay_s: float = 0.05,
+) -> bool:
+    for attempt in range(max(1, attempts)):
+        try:
+            await async_scheduler_client.forward(
+                ReleaseRealtimeSessionReq(session_id=session_id)
+            )
+            return True
+        except Exception as exc:
+            if attempt + 1 >= max(1, attempts):
+                logger.warning(
+                    "failed to release realtime session on scheduler after %d "
+                    "attempts, session_id=%s, error=%s",
+                    attempt + 1,
+                    session_id,
+                    exc,
+                )
+                return False
+            await asyncio.sleep(max(0.0, retry_delay_s) * (attempt + 1))
+    return False
+
+
 async def _cleanup_realtime_session(
     session: GenerateSession,
     generate_task: asyncio.Task | None,
@@ -1239,16 +1382,7 @@ async def _cleanup_realtime_session(
         if task is None:
             continue
         await _await_realtime_task(task)
-    try:
-        await async_scheduler_client.forward(
-            ReleaseRealtimeSessionReq(session_id=session.id)
-        )
-    except Exception as e:
-        logger.warning(
-            "failed to release realtime session on scheduler, session_id=%s, error=%s",
-            session.id,
-            e,
-        )
+    await _release_scheduler_realtime_session(session.id)
     if session.input_temp_dir is not None:
         shutil.rmtree(session.input_temp_dir, ignore_errors=True)
     log_realtime_trace(logger, session, "server.session_cleanup_done")
@@ -1278,8 +1412,17 @@ async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
     await websocket.accept()
     ws = _LockedRealtimeWebSocket(websocket)
+    server_args = get_global_server_args()
+    try:
+        user_id = _resolve_realtime_user_id(
+            websocket,
+            require_authenticated=server_args.realtime_require_authenticated_user,
+        )
+    except AdmissionRejected as exc:
+        await write_error_msg(f"realtime admission rejected: {exc.reason}", ws)
+        await _close_realtime_websocket(ws, code=1008, reason=exc.reason)
+        return
     session = GenerateSession()
-    user_id = _resolve_realtime_user_id(websocket)
     session.trace_id = normalize_trace_id(
         websocket.query_params.get("trace_id"), fallback=session.trace_id
     )
@@ -1303,7 +1446,6 @@ async def generate(websocket: WebSocket):
             "server.warmup_wait_done",
             wait_ms=round(warmup_wait_ms, 3),
         )
-    server_args = get_global_server_args()
     controller = _get_admission_controller(server_args)
     lease = None
     generate_task = None

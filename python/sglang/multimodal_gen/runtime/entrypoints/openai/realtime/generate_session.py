@@ -59,6 +59,7 @@ class GenerateSession:
         self.next_chunk_index = 0
         self.max_inflight_chunks = max_inflight_chunks
         self.active_chunks: dict[int, RealtimeChunkContext] = {}
+        self.active_batches: dict[int, Any] = {}
         self._completed_chunks: set[int] = set()
         self.realtime_session = RealtimeSession()
         self.adapter: BaseRealtimeModelAdapter | None = None
@@ -88,6 +89,7 @@ class GenerateSession:
         self.generate_chunk_cnt = 0
         self.next_chunk_index = 0
         self.active_chunks.clear()
+        self.active_batches.clear()
         self._completed_chunks.clear()
         self.adapter = None
         self.adapter_state = None
@@ -149,6 +151,11 @@ class GenerateSession:
         self.active_chunks[chunk.index] = chunk
         return chunk
 
+    def bind_chunk_request(self, chunk: RealtimeChunkContext, batch: Any) -> None:
+        if self.active_chunks.get(chunk.index) != chunk:
+            raise RuntimeError(f"realtime chunk {chunk.index} is not active")
+        self.active_batches[chunk.index] = batch
+
     def generate_chunk_completed(
         self, chunk: RealtimeChunkContext | None = None
     ) -> None:
@@ -159,6 +166,7 @@ class GenerateSession:
         active = self.active_chunks.pop(chunk.index, None)
         if active != chunk:
             raise RuntimeError(f"realtime chunk {chunk.index} is not active")
+        self.active_batches.pop(chunk.index, None)
         self._completed_chunks.add(chunk.index)
         while self.generate_chunk_cnt in self._completed_chunks:
             self._completed_chunks.remove(self.generate_chunk_cnt)

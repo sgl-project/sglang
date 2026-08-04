@@ -67,7 +67,7 @@ def init_request(args: argparse.Namespace, *, total_chunks: int, trace_id: str) 
         "prompt": args.prompt,
         "size": args.size,
         "fps": args.fps,
-        "num_frames": max(121, 1 + total_chunks * 16),
+        "num_frames": 1 + (total_chunks - 1) * 16,
         "seed": 42,
         "generator_device": "cuda",
         "num_inference_steps": 4,
@@ -81,12 +81,30 @@ def init_request(args: argparse.Namespace, *, total_chunks: int, trace_id: str) 
     }
 
 
-def stage_values(trace_events: list[dict]) -> dict[str, list[float]]:
-    values: dict[str, list[float]] = defaultdict(list)
+def stage_values(
+    trace_events: list[dict], *, min_chunk_index: int = 0
+) -> dict[str, list[float]]:
+    values: dict[str, dict[int, float]] = defaultdict(dict)
     for event in trace_events:
         name = event.get("event")
+        chunk_index_value = event.get("chunk_index")
+        if chunk_index_value is None:
+            continue
+        chunk_index = int(chunk_index_value)
+        if chunk_index < min_chunk_index:
+            continue
         if name == "server.model_denoise_complete":
-            values["denoise_ms"].append(float(event.get("cuda_ms") or event.get("duration_ms") or 0))
+            values["denoise_ms"][chunk_index] = float(
+                event.get("cuda_ms") or event.get("duration_ms") or 0
+            )
+        elif name == "server.vae_encode_complete":
+            values["vae_encode_ms"][chunk_index] = float(
+                event.get("cuda_ms") or event.get("duration_ms") or 0
+            )
+        elif name == "server.vae_decode_complete":
+            values["vae_decode_ms"][chunk_index] = float(
+                event.get("cuda_ms") or event.get("duration_ms") or 0
+            )
         elif name == "server.remote_vae_complete":
             for field in (
                 "vae_queue_wait_ms",
@@ -100,8 +118,65 @@ def stage_values(trace_events: list[dict]) -> dict[str, list[float]]:
                 "overlap_ratio",
             ):
                 if event.get(field) is not None:
-                    values[field].append(float(event[field]))
-    return dict(values)
+                    values[field][chunk_index] = float(event[field])
+        elif name == "server.vae_denoise_overlap_complete":
+            for field in (
+                "overlap_with_next_denoise_ms",
+                "overlap_ratio",
+            ):
+                if event.get(field) is not None:
+                    values[field][chunk_index] = float(event[field])
+    return {
+        name: [by_chunk[index] for index in sorted(by_chunk)]
+        for name, by_chunk in values.items()
+    }
+
+
+def record_action_latency(
+    message: dict,
+    *,
+    first_frame_at: dict[int, float],
+    action_sent_at: dict[int, float],
+    action_latencies: list[float],
+    min_chunk_index: int,
+) -> None:
+    chunk = int(message.get("chunk_index") or 0)
+    sampled_event = int(message.get("event_id") or 0)
+    if sampled_event <= 0 or chunk not in first_frame_at:
+        return
+    eligible = [event for event in action_sent_at if event <= sampled_event]
+    if not eligible:
+        return
+    latest = max(eligible)
+    if chunk >= min_chunk_index:
+        action_latencies.append(
+            round((first_frame_at[chunk] - action_sent_at[latest]) * 1000.0, 3)
+        )
+    for event_id in eligible:
+        action_sent_at.pop(event_id, None)
+
+
+async def stream_actions(
+    websocket,
+    *,
+    action_sent_at: dict[int, float],
+    stop: asyncio.Event,
+    interval_s: float = 0.1,
+) -> None:
+    event_id = 1
+    while not stop.is_set():
+        sent_at = time.perf_counter()
+        actions = ["w"] if event_id % 2 else ["a", "w"]
+        try:
+            await websocket.send(action_event(event_id, actions))
+        except Exception:
+            return
+        action_sent_at[event_id] = sent_at
+        event_id += 1
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except TimeoutError:
+            pass
 
 
 async def run_session(args: argparse.Namespace, concurrency: int, index: int) -> dict:
@@ -119,7 +194,6 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     trace_events: list[dict] = []
     action_sent_at: dict[int, float] = {}
     action_latencies: list[float] = []
-    next_event_id = 1
     pending_raw_header = None
 
     async with websockets.connect(
@@ -134,45 +208,69 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                 init_request(args, total_chunks=total_chunks, trace_id=trace_id)
             )
         )
-        while len(stats) < total_chunks:
-            packed = await asyncio.wait_for(websocket.recv(), timeout=args.timeout_s)
-            if not isinstance(packed, bytes):
-                continue
-            if pending_raw_header is not None:
-                pending_raw_header = None
-                continue
-            message = msgspec.msgpack.decode(packed)
-            message_type = message.get("type")
-            if message_type == "error":
-                raise RuntimeError(message.get("content") or "realtime server error")
-            if message_type == "trace_event":
-                trace_events.append(dict(message.get("trace") or {}))
-                continue
-            if message_type == "frame_batch_header":
-                pending_raw_header = message
-            if message_type in {"frame_batch", "frame_batch_header"}:
-                chunk = int(message.get("chunk_index") or 0)
-                first_frame_at.setdefault(chunk, time.perf_counter())
-                sampled_event = int(message.get("event_id") or 0)
-                eligible = [event for event in action_sent_at if event <= sampled_event]
-                if eligible:
-                    latest = max(eligible)
-                    action_latencies.append(
-                        (first_frame_at[chunk] - action_sent_at[latest]) * 1000.0
+        action_stop = asyncio.Event()
+        action_task = asyncio.create_task(
+            stream_actions(
+                websocket,
+                action_sent_at=action_sent_at,
+                stop=action_stop,
+            )
+        )
+        try:
+            while True:
+                try:
+                    packed = await asyncio.wait_for(
+                        websocket.recv(), timeout=args.timeout_s
                     )
-                    for event_id in eligible:
-                        action_sent_at.pop(event_id, None)
-                continue
-            if message_type != "chunk_stats":
-                continue
+                except websockets.ConnectionClosed:
+                    break
+                if not isinstance(packed, bytes):
+                    continue
+                if pending_raw_header is not None:
+                    pending_raw_header = None
+                    continue
+                message = msgspec.msgpack.decode(packed)
+                message_type = message.get("type")
+                if message_type == "error":
+                    raise RuntimeError(
+                        message.get("content") or "realtime server error"
+                    )
+                if message_type == "trace_event":
+                    trace_events.append(dict(message.get("trace") or {}))
+                    continue
+                if message_type == "frame_batch_header":
+                    pending_raw_header = message
+                if message_type in {"frame_batch", "frame_batch_header"}:
+                    chunk = int(message.get("chunk_index") or 0)
+                    first_frame_at.setdefault(chunk, time.perf_counter())
+                    record_action_latency(
+                        message,
+                        first_frame_at=first_frame_at,
+                        action_sent_at=action_sent_at,
+                        action_latencies=action_latencies,
+                        min_chunk_index=args.warmup_chunks,
+                    )
+                    continue
+                if message_type != "chunk_stats":
+                    continue
 
-            chunk = int(message["chunk_index"])
-            stats[chunk] = dict(message)
-            if chunk >= args.warmup_chunks - 1 and chunk < total_chunks - 1:
-                actions = ["w"] if next_event_id % 2 else ["a", "w"]
-                action_sent_at[next_event_id] = time.perf_counter()
-                await websocket.send(action_event(next_event_id, actions))
-                next_event_id += 1
+                chunk = int(message["chunk_index"])
+                stats[chunk] = dict(message)
+                record_action_latency(
+                    message,
+                    first_frame_at=first_frame_at,
+                    action_sent_at=action_sent_at,
+                    action_latencies=action_latencies,
+                    min_chunk_index=args.warmup_chunks,
+                )
+        finally:
+            action_stop.set()
+            await action_task
+
+    if len(stats) != total_chunks:
+        raise RuntimeError(
+            f"session closed after {len(stats)} of {total_chunks} chunks"
+        )
 
     measured = [stats[index] for index in range(args.warmup_chunks, total_chunks)]
     chunk_total = [float(item["chunk_total_ms"]) for item in measured]
@@ -185,7 +283,9 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
         "action_to_first_frame_ms": action_latencies,
         "frames": frame_count,
         "measured_seconds": measured_seconds,
-        "stage_values": stage_values(trace_events),
+        "stage_values": stage_values(
+            trace_events, min_chunk_index=args.warmup_chunks
+        ),
     }
 
 

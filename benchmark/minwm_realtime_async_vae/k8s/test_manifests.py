@@ -18,3 +18,16 @@ def test_l40s_alternate_is_spot_only_and_never_in_base_topology():
     )
     kustomization = (Path(__file__).parent / "kustomization.yaml").read_text()
     assert "l40s-vae.yaml" not in kustomization
+
+
+def test_wan22_5b_uses_the_matching_taehv_checkpoint():
+    for filename in ("h100-denoiser.yaml", "l4-vae.yaml"):
+        manifest = (Path(__file__).parent / filename).read_text()
+        assert "taew2_2.pth" in manifest
+        assert "taew2_1.pth" not in manifest
+
+
+def test_webui_enables_i2v_and_t2v_in_production_manifest():
+    manifest = (Path(__file__).parent / "h100-denoiser.yaml").read_text()
+    assert '"generationModes":["i2v","t2v"]' in manifest
+    assert '"t2vDefaultNumFrames":121' in manifest

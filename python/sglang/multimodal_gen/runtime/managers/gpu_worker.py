@@ -132,7 +132,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(
-            max_sessions=server_args.realtime_max_sessions_per_worker
+            max_sessions=server_args.realtime_max_sessions_per_worker,
+            stale_after_s=max(30.0, server_args.realtime_session_idle_timeout_s * 2),
         )
         self.memory_occupation: MemoryOccupationController | None = None
 

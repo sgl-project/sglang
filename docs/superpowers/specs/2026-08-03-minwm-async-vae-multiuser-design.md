@@ -293,6 +293,10 @@ Gateway 持有公网 WebSocket，但不持有 GPU 状态，主要职责包括：
 Gateway 不保存 latent、DiT state 或因果 VAE state。Gateway 进程丢失时，该进程上的
 Session 失败并由用户重试，不尝试把半个 Session 静默绑定到其他 Gateway。
 
+生产环境启用 `--realtime-require-authenticated-user`。此时 `user_id` 只接受上游认证
+中间件写入 ASGI scope 的 `sub`、`id` 或 `username`，不信任客户端自报 Header 或查询参数。
+未启用该开关的匿名模式仅用于本地 WebUI 调试，不能提供跨连接的严格单用户配额。
+
 ### 6.2 Session Coordinator
 
 Coordinator 负责准入与粘性路由。每个已接收生成任务形成以下绑定：
@@ -304,7 +308,8 @@ Coordinator 负责准入与粘性路由。每个已接收生成任务形成以�
 
 配对流程：
 
-1. 使用 DynamoDB 条件写创建严格的用户 Lease。
+1. 使用 DynamoDB 事务条件写同时抢占 `USER#<id>` 和固定编号
+   `CAPACITY#<slot>` Lease；容量槽带 TTL，节点崩溃后可原子回收，不维护可能泄漏的全局计数器。
 2. 根据空闲 Session slot、排队时间、近期服务时间、模型版本、AZ 选择 Denoiser。
 3. 选择 checkpoint/config 兼容并优先同 AZ 的 VAE Worker。
 4. 使用幂等 reservation token 预留两个 Worker。
@@ -503,6 +508,11 @@ TAEHV 产生可用帧后立即发送，不为了构造大包而等待整个逻�
 
 所以“推理前取消旧 Action”不是丢弃整个 Chunk，也不是跳过因果状态，而是替换尚未进入
 GPU 的 Chunk 所携带的旧条件。
+
+Gateway 与 Scheduler 使用独立 ZMQ 连接，因此更新消息可能早于原始 Chunk 到达。Scheduler
+为这种乱序保留最多 1024 条、有效期 5 秒的 pending replacement；原请求到达后按
+`(session_id, generation_id, chunk_index, request_id)` 原子匹配并保持原 FIFO 时间戳。
+匹配不到的更新在 TTL 后丢弃，避免控制消息无限占用内存。
 
 `W+A` 等组合键以一个完整 Action Vector 表示，由模型 Adapter 映射成 label 或 weight。
 持续按住一个键时，服务端保留最新完整状态，不依赖浏览器 key-repeat 才能持续生效。

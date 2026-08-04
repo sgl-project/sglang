@@ -225,6 +225,18 @@ class BaseRealtimeModelAdapter:
         )
         return batch
 
+    def refresh_queued_request(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+        batch: Req,
+        event_kind: str,
+    ) -> Req | None:
+        """Return a replacement for a chunk that has not reached GPU dispatch."""
+        del session, server_args, chunk, batch, event_kind
+        return None
+
     def apply_realtime_request_fields(
         self,
         batch: Req,

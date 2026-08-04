@@ -1,4 +1,4 @@
-from summarize import build_report, latency_summary, summarize_runs
+from summarize import build_report, latency_summary, render_markdown, summarize_runs
 
 
 def _run(concurrency, p95, fps, error_rate=0.0):
@@ -36,6 +36,40 @@ def test_report_calculates_async_improvement_at_common_concurrency():
         {"runs": [_run(1, p95=600, fps=18)]},
     )
     assert report["comparison"]["async_improvement_pct"] == 25.0
+    assert report["comparison"]["by_concurrency"] == [
+        {
+            "concurrency": 1,
+            "baseline_action_p95_ms": 800.0,
+            "async_action_p95_ms": 600.0,
+            "action_improvement_pct": 25.0,
+            "baseline_chunk_p95_ms": 800.0,
+            "async_chunk_p95_ms": 600.0,
+            "chunk_improvement_pct": 25.0,
+            "baseline_fps": 16.0,
+            "async_fps": 18.0,
+            "throughput_improvement_pct": 12.5,
+        }
+    ]
+
+
+def test_markdown_contains_hardware_stages_and_per_level_improvement():
+    baseline = {"runs": [_run(1, p95=800, fps=16)], "hardware": {}}
+    asynchronous = {"runs": [_run(1, p95=600, fps=18)], "hardware": {}}
+    asynchronous["runs"][0]["stage_ms"] = {
+        "denoise_ms": {"p95": 300},
+        "vae_decode_ms": {"p95": 30},
+        "frame_encode_ms": {"p95": 120},
+        "latent_send_ms": {"p95": 0.3},
+        "vae_queue_wait_ms": {"p95": 0.1},
+        "overlap_with_next_denoise_ms": {"p95": 35},
+    }
+
+    markdown = render_markdown(build_report(baseline, asynchronous))
+
+    assert "## 硬件与部署" in markdown
+    assert "## 异步收益" in markdown
+    assert "远端 TAEHV decode：30.0 ms" in markdown
+    assert "| 1 | 25.00% | 25.00% | 12.50% |" in markdown
 
 
 def test_latency_summary_uses_nearest_rank_percentiles():

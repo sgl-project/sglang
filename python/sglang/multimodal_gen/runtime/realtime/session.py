@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -56,9 +57,18 @@ class RealtimeSession:
 class RealtimeSessionCache:
     """Binds incoming chunks to persistent realtime sessions without eviction."""
 
-    def __init__(self, max_sessions: int = 64) -> None:
+    def __init__(
+        self,
+        max_sessions: int = 64,
+        *,
+        stale_after_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.max_sessions = max_sessions
+        self.stale_after_s = stale_after_s
+        self._clock = clock
         self._sessions: OrderedDict[str, RealtimeSession] = OrderedDict()
+        self._last_seen: dict[str, float] = {}
 
     def _dispose_session(
         self, session_id: str, session: RealtimeSession | None
@@ -76,6 +86,7 @@ class RealtimeSessionCache:
 
     def release(self, session_id: str) -> bool:
         session = self._sessions.pop(session_id, None)
+        self._last_seen.pop(session_id, None)
         released = session is not None
         self._dispose_session(session_id, session)
         logger.info(
@@ -85,10 +96,30 @@ class RealtimeSessionCache:
         )
         return released
 
+    def _prune_stale(self, now: float) -> None:
+        if self.stale_after_s is None:
+            return
+        stale = [
+            session_id
+            for session_id, last_seen in self._last_seen.items()
+            if now - last_seen >= self.stale_after_s
+        ]
+        for session_id in stale:
+            session = self._sessions.pop(session_id, None)
+            self._last_seen.pop(session_id, None)
+            self._dispose_session(session_id, session)
+            logger.warning(
+                "Reclaimed stale realtime session cache entry: session_id=%s",
+                session_id,
+            )
+
     def attach(self, req: Any) -> None:
         session_id = RealtimeSession.resolve_session_id(req)
         if session_id is None:
             return
+
+        now = self._clock()
+        self._prune_stale(now)
 
         if session_id not in self._sessions:
             if req.block_idx > 0:
@@ -111,4 +142,5 @@ class RealtimeSessionCache:
             logger.info("Realtime session reset: session_id=%s", session_id)
 
         req.session = self._sessions[session_id]
+        self._last_seen[session_id] = now
         self._sessions.move_to_end(session_id)

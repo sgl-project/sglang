@@ -269,13 +269,22 @@ function keepsLatestCompleteRemoteVaeMetricsDuringNextChunk() {
     trace_id: "trace-remote",
     chunk_index: 8,
   });
+  topology.addEvent({
+    event: "server.vae_denoise_overlap_complete",
+    trace_id: "trace-remote",
+    chunk_index: 7,
+    next_chunk_index: 8,
+    overlap_with_next_denoise_ms: 91,
+    overlap_ratio: 0.88,
+  });
 
   const summary = topology.summary();
   assert.equal(summary.latestChunk.vaeQueueWaitMs, 4);
   assert.equal(summary.latestChunk.vaeDecodeMs, 82);
   assert.equal(summary.latestChunk.frameEncodeMs, 13);
   assert.equal(summary.latestChunk.latentTransferMs, 8);
-  assert.equal(summary.latestChunk.overlapMs, 70);
+  assert.equal(summary.latestChunk.overlapMs, 91);
+  assert.equal(summary.latestChunk.overlapRatio, 0.88);
   assert.equal(summary.nodes.find((node) => node.id === "vae_decode").metric, "86ms");
 }
 

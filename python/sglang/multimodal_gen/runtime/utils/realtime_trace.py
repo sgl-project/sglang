@@ -20,7 +20,8 @@ MAX_CLIENT_TRACE_EVENTS = 32
 
 _TRACE_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 _HOSTNAME = socket.gethostname()
-_TRACE_SINKS: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+_TraceSinkKey = tuple[str, str | None, str | None]
+_TRACE_SINKS: dict[_TraceSinkKey, list[Callable[[dict[str, Any]], None]]] = {}
 _TRACE_SINKS_LOCK = threading.RLock()
 _RESERVED_PAYLOAD_KEYS = {
     "event",
@@ -101,11 +102,15 @@ def log_realtime_trace(
 def register_realtime_trace_sink(
     trace_id: str,
     sink: Callable[[dict[str, Any]], None],
+    *,
+    session_id: str | None = None,
+    generation_id: str | None = None,
 ) -> None:
     if not trace_id:
         return
+    key = (trace_id, session_id, generation_id)
     with _TRACE_SINKS_LOCK:
-        sinks = _TRACE_SINKS.setdefault(trace_id, [])
+        sinks = _TRACE_SINKS.setdefault(key, [])
         if sink not in sinks:
             sinks.append(sink)
 
@@ -113,17 +118,21 @@ def register_realtime_trace_sink(
 def unregister_realtime_trace_sink(
     trace_id: str,
     sink: Callable[[dict[str, Any]], None],
+    *,
+    session_id: str | None = None,
+    generation_id: str | None = None,
 ) -> None:
     if not trace_id:
         return
+    key = (trace_id, session_id, generation_id)
     with _TRACE_SINKS_LOCK:
-        sinks = _TRACE_SINKS.get(trace_id)
+        sinks = _TRACE_SINKS.get(key)
         if not sinks:
             return
         if sink in sinks:
             sinks.remove(sink)
         if not sinks:
-            _TRACE_SINKS.pop(trace_id, None)
+            _TRACE_SINKS.pop(key, None)
 
 
 def log_realtime_trace_for_batch(
@@ -290,8 +299,14 @@ def _notify_realtime_trace_sinks(payload: dict[str, Any]) -> None:
     trace_id = str(payload.get("trace_id") or "")
     if not trace_id:
         return
+    exact_key = (
+        trace_id,
+        str(payload.get("session_id") or "") or None,
+        str(payload.get("generation_id") or "") or None,
+    )
     with _TRACE_SINKS_LOCK:
-        sinks = list(_TRACE_SINKS.get(trace_id, ()))
+        sinks = list(_TRACE_SINKS.get(exact_key, ()))
+        sinks.extend(_TRACE_SINKS.get((trace_id, None, None), ()))
     for sink in sinks:
         try:
             sink(dict(payload))

@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from collections import deque
 from types import SimpleNamespace
 
 import msgspec.msgpack
@@ -33,10 +34,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_adapter import (
     empty_frame_send_stats,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ReplaceQueuedRealtimeReq,
+)
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
     LingBotWorldCausalDMDDenoisingStage,
 )
@@ -169,6 +174,53 @@ def test_active_realtime_sessions_are_never_lru_evicted():
     followup = _Req(realtime_session_id="session-a", block_idx=1, session=None)
     cache.attach(followup)
     assert followup.session is first.session
+
+
+def test_realtime_session_cache_reclaims_only_expired_orphaned_state():
+    now = [100.0]
+    cache = RealtimeSessionCache(
+        max_sessions=1,
+        stale_after_s=30,
+        clock=lambda: now[0],
+    )
+    first = _Req(realtime_session_id="session-a", block_idx=0, session=None)
+    cache.attach(first)
+    state = first.session.get_or_create_state(_State)
+
+    now[0] = 129.0
+    with pytest.raises(RealtimeSessionCapacityError):
+        cache.attach(_Req(realtime_session_id="session-b", block_idx=0, session=None))
+    assert not state.disposed
+
+    now[0] = 131.0
+    replacement = _Req(realtime_session_id="session-b", block_idx=0, session=None)
+    cache.attach(replacement)
+
+    assert state.disposed
+    assert replacement.session is not first.session
+
+
+def test_scheduler_session_release_retries_transient_failures(monkeypatch):
+    async def scenario():
+        calls = []
+
+        async def forward(_request):
+            calls.append(True)
+            if len(calls) < 3:
+                raise RuntimeError("scheduler temporarily unavailable")
+            return OutputBatch(output={"released": True})
+
+        monkeypatch.setattr(realtime_video_api.async_scheduler_client, "forward", forward)
+        released = await realtime_video_api._release_scheduler_realtime_session(
+            "session-a",
+            attempts=3,
+            retry_delay_s=0,
+        )
+
+        assert released
+        assert len(calls) == 3
+
+    asyncio.run(scenario())
 
 
 def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
@@ -479,6 +531,111 @@ def test_generate_session_allows_two_active_chunks_and_completes_in_order():
     assert session.active_chunks == {}
 
 
+def test_scheduler_replaces_queued_realtime_request_without_changing_fifo_slot():
+    scheduler = Scheduler.__new__(Scheduler)
+    original = Req.__new__(Req)
+    original.request_id = "request-1"
+    original.realtime_session_id = "session-1"
+    original.realtime_generation_id = "generation-1"
+    original.block_idx = 4
+    original.realtime_action_version = 1
+    original.realtime_prompt_version = 2
+    replacement = Req.__new__(Req)
+    replacement.request_id = "request-1"
+    replacement.realtime_session_id = "session-1"
+    replacement.realtime_generation_id = "generation-1"
+    replacement.block_idx = 4
+    replacement.realtime_action_version = 3
+    replacement.realtime_prompt_version = 2
+    scheduler.waiting_queue = deque([(b"client", original, 123.0)])
+
+    replaced = scheduler._replace_waiting_realtime_request(
+        ReplaceQueuedRealtimeReq(
+            session_id="session-1",
+            generation_id="generation-1",
+            chunk_index=4,
+            request_id="request-1",
+            replacement=replacement,
+        )
+    )
+
+    assert replaced is True
+    assert scheduler.waiting_queue[0] == (b"client", replacement, 123.0)
+
+
+def test_scheduler_rejects_stale_queued_realtime_replacement():
+    scheduler = Scheduler.__new__(Scheduler)
+    current = Req.__new__(Req)
+    current.request_id = "request-1"
+    current.realtime_session_id = "session-1"
+    current.realtime_generation_id = "generation-1"
+    current.block_idx = 4
+    current.realtime_action_version = 5
+    current.realtime_prompt_version = 2
+    stale = Req.__new__(Req)
+    stale.request_id = "request-1"
+    stale.realtime_session_id = "session-1"
+    stale.realtime_generation_id = "generation-1"
+    stale.block_idx = 4
+    stale.realtime_action_version = 4
+    stale.realtime_prompt_version = 2
+    scheduler.waiting_queue = deque([(b"client", current, 123.0)])
+
+    replaced = scheduler._replace_waiting_realtime_request(
+        ReplaceQueuedRealtimeReq(
+            session_id="session-1",
+            generation_id="generation-1",
+            chunk_index=4,
+            request_id="request-1",
+            replacement=stale,
+        )
+    )
+
+    assert replaced is False
+    assert scheduler.waiting_queue[0][1] is current
+
+
+def test_scheduler_applies_realtime_replacement_that_arrives_before_request():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.waiting_queue = deque()
+    replies = []
+    scheduler.return_result = lambda output, identity, should_not_return: replies.append(
+        (output.output, identity, should_not_return)
+    )
+    original = Req.__new__(Req)
+    original.request_id = "request-1"
+    original.realtime_session_id = "session-1"
+    original.realtime_generation_id = "generation-1"
+    original.block_idx = 4
+    original.realtime_action_version = 1
+    original.realtime_prompt_version = 2
+    replacement = Req.__new__(Req)
+    replacement.request_id = "request-1"
+    replacement.realtime_session_id = "session-1"
+    replacement.realtime_generation_id = "generation-1"
+    replacement.block_idx = 4
+    replacement.realtime_action_version = 3
+    replacement.realtime_prompt_version = 2
+    update = ReplaceQueuedRealtimeReq(
+        session_id="session-1",
+        generation_id="generation-1",
+        chunk_index=4,
+        request_id="request-1",
+        replacement=replacement,
+    )
+
+    scheduler._enqueue_received_reqs([(b"update", update)], now=100.0)
+    scheduler._enqueue_received_reqs([(b"request", original)], now=100.1)
+
+    queued_identity, queued_request, queued_at = scheduler.waiting_queue[0]
+    assert queued_identity == b"request"
+    assert queued_request is replacement
+    assert queued_at == 100.1
+    assert replies == [
+        ({"replaced": False, "buffered": True}, b"update", False)
+    ]
+
+
 def test_generate_session_does_not_advance_past_out_of_order_completion():
     session = GenerateSession(max_inflight_chunks=2)
     first = session.new_chunk()
@@ -706,6 +863,34 @@ def test_session_watchdog_closes_idle_session():
             await controller.release(lease)
 
     assert asyncio.run(run()) == "session idle timeout"
+
+
+def test_strict_realtime_identity_requires_authenticated_principal():
+    anonymous = SimpleNamespace(
+        scope={},
+        query_params={"user_id": "spoofed"},
+        headers={"x-user-id": "spoofed"},
+        client=SimpleNamespace(host="127.0.0.1"),
+    )
+    with pytest.raises(
+        realtime_video_api.AdmissionRejected,
+        match="AUTHENTICATED_USER_REQUIRED",
+    ):
+        realtime_video_api._resolve_realtime_user_id(
+            anonymous,
+            require_authenticated=True,
+        )
+
+    authenticated = SimpleNamespace(
+        scope={"user": {"sub": "user-123"}},
+        query_params={},
+        headers={},
+        client=SimpleNamespace(host="127.0.0.1"),
+    )
+    assert realtime_video_api._resolve_realtime_user_id(
+        authenticated,
+        require_authenticated=True,
+    ) == "auth:user-123"
 
 
 def test_cleanup_realtime_session_releases_scheduler_state(

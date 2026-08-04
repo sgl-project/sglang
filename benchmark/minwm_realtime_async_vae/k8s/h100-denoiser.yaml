@@ -94,6 +94,8 @@ spec:
               value: ws://minwm-async-vae.default.svc.cluster.local:18081/v1/realtime_vae/decode
             - name: REALTIME_MAX_SESSIONS
               value: "8"
+            - name: REALTIME_UI_CONFIG_JSON
+              value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
             - name: MINWM_CHECKPOINT_SOURCE
               value: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/dmd/wan22-5B-stage3-dmd-30-0731-acfd622962df/global_step_001800/ema_student/model.pt
             - name: MINWM_CHECKPOINT
@@ -103,9 +105,9 @@ spec:
             - name: TAEHV_REVISION
               value: 093b918971d59001a0bad6dfd6e0409b5e1752cf
             - name: TAEHV_CHECKPOINT_SHA256
-              value: d26151e76cdc2c9424bef988de874b33d9a53f30ef3060cd556c429c469c797e
+              value: d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b74c559a
             - name: TAEHV_CHECKPOINT_PATH
-              value: /opt/taehv/taew2_1.pth
+              value: /opt/taehv/taew2_2.pth
             - name: MINWM_ATTENTION_IMPL
               value: packed
             - name: MINWM_PACKED_ATTENTION_DETERMINISTIC
@@ -149,7 +151,7 @@ spec:
                 --root-user-action=ignore
               mkdir -p /opt/taehv
               curl --fail --location --retry 3 \
-                "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REVISION}/taew2_1.pth" \
+                "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REVISION}/taew2_2.pth" \
                 --output "${TAEHV_CHECKPOINT_PATH}"
               echo "${TAEHV_CHECKPOINT_SHA256}  ${TAEHV_CHECKPOINT_PATH}" | sha256sum -c -
 

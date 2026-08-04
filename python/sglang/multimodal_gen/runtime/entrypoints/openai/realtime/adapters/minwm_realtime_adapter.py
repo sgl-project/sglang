@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
@@ -513,6 +514,82 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
                 ) * int(arch_config.num_frames_per_block)
             condition_inputs[MINWM_CHUNK_SEED_PREFIX_FRAMES_CONDITION] = prefix_frames
         return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)
+
+    def refresh_queued_request(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+        batch,
+        event_kind: str,
+    ):
+        if event_kind not in {
+            "camera_actions",
+            "action_labels",
+            "action_weights",
+            "prompt",
+            "scene_cut",
+        }:
+            return None
+        request = session.request
+        if request is None:
+            return None
+
+        replacement = copy(batch)
+        replacement.condition_inputs = dict(batch.condition_inputs or {})
+        chunk_size = int(
+            getattr(batch, "realtime_chunk_size", None)
+            or self.get_chunk_size(session, server_args, chunk)
+        )
+        state = self._state(session)
+
+        if event_kind in {"camera_actions", "action_labels", "action_weights"}:
+            replacement.condition_inputs.pop(MINWM_ACTION_LABELS_CONDITION, None)
+            replacement.condition_inputs.pop(MINWM_ACTION_WEIGHTS_CONDITION, None)
+            t2v_first_block = self._is_t2v_request(request) and chunk.index == 0
+            if state.action_mode == "weights":
+                temporal_factor = int(
+                    server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
+                )
+                rows = (
+                    [[0.0] * 8] * (chunk_size * temporal_factor)
+                    if t2v_first_block
+                    else state.sample_action_weights(chunk_size * temporal_factor)
+                )
+                replacement.condition_inputs[MINWM_ACTION_WEIGHTS_CONDITION] = [
+                    rows[start : start + temporal_factor]
+                    for start in range(0, len(rows), temporal_factor)
+                ]
+            else:
+                replacement.condition_inputs[MINWM_ACTION_LABELS_CONDITION] = (
+                    [0] * chunk_size
+                    if t2v_first_block
+                    else state.sample_action_labels(chunk_size)
+                )
+        else:
+            if not state.prompt_queue.has_events("condition_switch"):
+                return None
+            prompt, switch_kind = state.sample_prompt()
+            request.prompt = prompt
+            replacement.condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] = True
+            replacement.condition_inputs[MINWM_CONDITION_SWITCH_CONDITION] = (
+                switch_kind
+            )
+            replacement.sampling_params = self.build_sampling_params(
+                session,
+                server_args,
+                chunk,
+                RealtimeChunkInputs(
+                    prompt=prompt,
+                    condition_inputs=replacement.condition_inputs,
+                ),
+                chunk_size,
+            )
+
+        replacement.realtime_action_version = session.action_version
+        replacement.realtime_prompt_version = session.prompt_version
+        replacement.realtime_event_id = self.get_realtime_event_id(session)
+        return replacement
 
     def build_sampling_params(
         self,
