@@ -179,6 +179,14 @@ async def set_limits(payload: dict):
     return {"limits": LIMITS, "updated": updated}
 
 
+@app.get("/admin/limits")
+async def get_limits():
+    """查询当前限并发配置。示例:
+    curl -s http://127.0.0.1:8080/admin/limits
+    """
+    return {"limits": LIMITS}
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "OPTIONS", "HEAD", "PUT", "DELETE"])
 async def passthrough(path: str, request: Request):
     """兜底透传：/health /metrics /v1/completions /v1/embeddings 等其它接口，
