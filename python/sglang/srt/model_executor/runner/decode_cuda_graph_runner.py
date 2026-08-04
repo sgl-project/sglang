@@ -437,12 +437,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return WarReadDonePolicy.NONE
             if attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph:
                 return WarReadDonePolicy.POST_REPLAY
-        elif not forward_mode.is_decode():
-            return WarReadDonePolicy.NONE
-
-        if self._war_read_done_node_planted:
-            return WarReadDonePolicy.IN_GRAPH
-        return WarReadDonePolicy.PRE_REPLAY
+            if self._war_read_done_node_planted:
+                return WarReadDonePolicy.IN_GRAPH
+            return WarReadDonePolicy.PRE_REPLAY
+        elif forward_mode.is_decode():
+            if self._war_read_done_node_planted:
+                return WarReadDonePolicy.IN_GRAPH
+            return WarReadDonePolicy.PRE_REPLAY
+        return WarReadDonePolicy.NONE
 
     def _publish_war_read_done(self, in_graph: bool):
         """Publish the read-done event the scheduler's WAR barrier waits on."""
