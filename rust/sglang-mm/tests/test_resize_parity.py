@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import sglang.srt.multimodal._core.inkling
+from sglang.srt.multimodal._core import common as _rs_common
+from sglang.srt.multimodal._core import inkling as _rs_inkling
 
 
 def py_scaled_dims(
@@ -41,9 +42,7 @@ def pil_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
 
 
 def rs_resize(arr: np.ndarray, tw: int, th: int) -> np.ndarray:
-    return sglang.srt.multimodal._core.inkling.resize_rgb(arr, tw, th).reshape(
-        th, tw, 3
-    )
+    return _rs_common.resize_rgb(arr, tw, th).reshape(th, tw, 3)
 
 
 CASES = [
@@ -74,9 +73,9 @@ def test_scaled_dims_sweep():
     sizes += [(2048, 1024), (2049, 100), (1024, 2048), (1, 1), (4096, 4096)]
     for frac, cap in [(2.0, 2048), (1.5, 2048), (3.0, None), (None, None), (2.0, 1)]:
         for w, h in sizes:
-            assert sglang.srt.multimodal._core.inkling.scaled_dims(
+            assert _rs_common.scaled_dims(w, h, frac, cap) == py_scaled_dims(
                 w, h, frac, cap
-            ) == py_scaled_dims(w, h, frac, cap), (
+            ), (
                 w,
                 h,
                 frac,
@@ -93,12 +92,10 @@ def test_decode_patchify_rescaled_matches_pil_pipeline():
     arr = rng.integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
     buf = io.BytesIO()
     Image.fromarray(arr).save(buf, format="PNG")
-    h, w, bits = sglang.srt.multimodal._core.inkling.decode_patchify(
-        buf.getvalue(), 40, 2.0, 2048
-    )
+    h, w, bits = _rs_inkling.decode_patchify(buf.getvalue(), 40, 2.0, 2048)
     assert (w, h) == py_scaled_dims(1920, 1080, 2.0, 2048)
     ref_arr = pil_resize(arr, w, h)
-    ref_bits = sglang.srt.multimodal._core.inkling.patchify_rgb(ref_arr, 40)
+    ref_bits = _rs_inkling.patchify_rgb(ref_arr, 40)
     np.testing.assert_array_equal(bits, ref_bits)
     assert torch.from_numpy(bits).view(torch.bfloat16).shape[0] > 0
 
