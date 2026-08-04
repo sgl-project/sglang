@@ -172,7 +172,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
@@ -186,7 +186,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
@@ -200,7 +200,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 2",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
@@ -214,7 +214,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 2",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
@@ -228,7 +228,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--speculative-algorithm NEXTN",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
@@ -307,7 +307,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
@@ -320,7 +320,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
@@ -333,7 +333,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 2",
         "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
@@ -346,7 +346,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 8",
+        "--tp 2",
         "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
@@ -359,7 +359,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
+        "--tp 2",
         "--context-length 262144",
         "--json-model-override-args '{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":2.0,\"rope_theta\":6000000,\"partial_rotary_factor\":0.5,\"original_max_position_embeddings\":131072}}'",
         "--host {{HOST_IP}}",
