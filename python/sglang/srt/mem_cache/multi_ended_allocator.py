@@ -25,7 +25,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Generic, List, Optional, Sequence, Set, Tuple, TypeVar
 
 import torch
 from torch.profiler import record_function
@@ -95,8 +95,49 @@ def _install_signal_handlers_once() -> None:
             pass
 
 
+_T = TypeVar("_T")
+
+
+class _CapacityField(Generic[_T]):
+    """Data descriptor for a capacity-bearing allocator field.
+
+    Every rebind bumps the owner's ``_capacity_epoch``, so the epoch-keyed
+    capacity memos (``available_size`` / ``schedulable_available_size`` on
+    every chain member plus the composite joint views) invalidate by
+    construction — mutation sites need no explicit hook, and future mutators
+    cannot forget one. Contract: these fields are REBOUND, never mutated in
+    place (all current writes are; ``_free_phys_pages`` slicing/cat/sort
+    always rebinds).
+    """
+
+    __slots__ = ("_name",)
+
+    def __set_name__(self, owner, name: str) -> None:
+        self._name = name
+
+    def __get__(self, obj, objtype=None) -> _T:
+        if obj is None:
+            return self  # type: ignore[return-value]
+        try:
+            return obj.__dict__[self._name]
+        except KeyError:
+            raise AttributeError(self._name) from None
+
+    def __set__(self, obj, value: _T) -> None:
+        obj.__dict__[self._name] = value
+        obj._capacity_epoch += 1
+
+
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
+
+    # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
+    # the epoch-keyed capacity memos across the whole chain (see
+    # `_CapacityField` / `_chain_capacity_epoch`).
+    _capacity_epoch: int = 0
+    watermark_physical: _CapacityField[int] = _CapacityField()
+    live_page_count: _CapacityField[int] = _CapacityField()
+    _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
 
     def __init__(
         self,
@@ -235,6 +276,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             os.environ.get("SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096")
         )
 
+        # Epoch-keyed memos for the capacity views — pure functions of chain
+        # state between mutations, but schedulers read them O(queue) times per
+        # step (see `available_size` / `schedulable_available_size`).
+        self._avail_memo_epoch: Optional[int] = None
+        self._avail_memo_tokens: int = 0
+        self._sched_avail_memo_epoch: Optional[int] = None
+        self._sched_avail_memo_tokens: int = 0
+
         self.clear()
 
         logger.info(
@@ -275,12 +324,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.high_peer = peer
         else:
             self.low_peer = peer
+        self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
     def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
         self.low_peer = peer
+        self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
     def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
         self.high_peer = peer
+        self._capacity_epoch += 1  # rewiring changes what the chain walks see
 
     # -- state --
 
@@ -387,6 +439,32 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     f"[{self.sub_pool_name}] span {wm_span} != live "
                     f"{self.live_page_count} + holes {holes} + pending {pending}"
                 )
+        out.extend(self._capacity_memo_violations())
+        return out
+
+    def _capacity_memo_violations(self) -> List[str]:
+        """Memo-coherence check (idle-time): a current-epoch capacity memo must
+        equal a fresh recompute; divergence means a mutation bypassed
+        `_CapacityField` (e.g. an in-place write). Empty == healthy."""
+        out: List[str] = []
+        epoch = self._chain_capacity_epoch()
+        if self._avail_memo_epoch == epoch:
+            actual = self._available_tokens()
+            if self._avail_memo_tokens != actual:
+                out.append(
+                    f"[{self.sub_pool_name}] stale available_size memo: "
+                    f"cached={self._avail_memo_tokens}, actual={actual}"
+                )
+        if self._sched_avail_memo_epoch == epoch:
+            actual = self._available_tokens(
+                extra_gap_bytes=self._peer_drainable_hole_bytes()
+            )
+            if self._sched_avail_memo_tokens != actual:
+                out.append(
+                    f"[{self.sub_pool_name}] stale schedulable_available_size "
+                    f"memo: cached={self._sched_avail_memo_tokens}, "
+                    f"actual={actual}"
+                )
         return out
 
     def _byte_low_frontier(self) -> int:
@@ -426,6 +504,24 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if p is None:
             return 0
         return p._byte_high_frontier()
+
+    def _chain_capacity_epoch(self) -> int:
+        """Sum of `_capacity_epoch` over the whole chain (self included).
+
+        Capacity views read chain-neighbor frontiers (gap/transparency walks),
+        so a memo stays valid only while EVERY member is unmutated; the sum
+        moves whenever any member does (epochs only ever increment).
+        """
+        total = self._capacity_epoch
+        p = self.low_peer
+        while p is not None:
+            total += p._capacity_epoch
+            p = p.low_peer
+        p = self.high_peer
+        while p is not None:
+            total += p._capacity_epoch
+            p = p.high_peer
+        return total
 
     def _growth_side_neighbor(self) -> Optional[MultiEndedAllocator]:
         """Nearest NON-transparent chain member on this pool's GROWTH side —
@@ -469,8 +565,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         Alloc shortfall gates consult this to decide whether to peer-flush, so it
         MUST NOT fold in peer holes (use `schedulable_available_size()` for that).
+        Memoized on the chain capacity epoch (pure between mutations).
         """
-        return self._available_tokens()
+        epoch = self._chain_capacity_epoch()
+        if self._avail_memo_epoch != epoch:
+            self._avail_memo_tokens = self._available_tokens()
+            self._avail_memo_epoch = epoch
+        return self._avail_memo_tokens
 
     def _peer_drainable_hole_bytes(self) -> int:
         """Gap bytes an urgent flush of the growth-side chain neighbor would
@@ -493,8 +594,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a neighbor urgent-flush (realizable-with-
         compaction). Used by composite views; alloc gates use `available_size()`.
+        Memoized on the chain capacity epoch (pure between mutations).
         """
-        return self._available_tokens(extra_gap_bytes=self._peer_drainable_hole_bytes())
+        epoch = self._chain_capacity_epoch()
+        if self._sched_avail_memo_epoch != epoch:
+            self._sched_avail_memo_tokens = self._available_tokens(
+                extra_gap_bytes=self._peer_drainable_hole_bytes()
+            )
+            self._sched_avail_memo_epoch = epoch
+        return self._sched_avail_memo_tokens
 
     def _flush_chain_for_alloc(self, need_tokens: int) -> bool:
         """One urgent flush of the growth-side chain neighbor on alloc
@@ -2356,6 +2464,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
         self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
 
+        # Epoch-keyed memo for the joint capacity view (any chain member's
+        # mutation invalidates — see `MultiEndedAllocator._chain_capacity_epoch`).
+        self._joint_avail_memo_epoch: Optional[int] = None
+        self._joint_avail_memo_tokens: int = 0
+
         # The full/SWA KV pools need no allocator wiring (write locations resolved
         # in attention metadata); the composite keeps allocators for read-path translates.
         kvcache.attach_allocators(
@@ -2391,7 +2504,18 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def available_size(self) -> int:
         """Tokens available for `alloc(N)` / `alloc_extend(N)` (TOKENS).
 
-        Joint byte-budget: each composite alloc(1) consumes one full-side AND one
+        Memoized on the chain capacity epoch (the compute walks every chain
+        frontier; see `_compute_available_size`, which the tri-pool subclass
+        overrides with its three-band variant).
+        """
+        epoch = self.full_attn_allocator._chain_capacity_epoch()
+        if self._joint_avail_memo_epoch != epoch:
+            self._joint_avail_memo_tokens = self._compute_available_size()
+            self._joint_avail_memo_epoch = epoch
+        return self._joint_avail_memo_tokens
+
+    def _compute_available_size(self) -> int:
+        """Joint byte-budget: each composite alloc(1) consumes one full-side AND one
         swa-side page (same virtual id). The 3-phase lazy formula consumes both
         sides' holes maximally before extending toward the gap (H_f/H_s = holes,
         e_f/e_s = bytes/page, R_f/R_s = extension room, G = byte gap):
@@ -2769,9 +2893,28 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear_inverse_history()
 
     def verify_byte_accounting(self) -> List[str]:
-        return _chain_byte_accounting_violations(
-            _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
+        return (
+            _chain_byte_accounting_violations(
+                _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
+            )
+            + self._joint_capacity_memo_violations()
         )
+
+    def _joint_capacity_memo_violations(self) -> List[str]:
+        """Idle-time twin of `MultiEndedAllocator._capacity_memo_violations`
+        for the composite joint view. Empty == healthy."""
+        if (
+            self._joint_avail_memo_epoch
+            != self.full_attn_allocator._chain_capacity_epoch()
+        ):
+            return []
+        actual = self._compute_available_size()
+        if self._joint_avail_memo_tokens == actual:
+            return []
+        return [
+            f"[joint] stale available_size memo: "
+            f"cached={self._joint_avail_memo_tokens}, actual={actual}"
+        ]
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
