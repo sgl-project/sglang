@@ -99,6 +99,14 @@ sglang serve \
   --port 30010
 ```
 
+Pure Ulysses4 is also the faster measured topology on H200, not just a
+capacity default. The 4×H100 TP2 + Ulysses2 recipe below fits on 141 GB H200
+cards, but it replaces the Ulysses all-to-all exchange with two per-block
+tensor-parallel all-reduces and measured slower end-to-end, at about 30 GB
+lower peak memory per GPU. See the **H200 topology comparison** in the
+Benchmarks section for the measured numbers; treat TP2 + Ulysses2 on H200 as
+a deliberate memory trade, not a latency default.
+
 For 4×H100 80 GB, balance the large packed activation with resident weight
 sharding. TP2 + Ulysses2 was the fastest measured lossless topology while the
 Qwen encoder still folds across all four GPUs:
@@ -664,7 +672,7 @@ the configurations with collected measurements:
 | --- | --- | --- |
 | B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
-| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4 |
+| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2 |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
@@ -745,6 +753,30 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 | Ref2VA | FP8 | auto | 124.0 s | 34.30 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | fold | 112.0 s | 34.44 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | replicate | 116.0 s | 33.42 s | **27.12 s** | 93,396 MB |
+
+### H200 topology comparison
+
+The same four-card H200 host completed both lossless resident placements with
+the standard 1344×768, 5-second, 50-step T2VA request (fixed prompt and seed,
+eager BF16/FP32, back-to-back runs on an otherwise idle host). Latency is the
+warmed-up request; the first pair uses the default warmup request, the second
+pair adds `--warmup-resolutions 1344x768` so warmup already covers the served
+resolution:
+
+| Topology | Warmup | Denoise | Decode | E2E | Peak/GPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Ulysses4 | default | 79.04 s | 3.77 s | **84.14 s** | 94,288 MB |
+| TP2 + Ulysses2 | default | 81.17 s | 2.97 s | 85.51 s | 63,490 MB |
+| Ulysses4 | `--warmup-resolutions 1344x768` | 71.73 s | 1.32 s | **74.38 s** | 94,290 MB |
+| TP2 + Ulysses2 | `--warmup-resolutions 1344x768` | 75.52 s | 1.29 s | 78.33 s | 63,490 MB |
+
+Ulysses4 stays the H200 latency default: 5.0 % faster end-to-end than
+TP2 + Ulysses2 once warmup covers the served resolution (1.6 % with the
+default warmup, where first-request cold start masks the topology gap).
+TP2 + Ulysses2 shards the DiT weights and holds peak memory about 30 GB per
+GPU lower, which is why it remains the 80 GB H100 recipe. Matching the warmup
+request to the served resolution removes the cold first-request cost on both
+topologies (about 10 s end-to-end on this workload).
 
 ### H100 topology comparison
 
