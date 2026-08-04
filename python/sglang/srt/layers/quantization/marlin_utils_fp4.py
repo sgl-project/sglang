@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
@@ -20,15 +22,14 @@ if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
+logger = logging.getLogger(__name__)
 
 
 def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     if not (marlin_scales >= 0).all():
         # NVFP4 ModelOpt scales are expected to be non-negative. Keep this as
         # a warning so unusual checkpoints can still load for diagnosis.
-        import logging
-
-        logging.getLogger(__name__).warning_once(
+        logger.warning_once(
             "NVFP4 Marlin assumes non-negative scales, but negative scales "
             "were found. Accuracy may be degraded."
         )
@@ -128,7 +129,11 @@ def apply_fp4_marlin_linear(
     if bias is not None:
         output.add_(bias)
 
-    return output[:, :size_n].contiguous().reshape(out_shape)
+    # A narrowed N dimension has the padded row stride, so materialize it
+    # before reshaping. This is only needed for a TP shard that was padded.
+    if padded_size_n != size_n:
+        output = output[:, :size_n].contiguous()
+    return output.reshape(out_shape)
 
 
 def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
@@ -145,13 +150,22 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     assert layer.weight.shape == (part_size_n, part_size_k // 2)
 
-    # Marlin accepts either N%64/K%128 or N%128/K%64. Use the former, which
-    # is minimal for this checkpoint's TP=4 shared-expert shards (N=2688,
-    # K=928 -> K=1024).
-    padded_size_n = (part_size_n + 63) // 64 * 64
-    padded_size_k = (part_size_k + 127) // 128 * 128
+    # Marlin accepts either N%64/K%128 or N%128/K%64. Select the smaller
+    # padded shape, matching vLLM's marlin_padded_nk helper.
+    padded_size_n, padded_size_k = min(
+        (
+            ((part_size_n + 63) // 64 * 64, (part_size_k + 127) // 128 * 128),
+            ((part_size_n + 127) // 128 * 128, (part_size_k + 63) // 64 * 64),
+        ),
+        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
+    )
 
     if (padded_size_n, padded_size_k) != (part_size_n, part_size_k):
+        logger.warning_once(
+            "Marlin requires thread-tile padding for some weight shapes in "
+            "this model. Activations and/or outputs of the padded layers are "
+            "padded/sliced on every forward; performance may be degraded."
+        )
         pad_rows = padded_size_n - part_size_n
         pad_cols = (padded_size_k - part_size_k) // 2
         scale_pad_cols = (padded_size_k - part_size_k) // 16
