@@ -148,6 +148,7 @@ def prepare_vision_attention_metadata(
     cu_seqlens: torch.Tensor,
     device: torch.device,
     *,
+    max_seqlen: Optional[int] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -156,7 +157,8 @@ def prepare_vision_attention_metadata(
 
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = int(seq_lens.max().item())
+    if max_seqlen is None:
+        max_seqlen = int(seq_lens.max().item())
     return VisionAttentionMetadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
