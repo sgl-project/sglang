@@ -452,9 +452,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         server_args = model_runner.server_args
-        # bcg 与本模块互相引用:bcg 顶层要 runner.shape_key(触发包 __init__,
-        # 而 __init__ 顶层 import 本模块),本模块又要 bcg 的这两个名字。顶层互指
-        # 使先被导入的一方必炸;把 runner->bcg 这条边推迟到首次使用,环即断开。
+        # bcg and this module import each other: bcg's top level needs
+        # runner.shape_key (which triggers the package __init__, whose top
+        # level imports this module), and this module needs these two names
+        # from bcg. Top-level mutual imports crash whichever side is imported
+        # first; deferring the runner->bcg edge to first use breaks the cycle.
         from sglang.srt.layers.cp.bcg import (
             PrefillCPBCGInput,
         )

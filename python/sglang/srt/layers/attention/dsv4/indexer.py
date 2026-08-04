@@ -357,20 +357,17 @@ def fp8_paged_mqa_logits_torch_sm120(
     # transient in the chunked path: without it every 1024-row sub-call
     # allocates its own [chunk, max_seq_len] fp32 before the copy -- the third
     # and final allocation site the 1M OOM walked to.
-    # No full-width -inf fill: every consumer downstream (topk_transform and
-    # the fused path's own callers) bounds its reads by seq_lens, so values
-    # past each row's length are never observed. The fused prefill kernel has
-    # shipped with garbage past PADDED_EFF from day one and the topk output
-    # is bit-identical -- that is the production proof. Filling (and below,
-    # masking) the whole max_seq_len row cost O(max_ctx) bandwidth per layer
-    # per decode step: at a 1M --context-length that tax halved single-stream
-    # decode throughput (12.5 vs 27.3 tok/s measured with the only variable
-    # being the configured ceiling).
+    # This reference path keeps the full-width -inf contract (registered
+    # tests assert it, and callers may compare the invalid region bitwise).
+    # The hot decode path routes to the fused kernel instead, which never
+    # pays this O(max_ctx) fill.
     if out is not None:
         logits = out
+        logits.fill_(float("-inf"))
     else:
-        logits = torch.empty(
+        logits = torch.full(
             (batch_size, max_seq_len),
+            float("-inf"),
             dtype=torch.float32,
             device=q_fp8.device,
         )
@@ -448,8 +445,9 @@ def fp8_paged_mqa_logits_torch_sm120(
             logits[:, _s0:_e] = _sc[:, : _e - _s0]
         del _g, _kvv, _kvs, _sc
 
-    # Invalid-region masking intentionally omitted -- see the allocation
-    # comment above: consumers are seq_lens-bounded.
+    positions = torch.arange(max_seq_len, device=device)
+    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
+    logits.masked_fill_(invalid_mask, float("-inf"))
 
     return logits
 
@@ -923,7 +921,11 @@ class C4IndexerBackendMixin:
             ):
                 # Ampere needs the same CUDA-graph-safe variant (no .item())
                 fn = fp8_paged_mqa_logits_torch_sm120
-                if (
+                if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                    # Explicit env request: keep the torch reference variant
+                    # as the debug escape hatch instead of overriding it.
+                    pass
+                elif (
                     envs.SGLANG_DSV4_INDEXER_FOLD_APPROX.get()
                     and q_indexer.shape[0] >= 128
                 ):
