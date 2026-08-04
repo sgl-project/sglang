@@ -26,7 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_split_before_forward,
+    cp_shard_model_inputs,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     get_eager_max_batch_size,
     require_mlp_sync,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -237,11 +238,7 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "decode"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
+        ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
             return model_runner.model.forward(
@@ -262,7 +259,11 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if forward_batch.needs_forward_metadata_init():
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+
+        if forward_batch.needs_forward_metadata_init() or cp_v2_active:
             if model_runner.dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
@@ -288,7 +289,6 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
@@ -297,12 +297,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": category})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -349,21 +344,21 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        prepare_cp_forward(forward_batch)
         input_embeds = kwargs.get("input_embeds")
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
-        input_embeds, positions = cp_split_before_forward(
+        with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
-        )
-
-        hidden_states = model.model(
-            forward_batch.input_ids,
-            positions,
-            forward_batch,
-            input_embeds=input_embeds,
-            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-        )
+        ) as (sharded_input_embeds, sharded_positions):
+            model_kwargs = {"input_embeds": sharded_input_embeds}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            hidden_states = model.model(
+                forward_batch.input_ids,
+                sharded_positions,
+                forward_batch,
+                **model_kwargs,
+            )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
@@ -401,12 +396,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "idle"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, "idle"):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

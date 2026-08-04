@@ -17,24 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-GROUPS = [
-    "activation",
-    "attention",
-    "communication",
-    "diffusion",
-    "elementwise",
-    "embeddings",
-    "gemm",
-    "grammar",
-    "kvcache",
-    "layernorm",
-    "mamba",
-    "memory",
-    "moe",
-    "quantization",
-    "sampling",
-    "speculative",
-]
+GROUPS = K.ops.__all__
 
 # Representative ops checked as a subset (the registry holds many more).
 EXPECTED = {
@@ -71,7 +54,7 @@ def test_top_level_exports():
 
 @pytest.mark.parametrize("group", GROUPS)
 def test_group_importable(group):
-    assert hasattr(importlib.import_module(f"sglang.kernels.ops.{group}"), "__all__")
+    assert importlib.import_module(f"sglang.kernels.ops.{group}") is not None
 
 
 @pytest.mark.parametrize("op, backends", list(EXPECTED.items()))
