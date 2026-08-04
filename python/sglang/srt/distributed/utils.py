@@ -101,6 +101,13 @@ def get_pp_indices(
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A single-stage pipeline owns every layer, so a partition list cannot
+        # apply to it. The env var is process-global, so a worker built with
+        # pp_size=1 inside a pipelined process -- the speculative draft, which
+        # never spans stages -- would otherwise read the target's list and
+        # reject it for having the wrong length.
+        partition_list_str = None
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
