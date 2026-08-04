@@ -11,7 +11,6 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
-import msgspec
 import numpy as np
 import torch
 from setproctitle import setproctitle
@@ -84,18 +83,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
-
-
-# Read-only srt get_server_args() surface for the reused fused_experts (LingBot
-# MoE). All False = default fused_experts mode; only the MoE path reads these.
-class SrtMoeBridgeArgs(msgspec.Struct, frozen=True):
-    enable_deterministic_inference: bool = False
-    enable_fused_moe_sum_all_reduce: bool = False
-    enable_symm_mem: bool = False
-
-
-_SRT_MOE_BRIDGE_ARGS = SrtMoeBridgeArgs()
-
 
 logger = init_logger(__name__)
 
@@ -251,9 +238,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
 
         from sglang.srt.runtime_context import get_context
+        from sglang.srt.server_args import ServerArgs as SrtServerArgs
 
         if get_context()._server_args is None:
-            get_context().set_server_args(_SRT_MOE_BRIDGE_ARGS)
+            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
 
         # set proc title
         if model_parallel_is_initialized():
