@@ -263,6 +263,34 @@ with open(sys.argv[2], "w") as f:
     f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
 PY
 
+# Resolve host ionic userspace mounts on each compute node. This keeps server
+# and benchmark containers compatible with the host RDMA ABI.
+cat > "$WORKDIR/ionic_mounts.sh" <<'IONIC_EOF'
+IONIC_MOUNTS=()
+_ionic_provider="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+_ionic_soname="/usr/lib/x86_64-linux-gnu/libionic.so.1"
+if [ ! -e "$_ionic_provider" ]; then
+    _ionic_provider=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 \
+        -name "libionic.so.*" -print -quit 2>/dev/null)
+fi
+if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
+    _ionic_real=$(readlink -f "$_ionic_provider" 2>/dev/null)
+    _ionic_soname_real=$(readlink -f "$_ionic_soname" 2>/dev/null)
+    [ -f "$_ionic_real" ] && IONIC_MOUNTS+=( -v "$_ionic_real:$_ionic_real:ro" )
+    [ -f "$_ionic_soname_real" ] && \
+        IONIC_MOUNTS+=( -v "$_ionic_soname_real:$_ionic_soname:ro" )
+    [ -d /usr/lib/x86_64-linux-gnu/libibverbs ] && \
+        IONIC_MOUNTS+=( -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro )
+    [ -d /etc/libibverbs.d ] && \
+        IONIC_MOUNTS+=( -v /etc/libibverbs.d:/etc/libibverbs.d:ro )
+    for _pattern in "libnl-3.so*" "libnl-route-3.so*" "libmnl.so*"; do
+        _lib=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 \
+            -maxdepth 1 -name "$_pattern" -print -quit 2>/dev/null)
+        [ -n "$_lib" ] && IONIC_MOUNTS+=( -v "$_lib:$_lib:ro" )
+    done
+fi
+IONIC_EOF
+
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
 EXTRA_FLAGS=""
@@ -495,8 +523,9 @@ EOF
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
+source "$WORKDIR/ionic_mounts.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_prefill \
+docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
@@ -504,8 +533,9 @@ EOF
 cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
+source "$WORKDIR/ionic_mounts.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_decode \
+docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
@@ -531,8 +561,9 @@ cat > "$WORKDIR/bench.sh" <<EOF
 #!/bin/bash
 set -e
 PIP=\$1; DIP=\$2
+source "$WORKDIR/ionic_mounts.sh"
 docker rm -f mi355x_bench 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_bench \
+docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
