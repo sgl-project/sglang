@@ -35,17 +35,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
-# committed to, so REPO and REVISION must be bumped together. New GT now
-# publishes to sgl-project/ci-data-diffusion; the pins below still resolve
-# against sgl-project/ci-data (readable but frozen). When you bump REVISION to a
-# freshly generated commit, switch REPO to sgl-project/ci-data-diffusion too
-# (and update the URL assertion in the consistency-metrics unit test).
-SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data"
+# committed to, so REPO and REVISION must be bumped together. All GT (CUDA and
+# NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
+# publish.
+SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
+SGL_TEST_FILES_CI_DATA_REVISION = "d05810e3ea3eff1d137dec723f6e66d9c11b470f"
 
-SGL_TEST_FILES_CI_DATA_REVISION = "320949ecc2587474a2f535229ffc8f47ed16ee51"
-
+# The NPU pin is kept as a separate branch so ascend GT can be bumped independently
+# when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
+    SGL_TEST_FILES_CI_DATA_REVISION = "d180ad38872dff3d1ad03e4610cffcda874d3eb8"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -2002,6 +2001,30 @@ def _save_generated_artifact_images(
         Image.fromarray(_ensure_rgb_uint8_image(frame)).save(path)
         generated_files.append(str(path.relative_to(out_dir)))
     return generated_files
+
+
+def save_missing_consistency_gt_artifact(
+    artifact_dir: str | Path | None,
+    case_id: str,
+    num_gpus: int,
+    output_frames: list[np.ndarray],
+    is_video: bool,
+    output_format: str | None = None,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+
+    out_dir = Path(artifact_dir) / "missing_consistency_gt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filenames = _consistency_gt_filenames(
+        case_id,
+        num_gpus,
+        is_video=is_video,
+        output_format=output_format,
+    )
+    for frame, filename in zip(output_frames, filenames):
+        Image.fromarray(_ensure_rgb_uint8_image(frame)).save(out_dir / filename)
+    return out_dir
 
 
 def _write_consistency_failure_index(

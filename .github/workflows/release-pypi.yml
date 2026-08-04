@@ -113,4 +113,4 @@ jobs:
           pip install twine
           # --skip-existing makes partial reruns safe (e.g. one arch failed,
           # rerun only the failed shard without re-uploading already-published wheels).
-          python3 -m twine upload --skip-existing dist/*.whl -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python3 -m twine upload --verbose --skip-existing dist/*.whl -u __token__ -p ${{ secrets.PYPI_TOKEN }}

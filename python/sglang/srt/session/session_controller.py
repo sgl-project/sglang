@@ -431,6 +431,7 @@ class SessionController:
                 mm.release_features()
             node.req.multimodal_inputs = None
 
+        self.tree_cache.release_radix_session(session_id)
         self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
         log_info_on_rank0(
