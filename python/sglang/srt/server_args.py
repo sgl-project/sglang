@@ -1408,7 +1408,7 @@ class ServerArgs:
     ] = False
     enable_session_radix_cache: A[
         bool,
-        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
+        "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
         NS("memory"),
     ] = False
 
@@ -3304,8 +3304,21 @@ class ServerArgs:
         NS("exec.features"),
     ] = False
     enable_return_hidden_states: A[
-        bool, "Enable returning hidden states with responses.", NS("exec.features")
+        bool,
+        "Enable returning full hidden states with responses. Equivalent to "
+        "`--return-hidden-states-mode full`.",
+        NS("exec.features"),
     ] = False
+    return_hidden_states_mode: A[
+        Optional[str],
+        Arg(
+            help="Set the maximum hidden-state return mode supported by the "
+            "server. `last` allows requests with return_hidden_states=False or "
+            "`last`; `full` also allows return_hidden_states=True.",
+            choices=["last", "full"],
+        ),
+        NS("exec.features"),
+    ] = None
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",
@@ -3407,6 +3420,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3582,6 +3596,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _handle_return_hidden_states_mode(self):
+        if self.return_hidden_states_mode not in (None, "last", "full"):
+            raise ValueError(
+                "return_hidden_states_mode must be one of: None, 'last', or 'full'."
+            )
+        if self.return_hidden_states_mode is None:
+            if self.enable_return_hidden_states:
+                self.return_hidden_states_mode = "full"
+        else:
+            self.enable_return_hidden_states = True
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -4425,7 +4450,12 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+        from sglang.srt.configs.model_config import (
+            is_deepseek_dsa,
+            is_deepseek_v4,
+            is_nemotron_h,
+        )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4436,6 +4466,13 @@ class ServerArgs:
                 lambda: self.use_mla_backend()
                 and not is_deepseek_dsa(self.get_model_config().hf_config),
             ),
+            # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
+            # state-track write is not wired into the captured buffers, so a
+            # replay can commit a cache slot it never wrote.
+            (
+                "NemotronH (hybrid Mamba2 prefill)",
+                lambda: is_nemotron_h(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -4445,7 +4482,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4457,10 +4495,10 @@ class ServerArgs:
                 "two-batch overlap",
                 lambda: self.enable_two_batch_overlap,
             ),
-            # Only DeepEP's a2a is validated under BCG.
             (
-                "non-DeepEP a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
+                "unvalidated a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -4701,14 +4739,6 @@ class ServerArgs:
                     prefill_cuda_graph_config.max_bs, 4096
                 )
 
-        # Clamp to context_length if explicitly set — prevents prefill CG
-        # warmup from compiling graphs with more tokens than the model
-        # buffers can hold, which causes illegal memory access (#21112).
-        if self.context_length is not None:
-            prefill_cuda_graph_config.max_bs = min(
-                prefill_cuda_graph_config.max_bs, self.context_length
-            )
-
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (
                 self._generate_prefill_cuda_graph_batch_sizes(
@@ -4754,9 +4784,15 @@ class ServerArgs:
             )
 
             # Multimodal models need more memory for the image processing,
-            # so we adjust the mem_fraction_static accordingly.
+            # so we adjust the mem_fraction_static accordingly. The VLM encoder
+            # only runs on the prefill stage, so PD decode engines do not need
+            # this headroom; prefill engines and normal (non-PD) engines do.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only:
+            if (
+                model_config.is_multimodal
+                and not self.language_only
+                and self.disaggregation_mode != "decode"
+            ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -4774,36 +4810,49 @@ class ServerArgs:
         # use_mla_backend is a method at args time but ModelRunner overwrites it
         # with a bool on global_server_args (see the FIXME there) -- handle both.
         use_mla = self.use_mla_backend
-        if not (
-            envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
-            and self.device == "cuda"
-            and self.dcp_size == 1
-            and not (use_mla() if callable(use_mla) else use_mla)
-            and self.kv_cache_dtype != "fp4_e2m1"
-            and not self.prefill_only_disable_kv_cache
-            and not self.enable_memory_saver
-            and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
-            # Accurate sizing assumes graph-covered execution (graphs retain the
-            # activation workspace, so it is measured post-capture). An eager
-            # phase would pay activations outside the measurement: DP attention
-            # runs prefill eager internally, and an explicitly disabled phase
-            # backend runs eager -- keep those on the heuristic reserve.
-            and not self.enable_dp_attention
-            and (
-                self.disaggregation_mode == "decode"
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
-            )
-            and (
-                self.disaggregation_mode == "prefill"
-                or self.cuda_graph_config.decode.backend != Backend.DISABLED
-            )
+        mla_enabled = use_mla() if callable(use_mla) else use_mla
+        if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
+            return False
+        if self.device != "cuda":
+            return False
+        if self.dcp_size != 1:
+            return False
+        if mla_enabled:
+            return False
+        if self.kv_cache_dtype == "fp4_e2m1":
+            return False
+        if self.prefill_only_disable_kv_cache:
+            return False
+        if self.enable_memory_saver:
+            return False
+        if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+            return False
+
+        if (
+            self.disaggregation_mode != "prefill"
+            and self.cuda_graph_config.decode.backend == Backend.DISABLED
         ):
             return False
+
+        if self.disaggregation_mode != "decode":
+            prefill_cfg = self.cuda_graph_config.prefill
+            # We can only skip eager activation headroom when the largest
+            # prefill forward batch size is already graph-captured. Otherwise,
+            # an eager forward will need more memory and lead to OOM.
+            if (
+                prefill_cfg.backend == Backend.DISABLED
+                or self.chunked_prefill_size <= 0
+                or self.max_prefill_buffer_tokens() > max(prefill_cfg.bs or (0,))
+            ):
+                return False
 
         from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
         hf_config = self.get_model_config().hf_config
-        return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
+        if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+            return False
+
+        return True
 
     def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Runtime activation working-set reserve for eager decode above the captured
@@ -6191,19 +6240,13 @@ class ServerArgs:
             hf_config = model_config.hf_config
             model_arch = hf_config.architectures[0]
             if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-                if getattr(hf_config, "index_share_for_mtp_iteration", False):
-                    # GLM 5.2 (DSA index-share MTP): CP-v2 is not ready for it
-                    # yet, so default the env to off and keep the legacy CP path.
-                    if not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(False)
-                else:
-                    is_dsa_default_model = is_deepseek_dsa(hf_config)
-                    # DSA CP-v2 currently supports only the interleave strategy.
-                    enable_default_cp_v2 = not is_dsa_default_model or (
-                        self.enable_prefill_cp and self.cp_strategy == "interleave"
-                    )
-                    if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                        envs.SGLANG_ENABLE_CP_V2.set(True)
+                is_dsa_default_model = is_deepseek_dsa(hf_config)
+                # DSA CP-v2 currently supports only the interleave strategy.
+                enable_default_cp_v2 = not is_dsa_default_model or (
+                    self.enable_prefill_cp and self.cp_strategy == "interleave"
+                )
+                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
+                    envs.SGLANG_ENABLE_CP_V2.set(True)
 
             if (
                 self.enable_prefill_cp
@@ -6586,10 +6629,6 @@ class ServerArgs:
         if a2a_backend == "megamoe":
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-            logger.info(
-                f"Mega MoE is enabled. The expert parallel size is adjusted "
-                f"to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
@@ -6612,19 +6651,6 @@ class ServerArgs:
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            logger.warning(
-                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
-        if a2a_backend == "mooncake":
-            logger.warning(
-                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
-
-        if a2a_backend == "nixl":
-            logger.warning(
-                f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
         if (
             self.moe_a2a_backend == "none" and is_npu()
@@ -6632,17 +6658,10 @@ class ServerArgs:
             # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
             self.moe_a2a_backend = "none"
 
-        if self.moe_a2a_backend == "ascend_fuseep":
-            logger.warning(
-                f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
         if self.moe_a2a_backend == "flashinfer":
             assert (
                 resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
-            logger.warning(
-                f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
             if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
@@ -6663,9 +6682,6 @@ class ServerArgs:
             if self.deepep_mode == "auto":
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
-            logger.warning(
-                f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
             # Check chunked prefill for mori
             # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -6706,9 +6722,6 @@ class ServerArgs:
             if self.moe_runner_backend == "auto":
                 self.moe_runner_backend = "deep_gemm"
                 logger.warning("auto set moe_runner_backend=`deep_gemm` for PPLX EP")
-            logger.warning(
-                f"PPLX MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
             # Check per-rank dispatch tokens for pplx
             # Skip validation if chunked prefill is disabled (i.e., size <= 0)
@@ -7088,6 +7101,49 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
+
+        # Step 3: DCP compatibility for the L2 (device<->host) path.
+        self._resolve_hicache_dcp_compatibility()
+
+    def _resolve_hicache_dcp_compatibility(self):
+        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+            return
+        if self.hicache_storage_backend is not None:
+            raise NotImplementedError(
+                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
+                "supported yet: under DCP each rank holds a distinct "
+                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
+                "backup and the storage keys must become dcp_rank-aware "
+                "first. Run HiCache+DCP with L1/L2 only."
+            )
+        if self.speculative_algorithm is not None:
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 does not support speculative "
+                "decoding yet (the draft-model host pool has no DCP index "
+                "translation)."
+            )
+        if self.enable_lmcache:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation."
+            )
+        if self.enable_hisparse:
+            raise NotImplementedError(
+                "--enable-hisparse with --dcp-size > 1 is not supported: the "
+                "HiSparse host pool is constructed without DCP translation."
+            )
+        if not self.use_mla_backend():
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 is only supported for MLA models: "
+                "the index translation lives in MLATokenToKVPoolHost, and the "
+                "MHA host pool has none."
+            )
+        logger.info(
+            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+            "logical slot accounting with per-rank physical translation at "
+            "the transfer boundary (dcp_size=%d).",
+            self.dcp_size,
+        )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -7562,11 +7618,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
-        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
-            raise ValueError(
-                "--enable-session-radix-cache requires --radix-eviction-policy priority"
-            )
-
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -9024,6 +9075,28 @@ class ServerArgs:
         }
 
 
+def m3_fp8_attn_gemm_enabled(args) -> bool:
+    """Whether MiniMax-M3 attention GEMMs run in fp8 (no opt-in flag; active
+    whenever possible): fp8_e4m3 main + index KV caches, fp8-cast q, fp8
+    sparse/MSA kernels, with dense layers on trtllm_mha's fp8-q path. Needs
+    kv_cache_dtype fp8_e4m3 (e5m2 would silently mis-dispatch fmha_sm100's
+    e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
+    GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
+    sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
+    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
+    bf16 q) without having to move off trtllm_mha.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.common import is_sm100_supported
+
+    return (
+        args.kv_cache_dtype == "fp8_e4m3"
+        and args.attention_backend == "trtllm_mha"
+        and is_sm100_supported()
+        and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
+    )
+
+
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
@@ -9241,6 +9314,10 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+            elif is_rust_server:
+                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
+                # DataParallelController allocating worker ports.
+                scheduler_input_port = port_base + 6 + dp_rank
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]

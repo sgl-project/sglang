@@ -227,6 +227,14 @@ class UlyssesAttention(nn.Module):
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "UlyssesAttention's all-to-all spans the combined sequence "
+                "parallel group and is not ring-aware; it would silently "
+                "shuffle across ring ranks instead of rotating KV within "
+                "them. Ring parallelism is not supported for models still "
+                "using UlyssesAttention -- use USPAttention instead."
+            )
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -1017,6 +1025,11 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
         """
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-prefix/suffix path does not support "
+                "ring parallelism yet."
+            )
         sp_size = get_ulysses_parallel_world_size()
         sp_rank = get_sp_parallel_rank()
 
@@ -1124,6 +1137,11 @@ class USPAttention(nn.Module):
         ctx_attn_metadata,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-kv-prefix path does not support "
+                "ring parallelism yet."
+            )
         sp_rank = get_sp_parallel_rank()
 
         if q.device.type == "cuda":

@@ -148,6 +148,7 @@ def prepare_vision_attention_metadata(
     cu_seqlens: torch.Tensor,
     device: torch.device,
     *,
+    max_seqlen: Optional[int] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -156,7 +157,8 @@ def prepare_vision_attention_metadata(
 
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = int(seq_lens.max().item())
+    if max_seqlen is None:
+        max_seqlen = int(seq_lens.max().item())
     return VisionAttentionMetadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
@@ -784,6 +786,9 @@ class VisionAscendAttention(nn.Module):
         if not _is_npu:
             raise Exception("VisionAscendAttention is only available for ascend npu")
         super().__init__()
+        # Ascend fused attention does not support SGLang's additive masks, so
+        # masked inputs must stay on SDPA.
+        self.sdpa_fallback = VisionSdpaAttention(**kwargs)
 
     def forward(
         self,
@@ -795,6 +800,7 @@ class VisionAscendAttention(nn.Module):
         seq_len: int,
         softmax_scale: Optional[float] = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -803,6 +809,19 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if attention_mask is not None:
+            return self.sdpa_fallback(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens,
+                bsz=bsz,
+                seq_len=seq_len,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                **kwargs,
+            )
+
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
@@ -1050,6 +1069,8 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        self.qkv_backend_name: str = qkv_backend
+
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
@@ -1151,7 +1172,8 @@ class VisionAttention(nn.Module):
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
-        - Non-CUDA: "sdpa"
+        - Ascend NPU: "ascend_attn"
+        - Other platforms: device-specific optimized backend or "sdpa"
         """
         override_backend = get_mm().mm_attention_backend
         if override_backend is not None:
@@ -1166,6 +1188,8 @@ class VisionAttention(nn.Module):
                 backend = "fa4"
             else:
                 backend = "triton_attn"
+        elif _is_npu:
+            backend = "ascend_attn"
         elif _is_musa:
             if get_device_capability() >= (3, 1):
                 backend = "fa3"
