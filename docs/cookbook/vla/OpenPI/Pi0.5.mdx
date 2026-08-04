@@ -426,7 +426,7 @@ The benchmark reports:
 - SGLang Python in-process latency when `--sglang-api python` is set. This loads the native Pi0.5 pipeline in the benchmark process and avoids HTTP, websocket, scheduler, and serialization overhead. Use `--sglang-python-batch-mode grouped` to exercise the conservative native grouped-batch path. The Python path also reports actual SGLang module parameter dtype counts and example parameter names.
 - OpenPI single-request latency through `Policy.infer`.
 - Batch latency for grouped robot streams. SGLang uses concurrent HTTP requests in HTTP mode and persistent multi-connection msgpack calls in websocket mode. The Python backend can use true grouped model execution for fresh-prefix requests. OpenPI defaults to its internal direct model batch path because the public `Policy.infer` API is single-observation.
-- Action difference on the common output prefix. Use `--deterministic-noise` for strict debugging when the SGLang and OpenPI horizons match. The `aloha` profile supports this directly; the LIBERO profile compares the common prefix because OpenPI's released LIBERO config uses a shorter output horizon than the LeRobot Pi0.5 checkpoint metadata.
+- Action difference in normalized model space from identical OpenPI-transformed model inputs and noise. The check requires `--deterministic-noise` and fails when either `--action-max-abs-diff` or `--action-mean-abs-diff` is exceeded. This mode isolates model parity from robot-specific normalization and action postprocessing. The LIBERO policy returns only 10 actions after policy postprocessing, but its flow-matching model still generates a 50-step chunk; the benchmark compares that model output with SGLang before OpenPI unnormalization and horizon slicing.
 
 For one-sided 16GB-class checks, run each backend separately under the same VRAM pressure. The SGLang Python path accepts the same pipeline config override as serving:
 
@@ -455,7 +455,7 @@ The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 | Check | Result |
 | --- | --- |
 | `lerobot/pi05_base` direct end-to-end | Prefix length `968`, output shape `[1, 50, 32]`, peak allocated memory `12.817 GiB`. |
-| LeRobot reference parity | One-step velocity max absolute difference `1.17e-6`; final 10-step action max absolute difference `1.17e-7`. |
+| Official OpenPI parity | Against OpenPI PyTorch revision `15a9616`, with the same LeRobot checkpoint revision, observation, and noise: first-step velocity max/mean absolute difference `0.02677` / `0.00344`; production 10-step normalized action `0.00813` / `0.00092`. |
 | Action denoise CUDA graph | Eager 10-step denoise `125.4 ms`; steady graph replay `50.8 ms`; max output difference `0`. |
 | Exact full-prefix cache | First prefix pass about `203 ms`; exact cache hit prefix stage about `0.2 ms`. |
 | `lerobot/pi05_libero_base` direct end-to-end | Image keys `image`, `image2`, `empty_camera_0`; state dim `8`; output action dim `7`; output tensor shape `[1, 50, 32]`. |
