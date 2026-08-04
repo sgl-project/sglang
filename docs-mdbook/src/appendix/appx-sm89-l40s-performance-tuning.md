@@ -717,3 +717,62 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - 瓶颈是**显存带宽**（GPU 读自身板载显存），不是 PCIe：decode 每 token 读 13.5GB 权重（卡内），PCIe 只承担加载权重和 TP 激活值通信（KB 级/token），非瓶颈；
 - 27B + 96K + thinking 长输出 + 高并发 的组合超出 L40S 物理能力；L40S 适合 ≤14B 模型或低并发/短输出；
 - 出路：换 H20/H100（显存带宽 4~5x）、换小模型、或非 thinking 检视 + 结构化 prompt（质量 A/B 定论）。
+
+### 11.9 TTFT 优化的非架构手段（优先调度 + 网关限并发 + round_robin）
+
+> 目标：不碰 MTP、不动架构，把 tool call TTFT 从 7.19s 压向 3~4s，thinking TTFT 稳定不随队列恶化。
+
+**三层机制**
+
+| 层 | 手段 | 解决的问题 |
+|----|------|-----------|
+| 服务端 | `--schedule-policy priority` + `--enable-priority-scheduling` | tool call 排队时插到 thinking 前面 |
+| 请求侧 | OpenAI 接口 `priority` 字段（tool call=10，thinking=0） | 同上（队列顺序） |
+| 网关侧 | 按类型信号量限并发 + 超时 429 | thinking 占不满槽位，tool call 永远有位置 |
+
+**服务端配置**（先 `--help | grep -iE "priority|schedule-policy"` 确认 0.5.17 支持）：
+
+```bash
+--schedule-policy priority \
+--enable-priority-scheduling \
+--default-priority-value 0
+```
+
+- 语义：priority 值越高越先调度（默认）；可选 `--disable-priority-preemption` 控制是否抢占；
+- 注意：priority **只改队列顺序，不改 GPU 计算份额**，网关限并发不能省。
+
+**请求侧**：
+
+```json
+// tool call：加 priority 10
+{ "priority": 10, ... }
+// thinking：默认 0，可不传
+```
+
+**网关侧限并发**（超时直接 429，不让请求进服务器排队）：
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+LIMITS = {"tool_call": 8, "thinking": 12}   # tool call 保底槽位，thinking 封顶
+sems = {k: asyncio.Semaphore(v) for k, v in LIMITS.items()}
+
+@asynccontextmanager
+async def guard(kind: str, timeout: float = 10.0):
+    try:
+        await asyncio.wait_for(sems[kind].acquire(), timeout)
+    except asyncio.TimeoutError:
+        raise   # 上层 catch 后返回 429/503，绝不进服务器排队
+    try:
+        yield
+    finally:
+        sems[kind].release()
+
+# 处理处：
+# kind = "tool_call" 或 "thinking"（按入口 path 或 chat_template_kwargs.enable_thinking 区分）
+# async with guard(kind):
+#     resp = await forward_to_sglang(payload)   # 转发时给 tool call 注入 priority=10
+```
+
+**预期效果**：round_robin 消 Worker 热点；priority=10 让 tool call 不被长 thinking 挡住；thinking 并发 ≤12 封顶后 TTFT 稳定（不再出现 100s 级队列）；tool call 并发 ≤8 防自爆。组合后 tool call TTFT 向 3~4s 收敛。
