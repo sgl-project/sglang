@@ -391,6 +391,47 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # Fused-accept spec path (flashinfer recurrent_kda): the next verify
+        # seeds itself in-kernel from the accepted checkpoint slot
+        # (num_accepted_tokens), so the per-round SSM commit scatter is skipped.
+        # accept_lens_pool holds last round's accept length per mamba slot;
+        # extend stages fresh requests with 1 (read slot 0). Its presence is the
+        # signal that switches the post-verify commit to conv-only.
+        if self._can_fuse_accept_state(model_runner, verify_backend):
+            self.accept_lens_pool = torch.ones(
+                self.req_to_token_pool.size + 1,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+
+    @staticmethod
+    def _can_fuse_accept_state(model_runner: ModelRunner, verify_backend) -> bool:
+        """Whether the verify kernel can seed itself from the accepted checkpoint.
+
+        The seed comes from recurrent_kda's ``num_accepted_tokens``, which makes
+        the previous round's accepted state addressable in-kernel so the SSM
+        state never has to round-trip through the committed pool (`temporal`).
+        Hence the keying on the verify backend -- the one that selects the
+        target_verify kernel -- and not on decode, which is set separately.
+
+        `temporal` then goes stale between verifies, which is what the remaining
+        conditions rule out: each is a reader of the committed state that the
+        skipped scatter would starve. Falling short of the contract falls back to
+        the commit scatter rather than raising -- this is a capability, not a
+        mode.
+        """
+        server_args = model_runner.server_args
+        if not verify_backend.is_flashinfer():
+            return False  # only recurrent_kda takes num_accepted_tokens
+        if server_args.speculative_algorithm is None:
+            return False  # no verify round, and no intermediate scratch
+        if not server_args.disable_radix_cache:
+            return False  # mamba radix tracking snapshots `temporal`
+        if server_args.enable_linear_replayssm_spec:
+            return False  # the ring already owns the verify-round commitment
+        if server_args.disaggregation_mode != "null":
+            return False  # the PD hand-off transfers `temporal`
+        return True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -688,6 +729,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 forward_batch, h, ssm_states, self.forward_metadata
             )
 
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
+
         return core_attn_out
 
     def _forward_target_verify(
@@ -855,6 +909,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **(
+                {"accept_lens_pool": self.accept_lens_pool}
+                if self.accept_lens_pool is not None
+                else {}
+            ),
         )
         if dense_token_indices is not None:
             # Kernel output is empty-allocated and the capped qsl skips the
