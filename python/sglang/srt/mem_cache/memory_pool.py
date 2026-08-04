@@ -4059,7 +4059,13 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        # loc is widened under DCP; the kernel divides by the world size itself.
+        maybe_detect_oob(
+            loc,
+            0,
+            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            "set_mla_kv_buffer (MLA)",
+        )
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
