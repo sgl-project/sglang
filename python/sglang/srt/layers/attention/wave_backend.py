@@ -365,7 +365,19 @@ class WaveAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                # The TARGET_VERIFY mask totals
+                # sum_i num_draft_tokens * (seq_len_i + num_draft_tokens) (the
+                # verify replay path's seq_mask_len), bounded by
+                # max_num_tokens * (max_context_len + num_draft_tokens) with
+                # max_num_tokens == max_bs * num_draft_tokens. The previous
+                # max_bs * max_context_len under-allocated by a num_draft_tokens
+                # factor plus the +num_draft_tokens term. With spec decoding off
+                # max_num_tokens == max_bs and (... or 0) == 0, so the size is
+                # unchanged.
+                (
+                    max_num_tokens
+                    * (self.max_context_len + (self.num_draft_tokens or 0))
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
