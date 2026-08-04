@@ -208,6 +208,21 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         )
 
 
+@pytest.mark.parametrize("bad_quality", ["ultra", "draft", "", 1])
+def test_video_adapter_rejects_invalid_quality(bad_quality):
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="t2va",
+        conditions=[],
+        target=TARGET,
+        quality=bad_quality,
+    )
+    with pytest.raises(ValueError, match="quality must be one of"):
+        MiniMaxH3SamplingParams.lower_video_request_kwargs(
+            request, {"prompt": request.prompt, "seed": request.seed}
+        )
+
+
 class _HopperCapability:
     def to_int(self) -> int:
         return 90
@@ -289,7 +304,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
     with pytest.raises(ValueError, match="does not support SageAttention"):
         stage.forward(batch, server_args)
 
-    batch.sampling_params.quality = "unsupported"
+    batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None
-    with pytest.raises(ValueError, match="unsupported MiniMax-H3 quality profile"):
+    with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
