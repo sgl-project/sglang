@@ -528,7 +528,7 @@ class StreamExecutor:
 
         self.images_.append((path, base64_data))
         self.cur_images.append((path, base64_data))
-        self.text_ += self.chat_template.get_image_token()
+        self.text_ += self.chat_template.image_token
 
     def _execute_video(self, expr: SglVideo):
         path = expr.path
@@ -538,7 +538,7 @@ class StreamExecutor:
 
         self.images_.append((path, base64_data))
         self.cur_images.append((path, base64_data))
-        self.text_ += self.chat_template.get_image_token()
+        self.text_ += self.chat_template.image_token
 
     def _spec_gen(self, sampling_params):
         stop = sampling_params.stop
