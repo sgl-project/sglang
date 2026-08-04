@@ -1255,6 +1255,12 @@ class SchedulerDisaggregationPrefillMixin:
             num_kv_tokens=end_idx - start_idx,
         )
         req.start_send_idx = end_idx
+        # A last chunk needs no entry: every `last_chunk=True` call site has
+        # already put the request on `disagg_prefill_inflight_queue`.
+        if last_chunk:
+            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        else:
+            self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1264,6 +1270,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
+        # Re-sends from scratch, so it must not hold the gate closed.
+        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None

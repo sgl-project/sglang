@@ -662,6 +662,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         overlap and index in dense ids. Both sides must therefore build the
         pool with identical specs.
         """
+        # The address formula omits the anchor; a nonzero one would mis-address.
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
