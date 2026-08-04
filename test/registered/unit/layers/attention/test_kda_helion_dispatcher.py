@@ -85,22 +85,23 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIs(backend, LinearAttnKernelBackend.HELION)
         self.assertTrue(backend.is_helion())
 
-    def test_replayssm_decode_uses_triton_fallback(self):
+    def test_replayssm_decode_uses_native_helion_kernel(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
         kernel._packed_decode = MagicMock()
+        kernel._replayssm_decode = MagicMock()
         kernel._triton = MagicMock()
-        expected = object()
-        kernel._triton.packed_decode.return_value = expected
-        mixed_qkv = torch.empty(2, 16)
+        mixed_qkv = torch.empty(2, 20)
         a = torch.empty(2, 8)
         b = torch.empty(2, 1)
         state = torch.empty(2, 1, 4, 8)
         indices = torch.arange(2, dtype=torch.int32)
+        force_flush = torch.zeros(2, dtype=torch.int32)
         replay_args = {
-            "replayssm_d": object(),
-            "replayssm_k": object(),
-            "replayssm_g": object(),
-            "replayssm_write_pos": object(),
+            "replayssm_d": torch.empty(2, 1, 4, 4),
+            "replayssm_k": torch.empty(2, 1, 4, 8),
+            "replayssm_g": torch.empty(2, 1, 4, 8),
+            "replayssm_write_pos": torch.zeros(2, dtype=torch.int32),
+            "replayssm_force_flush": force_flush,
         }
 
         result = kernel.packed_decode(
@@ -114,12 +115,18 @@ class TestHelionKDADispatcher(unittest.TestCase):
             cache_indices=indices,
             num_v_heads=1,
             head_v_dim=4,
+            lower_bound=-5.0,
             **replay_args,
         )
 
-        self.assertIs(result, expected)
+        self.assertEqual(result.shape, (1, 2, 1, 4))
         kernel._packed_decode.assert_not_called()
-        kernel._triton.packed_decode.assert_called_once()
+        kernel._replayssm_decode.assert_called_once()
+        self.assertIs(
+            kernel._replayssm_decode.call_args.kwargs["force_flush"], force_flush
+        )
+        self.assertEqual(kernel._replayssm_decode.call_args.kwargs["lower_bound"], -5.0)
+        kernel._triton.packed_decode.assert_not_called()
 
     def test_packed_decode_forwards_lower_bound(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
@@ -167,7 +174,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 linear_attn_decode_backend="flashinfer",
                 enable_linear_replayssm=True,
             )
-            with self.assertRaisesRegex(ValueError, "Triton decode implementation"):
+            with self.assertRaisesRegex(ValueError, "Triton, or Helion"):
                 flashinfer_args._handle_linear_attn_backend()
 
     def test_explicit_base_backend_is_not_replaced_by_flashinfer(self):

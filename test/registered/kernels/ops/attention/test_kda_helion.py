@@ -9,6 +9,9 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
+from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+    fused_recurrent_linear_replayssm_decode,
+)
 from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
 from sglang.kernels.ops.attention.helion.kda_decode import (
     helion_fused_recurrent_kda_packed_decode,
@@ -18,6 +21,9 @@ from sglang.kernels.ops.attention.helion.kda_prefill import (
 )
 from sglang.kernels.ops.attention.helion.kda_prefill import (
     chunk_kda as helion_chunk_kda,
+)
+from sglang.kernels.ops.attention.helion.kda_replayssm import (
+    helion_fused_recurrent_kda_replayssm_decode,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -46,6 +52,24 @@ def test_public_signatures_match_triton() -> None:
     assert [parameter.default for parameter in helion_decode_parameters] == [
         parameter.default for parameter in decode_parameters
     ]
+
+    replay_parameters = list(
+        inspect.signature(fused_recurrent_linear_replayssm_decode).parameters.values()
+    )
+    helion_replay_parameters = list(
+        inspect.signature(
+            helion_fused_recurrent_kda_replayssm_decode
+        ).parameters.values()
+    )
+    shared_replay_parameter_count = 15
+    assert (
+        helion_replay_parameters[:shared_replay_parameter_count]
+        == replay_parameters[:shared_replay_parameter_count]
+    )
+    assert [
+        parameter.name
+        for parameter in helion_replay_parameters[shared_replay_parameter_count:]
+    ] == ["lower_bound"]
 
     prefill_signature = inspect.signature(triton_chunk_kda)
     helion_prefill_signature = inspect.signature(helion_chunk_kda)
@@ -218,6 +242,436 @@ def test_packed_decode_lower_bound_contract(state_dtype: torch.dtype) -> None:
         rtol=1e-4,
     )
     assert torch.count_nonzero(helion_out[1]).item() == 0
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "lower_bound"),
+    [
+        (torch.float32, None),
+        (torch.bfloat16, None),
+        (torch.bfloat16, -5.0),
+    ],
+    ids=["fp32", "bf16", "bf16-lower-bound"],
+)
+def test_replayssm_decode_contract(
+    state_dtype: torch.dtype, lower_bound: float | None
+) -> None:
+    """Match Triton ring writes, forced flushes, and natural flushes."""
+    batch, q_heads, v_heads, key_dim, value_dim = 3, 2, 4, 128, 128
+    cache_length, pool_size = 4, 5
+    scale = key_dim**-0.5
+    torch.manual_seed(721)
+    a_log = torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.3
+    dt_bias = torch.randn(v_heads, key_dim, device="cuda", dtype=torch.float32) * 0.1
+    initial = torch.randn(
+        pool_size,
+        v_heads,
+        value_dim,
+        key_dim,
+        device="cuda",
+        dtype=state_dtype,
+    )
+    triton_state = initial.clone()
+    helion_state = initial.clone()
+    triton_d = torch.zeros(
+        pool_size,
+        v_heads,
+        cache_length,
+        value_dim,
+        device="cuda",
+        dtype=state_dtype,
+    )
+    helion_d = triton_d.clone()
+    triton_k = torch.zeros(
+        pool_size,
+        q_heads,
+        cache_length,
+        key_dim,
+        device="cuda",
+        dtype=state_dtype,
+    )
+    helion_k = triton_k.clone()
+    triton_g = torch.zeros(
+        pool_size,
+        v_heads,
+        cache_length,
+        key_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    helion_g = triton_g.clone()
+    indices = torch.tensor([3, -1, 1], device="cuda", dtype=torch.int32)
+    write_pos = torch.zeros(batch, device="cuda", dtype=torch.int32)
+
+    for step in range(7):
+        generator = torch.Generator(device="cuda").manual_seed(900 + step)
+        mixed_qkv = torch.randn(
+            batch,
+            2 * q_heads * key_dim + v_heads * value_dim,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        gate = (
+            torch.randn(
+                batch,
+                v_heads,
+                key_dim,
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 0.5
+        )
+        beta = torch.randn(
+            batch,
+            v_heads,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        triton_out = torch.empty(
+            batch, 1, v_heads, value_dim, device="cuda", dtype=torch.bfloat16
+        )
+        helion_out = torch.empty_like(triton_out)
+        force_flush = (
+            torch.ones(batch, device="cuda", dtype=torch.int32) if step == 2 else None
+        )
+
+        # Triton ReplaySSM is the protocol oracle for the unbounded gate. Its
+        # bounded-gate path is unsupported, so that case uses the full recurrent
+        # update as a stronger state oracle and checks the checkpoint on flushes.
+        if lower_bound is None:
+            fused_recurrent_linear_replayssm_decode(
+                mixed_qkv=mixed_qkv,
+                a=gate,
+                b=beta,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=triton_state,
+                d_cache=triton_d,
+                k_cache=triton_k,
+                g_cache=triton_g,
+                out=triton_out,
+                ssm_state_indices=indices,
+                write_pos=write_pos,
+                force_flush=force_flush,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                nk=2,
+            )
+        else:
+            fused_recurrent_kda_packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=gate.view(batch, -1),
+                b=beta,
+                A_log=a_log,
+                dt_bias=dt_bias.view(-1),
+                scale=scale,
+                initial_state=triton_state,
+                out=triton_out,
+                ssm_state_indices=indices,
+                use_qk_l2norm_in_kernel=True,
+                lower_bound=lower_bound,
+            )
+        helion_fused_recurrent_kda_replayssm_decode(
+            mixed_qkv=mixed_qkv,
+            a=gate,
+            b=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=helion_state,
+            d_cache=helion_d,
+            k_cache=helion_k,
+            g_cache=helion_g,
+            out=helion_out,
+            ssm_state_indices=indices,
+            write_pos=write_pos,
+            force_flush=force_flush,
+            use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
+        )
+
+        torch.testing.assert_close(helion_out, triton_out, atol=5e-4, rtol=1e-2)
+        assert torch.count_nonzero(helion_out[1]).item() == 0
+        is_flush = force_flush is not None or write_pos[0].item() == cache_length - 1
+        if is_flush:
+            torch.testing.assert_close(
+                helion_state.float(),
+                triton_state.float(),
+                atol=4e-3,
+                rtol=1e-2,
+            )
+            write_pos.zero_()
+        else:
+            write_pos.add_(1)
+
+    assert torch.equal(helion_state[4], initial[4])
+
+
+@pytest.mark.parametrize(
+    ("write_pos_values", "force_flush_values", "flushed_rows"),
+    [
+        ([0, 2, 3], None, [False, False, True]),
+        ([1, 2, 1], [1, 0, 1], [True, False, True]),
+    ],
+    ids=["divergent-natural-flush", "mixed-forced-flush"],
+)
+def test_replayssm_per_row_flush_contract(
+    write_pos_values: list[int],
+    force_flush_values: list[int] | None,
+    flushed_rows: list[bool],
+) -> None:
+    """Keep each row's cursor and partial-ring flush decision independent."""
+    batch, q_heads, v_heads, key_dim, value_dim = 3, 2, 4, 128, 128
+    cache_length = 4
+    torch.manual_seed(977)
+    mixed_qkv = torch.randn(
+        batch,
+        2 * q_heads * key_dim + v_heads * value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate = torch.randn(
+        batch,
+        v_heads,
+        key_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    beta = torch.randn(batch, v_heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.2
+    dt_bias = torch.randn(v_heads, key_dim, device="cuda", dtype=torch.float32) * 0.1
+    initial = (
+        torch.randn(
+            batch,
+            v_heads,
+            value_dim,
+            key_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.02
+    )
+    d_cache = (
+        torch.randn(
+            batch,
+            v_heads,
+            cache_length,
+            value_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.02
+    )
+    k_cache = torch.randn(
+        batch,
+        q_heads,
+        cache_length,
+        key_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    g_cache = (
+        -torch.rand(
+            batch,
+            v_heads,
+            cache_length,
+            key_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.1
+    )
+    indices = torch.arange(batch, device="cuda", dtype=torch.int32)
+    write_pos = torch.tensor(write_pos_values, device="cuda", dtype=torch.int32)
+    force_flush = (
+        None
+        if force_flush_values is None
+        else torch.tensor(force_flush_values, device="cuda", dtype=torch.int32)
+    )
+
+    triton_state = initial.clone()
+    helion_state = initial.clone()
+    triton_d, helion_d = d_cache.clone(), d_cache.clone()
+    triton_k, helion_k = k_cache.clone(), k_cache.clone()
+    triton_g, helion_g = g_cache.clone(), g_cache.clone()
+    triton_out = torch.empty(
+        batch, 1, v_heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+    helion_out = torch.empty_like(triton_out)
+
+    common_args = dict(
+        mixed_qkv=mixed_qkv,
+        a=gate,
+        b=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        scale=key_dim**-0.5,
+        ssm_state_indices=indices,
+        write_pos=write_pos,
+        force_flush=force_flush,
+        use_qk_l2norm_in_kernel=True,
+    )
+    fused_recurrent_linear_replayssm_decode(
+        **common_args,
+        initial_state=triton_state,
+        d_cache=triton_d,
+        k_cache=triton_k,
+        g_cache=triton_g,
+        out=triton_out,
+        is_kda=True,
+        nk=2,
+    )
+    helion_fused_recurrent_kda_replayssm_decode(
+        **common_args,
+        initial_state=helion_state,
+        d_cache=helion_d,
+        k_cache=helion_k,
+        g_cache=helion_g,
+        out=helion_out,
+    )
+
+    torch.testing.assert_close(helion_out, triton_out, atol=5e-4, rtol=1e-2)
+    torch.testing.assert_close(helion_state, triton_state, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(helion_d, triton_d, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(helion_k, triton_k, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(helion_g, triton_g, atol=1e-5, rtol=1e-4)
+    for row, flushed in enumerate(flushed_rows):
+        if flushed:
+            assert not torch.equal(helion_state[row], initial[row])
+        else:
+            assert torch.equal(helion_state[row], initial[row])
+
+
+def test_replayssm_cuda_graph_replay_with_strided_state() -> None:
+    """Keep cursor branches dynamic and preserve envelope-strided state I/O."""
+    batch, q_heads, v_heads, key_dim, value_dim = 2, 2, 4, 128, 128
+    cache_length, pool_size = 4, 3
+    state_size = v_heads * value_dim * key_dim
+    slot_stride = state_size + 257
+    storage = torch.empty(pool_size * slot_stride, device="cuda", dtype=torch.float32)
+    state = torch.as_strided(
+        storage,
+        (pool_size, v_heads, value_dim, key_dim),
+        (slot_stride, value_dim * key_dim, key_dim, 1),
+    )
+    torch.manual_seed(811)
+    initial = torch.randn_like(state)
+    state.copy_(initial)
+    mixed_qkv = torch.randn(
+        batch,
+        2 * q_heads * key_dim + v_heads * value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate = torch.randn(
+        batch,
+        v_heads,
+        key_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    beta = torch.randn(batch, v_heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(v_heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(v_heads, key_dim, device="cuda", dtype=torch.float32)
+    d_cache = torch.zeros(
+        pool_size,
+        v_heads,
+        cache_length,
+        value_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    k_cache = torch.zeros(
+        pool_size,
+        q_heads,
+        cache_length,
+        key_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    g_cache = torch.zeros(
+        pool_size,
+        v_heads,
+        cache_length,
+        key_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    indices = torch.tensor([2, 0], device="cuda", dtype=torch.int32)
+    write_pos = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    force_flush = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    output = torch.empty(
+        batch, 1, v_heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    def run_helion() -> None:
+        helion_fused_recurrent_kda_replayssm_decode(
+            mixed_qkv=mixed_qkv,
+            a=gate,
+            b=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=key_dim**-0.5,
+            initial_state=state,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=output,
+            ssm_state_indices=indices,
+            write_pos=write_pos,
+            force_flush=force_flush,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    run_helion()
+    torch.cuda.synchronize()
+    state.copy_(initial)
+    d_cache.zero_()
+    k_cache.zero_()
+    g_cache.zero_()
+    write_pos.fill_(1)
+    force_flush.zero_()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_helion()
+
+    state.copy_(initial)
+    d_cache.zero_()
+    k_cache.zero_()
+    g_cache.zero_()
+    write_pos.fill_(1)
+    force_flush.copy_(torch.tensor([1, 0], device="cuda", dtype=torch.int32))
+    reference_state = initial.clone()
+    reference_out = torch.empty_like(output)
+    fused_recurrent_linear_replayssm_decode(
+        mixed_qkv=mixed_qkv,
+        a=gate,
+        b=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        scale=key_dim**-0.5,
+        initial_state=reference_state,
+        d_cache=d_cache.clone(),
+        k_cache=k_cache.clone(),
+        g_cache=g_cache.clone(),
+        out=reference_out,
+        ssm_state_indices=indices,
+        write_pos=write_pos,
+        force_flush=force_flush,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        nk=2,
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, reference_out, atol=5e-4, rtol=1e-2)
+    torch.testing.assert_close(state, reference_state, atol=2e-3, rtol=1e-3)
 
 
 def _compare_prefill(

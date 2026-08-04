@@ -15,7 +15,8 @@ class HelionKDAKernel(LinearAttnKernelBase):
 
     The generic decode interface delegates to Triton, and the dispatcher routes
     speculative target verification directly to Triton. The one-token decode
-    path uses :meth:`packed_decode`, while prefill uses :meth:`extend`.
+    and ReplaySSM paths use :meth:`packed_decode`, while prefill uses
+    :meth:`extend`.
     """
 
     supports_packed_decode = True
@@ -29,13 +30,18 @@ class HelionKDAKernel(LinearAttnKernelBase):
     ) -> None:
         self.supports_packed_decode = enable_decode
         self._packed_decode = None
+        self._replayssm_decode = None
         self._chunk_kda = None
         if enable_decode:
             from sglang.kernels.ops.attention.helion.kda_decode import (
                 helion_fused_recurrent_kda_packed_decode,
             )
+            from sglang.kernels.ops.attention.helion.kda_replayssm import (
+                helion_fused_recurrent_kda_replayssm_decode,
+            )
 
             self._packed_decode = helion_fused_recurrent_kda_packed_decode
+            self._replayssm_decode = helion_fused_recurrent_kda_replayssm_decode
         if enable_prefill:
             from sglang.kernels.ops.attention.helion.kda_prefill import chunk_kda
 
@@ -59,30 +65,39 @@ class HelionKDAKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         assert self._packed_decode is not None
-        replayssm_args = (
-            kwargs.get("replayssm_d"),
-            kwargs.get("replayssm_k"),
-            kwargs.get("replayssm_g"),
-            kwargs.get("replayssm_write_pos"),
-        )
-        if all(value is not None for value in replayssm_args):
-            return self._triton.packed_decode(
-                mixed_qkv,
-                a,
-                b,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=scale,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                num_v_heads=num_v_heads,
-                head_v_dim=head_v_dim,
-                lower_bound=lower_bound,
-                **kwargs,
-            )
-
         batch_size = mixed_qkv.shape[0]
         out = mixed_qkv.new_empty(batch_size, 1, num_v_heads, head_v_dim)
+        replayssm_d = kwargs.get("replayssm_d")
+        replayssm_k = kwargs.get("replayssm_k")
+        replayssm_g = kwargs.get("replayssm_g")
+        replayssm_write_pos = kwargs.get("replayssm_write_pos")
+        if (
+            replayssm_d is not None
+            and replayssm_k is not None
+            and replayssm_g is not None
+            and replayssm_write_pos is not None
+        ):
+            assert self._replayssm_decode is not None
+            self._replayssm_decode(
+                mixed_qkv=mixed_qkv,
+                a=a.reshape(batch_size, num_v_heads, -1).contiguous(),
+                b=b.reshape(batch_size, num_v_heads).contiguous(),
+                A_log=A_log.reshape(-1),
+                dt_bias=dt_bias.reshape(num_v_heads, -1).contiguous(),
+                scale=scale,
+                initial_state=ssm_states,
+                d_cache=replayssm_d,
+                k_cache=replayssm_k,
+                g_cache=replayssm_g,
+                out=out,
+                ssm_state_indices=cache_indices,
+                write_pos=replayssm_write_pos,
+                force_flush=kwargs.get("replayssm_force_flush"),
+                use_qk_l2norm_in_kernel=True,
+                lower_bound=lower_bound,
+            )
+            return out.transpose(0, 1)
+
         if a.ndim != 2:
             a = a.reshape(batch_size, -1)
         if b.ndim != 2:
