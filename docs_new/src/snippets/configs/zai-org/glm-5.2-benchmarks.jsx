@@ -4,7 +4,7 @@
 // (env=[], no SGLANG_SIMULATE_ACC_LEN) and the exact benchmarkCommands (--random-range-ratio 1.0,
 // --flush-cache, warmup 64) — so spec-decode reflects real acceptance, not a fixed simulate.
 export const benchmarks = [
-  // ---- H200 + FP8 ----  (serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
+  // ---- H200 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
       {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
@@ -104,7 +104,7 @@ export const benchmarks = [
         ttft_ms: 1214156, tpot_ms: 100.03, tokens_per_sec_per_gpu: 6708 },
     ],
   },
-  // ---- B300 + FP8 ----  (8-GPU single node, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
+  // ---- B300 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
       {
     match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",
@@ -135,7 +135,7 @@ export const benchmarks = [
         ttft_ms: 381190, tpot_ms: 235.26, tokens_per_sec_per_gpu: 6634 },
     ],
   },
-  // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2, TP8; serve recipe in glm-5.2.jsx; benchmark pending re-measurement)
+  // ---- B300 + BF16 ----  (unquantized zai-org/GLM-5.2, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
     {
     match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15.post1",

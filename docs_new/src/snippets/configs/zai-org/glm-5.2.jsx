@@ -286,7 +286,7 @@ sgl-eval run aime25 \\
     },
     {
       // Memory-bound: FP8 weights + KV fill each H200. No max-running cap, but the CUDA-graph
-      // capture is bounded (--cuda-graph-max-bs 128) since uncapping it OOMs. Throughput
+      // capture is bounded (--cuda-graph-max-bs-decode 128) since uncapping it OOMs. Throughput
       // saturates at conc 256; higher conc just queues.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
@@ -298,7 +298,7 @@ sgl-eval run aime25 \\
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -411,7 +411,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Scales past balanced (verified): mfs 0.90 grows the KV batch, cuda-graph-max-bs 512
+      // Scales past balanced (verified): mfs 0.90 grows the KV batch, cuda-graph-max-bs-decode 512
       // sizes the decode capture for it.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
@@ -425,7 +425,7 @@ sgl-eval run aime25 \\
         "--enable-dp-attention",
         "--moe-a2a-backend deepep",
         "--mem-fraction-static 0.90",
-        "--cuda-graph-max-bs 512",
+        "--cuda-graph-max-bs-decode 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -534,7 +534,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      // Memory-bound (bf16). No max-running cap; CUDA-graph capture bounded (--cuda-graph-max-bs 256).
+      // Memory-bound (bf16). No max-running cap; CUDA-graph capture bounded (--cuda-graph-max-bs-decode 256).
       // Throughput saturates at conc 256 — higher conc just queues.
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
@@ -543,7 +543,7 @@ sgl-eval run aime25 \\
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--mem-fraction-static 0.9",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -779,7 +779,7 @@ sgl-eval run aime25 \\
         "--kv-cache-dtype fp8_e4m3",
         "--bf16-gemm-backend cutedsl",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -845,7 +845,7 @@ sgl-eval run aime25 \\
         "--kv-cache-dtype fp8_e4m3",
         "--bf16-gemm-backend cutedsl",
         "--max-running-requests 16",
-        "--cuda-graph-max-bs 16",
+        "--cuda-graph-max-bs-decode 16",
         "--max-prefill-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -897,7 +897,7 @@ sgl-eval run aime25 \\
     // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
     // draft kernel is not yet validated, and num-steps>3 hits a separate build
     // issue). Strategies differ only by batch-shaping levers
-    // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
+    // (cuda-graph-max-bs-decode / max-running-requests / chunked-prefill):
     //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
@@ -936,7 +936,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -953,7 +953,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -987,7 +987,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1004,7 +1004,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1038,7 +1038,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1055,7 +1055,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1089,7 +1089,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1106,7 +1106,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1140,7 +1140,7 @@ sgl-eval run aime25 \\
         "--dsa-decode-backend tilelang",
         "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 128",
+        "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 80",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
@@ -1157,7 +1157,7 @@ sgl-eval run aime25 \\
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs 256",
+        "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
