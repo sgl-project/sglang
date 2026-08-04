@@ -27,7 +27,6 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils import is_hip
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -386,10 +385,13 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
-        # Keep the raw per-rank request counts for CUDA graph batch-size checks.
-        # The sync tensors below are scaled for the speculative draft width.
-        if is_hip():
-            forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        num_tokens = forward_batch.input_ids.numel()
+        if enable_num_token_non_padded():
+            forward_batch.num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=device
+            )
+        forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
