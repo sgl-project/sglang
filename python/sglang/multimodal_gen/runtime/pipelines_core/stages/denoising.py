@@ -5,6 +5,7 @@
 Denoising stage for diffusion pipelines.
 """
 
+import gc
 import inspect
 import math
 import time
@@ -75,6 +76,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    is_fsdp_managed_module,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -108,6 +112,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
@@ -223,7 +230,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         num_attention_heads = (
             self.server_args.pipeline_config.dit_config.num_attention_heads
         )
-        attn_head_size = hidden_size // num_attention_heads
+        attn_head_size = getattr(
+            self.server_args.pipeline_config.dit_config,
+            "attention_head_dim",
+            hidden_size // num_attention_heads,
+        )
 
         # torch compile
         # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
@@ -337,10 +348,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not args.enable_torch_compile
             or not args.offload_during_compile
             or not args.warmup
-            # a subclass with its own forward would never run the restore
-            or type(self).forward is not DenoisingStage.forward
+            or not self._owns_compile_warmup_lifecycle()
             or args.use_fsdp_inference
-            or envs.SGLANG_CACHE_DIT_ENABLED
+            or self._cache_dit_requested()
             or not isinstance(module, LayerwiseOffloadableModuleMixin)
             or is_layerwise_offloaded_module(module)
         ):
@@ -348,6 +358,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         module.configure_layerwise_offload(args)
         if is_layerwise_offloaded_module(module):
             self._offloaded_dit_modules_for_compile.append(module)
+
+    def _owns_compile_warmup_lifecycle(self) -> bool:
+        """Whether ``forward`` enters ``_offload_for_torch_compile_warmup``.
+
+        Custom denoising loops opt in explicitly after wiring the same restore
+        lifecycle. This keeps the safety guard without silently disabling the
+        optimization solely because a model overrides ``forward``.
+        """
+        return type(self).forward is DenoisingStage.forward
 
     def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
         """Move resident non-DiT components off-device while the warmup
@@ -361,6 +380,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 isinstance(module, torch.nn.Module)
                 and id(module) not in dit_ids
+                and not is_fsdp_managed_module(module)
                 and not is_layerwise_offloaded_module(module)
             ):
                 param = next(module.parameters(), None)
@@ -382,7 +402,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.server_args, "enable_torch_compile", False
         ) or not isinstance(module, nn.Module):
             return
-        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+        if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
         if self._torch_compile_registry.is_compiled(module):
@@ -402,11 +422,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        self._torch_compile_registry.compile_once(
-            module,
-            compile_kwargs=compile_kwargs,
-        )
+        if getattr(self.server_args, "regional_compile", False):
+            compiled_count = self._torch_compile_registry.compile_regions_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
+            logger.info(
+                "Enabled regional torch.compile for %d submodules in %s",
+                compiled_count,
+                type(module).__name__,
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            self._torch_compile_registry.compile_once(
+                module,
+                compile_kwargs=compile_kwargs,
+            )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -418,6 +449,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
+
+    def _cache_dit_requested(self) -> bool:
+        return envs.SGLANG_CACHE_DIT_ENABLED
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
@@ -589,7 +623,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
         # warmup to mount cache-dit before Dynamo traces the transformer.
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
+        if not self._cache_dit_requested():
             return
         if batch.is_warmup and not getattr(
             self.server_args, "enable_torch_compile", False
@@ -677,9 +711,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
                 primary_num_steps,
-                envs.SGLANG_CACHE_DIT_FN,
-                envs.SGLANG_CACHE_DIT_BN,
-                envs.SGLANG_CACHE_DIT_RDT,
+                primary_config.Fn_compute_blocks,
+                primary_config.Bn_compute_blocks,
+                primary_config.residual_diff_threshold,
             )
 
         self._cache_dit_enabled = True
@@ -754,6 +788,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Returns:
             A context object containing the invariant state for the denoising loop.
         """
+        batch = server_args.pipeline_config.expand_conditioning_to_sample_batch(batch)
+
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler
@@ -1204,13 +1240,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # 5. Advance the scheduler state with the predicted noise.
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            ctx.latents = ctx.scheduler.step(
+            latents_dtype = ctx.latents.dtype
+            latents = ctx.scheduler.step(
                 model_output=noise_pred,
                 timestep=step.t_device,
                 sample=ctx.latents,
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0]
+            if latents.dtype != latents_dtype and latents.device.type == "mps":
+                latents = latents.to(latents_dtype)
+            ctx.latents = latents
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -1335,10 +1375,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self._component_residency_manager.remove_nvtx_hooks_for_module(
                     self.transformer
                 )
+                self._component_residency_manager.strategy_for.cache_clear()
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
             server_args.model_loaded["transformer"] = False
+            gc.collect()
+            torch.mps.empty_cache()
             logger.info(
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -1574,9 +1617,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
+            precision_autocast_context(
+                ctx.target_dtype,
+                server_args.disable_autocast,
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
@@ -1640,6 +1683,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        if "step" in locals():
+            del step
         self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so

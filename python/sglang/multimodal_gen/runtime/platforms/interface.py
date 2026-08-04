@@ -29,6 +29,8 @@ class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
+    TORCH_CUDNN_SDPA = enum.auto()
+    DYNAMIC_CUDNN_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
@@ -120,10 +122,6 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
         return self.is_cuda_static()
-
-    @lru_cache(maxsize=1)
-    def is_npu(self) -> bool:
-        return self._enum == PlatformEnum.NPU
 
     @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
