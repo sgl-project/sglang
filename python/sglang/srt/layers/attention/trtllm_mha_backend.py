@@ -1302,6 +1302,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 *,
                 cu_seqlens_kv,
                 use_zigzag_page_table=False,
+                out=None,
             ):
                 block_tables = page_table
                 if use_zigzag_page_table:
@@ -1327,6 +1328,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    out=out,
                     out_dtype=self.q_data_type,
                 )
 
@@ -1341,12 +1343,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
                 )
             else:
+                out = forward_batch._attn_output
+                if out is not None:
+                    out = out.view_as(q)
                 o = _trtllm_context_attn(
                     q,
                     self.forward_metadata.cu_seqlens_q,
                     self.forward_metadata.cache_seqlens_int32,
                     self.forward_metadata.max_seq_len_q,
                     cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
+                    out=out,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
