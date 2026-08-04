@@ -69,6 +69,16 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+    /// Cache-hit load guard (absolute): after a cache hit, divert to the
+    /// globally least-loaded worker when the hit worker leads it by more
+    /// than this many in-flight requests (AND the relative guard fires).
+    #[arg(long)]
+    pub hit_load_abs_threshold: Option<usize>,
+    /// Cache-hit load guard (relative): the hit worker must also exceed
+    /// `min_load * this` to be diverted. Omit (or set infinity) to keep the
+    /// guard OFF. Must be `>= 1.0` when set.
+    #[arg(long)]
+    pub hit_load_rel_threshold: Option<f32>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -157,12 +167,27 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+            || self.balance_rel_threshold.is_some()
+            || self.hit_load_abs_threshold.is_some()
+            || self.hit_load_rel_threshold.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
+                 / --hit-load-abs-threshold / --hit-load-rel-threshold \
                  require --policy cache_aware_zmq"
             ));
+        }
+        // The relative hit-load guard arms the divert logic; a value < 1.0
+        // would divert on almost any gap and defeat the cache. Reject NaN
+        // explicitly (it would otherwise slip past a plain `< 1.0`).
+        // Infinity is allowed and means "guard off".
+        if let Some(rel) = self.hit_load_rel_threshold {
+            if rel.is_nan() || rel < 1.0 {
+                return Err(anyhow!(
+                    "--hit-load-rel-threshold must be >= 1.0 \
+                     (omit it or use infinity to disable the guard)"
+                ));
+            }
         }
 
         let tuned_sticky = self.routing_key_header.is_some()
@@ -244,6 +269,12 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                hit_load_abs_threshold: self
+                    .hit_load_abs_threshold
+                    .unwrap_or(d.hit_load_abs_threshold),
+                hit_load_rel_threshold: self
+                    .hit_load_rel_threshold
+                    .unwrap_or(d.hit_load_rel_threshold),
             })
         } else {
             None
@@ -774,6 +805,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hit_load_guard_flags_build_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--hit-load-abs-threshold",
+            "6",
+            "--hit-load-rel-threshold",
+            "1.2",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.hit_load_abs_threshold, 6);
+        assert_eq!(ca.hit_load_rel_threshold, 1.2);
+    }
+
+    #[test]
+    fn hit_load_guard_defaults_off_when_untouched() {
+        // cache_aware_zmq with only an unrelated knob: guard stays OFF.
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--cache-threshold",
+            "0.7",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert_eq!(ca.hit_load_abs_threshold, 0);
+        assert!(ca.hit_load_rel_threshold.is_infinite());
+    }
+
+    #[test]
+    fn rejects_hit_load_flag_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--hit-load-abs-threshold",
+            "6",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("require --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_hit_load_rel_below_one() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--hit-load-rel-threshold",
+            "0.5",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--hit-load-rel-threshold must be >= 1.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn hit_load_rel_infinity_is_allowed_off() {
+        // Explicit infinity parses and means guard OFF.
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--hit-load-rel-threshold",
+            "inf",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert!(ca.hit_load_rel_threshold.is_infinite());
+    }
     #[test]
     fn log_format_parses_json() {
         let c = into_config_owned(with_model(&[
