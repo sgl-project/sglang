@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
+    poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
@@ -86,7 +87,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -208,6 +209,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        linear_replayssm_cache_len: int = 16,
+        mamba_envelope_layout: bool = False,
+        enable_gdn_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -252,6 +256,9 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
+            mamba_envelope_layout=mamba_envelope_layout,
+            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
         )
 
     def clear(self):
@@ -327,6 +334,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -415,6 +423,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.kv_cache_dtype_str = (
+            self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
+        )
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
@@ -727,23 +738,40 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return resumed_reqs
 
     def _update_handshake_waiters(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> None:
         if not self.queue:
             return
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            decode_req.kv_receiver.conclude_state == KVPoll.Failed
-            for decode_req in self.queue
+        if (
+            self.pp_size <= 1
+            and all(decode_req.waiting_for_input for decode_req in self.queue)
+            and not any(
+                decode_req.kv_receiver.conclude_state == KVPoll.Failed
+                for decode_req in self.queue
+            )
         ):
             return
 
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        if self.pp_size > 1:
+            polls = poll_and_all_reduce_pp(
+                (decode_req.req.rid for decode_req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_good_rids,
+                pp_bad_rids,
+            )
+        else:
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            )
 
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        for decode_req, poll in zip(self.queue, polls):
+            if poll is None:
+                continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -864,11 +892,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        is_pp_mode = self.pp_size > 1
+        if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
+            raise ValueError("PP consensus is required when pp_size > 1")
+        if is_pp_mode and rids_to_check is not None:
+            raise ValueError("rids_to_check cannot be used in PP mode")
+
         self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check)
+        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        if is_pp_mode:
+            rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
         failed_reqs = []
         preallocated_reqs = []
@@ -1210,6 +1249,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            device_page_indices = None
+            if (
+                self.scheduler.enable_hisparse
+                and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            ):
+                # alloc_logical_only() already allocated the shared logical pages
+                # used by C4 indexer and C128 KV. These device buffers do not use
+                # the C4 sparse physical-slot mapping; carry their logical page IDs
+                # alongside the independently allocated C4 host page IDs.
+                full_kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx,
+                    prefix_len:origin_input_len,
+                ]
+                device_page_indices = kv_to_page_indices(
+                    full_kv_indices,
+                    page_size,
+                ).astype(np.int32)
+                if self.transfer_backend != TransferBackend.MOONCAKE:
+                    raise NotImplementedError(
+                        "DSV4 HiSparse direct PD transfer currently requires "
+                        "the Mooncake backend"
+                    )
+            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if device_page_indices is not None:
+                metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1224,7 +1289,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=total_prefix_len,
+                **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
@@ -2208,7 +2273,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if self.server_args.disaggregation_decode_enable_radix_cache:
+                if get_disagg().disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
@@ -2248,7 +2313,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
@@ -2260,9 +2325,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
-            self.polling_interval = (
-                self.server_args.disaggregation_decode_polling_interval
-            )
+            self.polling_interval = get_disagg().disaggregation_decode_polling_interval
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 

@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -178,13 +178,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
-    global_server_args = get_server_args()
-    page_size = global_server_args.page_size
-    spec_algo = global_server_args.speculative_algorithm
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    spec_algo = get_spec().speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not global_server_args.strip_thinking_cache:
+    if spec_algo is None and not get_serving().strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
@@ -196,7 +196,9 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        # start_p is aligned to the allocator's physical page size above, so it
+        # never shares a page with cache_finished_req's tail free in this group.
+        allocator.free_segment(indices_to_free, start_pos=start_p)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
