@@ -23,6 +23,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     is_graph_dsa_split_op_surface,
+    resolve_fp8_mqa_logits_fn,
+    resolve_fp8_paged_mqa_logits_fn,
+    resolve_num_sms,
+    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
@@ -413,7 +417,7 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = resolve_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -978,7 +982,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -1020,11 +1024,11 @@ class Indexer(MultiPlatformOp):
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                deep_gemm.fp8_paged_mqa_logits,
+                resolve_fp8_paged_mqa_logits_fn(),
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -1038,7 +1042,7 @@ class Indexer(MultiPlatformOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                deep_gemm.fp8_paged_mqa_logits,
+                resolve_fp8_paged_mqa_logits_fn(),
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -1228,7 +1232,7 @@ class Indexer(MultiPlatformOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
                     )
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,
@@ -1284,7 +1288,7 @@ class Indexer(MultiPlatformOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[start:end], weights[start:end]
                     )
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
                         w_padded,
@@ -1492,7 +1496,7 @@ class Indexer(MultiPlatformOp):
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = resolve_fp8_mqa_logits_fn()(
                     q_padded,
                     kv_fp8,
                     w_padded,
@@ -1539,7 +1543,7 @@ class Indexer(MultiPlatformOp):
 
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = resolve_fp8_mqa_logits_fn()(
                     q_padded,
                     kv_fp8,
                     w_padded,
@@ -1581,7 +1585,7 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+        # logits = resolve_fp8_mqa_logits_fn()(q_fp8, kv_fp8, weights, ks, ke)
         k_fp8_list = []
         k_scale_list = []
 
