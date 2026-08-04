@@ -876,7 +876,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        # fp8 block scales are reciprocals and live on ``weight_scale_inv``;
+        # mxfp4 block scales are not, and their buffer is ``weight_scale``.
+        # Using the fp8 name for an mxfp4 draft silently drops every expert
+        # scale, which costs acceptance rate rather than raising anything.
+        # Mirror the main model: only MoE scales take the mxfp4 name. An
+        # attention scale in a mixed checkpoint must keep weight_scale_inv.
+        if "mlp" in mapped_rest and mapped_rest.endswith(".scale"):
+            suffix = (
+                "weight_scale"
+                if self.quant_config is not None
+                and self.quant_config.get_name() == "mxfp4"
+                else "weight_scale_inv"
+            )
+            mapped_rest = mapped_rest.removesuffix(".scale") + "." + suffix
         return f"stages.{stage_id}.{mapped_rest}"
 
 

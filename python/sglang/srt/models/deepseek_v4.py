@@ -2851,8 +2851,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         expert_scale_suffix = (
             "weight_scale"
-            if self.quant_config is not None
-            and self.quant_config.get_name() == "mxfp4"
+            if self.quant_config is not None and self.quant_config.get_name() == "mxfp4"
             else "weight_scale_inv"
         )
 

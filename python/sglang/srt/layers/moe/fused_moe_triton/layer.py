@@ -865,7 +865,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None  # `not expert_id` also caught expert 0
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -951,17 +951,6 @@ class FusedMoE(torch.nn.Module):
                 if expert_id >= self.quant_method.num_gpu_experts:
                     return
 
-        # MXFP4 block scales are stored as e8m0 by some checkpoints (DeepSeek)
-        # and as raw uint8 by others (GPT-OSS), but the parameter buffer is
-        # always uint8. Copying an e8m0 tensor into it converts numerically --
-        # a scale byte of 120 means 2^-7, so it lands as 0 and silently zeroes
-        # every block scale. Reinterpret the bits instead.
-        if (
-            loaded_weight.dtype == torch.float8_e8m0fnu
-            and param.dtype == torch.uint8
-        ):
-            loaded_weight = loaded_weight.view(torch.uint8)
-
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -1028,6 +1017,13 @@ class FusedMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         tp_rank = self.moe_tp_rank
+
+        # MXFP4 block scales ship as e8m0 in some checkpoints and as raw uint8
+        # in others, but the parameter buffer is always uint8. Copying an e8m0
+        # tensor into it converts numerically: a scale byte of 120 means 2^-7,
+        # so it lands as 0 and every block scale is silently zeroed.
+        if loaded_weight.dtype == torch.float8_e8m0fnu and param.dtype == torch.uint8:
+            loaded_weight = loaded_weight.view(torch.uint8)
 
         # Special case for GGUF weights
         if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
@@ -1293,6 +1289,11 @@ class FusedMoE(torch.nn.Module):
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
             elif "scale" in weight_name:
+                if (
+                    loaded_weight.dtype == torch.float8_e8m0fnu
+                    and param.dtype == torch.uint8
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
                 param.data.copy_(loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]

@@ -304,14 +304,18 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            # An MXFP4 checkpoint only serializes the MoE experts; every other
+            # linear carries plain bf16. Falling through to `return None` made
+            # the layer assert, so a single missing ignore entry killed the load.
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
-        else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
+        # Attention wrappers and embeddings carry no fp4 tensors in an MXFP4
+        # checkpoint; route them through the unquantized path like every other
+        # quant config does instead of refusing to load.
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -449,9 +453,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # naive-copy fast path above the dispatch.
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-        )
+        # Per-expert checkpoints reach the generic scale loader, which
+        # dispatches on this attribute; GPT-OSS never does, so it was never set.
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -476,7 +481,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
 
         w13_weight_bias = torch.nn.Parameter(
             torch.zeros(
@@ -512,7 +517,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
         w2_weight_bias = torch.nn.Parameter(
             torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
@@ -531,8 +536,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if not is_sm90_supported() and not is_sm120_supported():
-                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+            # Marlin targets SM80+ and its e2m1 decode is bit manipulation,
+            # so gate on the Marlin floor rather than SM90/SM120.
+            if torch.cuda.get_device_capability()[0] < 8:
+                raise RuntimeError("MXFP4 Marlin requires SM80 or newer.")
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
