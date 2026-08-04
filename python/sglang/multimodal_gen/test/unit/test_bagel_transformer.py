@@ -8,11 +8,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.bagel import (
     BagelDiTArchConfig,
     BagelDiTConfig,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -192,6 +194,225 @@ def test_position_table_is_loaded_and_shape_checked(
         )
 
 
+def test_mot_mlp_fuses_gate_up_projection_without_changing_math(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    mlp = tiny_transformer.layers[0].mlp
+    hidden_states = torch.randn(5, 8)
+    gate_weight = torch.randn(16, 8)
+    up_weight = torch.randn(16, 8)
+    down_weight = torch.randn(8, 16)
+    with torch.no_grad():
+        mlp.und_gate_up.weight.copy_(torch.cat((gate_weight, up_weight)))
+        mlp.und_down.weight.copy_(down_weight)
+
+    output = mlp(
+        hidden_states,
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        mode="und",
+    )
+    expected = F.linear(
+        F.silu(F.linear(hidden_states, gate_weight))
+        * F.linear(hidden_states, up_weight),
+        down_weight,
+    )
+
+    assert isinstance(mlp.act_fn, SiluAndMul)
+    assert not hasattr(mlp, "und_gate")
+    assert not hasattr(mlp, "und_up")
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_mot_mlp_cuda_fused_activation_runs_without_cuda_home(
+    tiny_transformer: BagelTransformer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    mlp = tiny_transformer.layers[0].mlp.to(device="cuda", dtype=torch.bfloat16)
+    hidden_states = torch.randn(5, 8, device="cuda", dtype=torch.bfloat16)
+
+    output = mlp(
+        hidden_states,
+        torch.empty(0, device="cuda", dtype=torch.long),
+        torch.empty(0, device="cuda", dtype=torch.long),
+        mode="und",
+    )
+    gate_up_states = F.linear(hidden_states, mlp.und_gate_up.weight)
+    expected = F.linear(
+        F.silu(gate_up_states[..., :16]) * gate_up_states[..., 16:],
+        mlp.und_down.weight,
+    )
+
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_mot_attention_packs_qkv_projections_without_changing_generation_math(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    attention = tiny_transformer.layers[0].attn
+    hidden_states = torch.randn(5, 8)
+    text_indexes = torch.tensor([0, 3])
+    latent_indexes = torch.tensor([1, 2, 4])
+    query_size = attention.num_heads * attention.head_dim
+    kv_size = attention.num_kv_heads * attention.head_dim
+
+    und_weights = [
+        torch.randn(query_size, 8),
+        torch.randn(kv_size, 8),
+        torch.randn(kv_size, 8),
+    ]
+    gen_weights = [weight + 1.0 for weight in und_weights]
+    und_biases = [
+        torch.randn(query_size),
+        torch.randn(kv_size),
+        torch.randn(kv_size),
+    ]
+    gen_biases = [bias + 1.0 for bias in und_biases]
+    with torch.no_grad():
+        attention.und_qkv_proj.weight.copy_(torch.cat(und_weights))
+        attention.und_qkv_proj.bias.copy_(torch.cat(und_biases))
+        attention.gen_qkv_proj.weight.copy_(torch.cat(gen_weights))
+        attention.gen_qkv_proj.bias.copy_(torch.cat(gen_biases))
+
+    query, key, value = attention._project_generation(
+        hidden_states, text_indexes, latent_indexes
+    )
+
+    expected_query = torch.empty_like(query)
+    expected_key = torch.empty_like(key)
+    expected_value = torch.empty_like(value)
+    for indexes, weights, biases, query_norm, key_norm in (
+        (
+            text_indexes,
+            und_weights,
+            und_biases,
+            attention.und_q_norm,
+            attention.und_k_norm,
+        ),
+        (
+            latent_indexes,
+            gen_weights,
+            gen_biases,
+            attention.gen_q_norm,
+            attention.gen_k_norm,
+        ),
+    ):
+        projected_query = F.linear(
+            hidden_states[indexes], weights[0], biases[0]
+        ).view(-1, attention.num_heads, attention.head_dim)
+        projected_key = F.linear(
+            hidden_states[indexes], weights[1], biases[1]
+        ).view(-1, attention.num_kv_heads, attention.head_dim)
+        projected_query, projected_key = _apply_bagel_qk_norm(
+            projected_query.float(),
+            projected_key.float(),
+            query_norm,
+            key_norm,
+            attention.head_dim,
+        )
+        expected_query[indexes] = projected_query
+        expected_key[indexes] = projected_key
+        expected_value[indexes] = F.linear(
+            hidden_states[indexes], weights[2], biases[2]
+        ).view(-1, attention.num_kv_heads, attention.head_dim)
+
+    assert not hasattr(attention, "und_q_proj")
+    assert not hasattr(attention, "gen_q_proj")
+    torch.testing.assert_close(query, expected_query)
+    torch.testing.assert_close(key, expected_key)
+    torch.testing.assert_close(value, expected_value)
+
+
+def test_split_checkpoint_qkv_weights_load_into_packed_projection(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    query_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    key_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) + 100
+    value_weight = key_weight + 100
+    query_bias = torch.arange(8, dtype=torch.float32)
+    key_bias = torch.arange(4, dtype=torch.float32) + 100
+    value_bias = key_bias + 100
+
+    loaded = tiny_transformer.load_weights(
+        [
+            ("language_model.model.layers.0.self_attn.q_proj.weight", query_weight),
+            ("language_model.model.layers.0.self_attn.k_proj.weight", key_weight),
+            ("language_model.model.layers.0.self_attn.v_proj.weight", value_weight),
+            ("language_model.model.layers.0.self_attn.q_proj.bias", query_bias),
+            ("language_model.model.layers.0.self_attn.k_proj.bias", key_bias),
+            ("language_model.model.layers.0.self_attn.v_proj.bias", value_bias),
+        ],
+        strict=False,
+    )
+
+    assert loaded == {
+        "layers.0.attn.und_qkv_proj.bias",
+        "layers.0.attn.und_qkv_proj.weight",
+    }
+    attention = tiny_transformer.layers[0].attn
+    torch.testing.assert_close(
+        attention.und_qkv_proj.weight,
+        torch.cat((query_weight, key_weight, value_weight)),
+    )
+    torch.testing.assert_close(
+        attention.und_qkv_proj.bias,
+        torch.cat((query_bias, key_bias, value_bias)),
+    )
+
+
+def test_split_checkpoint_gate_up_weights_load_into_fused_projection(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    gate_weight = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+    up_weight = gate_weight + 1000
+
+    loaded = tiny_transformer.load_weights(
+        [
+            (
+                "language_model.model.layers.0.mlp.gate_proj.weight",
+                gate_weight,
+            ),
+            (
+                "language_model.model.layers.0.mlp.up_proj.weight",
+                up_weight,
+            ),
+        ],
+        strict=False,
+    )
+
+    assert loaded == {"layers.0.mlp.und_gate_up.weight"}
+    torch.testing.assert_close(
+        tiny_transformer.layers[0].mlp.und_gate_up.weight,
+        torch.cat((gate_weight, up_weight)),
+    )
+
+
+def test_meta_streaming_load_requires_both_fused_mlp_checkpoint_shards(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    with torch.device("meta"):
+        model = BagelTransformer(tiny_transformer.config)
+
+    weights: list[tuple[str, torch.Tensor]] = []
+    for name, parameter in model.named_parameters():
+        if name == "layers.0.mlp.und_gate_up.weight":
+            weights.append(
+                (
+                    "language_model.model.layers.0.mlp.gate_proj.weight",
+                    torch.zeros(16, 8, dtype=parameter.dtype),
+                )
+            )
+        else:
+            weights.append(
+                (name, torch.zeros(tuple(parameter.shape), dtype=parameter.dtype))
+            )
+
+    with pytest.raises(ValueError, match="layers.0.mlp.und_gate_up.weight"):
+        model.load_weights(iter(weights))
+
+
 def test_context_and_forward_are_request_isolated(
     tiny_transformer: BagelTransformer,
 ) -> None:
@@ -290,13 +511,13 @@ def test_batch_one_preserves_two_and_three_dimensional_forward_contract(
             latents,
             torch.tensor([0.5]),
             bagel_context=context,
-            guidance_scale=2.0,
+            guidance_scale=1.0,
         )
         batched = tiny_transformer(
             latents.unsqueeze(0),
             torch.tensor([0.5]),
             bagel_context=context,
-            guidance_scale=2.0,
+            guidance_scale=1.0,
         )
 
     assert unbatched.shape == latents.shape
@@ -304,7 +525,32 @@ def test_batch_one_preserves_two_and_three_dimensional_forward_contract(
     torch.testing.assert_close(batched[0], unbatched, rtol=0, atol=0)
 
 
-def test_disabled_taylorseer_preserves_pre_acceleration_singleton_math(
+def test_cfg_without_taylorseer_batches_branches_in_one_layer_call(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    latents = torch.randn(4, 4)
+    layer_calls: list[int] = []
+    hook = tiny_transformer.layers[0].register_forward_hook(
+        lambda *_args: layer_calls.append(1)
+    )
+
+    try:
+        output = tiny_transformer(
+            latents,
+            torch.tensor([0.5]),
+            bagel_context=context,
+            guidance_scale=2.0,
+            cfg_interval=(0.0, 1.0),
+        )
+    finally:
+        hook.remove()
+
+    assert output.shape == latents.shape
+    assert len(layer_calls) == 1
+
+
+def test_cfg_branch_batching_matches_sequential_prediction(
     tiny_transformer: BagelTransformer,
 ) -> None:
     context = _build_context(tiny_transformer, [1, 2])
@@ -351,7 +597,7 @@ def test_disabled_taylorseer_preserves_pre_acceleration_singleton_math(
         taylorseer_context=None,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_request_owned_taylorseer_skips_layers_between_refreshes(
@@ -706,20 +952,24 @@ def test_tp2_uses_local_attention_heads_and_linear_shard_shapes() -> None:
     assert model.lm_head.gather_output is True
     assert attention.num_heads == 2
     assert attention.num_kv_heads == 1
-    assert tuple(attention.und_q_proj.weight.shape) == (4, 8)
-    assert tuple(attention.und_k_proj.weight.shape) == (2, 8)
-    assert tuple(attention.und_v_proj.weight.shape) == (2, 8)
+    assert tuple(attention.und_qkv_proj.weight.shape) == (8, 8)
+    assert tuple(attention.und_qkv_proj.bias.shape) == (8,)
     assert tuple(attention.und_o_proj.weight.shape) == (8, 4)
-    assert tuple(mlp.und_gate.weight.shape) == (6, 8)
-    assert tuple(mlp.und_up.weight.shape) == (6, 8)
+    assert tuple(mlp.und_gate_up.weight.shape) == (12, 8)
     assert tuple(mlp.und_down.weight.shape) == (8, 6)
 
 
 def test_tp2_rank1_loads_full_checkpoint_column_and_row_shards() -> None:
     embedding_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8)
     query_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    key_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) + 100
+    value_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) + 200
     query_bias = torch.arange(8, dtype=torch.float32)
-    output_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 100
+    key_bias = torch.arange(4, dtype=torch.float32) + 100
+    value_bias = torch.arange(4, dtype=torch.float32) + 200
+    output_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 300
+    gate_weight = torch.arange(96, dtype=torch.float32).reshape(12, 8) + 400
+    up_weight = torch.arange(96, dtype=torch.float32).reshape(12, 8) + 600
     lm_head_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8) + 1000
     with _fake_tp2(rank=1):
         model = BagelTransformer(_tp2_config(load_lm_head=True))
@@ -735,8 +985,32 @@ def test_tp2_rank1_loads_full_checkpoint_column_and_row_shards() -> None:
                     query_bias,
                 ),
                 (
+                    "language_model.model.layers.0.self_attn.k_proj.weight",
+                    key_weight,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.k_proj.bias",
+                    key_bias,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.v_proj.weight",
+                    value_weight,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.v_proj.bias",
+                    value_bias,
+                ),
+                (
                     "language_model.model.layers.0.self_attn.o_proj.weight",
                     output_weight,
+                ),
+                (
+                    "language_model.model.layers.0.mlp.gate_proj.weight",
+                    gate_weight,
+                ),
+                (
+                    "language_model.model.layers.0.mlp.up_proj.weight",
+                    up_weight,
                 ),
                 ("language_model.lm_head.weight", lm_head_weight),
             ],
@@ -747,21 +1021,34 @@ def test_tp2_rank1_loads_full_checkpoint_column_and_row_shards() -> None:
     assert model.lm_head is not None
     assert loaded == {
         "embed_tokens.weight",
-        "layers.0.attn.und_q_proj.weight",
-        "layers.0.attn.und_q_proj.bias",
+        "layers.0.attn.und_qkv_proj.weight",
+        "layers.0.attn.und_qkv_proj.bias",
         "layers.0.attn.und_o_proj.weight",
+        "layers.0.mlp.und_gate_up.weight",
         "lm_head.weight",
     }
     torch.testing.assert_close(model.embed_tokens.weight, embedding_weight[64:])
-    torch.testing.assert_close(attention.und_q_proj.weight, query_weight[4:])
-    torch.testing.assert_close(attention.und_q_proj.bias, query_bias[4:])
+    torch.testing.assert_close(
+        attention.und_qkv_proj.weight,
+        torch.cat((query_weight[4:], key_weight[2:], value_weight[2:])),
+    )
+    torch.testing.assert_close(
+        attention.und_qkv_proj.bias,
+        torch.cat((query_bias[4:], key_bias[2:], value_bias[2:])),
+    )
     torch.testing.assert_close(attention.und_o_proj.weight, output_weight[:, 4:])
+    torch.testing.assert_close(
+        model.layers[0].mlp.und_gate_up.weight,
+        torch.cat((gate_weight[6:], up_weight[6:])),
+    )
     torch.testing.assert_close(model.lm_head.weight, lm_head_weight[64:])
 
 
 def test_tp2_meta_load_materializes_local_shards_and_preserves_loader_attrs() -> None:
     embedding_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8)
     query_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    key_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) + 100
+    value_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8) + 200
     output_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 100
     lm_head_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8) + 1000
     with _fake_tp2(rank=1):
@@ -775,6 +1062,14 @@ def test_tp2_meta_load_materializes_local_shards_and_preserves_loader_attrs() ->
                     query_weight,
                 ),
                 (
+                    "language_model.model.layers.0.self_attn.k_proj.weight",
+                    key_weight,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.v_proj.weight",
+                    value_weight,
+                ),
+                (
                     "language_model.model.layers.0.self_attn.o_proj.weight",
                     output_weight,
                 ),
@@ -784,7 +1079,7 @@ def test_tp2_meta_load_materializes_local_shards_and_preserves_loader_attrs() ->
         )
 
     embedding_parameter = model.embed_tokens.weight
-    query_parameter = model.layers[0].attn.und_q_proj.weight
+    query_parameter = model.layers[0].attn.und_qkv_proj.weight
     output_parameter = model.layers[0].attn.und_o_proj.weight
     assert model.lm_head is not None
     lm_head_parameter = model.lm_head.weight
@@ -801,7 +1096,10 @@ def test_tp2_meta_load_materializes_local_shards_and_preserves_loader_attrs() ->
     assert output_parameter.input_dim == 1
     assert lm_head_parameter.output_dim == 0
     torch.testing.assert_close(embedding_parameter, embedding_weight[64:])
-    torch.testing.assert_close(query_parameter, query_weight[4:])
+    torch.testing.assert_close(
+        query_parameter,
+        torch.cat((query_weight[4:], key_weight[2:], value_weight[2:])),
+    )
     torch.testing.assert_close(output_parameter, output_weight[:, 4:])
     torch.testing.assert_close(lm_head_parameter, lm_head_weight[64:])
 
@@ -1465,7 +1763,8 @@ def test_understanding_projection_uses_pair_qk_norm(
 ) -> None:
     attention = tiny_transformer.layers[0].attn
     hidden_states = torch.randn(3, 8)
-    expected_value = attention.und_v_proj(hidden_states).view(
+    projected = attention.und_qkv_proj(hidden_states)
+    expected_value = projected[..., attention.query_size + attention.kv_size :].view(
         3, attention.num_kv_heads, attention.head_dim
     )
 
@@ -1683,11 +1982,11 @@ def test_generation_qk_stays_fp32_until_attention_cast(
     assert qk_norm.call_count == 2
     assert all(call.args[0].dtype == torch.float32 for call in qk_norm.call_args_list)
     assert all(call.args[1].dtype == torch.float32 for call in qk_norm.call_args_list)
-    expected_text_query = (
-        attention.und_q_proj(hidden_states[text_indexes])
-        .view(-1, attention.num_heads, attention.head_dim)
-        .float()
-    )
+    expected_text_query = attention.und_qkv_proj(hidden_states[text_indexes])
+    expected_text_query = expected_text_query[..., : attention.query_size]
+    expected_text_query = expected_text_query.view(
+        -1, attention.num_heads, attention.head_dim
+    ).float()
     variance = expected_text_query.pow(2).mean(-1, keepdim=True)
     expected_text_query = attention.und_q_norm.weight * (
         expected_text_query * torch.rsqrt(variance + attention.und_q_norm.eps)

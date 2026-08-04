@@ -39,9 +39,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
@@ -58,6 +60,11 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 
+if current_platform.is_cuda():
+    from sgl_kernel import silu_and_mul as _precompiled_silu_and_mul
+else:
+    _precompiled_silu_and_mul = None
+
 logger = logging.getLogger(__name__)
 _USE_FUSED_FP32_QK_NORM: bool | None = None
 _AttentionStateKey = tuple[torch.device, torch.dtype, int, int, int, int]
@@ -73,6 +80,23 @@ class _BagelColumnParallelLinear(ColumnParallelLinear):
 class _BagelRowParallelLinear(RowParallelLinear):
     def forward(self, hidden_states: Tensor) -> Tensor:
         return super().forward(hidden_states)[0]
+
+
+class _BagelMergedColumnParallelLinear(MergedColumnParallelLinear):
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        return super().forward(hidden_states)[0]
+
+
+class _BagelSiluAndMul(SiluAndMul):
+    """Use the packaged CUDA kernel without requiring a local CUDA toolkit."""
+
+    def forward_cuda(self, x: Tensor) -> Tensor:
+        assert _precompiled_silu_and_mul is not None
+        output = torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 2), dtype=x.dtype, device=x.device
+        )
+        _precompiled_silu_and_mul(x, output)
+        return output
 
 
 def _tp_size() -> int:
@@ -101,6 +125,58 @@ def _column_parallel_linear(
         output_size,
         bias=bias,
         gather_output=gather_output,
+    )
+
+
+def _merged_column_parallel_linear(
+    input_size: int,
+    output_size: int,
+    *,
+    bias: bool,
+    gather_output: bool = False,
+) -> nn.Module:
+    """Pack two equal output projections while preserving TP-local layout."""
+    tp_size = _tp_size()
+    if output_size % tp_size != 0:
+        raise ValueError(
+            f"BAGEL merged column dimension {output_size} must be divisible by "
+            f"TP size {tp_size}"
+        )
+    if tp_size == 1:
+        return nn.Linear(input_size, output_size * 2, bias=bias)
+    return _BagelMergedColumnParallelLinear(
+        input_size,
+        [output_size, output_size],
+        bias=bias,
+        gather_output=gather_output,
+    )
+
+
+def _qkv_parallel_linear(
+    input_size: int,
+    query_size: int,
+    kv_size: int,
+    *,
+    bias: bool,
+) -> nn.Module:
+    """Pack Q/K/V while preserving each projection's TP-local shard."""
+    tp_size = _tp_size()
+    if query_size % tp_size != 0 or kv_size % tp_size != 0:
+        raise ValueError(
+            "BAGEL Q/K/V dimensions must be divisible by the TP size"
+        )
+    if tp_size == 1:
+        layer = nn.Linear(input_size, query_size + 2 * kv_size, bias=bias)
+        shard_sizes = (query_size, kv_size, kv_size)
+        layer.weight.bagel_shard_sizes = shard_sizes
+        if layer.bias is not None:
+            layer.bias.bagel_shard_sizes = shard_sizes
+        return layer
+    return _BagelMergedColumnParallelLinear(
+        input_size,
+        [query_size, kv_size, kv_size],
+        bias=bias,
+        gather_output=False,
     )
 
 
@@ -176,12 +252,19 @@ class BagelKVCache:
                 (key is None) != (value is None) for key, value in zip(keys, values)
             ):
                 raise ValueError("BAGEL key/value cache entries must be paired")
-            present_keys = [key for key in keys if key is not None]
-            present_values = [value for value in values if value is not None]
-            if present_keys and len(present_keys) != len(caches):
-                raise ValueError(
-                    "BAGEL cache layers must be present for every batched request"
-                )
+            present_keys: list[Tensor] = []
+            present_values: list[Tensor] = []
+            for cache, key, value in zip(caches, keys, values):
+                cache_length = cache.sequence_length
+                if key is None:
+                    if cache_length != 0:
+                        raise ValueError("BAGEL cache layer is unexpectedly missing")
+                    continue
+                assert value is not None
+                if key.shape[0] != cache_length or value.shape[0] != cache_length:
+                    raise ValueError("BAGEL cache layers have inconsistent lengths")
+                present_keys.append(key)
+                present_values.append(value)
             packed_keys.append(
                 None if not present_keys else torch.cat(present_keys, dim=0)
             )
@@ -916,6 +999,9 @@ class _BagelMoTAttention(nn.Module):
         self.num_heads = config.num_attention_heads // tp_size
         self.num_kv_heads = config.num_key_value_heads // tp_size
         self.head_dim = config.attention_head_dim
+        self.query_size = query_size // tp_size
+        self.kv_size = kv_size // tp_size
+        self.tp_size = tp_size
         self.layer_index = layer_index
         self.attention_backend = attention_backend
         # DenoisingStage discovers the selected backend by scanning child
@@ -923,25 +1009,15 @@ class _BagelMoTAttention(nn.Module):
         self.backend = attention_backend
         self.generation_enabled = load_generation_expert
 
-        self.und_q_proj = _column_parallel_linear(hidden_size, query_size, bias=True)
-        self.und_k_proj = _column_parallel_linear(hidden_size, kv_size, bias=True)
-        self.und_v_proj = _column_parallel_linear(hidden_size, kv_size, bias=True)
+        self.und_qkv_proj = _qkv_parallel_linear(
+            hidden_size, query_size, kv_size, bias=True
+        )
         self.und_o_proj = _row_parallel_linear(query_size, hidden_size, bias=False)
         self.und_q_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.und_k_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.gen_q_proj = (
-            _column_parallel_linear(hidden_size, query_size, bias=True)
-            if load_generation_expert
-            else None
-        )
-        self.gen_k_proj = (
-            _column_parallel_linear(hidden_size, kv_size, bias=True)
-            if load_generation_expert
-            else None
-        )
-        self.gen_v_proj = (
-            _column_parallel_linear(hidden_size, kv_size, bias=True)
+        self.gen_qkv_proj = (
+            _qkv_parallel_linear(hidden_size, query_size, kv_size, bias=True)
             if load_generation_expert
             else None
         )
@@ -961,17 +1037,27 @@ class _BagelMoTAttention(nn.Module):
             else None
         )
 
+    def _project_qkv(
+        self, projection: nn.Module, hidden_states: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return projection(hidden_states).split(
+            (self.query_size, self.kv_size, self.kv_size), dim=-1
+        )
+
     def _project_understanding(
         self, hidden_states: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         sequence_length = hidden_states.shape[0]
-        query = self.und_q_proj(hidden_states).view(
+        query, key, value = self._project_qkv(
+            self.und_qkv_proj, hidden_states
+        )
+        query = query.contiguous().view(
             sequence_length, self.num_heads, self.head_dim
         )
-        key = self.und_k_proj(hidden_states).view(
+        key = key.contiguous().view(
             sequence_length, self.num_kv_heads, self.head_dim
         )
-        value = self.und_v_proj(hidden_states).view(
+        value = value.contiguous().view(
             sequence_length, self.num_kv_heads, self.head_dim
         )
         query, key = _apply_bagel_qk_norm(
@@ -990,12 +1076,21 @@ class _BagelMoTAttention(nn.Module):
             raise RuntimeError(
                 "BAGEL generation expert is not loaded for this transformer"
             )
-        assert self.gen_q_proj is not None
-        assert self.gen_k_proj is not None
-        assert self.gen_v_proj is not None
+        assert self.gen_qkv_proj is not None
         assert self.gen_q_norm is not None
         assert self.gen_k_norm is not None
         sequence_length = hidden_states.shape[0]
+        projected = hidden_states.new_zeros(
+            sequence_length, self.query_size + 2 * self.kv_size
+        )
+        if text_indexes.numel() > 0:
+            projected[text_indexes] = self.und_qkv_proj(
+                hidden_states[text_indexes]
+            )
+        projected[latent_indexes] = self.gen_qkv_proj(hidden_states[latent_indexes])
+        query_states, key_states, value_states = projected.split(
+            (self.query_size, self.kv_size, self.kv_size), dim=-1
+        )
         # Official BAGEL keeps generation Q/K in FP32 through QK-norm and RoPE,
         # then casts to BF16 immediately before FlashAttention. Preserve that
         # ordering because casting before RoPE causes measurable parity drift.
@@ -1018,17 +1113,12 @@ class _BagelMoTAttention(nn.Module):
         )
 
         if text_indexes.numel() > 0:
-            text_states = hidden_states[text_indexes]
-            text_query = (
-                self.und_q_proj(text_states)
-                .view(-1, self.num_heads, self.head_dim)
-                .float()
-            )
-            text_key = (
-                self.und_k_proj(text_states)
-                .view(-1, self.num_kv_heads, self.head_dim)
-                .float()
-            )
+            text_query = query_states[text_indexes].view(
+                -1, self.num_heads, self.head_dim
+            ).float()
+            text_key = key_states[text_indexes].view(
+                -1, self.num_kv_heads, self.head_dim
+            ).float()
             text_query, text_key = _apply_bagel_qk_norm(
                 text_query,
                 text_key,
@@ -1038,21 +1128,16 @@ class _BagelMoTAttention(nn.Module):
             )
             query[text_indexes] = text_query
             key[text_indexes] = text_key
-            value[text_indexes] = self.und_v_proj(text_states).view(
+            value[text_indexes] = value_states[text_indexes].view(
                 -1, self.num_kv_heads, self.head_dim
             )
 
-        latent_states = hidden_states[latent_indexes]
-        latent_query = (
-            self.gen_q_proj(latent_states)
-            .view(-1, self.num_heads, self.head_dim)
-            .float()
-        )
-        latent_key = (
-            self.gen_k_proj(latent_states)
-            .view(-1, self.num_kv_heads, self.head_dim)
-            .float()
-        )
+        latent_query = query_states[latent_indexes].view(
+            -1, self.num_heads, self.head_dim
+        ).float()
+        latent_key = key_states[latent_indexes].view(
+            -1, self.num_kv_heads, self.head_dim
+        ).float()
         latent_query, latent_key = _apply_bagel_qk_norm(
             latent_query,
             latent_key,
@@ -1062,7 +1147,7 @@ class _BagelMoTAttention(nn.Module):
         )
         query[latent_indexes] = latent_query
         key[latent_indexes] = latent_key
-        value[latent_indexes] = self.gen_v_proj(latent_states).view(
+        value[latent_indexes] = value_states[latent_indexes].view(
             -1, self.num_kv_heads, self.head_dim
         )
         return query, key, value
@@ -1172,24 +1257,15 @@ class _BagelMoTMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.generation_enabled = load_generation_expert
-        self.und_gate = _column_parallel_linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.und_up = _column_parallel_linear(
+        self.act_fn = _BagelSiluAndMul()
+        self.und_gate_up = _merged_column_parallel_linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
         self.und_down = _row_parallel_linear(
             config.intermediate_size, config.hidden_size, bias=False
         )
-        self.gen_gate = (
-            _column_parallel_linear(
-                config.hidden_size, config.intermediate_size, bias=False
-            )
-            if load_generation_expert
-            else None
-        )
-        self.gen_up = (
-            _column_parallel_linear(
+        self.gen_gate_up = (
+            _merged_column_parallel_linear(
                 config.hidden_size, config.intermediate_size, bias=False
             )
             if load_generation_expert
@@ -1203,11 +1279,16 @@ class _BagelMoTMLP(nn.Module):
             else None
         )
 
-    @staticmethod
     def _expert(
-        hidden_states: Tensor, gate: nn.Module, up: nn.Module, down: nn.Module
+        self, hidden_states: Tensor, gate_up: nn.Module, down: nn.Module
     ) -> Tensor:
-        return down(F.silu(gate(hidden_states)) * up(hidden_states))
+        gate_up_states = gate_up(hidden_states)
+        activated = (
+            self.act_fn(gate_up_states)
+            if gate_up_states.is_cuda
+            else self.act_fn.forward_native(gate_up_states)
+        )
+        return down(activated)
 
     def forward(
         self,
@@ -1218,26 +1299,22 @@ class _BagelMoTMLP(nn.Module):
         mode: str,
     ) -> Tensor:
         if mode == "und":
-            return self._expert(
-                hidden_states, self.und_gate, self.und_up, self.und_down
-            )
+            return self._expert(hidden_states, self.und_gate_up, self.und_down)
         if not self.generation_enabled:
             raise RuntimeError(
                 "BAGEL generation expert is not loaded for this transformer"
             )
-        assert self.gen_gate is not None
-        assert self.gen_up is not None
+        assert self.gen_gate_up is not None
         assert self.gen_down is not None
         output = torch.zeros_like(hidden_states)
         if text_indexes.numel() > 0:
             output[text_indexes] = self._expert(
                 hidden_states[text_indexes],
-                self.und_gate,
-                self.und_up,
+                self.und_gate_up,
                 self.und_down,
             )
         output[latent_indexes] = self._expert(
-            hidden_states[latent_indexes], self.gen_gate, self.gen_up, self.gen_down
+            hidden_states[latent_indexes], self.gen_gate_up, self.gen_down
         )
         return output
 
@@ -2151,21 +2228,75 @@ class BagelTransformer(BaseDiT):
             taylorseer_context.validate_branch_count(
                 has_secondary=bagel_context.has_three_way_cfg
             )
-        conditional = self._generation_branch(
-            hidden_states,
-            timestep,
-            bagel_context.conditional_kv,
-            bagel_context.conditional_kv_lens,
-            bagel_context.conditional_rope_offset,
-            bagel_context,
-            taylorseer_context.conditional if taylorseer_context else None,
-        )
-
         scale = self._as_float(guidance_scale)
         image_scale = self._as_float(image_guidance_scale)
         sigma = float(timestep[0].item())
         cfg_enabled = cfg_interval[0] < sigma <= cfg_interval[1] and scale > 1.0
-        if cfg_enabled:
+        if cfg_enabled and taylorseer_context is None:
+            branch_caches = [
+                bagel_context.conditional_kv,
+                bagel_context.unconditional_kv,
+            ]
+            branch_lens = [
+                bagel_context.conditional_kv_lens,
+                bagel_context.unconditional_kv_lens,
+            ]
+            branch_offsets = [
+                bagel_context.conditional_rope_offset,
+                bagel_context.unconditional_rope_offset,
+            ]
+            include_secondary = bagel_context.has_three_way_cfg and image_scale > 1.0
+            if include_secondary:
+                secondary_cache = bagel_context.secondary_unconditional_kv
+                secondary_lens = bagel_context.secondary_unconditional_kv_lens
+                secondary_offset = bagel_context.secondary_unconditional_rope_offset
+                if (
+                    secondary_cache is None
+                    or secondary_lens is None
+                    or secondary_offset is None
+                ):
+                    raise ValueError("incomplete BAGEL three-way CFG context")
+                branch_caches.append(secondary_cache)
+                branch_lens.append(secondary_lens)
+                branch_offsets.append(secondary_offset)
+            predictions = self._generation_branches_batched(
+                hidden_states,
+                timestep,
+                branch_caches,
+                branch_lens,
+                branch_offsets,
+                bagel_context,
+            )
+            conditional, unconditional = predictions[:2]
+            if bagel_context.has_three_way_cfg:
+                conditional = self._apply_cfg_three_way(
+                    conditional,
+                    unconditional,
+                    predictions[2] if include_secondary else None,
+                    scale,
+                    image_scale,
+                    renorm_min=cfg_renorm_min,
+                    renorm_type=cfg_renorm_type,
+                )
+            else:
+                conditional = self._apply_cfg(
+                    conditional,
+                    unconditional,
+                    scale,
+                    renorm_min=cfg_renorm_min,
+                    renorm_type=cfg_renorm_type,
+                )
+        else:
+            conditional = self._generation_branch(
+                hidden_states,
+                timestep,
+                bagel_context.conditional_kv,
+                bagel_context.conditional_kv_lens,
+                bagel_context.conditional_rope_offset,
+                bagel_context,
+                taylorseer_context.conditional if taylorseer_context else None,
+            )
+        if cfg_enabled and taylorseer_context is not None:
             unconditional = self._generation_branch(
                 hidden_states,
                 timestep,
@@ -2226,6 +2357,50 @@ class BagelTransformer(BaseDiT):
         if hidden_states.shape[0] == 1:
             return conditional.unsqueeze(0) if had_batch_dimension else conditional
         return conditional
+
+    def _generation_branches_batched(
+        self,
+        latents: Tensor,
+        timestep: Tensor,
+        prefix_caches: list[BagelKVCache],
+        prefix_lens: list[Tensor],
+        rope_offsets: list[int | Tensor],
+        context: BagelContext,
+    ) -> tuple[Tensor, ...]:
+        """Execute stateless CFG branches in one varlen transformer forward."""
+        branch_count = len(prefix_caches)
+        if branch_count < 2 or not (
+            len(prefix_lens) == len(rope_offsets) == branch_count
+        ):
+            raise ValueError("BAGEL CFG branch metadata must align")
+        batch_size = latents.shape[0]
+        if any(lengths.numel() != batch_size for lengths in prefix_lens):
+            raise ValueError("BAGEL CFG branch prefix counts must match the batch")
+
+        offset_tensors: list[Tensor] = []
+        for offset, lengths in zip(rope_offsets, prefix_lens):
+            offset_tensor = torch.as_tensor(
+                offset, dtype=torch.long, device=latents.device
+            ).reshape(-1)
+            if offset_tensor.numel() == 1:
+                offset_tensor = offset_tensor.expand(batch_size)
+            elif offset_tensor.numel() != batch_size:
+                raise ValueError("BAGEL CFG branch RoPE offsets must match the batch")
+            offset_tensors.append(offset_tensor)
+
+        predictions = self._generation_step(
+            torch.cat([latents] * branch_count, dim=0),
+            torch.cat([timestep] * branch_count, dim=0),
+            BagelKVCache.concatenate(prefix_caches),
+            torch.cat(prefix_lens, dim=0),
+            torch.cat(offset_tensors, dim=0),
+            context,
+            None,
+        )
+        branches = predictions.split(batch_size, dim=0)
+        if batch_size == 1:
+            return tuple(branch[0] for branch in branches)
+        return branches
 
     def _generation_branch(
         self,
@@ -2667,17 +2842,28 @@ class BagelTransformer(BaseDiT):
         params = dict(self.named_parameters())
         required = set(params)
         loaded: set[str] = set()
+        loaded_shards: dict[str, set[int]] = {}
         unexpected: list[str] = []
         for source_name, tensor in weights:
             if not self.accepts_checkpoint_weight(source_name):
                 continue
             target_name = self._map_checkpoint_name(source_name)
+            shard_id = self._checkpoint_shard_id(source_name)
             parameter = params.get(target_name)
             if parameter is None:
                 unexpected.append(source_name)
                 continue
-            self._load_parameter(target_name, parameter, tensor)
-            loaded.add(target_name)
+            parameter = self._load_parameter(
+                target_name, parameter, tensor, shard_id=shard_id
+            )
+            params[target_name] = parameter
+            if shard_id is None:
+                loaded.add(target_name)
+            else:
+                shards = loaded_shards.setdefault(target_name, set())
+                shards.add(shard_id)
+                if shards == self._required_checkpoint_shards(target_name):
+                    loaded.add(target_name)
 
         missing = sorted(required - loaded)
         if strict and (missing or unexpected):
@@ -2732,16 +2918,45 @@ class BagelTransformer(BaseDiT):
                 break
         return name
 
+    @staticmethod
+    def _checkpoint_shard_id(source_name: str) -> int | None:
+        attention_match = re.match(
+            r"^language_model\.model\.layers\.\d+\.self_attn\."
+            r"(q|k|v)_proj(?:_moe_gen)?\.",
+            source_name,
+        )
+        if attention_match is not None:
+            return {"q": 0, "k": 1, "v": 2}[attention_match.group(1)]
+        match = re.match(
+            r"^language_model\.model\.layers\.\d+\.mlp(?:_moe_gen)?\."
+            r"(gate|up)_proj\.",
+            source_name,
+        )
+        if match is None:
+            return None
+        return 0 if match.group(1) == "gate" else 1
+
+    @staticmethod
+    def _required_checkpoint_shards(target_name: str) -> set[int]:
+        if ".qkv_proj." in target_name:
+            return {0, 1, 2}
+        return {0, 1}
+
     def _load_parameter(
-        self, name: str, parameter: nn.Parameter, tensor: Tensor
-    ) -> None:
+        self,
+        name: str,
+        parameter: nn.Parameter,
+        tensor: Tensor,
+        *,
+        shard_id: int | None = None,
+    ) -> nn.Parameter:
         weight_loader = getattr(parameter, "weight_loader", None)
         if parameter.is_meta:
             parent: nn.Module = self
             parts = name.split(".")
             for part in parts[:-1]:
                 parent = getattr(parent, part)
-            if weight_loader is None:
+            if weight_loader is None and shard_id is None:
                 if tuple(parameter.shape) != tuple(tensor.shape):
                     raise ValueError(
                         f"BAGEL weight shape mismatch for {name}: expected "
@@ -2750,6 +2965,8 @@ class BagelTransformer(BaseDiT):
                 materialized = nn.Parameter(
                     tensor.to(dtype=parameter.dtype), requires_grad=False
                 )
+                setattr(parent, parts[-1], materialized)
+                return materialized
             else:
                 materialized = nn.Parameter(
                     torch.empty(
@@ -2760,19 +2977,46 @@ class BagelTransformer(BaseDiT):
                     requires_grad=False,
                 )
                 materialized.__dict__.update(parameter.__dict__)
-                weight_loader(materialized, tensor)
             setattr(parent, parts[-1], materialized)
-            return
+            parameter = materialized
+            weight_loader = getattr(parameter, "weight_loader", None)
 
         if weight_loader is not None:
-            weight_loader(parameter, tensor)
-            return
+            if shard_id is None:
+                weight_loader(parameter, tensor)
+            else:
+                weight_loader(parameter, tensor, shard_id)
+            return parameter
+        if shard_id is not None:
+            shard_sizes = getattr(parameter, "bagel_shard_sizes", None)
+            if shard_sizes is None:
+                if parameter.shape[0] % 2 != 0:
+                    raise ValueError(
+                        f"BAGEL fused weight {name} has odd output dimension "
+                        f"{parameter.shape[0]}"
+                    )
+                shard_sizes = (parameter.shape[0] // 2,) * 2
+            if shard_id >= len(shard_sizes):
+                raise ValueError(f"BAGEL fused weight {name} has no shard {shard_id}")
+            shard_size = shard_sizes[shard_id]
+            shard_shape = (shard_size, *parameter.shape[1:])
+            if tuple(tensor.shape) != shard_shape:
+                raise ValueError(
+                    f"BAGEL weight shape mismatch for {name} shard {shard_id}: "
+                    f"expected {shard_shape}, got {tuple(tensor.shape)}"
+                )
+            shard_offset = sum(shard_sizes[:shard_id])
+            parameter.data.narrow(0, shard_offset, shard_size).copy_(
+                tensor.to(device=parameter.device, dtype=parameter.dtype)
+            )
+            return parameter
         if tuple(parameter.shape) != tuple(tensor.shape):
             raise ValueError(
                 f"BAGEL weight shape mismatch for {name}: expected "
                 f"{tuple(parameter.shape)}, got {tuple(tensor.shape)}"
             )
         parameter.data.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+        return parameter
 
 
 EntryClass = BagelTransformer
