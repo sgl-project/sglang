@@ -3,21 +3,27 @@ export const Gemma4Deployment = () => {
     modelSize: {
       name: 'modelSize',
       title: 'Model Variant',
-      items: [
-        { id: 'e2b', label: 'E2B (~2B)', default: false },
-        { id: 'e4b', label: 'E4B (~4B)', default: true },
-        { id: '12b', label: '12B (Dense)', default: false },
-        { id: '31b', label: '31B (Dense)', default: false },
-        { id: '26b-a4b', label: '26B-A4B (MoE)', default: false },
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: 'e2b', label: 'E2B (~2B)', default: false, disabled: isArcB },
+          { id: 'e4b', label: 'E4B (~4B)', default: !isArcB, disabled: isArcB },
+          { id: '12b', label: '12B (Dense)', default: false, disabled: isArcB },
+          { id: '31b', label: '31B (Dense)', default: isArcB, disabled: false },
+          { id: '26b-a4b', label: '26B-A4B (MoE)', default: false, disabled: false },
+        ];
+      }
     },
     checkpoint: {
       name: 'checkpoint',
       title: 'Checkpoint',
-      items: [
-        { id: 'standard', label: 'Standard', subtitle: 'BF16', default: true },
-        { id: 'qat', label: 'QAT', subtitle: 'q4_0-unquantized', default: false },
-      ]
+      getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'Arc B';
+        return [
+          { id: 'standard', label: 'Standard', subtitle: 'BF16', default: true },
+          { id: 'qat', label: 'QAT', subtitle: 'q4_0-unquantized', default: false, disabled: isArcB },
+        ];
+      }
     },
     hardware: {
       name: 'hardware',
@@ -30,6 +36,7 @@ export const Gemma4Deployment = () => {
           { id: 'b200', label: 'B200', default: false },
           { id: 'b300', label: 'B300', default: false },
           { id: 'mi300x', label: 'MI300X', default: false, disabled: !showMI300X },
+          { id: 'Arc B', label: 'BMG', default: false },
         ];
       }
     },
@@ -88,6 +95,10 @@ export const Gemma4Deployment = () => {
       '31b': { tp: 1, mem: 0.80 },
       '26b-a4b': { tp: 1, mem: 0.80 },
     },
+    'Arc B': {
+      '31b': { tp: 4, mem: 0.80 },
+      '26b-a4b': { tp: 4, mem: 0.75 },
+    },
   };
 
   const generateCommand = (values) => {
@@ -139,6 +150,10 @@ export const Gemma4Deployment = () => {
 
     if (hardware === 'b300') {
       cmd += ` \\\n  --attention-backend triton`;
+    }
+
+    if (hardware === 'Arc B') {
+      cmd += ` \\\n  --device xpu`;
     }
 
     cmd += ` \\\n  --mem-fraction-static ${mem}`;
@@ -205,7 +220,16 @@ export const Gemma4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B') {
+        if (!['31b', '26b-a4b'].includes(next.modelSize)) {
+          next.modelSize = '31b';
+        }
+        next.checkpoint = 'standard';
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {

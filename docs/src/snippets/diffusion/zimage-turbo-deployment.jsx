@@ -14,7 +14,8 @@ export const ZImageTurboDeployment = () => {
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
           { id: 'a2', label: 'A2', default: false },
-          { id: 'a3', label: 'A3', default: false }
+          { id: 'a3', label: 'A3', default: false },
+          { id: 'Arc B', label: 'BMG', default: false }
         ]
       }
     },
@@ -35,6 +36,11 @@ sglang serve \\
   --tp-size 2 \\
   --sp-degree 1 \\
   --num-gpus 2`;
+      }
+
+      if (hardware === 'Arc B') {
+        return `sglang serve \\
+  --model-path Tongyi-MAI/Z-Image-Turbo`;
       }
 
       return `sglang serve \\
