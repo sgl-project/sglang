@@ -254,6 +254,18 @@ def resample_patch_embed(
     except ImportError:
         from torch.func import vmap
 
+    try:
+        new_size = [int(x) for x in new_size]
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"new_size elements must be integers, got {new_size}"
+        ) from None
+
+    if not all(x > 0 for x in new_size):
+        raise ValueError(
+            f"new_size elements must be positive, got {new_size}"
+        )
+
     assert len(patch_embed.shape) == 4, "Four dimensions expected"
     assert len(new_size) == 2, "New shape should only be hw"
     old_size = patch_embed.shape[-2:]
