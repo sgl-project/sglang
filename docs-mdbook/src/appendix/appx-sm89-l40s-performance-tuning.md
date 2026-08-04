@@ -555,6 +555,8 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 
 ### 10.9 K8s 部署方案（两实例，无请求路由控制）
 
+> **状态：已搁置（2026-08）**。双架构在无请求路由控制 + thinking 容量不足下实测更差（利用率 ~25% vs 统一 ~90%；thinking TTFT 随队列单调恶化至 ~100s）。当前生产方案回到 6 卡统一 + round_robin（见 11.7）；双架构仅在具备按类型分流能力和 thinking 容量 ≥4 卡后重启。
+
 > 前提：pod 镜像为附录 C 固化的版本（含 sgl_stubs.so、load_utils 补丁、sglang-kernel 源码编译产物、flashinfer 0.6.13）。启动脚本：[sglang_start.sh](appendix/sglang_start.sh)（已适配 K8s：按 `CUDA_VISIBLE_DEVICES` 计数、空 `GPU_IDS` 不再禁用显卡、默认值按验证结论 0.85/98304/12）。
 
 **为何是两实例而非三实例**：没有请求路由控制时，单卡轻量实例无法差异化——context 必须与其他实例一致（98304），否则长请求会被拒；而 98304 + TP=1 让它变成一个慢速通用实例，无意义。故放弃单卡实例，第 7 卡作热备/扩容预留。
@@ -661,6 +663,8 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 
 ### 11.6 两实例最终启动命令（round_robin 修复后）
 
+> **状态：已搁置（2026-08）**，保留作为"具备分流能力后的备选方案"。
+
 > 已验证 `--load-balance-method` 在部署版本可用；脚本默认已是 `round_robin`。
 
 ```bash
@@ -680,3 +684,36 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 ```
 
 验证点：启动日志出现 `load-balance: round_robin`；两个 worker 都有 running/queue（不再一个满载一个空转）；TTFT 明显下降、GPU 利用率回到 ~90%。tool call 并发先 5，`queue_time≈0` 且 TTFT<2s 后再试 8。
+
+### 11.7 生产方案定版：回到 6 卡统一 + round_robin
+
+**决策依据**：双架构总 decode 容量与统一方案相同（都是 3 个 TP2 worker），但没有路由控制导致隔离前提不成立，实测利用率 25%、thinking 队列单调恶化；统一方案数据稳定可预期，round_robin 同时修掉其隐藏的前缀粘滞热点。**生产选型优先稳定性。**
+
+**生产配置（当前定版）**：
+
+```bash
+# 6 卡统一（K8s 6 卡 pod，或裸机 --gpu-ids 0-5）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 12 \
+    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4 \
+    --load-balance-method round_robin --warmup --keep-alive
+```
+
+配套 API 侧参数（不可省）：
+
+- thinking（代码检视）：`enable_thinking: true` + `max_tokens 4096`（Qwen3.6-27B 模板不支持 thinking_budget，见 9.3）；
+- 非 thinking（tool call）：`enable_thinking: false` + `max_tokens 512`（见 9.2）。
+
+**预期与后续**：
+
+- round_robin 修掉前缀粘滞热点后，TTFT 应明显低于统一方案此前的 8.76~14.36s；
+- 若 TTFT 仍高：为纯容量问题（thinking 长输出），走"非 thinking 检视质量 A/B"或换 H20/H100（见 11.8 硬件结论）；
+- 双架构重启条件：具备按类型分流能力，且 thinking 容量 ≥4 卡（TP2 DP2）。
+
+### 11.8 硬件适配结论（L40S × Qwen3.6-27B）
+
+- L40S 跑 27B 的 decode 上限约 64 tok/s/卡（864GB/s ÷ 13.5GB/卡权重），MTP 后 ~120 tok/s/卡——**已接近软件极限，剩余瓶颈是显存带宽，不是配置**；
+- 瓶颈是**显存带宽**（GPU 读自身板载显存），不是 PCIe：decode 每 token 读 13.5GB 权重（卡内），PCIe 只承担加载权重和 TP 激活值通信（KB 级/token），非瓶颈；
+- 27B + 96K + thinking 长输出 + 高并发 的组合超出 L40S 物理能力；L40S 适合 ≤14B 模型或低并发/短输出；
+- 出路：换 H20/H100（显存带宽 4~5x）、换小模型、或非 thinking 检视 + 结构化 prompt（质量 A/B 定论）。
