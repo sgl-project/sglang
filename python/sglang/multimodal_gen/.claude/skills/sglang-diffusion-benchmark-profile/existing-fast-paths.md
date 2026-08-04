@@ -18,6 +18,11 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
 - `python/sglang/kernels/ops/diffusion/triton/rotary.py`
 - `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
+- `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
+- `python/sglang/kernels/ops/diffusion/usp_relayout.py`
+- `python/sglang/multimodal_gen/runtime/layers/usp.py`
+- `python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py`
 - `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
 - `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
@@ -106,7 +111,23 @@ framework-specific optimization workflow.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
 - Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
 
-9. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
+9. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
+- Kernels: `indexed_scale_shift_bf16_`, `indexed_gate_bf16_`
+- Locations: `triton/indexed_modulation.py`, `runtime/models/dits/minimax_h3.py`
+- Use cases: H3's packed video/audio/text rows select per-token modulation with `combined_indices`; the Triton paths replace `index_select` plus scale/shift or gated residual chains in place.
+- Constraints: CUDA BF16 H3 tensors, BF16 modulation tensors, contiguous disposable inputs; the gated path also requires contiguous `other`. Unsupported shapes/dtypes retain the eager formula.
+- Numerical contract: the kernels explicitly reproduce H3's eager BF16 rounding boundaries. Do not replace them with a mathematically equivalent contraction without the H3 consistency check.
+- Workflow rule: if H3 traces show `index_select` plus elementwise ladders around every block, check dtype, contiguity, and input-reuse eligibility before designing another modulation kernel.
+
+10. MiniMax-H3 packed Ulysses QKV and output relayout
+- Kernels: `pack_qkv_destination_major`, `usp_merge_heads`
+- Locations: `triton/ulysses_qkv.py`, `usp_relayout.py`, `runtime/layers/usp.py`, `runtime/models/dits/minimax_h3.py`
+- Use cases: one destination-major QKV pack plus one collective replaces three separately prepared Ulysses input exchanges; the output JIT kernel replaces `permute(...).contiguous()` when merging gathered heads.
+- Constraints: packed QKV fast packing requires CUDA fp16/bf16 Q/K/V with matching dtypes, contiguous head dimension, and eager execution. `usp_merge_heads` requires a nonempty contiguous 5D CUDA fp16/bf16/fp32 tensor and is disabled inside `torch.compile`.
+- Related transport: 2-rank, peer-accessible CUDA groups can use the existing IPC A2A transport; larger or unsupported groups fall back to the normal collective path.
+- Workflow rule: if an H3 Ulysses trace has three Q/K/V preparation ladders or a large output `permute + contiguous`, first prove why these existing guards missed.
+
+11. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
 - Kernel: `triton_group_norm_silu`
 - Locations: `diffusion/group_norm_silu.py`, `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`, `runtime/models/upsampler/latent_upsampler.py`
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
@@ -166,6 +187,11 @@ framework-specific optimization workflow.
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
 - Validation: `test/registered/kernels/ops/diffusion/test_qknorm_rope.py`.
+- MiniMax-H3: the H3 DiT calls `fused_inplace_qknorm_rope` directly for BF16
+  head dim 128 with 96 rotary dims, NeoX layout, and
+  `round_norm_before_rope=True`. This flag is part of H3's eager numerical
+  contract. Compiled execution deliberately falls back to separate eager
+  operations.
 - Workflow rule: treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, and check the separate LTX2 split-RoPE path before proposing new attention-prep kernels.
 
 **Nunchaku Fused GELU MLP**
@@ -197,6 +223,8 @@ framework-specific optimization workflow.
   `zimage_rmsnorm_tanh_mul_add` in `zimage.py`, backed by
   `triton/zimage_native_norm.py`.
 - HunyuanVideo VAE and LTX upsampler GroupNorm+SiLU: `apply_group_norm_silu` in `hunyuanvae.py` and `latent_upsampler.py`; default-eligible when wrapper guards pass.
+- MiniMax-H3 indexed modulation: `_modulate_scale_shift` and `_modulate_gate` in `minimax_h3.py`, backed by `triton/indexed_modulation.py`.
+- MiniMax-H3 Ulysses relayout: `_usp_input_all_to_all_packed_qkv` and `usp_merge_heads` through `runtime/layers/usp.py`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
@@ -210,6 +238,8 @@ framework-specific optimization workflow.
 **Existing Overlap / Communication Families**
 
 - Ulysses / USP attention: treat `all_to_all`, `ring_attn`, and head / sequence reshards as an existing distributed attention family, not a new overlap idea.
+- MiniMax-H3 TP AdaLN: the DiT stacks every block's TP-local AdaLN projection and performs one batched all-gather before the block loop when `_can_batch_block_adaln()` passes. One all-gather per block indicates that this existing batching path missed.
+- MiniMax-H3 final projections: H3 removes dead text/padding rows before the final TP column gathers and combines video/audio for the SP row gather. Preserve that ordering when optimizing output communication.
 - Turbo-layer async all-to-all: `all_to_all_single(..., async_op=True)` plus staged waits already form an existing overlap family in `turbo_layer.py`.
 - TorchInductor compute / communication reorder: `torch._inductor.config.reorder_for_compute_comm_overlap = True` can already partially overlap compiled denoise traces.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.

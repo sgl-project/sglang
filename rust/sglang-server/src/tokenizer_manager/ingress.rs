@@ -204,10 +204,10 @@ impl Ingress {
                     registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control skips normalization (no sampling params) straight to the
-                // pre-send checks; generate goes to Normalizing.
+                // Control and detokenize skip normalization (no sampling params)
+                // straight to the pre-send checks; generate goes to Normalizing.
                 RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) => {
+                    RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
                         let _ = req
                             .state
                             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
@@ -221,8 +221,8 @@ impl Ingress {
                 RequestState::Normalizing => {
                     let outcome = {
                         let RequestKind::Generate(g) = &mut req.kind else {
-                            // Unreachable (control never reaches here); reject so a
-                            // bug can't leak/hang a registered request.
+                            // Unreachable (control/detokenize never reach here);
+                            // reject so a bug can't leak/hang a registered request.
                             self.fail(
                                 &mut req,
                                 Error::Internal("non-generate request in Normalizing".into()),
@@ -282,14 +282,16 @@ impl Ingress {
                     }
                     let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
-                // Push the wire message (control frame or generate payload) to the ring.
+                // Hand the request to the stage that answers it: the scheduler
+                // ring (generate payload or control frame), or — for detokenize
+                // — the detok shard itself.
                 RequestState::Queued => {
-                    // `matches!` reads the discriminant without holding a borrow,
-                    // so `req` can be moved into the push below.
-                    if matches!(req.kind, RequestKind::Generate(_)) {
-                        self.push_to_ring(req);
-                    } else {
-                        self.push_control_to_ring(req);
+                    // The patterns bind nothing, so the match reads only the
+                    // discriminant and `req` can be moved into each push.
+                    match req.kind {
+                        RequestKind::Generate(_) => self.push_to_ring(req),
+                        RequestKind::Control(_) => self.push_control_to_ring(req),
+                        RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
                     }
                     return;
                 }
@@ -323,7 +325,7 @@ impl Ingress {
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
             ),
-            RequestKind::Control(_) => (false, false),
+            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
         };
         self.senders
             .detok_for(&req.rid)
@@ -334,6 +336,34 @@ impl Ingress {
                 no_stop_trim,
             })
             .is_ok()
+    }
+
+    /// Hand a `Detokenize` request to its owning detok shard — the stage that
+    /// answers this kind (it never touches the scheduler ring). The shard
+    /// already holds this rid's sink: `register_detok` queued `Register` on the
+    /// same channel from this same thread, so FIFO gives Register → Decode.
+    fn push_detokenize_to_shard(&self, mut req: Request) {
+        let RequestKind::Detokenize { token_ids } = &req.kind else {
+            self.fail(
+                &mut req,
+                Error::Internal("non-detokenize request reached push_detokenize_to_shard".into()),
+                true,
+            );
+            return;
+        };
+        // Infallible: `validate` rejected out-of-range ids at `Received`.
+        let token_ids: Vec<u32> = token_ids.iter().map(|&id| id as u32).collect();
+        if self
+            .senders
+            .detok_for(&req.rid)
+            .send(DetokMsg::Decode {
+                rid: req.rid.clone(),
+                token_ids,
+            })
+            .is_err()
+        {
+            self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
+        }
     }
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the ingress ring. The
@@ -481,6 +511,18 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
                          {id}; valid range is [0, {vocab_size})"
                     )));
                 }
+            }
+        }
+    }
+
+    // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab
+    // bound — parity with the retired direct decode service: an unknown id is
+    // the tokenizer's error to report, and nothing here reaches the scheduler's
+    // embedding lookup.
+    if let RequestKind::Detokenize { token_ids } = &req.kind {
+        for &id in token_ids {
+            if u32::try_from(id).is_err() {
+                return Err(Error::Validation(format!("Token ID {id} is out of range")));
             }
         }
     }
@@ -941,6 +983,68 @@ mod tests {
             consumer.drain(16).headers.is_empty(),
             "must not reach the scheduler"
         );
+    }
+
+    /// A `Detokenize` request terminates at the detok stage, and the shard must
+    /// see its `Register` BEFORE its `Decode` — the shard delivers the result
+    /// through the sink registered under that rid, so a `Decode` that arrives
+    /// unregistered is silently dropped and the caller waits forever. Both
+    /// messages ride one channel from this one thread, which is the FIFO this
+    /// pins. Nothing may reach the scheduler ring.
+    #[test]
+    fn detokenize_flows_register_then_decode_and_skips_the_ring() {
+        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress();
+        let (tx, mut rx) = mpsc::channel(8);
+        ingress.drive(Request {
+            rid: "41".into(),
+            state: RequestState::Received,
+            sink: EgressSink::Local(tx),
+            kind: RequestKind::Detokenize {
+                token_ids: vec![7, 8, 9],
+            },
+        });
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "41"),
+            "the sink must be registered before the decode job",
+        );
+        assert!(
+            matches!(
+                detok_rx.try_recv(),
+                Ok(DetokMsg::Decode { rid, token_ids })
+                    if rid.as_str() == "41" && token_ids == [7, 8, 9]
+            ),
+            "the decode job follows, ids intact",
+        );
+        assert!(
+            consumer.drain(16).headers.is_empty(),
+            "must never reach the scheduler"
+        );
+        assert!(rx.try_recv().is_err(), "no egress until the shard answers");
+    }
+
+    /// Negative ids cannot decode (the shard's domain is `&[u32]`): rejected by
+    /// `validate` at `Received` — an `Error` to the sink, and the shard sees
+    /// NOTHING (validation runs before registration, so there is no entry to
+    /// leak and no decode job to drop).
+    #[test]
+    fn detokenize_negative_ids_reject_before_registration() {
+        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress();
+        let (tx, mut rx) = mpsc::channel(8);
+        ingress.drive(Request {
+            rid: "43".into(),
+            state: RequestState::Received,
+            sink: EgressSink::Local(tx),
+            kind: RequestKind::Detokenize {
+                token_ids: vec![1, -1],
+            },
+        });
+        let Ok(EgressItem::Error(err)) = rx.try_recv() else {
+            panic!("sink must receive the validation error");
+        };
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("out of range"), "{err}");
+        assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
+        assert!(consumer.drain(16).headers.is_empty());
     }
 
     /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
