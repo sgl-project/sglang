@@ -1,6 +1,8 @@
-import os
+import subprocess
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -13,9 +15,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    try_cached_model,
 )
 
-register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(est_time=189, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 
@@ -25,7 +28,7 @@ class TestTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -83,7 +86,6 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",
@@ -94,11 +96,26 @@ class TestPureDP(TestTP):
     pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
     pkill_process_2 = "sglang::scheduler_DP3_TP3_EP3"
 
+    def _kill_and_bootstrap(self, process_name: str) -> None:
+        subprocess.run(["pkill", "-f", process_name], check=True)
+        # Bootstrap one forward on a survivor so the controller learns the
+        # post-fault active-rank mask before dispatching concurrent requests.
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 1},
+                "routed_dp_rank": 0,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_gsm8k_fault_1(self):
         """
         Kill one rank and the system should remain operational.
         """
-        os.system(f"pkill -f {self.pkill_process_1}")
+        self._kill_and_bootstrap(self.pkill_process_1)
         super().test_gsm8k()
 
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -106,7 +123,7 @@ class TestPureDP(TestTP):
         """
         Kill another rank and the system should remain operational.
         """
-        os.system(f"pkill -f {self.pkill_process_2}")
+        self._kill_and_bootstrap(self.pkill_process_2)
         super().test_gsm8k()
 
 

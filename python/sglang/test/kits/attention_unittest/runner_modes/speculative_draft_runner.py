@@ -327,6 +327,10 @@ def _configure_runner_for_eagle_draft(
         "use_mla_backend": runner.use_mla_backend,
     }
     server_args.override(source="attention-unittest-eagle-draft", **updates)
+    # Re-publish so the bags pick up the overrides.
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(server_args)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -390,6 +394,9 @@ def _build_frozen_kv_mtp_fixture(
     fixture.runner.server_args.override(
         "attention_unittest.frozen_kv_draft", speculative_algorithm="FROZEN_KV_MTP"
     )
+    from sglang.srt.runtime_context import get_context
+
+    get_context().set_server_args(fixture.runner.server_args)
     fixture.runner.spec_algorithm = SpeculativeAlgorithm.FROZEN_KV_MTP
     fixture.runner.draft_attn_backend = fixture.backend
     fixture.runner.attn_backend = fixture.backend
