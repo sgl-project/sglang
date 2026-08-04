@@ -262,6 +262,44 @@ def get_processor(
             )
         else:
             raise
+    except TypeError as e:
+        if "Unexpected keyword argument" not in str(e):
+            raise
+        # Some trust_remote_code processor implementations (e.g. Molmo2Processor)
+        # pass custom kwargs to ProcessorMixin.__init__ that newer Transformers no
+        # longer accepts.  Patch the validator to store them as instance attributes.
+        from transformers.processing_utils import ProcessorMixin
+
+        _orig_processor_init = ProcessorMixin.__init__
+
+        def _permissive_processor_init(self_p, *p_args, **p_kwargs):
+            valid = set(getattr(self_p.__class__, "attributes", [])) | {
+                "chat_template",
+                "audio_tokenizer",
+            }
+            extra = {k: p_kwargs.pop(k) for k in list(p_kwargs) if k not in valid}
+            _orig_processor_init(self_p, *p_args, **p_kwargs)
+            for k, v in extra.items():
+                setattr(self_p, k, v)
+
+        ProcessorMixin.__init__ = _permissive_processor_init
+        try:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+            logger.info(
+                "Processor for %s loaded after relaxing ProcessorMixin.__init__ "
+                "kwarg validation (model's processor passes non-standard kwargs). "
+                "Consider updating the model's processor code.",
+                tokenizer_name,
+            )
+        finally:
+            ProcessorMixin.__init__ = _orig_processor_init
+
     if (
         isinstance(processor, PreTrainedTokenizerBase)
         and getattr(config, "model_type", None) == "pixtral"
