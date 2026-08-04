@@ -73,6 +73,7 @@ def minimax_sparse_prefill(
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
     page_size: int = 1,
+    msa_meta_cache: Optional[dict] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -145,6 +146,7 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                meta_cache=msa_meta_cache,
             )
         except MSAUnavailableError as err:
             _warn_msa_fallback(err)

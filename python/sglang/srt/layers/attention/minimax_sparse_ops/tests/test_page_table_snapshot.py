@@ -89,6 +89,7 @@ def test_backend_slices_max_batch_buffers_before_snapshot(monkeypatch):
     backend = object.__new__(MiniMaxSparseAttnBackend)
     backend.is_npu = False
     backend._msa_dec_meta = None
+    backend._msa_prefill_meta_cache = {}
     backend._active_page_table = None
     backend._cuda_graph_page_table = torch.empty((4, 4), dtype=torch.int32)
     backend._msa_owns_decode = False
@@ -129,3 +130,55 @@ def test_backend_slices_max_batch_buffers_before_snapshot(monkeypatch):
     assert backend._active_page_table.shape == (2, 4)
     assert captured["page_table"].shape == (2, 4)
     assert backend._max_seqlen_k == 16
+
+
+def test_msa_prefill_metadata_is_reused_within_forward(monkeypatch):
+    from sglang.srt.layers.attention.minimax_sparse_ops import msa
+
+    calls = {"pack": 0, "plan": 0, "fmha": 0}
+
+    def fake_pack(page_table, seq_lens, page_size):
+        calls["pack"] += 1
+        return page_table.flatten().to(torch.int32)
+
+    def fake_plan(*args, **kwargs):
+        calls["plan"] += 1
+        return object()
+
+    def fake_fmha(q, k, v, plan, **kwargs):
+        calls["fmha"] += 1
+        return q, None
+
+    monkeypatch.setattr(msa, "_pack_page_table", fake_pack)
+    monkeypatch.setattr(msa, "_run_fmha_sm100_plan", fake_plan)
+    monkeypatch.setattr(msa, "_load_fmha_sm100", lambda: (fake_fmha, None))
+
+    q = torch.zeros(4, 2, 128, dtype=torch.bfloat16)
+    k = torch.zeros(256, 1, 128, dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    topk_idx = torch.zeros(1, 4, 1, dtype=torch.int32)
+    page_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    seq_lens = torch.tensor([132], dtype=torch.int32)
+    prefix_lens = torch.tensor([128], dtype=torch.int32)
+    cache = {}
+
+    kwargs = dict(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        topk_idx=topk_idx,
+        page_table=page_table,
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        block_size_k=128,
+        meta_cache=cache,
+    )
+    msa.msa_sparse_prefill_main(**kwargs)
+    msa.msa_sparse_prefill_main(**kwargs)
+    assert calls == {"pack": 1, "plan": 1, "fmha": 2}
+
+    cache.clear()
+    msa.msa_sparse_prefill_main(**kwargs)
+    assert calls == {"pack": 2, "plan": 2, "fmha": 3}

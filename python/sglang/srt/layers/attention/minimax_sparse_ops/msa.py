@@ -113,6 +113,7 @@ def msa_sparse_prefill_main(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    meta_cache: Optional[dict] = None,
 ) -> torch.Tensor:
     """Drop-in for flash_prefill_with_gqa_share_sparse using MSA fmha_sm100.
 
@@ -143,24 +144,30 @@ def msa_sparse_prefill_main(
     k_paged = k_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
     v_paged = v_cache.view(n_phys_pages, P, num_kv_heads, head_dim).permute(0, 2, 1, 3)
 
-    # Per-request Q lengths (extend) and physical page table.
-    qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-    kv_indices = _pack_page_table(page_table, seq_lens, P)
+    cached_meta = meta_cache.get("prefill") if meta_cache is not None else None
+    if cached_meta is not None:
+        kv_indices, plan = cached_meta
+    else:
+        # Per-request Q lengths and physical page table are layer-invariant.
+        # Build them on the first sparse layer and reuse them for this forward.
+        qo_segment_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        kv_indices = _pack_page_table(page_table, seq_lens, P)
+        plan = _run_fmha_sm100_plan(
+            qo_segment_lens,
+            seq_lens.to(torch.int32),
+            num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=P,
+            kv_block_num=topk,
+            causal=True,
+            qo_offset=prefix_lens.to(torch.int32),
+            use_fp8_kvcache=is_fp8,
+        )
+        if meta_cache is not None:
+            meta_cache["prefill"] = (kv_indices, plan)
 
     # topk_idx [Hkv, total_q, topk] -> kv_block_indexes [total_q, Hkv, topk].
     kv_block_indexes = topk_idx.permute(1, 0, 2).contiguous().to(torch.int32)
-
-    plan = _run_fmha_sm100_plan(
-        qo_segment_lens,
-        seq_lens.to(torch.int32),
-        num_q_heads,
-        num_kv_heads=num_kv_heads,
-        page_size=P,
-        kv_block_num=topk,
-        causal=True,
-        qo_offset=prefix_lens.to(torch.int32),
-        use_fp8_kvcache=is_fp8,
-    )
     o, _ = fmha_sm100(
         q,
         k_paged,

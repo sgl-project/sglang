@@ -215,6 +215,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         self._msa_dec_meta = None
+        self._msa_prefill_meta_cache: dict = {}
         if self.use_msa:
             from sglang.srt.runtime_context import get_parallel
 
@@ -337,6 +338,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._active_page_table = None
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        self._msa_prefill_meta_cache.clear()
         if self.is_npu:
             # Invalidate cached prefill/extend metadata; rebuilt on first sparse layer.
             self._prefill_meta = None
@@ -1483,6 +1485,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
                 page_size=self.page_size,
+                msa_meta_cache=self._msa_prefill_meta_cache,
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
