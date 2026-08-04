@@ -74,7 +74,10 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
 def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
     """Per-shard wall budget = 0.75 * stage timeout. 0.75 is the inverse
     of LPT's 4/3 worst-case approximation ratio, so the most imbalanced
-    LPT shard fills exactly the timeout."""
+    LPT shard fills exactly the timeout.
+
+    A stage's `run_timeout_minutes` therefore drives its fanout rather than
+    capping it: shrinking it buys more shards, not shorter ones."""
     return 0.75 * run_timeouts[suite] * 60
 
 

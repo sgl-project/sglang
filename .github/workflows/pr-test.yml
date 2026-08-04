@@ -302,12 +302,10 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      # compute_partitions reads this back as the per-shard budget, so it
-      # drives the fanout rather than capping it -- shrinking it buys more
-      # shards, not shorter ones.
       run_timeout_minutes: '15'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
+    # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
+    # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
