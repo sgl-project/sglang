@@ -8,7 +8,6 @@ the per-backend weight preparation
 and the MoE runner dispatch. Single GPU, tp=ep=1.
 """
 
-import os
 import unittest
 
 import torch
@@ -18,81 +17,29 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.layer_ut_utils import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    assert_output_close,
+    dequantize_nvfp4_to_dtype,
+    init_single_process_dist,
+    quantize_nvfp4_shard,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
-FLOAT8_E4M3_MAX = 448.0
-FLOAT4_E2M1_MAX = 6.0
-
-kE2M1ToFloat = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
-
-
-def _init_single_process_dist():
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29631")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-    from sglang.srt.distributed.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-        model_parallel_is_initialized,
-    )
-
-    if not torch.distributed.is_initialized():
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
-
-
-def convert_swizzled_to_linear(a_sf_swizzled, m, k, block_size=16):
-    m_tiles = (m + 128 - 1) // 128
-    f = block_size * 4
-    k_tiles = (k + f - 1) // f
-    tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
-    tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-    out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
-    return out[0:m, 0 : k // block_size]
-
-
-def break_fp4_bytes(a):
-    m, n = a.shape
-    a_flat = a.flatten()
-    high = (a_flat & 0xF0) >> 4
-    low = a_flat & 0x0F
-    combined = torch.stack((low, high), dim=1).flatten()
-    signs = (combined & 0x08).to(torch.bool)
-    abs_vals = (combined & 0x07).to(torch.long)
-    kE2M1 = kE2M1ToFloat.to(device=a.device)
-    values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
-    return values.reshape(m, n * 2).to(dtype=torch.float32)
-
-
-def dequant_nvfp4(w_q, sf_swizzled, gs, n, k):
-    w_f32 = break_fp4_bytes(w_q).reshape(n, k // 16, 16)
-    sf = convert_swizzled_to_linear(sf_swizzled.view(torch.float8_e4m3fn), n, k)
-    return (w_f32 * (sf.float() / gs).unsqueeze(-1)).reshape(n, k)
 
 
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 MoE backends require SM100+")
 class TestNvFp4MoeBackends(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        _init_single_process_dist()
+        init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
     def _run_backend(self, backend: str):
-        from flashinfer import fp4_quantize
-
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -138,11 +85,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
                         / 10
                     )
-                    gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w.abs().max().float()
-                    w_q, w_sf = fp4_quantize(w, gs)
-                    sf_linear = convert_swizzled_to_linear(
-                        w_sf.view(torch.float8_e4m3fn), rows, cols
-                    )
+                    w_q, sf_linear, gs, w_dequant = quantize_nvfp4_shard(w)
                     prefix = "w13" if shard_id in ("w1", "w3") else "w2"
                     for suffix, loaded in (
                         ("weight", w_q),
@@ -155,8 +98,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         layer.weight_loader(
                             param, loaded, name, shard_id=shard_id, expert_id=e
                         )
-                    refs[shard_id][e] = dequant_nvfp4(w_q, w_sf, gs, rows, cols)
-
+                    refs[shard_id][e] = w_dequant
             layer.quant_method.process_weights_after_loading(layer)
 
             x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda") / 10
@@ -176,12 +118,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             ref = self._torch_moe_reference(
                 x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
             )
-
-            self.assertEqual(out.shape, (M, H))
-            cos = torch.nn.functional.cosine_similarity(
-                out.float().flatten(), ref.flatten(), dim=0
-            ).item()
-            self.assertGreater(cos, 0.99)
+            assert_output_close(self, out, ref)
 
     @staticmethod
     def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
@@ -189,7 +126,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
         def quant_roundtrip(t2d, gs):
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
-            return dequant_nvfp4(q, sf, gs, t2d.shape[0], t2d.shape[1])
+            return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
         # The kernels quantize the input and the GEMM1->GEMM2 intermediate to
         # NVFP4; mirror both round trips or the comparison carries ~7% noise.
