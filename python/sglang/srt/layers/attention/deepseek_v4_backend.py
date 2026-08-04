@@ -666,16 +666,9 @@ class DeepseekV4AttnBackend(
             )
             self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
 
-        # In-graph metadata prep corrupts CUDA-graph replays with trtllm backend
-        # on bs>1; WAR by forcing host-side prep.
-        self._prep_in_cuda_graph: bool = (
-            envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not self.trtllm_attn
-        )
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and self.trtllm_attn:
-            logger.info(
-                "DSv4 trtllm backend: forcing host-side metadata prep "
-                "(SGLANG_PREP_IN_CUDA_GRAPH ignored)."
-            )
+        # Pins metadata built inside graph captures; see
+        # init_forward_metadata_in_graph.
+        self._captured_full_metadata_refs: List[DSV4Metadata] = []
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -777,7 +770,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if self._prep_in_cuda_graph:
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -927,7 +920,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if self._prep_in_cuda_graph:
+        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             bs = len(seq_lens)
             if self.needs_cpu_seq_lens:
@@ -1211,6 +1204,9 @@ class DeepseekV4AttnBackend(
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
         # materialization is recorded inside the cuda graph; a no-op (Full
         # already) when PREP_IN_CUDA_GRAPH=0.
+        was_raw = isinstance(
+            self.forward_metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata)
+        )
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
@@ -1220,6 +1216,12 @@ class DeepseekV4AttnBackend(
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
+        # Metadata built inside a capture lives in the shared CUDA-graph
+        # memory pool; keep a reference per captured graph so later bucket
+        # captures cannot reuse its blocks (replays of interleaved buckets
+        # would otherwise read memory another graph's replay last wrote).
+        if was_raw and torch.cuda.is_current_stream_capturing():
+            self._captured_full_metadata_refs.append(self.forward_metadata)
 
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
