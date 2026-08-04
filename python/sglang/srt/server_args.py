@@ -8183,6 +8183,11 @@ class ServerArgs:
                     "--radix-eviction-policy tlru requires the unified radix tree. "
                     "Set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1."
                 )
+            if self.tlru_threshold < 0 or self.tlru_next_prompt_estimate < 0:
+                raise ValueError(
+                    "--radix-eviction-policy tlru requires non-negative --tlru-threshold and "
+                    f"--tlru-next-prompt-estimate, got {self.tlru_threshold} and {self.tlru_next_prompt_estimate}."
+                )
             if self.tlru_threshold <= self.tlru_next_prompt_estimate:
                 raise ValueError(
                     "--radix-eviction-policy tlru needs --tlru-threshold greater than "

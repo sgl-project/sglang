@@ -180,6 +180,8 @@ def _set_depth_and_raise_convo_length(
     Walks up only until an ancestor is already at least this deep, so extending a
     conversation by one turn costs O(new nodes) rather than O(conversation).
     """
+    if node.key is None:
+        raise ValueError("_set_depth_and_raise_convo_length requires node.key to be set")
     node.depth = parent.depth + len(node.key)
     if node.convo_length < node.depth:
         node.convo_length = node.depth
