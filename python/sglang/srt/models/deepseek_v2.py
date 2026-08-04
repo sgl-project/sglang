@@ -188,12 +188,14 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_exec,
     get_flags,
     get_forward,
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -503,7 +505,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_server_args().enable_deterministic_inference:
+        if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -569,7 +571,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_server_args().disable_shared_experts_fusion
+        _fusion_disabled = get_exec().moe.disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -639,8 +641,7 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe
-            + get_server_args().ep_num_redundant_experts,
+            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -814,7 +815,7 @@ class DeepseekV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -911,8 +912,8 @@ class DeepseekV2MoE(nn.Module):
                 and not (
                     get_flags().capture.enable_torch_compile
                     and hidden_states.shape[0]
-                    <= server_args.torch_compile_max_bs
-                    * (server_args.speculative_num_draft_tokens or 1)
+                    <= get_exec().graph.torch_compile_max_bs
+                    * (get_spec().speculative_num_draft_tokens or 1)
                 )
             ):
                 return self.forward_normal_dual_stream(
@@ -962,7 +963,7 @@ class DeepseekV2MoE(nn.Module):
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb and not self.is_nextn
+            if get_exec().moe.enable_eplb and not self.is_nextn
             else None
         )
         # router_logits: (num_tokens, n_experts)
@@ -1063,7 +1064,7 @@ class DeepseekV2MoE(nn.Module):
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb and not self.is_nextn
+            if get_exec().moe.enable_eplb and not self.is_nextn
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1269,6 +1270,13 @@ class DeepseekV2MoE(nn.Module):
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
+                    if is_in_breakable_cuda_graph():
+                        # The MoE call below is an eager break, so record
+                        # and wait must share one capture; joining here means
+                        # the shared experts overlap nothing. The alt stream
+                        # is kept for record_stream: without that marking the
+                        # allocator recycles shared_output across the break.
+                        torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1452,6 +1460,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
@@ -1879,7 +1888,7 @@ class DeepseekV2AttentionMLA(
                 base=rope_theta,
                 rope_scaling=rope_scaling,
                 is_neox_style=is_neox_style,
-                device=get_server_args().device,
+                device=get_device().device,
             )
 
             if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
@@ -2011,7 +2020,7 @@ class DeepseekV2AttentionMLA(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if server_args.speculative_attention_mode == "decode":
+            if get_spec().speculative_attention_mode == "decode":
                 attention_backend = decode_backend_str
             else:  # default to prefill
                 attention_backend = prefill_backend_str
@@ -2270,7 +2279,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -2929,7 +2938,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -2968,11 +2977,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         server_args = get_server_args()
 
-        if get_server_args().disable_shared_experts_fusion:
+        if get_exec().moe.disable_shared_experts_fusion:
             return
 
         disable_reason = None
-        if server_args.enforce_shared_experts_fusion:
+        if get_exec().moe.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."

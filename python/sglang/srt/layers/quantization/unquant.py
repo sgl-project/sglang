@@ -374,6 +374,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            # The cached indices are GPU tensors. Colocated weight offloading
+            # can release their backing memory between reloads, so rebuild them
+            # once per post-processing cycle.
+            self._cache_permute_indices.clear()
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,

@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     register_model_override,
     validate_declarations,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
     get_server_args,
@@ -613,7 +614,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _attention_backend_default,
-            _attention_backend_dual_chunk,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
         )
@@ -648,19 +648,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with patch.object(overrides_module, "cpu_has_amx_support", return_value=True):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
-
-        # dual-chunk config: mismatched explicit backend raises verbatim
-        def _mc(dual):
-            return SimpleNamespace(
-                get_model_config=lambda: SimpleNamespace(
-                    hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
-                ),
-                attention_backend="fa3",
-            )
-
-        with self.assertRaises(ValueError):
-            _attention_backend_dual_chunk(ResolvedView(_mc({"a": 1})))
-        self.assertEqual(_attention_backend_dual_chunk(ResolvedView(_mc(None))), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
@@ -1642,6 +1629,87 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+    def test_m3_fp8_attn_gemm_resolution(self):
+        from sglang.srt.arg_groups.overrides import _minimax_m3_overrides
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend="trtllm_mha",
+                kv_cache_dtype="fp8_e4m3",
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
+            # e4m3 + trtllm_mha + SM100: mode active
+            self.assertTrue(m3_fp8_attn_gemm_enabled(_args()))
+            # fa4 dense backend: mode inactive (no fp8-q GEMM path)
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(attention_backend="fa4")))
+            # bf16 KV: mode inactive
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(kv_cache_dtype="auto")))
+            # e5m2: mode inactive (fmha_sm100's variant lookup would silently
+            # dispatch the e4m3 kernel)
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args(kv_cache_dtype="fp8_e5m2")))
+            # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch wins over an
+            # otherwise-active config
+            with envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.override(True):
+                self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
+            # non-SM100: mode inactive
+            self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
+
+        def _m3_args(**kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                page_size=None,
+                moe_runner_backend="auto",
+                kv_cache_dtype="auto",
+            )
+            defaults.update(kw)
+            ns = SimpleNamespace(**defaults)
+            ns.is_attention_backend_not_set = lambda: (
+                ns.attention_backend is None
+                and ns.prefill_attention_backend is None
+                and ns.decode_attention_backend is None
+            )
+            return ns
+
+        hf = SimpleNamespace()
+        with patch.object(overrides_module, "is_hip", return_value=False), patch.object(
+            overrides_module, "is_sm100_supported", return_value=True
+        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+            # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
+            # dense backend with the fp8-q GEMM path); page snaps to 128
+            ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
+            self.assertEqual(ov["attention_backend"], "trtllm_mha")
+            self.assertEqual(ov["page_size"], 128)
+            # auto KV: fa4 stays the SM100 default
+            ov = _minimax_m3_overrides(_m3_args(), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertEqual(ov["page_size"], 128)
+            # e5m2 KV: stays on fa4 + the widening Triton path, and warns
+            with self.assertLogs(
+                "sglang.srt.arg_groups.overrides", level="WARNING"
+            ) as logs:
+                ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e5m2"), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertIn("fp8_e5m2", "\n".join(logs.output))
+            # explicit backend choice is never overridden
+            ov = _minimax_m3_overrides(
+                _m3_args(kv_cache_dtype="fp8_e4m3", attention_backend="fa4"), hf
+            )
+            self.assertNotIn("attention_backend", ov)
+            # kill switch also reverts the SM100 backend default to fa4
+            with envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.override(True):
+                ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
+            self.assertEqual(ov["attention_backend"], "fa4")
+            self.assertEqual(ov["page_size"], 128)
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
@@ -1655,6 +1723,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 decode_attention_backend=None,
                 prefill_attention_backend=None,
+                speculative_draft_attention_backend=None,
                 page_size=1,
             )
             defaults.update(kw)
@@ -1679,6 +1748,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     decode_attention_backend="flashmla",
                     prefill_attention_backend="trtllm_mha",
                 )
+            ),
+            {"page_size": 64},
+        )
+        # trtllm_mha accepts 128 (trtllm-gen dynamic tokens-per-page kernels)
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=128)
+            ),
+            {},
+        )
+        # trtllm_mha with an unsupported page still snaps to 64
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(attention_backend="trtllm_mha", page_size=256)
             ),
             {"page_size": 64},
         )
@@ -1903,7 +1986,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="deepep", ep_size=1, tp_size=8)
+                )
             ),
             {"ep_size": 8},
         )
