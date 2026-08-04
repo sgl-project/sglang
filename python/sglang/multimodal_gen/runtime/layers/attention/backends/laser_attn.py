@@ -22,6 +22,9 @@ except ImportError as e:
 
 logger = init_logger(__name__)
 
+# Laser consumes FP16, while diffusion V activations can require BF16 range.
+_BF16_VALUE_SCALE = 256.0
+
 
 class LaserAttentionBackend(AttentionBackend):
 
@@ -103,22 +106,27 @@ class LaserAttentionImpl(AttentionImpl):
 
     def _la_preprocess_input(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         # Currently BSND input layout is not supported
         q = query.transpose(1, 2)
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
 
+        value_scale = 1.0
         if q.dtype != torch.float16:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
-            v = v.to(torch.float16)
+            if v.dtype == torch.bfloat16:
+                value_scale = _BF16_VALUE_SCALE
+                v = v.mul(1.0 / value_scale).to(torch.float16)
+            else:
+                v = v.to(torch.float16)
 
         q = self._pad(q)
         k = self._pad(k)
         v = self._pad(v)
 
-        return q, k, v
+        return q, k, v, value_scale
 
     def _la_postprocess_output(
         self,
@@ -182,8 +190,10 @@ class LaserAttentionImpl(AttentionImpl):
                     kv_seqlen // self.seq_len_pad_base + 1
                 ) * self.seq_len_pad_base - kv_seqlen
 
-            q, k, v = self._la_preprocess_input(query, key, value)
+            q, k, v, value_scale = self._la_preprocess_input(query, key, value)
             _, la_output = self._laser_attention(q, k, v, q.shape[1], pre_tokens)
+            if value_scale != 1.0:
+                la_output.mul_(value_scale)
             output = self._la_postprocess_output(
                 la_output, query.dtype, q_seqlen, head_dim
             )
