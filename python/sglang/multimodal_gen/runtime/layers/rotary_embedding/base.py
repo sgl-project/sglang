@@ -72,9 +72,12 @@ class RotaryEmbedding(CustomOp):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        position_offset: int = 0,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
         complex_freqs: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -110,15 +113,30 @@ class RotaryEmbedding(CustomOp):
                 return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
                     batch_size, seq_len, num_heads, head_dim
                 )
-        if cos is None or sin is None:
-            raise ValueError("Can't call _apply_rotary_embedding, no cos/sin data.")
-        q_flat = query.reshape(total_tokens, num_heads, head_dim)
-        k_flat = key.reshape(total_tokens, num_heads, head_dim)
-        q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox_style=self.is_neox_style)
-        k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox_style=self.is_neox_style)
-        return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
-            batch_size, seq_len, num_heads, head_dim
-        )
+        if cos is not None and sin is not None:
+            q_flat = query.reshape(total_tokens, num_heads, head_dim)
+            k_flat = key.reshape(total_tokens, num_heads, head_dim)
+            q_rot = _apply_rotary_emb(
+                q_flat, cos, sin, is_neox_style=self.is_neox_style
+            )
+            k_rot = _apply_rotary_emb(
+                k_flat, cos, sin, is_neox_style=self.is_neox_style
+            )
+            return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
+                batch_size, seq_len, num_heads, head_dim
+            )
+        if cos_sin_cache is not None:
+            return self.forward_native(
+                query=query,
+                key=key,
+                positions=positions,
+                position_offset=position_offset,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+                cos_sin_cache=cos_sin_cache,
+                **kwargs,
+            )
 
     def forward_cuda(
         self,
@@ -126,12 +144,31 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
         position_offset: int = 0,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        if query.dim() != 4 or key.dim() != 4:
+            raise ValueError(
+                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
+                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+            )
+
         if cos_sin_cache is None:
-            raise ValueError("cos_sin_cache is required for CUDA RoPE kernel.")
+            return self.forward_native(
+                query=query,
+                key=key,
+                positions=positions,
+                position_offset=position_offset,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+                cos_sin_cache=cos_sin_cache,
+                **kwargs,
+            )
 
         batch_size, seq_len, _, head_dim = query.shape
 
