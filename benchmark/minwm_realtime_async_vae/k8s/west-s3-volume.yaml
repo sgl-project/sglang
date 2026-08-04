@@ -28,7 +28,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: minwm-async-west-s3
-  namespace: default
+  namespace: minwm-realtime
   labels:
     seedleap.ai/test-run: minwm-async-vae-benchmark
     seedleap.ai/ttl-after-test: required

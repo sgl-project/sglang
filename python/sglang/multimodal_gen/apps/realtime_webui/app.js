@@ -406,7 +406,6 @@ let recordingBaseFileName = "";
 let currentSessionArtifact = null;
 let recordingArtifact = null;
 let currentTrace = null;
-let traceInitSent = false;
 let renderedTraceChunks = new Set();
 const decodeRequests = new Map();
 let controlStateController = null;
@@ -415,6 +414,14 @@ let lastSampledEventId = 0;
 const traceTopologyApi = window.SGLangRealtimeTraceTopology || {};
 const traceTopology = traceTopologyApi.createRealtimeTraceTopology
   ? traceTopologyApi.createRealtimeTraceTopology({ maxEvents: 220 })
+  : null;
+const traceTransportApi = window.SGLangRealtimeTraceTransport || {};
+const traceHttpClient = traceTransportApi.RealtimeTraceHttpClient
+  ? new traceTransportApi.RealtimeTraceHttpClient({
+      onServerEvents: (events) => {
+        events.forEach((event) => recordTraceTopologyEvent(event));
+      },
+    })
   : null;
 const formatTraceDuration = traceTopologyApi.formatTraceDuration || formatMs;
 let activeWorkspaceView = "preview";
@@ -431,17 +438,19 @@ const recordingCtx = recordingCanvas.getContext("2d", { alpha: false });
 const playbackController = new RealtimePlaybackController({
   mode: "live",
   targetFps: DEFAULT_TARGET_FPS,
-  holdForTargetLead: true,
-  targetLeadChunkRatio: 0.34,
-  minTargetLeadMs: 220,
-  maxTargetLeadMs: 420,
-  startLeadChunkRatio: 0.28,
-  minStartLeadMs: 160,
-  resumeLeadChunkRatio: 0.3,
-  minResumeLeadMs: 140,
-  maxResumeLeadMs: 320,
-  maxDeliveryLeadBoostMs: 220,
-  deliveryStallExpectedMultiplier: 1.12,
+  lowLatencyPlayback: true,
+  holdForTargetLead: false,
+  targetLeadChunkRatio: 0.08,
+  minTargetLeadMs: 0,
+  maxTargetLeadMs: 80,
+  lowLatencyMaxLeadFrames: 1,
+  startLeadChunkRatio: 0,
+  minStartLeadMs: 0,
+  resumeLeadChunkRatio: 0,
+  minResumeLeadMs: 0,
+  maxResumeLeadMs: 80,
+  maxDeliveryLeadBoostMs: 30,
+  deliveryStallExpectedMultiplier: 1.2,
 });
 
 function setStatus(text, kind = "") {
@@ -495,19 +504,6 @@ function stableBrowserUserId() {
 
 const browserUserId = stableBrowserUserId();
 
-function currentTracePayload() {
-  if (!currentTrace) return undefined;
-  return {
-    trace_id: currentTrace.traceId,
-    time_origin_ms: performance.timeOrigin,
-    created_perf_ms: roundTraceNumber(currentTrace.createdPerfMs),
-    created_epoch_ms: currentTrace.createdEpochMs,
-    user_agent: navigator.userAgent,
-    location: window.location.href,
-    events: currentTrace.events.slice(-32),
-  };
-}
-
 function traceWebSocketUrl(baseUrl) {
   try {
     const url = new URL(baseUrl, window.location.href);
@@ -536,24 +532,8 @@ function markClientTrace(name, fields = {}, options = {}) {
   currentTrace.events.push(event);
   if (currentTrace.events.length > 64) currentTrace.events.shift();
   recordTraceTopologyEvent(event);
-  if (options.send !== false) sendClientTrace(event);
+  if (options.send !== false) traceHttpClient?.enqueueClientEvent(event);
   return event;
-}
-
-function sendClientTrace(event) {
-  if (!traceInitSent || !currentTrace || !ws || ws.readyState !== WebSocket.OPEN) {
-    return;
-  }
-  try {
-    ws.send(pack({
-      type: "event",
-      kind: "client_trace",
-      trace_id: currentTrace.traceId,
-      payload: event,
-    }));
-  } catch (error) {
-    console.debug("realtime_trace send failed", error);
-  }
 }
 
 function roundTraceNumber(value) {
@@ -753,7 +733,12 @@ function setWorkspaceView(view) {
     pane.classList.toggle("is-active", active);
     pane.hidden = !active;
   });
-  if (activeWorkspaceView === "trace") renderTraceTopologyNow();
+  if (activeWorkspaceView === "trace") {
+    renderTraceTopologyNow();
+    traceHttpClient?.startPolling(5000);
+  } else {
+    traceHttpClient?.stopPolling();
+  }
 }
 
 function updateControlDebugText() {
@@ -3008,6 +2993,13 @@ function renderLoop(now) {
 }
 
 function scheduleRenderLoop() {
+  if (
+    document.visibilityState !== "hidden" &&
+    typeof window.requestAnimationFrame === "function"
+  ) {
+    window.requestAnimationFrame(renderLoop);
+    return;
+  }
   const timerFps = Math.min(
     MAX_RENDER_TIMER_FPS,
     Math.max(MIN_RENDER_TIMER_FPS, previewPlaybackTargetFps() * 2),
@@ -3160,13 +3152,13 @@ async function connect() {
     resetStreamStats();
     const epoch = ++streamEpoch;
     currentTrace = createClientTrace();
-    traceInitSent = false;
+    traceHttpClient?.reset(currentTrace.traceId, $("serverUrl").value);
     resetTraceTopology(currentTrace.traceId);
     markClientTrace("client.generate_clicked", {
       generation_mode: selectedGenerationMode(),
       transport: $("transportFormat").value || "raw",
       fps: Number($("fps").value || DEFAULT_TARGET_FPS),
-    }, { send: false });
+    });
     const generationMode = selectedGenerationMode();
     let firstFrame;
     let numFrames = Number($("numFrames").value);
@@ -3205,7 +3197,6 @@ async function connect() {
         ? undefined
         : 1,
       trace_id: currentTrace.traceId,
-      client_trace: currentTracePayload(),
       first_frame: firstFrame,
       ...previewTransportParams,
       ...frameInterpolationParams,
@@ -3229,11 +3220,10 @@ async function connect() {
       if (epoch !== streamEpoch) return;
       markClientTrace("client.ws_open", {
         url: traceWebSocketUrl($("serverUrl").value),
-      }, { send: false });
+      });
       recordTrajectoryEvent("socket_open", { url: traceWebSocketUrl($("serverUrl").value) });
       const initPayload = pack(init);
       socket.send(initPayload);
-      traceInitSent = true;
       markClientTrace("client.init_sent", {
         generation_mode: generationMode,
         num_frames: init.num_frames,
@@ -3257,7 +3247,7 @@ async function connect() {
       markClientTrace("client.ws_close", {
         code: event.code,
         reason: event.reason || "",
-      }, { send: false });
+      });
       $("connectBtn").disabled = false;
       if (clearQueueOnClose) {
         clearFrameQueue();
@@ -3283,12 +3273,13 @@ async function connect() {
         normal_close: normalClose,
         expected_close: socketCloseExpected,
       });
+      void traceHttpClient?.flushClientEvents().catch(() => {});
       if (!renderedPreviewFrames) setPreviewState("idle");
       socketCloseExpected = false;
     };
     socket.onerror = () => {
       if (epoch !== streamEpoch) return;
-      markClientTrace("client.ws_error", {}, { send: false });
+      markClientTrace("client.ws_error");
       recordTrajectoryEvent("socket_error", { ready_state: socket.readyState });
       if (!socketCloseExpected) {
         socketHadError = true;
@@ -3354,17 +3345,6 @@ function receive(data, epoch) {
       recordTraceTopologyEvent({ event: "server.chunk_complete", ...stats }, receivedAt);
       recordServerChunkStats(stats);
       updateServerChunkStats(stats);
-      return;
-    }
-    if (message.type === "trace_event") {
-      recordTraceTopologyEvent(message.trace || message, receivedAt);
-      return;
-    }
-    if (message.type === "trace_events") {
-      const traces = Array.isArray(message.traces) ? message.traces : [];
-      traces.forEach((traceEvent) => {
-        recordTraceTopologyEvent(traceEvent, receivedAt);
-      });
       return;
     }
     if (message.type === "frame_batch") {

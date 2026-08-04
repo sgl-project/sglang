@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import inspect
 import time
 from collections import deque
 from copy import copy
@@ -93,39 +94,38 @@ class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
         raise NotImplementedError
 
 
-def test_realtime_trace_sender_batches_events_without_dropping_them():
-    class _WebSocket:
-        def __init__(self):
-            self.messages = []
+def test_realtime_generate_does_not_start_a_trace_websocket_sender():
+    source = inspect.getsource(realtime_video_api.generate)
 
-        async def send_bytes(self, payload):
-            self.messages.append(msgspec.msgpack.decode(payload))
+    assert "_send_realtime_trace_events" not in source
+    assert "trace_task" not in source
+    assert '"type": "trace_events"' not in inspect.getsource(realtime_video_api)
 
-    async def run():
-        websocket = _WebSocket()
-        queue = asyncio.Queue()
-        for index in range(3):
-            queue.put_nowait({"event": f"server.stage_{index}"})
 
-        task = asyncio.create_task(
-            realtime_video_api._send_realtime_trace_events(websocket, queue)
-        )
-        await asyncio.sleep(0.02)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return websocket.messages
-
-    assert asyncio.run(run()) == [
-        {
-            "type": "trace_events",
-            "traces": [
-                {"event": "server.stage_0"},
-                {"event": "server.stage_1"},
-                {"event": "server.stage_2"},
-            ],
+def test_gateway_managed_session_uses_coordinator_identity_and_routes():
+    websocket = SimpleNamespace(
+        query_params={
+            "gateway_managed": "1",
+            "session_id": "session-a",
+            "generation_id": "generation-a",
+            "coordinator_token": "lease-secret",
+            "realtime_vae_worker_url": "ws://vae-a/decode",
+            "gateway_output_url": "ws://gateway-a/output",
+            "gateway_output_token": "output-secret",
         }
-    ]
+    )
+    config = realtime_video_api._gateway_managed_config(websocket)
+    assert config.session_id == "session-a"
+    assert config.generation_id == "generation-a"
+    assert config.vae_worker_url == "ws://vae-a/decode"
+    assert config.output_url == "ws://gateway-a/output"
+
+    session = GenerateSession(
+        session_id=config.session_id,
+        generation_id=config.generation_id,
+    )
+    assert session.id == "session-a"
+    assert session.generation_id == "generation-a"
 
 
 def test_realtime_diffusion_stage_declares_long_lived_components():

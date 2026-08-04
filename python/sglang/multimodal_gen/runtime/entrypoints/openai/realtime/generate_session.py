@@ -37,11 +37,17 @@ class RealtimeChunkContext:
 class GenerateSession:
     """A realtime generation session"""
 
-    def __init__(self, *, max_inflight_chunks: int = 1):
+    def __init__(
+        self,
+        *,
+        max_inflight_chunks: int = 1,
+        session_id: str | None = None,
+        generation_id: str | None = None,
+    ):
         if max_inflight_chunks < 1:
             raise ValueError("max_inflight_chunks must be positive")
-        self.id = uuid4().hex
-        self.generation_id = uuid4().hex
+        self.id = session_id or uuid4().hex
+        self.generation_id = generation_id or uuid4().hex
         self.trace_id = self.id
         self.trace_started_at = time.perf_counter()
         self.trace_started_epoch_ms = int(time.time() * 1000)
@@ -67,6 +73,9 @@ class GenerateSession:
         self.output_pace_next_send_at: float | None = None
         self.output_pace_last_event_id: int | None = None
         self.vae_client: Any = None
+        self.vae_worker_url: str | None = None
+        self.gateway_output_url: str | None = None
+        self.gateway_output_token: str | None = None
         self.pending_control_refresh: tuple[str, int | None] | None = None
         self.control_refresh_task: Any = None
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import shutil
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import msgspec.msgpack
@@ -25,14 +26,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
-    CLIENT_TRACE_EVENT_KIND,
     calculate_overlap_ms,
     calculate_overlap_ratio,
-    compact_client_trace_event,
     log_realtime_trace,
     normalize_trace_id,
-    register_realtime_trace_sink,
-    unregister_realtime_trace_sink,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
@@ -68,9 +65,6 @@ logger = init_logger(__name__)
 
 _REALTIME_CONTROL_REFRESH_TIMEOUT_S = 1.0
 router = APIRouter(prefix="/v1/realtime_video", tags=["realtime"])
-_TRACE_EVENT_QUEUE_LIMIT = 256
-_TRACE_EVENT_BATCH_LIMIT = 64
-_TRACE_EVENT_BATCH_WAIT_S = 0.005
 _REALTIME_RESULT_STAGE_MARKERS = ("vae", "denois")
 _ADMISSION_CONTROLLER: RealtimeAdmissionController | None = None
 _ADMISSION_CONFIG: tuple | None = None
@@ -98,6 +92,33 @@ class _OrderedDecodeCoordinator:
         self.pending.cancel()
         await asyncio.gather(self.pending, return_exceptions=True)
         self.pending = None
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayManagedConfig:
+    session_id: str
+    generation_id: str
+    coordinator_token: str
+    vae_worker_url: str
+    output_url: str
+    output_token: str
+
+
+def _gateway_managed_config(websocket: WebSocket) -> _GatewayManagedConfig | None:
+    query = websocket.query_params
+    if query.get("gateway_managed") != "1":
+        return None
+    fields = {
+        "session_id": query.get("session_id"),
+        "generation_id": query.get("generation_id"),
+        "coordinator_token": query.get("coordinator_token"),
+        "vae_worker_url": query.get("realtime_vae_worker_url"),
+        "output_url": query.get("gateway_output_url"),
+        "output_token": query.get("gateway_output_token"),
+    }
+    if not all(fields.values()):
+        raise AdmissionRejected("INVALID_GATEWAY_ASSIGNMENT")
+    return _GatewayManagedConfig(**fields)
 
 
 def _log_previous_chunk_overlap(
@@ -217,90 +238,6 @@ def _safe_len(value) -> int:
         return len(value)
     except TypeError:
         return 0
-
-
-def _make_trace_queue_sink(
-    loop: asyncio.AbstractEventLoop,
-    queue: asyncio.Queue,
-):
-    def sink(payload: dict):
-        def enqueue():
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                queue.put_nowait(payload)
-            except asyncio.QueueFull:
-                pass
-
-        loop.call_soon_threadsafe(enqueue)
-
-    return sink
-
-
-def _install_realtime_trace_sink(session: GenerateSession, sink) -> None:
-    trace_id = session.trace_id
-    if not trace_id:
-        return
-    sink_key = (trace_id, session.id, session.generation_id)
-    previous_key = getattr(session, "_trace_sink_key", None)
-    if previous_key == sink_key:
-        return
-    if previous_key:
-        unregister_realtime_trace_sink(
-            previous_key[0],
-            sink,
-            session_id=previous_key[1],
-            generation_id=previous_key[2],
-        )
-    register_realtime_trace_sink(
-        trace_id,
-        sink,
-        session_id=session.id,
-        generation_id=session.generation_id,
-    )
-    session._trace_sink_key = sink_key
-
-
-def _uninstall_realtime_trace_sink(session: GenerateSession, sink) -> None:
-    sink_key = getattr(session, "_trace_sink_key", None)
-    if not sink_key:
-        return
-    unregister_realtime_trace_sink(
-        sink_key[0],
-        sink,
-        session_id=sink_key[1],
-        generation_id=sink_key[2],
-    )
-    session._trace_sink_key = None
-
-
-async def _send_realtime_trace_events(
-    ws: WebSocket,
-    queue: asyncio.Queue,
-) -> None:
-    while True:
-        batch = [await queue.get()]
-        deadline = asyncio.get_running_loop().time() + _TRACE_EVENT_BATCH_WAIT_S
-        while len(batch) < _TRACE_EVENT_BATCH_LIMIT:
-            timeout = deadline - asyncio.get_running_loop().time()
-            if timeout <= 0:
-                break
-            try:
-                batch.append(await asyncio.wait_for(queue.get(), timeout=timeout))
-            except TimeoutError:
-                break
-        await ws.send_bytes(
-            msgspec.msgpack.encode(
-                {
-                    "type": "trace_events",
-                    "traces": batch,
-                }
-            )
-        )
-        await asyncio.sleep(0)
 
 
 def _get_admission_controller(server_args) -> RealtimeAdmissionController:
@@ -595,7 +532,7 @@ async def _send_realtime_chunk_stats(
 
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
     server_args = get_global_server_args()
-    if getattr(server_args, "realtime_vae_worker_url", None):
+    if session.vae_worker_url or getattr(server_args, "realtime_vae_worker_url", None):
         return await _generate_loop_async_vae(ws, session, server_args)
     return await _generate_loop_local(ws, session)
 
@@ -810,8 +747,14 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
         raise ValueError("realtime adapter and request must be initialized")
 
     session.max_inflight_chunks = 2
+    vae_worker_url = (
+        getattr(session, "vae_worker_url", None)
+        or server_args.realtime_vae_worker_url
+    )
+    if not vae_worker_url:
+        raise ValueError("realtime VAE worker URL is required")
     client = RealtimeVAEClient(
-        server_args.realtime_vae_worker_url,
+        vae_worker_url,
         session_id=session.id,
         generation_id=session.generation_id,
         timeout_s=server_args.realtime_vae_timeout_s,
@@ -827,6 +770,9 @@ async def _generate_loop_async_vae(ws, session: GenerateSession, server_args):
             output_format=output_format,
             quality=quality,
             preview_max_width=session.request.realtime_preview_max_width,
+            output_url=getattr(session, "gateway_output_url", None),
+            output_token=getattr(session, "gateway_output_token", None),
+            trace_id=session.trace_id,
         )
         while session.can_schedule_chunk():
             if coordinator.pending is not None and coordinator.pending.done():
@@ -1315,12 +1261,6 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
             if not isinstance(data, dict):
                 raise ValueError("realtime event must be a map")
             realtime_event = RealtimeEvent.model_validate(data)
-            if realtime_event.kind == CLIENT_TRACE_EVENT_KIND:
-                client_event = compact_client_trace_event(realtime_event.payload)
-                event_name = str(client_event.pop("name", "client_trace"))
-                log_realtime_trace(logger, session, event_name, **client_event)
-                session.mark_client_activity()
-                continue
             if realtime_event.kind == "heartbeat":
                 session.mark_client_activity()
                 continue
@@ -1367,7 +1307,6 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
 async def _listen_generate_request(
     ws: WebSocket,
     session: GenerateSession,
-    trace_sink=None,
 ):
     while True:
         try:
@@ -1381,8 +1320,6 @@ async def _listen_generate_request(
 
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
             session.bind_trace(realtime_req)
-            if trace_sink is not None:
-                _install_realtime_trace_sink(session, trace_sink)
             log_realtime_trace(
                 logger,
                 session,
@@ -1535,72 +1472,83 @@ async def generate(websocket: WebSocket):
     ws = _LockedRealtimeWebSocket(websocket)
     server_args = get_global_server_args()
     try:
-        user_id = _resolve_realtime_user_id(
-            websocket,
-            require_authenticated=server_args.realtime_require_authenticated_user,
-        )
+        gateway_config = _gateway_managed_config(websocket)
+        if gateway_config is None:
+            user_id = _resolve_realtime_user_id(
+                websocket,
+                require_authenticated=server_args.realtime_require_authenticated_user,
+            )
+        else:
+            user_id = "gateway-managed"
     except AdmissionRejected as exc:
         await write_error_msg(f"realtime admission rejected: {exc.reason}", ws)
         await _close_realtime_websocket(ws, code=1008, reason=exc.reason)
         return
-    session = GenerateSession()
+    session = GenerateSession(
+        session_id=gateway_config.session_id if gateway_config else None,
+        generation_id=gateway_config.generation_id if gateway_config else None,
+    )
+    if gateway_config is not None:
+        session.vae_worker_url = gateway_config.vae_worker_url
+        session.gateway_output_url = gateway_config.output_url
+        session.gateway_output_token = gateway_config.output_token
     session.trace_id = normalize_trace_id(
         websocket.query_params.get("trace_id"), fallback=session.trace_id
     )
-    trace_queue: asyncio.Queue = asyncio.Queue(maxsize=_TRACE_EVENT_QUEUE_LIMIT)
-    trace_sink = _make_trace_queue_sink(asyncio.get_running_loop(), trace_queue)
-    _install_realtime_trace_sink(session, trace_sink)
-    trace_task = asyncio.create_task(_send_realtime_trace_events(ws, trace_queue))
     log_realtime_trace(
         logger,
         session,
         "server.ws_accepted",
         client=str(websocket.client) if websocket.client else None,
     )
-    controller = _get_admission_controller(server_args)
+    controller = (
+        None if gateway_config is not None else _get_admission_controller(server_args)
+    )
     lease = None
     initialization_task = None
     generate_task = None
     listen_task = None
     watchdog_task = None
     try:
-        try:
-            lease = await controller.admit(
-                user_id,
-                session.id,
-                session.generation_id,
-                wait_for_capacity=False,
+        if controller is not None:
+            try:
+                lease = await controller.admit(
+                    user_id,
+                    session.id,
+                    session.generation_id,
+                    wait_for_capacity=False,
+                )
+            except AdmissionRejected as exc:
+                log_realtime_trace(
+                    logger,
+                    session,
+                    "server.session_rejected",
+                    reason=exc.reason,
+                    retry_after_s=exc.retry_after_s,
+                )
+                await write_error_msg(f"realtime admission rejected: {exc.reason}", ws)
+                await _close_realtime_websocket(
+                    ws,
+                    code=1008,
+                    reason=exc.reason,
+                )
+                return
+            watchdog_task = asyncio.create_task(
+                _session_watchdog(
+                    session,
+                    controller,
+                    lease,
+                    idle_timeout_s=server_args.realtime_session_idle_timeout_s,
+                    max_lifetime_s=server_args.realtime_session_max_lifetime_s,
+                    lease_ttl_s=server_args.realtime_session_lease_ttl_s,
+                )
             )
-        except AdmissionRejected as exc:
-            log_realtime_trace(
-                logger,
-                session,
-                "server.session_rejected",
-                reason=exc.reason,
-                retry_after_s=exc.retry_after_s,
-            )
-            await write_error_msg(f"realtime admission rejected: {exc.reason}", ws)
-            await _close_realtime_websocket(
-                ws,
-                code=1008,
-                reason=exc.reason,
-            )
-            return
         log_realtime_trace(
             logger,
             session,
             "server.session_admitted",
             user_key_hash=_user_id_fingerprint(user_id),
-        )
-        watchdog_task = asyncio.create_task(
-            _session_watchdog(
-                session,
-                controller,
-                lease,
-                idle_timeout_s=server_args.realtime_session_idle_timeout_s,
-                max_lifetime_s=server_args.realtime_session_max_lifetime_s,
-                lease_ttl_s=server_args.realtime_session_lease_ttl_s,
-            )
+            gateway_managed=gateway_config is not None,
         )
 
         async def initialize_session() -> None:
@@ -1614,13 +1562,17 @@ async def generate(websocket: WebSocket):
                     "server.warmup_wait_done",
                     wait_ms=round(warmup_wait_ms, 3),
                 )
-            await _listen_generate_request(ws, session, trace_sink)
+            await _listen_generate_request(ws, session)
 
         initialization_task = asyncio.create_task(initialize_session())
-        init_close_reason = await _wait_for_initialization_or_watchdog(
-            initialization_task,
-            watchdog_task,
-        )
+        if watchdog_task is None:
+            await initialization_task
+            init_close_reason = None
+        else:
+            init_close_reason = await _wait_for_initialization_or_watchdog(
+                initialization_task,
+                watchdog_task,
+            )
         if init_close_reason is not None:
             log_realtime_trace(
                 logger,
@@ -1640,7 +1592,9 @@ async def generate(websocket: WebSocket):
         generate_task = asyncio.create_task(_generate_loop(ws, session))
         # continuously listen for user events
         listen_task = asyncio.create_task(_listen_events(ws, session))
-        wait_tasks = [generate_task, listen_task, watchdog_task]
+        wait_tasks = [generate_task, listen_task]
+        if watchdog_task is not None:
+            wait_tasks.append(watchdog_task)
         await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
         if generate_task.done() and session.reached_max_chunks():
             await _close_realtime_websocket(
@@ -1648,7 +1602,7 @@ async def generate(websocket: WebSocket):
                 code=1000,
                 reason="generation complete",
             )
-        elif watchdog_task.done():
+        elif watchdog_task is not None and watchdog_task.done():
             reason = await watchdog_task
             log_realtime_trace(
                 logger,
@@ -1671,11 +1625,8 @@ async def generate(websocket: WebSocket):
                 await _await_realtime_task(initialization_task)
             await _cleanup_realtime_session(session, generate_task, listen_task)
         finally:
-            if lease is not None:
+            if lease is not None and controller is not None:
                 await controller.release(lease)
-            trace_task.cancel()
-            await _await_realtime_task(trace_task)
-            _uninstall_realtime_trace_sink(session, trace_sink)
 
 
 async def write_error_msg(error_msg: str, websocket: WebSocket):

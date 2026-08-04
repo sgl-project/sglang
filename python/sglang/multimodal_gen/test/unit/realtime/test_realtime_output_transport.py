@@ -254,14 +254,18 @@ def test_raw_rgb_realtime_output_adapter_defaults_to_webp_preview_frames():
 
     payloads = asyncio.run(run())
 
-    [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
+    frame_batches = _unpack_frame_batch_messages(payloads)
+    assert len(frame_batches) == 2
+    first_header, first_payload = frame_batches[0]
     assert first_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert first_header["encoding"] == "webp"
     assert first_header["source_width"] == 1000
     assert first_header["preview_width"] == 480
     assert first_header["width"] == 480
-    assert first_header["num_frames"] == 2
+    assert first_header["num_frames"] == 1
+    assert frame_batches[1][0]["num_frames"] == 1
     assert first_payload.startswith(b"RIFF")
+    assert frame_batches[1][1].startswith(b"RIFF")
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():

@@ -13,6 +13,7 @@
     minTargetLeadMs: 180,
     maxTargetLeadMs: 360,
     maxLeadExtraChunkRatio: 0.8,
+    lowLatencyMaxLeadFrames: 2,
     startLeadChunkRatio: 0.45,
     minStartLeadMs: 180,
     resumeLeadChunkRatio: 0.45,
@@ -277,6 +278,10 @@
     }
 
     get maxLeadMs() {
+      if (this.config.lowLatencyPlayback) {
+        return this.targetLeadMs +
+          this.config.lowLatencyMaxLeadFrames * 1000 / Math.max(1, this.sourceFps);
+      }
       return this.targetLeadMs + this.latestChunkDurationMs * this.config.maxLeadExtraChunkRatio;
     }
 
@@ -450,9 +455,7 @@
         );
       }
       this.lastRateUpdateAt = now;
-      const baseRenderFps = this.config.lowLatencyPlayback
-        ? this.targetFps
-        : this.sourceFps;
+      const baseRenderFps = this.sourceFps;
       this.renderFps = clamp(
         baseRenderFps * this.playbackRate,
         this.config.minSourceFps,
@@ -464,6 +467,17 @@
       const droppedFrames = [];
       if (this.mode === "timeline") return droppedFrames;
       droppedFrames.push(...this.#trimStaleBacklog(now));
+      if (this.config.lowLatencyPlayback) {
+        const backlogDropStart = droppedFrames.length;
+        while (this.queue.length > 1 && this.bufferDurationMs > this.maxLeadMs) {
+          droppedFrames.push(this.queue.shift());
+        }
+        const backlogDropCount = droppedFrames.length - backlogDropStart;
+        if (backlogDropCount) {
+          this.#recordDrop(backlogDropCount, "low latency backlog", now);
+        }
+        return droppedFrames;
+      }
       while (this.queue.length && this.bufferDurationMs > this.maxLeadMs) {
         const firstChunk = this.queue[0].chunkIndex;
         let dropCount = 0;

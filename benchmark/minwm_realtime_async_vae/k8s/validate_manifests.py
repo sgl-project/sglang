@@ -10,8 +10,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 BASE_MANIFESTS = (
-    "gpu-device-plugin.yaml",
+    "namespace.yaml",
     "west-s3-volume.yaml",
+    "observability.yaml",
+    "coordinator.yaml",
+    "gateway.yaml",
+    "worker-discovery.yaml",
+    "autoscaling.yaml",
     "h100-denoiser.yaml",
     "l4-vae.yaml",
     "gateway-service.yaml",
@@ -57,8 +62,8 @@ def validate(documents: list[dict]) -> None:
     assert all(value.startswith("g6.") for value in requirement_values(
         vae, "node.kubernetes.io/instance-type"
     ))
-    assert denoiser["spec"]["limits"]["nvidia.com/gpu"] == "1"
-    assert vae["spec"]["limits"]["nvidia.com/gpu"] == "1"
+    assert 1 <= int(denoiser["spec"]["limits"]["nvidia.com/gpu"]) <= 8
+    assert 1 <= int(vae["spec"]["limits"]["nvidia.com/gpu"]) <= 8
 
     for deployment_name in ("minwm-async-denoiser", "minwm-async-vae"):
         deployment = find(documents, "Deployment", deployment_name)
@@ -73,19 +78,21 @@ def validate(documents: list[dict]) -> None:
         assert resources["limits"]["nvidia.com/gpu"] == "1"
 
     denoiser_deployment = find(documents, "Deployment", "minwm-async-denoiser")
-    env = {
-        item["name"]: item.get("value")
-        for item in denoiser_deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    containers = denoiser_deployment["spec"]["template"]["spec"]["containers"]
+    assert {container["name"] for container in containers} == {
+        "denoiser",
+        "denoiser-heartbeat",
     }
-    assert env["REALTIME_VAE_WORKER_URL"].startswith("ws://minwm-async-vae")
-    assert "REALTIME_SESSION_LEASE_TABLE" not in env
+    command = " ".join(containers[0]["args"])
+    assert "--realtime-vae-worker-url" not in command
+    assert "realtime_worker_heartbeat" in " ".join(containers[1]["args"])
 
-    plugin = find(
-        documents, "DaemonSet", "minwm-async-nvidia-device-plugin"
-    )
-    assert plugin["spec"]["template"]["spec"]["nodeSelector"] == {
-        "seedleap.ai/test-run": "minwm-async-vae-benchmark"
+    gateway_service = find(documents, "Service", "minwm-realtime-public")
+    assert gateway_service["spec"]["selector"] == {
+        "app.kubernetes.io/name": "minwm-realtime-gateway"
     }
+
+    assert find(documents, "Namespace", "minwm-realtime")
 
 
 def main() -> None:

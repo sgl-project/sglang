@@ -1,0 +1,91 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minwm-realtime-gateway
+  namespace: minwm-realtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 18080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minwm-realtime-coordinator
+  namespace: minwm-realtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-coordinator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - minwm-realtime-gateway
+                  - minwm-async-denoiser
+                  - minwm-async-vae
+      ports:
+        - {protocol: TCP, port: 18081}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minwm-async-denoiser
+  namespace: minwm-realtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-denoiser
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minwm-realtime-gateway
+      ports:
+        - {protocol: TCP, port: 30000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minwm-async-vae
+  namespace: minwm-realtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-async-vae
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minwm-async-denoiser
+      ports:
+        - {protocol: TCP, port: 18081}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: minwm-realtime-adot
+  namespace: minwm-realtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-adot
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: minwm-realtime
+      ports:
+        - {protocol: TCP, port: 4317}
+        - {protocol: TCP, port: 4318}

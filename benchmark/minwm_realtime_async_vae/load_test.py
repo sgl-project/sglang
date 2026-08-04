@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size", default="832x480")
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--timeout-s", type=float, default=300.0)
+    parser.add_argument(
+        "--trace-http-url",
+        help="Gateway HTTP origin; defaults to the public WebSocket origin",
+    )
+    parser.add_argument("--trace-timeout-s", type=float, default=75.0)
+    parser.add_argument("--skip-trace-query", action="store_true")
     parser.add_argument("--hardware-json", type=Path)
     return parser.parse_args()
 
@@ -39,6 +45,76 @@ def with_identity(url: str, *, user_id: str, trace_id: str) -> str:
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.update(user_id=user_id, trace_id=trace_id)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def derive_trace_http_url(ws_url: str) -> str:
+    parts = urlsplit(ws_url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme)
+    if scheme is None or not parts.netloc:
+        raise ValueError("ws_url must use ws:// or wss://")
+    return urlunsplit((scheme, parts.netloc, "", "", ""))
+
+
+async def collect_trace_events(
+    http_origin: str,
+    trace_id: str,
+    *,
+    timeout_s: float,
+    poll_interval_s: float = 2.0,
+    stable_polls: int = 2,
+    client=None,
+) -> list[dict]:
+    """Collect an incrementally published Trace without touching the video WS."""
+
+    import httpx
+
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be positive")
+    if stable_polls < 1:
+        raise ValueError("stable_polls must be positive")
+    endpoint = (
+        f"{http_origin.rstrip('/')}/v1/realtime_video/traces/{trace_id}"
+    )
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=min(10.0, timeout_s))
+    cursor = 0
+    unchanged = 0
+    by_cursor: dict[int, dict] = {}
+    deadline = time.monotonic() + timeout_s
+    try:
+        while time.monotonic() < deadline:
+            response = await client.get(
+                endpoint,
+                params={"after": cursor, "limit": 500},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            added = 0
+            for raw_event in payload.get("events") or []:
+                if not isinstance(raw_event, dict):
+                    continue
+                event_cursor = int(raw_event.get("trace_seq") or 0)
+                if event_cursor <= 0 or event_cursor in by_cursor:
+                    continue
+                by_cursor[event_cursor] = dict(raw_event)
+                added += 1
+            cursor = max(
+                cursor,
+                int(payload.get("next_cursor") or 0),
+                *by_cursor.keys(),
+            )
+            unchanged = 0 if added else unchanged + 1
+            if by_cursor and unchanged >= stable_polls:
+                break
+            if poll_interval_s > 0:
+                await asyncio.sleep(poll_interval_s)
+        if not by_cursor:
+            raise RuntimeError(f"no Trace events published for {trace_id}")
+        return [by_cursor[key] for key in sorted(by_cursor)]
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 def action_event(event_id: int, actions: list[str]) -> bytes:
@@ -129,6 +205,26 @@ def stage_values(
     return {
         name: [by_chunk[index] for index in sorted(by_chunk)]
         for name, by_chunk in values.items()
+    }
+
+
+def trace_contract_summary(trace_events: list[dict]) -> dict:
+    event_names = sorted(
+        {
+            str(event["event"])
+            for event in trace_events
+            if isinstance(event.get("event"), str)
+        }
+    )
+    direct_batches = sum(
+        1
+        for event in trace_events
+        if event.get("event") == "server.vae_frame_batch_sent"
+        and event.get("output_direct") is True
+    )
+    return {
+        "event_names": event_names,
+        "direct_vae_frame_batches": direct_batches,
     }
 
 
@@ -253,19 +349,6 @@ async def stream_actions(
             pass
 
 
-def iter_trace_events(message: dict) -> list[dict]:
-    message_type = message.get("type")
-    if message_type == "trace_event":
-        trace = message.get("trace")
-        return [dict(trace)] if isinstance(trace, dict) else []
-    if message_type == "trace_events":
-        traces = message.get("traces")
-        if not isinstance(traces, list):
-            return []
-        return [dict(trace) for trace in traces if isinstance(trace, dict)]
-    return []
-
-
 async def run_session(args: argparse.Namespace, concurrency: int, index: int) -> dict:
     import websockets
 
@@ -325,18 +408,9 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                         message.get("content") or "realtime server error"
                     )
                 if message_type in {"trace_event", "trace_events"}:
-                    for trace in iter_trace_events(message):
-                        trace_events.append(trace)
-                        trace_chunk = trace.get("chunk_index")
-                        if (
-                            measured_started_at is None
-                            and trace.get("event")
-                            == "server.scheduler_forward_start"
-                            and trace_chunk is not None
-                            and int(trace_chunk) >= args.warmup_chunks
-                        ):
-                            measured_started_at = time.perf_counter()
-                    continue
+                    raise RuntimeError(
+                        "production video WebSocket carried forbidden Trace data"
+                    )
                 if message_type == "frame_batch_header":
                     pending_raw_header = message
                 if message_type in {"frame_batch", "frame_batch_header"}:
@@ -374,6 +448,13 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
             action_stop.set()
             await action_task
 
+    if not args.skip_trace_query:
+        trace_events = await collect_trace_events(
+            args.trace_http_url or derive_trace_http_url(args.ws_url),
+            trace_id,
+            timeout_s=args.trace_timeout_s,
+        )
+
     if len(stats) != total_chunks:
         raise RuntimeError(
             f"session closed after {len(stats)} of {total_chunks} chunks"
@@ -390,6 +471,7 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     server_action = server_action_latencies(
         trace_events, min_chunk_index=args.warmup_chunks
     )
+    trace_contract = trace_contract_summary(trace_events)
     return {
         "session_index": index,
         "trace_id": trace_id,
@@ -408,6 +490,10 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
         "stage_values": stage_values(
             trace_events, min_chunk_index=args.warmup_chunks
         ),
+        "trace_event_names": trace_contract["event_names"],
+        "direct_vae_frame_batches": trace_contract[
+            "direct_vae_frame_batches"
+        ],
     }
 
 
@@ -436,6 +522,13 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
     for session in sessions:
         for name, values in session["stage_values"].items():
             stages[name].extend(values)
+    trace_event_names = sorted(
+        {
+            name
+            for session in sessions
+            for name in session["trace_event_names"]
+        }
+    )
     total_frames = sum(session["frames"] for session in sessions)
     wall_seconds = aggregate_measurement_seconds(sessions)
     session_fps = [
@@ -459,6 +552,10 @@ async def run_level(args: argparse.Namespace, concurrency: int) -> dict:
         "per_session_fps": latency_summary(session_fps),
         "min_session_fps": min(session_fps, default=0.0),
         "stage_ms": {name: latency_summary(values) for name, values in stages.items()},
+        "trace_event_names": trace_event_names,
+        "direct_vae_frame_batches": sum(
+            session["direct_vae_frame_batches"] for session in sessions
+        ),
     }
 
 

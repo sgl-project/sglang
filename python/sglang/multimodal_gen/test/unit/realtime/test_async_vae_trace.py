@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.multimodal_gen.runtime.utils import realtime_trace
+
 from sglang.multimodal_gen.runtime.utils.realtime_trace import (
     calculate_overlap_ms,
     calculate_overlap_ratio,
@@ -97,3 +99,25 @@ def test_trace_sinks_are_scoped_by_session_even_when_client_trace_ids_collide():
 
     assert [event["event"] for event in first_events] == ["first"]
     assert [event["event"] for event in second_events] == ["second"]
+
+
+def test_trace_events_are_mirrored_to_the_independent_otlp_log_plane(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(realtime_trace, "_emit_otlp_trace", emitted.append)
+    session = SimpleNamespace(
+        id="session-1",
+        generation_id="generation-1",
+        trace_id="trace-1",
+        trace_started_at=0,
+    )
+
+    log_realtime_trace(
+        SimpleNamespace(info=lambda *args: None),
+        session,
+        "server.denoise_done",
+        duration_ms=123,
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0]["event"] == "server.denoise_done"
+    assert emitted[0]["duration_ms"] == 123

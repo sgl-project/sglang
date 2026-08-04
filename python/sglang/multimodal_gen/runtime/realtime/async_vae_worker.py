@@ -47,9 +47,12 @@ class VAESessionCapacityError(RuntimeError):
 class SessionOpen:
     session_id: str
     generation_id: str
+    trace_id: str | None = None
     output_format: str = "raw"
     quality: int = 90
     preview_max_width: int | None = None
+    output_url: str | None = None
+    output_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +112,7 @@ class AsyncVAEWorker:
         *,
         max_sessions: int,
         queue_depth_per_session: int = 1,
-        encoded_frames_per_batch: int = 3,
+        encoded_frames_per_batch: int = 1,
     ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be positive")

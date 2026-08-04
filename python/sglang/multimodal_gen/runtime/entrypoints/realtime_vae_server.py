@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
+import time
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import torch
 import uvicorn
@@ -20,11 +23,21 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     latent_header_from_message,
     validate_payload,
 )
+from sglang.multimodal_gen.runtime.realtime.async_vae_client import (
+    GatewayOutputClient,
+)
 from sglang.multimodal_gen.runtime.realtime.async_vae_worker import (
     AsyncVAEWorker,
     SessionOpen,
     TAEHVEngine,
 )
+from sglang.multimodal_gen.runtime.utils.realtime_trace import (
+    log_realtime_trace,
+    normalize_trace_id,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _tensor_from_payload(header, payload: bytes) -> torch.Tensor:
@@ -73,6 +86,8 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
     async def decode_socket(ws: WebSocket):
         await ws.accept()
         identity = None
+        trace_session = None
+        output_client = None
         send_lock = asyncio.Lock()
         finish_tasks: set[asyncio.Task] = set()
 
@@ -89,11 +104,42 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                     opened = SessionOpen(
                         session_id=str(message["session_id"]),
                         generation_id=str(message["generation_id"]),
+                        trace_id=normalize_trace_id(
+                            message.get("trace_id"),
+                            fallback=str(message["session_id"]),
+                        ),
                         output_format=str(message.get("output_format") or "webp"),
                         quality=int(message.get("quality") or 90),
                         preview_max_width=message.get("preview_max_width"),
+                        output_url=message.get("output_url"),
+                        output_token=message.get("output_token"),
                     )
+                    if bool(opened.output_url) != bool(opened.output_token):
+                        raise ProtocolViolation(
+                            "output_url and output_token must be provided together"
+                        )
+                    if opened.output_url is not None:
+                        output_client = GatewayOutputClient(
+                            opened.output_url,
+                            session_id=opened.session_id,
+                            generation_id=opened.generation_id,
+                            token=opened.output_token or "",
+                            max_message_bytes=max_message_bytes,
+                        )
+                        await output_client.open()
                     identity = await _bind_socket_session(worker, identity, opened)
+                    trace_session = SimpleNamespace(
+                        id=opened.session_id,
+                        generation_id=opened.generation_id,
+                        trace_id=opened.trace_id,
+                        trace_started_at=time.perf_counter(),
+                    )
+                    log_realtime_trace(
+                        logger,
+                        trace_session,
+                        "server.vae_session_open",
+                        output_direct=output_client is not None,
+                    )
                     await send(
                         encode_message(
                             "session_accepted",
@@ -118,11 +164,18 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                     raise ProtocolViolation("latent payload is required")
                 validate_payload(header, payload)
                 latents = _tensor_from_payload(header, payload)
+                log_realtime_trace(
+                    logger,
+                    trace_session,
+                    "server.vae_latent_received",
+                    request_id=header.request_id,
+                    chunk_index=header.chunk_index,
+                    latent_bytes=len(payload),
+                )
 
                 async def on_frame_batch(frame_batch, *, header=header):
                     payload_lengths = [len(value) for value in frame_batch.payloads]
-                    await send(
-                        encode_message(
+                    wire = encode_message(
                             "frame_batch",
                             payload=b"".join(frame_batch.payloads),
                             session_id=header.session_id,
@@ -139,6 +192,23 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                             is_final_frame_batch=frame_batch.is_final,
                             encode_ms=frame_batch.encode_ms,
                         )
+                    send_started = time.perf_counter()
+                    if output_client is not None:
+                        await output_client.send(wire)
+                    else:
+                        await send(wire)
+                    log_realtime_trace(
+                        logger,
+                        trace_session,
+                        "server.vae_frame_batch_sent",
+                        request_id=header.request_id,
+                        chunk_index=header.chunk_index,
+                        frame_batch_index=frame_batch.frame_batch_index,
+                        num_frames=frame_batch.num_frames,
+                        duration_ms=round(
+                            (time.perf_counter() - send_started) * 1000, 3
+                        ),
+                        output_direct=output_client is not None,
                     )
 
                 future = await worker.submit(
@@ -160,6 +230,31 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                 async def finish_chunk(future=future, header=header):
                     try:
                         result = await future
+                        common_trace = {
+                            "request_id": header.request_id,
+                            "chunk_index": header.chunk_index,
+                        }
+                        log_realtime_trace(
+                            logger,
+                            trace_session,
+                            "server.vae_queue_wait_complete",
+                            duration_ms=round(result.queue_wait_ms, 3),
+                            **common_trace,
+                        )
+                        log_realtime_trace(
+                            logger,
+                            trace_session,
+                            "server.vae_decode_complete",
+                            duration_ms=round(result.decode_ms, 3),
+                            **common_trace,
+                        )
+                        log_realtime_trace(
+                            logger,
+                            trace_session,
+                            "server.vae_encode_complete",
+                            duration_ms=round(result.encode_ms, 3),
+                            **common_trace,
+                        )
                         await send(
                             encode_message(
                                 "chunk_complete",
@@ -207,6 +302,8 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
                 await asyncio.gather(*finish_tasks, return_exceptions=True)
             if identity is not None:
                 await worker.close(*identity)
+            if output_client is not None:
+                await output_client.close()
 
     return app
 
@@ -220,6 +317,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--max-sessions", type=int, default=8)
     parser.add_argument("--queue-depth-per-session", type=int, default=1)
+    parser.add_argument("--encoded-frames-per-batch", type=int, default=1)
     parser.add_argument("--max-message-mb", type=int, default=64)
     args = parser.parse_args()
 
@@ -229,6 +327,7 @@ def main() -> None:
         engine,
         max_sessions=args.max_sessions,
         queue_depth_per_session=args.queue_depth_per_session,
+        encoded_frames_per_batch=args.encoded_frames_per_batch,
     )
     app = create_app(worker, max_message_bytes=args.max_message_mb * 1024 * 1024)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

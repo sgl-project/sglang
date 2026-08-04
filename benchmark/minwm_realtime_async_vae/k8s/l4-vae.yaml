@@ -3,12 +3,13 @@ kind: NodePool
 metadata:
   name: minwm-async-vae-l4
   labels:
+    app.kubernetes.io/part-of: minwm-realtime
     seedleap.ai/test-run: minwm-async-vae-benchmark
     seedleap.ai/ttl-after-test: required
 spec:
   limits:
-    cpu: "16"
-    nvidia.com/gpu: "1"
+    cpu: "128"
+    nvidia.com/gpu: "8"
   disruption:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 1m
@@ -19,7 +20,7 @@ spec:
         seedleap.ai/vae-worker: "true"
         seedleap.ai/test-run: minwm-async-vae-benchmark
     spec:
-      expireAfter: 4h
+      expireAfter: 24h
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
@@ -46,9 +47,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: minwm-async-vae
-  namespace: default
+  namespace: minwm-realtime
   labels:
     app.kubernetes.io/name: minwm-async-vae
+    app.kubernetes.io/part-of: minwm-realtime
     seedleap.ai/test-run: minwm-async-vae-benchmark
     seedleap.ai/ttl-after-test: required
 spec:
@@ -64,8 +66,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: minwm-async-vae
+        app.kubernetes.io/part-of: minwm-realtime
         seedleap.ai/test-run: minwm-async-vae-benchmark
     spec:
+      serviceAccountName: minwm-realtime-worker-discovery
       restartPolicy: Always
       terminationGracePeriodSeconds: 60
       nodeSelector:
@@ -78,89 +82,38 @@ spec:
           effect: NoSchedule
       containers:
         - name: vae
-          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          image: REPLACE_WITH_VAE_IMAGE_DIGEST
           imagePullPolicy: IfNotPresent
-          workingDir: /workspace
+          args:
+            - --checkpoint-path=/opt/taehv/taew2_2.pth
+            - --device=cuda
+            - --dtype=bfloat16
+            - --max-sessions=16
+            - --queue-depth-per-session=1
+            - --encoded-frames-per-batch=1
+            - --max-message-mb=64
+            - --host=0.0.0.0
+            - --port=18081
           env:
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: github-token
-                  key: token
-            - name: PYTHONUNBUFFERED
-              value: "1"
-            - name: SGLANG_GIT_REF
-              value: REPLACE_WITH_GIT_SHA
-            - name: TAEHV_REVISION
-              value: 093b918971d59001a0bad6dfd6e0409b5e1752cf
-            - name: TAEHV_CHECKPOINT_SHA256
-              value: d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b74c559a
-            - name: TAEHV_CHECKPOINT_PATH
-              value: /opt/taehv/taew2_2.pth
-          command:
-            - /bin/bash
-            - -lc
-            - |
-              set -euo pipefail
-              git clone --no-checkout \
-                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
-                /workspace/sglang
-              git -C /workspace/sglang checkout --detach "${SGLANG_GIT_REF}"
-              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == "${SGLANG_GIT_REF}" ]]
-              python3 - <<'PY'
-              from pathlib import Path
-              path = Path("/workspace/sglang/python/pyproject.toml")
-              text = path.read_text()
-              block = '''[[tool.setuptools-rust.ext-modules]]
-              target = "sglang.srt.grpc._core"
-              path = "../rust/sglang-grpc/Cargo.toml"
-              binding = "PyO3"
-              '''
-              if text.count(block) != 1:
-                  raise RuntimeError("expected exactly one SGLang gRPC extension block")
-              path.write_text(text.replace(block, ""))
-              PY
-              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
-                --root-user-action=ignore
-              python3 -m pip uninstall -y peft
-              python3 -m pip install --no-cache-dir --no-deps \
-                "taehv @ git+https://github.com/madebyollin/taehv.git@${TAEHV_REVISION}" \
-                --root-user-action=ignore
-              mkdir -p /opt/taehv
-              curl --fail --location --retry 3 \
-                "https://raw.githubusercontent.com/madebyollin/taehv/${TAEHV_REVISION}/taew2_2.pth" \
-                --output "${TAEHV_CHECKPOINT_PATH}"
-              echo "${TAEHV_CHECKPOINT_SHA256}  ${TAEHV_CHECKPOINT_PATH}" | sha256sum -c -
-              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_vae_server \
-                --checkpoint-path "${TAEHV_CHECKPOINT_PATH}" \
-                --device cuda \
-                --dtype bfloat16 \
-                --max-sessions 8 \
-                --queue-depth-per-session 1 \
-                --max-message-mb 64 \
-                --host 0.0.0.0 \
-                --port 18081
+            - {name: OTEL_SERVICE_NAME, value: minwm-realtime-vae}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://minwm-realtime-adot:4317
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=minwm,deployment.environment=production,worker.role=vae
           ports:
-            - name: vae
-              containerPort: 18081
+            - {name: vae, containerPort: 18081}
           startupProbe:
-            httpGet:
-              path: /health
-              port: vae
+            httpGet: {path: /health, port: vae}
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 180
           readinessProbe:
-            httpGet:
-              path: /health
-              port: vae
+            httpGet: {path: /health, port: vae}
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 6
           livenessProbe:
-            httpGet:
-              path: /health
-              port: vae
+            httpGet: {path: /health, port: vae}
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5
@@ -176,3 +129,33 @@ spec:
               memory: 28Gi
               ephemeral-storage: 40Gi
               nvidia.com/gpu: "1"
+        - name: vae-heartbeat
+          image: REPLACE_WITH_VAE_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              exec python3 -m sglang.multimodal_gen.runtime.entrypoints.realtime_worker_heartbeat
+              --coordinator-url=http://minwm-realtime-coordinator:18081
+              --health-url=http://127.0.0.1:18081/health
+              --worker-id=$(POD_UID)
+              --role=vae
+              --endpoint=ws://$(POD_IP):18081/v1/realtime_vae/decode
+              --node-name=$(NODE_NAME)
+              --capacity=16
+              --model-revision=all
+              --vae-fingerprint=taew2_2-d053e216
+              --interval-s=5
+          env:
+            - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}

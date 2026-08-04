@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: MinWM realtime production control plane and least-privilege IRSA roles
+
+Parameters:
+  Environment:
+    Type: String
+    Default: benchmark
+  Namespace:
+    Type: String
+    Default: minwm-realtime
+  CoordinatorTableName:
+    Type: String
+  TraceLogGroupName:
+    Type: String
+  EcrRepositoryName:
+    Type: String
+  OidcProviderArn:
+    Type: String
+  ArtifactBucket:
+    Type: String
+  ArtifactPrefix:
+    Type: String
+
+Resources:
+  CoordinatorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref CoordinatorTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: allocation_key, AttributeType: S}
+        - {AttributeName: allocation_sort, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: allocation-index
+          KeySchema:
+            - {AttributeName: allocation_key, KeyType: HASH}
+            - {AttributeName: allocation_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+        - {Key: environment, Value: !Ref Environment}
+
+  TraceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref TraceLogGroupName
+      RetentionInDays: 5
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+        - {Key: environment, Value: !Ref Environment}
+
+  RuntimeRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Remove untagged build layers after seven days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {"type": "expire"}
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the newest twenty immutable releases",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["gateway-", "coordinator-", "denoiser-", "vae-"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+        - {Key: environment, Value: !Ref Environment}
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub minwm-realtime-gateway-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: !Ref OidcProviderArn}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:aud": sts.amazonaws.com
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:sub": !Sub system:serviceaccount:${Namespace}:minwm-realtime-gateway
+      Policies:
+        - PolicyName: trace-query
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:StartQuery]
+                Resource: !GetAtt TraceLogGroup.Arn
+              - Effect: Allow
+                Action: [logs:GetQueryResults, logs:StopQuery]
+                Resource: "*"
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+
+  CoordinatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub minwm-realtime-coordinator-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: !Ref OidcProviderArn}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:aud": sts.amazonaws.com
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:sub": !Sub system:serviceaccount:${Namespace}:minwm-realtime-coordinator
+      Policies:
+        - PolicyName: coordinator-table
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:TransactWriteItems
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt CoordinatorTable.Arn
+                  - !Sub ${CoordinatorTable.Arn}/index/allocation-index
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+
+  AdotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub minwm-realtime-adot-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: !Ref OidcProviderArn}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:aud": sts.amazonaws.com
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:sub": !Sub system:serviceaccount:${Namespace}:minwm-realtime-adot
+      Policies:
+        - PolicyName: telemetry-export
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource: !Sub ${TraceLogGroup.Arn}:*
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+
+  ModelArtifactPublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub minwm-model-artifact-publisher-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Federated: !Ref OidcProviderArn}
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:aud": sts.amazonaws.com
+                "REPLACE_WITH_OIDC_PROVIDER_HOSTPATH:sub": !Sub system:serviceaccount:${Namespace}:minwm-model-artifact-publisher
+      Policies:
+        - PolicyName: publish-serving-artifact
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketMultipartUploads]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub ${ArtifactPrefix}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactPrefix}/*
+      Tags:
+        - {Key: app, Value: minwm-realtime}
+
+Outputs:
+  CoordinatorTableName: {Value: !Ref CoordinatorTable}
+  TraceLogGroupName: {Value: !Ref TraceLogGroup}
+  EcrRepositoryName: {Value: !Ref RuntimeRepository}
+  GatewayRoleArn: {Value: !GetAtt GatewayRole.Arn}
+  CoordinatorRoleArn: {Value: !GetAtt CoordinatorRole.Arn}
+  AdotRoleArn: {Value: !GetAtt AdotRole.Arn}
+  ModelArtifactPublisherRoleArn: {Value: !GetAtt ModelArtifactPublisherRole.Arn}

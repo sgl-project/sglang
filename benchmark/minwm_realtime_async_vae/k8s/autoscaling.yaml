@@ -1,0 +1,41 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minwm-realtime-gateway
+  namespace: minwm-realtime
+spec:
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minwm-realtime-gateway
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minwm-realtime-coordinator
+  namespace: minwm-realtime
+spec:
+  minReplicas: 2
+  maxReplicas: 6
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minwm-realtime-coordinator
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}

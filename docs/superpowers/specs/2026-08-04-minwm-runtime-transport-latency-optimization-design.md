@@ -1,79 +1,201 @@
-# MinWM Runtime Transport And Latency Optimization Design
+# MinWM 生产链路运行时、Trace 与播放延迟优化设计
 
-## Goal
+## 1. 设计基线
 
-Remove runtime dependency installation, move diagnostic trace traffic off the
-video WebSocket, and reduce browser receive-to-display latency without changing
-the generated video or the asynchronous Denoiser-to-VAE protocol.
+本文档是
+`2026-08-03-minwm-async-vae-multiuser-design.md` 的生产实施增量，不能以验证版
+`NLB -> Denoiser Pod` 拓扑替代。最终实现和端到端测试必须覆盖：
 
-## Dependency Image
+```text
+Browser / VLM
+  -> NLB
+  -> Realtime Gateway CPU Pool
+  -> Session Coordinator CPU Pool
+  -> Denoiser Worker Pool (H100 Spot)
+  -> VAE Worker Pool (L4 Spot，必要时 L40S)
+  -> Realtime Gateway
+  -> Browser / VLM
+```
 
-Build one immutable MinWM realtime runtime image from the existing CUDA/PyTorch
-training base. The image contains the checked-out SGLang source, diffusion
-dependencies, TAEHV package, and the verified `taew2_2.pth` checkpoint. Both the
-Denoiser and VAE worker use this image. Model checkpoints remain external S3
-artifacts because they are large and change independently from runtime code.
+Coordinator 负责全局准入、Worker 配对、容量槽 Lease 和 Session 生命周期。Gateway
+持有公网 WebSocket，但不持有 GPU KV。Denoiser 只产生 latent，VAE 直接把编码后帧发送
+到当前 Gateway 实例，媒体数据不绕回 Denoiser。
 
-The image is layered in this order:
+## 2. 角色化预打包镜像
 
-1. Existing CUDA, PyTorch, and system runtime base.
-2. TAEHV package and its checksum-verified small checkpoint.
-3. SGLang Python dependencies and source.
-4. Role-neutral runtime entrypoints.
+使用一个多阶段 BuildKit Dockerfile 生成三个不可变 ECR 镜像：
 
-Pods must not clone Git repositories, install Python packages, or download
-TAEHV during startup. A build-and-push helper emits an immutable ECR tag based
-on the Git SHA, and Kubernetes manifests reference a replaceable image URI.
+| 镜像 | 包含内容 | 不包含内容 |
+| --- | --- | --- |
+| Gateway | WebUI、WebSocket Gateway、Trace Query API、Coordinator Client | CUDA、模型权重 |
+| Denoiser | CUDA/PyTorch、SGLang Diffusion、MinWM Converter、Denoiser Runtime | TAEHV Session state |
+| VAE | CUDA/PyTorch、TAEHV、校验后的 `taew2_2.pth`、VAE Runtime | MinWM DiT checkpoint |
 
-## Trace Transport
+容器启动时禁止执行 `git clone`、`pip install`、GitHub 下载、TAEHV 下载或 checkpoint
+转换。原始 checkpoint 由一次性 CPU Spot Publisher 转换成独立的版本化 S3 serving
+artifact；每个文件写入 SHA-256 manifest，`_READY` 最后以条件写创建。Denoiser 只挂载
+只读、已经 ready 的模型制品，不与代码镜像绑定，也不在 GPU 节点上执行转换。
 
-Full server trace events continue to be emitted as structured
-`realtime_trace` log records. Production log collection sends these records to
-CloudWatch with the existing five-day retention policy.
+镜像使用 Git SHA 与内容 digest 双重标识。Kubernetes Deployment 只接受 digest，回滚
+通过切换 digest 完成。ECR 生命周期保留最近版本并清理未标记构建层。
 
-For the WebUI, each API process also keeps a bounded, five-minute in-memory
-trace window. The buffer has explicit maximum trace and event counts and is
-not durable. A read-only HTTP endpoint returns incremental events by cursor.
-The WebUI polls it only while the Trace tab is visible.
+## 3. Gateway 与 Coordinator
 
-Browser trace events use a separate batched HTTP POST endpoint. They are never
-written to the video WebSocket. The video WebSocket retains only initialization,
-controls, acknowledgements, chunk statistics, and frame payloads. `trace_id`
-remains lightweight correlation metadata on the generation connection.
+### 3.1 Gateway
 
-The HTTP trace path is diagnostic. Failures must not close or delay video
-generation, and retries are bounded. Existing WebSocket trace messages remain
-accepted by the client for compatibility but the server no longer emits them.
+Gateway 在读取 Generate Init 后调用 Coordinator：
 
-## Display Latency
+1. 校验认证用户和请求配额。
+2. 请求 `(Denoiser slot, VAE slot)` 原子配对。
+3. 创建 `session_id`、`generation_id` 和短期 reservation token。
+4. 连接指定 Denoiser，并注入 VAE 地址、Gateway 直传地址和 token。
+5. 将 Action/Prompt 转发给 Denoiser。
+6. 从 VAE 直传连接接收 `FrameBatch`，立即转发浏览器。
+7. 关闭时幂等释放两个 Worker slot 和用户 Lease。
 
-The default live playback profile targets a 100-200 ms queue rather than the
-current 220-420 ms smoothing lead. It starts on the first decodable frame,
-does not wait for a target lead, trims stale event frames immediately, and
-caps adaptive jitter growth. Timeline mode remains lossless and unchanged.
+Gateway 使用 Pod IP 构造 Session 专属内部回传地址，避免 VAE 通过普通 Service 被路由到
+错误 Gateway 实例。回传 token 绑定 `session_id + generation_id + expiry`，不能跨 Session
+复用。
 
-The profile uses:
+### 3.2 Coordinator
+
+Coordinator 是独立 CPU Deployment，提供 Worker heartbeat、Session admit/renew/release
+接口。生产状态使用 DynamoDB On-Demand：
+
+- `USER#<user>`：每用户单活动 Session Lease。
+- `WORKER#<worker>#SLOT#<n>`：Denoiser/VAE 有界容量槽 Lease。
+- `WORKER#<worker>`：带 TTL 的 Worker heartbeat 与兼容性元数据。
+- `SESSION#<session>`：Gateway、Worker 配对与 generation fencing。
+
+准入事务必须同时获得用户 Lease、一个 Denoiser slot 和一个 VAE slot；部分失败不能留下
+孤立 reservation。Coordinator Pod 可水平扩容，状态不依赖进程内内存。Spot 不足时不切
+On-Demand，10 秒内无法获得完整配对则返回 `Retry-After`。
+
+执行真实 DynamoDB 建表或写入前，必须按仓库规则再次展示精确表结构、Region、影响和
+清理命令并获得人工确认。
+
+## 4. VAE 直传协议
+
+`SessionOpen` 和 `LatentChunk` 增加 `trace_id`、`traceparent`、Gateway output URL 与短期
+token。VAE 保留到 Denoiser 的控制连接，用于 credit、reject 和 chunk completion；编码
+后的 `FrameBatch` 通过独立 WebSocket 直接发往 Gateway。
+
+Gateway 只有在验证 Session identity、generation、token、chunk 单调性后才接受帧。每个
+Session 的 Gateway 输出队列有界，满时优先丢弃已被新 Action 取代的旧帧；持续背压则关闭
+Session，禁止无界占用内存。
+
+## 5. Trace 完全拆分
+
+视频 WebSocket 只允许以下业务消息：
+
+- Generate Init、Action、Prompt、Heartbeat、Close。
+- Session Ready/Error、必要控制 ACK、Chunk Stats。
+- FrameBatch 媒体数据。
+
+服务端 Trace 不再进入视频 WebSocket。Gateway、Coordinator、Denoiser、VAE 使用 OTLP
+把全量 Span/时序事件发给 ADOT Collector，Collector 批量写 CloudWatch Logs，保留 5 天。
+Trace 不携带原始 prompt、图片、视频、latent 或 KV。
+
+浏览器自身的 decode/canvas/display 指标使用独立、批量 HTTP POST 上报 Gateway，失败不
+影响生成。Trace 页使用独立 HTTP Query API：
+
+- 只有页面打开时才查询。
+- 默认查询最近 5 分钟的 P50/P95/平均值及指定 `trace_id` 的最新事件。
+- Gateway 对相同查询缓存 15 秒，限制并发和扫描时间。
+- 相同 Trace Query 合并为一个 CloudWatch Logs Insights 请求；不同查询使用全局有界并发，
+  单个浏览器取消请求不会取消共享查询。
+- Query API 使用服务端 IAM 查询 CloudWatch，浏览器不持有 AWS 凭证。
+- CloudWatch 尚未完成 ingestion 时显示上一次成功结果，不闪烁为 `-`。
+
+本地内存可以作为 15 秒查询结果 cache，但不能作为 Trace 权威存储。
+
+## 6. Display Lag 优化
+
+Live 模式默认目标是 100–200ms 而不是原来的 220–420ms：
 
 - `lowLatencyPlayback: true`
 - `holdForTargetLead: false`
-- target lead range of 80-180 ms
-- startup/resume lead of one frame
-- maximum delivery jitter boost of 60 ms
-- zero old-event grace frames
+- target lead 80–180ms
+- startup/resume lead 为一帧
+- delivery jitter boost 最大 60ms
+- Action generation cutover 时旧 event grace 为 0
+- VAE 每个 encoded frame batch 默认 1 帧，数据可用即发送
+- 每 Session 只允许 1 个等待 latent；与正在 Decode 的 Chunk 形成双缓冲，但不允许旧
+  Action 的多个未来 Chunk 在 VAE 前排队
 
-This intentionally favors action responsiveness over perfectly uniform frame
-cadence. It cannot make display latency zero because WebP decoding, browser
-animation scheduling, network jitter, and at least one decoded frame remain.
+Timeline 模式保持不丢帧。Live 模式允许丢弃已经过时的旧 Action 帧；若生成吞吐持续低于
+目标 FPS，播放速度跟随真实 source FPS，不能靠堆积缓存伪造流畅。
 
-## Verification
+## 7. 生产部署与伸缩
 
-Local verification covers the bounded trace store, HTTP trace endpoints,
-absence of server WebSocket trace delivery, client HTTP polling/batching,
-low-latency playback behavior, and image policy manifests.
+- Gateway 和 Coordinator 跨 AZ，各最少 2 个 CPU Pod。
+- H100 Denoiser 与 L4/L40S VAE 使用独立 Spot NodePool 和独立 HPA/KEDA 指标。
+- Denoiser 依据可用 slot、排队时间、GPU 利用率扩缩；VAE 依据 queue wait、decode P95、
+  活跃 decoder context 扩缩。
+- GPU 池采用定时预热加事件驱动扩容，夜间可缩到 0。
+- 所有队列、Lease、Trace cache 和 Session 都有 TTL 与硬上限。
+- PDB 只保护 CPU 控制面；Spot GPU Worker 不做状态复制，故障后用户重试。
 
-End-to-end verification uses the existing disposable Spot topology: one H100
-Denoiser and one low-cost L4 VAE worker, falling back to L40S only if needed.
-The report records image pull/startup time, video WebSocket message types,
-trace endpoint correctness, warm display-lag percentiles, generation latency,
-and dropped-frame behavior. All temporary GPU resources and the public load
-balancer are deleted after the run.
+## 8. 验收标准
+
+端到端测试不能直连 Denoiser，必须从 NLB 进入 Gateway，并验证：
+
+1. Coordinator 返回真实 Denoiser/VAE 配对，Lease 可续约和幂等释放。
+2. VAE FrameBatch 直接进入 Gateway，Denoiser WebSocket 不携带媒体帧。
+3. 视频 WebSocket 中不存在 `trace_event/trace_events/client_trace`。
+4. Trace HTTP 页面能够读取 CloudWatch 结果，关闭 Trace 页后停止查询。
+5. Pod 启动日志不存在 git/pip/curl 安装，镜像 digest 可追溯。
+6. Warm session 的 display lag 输出 P50/P95，目标 P95 不高于 250ms；若公网抖动导致
+   未达标，报告必须分离 server-to-gateway 与 browser queue 两部分证据。
+7. 完成单用户正确性、至少 4 并发 Session、Action/Prompt 更新、异常断开和 Worker
+   故障测试。
+8. 测试结束后删除 GPU NodePool、Pod、NLB 和临时 Trace 资源，并确认没有残留计费 GPU。
+
+## 9. 基础设施、权限与数据生命周期
+
+AWS 控制面使用一份 CloudFormation 模板声明，避免脚本边运行边创建隐式资源：
+
+| 资源 | 生产配置 | 生命周期 |
+| --- | --- | --- |
+| DynamoDB | PAY_PER_REQUEST、TTL、SSE、allocation GSI | 测试栈删除时删除 |
+| CloudWatch Logs | Trace 专属 Log Group | 固定保留 5 天 |
+| ECR | immutable tag、push scan、清理未标记层 | 栈删除时保留 |
+| IRSA | Gateway/Coordinator/ADOT/Publisher 四个最小权限角色 | 随栈删除 |
+| S3 serving artifact | 版本化路径、manifest、条件 `_READY` | 默认保留复用 |
+
+Gateway 只能查询指定 Log Group；Coordinator 只能读写指定 DynamoDB 表；ADOT 只能写指定
+Log Group/X-Ray；Publisher 只能读取原 checkpoint 并写指定 serving artifact prefix，不能
+删除对象。应用 namespace 使用 default-deny NetworkPolicy，仅开放 Gateway、Coordinator、
+Denoiser、VAE、ADOT 之间必需端口。公网 NLB 只选择 Gateway。
+
+## 10. 标准发布、回滚与清理
+
+```mermaid
+flowchart LR
+    Cfn["CloudFormation 控制面"] --> Images["四个 digest 镜像"]
+    Images --> Artifact["一次性 CPU Spot 发布模型制品"]
+    Artifact --> Apply["Server-side apply 生产拓扑"]
+    Apply --> Probe["真实浏览器 + 1/4 并发验收"]
+    Probe --> Report["中文结果报告"]
+    Report --> Cleanup["删除 NLB、GPU NodePool 与测试栈"]
+```
+
+部署脚本在 apply 前执行只读门禁：DynamoDB 必须存在、Trace Log Group 必须是 5 天、模型
+`_READY` 必须存在、所有镜像必须是 SHA-256 digest，且渲染后不能残留 placeholder。
+
+应用回滚只替换角色镜像 digest；模型回滚只替换 `MODEL_ARTIFACT_REVISION`。Coordinator
+Schema 保持向后兼容。GPU Worker 不做状态迁移，回滚或 Spot 中断只影响绑定 Session，用户
+重试后重新准入。清理脚本必须验证测试标签 Node 数量为 0、NLB 已删除且 namespace 无残留；
+ECR 和模型制品保留，以避免下一次重复构建与转换成本。
+
+## 11. 运维门禁与扩容路径
+
+- 初始低成本规模：2 Gateway、2 Coordinator、1 H100 Spot、1 L4 Spot；夜间 GPU 缩到 0。
+- Gateway/Coordinator 通过 HPA 横向扩展；GPU 池先按定时计划预热，再依据 Worker slot、
+  queue wait、decode/denoise P95 扩容。单个 Deployment/NodePool 上限为 8，扩容前必须通过
+  同档并发压测更新每 Worker 的准入容量。
+- 关键告警：准入等待、slot 冲突、Worker 心跳丢失、latent queue 满、VAE decode P95、
+  action-to-visible-frame、browser display lag、OTLP export failure、Spot interruption。
+- 当前 Region 容量不足时返回可重试容量错误，不自动切换 On-Demand，避免成本失控。
+- 扩到多 AZ 时 CPU 控制面保持跨 AZ；GPU 优先同 AZ 配对。跨 AZ handoff 只有在实测 P99
+  和流量成本均满足预算后开启。

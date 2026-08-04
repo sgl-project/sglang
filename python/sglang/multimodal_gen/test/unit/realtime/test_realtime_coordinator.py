@@ -1,0 +1,307 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+
+import pytest
+
+from sglang.multimodal_gen.runtime.realtime.coordinator import (
+    CoordinatorRejected,
+    DynamoDBCoordinatorStore,
+    InMemoryCoordinatorStore,
+    RealtimeCoordinator,
+    WorkerHeartbeat,
+)
+
+
+def _heartbeat(
+    worker_id: str,
+    role: str,
+    *,
+    capacity: int = 1,
+    az: str = "us-east-2a",
+    model_revision: str = "minwm-r1",
+    vae_fingerprint: str = "taew2_2",
+):
+    return WorkerHeartbeat(
+        worker_id=worker_id,
+        role=role,
+        endpoint=f"ws://{worker_id}.cluster.local/generate",
+        az=az,
+        capacity=capacity,
+        model_revision=model_revision,
+        vae_fingerprint=vae_fingerprint,
+    )
+
+
+def test_coordinator_atomically_pairs_compatible_worker_slots():
+    async def run():
+        store = InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30)
+        coordinator = RealtimeCoordinator(store, wait_timeout_s=0)
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser", capacity=2))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae", capacity=2))
+
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert assignment.denoiser.worker_id == "denoiser-a"
+        assert assignment.vae.worker_id == "vae-a"
+        assert assignment.denoiser.slot_index == 0
+        assert assignment.vae.slot_index == 0
+        assert assignment.token
+        return coordinator, assignment
+
+    coordinator, assignment = asyncio.run(run())
+    assert coordinator is not None
+    assert assignment.session_id == "session-a"
+
+
+def test_coordinator_rejects_second_session_for_the_same_user():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser", capacity=2))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae", capacity=2))
+        await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        with pytest.raises(CoordinatorRejected, match="USER_SESSION_LIMIT"):
+            await coordinator.admit(
+                user_id="user-a",
+                session_id="session-b",
+                generation_id="generation-b",
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+            )
+
+    asyncio.run(run())
+
+
+def test_coordinator_does_not_leak_a_partial_worker_reservation():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        with pytest.raises(CoordinatorRejected, match="CAPACITY_EXHAUSTED"):
+            await coordinator.admit(
+                user_id="user-a",
+                session_id="session-a",
+                generation_id="generation-a",
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+            )
+
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        assignment = await coordinator.admit(
+            user_id="user-b",
+            session_id="session-b",
+            generation_id="generation-b",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert assignment.denoiser.slot_index == 0
+
+    asyncio.run(run())
+
+
+def test_coordinator_prefers_same_az_and_filters_incompatible_workers():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(
+            _heartbeat("denoiser-a", "denoiser", az="us-east-2a")
+        )
+        await coordinator.heartbeat(
+            _heartbeat("vae-wrong", "vae", az="us-east-2a", vae_fingerprint="wrong")
+        )
+        await coordinator.heartbeat(
+            _heartbeat("vae-cross-az", "vae", az="us-east-2b")
+        )
+        await coordinator.heartbeat(
+            _heartbeat("vae-same-az", "vae", az="us-east-2a")
+        )
+
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert assignment.vae.worker_id == "vae-same-az"
+
+    asyncio.run(run())
+
+
+def test_coordinator_expires_stale_workers_and_reclaims_expired_assignments():
+    async def run():
+        now = [100.0]
+        store = InMemoryCoordinatorStore(
+            ttl_s=5,
+            worker_ttl_s=3,
+            clock=lambda: now[0],
+        )
+        coordinator = RealtimeCoordinator(store, wait_timeout_s=0)
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        first = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+
+        now[0] = 104.0
+        with pytest.raises(CoordinatorRejected, match="CAPACITY_EXHAUSTED"):
+            await coordinator.admit(
+                user_id="user-b",
+                session_id="session-b",
+                generation_id="generation-b",
+                model_revision="minwm-r1",
+                vae_fingerprint="taew2_2",
+            )
+
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        now[0] = 106.0
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        second = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-b",
+            generation_id="generation-b",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert second.token != first.token
+
+    asyncio.run(run())
+
+
+def test_coordinator_renew_and_release_are_fenced_and_idempotent():
+    async def run():
+        coordinator = RealtimeCoordinator(
+            InMemoryCoordinatorStore(ttl_s=60, worker_ttl_s=30),
+            wait_timeout_s=0,
+        )
+        await coordinator.heartbeat(_heartbeat("denoiser-a", "denoiser"))
+        await coordinator.heartbeat(_heartbeat("vae-a", "vae"))
+        assignment = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        renewed = await coordinator.renew(assignment)
+        assert renewed.token == assignment.token
+        assert renewed.expires_at >= assignment.expires_at
+
+        await coordinator.release(renewed)
+        await coordinator.release(renewed)
+        replacement = await coordinator.admit(
+            user_id="user-a",
+            session_id="session-b",
+            generation_id="generation-b",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert replacement.session_id == "session-b"
+
+    asyncio.run(run())
+
+
+def test_dynamodb_coordinator_admission_is_one_four_item_transaction():
+    class TransactionCanceledException(Exception):
+        pass
+
+    class FakeExceptions:
+        pass
+
+    FakeExceptions.TransactionCanceledException = TransactionCanceledException
+
+    class FakeClient:
+        exceptions = FakeExceptions()
+
+        def __init__(self):
+            self.transactions = []
+
+        def query(self, **kwargs):
+            allocation_key = kwargs["ExpressionAttributeValues"][":allocation"]["S"]
+            if allocation_key.startswith("DENOISER#"):
+                role = "denoiser"
+                worker_id = "denoiser-a"
+                endpoint = "ws://denoiser-a/generate"
+            else:
+                role = "vae"
+                worker_id = "vae-a"
+                endpoint = "ws://vae-a/decode"
+            return {
+                "Items": [
+                    {
+                        "pk": {"S": f"SLOT#{role}#{worker_id}#0000"},
+                        "sk": {"S": "LEASE"},
+                        "role": {"S": role},
+                        "worker_id": {"S": worker_id},
+                        "endpoint": {"S": endpoint},
+                        "az": {"S": "us-east-2a"},
+                        "slot_index": {"N": "0"},
+                        "model_revision": {"S": "minwm-r1"},
+                        "vae_fingerprint": {"S": "taew2_2"},
+                        "heartbeat_expires_at": {"N": "9999999999"},
+                    }
+                ]
+            }
+
+        def transact_write_items(self, *, TransactItems):
+            self.transactions.append(TransactItems)
+
+    async def run():
+        client = FakeClient()
+        store = DynamoDBCoordinatorStore(
+            "minwm-realtime-coordinator",
+            ttl_s=60,
+            worker_ttl_s=30,
+            client=client,
+        )
+        assignment = await store.acquire(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        assert assignment.denoiser.worker_id == "denoiser-a"
+        assert assignment.vae.worker_id == "vae-a"
+        assert len(client.transactions) == 1
+        transaction = client.transactions[0]
+        assert len(transaction) == 4
+        keys = {
+            item["Put"]["Item"]["pk"]["S"]
+            if "Put" in item
+            else item["Update"]["Key"]["pk"]["S"]
+            for item in transaction
+        }
+        assert keys == {
+            "USER#user-a",
+            "SESSION#session-a",
+            "SLOT#denoiser#denoiser-a#0000",
+            "SLOT#vae#vae-a#0000",
+        }
+
+    asyncio.run(run())

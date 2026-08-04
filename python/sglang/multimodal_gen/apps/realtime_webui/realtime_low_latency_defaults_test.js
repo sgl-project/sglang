@@ -22,8 +22,8 @@ assert.match(
 );
 assert.match(
   outputAdapterPy,
-  /ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE\s*=\s*3/,
-  "backend should send tiny encoded preview batches to reduce websocket message overhead",
+  /ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE\s*=\s*1/,
+  "backend should send each encoded preview frame as soon as it is available",
 );
 assert.match(
   outputAdapterPy,
@@ -58,13 +58,38 @@ assert.match(
 );
 assert.match(
   appJs,
-  /holdForTargetLead:\s*true/,
-  "webui should keep a tiny playback lead to absorb public websocket jitter",
+  /lowLatencyPlayback:\s*true/,
+  "webui should render at the requested cadence without accumulating a smoothing queue",
 );
 assert.match(
   appJs,
-  /maxDeliveryLeadBoostMs:\s*220/,
-  "webui should adapt its tiny playback lead when frame delivery is bursty",
+  /holdForTargetLead:\s*false/,
+  "webui should start from the first decoded frame",
+);
+assert.match(
+  appJs,
+  /minTargetLeadMs:\s*0/,
+  "webui should be able to render the first available frame immediately",
+);
+assert.match(
+  appJs,
+  /maxTargetLeadMs:\s*80/,
+  "webui should cap its nominal display lead near one frame",
+);
+assert.match(
+  appJs,
+  /maxDeliveryLeadBoostMs:\s*30/,
+  "webui should bound adaptive jitter buffering",
+);
+assert.match(
+  appJs,
+  /lowLatencyMaxLeadFrames:\s*1/,
+  "live playback should retain at most one extra source frame",
+);
+assert.match(
+  appJs,
+  /requestAnimationFrame\(renderLoop\)/,
+  "visible playback should render on the browser refresh clock",
 );
 assert.doesNotMatch(
   appJs,

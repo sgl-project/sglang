@@ -1,12 +1,16 @@
 from argparse import Namespace
 
+import asyncio
+
 from load_test import (
     aggregate_measurement_seconds,
+    collect_trace_events,
+    derive_trace_http_url,
     init_request,
-    iter_trace_events,
     record_action_latency,
     server_action_latencies,
     stage_values,
+    trace_contract_summary,
 )
 
 
@@ -49,25 +53,67 @@ def test_stage_values_excludes_warmup_and_records_local_vae():
     }
 
 
-def test_iter_trace_events_supports_batched_server_messages():
-    assert iter_trace_events(
-        {
-            "type": "trace_events",
-            "traces": [
-                {"event": "server.scheduler_forward_start", "chunk_index": 2},
-                {"event": "server.model_denoise_complete", "chunk_index": 2},
-            ],
-        }
-    ) == [
-        {"event": "server.scheduler_forward_start", "chunk_index": 2},
-        {"event": "server.model_denoise_complete", "chunk_index": 2},
-    ]
+def test_trace_http_url_is_derived_from_the_public_websocket_origin():
+    assert derive_trace_http_url(
+        "wss://realtime.example.com/v1/realtime_video/generate?mode=t2v"
+    ) == "https://realtime.example.com"
+    assert derive_trace_http_url(
+        "ws://127.0.0.1:18080/v1/realtime_video/generate"
+    ) == "http://127.0.0.1:18080"
 
 
-def test_iter_trace_events_keeps_legacy_single_trace_message():
-    assert iter_trace_events(
-        {"type": "trace_event", "trace": {"event": "server.init_ready"}}
-    ) == [{"event": "server.init_ready"}]
+def test_collect_trace_events_polls_incrementally_and_deduplicates():
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def get(self, url, *, params):
+            self.calls.append((url, dict(params)))
+            if len(self.calls) == 1:
+                return Response(
+                    {
+                        "events": [
+                            {"event": "gateway.ws_accepted", "trace_seq": 1},
+                            {"event": "server.chunk_complete", "trace_seq": 2},
+                        ],
+                        "next_cursor": 2,
+                    }
+                )
+            return Response(
+                {
+                    "events": [
+                        {"event": "server.chunk_complete", "trace_seq": 2},
+                        {"event": "server.vae_decode_complete", "trace_seq": 3},
+                    ],
+                    "next_cursor": 3,
+                }
+            )
+
+    async def run():
+        client = Client()
+        events = await collect_trace_events(
+            "http://gateway",
+            "trace-a",
+            client=client,
+            timeout_s=0.1,
+            poll_interval_s=0,
+            stable_polls=1,
+        )
+        assert [event["trace_seq"] for event in events] == [1, 2, 3]
+        assert client.calls[0][1]["after"] == 0
+        assert client.calls[1][1]["after"] == 2
+
+    asyncio.run(run())
 
 
 def test_stage_values_backfills_overlap_after_next_denoise_completes():
@@ -181,3 +227,27 @@ def test_server_action_latencies_support_sync_marker_and_latest_prior_event():
         "action_to_server_first_frame_ms": [430.0],
         "action_ingress_to_server_first_frame_ms": [420.0],
     }
+
+
+def test_trace_contract_summary_proves_direct_vae_media_route():
+    summary = trace_contract_summary(
+        [
+            {"event": "gateway.ws_accepted"},
+            {"event": "coordinator.admit_complete"},
+            {"event": "server.model_denoise_complete"},
+            {"event": "server.vae_decode_complete"},
+            {
+                "event": "server.vae_frame_batch_sent",
+                "output_direct": True,
+            },
+        ]
+    )
+
+    assert summary["event_names"] == [
+        "coordinator.admit_complete",
+        "gateway.ws_accepted",
+        "server.model_denoise_complete",
+        "server.vae_decode_complete",
+        "server.vae_frame_batch_sent",
+    ]
+    assert summary["direct_vae_frame_batches"] == 1

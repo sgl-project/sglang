@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minwm-realtime-adot
+  namespace: minwm-realtime
+  annotations:
+    eks.amazonaws.com/role-arn: REPLACE_WITH_ADOT_ROLE_ARN
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minwm-realtime-adot-config
+  namespace: minwm-realtime
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 768
+      batch:
+        timeout: 2s
+        send_batch_size: 512
+    exporters:
+      awscloudwatchlogs:
+        log_group_name: REPLACE_WITH_TRACE_LOG_GROUP
+        log_stream_name: otlp/{service.name}
+        region: REPLACE_WITH_AWS_REGION
+        raw_log: true
+      awsxray:
+        region: REPLACE_WITH_AWS_REGION
+    service:
+      telemetry:
+        logs:
+          level: info
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [awsxray]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [awscloudwatchlogs]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-realtime-adot
+  namespace: minwm-realtime
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minwm-realtime-adot
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc}
+    - {name: otlp-http, port: 4318, targetPort: otlp-http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minwm-realtime-adot
+  namespace: minwm-realtime
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minwm-realtime-adot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-realtime-adot
+        app.kubernetes.io/part-of: minwm-realtime
+    spec:
+      serviceAccountName: minwm-realtime-adot
+      containers:
+        - name: adot
+          image: REPLACE_WITH_ADOT_IMAGE_DIGEST
+          args: [--config=/conf/collector.yaml]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+          volumeMounts:
+            - {name: config, mountPath: /conf, readOnly: true}
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+      volumes:
+        - name: config
+          configMap:
+            name: minwm-realtime-adot-config

@@ -15,8 +15,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_video_api import (
     _OrderedDecodeCoordinator,
 )
-from sglang.multimodal_gen.runtime.realtime.async_vae_client import RealtimeVAEClient
-from sglang.multimodal_gen.runtime.realtime.async_vae_client import RemoteFrameBatch
+from sglang.multimodal_gen.runtime.realtime.async_vae_client import (
+    GatewayOutputClient,
+    RealtimeVAEClient,
+    RemoteFrameBatch,
+)
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     decode_message,
     encode_message,
@@ -253,9 +256,20 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
             generation_id="g",
             connect_factory=connect_factory,
         )
-        await client.open(output_format="webp", quality=80, preview_max_width=560)
+        await client.open(
+            output_format="webp",
+            quality=80,
+            preview_max_width=560,
+            output_url="ws://gateway/v1/internal/realtime_output/s",
+            output_token="output-secret",
+            trace_id="trace-a",
+        )
         assert connect_kwargs["compression"] is None
-        assert decode_message(await socket.sent.get())["type"] == "session_open"
+        session_open = decode_message(await socket.sent.get())
+        assert session_open["type"] == "session_open"
+        assert session_open["output_url"].startswith("ws://gateway/")
+        assert session_open["output_token"] == "output-secret"
+        assert session_open["trace_id"] == "trace-a"
 
         received_batches = []
         submit_task = asyncio.create_task(
@@ -321,6 +335,69 @@ def test_remote_vae_client_streams_batches_before_chunk_completion():
 
     async def _append_async(items, value):
         items.append(value)
+
+    asyncio.run(scenario())
+
+
+def test_gateway_output_client_binds_identity_and_sends_frames_directly():
+    class FakeSocket:
+        def __init__(self):
+            self.sent = asyncio.Queue()
+            self.received = asyncio.Queue()
+            self.closed = False
+
+        async def send(self, payload):
+            await self.sent.put(payload)
+
+        async def recv(self):
+            return await self.received.get()
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        socket = FakeSocket()
+
+        async def connect_factory(*_args, **_kwargs):
+            return socket
+
+        await socket.received.put(
+            encode_message(
+                "session_output_accepted",
+                session_id="s",
+                generation_id="g",
+            )
+        )
+        client = GatewayOutputClient(
+            "ws://gateway/v1/internal/realtime_output",
+            session_id="s",
+            generation_id="g",
+            token="secret",
+            connect_factory=connect_factory,
+        )
+        await client.open()
+        opened = decode_message(await socket.sent.get())
+        assert opened == {
+            "version": 1,
+            "type": "session_output_open",
+            "session_id": "s",
+            "generation_id": "g",
+            "token": "secret",
+        }
+
+        frame = encode_message(
+            "frame_batch",
+            session_id="s",
+            generation_id="g",
+            chunk_index=0,
+            frame_batch_index=0,
+            payload_lengths=[1],
+            payload=b"x",
+        )
+        await client.send(frame)
+        assert await socket.sent.get() == frame
+        await client.close()
+        assert socket.closed
 
     asyncio.run(scenario())
 

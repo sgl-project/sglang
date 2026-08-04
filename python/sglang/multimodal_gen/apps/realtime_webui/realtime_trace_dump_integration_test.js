@@ -28,23 +28,33 @@ assert.match(
 );
 assert.match(
   appJs,
-  /function currentTracePayload\(/,
-  "generate init payload should include the client trace envelope",
+  /traceHttpClient\?\.enqueueClientEvent\(event\)/,
+  "client trace events should use the independent HTTP transport",
 );
 assert.match(
   appJs,
   /function traceWebSocketUrl\(/,
   "WebSocket URL should carry trace_id so server trace events join the same request",
 );
-assert.match(
+assert.doesNotMatch(
   appJs,
   /message\.type === "trace_event"/,
-  "client should consume server trace_event messages",
+  "video WebSocket should not consume server trace_event messages",
+);
+assert.doesNotMatch(
+  appJs,
+  /message\.type === "trace_events"/,
+  "video WebSocket should not consume batched server trace events",
 );
 assert.match(
   appJs,
-  /message\.type === "trace_events"/,
-  "client should consume batched server trace events",
+  /traceHttpClient\?\.startPolling\(5000\)/,
+  "Trace workspace should start bounded HTTP polling only while visible",
+);
+assert.match(
+  appJs,
+  /traceHttpClient\?\.stopPolling\(\)/,
+  "leaving the Trace workspace should stop HTTP polling",
 );
 assert.match(
   appJs,
@@ -61,10 +71,10 @@ assert.match(
   /trace_id: currentTrace\?\.traceId/,
   "runtime input events should include the current trace id",
 );
-assert.match(
+assert.doesNotMatch(
   appJs,
   /client_trace: currentTracePayload\(\)/,
-  "init request should include recent client-side trace marks",
+  "generate init should not carry client trace data over the video WebSocket",
 );
 assert.match(
   appJs,

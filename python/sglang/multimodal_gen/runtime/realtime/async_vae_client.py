@@ -60,6 +60,87 @@ class RemoteDecodeResult:
 FrameBatchHandler = Callable[[RemoteFrameBatch], Awaitable[None]]
 
 
+class GatewayOutputClient:
+    """Session-bound media connection from a VAE worker to one Gateway Pod."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        session_id: str,
+        generation_id: str,
+        token: str,
+        timeout_s: float = 5.0,
+        max_message_bytes: int = 64 * 1024 * 1024,
+        connect_factory=connect,
+    ) -> None:
+        if not url or not session_id or not generation_id or not token:
+            raise ValueError("Gateway output identity is required")
+        self.url = url
+        self.session_id = session_id
+        self.generation_id = generation_id
+        self.token = token
+        self.timeout_s = timeout_s
+        self.max_message_bytes = max_message_bytes
+        self._connect_factory = connect_factory
+        self._ws = None
+        self._send_lock = asyncio.Lock()
+
+    async def open(self) -> None:
+        if self._ws is not None:
+            return
+        self._ws = await self._connect_factory(
+            self.url,
+            max_size=self.max_message_bytes,
+            compression=None,
+            open_timeout=self.timeout_s,
+            close_timeout=2,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+        await self._ws.send(
+            encode_message(
+                "session_output_open",
+                session_id=self.session_id,
+                generation_id=self.generation_id,
+                token=self.token,
+            )
+        )
+        response = decode_message(
+            await asyncio.wait_for(self._ws.recv(), self.timeout_s),
+            max_message_bytes=self.max_message_bytes,
+        )
+        if response.get("type") != "session_output_accepted":
+            raise RemoteVAEError(
+                f"Gateway rejected output route: {response.get('message', response)}"
+            )
+        if (
+            response.get("session_id") != self.session_id
+            or response.get("generation_id") != self.generation_id
+        ):
+            raise ProtocolViolation("Gateway output acceptance identity mismatch")
+
+    async def send(self, wire: bytes) -> None:
+        if self._ws is None:
+            raise RemoteVAEError("Gateway output client is not open")
+        message = decode_message(wire, max_message_bytes=self.max_message_bytes)
+        if message.get("type") != "frame_batch":
+            raise ProtocolViolation("Gateway output accepts frame_batch only")
+        if (
+            message.get("session_id") != self.session_id
+            or message.get("generation_id") != self.generation_id
+        ):
+            raise ProtocolViolation("Gateway output frame identity mismatch")
+        async with self._send_lock:
+            await self._ws.send(wire)
+
+    async def close(self) -> None:
+        if self._ws is None:
+            return
+        await self._ws.close()
+        self._ws = None
+
+
 @dataclass(slots=True)
 class _PendingDecode:
     header: LatentChunkHeader
@@ -120,6 +201,9 @@ class RealtimeVAEClient:
         output_format: str,
         quality: int,
         preview_max_width: int | None,
+        output_url: str | None = None,
+        output_token: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
         if self._ws is not None:
             return
@@ -140,6 +224,9 @@ class RealtimeVAEClient:
                 output_format=output_format,
                 quality=quality,
                 preview_max_width=preview_max_width,
+                output_url=output_url,
+                output_token=output_token,
+                trace_id=trace_id,
             )
         )
         response = decode_message(
