@@ -18,6 +18,7 @@ cleanup must never sync at all.
 
 import importlib.util
 import unittest
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,6 +37,7 @@ if _HAS_MLX:
         MlxAttentionKVPool,
     )
     from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+    from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
     H, D, LAYERS = 2, 4, 1
@@ -181,7 +183,15 @@ class TestDecodeKvPoolSyncCommittedClamp(CustomTestCase):
             runner._req_to_token_pool.req_to_token[0, pos] = slot
         self._add_request(runner, "R", n_tokens=4, value=100.0, committed=4, synced=2)
 
-        runner.flush_request_decode_kv("R")
+        # Drive the flush through the real release wiring
+        # (MlxTpModelWorker.prepare_for_kv_cache_release -> flush_request_decode_kv)
+        # so dropping that call in the worker is caught here, not only when
+        # flush_request_decode_kv is invoked directly on the runner.
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker._mlx_runner = runner
+        worker.prepare_for_kv_cache_release(
+            SimpleNamespace(rid="R", mamba_last_track_seqlen=1)
+        )
         mx.eval(*pool.all_buffers())
         # Committed decode KV reached its real slots and the synced bound
         # caught up to the committed length.
