@@ -109,9 +109,11 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
 class TestQwen35FP4MTPReplaySSM(ReasoningTokenUsageMixin, CustomTestCase):
     """MTP with the ReplaySSM spec-verify fold protocol.
 
-    The explicit --mamba-ssm-dtype bfloat16 in MTP_BASE_ARGS overrides the
-    float32 default that --enable-linear-replayssm-spec would set, keeping
-    the FlashInfer GDN (bf16-state) kernel stack under test.
+    Pins the FlashInfer GDN (bf16-state) kernel stack explicitly: the
+    --mamba-ssm-dtype bfloat16 in MTP_BASE_ARGS overrides the float32
+    default that --enable-linear-replayssm-spec would set, and the three
+    linear-attn backend flags keep decode/prefill/verify on FlashInfer
+    even if the auto-selection defaults drift.
     """
 
     reasoning_parser_name = "qwen3"
@@ -125,7 +127,16 @@ class TestQwen35FP4MTPReplaySSM(ReasoningTokenUsageMixin, CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=MTP_BASE_ARGS + ["--enable-linear-replayssm-spec"],
+            other_args=MTP_BASE_ARGS
+            + [
+                "--enable-linear-replayssm-spec",
+                "--linear-attn-decode-backend",
+                "flashinfer",
+                "--linear-attn-prefill-backend",
+                "flashinfer",
+                "--linear-attn-verify-backend",
+                "flashinfer",
+            ],
         )
 
     @classmethod
