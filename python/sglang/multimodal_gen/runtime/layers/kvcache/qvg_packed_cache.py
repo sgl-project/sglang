@@ -103,6 +103,7 @@ class QVGPackedCausalKVCache:
         device: torch.device,
         global_end_index: torch.Tensor,
         local_end_index: torch.Tensor,
+        use_int_indices: bool = False,
         sink_tokens: int = 0,
         attention_window_size: int | None = None,
         quant_args: QVGKVQuantArgs,
@@ -121,6 +122,8 @@ class QVGPackedCausalKVCache:
         # by consumers, but reset/patterns touch them)
         self.global_end_index = global_end_index
         self.local_end_index = local_end_index
+        self.global_end_index_int = 0 if use_int_indices else None
+        self.local_end_index_int = 0 if use_int_indices else None
 
         self._segments: list[_Segment] = []  # completed, global-ordered
         self._cur: _Segment | None = None  # current (mutable) chunk
@@ -132,6 +135,9 @@ class QVGPackedCausalKVCache:
         self._segments = []
         self._cur = None
         self._global_end = 0
+        if self.global_end_index_int is not None:
+            self.global_end_index_int = 0
+            self.local_end_index_int = 0
         self.global_end_index.zero_()
         self.local_end_index.zero_()
 
@@ -313,8 +319,13 @@ class QVGPackedCausalKVCache:
                 f"cur={None if self._cur is None else self._cur.g0}"
             )
 
-        self.global_end_index.fill_(self._global_end)
-        self.local_end_index.fill_(min(self._global_end, self.cache_size))
+        local_end = min(self._global_end, self.cache_size)
+        if self.global_end_index_int is not None:
+            self.global_end_index_int = self._global_end
+            self.local_end_index_int = local_end
+        else:
+            self.global_end_index.fill_(self._global_end)
+            self.local_end_index.fill_(local_end)
 
         vk, vv = self._reconstruct(current_chunk_start, recent_window_tokens)
         return CausalAttentionKVView(

@@ -421,7 +421,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
         # KV-cache quantization config is fixed for the server lifetime
-        self._kv_quant_args = server_args.kv_cache_quant_config
+        self._kv_quant_args = getattr(server_args, "kv_cache_quant_config", None)
 
     def _resolve_kv_quant_args(self) -> QVGKVQuantArgs:
         """KV-quant config from ServerArgs (disabled by default)."""
@@ -1143,6 +1143,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     head_dim=attention_head_dim,
                     dtype=dtype,
                     device=device,
+                    use_int_indices=use_int_indices,
                     global_end_index=torch.zeros(1, dtype=torch.long, device=device),
                     local_end_index=torch.zeros(1, dtype=torch.long, device=device),
                     sink_tokens=sink_tokens,

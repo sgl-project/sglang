@@ -37,7 +37,7 @@ def _base(B, W, H, D, sink, dev):
     )
 
 
-def _packed(B, W, H, D, sink, dev, quant):
+def _packed(B, W, H, D, sink, dev, quant, use_int_indices=False):
     return QVGPackedCausalKVCache(
         batch_size=B,
         cache_size=W,
@@ -45,6 +45,7 @@ def _packed(B, W, H, D, sink, dev, quant):
         head_dim=D,
         dtype=torch.float32,
         device=torch.device(dev),
+        use_int_indices=use_int_indices,
         global_end_index=torch.zeros(1, dtype=torch.long, device=dev),
         local_end_index=torch.zeros(1, dtype=torch.long, device=dev),
         sink_tokens=sink,
@@ -130,6 +131,31 @@ class TestPackedStorageEquivalence(unittest.TestCase):
 
     def test_recent_window_selection(self):
         self._run(rwt=16)
+
+    def test_host_index_cursors_reset_without_device_updates(self):
+        cache = _packed(
+            B=1,
+            W=16,
+            H=2,
+            D=4,
+            sink=0,
+            dev="cpu",
+            quant=QVGKVQuantArgs(),
+            use_int_indices=True,
+        )
+        cache.update_and_get_attention_kv(
+            key=torch.ones(1, 4, 2, 4),
+            value=torch.ones(1, 4, 2, 4),
+            current_chunk_start=0,
+        )
+        self.assertEqual(cache.global_end_index_int, 4)
+        self.assertEqual(cache.local_end_index_int, 4)
+        self.assertEqual(int(cache.global_end_index.item()), 0)
+        self.assertEqual(int(cache.local_end_index.item()), 0)
+
+        cache.reset_indices()
+        self.assertEqual(cache.global_end_index_int, 0)
+        self.assertEqual(cache.local_end_index_int, 0)
 
 
 @unittest.skipUnless(
