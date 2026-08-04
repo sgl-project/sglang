@@ -567,3 +567,64 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - 横向扩容 = 加同配置 pod 副本 + 负载均衡，不要通过调高并发实现；
 - 上线后按 10.6 定位表盯三个指标：`queue_time_seconds` / `cache_hit_rate` / `kv_available`；
 - 请求侧参数（max_tokens / thinking_budget 等）按 9.2 / 9.3 场景取值。
+
+## 11. 双架构生产数据与路由热点排查（2026-08）
+
+### 11.1 两实例实测对比
+
+| 指标 | tool call（4卡 TP2 DP2, steps2, 并发5） | thinking（2卡 TP2 DP1, steps3, 并发12） |
+|------|------|------|
+| 请求占比 | 278 (80%) | 69 (20%) |
+| Gen/req | 160 tok | 2,546 tok |
+| TTFT (stream) | 9.95s | 2.17s |
+| ITL avg（每 token 实际流延迟） | 69.7ms | 32.2ms |
+| Accept Rate | 97.6% | 60.8% |
+| Accept Len | 2.96 | 2.83 |
+| Cache hit | 30.8% | 39.1% |
+| Running / Queue | 0+2 / 12 | 1 / 0 |
+
+### 11.2 核心问题：DP Router 热点（致命）
+
+tool call 实例 Worker 0 完全空转（0 running / 0 queued），Worker 1 满载（2 running / 12 queued）——相同 system prompt 的请求被**前缀粘滞路由**全塞到一个 worker，4 卡当 2 卡用，TTFT 9.95s 几乎全是排队。
+
+**修复参数**：`--load-balance-method`（不是 `--dp-load-balancing`），choices：`auto` / `round_robin` / `follow_bootstrap_room` / `total_requests` / `total_tokens`。当前主线非 PD 默认 `auto`→`round_robin`，但 0.5.17 实测为前缀粘滞 → **显式加 `--load-balance-method round_robin`**。
+
+**排查方法**：
+
+```bash
+python3.12 -m sglang.launch_server --help | grep load-balance   # 确认版本支持
+# 看各 worker running/queue 是否均衡；热点特征是一个 worker 满载、其余空转
+curl -s localhost:8000/metrics | grep -E "num_running|num_queue|gen_throughput"
+```
+
+round_robin 下每个 worker 首请求后各自缓存 system prompt，命中率不受影响；TTFT 因并行而下降。
+
+### 11.3 口径修正
+
+- "有效 ITL = ITL / accept_len" 是重复计算（同 10.8.2）：tool call 每 token **69.7ms**、thinking **32.2ms**；对应 E2E ≈ tool 21s / thinking 84s（非 13.7s / 30s）；
+- accept rate 与 batch 大小无关：60.8% vs 82% 是任务分布/样本量（69 req）差异，不是"2 卡 batch 小"的锅；
+- thinking non-stream TTFT 11.34s 是"等全部生成完才返回"的固有特性，非延迟问题；
+- tool call **保留 MTP**（accept 97.6%，工作得极好）；问题是路由不是 MTP，关掉反而让 ITL 从 69.7ms 回到 ~92ms。
+
+### 11.4 关键洞察与行动
+
+- **统一 6 卡方案的"均衡"可能是被混合流量掩盖的热点**：之前流量前缀多样所以看着均衡；tool call 专属实例前缀单一所以暴露。**回退统一方案时也显式加 round_robin**，TTFT 可能从 8.76~14.36s 明显下降；
+- 行动顺序：回退统一 6 卡 + `round_robin` + MTP + 预热（`--warmup --keep-alive`）→ 盯 TTFT 与 GPU 利用率；
+- 双架构待路由行为验证后再上（此时才需要客户端按类型分流）；
+- thinking steps 保持 3（降 steps 只减 verify 开销，不会回升接受率）；
+- 长期：PD 分离方向正确，但 PD + MTP/mamba 栈未验证，优先级最低。
+
+### 11.5 脚本已内置
+
+`sglang_start.sh` 新增 `--load-balance-method`（默认 `round_robin`），直接使用即可：
+
+```bash
+# 统一 6 卡回退验证（新方式）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 12 \
+    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4 \
+    --warmup --keep-alive
+```
+
+> 6 卡 pod 由 K8s 分配；若脚本自动推断不是 TP2 DP3（如检测到 7 卡），显式传 `--tp-size 2 --dp-size 3` 或用 `--gpu-ids`（裸机）限定 6 卡。

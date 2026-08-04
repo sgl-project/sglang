@@ -40,6 +40,7 @@ SKIP_WARMUP=true
 SCHEDULE_POLICY=lpm
 KEEP_ALIVE=false
 KEEP_ALIVE_INTERVAL=45
+LOAD_BALANCE_METHOD=round_robin
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --schedule-policy) SCHEDULE_POLICY="$2"; shift 2 ;;
         --keep-alive) KEEP_ALIVE=true; shift ;;
         --keep-alive-interval) KEEP_ALIVE_INTERVAL="$2"; shift 2 ;;
+        --load-balance-method) LOAD_BALANCE_METHOD="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -143,6 +145,7 @@ echo " RadixTree: enabled"
 echo " Speculative(MTP): $ENABLE_SPECULATIVE"
 echo " schedule-policy: $SCHEDULE_POLICY  预热: $([ "$SKIP_WARMUP" = true ] && echo skip || echo on)"
 echo " keep-alive: $([ "$KEEP_ALIVE" = true ] && echo "on 每${KEEP_ALIVE_INTERVAL}s" || echo off)"
+echo " load-balance: $LOAD_BALANCE_METHOD (DP 路由; round_robin 避免前缀粘滞热点)"
 echo "=========================================="
 
 # ==================== 常驻 keep-alive ====================
@@ -174,6 +177,7 @@ CUDA_VISIBLE_DEVICES=${GPU_IDS:-$CUDA_VISIBLE_DEVICES} python3.12 -m sglang.laun
     --port $PORT \
     --tp-size $TP_SIZE \
     --dp-size $DP_SIZE \
+    --load-balance-method $LOAD_BALANCE_METHOD \
     --mem-fraction-static $MEM_FRACTION_STATIC \
     --context-length $CONTEXT_LENGTH \
     --reasoning-parser qwen3 \
