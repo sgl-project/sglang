@@ -882,6 +882,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -934,9 +935,37 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
+        src_data_ptrs = self.kv_args.kv_data_ptrs
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            # Pair by layer id. Required once draft KV buffers are appended: the
+            # flat list is then no longer [K block, V block], so the half-split
+            # in get_mha_kv_ptrs_with_pp mislabels entries.
+            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+                logger.error(
+                    f"[{mooncake_session_id}] head-sliced transfer assumes one item "
+                    f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
+                )
+                return -1
+            layer_ptr_pairs = [
+                (src_data_ptrs[i], dst_kv_ptrs[j])
+                for i, j in build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_kv_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
+            )
+            layer_ptr_pairs = [
+                (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
+            ] + [
+                (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)
+            ]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -981,15 +1010,10 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = []
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
+        futures = [
+            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
+            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
+        ]
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()

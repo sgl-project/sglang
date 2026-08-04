@@ -9,7 +9,10 @@ import numpy as np
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
-from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
+from sglang.srt.disaggregation.utils import (
+    build_kv_layer_ids,
+    build_transfer_entry_pairs,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -173,6 +176,108 @@ class TestBuildTransferEntryPairsDuplicateIds(CustomTestCase):
             allow_positional_fallback=False,
         )
         self.assertEqual(pairs, [(0, 0), (1, 1), (2, 3), (3, 4)])
+
+
+def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
+    pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+    pool.full_attention_layer_id_mapping = layer_ids
+    pool.use_mla = False
+    return pool
+
+
+class TestBuildKvLayerIds(CustomTestCase):
+    """Bug regression: enabling EAGLE appended draft KV buffers to kv_data_ptrs
+    while kv_layer_ids described only the target's entries, so the ids were
+    suppressed entirely and the transfer fell back to positional slicing. Under
+    prefill pp_size > 1 that slices the wrong layers -- prefill pp=2 + EAGLE
+    produced garbled decode output while pp=1 + EAGLE did not."""
+
+    def _stage1_ids(self) -> list:
+        full = _full_attention_ids(num_layers=60, interval=4)
+        return [lid for lid in full if lid >= 30]
+
+    def test_draft_entries_get_a_reserved_band_above_the_target_range(self):
+        """A draft pool that only reports a layer count, not ids."""
+        ids = build_kv_layer_ids(
+            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+            draft_token_to_kv_pool=SimpleNamespace(layer_num=1),
+            num_draft_entries=2,
+            num_hidden_layers=60,
+        )
+        stage1 = self._stage1_ids()
+        # k0..k(L-1) then v0..v(L-1) per pool, and the pools are concatenated --
+        # so the band repeats per group after the target's ids, not interleaved.
+        self.assertEqual(ids, stage1 + stage1 + [60, 60])
+
+    def test_hybrid_draft_pool_is_remapped_out_of_the_target_range(self):
+        """The EAGLE draft pool for a hybrid-linear model is itself a
+        HybridLinearKVPool that numbers its single MTP layer from zero, so its
+        raw ids collide with target layer 0 and must be remapped into the band."""
+        ids = build_kv_layer_ids(
+            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+            draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
+            num_draft_entries=2,
+            num_hidden_layers=60,
+        )
+        stage1 = self._stage1_ids()
+        self.assertEqual(ids, stage1 + stage1 + [60, 60])
+
+    def test_non_hybrid_pool_publishes_nothing(self):
+        self.assertEqual(
+            build_kv_layer_ids(
+                token_to_kv_pool=SimpleNamespace(),
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=60,
+            ),
+            [],
+        )
+
+    def test_ragged_draft_registration_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            build_kv_layer_ids(
+                token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+                draft_token_to_kv_pool=SimpleNamespace(layer_num=2),
+                num_draft_entries=3,
+                num_hidden_layers=60,
+            )
+
+
+class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
+    """Derived property: a pp=2 prefill stage and a pp=1 decode peer, both with
+    an EAGLE draft pool, must pair on layer id -- the stage's 8 full-attention
+    layers land on the decode peer's matching K and V entries, and the draft
+    band lands on the decode peer's draft entries rather than on layer 0."""
+
+    def test_stage1_pairs_onto_the_decode_layout(self):
+        full = _full_attention_ids(num_layers=60, interval=4)
+        stage1 = [lid for lid in full if lid >= 30]
+        src = build_kv_layer_ids(
+            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=stage1),
+            draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
+            num_draft_entries=2,
+            num_hidden_layers=60,
+        )
+        dst = build_kv_layer_ids(
+            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=full),
+            draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
+            num_draft_entries=2,
+            num_hidden_layers=60,
+        )
+        pairs = build_transfer_entry_pairs(
+            src, dst, len(src), len(dst), allow_positional_fallback=False
+        )
+        k_offset = len(full) - len(stage1)
+        self.assertEqual(
+            pairs,
+            # K block, then V block, then the two draft entries at the tail.
+            [(i, k_offset + i) for i in range(len(stage1))]
+            + [
+                (len(stage1) + i, len(full) + k_offset + i)
+                for i in range(len(stage1))
+            ]
+            + [(2 * len(stage1), 2 * len(full)), (2 * len(stage1) + 1, 2 * len(full) + 1)],
+        )
 
 
 if __name__ == "__main__":

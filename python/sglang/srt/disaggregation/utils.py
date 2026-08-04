@@ -934,6 +934,65 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def build_kv_layer_ids(
+    *,
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    num_draft_entries: int,
+    num_hidden_layers: int,
+) -> List[int]:
+    """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
+
+    Draft KV buffers are appended after the target's, so they need ids of their
+    own: build_transfer_entry_pairs requires the id list to cover every entry,
+    and a target-only list would be rejected. The draft numbers its layers from
+    zero, which would collide with the target's, so its entries are remapped
+    into a reserved band above the target's layer range. Both PD peers run this
+    against the same draft config and so agree on the band.
+
+    Returns [] for pools that cannot report ids, leaving the peers on positional
+    pairing.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return []
+    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if draft_token_to_kv_pool is None:
+        return layer_ids
+
+    draft_ids = _draft_entry_layer_ids(
+        pool=draft_token_to_kv_pool, num_entries=num_draft_entries
+    )
+    # Rank the draft's own ids by first appearance, so the band stays dense and
+    # contiguous whatever the draft config numbers its layers.
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
+    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+
+
+def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    """One draft-local layer id per registered draft KV entry."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(pool, HybridLinearKVPool):
+        ids = pool.get_kv_layer_ids()
+    else:
+        # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
+        # group; derive the group count rather than assuming MHA vs MLA.
+        if pool.layer_num <= 0 or num_entries % pool.layer_num != 0:
+            raise RuntimeError(
+                "Draft KV buffers must register a whole number of per-layer "
+                f"groups: entries={num_entries}, layers={pool.layer_num}"
+            )
+        ids = list(range(pool.layer_num)) * (num_entries // pool.layer_num)
+    if len(ids) != num_entries:
+        raise RuntimeError(
+            "Draft KV layer ids must cover every registered entry: "
+            f"ids={len(ids)}, entries={num_entries}"
+        )
+    return ids
+
+
 def resolve_dcp_dst_entry_indices(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
