@@ -144,6 +144,7 @@ class DFlashDraftInputV2(SpecInput):
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
         num_needed_tokens = 0
+        max_reserved_len = 0
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
@@ -152,6 +153,8 @@ class DFlashDraftInputV2(SpecInput):
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            if reserved_len > max_reserved_len:
+                max_reserved_len = reserved_len
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
@@ -168,6 +171,14 @@ class DFlashDraftInputV2(SpecInput):
                 uniform_top_k_value = top_k
             elif uniform_top_k and top_k != uniform_top_k_value:
                 uniform_top_k = False
+
+        row_width = batch.req_to_token_pool.req_to_token.shape[1]
+        assert max_reserved_len <= row_width, (
+            f"DFLASH decode reserve ({max_reserved_len}) exceeds the req_to_token "
+            f"row width ({row_width}); the row write would spill into the neighbor "
+            f"row and the release slice would clamp, stranding KV slots. Widen the "
+            f"row via get_req_to_token_extra_context_len."
+        )
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
