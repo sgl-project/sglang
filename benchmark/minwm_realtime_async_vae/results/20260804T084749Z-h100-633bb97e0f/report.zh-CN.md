@@ -4,7 +4,7 @@
 
 - 最终分支：`codex/minwm-async-vae-multiuser`
 - A/B 压测代码：`633bb97e0fe002ccbe9c9317d71f21fd052278cd`
-- 最终端到端代码：`5faecf80c2eea94595568f94b4a0f5f9fbbd3c1e`
+- 最终端到端代码：`d5ef138db95cb86389018007989d487c02ca8a0b`
 - Denoiser 固定使用 `1 x NVIDIA H100 80GB` Spot；异步 VAE 使用 `1 x NVIDIA L4 24GB` Spot。
 - 零错误压测容量为 4 个并发会话；按 `action P95 < 1s`、单会话 `>=16 FPS`、错误率为 0 的交互 SLO，单个 H100 实例建议严格配额为 2 个并发会话。
 - 8 并发时同步和异步方案都出现 1/8 CUDA OOM，因此生产默认不能把单 H100 配额设为 8。
@@ -61,7 +61,7 @@ sequenceDiagram
 | 同步基线 | H100 80GB | 本地 H100 TAEHV `taew2_2.pth` | `p5.48xlarge` | 1 | Spot |
 | 异步方案 | H100 80GB | 远端 L4 TAEHV `taew2_2.pth` | `p5.48xlarge` + `g6.2xlarge` | 1 + 1 | Spot |
 
-`p5.48xlarge` 物理节点有 8 张 H100，但本次 Denoiser Pod 仅申请并使用 1 张。H100 与 B200 Spot 候选同时检查，H100 先成功调度，B200 候选立即释放；本次没有占用 B200 或 B300 Capacity Block。
+`p5.48xlarge` 物理节点有 8 张 H100，但本次 Denoiser Pod 仅申请并使用 1 张。H100 与 B200 Spot 候选同时检查，H100 成功调度，B200 当时没有可用容量；本次没有占用 B200 或 B300 Capacity Block。
 
 模型为 832x480 MinWM checkpoint，压测使用 24 FPS、4 steps、3 个 warmup chunk 和 6 个统计 chunk。异步 VAE 队列有界，实时会话上限配置为 8，但根据压测结果建议生产硬限制调整为 4，交互流量目标配额为 2/H100。
 
@@ -77,6 +77,16 @@ sequenceDiagram
 | 异步 | 2 | 2/2 | 876.2ms | 870ms | 20.40 | 37.78 | 0% |
 | 异步 | 4 | 4/4 | 874.9ms | 1664ms | 10.38 | 36.97 | 0% |
 | 异步 | 8 | 7/8 | 909.9ms | 2826ms | 5.99 | 36.84 | 12.5% |
+
+最终 SHA `d5ef138d...` 又在 Denoiser Pod 内对当前部署做了独立回归，排除了本地中国到 AWS Ohio 公网链路的抖动：
+
+| 并发 | 成功会话 | Action 到首帧 P95 | Chunk P95 | 最低单会话 FPS | 集群 FPS | 错误率 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1/1 | 469.0ms | 424ms | 41.51 | 41.51 | 0% |
+| 2 | 2/2 | 835.7ms | 785ms | 21.57 | 37.11 | 0% |
+| 4 | 4/4 | 843.1ms | 1499ms | 10.98 | 35.24 | 0% |
+
+该回归使用 16 FPS、2 个 warmup chunk 和 3 个统计 chunk。单并发 P95 阶段耗时为：Denoising 361.1ms、L4 TAEHV Decode 42.2ms、WebP encode 173.0ms；VAE 与下一轮 Denoising 重叠 54.9ms，重叠比例 14.93%。原始结果保存在同级 `20260804T130000Z-final-h100-l4-2d725b214d80/async.json`。
 
 ## 异步收益
 
@@ -105,21 +115,22 @@ sequenceDiagram
 
 ## 公网浏览器验证
 
-最终 SHA `5faecf80...` 通过真实 NLB，而不是 `kubectl port-forward`，完成 121 帧 T2V 与持续 `W` 输入：
+最终 SHA `d5ef138d...` 通过真实 NLB，而不是 `kubectl port-forward`，完成 33 帧 T2V 与持续 `W` 输入：
 
-- WebSocket 在 6.67s 内完成；页面接收 121 帧，最终 source 15.0 FPS、render 16 FPS。
-- 用户按键连续发送到 `event#38`；后端 chunk 3/4/5/6/7/8 分别采样 `event#11/#14/#18/#22/#26/#30`。
-- 手工注入的 `key_down` 到首个实际采用该 action 的 chunk 首帧渲染约 1.18s；从该 chunk 采用的 `event#11` 发出到渲染约 0.87s。自动压测中单用户 action P95 为 499.6ms，差异主要来自手工按键落在 chunk 中段后的边界等待。
-- 最后完整 chunk Trace：总计 413ms，Scheduler 378ms，Denoising 373ms，VAE Decode 45ms，Transport 1ms，Frontend decode/canvas 20ms。
-- Trace 页间隔 3s 的两次快照保持相同最后值，没有退回 `-` 或发生闪烁。
-- 录屏 dump 包含视频、prompt history、T2V 无参考图状态、前端 key down/up、连续 action 发送、后端 chunk 采样和完整 Trace；WebM/JSON/HTML 均成功下载并可回放。
+- WebSocket 在 4.84s 内正常完成并以 code `1000` 关闭，页面收到并播放全部 33 帧。
+- 按住 `W` 约 0.8s 时，前端约每 100ms 连续发送 Forward action；释放后发送 No-op，历史面板可见 `event#3` 至 `event#9`。
+- 最后完整 chunk Trace：总计 426ms，Scheduler 366ms，Denoising 361ms，VAE Decode 46ms，Transport 3ms，Frontend decode/canvas 50ms。
+- Trace 面板显示 167 个事件，所有关键阶段都有耗时并保留最后稳定值，没有退回 `-` 或闪烁。
+- 录屏 dump 已在前一轮当前分支浏览器回归中验证：包含视频、prompt history、T2V 无参考图状态、前端 key down/up、连续 action 发送、后端 chunk 采样和完整 Trace；WebM/JSON/HTML 均可回放。本轮代码没有改动 dump 路径。
+
+额外做了公网与集群内对照：相同 10Hz action 流在 Pod 内 5 个 chunk 仅用 2.105s，65/65 帧和 5/5 个 `chunk_stats` 全部到达；本地跨境公网测试存在 4s 以上单次 socket write 背压。因此公网长会话抖动不是 GPU、异步 VAE 或 Scheduler 攒帧造成，容量结论以集群内压测为准。
 
 ## 代码验证
 
-- Realtime Python tests：306 passed。
-- Benchmark tests：17 passed。
-- WebUI Node tests：codec、低延迟默认值、多用户生命周期、Trace dump、录屏回放、Trace topology 共 6 组通过。
-- Python compileall 与 `git diff --check` 通过。
+- Realtime、Benchmark 与部署策略 Python tests：335 passed。
+- WebUI Node tests：codec、播放控制、低延迟默认值、多用户生命周期、Trace dump、录屏回放、Trace topology 共 7 组通过。
+- K8s manifest 专项测试 6 passed，策略 validator 与 `kubectl kustomize` 渲染通过。
+- 仓库 Ruff 规则、Python compileall 与 `git diff --check` 通过。
 
 ## 生产建议
 
