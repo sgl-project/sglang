@@ -782,7 +782,10 @@ class MooncakeKVManager(CommonKVManager):
             return process_layers(layers_params)
 
     def _validate_envelope_kv_layout(
-        self, dst_kv_ptrs: list[int], dst_kv_item_len: Optional[int]
+        self,
+        dst_kv_ptrs: list[int],
+        dst_kv_item_len: Optional[int],
+        dst_attn_tp_size: Optional[int] = None,
     ) -> None:
         """Reject a peer whose KV registration shape differs from ours.
 
@@ -798,6 +801,17 @@ class MooncakeKVManager(CommonKVManager):
         """
         if not get_memory().enable_unified_memory:
             return
+        if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
+            # The unified mamba state ships as one whole-slot envelope with no
+            # per-tensor dims, so `_send_mamba_state_slice` cannot reslice it and
+            # silently falls back to an unsliced copy. Reject here, before any KV
+            # is written, rather than in `maybe_send_extra` afterwards.
+            raise RuntimeError(
+                "--enable-unified-memory does not support different prefill / "
+                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
+                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
+                "be TP-resliced."
+            )
         src_item_lens = self.kv_args.kv_item_lens
         if (
             len(src_item_lens) != 1
@@ -823,8 +837,11 @@ class MooncakeKVManager(CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
     ):
-        self._validate_envelope_kv_layout(dst_kv_ptrs, dst_kv_item_len)
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -1745,6 +1762,7 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
                         elif (
                             self.enable_staging
