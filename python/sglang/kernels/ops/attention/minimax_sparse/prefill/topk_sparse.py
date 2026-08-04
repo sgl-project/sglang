@@ -106,6 +106,7 @@ def _gqa_share_sparse_fwd_kernel(
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    ONE_PAGE_PER_BLOCK: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -191,14 +192,20 @@ def _gqa_share_sparse_fwd_kernel(
             # Resolve from graph-owned page ids during replay.
             pos = c + off_n
             pos_mask = pos < seq_len
-            slots = load_token_slots(
-                page_table_ptr,
-                pid_b,
-                pos,
-                stride_pt_b,
-                pos_mask,
-                PAGE_SIZE,
-            )
+            if ONE_PAGE_PER_BLOCK:
+                physical_page = tl.load(
+                    page_table_ptr + pid_b * stride_pt_b + c // BLOCK_SIZE_K
+                ).to(tl.int64)
+                slots = physical_page * BLOCK_SIZE_K + off_n
+            else:
+                slots = load_token_slots(
+                    page_table_ptr,
+                    pid_b,
+                    pos,
+                    stride_pt_b,
+                    pos_mask,
+                    PAGE_SIZE,
+                )
             # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
             k = tl.load(
                 k_cache_ptr
@@ -377,5 +384,6 @@ def flash_prefill_with_gqa_share_sparse(
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
         PAGE_SIZE=page_size,
+        ONE_PAGE_PER_BLOCK=page_size == block_size_k,
     )
     return o
