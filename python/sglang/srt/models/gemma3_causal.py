@@ -48,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
-from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
+from sglang.srt.utils.hf_transformers.common import resolve_local_or_cached_file
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -981,7 +981,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         """Create the checkpoint's SentenceTransformers Dense tail, if present."""
         model_path = getattr(config, "_name_or_path", "")
         try:
-            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            modules_path = resolve_local_or_cached_file(model_path, "modules.json")
             with open(modules_path) as f:
                 module_specs = json.load(f)
 
@@ -989,7 +989,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
             for spec in module_specs:
                 if spec.get("type") != "sentence_transformers.models.Dense":
                     continue
-                dense_config_path = _resolve_local_or_cached_file(
+                dense_config_path = resolve_local_or_cached_file(
                     model_path, f"{spec['path']}/config.json"
                 )
                 with open(dense_config_path) as f:
@@ -1054,7 +1054,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         loaded_params = super().load_weights(remapped_weights)
         if self.projector is not None:
             model_path = getattr(self.config, "_name_or_path", "")
-            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            modules_path = resolve_local_or_cached_file(model_path, "modules.json")
             with open(modules_path) as f:
                 module_specs = json.load(f)
             dense_specs = [
@@ -1065,7 +1065,7 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
             from safetensors.torch import load_file
 
             for layer, spec in zip(self.projector, dense_specs):
-                weights_path = _resolve_local_or_cached_file(
+                weights_path = resolve_local_or_cached_file(
                     model_path, f"{spec['path']}/model.safetensors"
                 )
                 weights = load_file(weights_path, device="cpu")
