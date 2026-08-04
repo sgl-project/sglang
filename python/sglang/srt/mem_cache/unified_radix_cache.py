@@ -2191,4 +2191,4 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
-        return self.tree_core.root_node.id
+        return self.tree_core.root_node_handle(extra_key)

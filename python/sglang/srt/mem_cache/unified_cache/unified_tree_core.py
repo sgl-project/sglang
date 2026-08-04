@@ -497,6 +497,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         return node.get_prefix_hash_values(node.parent)
 
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash values owned by this node, excluding its ancestors."""
+        return self.node_by_id(node_id).hash_value or []
+
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+        """The NodeId anchoring matches; the single root serves every namespace."""
+        return self.root_node.id
+
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
         node = UnifiedTreeNode(self.component_types, priority=priority)
@@ -1278,6 +1286,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.host_frees,
             )
         return result
+
+    def evict_excess_path_states(
+        self,
+        tail_node_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+            self.node_by_id(tail_node_id), device_frees, host_frees
+        )
 
     def _evict_host_leaf(
         self,
