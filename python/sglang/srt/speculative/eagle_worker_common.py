@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
-from sglang.srt.managers.utils import GenerationBatchResult, _async_d2h
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -23,8 +23,9 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -190,10 +191,10 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_cuda_graph:
+    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
@@ -203,7 +204,7 @@ def prepare_for_draft_extend(
         # On NPU with --disable-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
-        if not is_npu() or can_cuda_graph:
+        if not is_npu() or can_run_decode_cuda_graph:
             forward_batch.mark_forward_metadata_ready()
     return forward_batch
 
@@ -306,10 +307,10 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph
 
 
 def build_eagle_verify_input(
@@ -341,22 +342,26 @@ def build_eagle_verify_input(
             device,
         )
 
-    # Build tree mask
-    # Directly write to cuda graph buffers for verify attn
-    tree_mask_buf, position_buf = (
-        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-    )
+    # Write straight into the backend's buffer when it owns one and this batch
+    # fits; an eager batch past the captured max_bs falls back to allocating.
+    bs = batch.seq_lens.shape[0]
+    target_attn_backend = target_worker.model_runner.attn_backend
+    verify_mask = target_attn_backend.verify_mask
+    if verify_mask is None:
+        tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
+    else:
+        mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-    # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+    # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
     seq_lens_sum = batch.seq_lens_sum
     if seq_lens_sum is None:
-        if tree_mask_buf is None:
-            max_context_len = target_worker.model_runner.attn_backend.max_context_len
-            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-        else:
-            # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+        if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+            # Preallocated, or a QLEN_ONLY allocation sized off bs alone.
             seq_lens_sum = 0
+        else:
+            seq_lens_sum = bs * target_attn_backend.max_context_len
 
     (
         tree_mask,
@@ -375,9 +380,9 @@ def build_eagle_verify_input(
         topk,
         num_steps,
         num_draft_tokens,
-        tree_mask_mode,
+        mask_mode,
         tree_mask_buf,
-        position_buf,
+        fill_prefix_mask=fill_mask,
     )
 
     return EagleVerifyInput(
@@ -528,21 +533,16 @@ def run_eagle_verify(
             ),
         )
 
-    # Prepare grammar data on CPU if needed. Use async pinned D2H copies (not
-    # blocking .cpu()) and record an event. The copies are issued before the
-    # target verify launch below so they run right after the draft, but the
-    # host does not block here. We wait on grammar_copy_done only just before
-    # the CPU bitmask traversal reads the buffers, so the traversal (and these
-    # copies) overlap the target verify forward instead of stalling the GPU.
-    grammar_copy_done = None
-    if batch.has_grammar:
-        retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
-        retrieve_next_sibling_cpu = _async_d2h(verify_input.retrieve_next_sibling)
-        draft_tokens_cpu = _async_d2h(
-            verify_input.draft_token.view(verify_input.retrieve_next_token.shape)
+    # Must stay ahead of the target verify launch below.
+    grammar_tree = (
+        GrammarTree.from_device(
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
-        grammar_copy_done = torch.get_device_module(device).Event()
-        grammar_copy_done.record()
+        if batch.has_grammar
+        else None
+    )
 
     if metadata_ready_pre_pad:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
@@ -568,40 +568,15 @@ def run_eagle_verify(
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
-    vocab_mask = None
+    grammar_mask = None
     if batch.has_grammar:
-        # Grammar barrier: advance the previous batch's grammar FSM over its
-        # committed tokens before building this batch's bitmask. Runs after the
-        # target forward launch, so the FSM advance and the traversal below both
-        # overlap the target verify forward. No-op if there is nothing pending.
-        if grammar_barrier is not None:
-            grammar_barrier()
-        # Wait for the async draft/verify-input D2H copies above to land before
-        # the CPU traversal reads them. The event was recorded right after the
-        # copies (before the target verify launch), so this wait — and the
-        # traversal below — overlap the target verify forward.
-        grammar_copy_done.synchronize()
-        # Generate the logit mask for structured output.
-        vocab_mask = generate_token_bitmask(
-            batch.reqs,
-            verify_input,
-            retrieve_next_token_cpu,
-            retrieve_next_sibling_cpu,
-            draft_tokens_cpu,
-            batch.sampling_info.vocab_size,
+        grammar_mask = build_grammar_vocab_mask(
+            reqs=batch.reqs,
+            tree=grammar_tree,
+            sampling_info=batch.sampling_info,
+            device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
-
-        if vocab_mask is not None:
-            assert verify_input.grammar is not None
-            # non_blocking H2D so the mask copy overlaps the tail of the target
-            # verify forward instead of syncing the host; stream ordering keeps
-            # it before eagle_sample's apply_vocab_mask below.
-            vocab_mask = vocab_mask.to(
-                verify_input.retrieve_next_token.device, non_blocking=True
-            )
-            # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
-            # and will be applied to produce wrong results
-            batch.sampling_info.vocab_mask = None
 
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
@@ -610,7 +585,7 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

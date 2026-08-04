@@ -16,8 +16,10 @@ _MAX_THREAD_N = 256
 
 
 @cache_once
-def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_moe_wna16_marlin_module(
+    dtype: torch.dtype, is_ep: bool, has_bias: bool
+) -> Module:
+    args = make_cpp_args(dtype, is_ep, has_bias)
     return load_jit(
         "moe_wna16_marlin",
         *args,
@@ -134,7 +136,7 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(a.dtype)
+    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
     module.moe_wna16_marlin_gemm(
         a,
         c,

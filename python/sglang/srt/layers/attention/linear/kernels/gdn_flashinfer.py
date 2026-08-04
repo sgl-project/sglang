@@ -5,19 +5,26 @@ Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
 SM100 (Blackwell): full support — decode, prefill, MTP.
 
-Requires flashinfer >= 0.6.7.
+Requires flashinfer >= 0.6.14.
 """
+
+from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,47 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
+
+
+def maybe_build_flashinfer_checkpoint_plan(
+    forward_batch: ForwardBatch,
+    forward_metadata: ForwardMetadata,
+    device: str,
+) -> None:
+    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    if (
+        forward_metadata.track_ssm_h_src is None
+        or forward_metadata.track_ssm_h_src.numel() == 0
+    ):
+        return
+
+    checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
+    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+    relative_track_lens = forward_batch.mamba_track_seqlens.to(
+        device="cpu", dtype=torch.int64
+    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+
+    checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
+    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
+    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
+
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+    track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
+        relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
+    )
+    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+
+    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+        device, non_blocking=True
+    )
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+        device, non_blocking=True
+    )
+    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
 def _get_flashinfer_gdn_kernels():
@@ -89,8 +137,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
     SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
 
-    Requires flashinfer >= 0.6.7.
+    Requires flashinfer >= 0.6.14.
     """
+
+    uses_state_checkpoints = True
 
     def __init__(self):
         (
@@ -231,6 +281,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -253,23 +306,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            # Pre-allocate bf16 output_state so the kernel compiles and writes the
-            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
-            # fp32->bf16 conversion in the scatter step.
-            output_state_fi = torch.empty_like(initial_state_fi)
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc,  # already int32
-                use_qk_l2norm_in_kernel=False,
-                output_state=output_state_fi,
-            )
+            cu_seqlens = query_start_loc  # already int32
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
@@ -279,18 +316,33 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ).to(torch.int64)
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc.to(torch.int64),
-                use_qk_l2norm_in_kernel=False,
+            cu_seqlens = query_start_loc.to(torch.int64)
+
+        # Keep final state and checkpoints in the same kernel state dtype.
+        output_state_fi = torch.empty_like(initial_state_fi)
+        state_checkpoints = (
+            initial_state_fi.new_empty(
+                (num_state_checkpoints, *initial_state_fi.shape[1:])
             )
+            if num_state_checkpoints > 0
+            else None
+        )
+        output_fi, output_state_fi = self._prefill_fn(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=initial_state_fi,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output_state=output_state_fi,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=state_checkpoint_cu_starts,
+            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+        )
 
         # Write back state to pool
         ssm_states.index_copy_(
@@ -302,9 +354,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
-        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
-        # h=None since FlashInfer doesn't provide intermediate states.
-        return core_attn_out, None, None
+        # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
+        h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
+        return core_attn_out, None, h
 
     # ---- target_verify (MTP) ----
 

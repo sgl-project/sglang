@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        flash_attn_varlen_fp8_pertensor_func,
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
@@ -148,8 +149,8 @@ class AiterAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -857,6 +858,11 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
+        verify_tokens_per_req = (
+            forward_batch.input_ids.shape[0] // forward_batch.batch_size
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -866,6 +872,7 @@ class AiterAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            verify_tokens_per_req=verify_tokens_per_req,
         )
 
         # Refill the SWA write-target buffer from the live out_cache_loc and
@@ -1196,8 +1203,8 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
+                draft_num = forward_batch.input_ids.shape[0] // bs
                 bs = len(forward_batch.req_pool_indices)
-                draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
                     page_table, qo_indptr, max_q_len, swa_page_table = (
@@ -1500,6 +1507,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        verify_tokens_per_req: Optional[int],
     ):
 
         num_kv_splits = None
@@ -1652,11 +1660,17 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
+            assert verify_tokens_per_req is not None
+            # MLA uses a fixed draft length (num_draft_tokens); the non-MLA
+            # unified path derives it per batch from input_ids.
+            tokens_per_req = (
+                self.num_draft_tokens if self.use_mla else verify_tokens_per_req
+            )
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * tokens_per_req,
+                step=tokens_per_req,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1689,9 +1703,9 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = self.num_draft_tokens
 
             if self.use_mla:
+                max_q_len = self.num_draft_tokens
                 if _use_mla_ps_kernel:
                     num_kv_splits = self.max_split_per_batch
 
@@ -1735,6 +1749,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
                     max_num_blocks_per_seq = (
                         self.max_context_len + self.page_size - 1
@@ -1753,7 +1768,7 @@ class AiterAttnBackend(AttentionBackend):
                             bs,
                             seq_lens,
                             req_pool_indices,
-                            self.num_draft_tokens,
+                            verify_tokens_per_req,
                             page_table_dest=page_table,
                             swa_page_table_dest=swa_page_table,
                         )
@@ -2278,7 +2293,9 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
+                        seqused_k=(
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -2320,6 +2337,42 @@ class AiterAttnBackend(AttentionBackend):
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
+
+            if (
+                is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+                and self.kv_cache_dtype == fp8_dtype
+            ):
+                q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                fp8_q_descale = (
+                    layer.k_scale if layer.k_scale is not None else self.k_scale
+                )
+                o = flash_attn_varlen_fp8_pertensor_func(
+                    q_c.to(fp8_dtype),
+                    k_c.to(fp8_dtype),
+                    v_c.to(fp8_dtype),
+                    fp8_q_descale.reshape(1),
+                    k_descale.reshape(1),
+                    v_descale.reshape(1),
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
