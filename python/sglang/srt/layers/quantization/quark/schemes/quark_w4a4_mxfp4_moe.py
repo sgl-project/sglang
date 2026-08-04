@@ -44,6 +44,14 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
+    # a16w4 (bf16 activations + fp4 weights) fp4_bf16 FlyDSL path. Uses the
+    # unified aiter shuffle API (finalized aiter #4398): klane_inner is tied to
+    # INTERLEAVE mode. Guarded so older aiter builds fall back to a4w4.
+    try:
+        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+    except ImportError:
+        shuffle_scale_a16w4 = shuffle_weight_a16w4 = None
+
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
@@ -574,6 +582,46 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
+        # a16w4 (bf16 activations, fp4 weights). The fp4_bf16 FlyDSL kernels unpack
+        # the weights with v_cvt_scalef32_pk_bf16_fp4, which needs the
+        # fp4-cvt-scale-insts target feature -- gfx950 only -- so the hardware check
+        # is the gate. Layout follows the aiter #4398 recipe: w13 gate/up-interleaved
+        # with klane_inner=True, w2 on the default layout, scales through
+        # shuffle_scale_a16w4 rather than e8m0_shuffle.
+        _use_a16w4 = (
+            _use_aiter and is_gfx95_supported() and shuffle_weight_a16w4 is not None
+        )
+        if _use_a16w4:
+            E = layer.w13_weight.shape[0]
+            logger.info("[quark a16w4] INTERLEAVE fp4_bf16 (klane_inner) weight prep")
+
+            s0, s1, _ = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = shuffle_scale_a16w4(
+                layer.w13_weight_scale.view(s0 * s1, -1), E, True, klane_inner=True
+            ).view(s0, s1, -1)
+            s0, s1, _ = layer.w2_weight_scale.shape
+            # w2 keeps the default layout: klane_inner is a stage1 gate/up-interleave
+            # concept, and aiter rejects it on stage2 (ROCm/aiter#4548).
+            layer.w2_weight_scale.data = shuffle_scale_a16w4(
+                layer.w2_weight_scale.view(s0 * s1, -1), E, False, klane_inner=False
+            ).view(s0, s1, -1)
+
+            layer.w13_weight.data = shuffle_weight_a16w4(
+                layer.w13_weight.contiguous(), 16, True, klane_inner=True
+            )
+            layer.w2_weight.data = shuffle_weight_a16w4(
+                layer.w2_weight.contiguous(), 16, False, klane_inner=False
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+            layer.w13_weight.is_guinterleave = True
+
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -639,6 +687,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if hasattr(layer.w13_weight, "is_shuffled"):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
+
+        # `.view()` above returns fresh tensors, so re-tag the gate/up-interleaved
+        # layout. The aiter runner reads this to pick gate_mode, and aiter itself
+        # only sees it when the call stays in eager mode.
+        if getattr(layer.w13_weight, "is_guinterleave", False):
+            w13_weight.is_guinterleave = True
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
