@@ -17,6 +17,8 @@
 
 set -e
 source ~/.bashrc 2>/dev/null || true
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROXY_SCRIPT="$SCRIPT_DIR/sglang_proxy.py"
 
 # ==================== 参数 ====================
 PORT=8000
@@ -42,6 +44,7 @@ KEEP_ALIVE=false
 KEEP_ALIVE_INTERVAL=45
 LOAD_BALANCE_METHOD=round_robin
 ENABLE_PRIORITY=false
+PROXY_PORT=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
         --keep-alive-interval) KEEP_ALIVE_INTERVAL="$2"; shift 2 ;;
         --load-balance-method) LOAD_BALANCE_METHOD="$2"; shift 2 ;;
         --priority-scheduling) ENABLE_PRIORITY=true; shift ;;
+        --proxy-port) PROXY_PORT="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -156,6 +160,7 @@ echo " schedule-policy: $SCHEDULE_POLICY  预热: $([ "$SKIP_WARMUP" = true ] &&
 echo " keep-alive: $([ "$KEEP_ALIVE" = true ] && echo "on 每${KEEP_ALIVE_INTERVAL}s" || echo off)"
 echo " load-balance: $LOAD_BALANCE_METHOD (DP 路由; round_robin 避免前缀粘滞热点)"
 echo " priority-scheduling: $([ "$ENABLE_PRIORITY" = true ] && echo on || echo off)"
+echo " proxy: $([ "$PROXY_PORT" != "0" ] && echo "on 端口$PROXY_PORT (限并发+priority)" || echo off)"
 echo "=========================================="
 
 # ==================== 常驻 keep-alive ====================
@@ -176,8 +181,25 @@ if [ "$KEEP_ALIVE" = true ]; then
         done
     ) &
     KEEP_ALIVE_PID=$!
-    trap 'kill $KEEP_ALIVE_PID 2>/dev/null || true' EXIT
 fi
+
+# ==================== 前置代理（限并发 + 注入 priority） ====================
+# 客户端连代理端口，代理转发到本机 SGLang；仅启动脚本层改动即可生效
+if [ "$PROXY_PORT" != "0" ]; then
+    (
+        for i in $(seq 1 120); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PORT/v1/models" && break
+            sleep 5
+        done
+        exec python3.12 "$PROXY_SCRIPT" --backend "http://127.0.0.1:$PORT" --listen "$PROXY_PORT"
+    ) &
+    PROXY_PID=$!
+fi
+
+MANAGED_PIDS=""
+[ -n "$KEEP_ALIVE_PID" ] && MANAGED_PIDS="$MANAGED_PIDS $KEEP_ALIVE_PID"
+[ -n "$PROXY_PID" ] && MANAGED_PIDS="$MANAGED_PIDS $PROXY_PID"
+trap 'kill $MANAGED_PIDS 2>/dev/null || true' EXIT
 
 # K8s pod 内 GPU_IDS 为空时沿用环境已有的 CUDA_VISIBLE_DEVICES（否则空值会禁用全部 GPU）
 CUDA_VISIBLE_DEVICES=${GPU_IDS:-$CUDA_VISIBLE_DEVICES} python3.12 -m sglang.launch_server \

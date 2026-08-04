@@ -741,6 +741,7 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - 语义：priority 值越高越先调度（默认）；可选 `--disable-priority-preemption` 控制是否抢占；
 - 注意：priority **只改队列顺序，不改 GPU 计算份额**，网关限并发不能省。
 - 落地：`sglang_start.sh` 已内置 `--priority-scheduling` 开关（启用时自动切 `--schedule-policy priority` 并加 `--enable-priority-scheduling --default-priority-value 0`）。
+- **只改启动脚本层的完整方案**：`sglang_start.sh --proxy-port 8080` 会在脚本内同时拉起 [sglang_proxy.py](appendix/sglang_proxy.py) 前置代理——客户端连代理端口，代理按类型限并发（tool call 8 / thinking 12，超时 429）、给 tool call 注入 `priority=10` 后转发到本机 SGLang；流式响应期间持续占用槽位。代理代码与脚本同目录，随镜像持久化。
 
 **请求侧**：
 
