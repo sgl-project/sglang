@@ -6,11 +6,11 @@ import os
 import pickle
 import time
 import traceback
-from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import aiohttp
+import msgspec
 import numpy as np
 import torch
 import zmq
@@ -223,9 +223,10 @@ class InternalError(MMError):
         super().__init__(message, code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
-@dataclass
-class EncodeContext:
-    req_id: str
+class EncodeContext(msgspec.Struct):
+    """One flattened encode batch; a single request is the N=1 case."""
+
+    req_id: str  # first request's id, for cache prefetch keys and logs
     modality: Modality
     mm_inputs: dict
     get_feature_fn: Any
@@ -233,6 +234,7 @@ class EncodeContext:
     token_counts: List[int]
     mm_feature: Any
     num_items: int
+    items_per_req: List[int]  # grid entries per request, in flatten order
     aux_data: dict
     str_mm_hashes: Optional[List[str]]
     use_global_cache: bool
@@ -665,7 +667,6 @@ class MMEncoder:
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
         grid_thw: Optional[List] = None,
-        keep_on_gpu: bool = False,
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
@@ -716,8 +717,6 @@ class MMEncoder:
         forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn([mm_item])
-            if not keep_on_gpu:
-                new_embeddings = new_embeddings.cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
         if encoder_metrics_collector is not None:
@@ -729,36 +728,40 @@ class MMEncoder:
 
     async def _prepare_encode_context(
         self,
-        mm_items,
+        requests: List[dict],
         modality: Modality,
-        req_id: str,
-        hashes: Optional[List[str]] = None,
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
     ) -> EncodeContext:
+        """Flatten a batch of requests into one EncodeContext (single = N of 1)."""
         modality_str = modality.name.lower()
         preprocess_start = time.perf_counter()
         try:
-            mm_inputs, token_counts = await self.preprocessor.process_mm_items(
-                mm_items, modality
+            mm_inputs, token_counts, items_per_req = (
+                await self.preprocessor.process_batch_mm_items(requests, modality)
             )
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
 
+        if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
+            raise InternalError(
+                f"Invalid batch layout {items_per_req} for {len(requests)} requests"
+            )
+
         if encoder_metrics_collector is not None and not is_health_check:
-            item_count = len(token_counts)
             encoder_metrics_collector.observe_preprocess(
                 time.perf_counter() - preprocess_start,
                 modality=modality_str,
             )
-            encoder_metrics_collector.observe_mm_items_per_request(
-                item_count, modality=modality_str
-            )
+            for item_count in items_per_req:
+                encoder_metrics_collector.observe_mm_items_per_request(
+                    item_count, modality=modality_str
+                )
             encoder_metrics_collector.observe_mm_items_per_batch(
-                item_count, modality=modality_str
+                sum(items_per_req), modality=modality_str
             )
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_fn = getattr(target, f"get_{modality_str}_feature")
@@ -766,6 +769,11 @@ class MMEncoder:
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
+        if num_items != sum(items_per_req):
+            raise InternalError(
+                f"Batch layout {items_per_req} expects {sum(items_per_req)} "
+                f"grids, but the processor produced {num_items}"
+            )
         if len(token_counts) != num_items:
             raise InternalError(
                 f"Preprocessor returned {len(token_counts)} token counts for "
@@ -774,27 +782,30 @@ class MMEncoder:
 
         str_mm_hashes = None
         if use_global_cache:
-            # Hashes must be grid-space; a leaf-space list would size-mismatch
-            # rank>0's mask (zeros(num_items)) and deadlock TP.
-            if hashes is not None and len(hashes) != num_items:
-                raise BadRequestError(
-                    f"User-supplied hashes length {len(hashes)} != grid count "
-                    f"{num_items} for {self.model_type}/{modality.name}; hashes "
-                    f"must be in grid space (1 per encoder grid entry)."
-                )
-
+            # Hashes must be grid-space per request (a leaf-space list would
+            # size-mismatch rank>0's mask and deadlock TP); validate on every
+            # rank so a bad request fails symmetrically before any collective.
+            per_req_hashes = [req.get("hashes") for req in requests]
+            mm_hashes = None
+            if all(h is not None for h in per_req_hashes):
+                for req, hashes, n in zip(requests, per_req_hashes, items_per_req):
+                    if len(hashes) != n:
+                        raise BadRequestError(
+                            f"User-supplied hashes length {len(hashes)} != grid "
+                            f"count {n} for req {req['req_id']}; hashes must be "
+                            f"grid-space (1 per encoder grid entry)."
+                        )
+                mm_hashes = [h for hashes in per_req_hashes for h in hashes]
             if self.rank == 0:
-                if hashes is None:
+                if mm_hashes is None:
                     mm_hashes = self._calculate_hashes_from_features(
                         mm_feature, grid_thw, modality
                     )
-                else:
-                    mm_hashes = hashes
                 # Embedding stores use string cache keys.
                 str_mm_hashes = [str(h) for h in mm_hashes]
 
         return EncodeContext(
-            req_id=req_id,
+            req_id=requests[0]["req_id"],
             modality=modality,
             mm_inputs=mm_inputs,
             get_feature_fn=get_feature_fn,
@@ -802,6 +813,7 @@ class MMEncoder:
             token_counts=token_counts,
             mm_feature=mm_feature,
             num_items=num_items,
+            items_per_req=items_per_req,
             aux_data=_build_mm_aux_data(mm_inputs, self.model_type),
             str_mm_hashes=str_mm_hashes,
             use_global_cache=use_global_cache,
@@ -1049,7 +1061,6 @@ class MMEncoder:
                 ctx.modality,
                 ctx.get_feature_fn,
                 ctx.grid_thw,
-                keep_on_gpu=True,
             )
 
         miss_d2h_handles = []
@@ -1079,7 +1090,6 @@ class MMEncoder:
                 ctx.modality,
                 ctx.get_feature_fn,
                 ctx.grid_thw,
-                keep_on_gpu=True,
             )
             if self.rank == 0 and not keep_on_gpu:
                 fallback_hashes = [ctx.str_mm_hashes[i] for i in fallback_indices]
@@ -1154,10 +1164,13 @@ class MMEncoder:
                 mm_item.set(k, _convert(v))
 
             cache_hit = False
+            # The prefix cache hashes the whole request; a fused multi-request
+            # batch has no per-request key, so only N=1 contexts use it.
             use_mm_cache = (
                 self.server_args.enable_prefix_mm_cache
                 and not ctx.is_health_check
                 and not keep_on_gpu
+                and len(ctx.items_per_req) == 1
             )
             if use_mm_cache:
                 mm_item.set_pad_value()
@@ -1374,43 +1387,6 @@ class MMEncoder:
                 backend=self.server_args.encoder_transfer_backend,
             )
 
-    async def _encode_zmq(
-        self,
-        ctx: EncodeContext,
-        num_parts: int,
-        part_idx: int,
-    ):
-        """Compute synchronously and stage a CPU embedding for ZMQ transfer."""
-        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=False)
-
-        if self.profiler is not None:
-            self.profiler.step()
-
-        if self.rank == 0:
-            if mm_embedding is None:
-                raise InternalError(
-                    f"Rank 0 produced no embedding for request {ctx.req_id}"
-                )
-            mm_data = EmbeddingData(
-                ctx.req_id,
-                num_parts,
-                part_idx,
-                ctx.grid_thw,
-                ctx.modality,
-                mm_embedding,
-                **ctx.aux_data,
-            )
-            self.embedding_to_send[ctx.req_id] = mm_data
-        if mm_embedding is None:
-            return (0, 0, 0, None, None)
-        return (
-            mm_embedding.nbytes,
-            mm_embedding.shape[0],
-            mm_embedding.shape[1],
-            None,
-            None,
-        )
-
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
         try:
@@ -1422,275 +1398,67 @@ class MMEncoder:
                 f"falling back to per-/send register: {reg_err}"
             )
 
-    def _handle_mooncake_encode_error(
-        self, req_id, num_parts, part_idx, modality, error_msg, error_code
-    ):
-        """Stage an error EmbeddingData so /send reports the encode failure."""
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                None,
-                modality,
-                error_msg=error_msg,
-                error_code=error_code,
-            )
-            self.embedding_to_send[req_id] = mm_data
-        return 0, 0, 0, error_msg, error_code
-
-    async def _encode_mooncake(
+    def _stage_embeddings(
         self,
         ctx: EncodeContext,
-        num_parts: int,
-        part_idx: int,
-    ):
-        """Compute synchronously and stage a GPU embedding for RDMA transfer.
-
-        Returning only after the forward means every later /send finds it staged.
-        """
-        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=True)
-        # transfer_sync bypasses CUDA streams, so GPU writes must land first.
-        if mm_embedding is not None and mm_embedding.is_cuda:
-            torch.cuda.current_stream(mm_embedding.device).synchronize()
-
-        if self.profiler is not None:
-            self.profiler.step()
-
-        if self.rank != 0:
-            return (0, 0, 0, None, None)
-
-        if mm_embedding is None:
-            raise InternalError(
-                f"Rank 0 produced no embedding for request {ctx.req_id}"
-            )
-        mm_data = EmbeddingData(
-            ctx.req_id,
-            num_parts,
-            part_idx,
-            ctx.grid_thw,
-            ctx.modality,
-            mm_embedding,
-            **ctx.aux_data,
-        )
-        # Global-cache embeddings keep registering per /send instead.
-        if not ctx.use_global_cache:
-            self._register_shared_mr(mm_data, mm_embedding)
-        self.embedding_to_send[ctx.req_id] = mm_data
-        return (
-            mm_embedding.nbytes,
-            mm_embedding.shape[0],
-            mm_embedding.shape[1],
-            None,
-            None,
-        )
-
-    async def encode(
-        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
-    ):
-        """Encode one request through the configured transfer backend.
-
-        Global cache lookup is an optional compute stage. Health probes bypass
-        both global and prefix caches and run synchronously, so completion
-        confirms a model forward even when Mooncake is configured.
-        """
-        is_health_check = is_health_check_request(req_id)
-        use_mooncake = (
-            self.server_args.encoder_transfer_backend == "mooncake"
-            and not is_health_check
-        )
-        try:
-            use_global_cache = self.mm_global_cache is not None and not is_health_check
-            ctx = await self._prepare_encode_context(
-                mm_items,
-                modality,
-                req_id,
-                hashes,
-                use_global_cache=use_global_cache,
-                is_health_check=is_health_check,
-            )
-            if use_mooncake:
-                return await self._encode_mooncake(
-                    ctx,
-                    num_parts,
-                    part_idx,
-                )
-            return await self._encode_zmq(
-                ctx,
-                num_parts,
-                part_idx,
-            )
-        except Exception as e:
-            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
-            error_msg = str(e)
-            logger.error(
-                f"Rank {self.rank} encode failed: {error_msg} {error_code = }",
-                exc_info=use_mooncake,
-            )
-            if use_mooncake:
-                return self._handle_mooncake_encode_error(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    modality,
-                    error_msg,
-                    error_code,
-                )
-            if self.rank == 0:
-                mm_data = EmbeddingData(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    None,
-                    modality,
-                    error_msg=error_msg,
-                    error_code=error_code,
-                )
-                self.embedding_to_send[req_id] = mm_data
-                logger.debug(f"Created error EmbeddingData: {mm_data}")
-            return 0, 0, 0, error_msg, error_code
-
-    async def encode_request(self, req: dict, modality: Modality):
-        """Adapt a request dictionary to the single-request encode interface."""
-        return await self.encode(
-            mm_items=req["mm_items"],
-            modality=modality,
-            req_id=req["req_id"],
-            num_parts=req["num_parts"],
-            part_idx=req["part_idx"],
-            hashes=req.get("hashes"),
-        )
-
-    async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        requests: List[dict],
+        mm_embedding: Optional[torch.Tensor],
+        *,
+        keep_on_gpu: bool,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). No cache path."""
-        try:
-            preprocess_start = time.perf_counter()
-            mm_inputs, token_counts, items_per_req = (
-                await self.preprocessor.process_batch_mm_items(requests, modality)
-            )
-            if encoder_metrics_collector is not None:
-                encoder_metrics_collector.observe_preprocess(
-                    time.perf_counter() - preprocess_start,
-                    modality=modality.name.lower(),
-                )
-            target = (
-                self.model.thinker if hasattr(self.model, "thinker") else self.model
-            )
-            get_feat = getattr(target, f"get_{modality.name.lower()}_feature")
-        except NotImplementedError as e:
-            return self._batch_set_error(
-                requests, modality, InternalError(f"Not implemented error: {e}")
-            )
-        except Exception as e:
-            return self._batch_set_error(
-                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
-            )
+        """Split the fused embedding per request and stage one EmbeddingData each.
 
-        if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
-            return self._batch_set_error(
-                requests,
-                modality,
-                InternalError(
-                    f"Invalid batch layout {items_per_req} for {len(requests)} requests"
-                ),
-            )
+        Per-request token ranges are contiguous in flatten order, so each
+        staged embedding is a slice of the batch tensor.
+        """
+        if self.rank != 0:
+            return [(0, 0, 0, None, None)] * len(requests)
+        if mm_embedding is None:
+            raise InternalError(f"Rank 0 produced no embedding for {ctx.req_id}")
 
-        total = sum(items_per_req)
-        if len(token_counts) != total:
-            return self._batch_set_error(
-                requests,
-                modality,
-                InternalError(
-                    f"Preprocessor returned {len(token_counts)} token counts for "
-                    f"batch layout {items_per_req}"
-                ),
+        results = []
+        item_offset = 0
+        token_offset = 0
+        for req, num_items in zip(requests, ctx.items_per_req):
+            num_tokens = sum(ctx.token_counts[item_offset : item_offset + num_items])
+            embedding = mm_embedding[token_offset : token_offset + num_tokens]
+            if keep_on_gpu and len(requests) > 1:
+                # A view would pin the whole batch tensor until the last transfer.
+                embedding = embedding.clone()
+            mm_data = EmbeddingData(
+                req["req_id"],
+                req["num_parts"],
+                req["part_idx"],
+                ctx.grid_thw[item_offset : item_offset + num_items],
+                ctx.modality,
+                embedding,
+                **ctx.aux_data,
             )
-        if encoder_metrics_collector is not None:
-            modality_str = modality.name.lower()
-            for n in items_per_req:
-                encoder_metrics_collector.observe_mm_items_per_request(
-                    n, modality=modality_str
-                )
-            encoder_metrics_collector.observe_mm_items_per_batch(
-                total, modality=modality_str
+            # Global-cache embeddings keep registering per /send instead.
+            if keep_on_gpu and not ctx.use_global_cache:
+                self._register_shared_mr(mm_data, embedding)
+            self.embedding_to_send[req["req_id"]] = mm_data
+            results.append(
+                (embedding.nbytes, embedding.shape[0], embedding.shape[1], None, None)
             )
+            item_offset += num_items
+            token_offset += num_tokens
 
-        try:
-            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
-            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
-            if len(grid_dim) != total:
-                return self._batch_set_error(
-                    requests,
-                    modality,
-                    InternalError(
-                        f"Grid count mismatch for {self.model_type}/"
-                        f"{modality.name}: {len(requests)} requests expected "
-                        f"{total} grids "
-                        f"(per-req {items_per_req}), but processor produced "
-                        f"{len(grid_dim)}. Processor batch layout must report "
-                        f"one entry per encoder grid."
-                    ),
-                )
+        # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
+        # per-request clones) must land before /send reads the buffers.
+        if keep_on_gpu and mm_embedding.is_cuda:
+            torch.cuda.current_stream(mm_embedding.device).synchronize()
+        return results
 
-            keep_on_gpu = self.server_args.encoder_transfer_backend == "mooncake"
-            final_slices = self._encode_missing(
-                mm_feature,
-                mm_inputs,
-                list(range(total)),
-                token_counts,
-                modality,
-                get_feat,
-                keep_on_gpu=keep_on_gpu,
-            )
-
-            if self.profiler is not None:
-                for _ in requests:
-                    self.profiler.step()
-            # No aux_data here: batch_encode only handles IMAGE/AUDIO
-            # (_BATCHABLE_MODALITIES), and _build_mm_aux_data only extracts
-            # video-meta fields — which never appear in image/audio mm_inputs.
-            results = []
-            offset = 0
-            staged_device = None
-            for req, n in zip(requests, items_per_req):
-                slices = final_slices[offset : offset + n]
-                if n > 1:
-                    emb = torch.cat(slices, dim=0)
-                else:
-                    # A view would pin the whole batch tensor until the last transfer.
-                    emb = slices[0].clone() if keep_on_gpu else slices[0]
-                if self.rank == 0:
-                    mm_data = EmbeddingData(
-                        req["req_id"],
-                        req["num_parts"],
-                        req["part_idx"],
-                        grid_dim[offset : offset + n],
-                        modality,
-                        emb,
-                    )
-                    if keep_on_gpu:
-                        self._register_shared_mr(mm_data, emb)
-                    self.embedding_to_send[req["req_id"]] = mm_data
-                if keep_on_gpu and emb.is_cuda:
-                    staged_device = emb.device
-                results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
-                offset += n
-            if staged_device is not None:
-                torch.cuda.current_stream(staged_device).synchronize()
-            return results
-        except Exception as e:
-            return self._batch_set_error(
-                requests, modality, InternalError(f"Internal encoding error: {e}")
-            )
-
-    def _batch_set_error(
+    def _stage_errors(
         self, requests: List[dict], modality: Modality, exc: Exception
-    ) -> List[Tuple[int, int, int, str, int]]:
-        code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Stage one error EmbeddingData per request so /send reports the failure."""
+        code = (
+            exc.code if isinstance(exc, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
+        )
         msg = str(exc)
-        logger.error(f"Rank {self.rank} batch_encode failed: {msg} {code = }")
+        logger.error(f"Rank {self.rank} encode failed: {msg} {code = }", exc_info=True)
         if self.rank == 0:
             for req in requests:
                 self.embedding_to_send[req["req_id"]] = EmbeddingData(
@@ -1703,6 +1471,70 @@ class MMEncoder:
                     error_code=code,
                 )
         return [(0, 0, 0, msg, code)] * len(requests)
+
+    async def batch_encode(
+        self, requests: List[dict], modality: Modality
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Encode requests through one fused pipeline; encode() is the N=1 case.
+
+        Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
+        bypass caches and stage on CPU so completion confirms a model forward.
+        """
+        is_health_check = all(
+            is_health_check_request(req["req_id"]) for req in requests
+        )
+        keep_on_gpu = (
+            self.server_args.encoder_transfer_backend == "mooncake"
+            and not is_health_check
+        )
+        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        try:
+            ctx = await self._prepare_encode_context(
+                requests,
+                modality,
+                use_global_cache=use_global_cache,
+                is_health_check=is_health_check,
+            )
+            mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+
+            if self.profiler is not None:
+                for _ in requests:
+                    self.profiler.step()
+
+            return self._stage_embeddings(
+                ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
+            )
+        except Exception as e:
+            return self._stage_errors(requests, modality, e)
+
+    async def encode(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
+        """Encode one request: the batch-of-1 case of batch_encode."""
+        results = await self.batch_encode(
+            [
+                {
+                    "req_id": req_id,
+                    "num_parts": num_parts,
+                    "part_idx": part_idx,
+                    "mm_items": mm_items,
+                    "hashes": hashes,
+                }
+            ],
+            modality,
+        )
+        return results[0]
+
+    async def encode_request(self, req: dict, modality: Modality):
+        """Adapt a request dictionary to the single-request encode interface."""
+        return await self.encode(
+            mm_items=req["mm_items"],
+            modality=modality,
+            req_id=req["req_id"],
+            num_parts=req["num_parts"],
+            part_idx=req["part_idx"],
+            hashes=req.get("hashes"),
+        )
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -1906,20 +1738,9 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
             request["requests"],
             Modality.from_str(request["modality"]),
         )
-    elif (
-        isinstance(request, dict)
-        and isinstance(request.get("req_id"), str)
-        and request["req_id"].startswith(HEALTH_CHECK_RID_PREFIX)
-    ):
-        await encoder.encode(
-            mm_items=request["mm_items"],
-            modality=Modality.from_str(request["modality"]),
-            req_id=request["req_id"],
-            num_parts=request["num_parts"],
-            part_idx=request["part_idx"],
-            hashes=request.get("hashes"),
-        )
     else:
+        # Health-check rids need no special routing: batch_encode derives
+        # health semantics from the rid prefix itself.
         await encoder.encode_request(request, Modality.from_str(request["modality"]))
 
 
