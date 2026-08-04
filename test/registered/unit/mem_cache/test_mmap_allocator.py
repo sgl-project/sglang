@@ -25,6 +25,59 @@ class TestMmapAllocator(unittest.TestCase):
         # Verify it has mapped memory address
         self.assertGreater(tensor.data_ptr(), 0)
 
+    def test_alloc_mmap_hugepage_modes(self):
+        import ctypes
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+        from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+            MEM_BACKEND_HUGEPAGE,
+            MEM_BACKEND_MMAP,
+            tensor_mem_backend,
+        )
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("off"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(mmap_allocator, "_alloc_hugepage") as mock_hp:
+                    mock_hp.return_value = (ctypes.c_uint8 * 16)()
+                    buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_HUGEPAGE)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "_alloc_hugepage",
+                    side_effect=OSError("no hugepages"),
+                ):
+                    with patch.object(mmap_allocator, "_libc", object()):
+                        buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "_alloc_hugepage",
+                    side_effect=OSError("no hugepages"),
+                ):
+                    with patch.object(mmap_allocator, "_libc", object()):
+                        with patch.object(mmap_allocator.mmap, "mmap") as plain_mmap:
+                            with self.assertRaisesRegex(RuntimeError, "no hugepages"):
+                                mmap_allocator.alloc_mmap((4,), torch.float32)
+                            plain_mmap.assert_not_called()
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+                    mmap_allocator.alloc_mmap((4,), torch.float32)
+
     def test_alloc_shm(self):
         dims = (10, 1024)
         dtype = torch.float32
