@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -91,7 +92,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -99,6 +100,7 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
@@ -174,8 +176,12 @@ def build_replay_fb_view(
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
-        # when mamba-track is disabled.
-        mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
+        # when mamba-track is disabled, slice to [:bs] like every other buffer
+        mamba_track_indices=(
+            None
+            if buffers.mamba_track_indices is None
+            else buffers.mamba_track_indices[:bs]
+        ),
         spec_info=forward_batch.spec_info,
     )
 
@@ -245,19 +251,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
-            model_runner.server_args.speculative_num_steps
+            get_spec().speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
         self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
+            get_spec().speculative_num_draft_tokens
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
 
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width.
         self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
@@ -302,10 +308,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "tier); disable SGLANG_RAGGED_VERIFY_MODE or the conflicting "
                 "feature."
             )
-
-        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if self.enable_return_hidden_states:
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -556,19 +558,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        requested_capture_hidden_mode = max(
-            forward_batch.capture_hidden_mode,
-            (
-                forward_batch.spec_info.capture_hidden_mode
-                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-                is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-        capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
-        )
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
@@ -586,7 +575,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
-            and capture_hidden_mode_matches
             and is_ngram_supported
         )
 
@@ -609,18 +597,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        requested_capture_hidden_mode = max(
-            forward_batch.capture_hidden_mode,
-            (
-                forward_batch.spec_info.capture_hidden_mode
-                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-                is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
         capture_hidden_mode_matches = (
-            requested_capture_hidden_mode == CaptureHiddenMode.NULL
-            or requested_capture_hidden_mode == self.capture_hidden_mode
+            forward_batch.capture_hidden_mode <= self.capture_hidden_mode
         )
 
         return (
@@ -750,10 +728,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_dp_buffer_len = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
+        self.capture_hidden_mode = get_required_capture_hidden_mode(
+            self.capture_hidden_mode,
+            spec_info,
+        )
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -1022,38 +1000,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
-
-        # If the required capture_hidden_mode changes, we need to recapture the graph
-
-        # These are the different factors that can influence the capture_hidden_mode
-        capture_hidden_mode_required_by_forward_batch = (
-            forward_batch.capture_hidden_mode
-        )
-        capture_hidden_mode_required_by_spec_info = (
-            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
-            or CaptureHiddenMode.NULL
-        )
-        capture_hidden_mode_required_for_returning_hidden_states = (
-            CaptureHiddenMode.FULL
-            if self.enable_return_hidden_states
-            else CaptureHiddenMode.NULL
-        )
-
-        # Determine the highest capture_hidden_mode required
-        # (If we have FULL, we can emulate LAST or NULL)
-        # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
-            capture_hidden_mode_required_by_forward_batch,
-            capture_hidden_mode_required_by_spec_info,
-            capture_hidden_mode_required_for_returning_hidden_states,
-        )
-
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.backend.cleanup()
-            self.capture()
+    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
+            raise RuntimeError(
+                "The runtime hidden-state mode exceeds the fixed CUDA graph "
+                f"capture mode ({self.capture_hidden_mode.name})."
+            )
 
     def load_batch(
         self,
@@ -1103,7 +1055,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
 
         buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
+        self._validate_capture_hidden_mode(forward_batch)
 
         raw_bs = forward_batch.batch_size
 
@@ -1212,12 +1164,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        timer_ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={"category": forward_batch.forward_mode.name.lower()}
-            )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
+        timer_ctx = device_timer_ctx(
+            self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
         # Publish a read-done event for the WAR barrier: a cuda-graph forward
         # finishes its shared req_to_token / SWA reads at this pre-replay

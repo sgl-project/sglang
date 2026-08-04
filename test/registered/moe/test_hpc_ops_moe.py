@@ -3,7 +3,7 @@
 Compares the hpc_ops fused func (hpc.fuse_moe_blockwise) against the triton
 fused_experts reference and an fp32 exact reference on realistic blockwise
 FP8 quantized weights. Skipped when HPC-Ops (https://github.com/Tencent/hpc-ops)
-is not installed or the GPU is older than sm90.
+is not installed or the GPU is not SM90 (the kernels ship sm90a only).
 """
 
 import os
@@ -35,11 +35,11 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 E, TOPK, H, I = 128, 8, 2048, 768
 
 
-def _sm90_or_newer() -> bool:
+def _sm90() -> bool:
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+    return major == 9
 
 
 def _ensure_dist_initialized() -> None:
@@ -76,8 +76,8 @@ def _quant_blockwise(w: torch.Tensor, block: int = 128):
 
 
 @unittest.skipUnless(
-    has_hpc_ops() and _sm90_or_newer(),
-    "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and sm90+",
+    has_hpc_ops() and _sm90(),
+    "requires HPC-Ops (install from source: https://github.com/Tencent/hpc-ops) and an SM90 (Hopper) GPU",
 )
 class TestHpcOpsMoeBlockwise(CustomTestCase):
 
