@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -583,6 +584,43 @@ def compute_dflash_correct_drafts_and_bonus(
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len, bonus.to(torch.int64)
+
+
+def apply_dflash_simulated_acceptance(
+    *,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    simulate_acc_token_mode: str,
+    fixed_token_id: int = 100,
+) -> None:
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
+    block_size = candidates.shape[1]
+
+    # _sample_simulated_acc_len clamps to [1, block_size].
+    forced_commit_len = _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, block_size
+    )
+    forced_accept_len = forced_commit_len - 1
+
+    accept_len.fill_(forced_accept_len)
+    commit_lens.fill_(forced_commit_len)
+
+    if simulate_acc_token_mode != "real-draft-token":
+        bonus.fill_(fixed_token_id)
+        out_tokens.fill_(fixed_token_id)
+        return
+
+    out_tokens.zero_()
+    if forced_accept_len > 0:
+        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
+    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

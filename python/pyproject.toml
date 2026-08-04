@@ -33,7 +33,7 @@ dependencies = [
   "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.15.post1", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "helion==0.2.6",
+  "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
@@ -199,6 +199,12 @@ killall_sglang = "sglang.cli.killall:main"
   "multimodal_gen/apps/realtime_webui/**/*"
 ]
 
+[tool.setuptools.exclude-package-data]
+"sglang" = [
+  "kernels/aot/*",
+  "kernels/aot/**/*",
+]
+
 [tool.setuptools.packages.find]
 exclude = [
   "assets*",
@@ -207,6 +213,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang.kernels.aot*",
   "tests*",
 ]
 
@@ -218,6 +225,7 @@ exclude = [
   "dist*",
   "playground*",
   "scripts*",
+  "sglang/kernels/aot*",
   "tests*",
 ]
 
