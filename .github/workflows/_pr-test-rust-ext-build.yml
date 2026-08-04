@@ -150,8 +150,17 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Same path ci_install_dependency.sh uses: one warm cargo cache per host.
+          # Same path ci_install_dependency.sh uses, so a runner that also runs test
+          # stages keeps one warm cache. Its guard is repeated here because nothing
+          # prunes the tree on a runner that only ever builds.
           export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+          mkdir -p "${CARGO_TARGET_DIR}"
+          used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+          if [ "${used:-0}" -ge 85 ]; then
+              echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+              rm -rf "${CARGO_TARGET_DIR}"
+              mkdir -p "${CARGO_TARGET_DIR}"
+          fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
@@ -166,6 +175,22 @@ jobs:
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+
+      # actions/cache identifies an entry by key *and* a version derived from the
+      # compression tool, so a runner without zstd saves what the hosted restore job
+      # cannot find - a silent miss every run. Warn, not fail: a cold build still works.
+      - name: Ensure zstd so the restore job can read what this job saves
+        run: |
+          set -uo pipefail
+          if ! command -v zstd >/dev/null 2>&1; then
+              if [ "$(id -u)" = "0" ]; then SUDO=""
+              elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+              else SUDO=""; fi
+              ${SUDO} apt-get update || true
+              ${SUDO} apt-get install -y --no-install-recommends zstd || true
+          fi
+          command -v zstd >/dev/null 2>&1 \
+              || echo "::warning::zstd unavailable on ${RUNNER_NAME:-this runner}; the cache entry saved below will not be readable by the restore job"
 
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
