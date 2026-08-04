@@ -295,6 +295,9 @@ class TinyModelConfig:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
         return self.num_key_value_heads // tp_size
@@ -318,6 +321,7 @@ class MockModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -327,6 +331,9 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.ps = ParallelState.trivial()
         self.is_draft_worker = False
+        # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
+        # this dense mock declares none.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         # The runner lifecycle warms up kernels in capture() / first execute()
         # via BaseRunner.warmup(); this mock never calls init_backends and has no

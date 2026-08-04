@@ -61,7 +61,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
     DeepseekMHAForwardMixin,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
     get_stream,
@@ -83,7 +85,7 @@ if _is_cuda:
     try:
         from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
         from sglang.kernels.ops.gemm import bmm_fp8
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
@@ -273,7 +275,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -450,7 +452,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None
@@ -1229,7 +1231,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

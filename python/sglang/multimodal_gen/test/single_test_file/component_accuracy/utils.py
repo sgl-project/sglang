@@ -16,8 +16,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     destroy_model_parallel,
     get_classifier_free_guidance_world_size,
     get_data_parallel_world_size,
+    get_ring_parallel_world_size,
     get_sequence_parallel_world_size,
     get_tensor_model_parallel_world_size,
+    get_ulysses_parallel_world_size,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
@@ -305,11 +307,15 @@ def initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
     if model_parallel_is_initialized():
         current_tp = get_tensor_model_parallel_world_size()
         current_sp = get_sequence_parallel_world_size()
+        current_ulysses = get_ulysses_parallel_world_size()
+        current_ring = get_ring_parallel_world_size()
         current_dp = get_data_parallel_world_size()
         current_cfg = get_classifier_free_guidance_world_size()
         if (
             current_tp == tp_size
             and current_sp == sp_degree
+            and current_ulysses == ulysses_degree
+            and current_ring == ring_degree
             and current_dp == dp_size
             and current_cfg == cfg_degree
         ):

@@ -1111,7 +1111,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
-        self.assertEqual(scheduler.forward_ct, 1)
 
     def test_overlap_loop_materializes_prefill_input_ids(self):
         # Regression: the MLX overlap loop must materialize batch.input_ids
@@ -1132,7 +1131,12 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
         scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler.gracefully_exit = False
         scheduler._engine_paused = False
+        scheduler.forward_ct = 0
+        scheduler.profiler_manager = SimpleNamespace(
+            _profile_batch_predicate=lambda batch: None
+        )
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
@@ -1504,9 +1508,7 @@ if _HAS_MLX:
             self.last_batch = None
             self.processed_batch = None
             self.processed_result = None
-            # _finalize_mlx_pending_job now advances forward_ct and runs the
-            # profiler batch predicate (mirroring run_batch); stub both so the
-            # overlap accounting added in #29217 has something to call.
+            # Launch bookkeeping mirrors run_batch before each MLX forward.
             self.forward_ct = 0
             self.profiler_manager = SimpleNamespace(
                 _profile_batch_predicate=lambda batch: None
