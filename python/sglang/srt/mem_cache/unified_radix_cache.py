@@ -515,7 +515,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
-                        if written > 0:
+                        if written is not None:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
@@ -819,13 +819,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
-    ) -> int:
+    ) -> Optional[int]:
         """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
-            # Incremental component backup is currently write-through only.
-            if write_back and self.tree_core.is_backuped(node_id):
-                continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             if device_value.numel() == 0 and not comp_xfers:
                 continue
@@ -834,7 +831,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
-                return 0
+                return None
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:

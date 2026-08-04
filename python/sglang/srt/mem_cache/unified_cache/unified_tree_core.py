@@ -1078,10 +1078,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if is_write_back:
+            result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+            return result
         if not node.backuped:
-            if is_write_back:
-                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
-                return result
             # Write-through: node has no backup, delete entirely.
             self._delete_unbacked_device_leaf(
                 node,
