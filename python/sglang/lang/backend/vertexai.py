@@ -85,7 +85,7 @@ class VertexAI(BaseBackend):
     def text_to_vertexai_input(self, text, images):
         input = []
         # split with image token
-        text_segs = text.split(self.chat_template.image_token)
+        text_segs = text.split(self.chat_template.get_image_token())
         for image_path, image_base64_data in images:
             text_seg = text_segs.pop(0)
             if text_seg != "":
