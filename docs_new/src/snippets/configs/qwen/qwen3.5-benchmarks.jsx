@@ -338,9 +338,46 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 540099, tpot_ms: 33.5, tokens_per_sec_per_gpu: 1975 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 2287294, tpot_ms: 34.78, tokens_per_sec_per_gpu: 1975 },
+    ],
+  },
+  {
     match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
     accuracy: { gsm8k_pct: 97.5, mmmu_pct: 97.8 },
     notes: "GSM8K via benchmark/gsm8k/bench_sglang.py (200 questions); MMMU via benchmark/mmmu/bench_sglang.py (91-sample val subset).",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 220, tpot_ms: 2.24, tokens_per_sec_per_gpu: 439 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 452, tpot_ms: 8.31, tokens_per_sec_per_gpu: 1764 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 270545, tpot_ms: 62.74, tokens_per_sec_per_gpu: 3340 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 1274582, tpot_ms: 72.74, tokens_per_sec_per_gpu: 3322 },
+    ],
+  },
+  {
+    match: { hw: "h200", variant: "397b", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.16",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 219, tpot_ms: 2.73, tokens_per_sec_per_gpu: 374 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 452, tpot_ms: 7.35, tokens_per_sec_per_gpu: 2003 },
+    ],
   },
   {
     match: { hw: "b200", variant: "0.8b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
