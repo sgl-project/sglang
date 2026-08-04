@@ -1408,8 +1408,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
             # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
             # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
-            # shuffle_scale also supports non-256 shapes since aiter PR#4130.
-            fp4_k_align = 128
+            # shuffle_scale also supports non-256 shapes since aiter PR#4130;
+            # pinned to 256 because this image's aiter predates that PR.
+            fp4_k_align = 256
             E, w13_N, w13_K_packed = layer.w13_weight.shape
             _, w2_N, w2_K_packed = layer.w2_weight.shape
             inter_per_part = w13_N // 2

@@ -61,6 +61,10 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    attn_cp_all_gather_into_tensor,
+    attn_cp_overlap_all_gather_into_tensor,
+    attn_cp_overlap_reduce_scatter_tensor,
+    attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
@@ -224,6 +228,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+_CP_TBO_COMM_OVERLAP = get_bool_env_var("SGLANG_CP_TBO_COMM_OVERLAP", "true")
+_CP_TBO_ATTN_OVERLAP = get_bool_env_var("SGLANG_CP_TBO_ATTN_OVERLAP", "false")
+
+
+def cp_tbo_attn_overlap_enabled() -> bool:
+    return _CP_TBO_ATTN_OVERLAP and _CP_TBO_COMM_OVERLAP
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 
@@ -982,7 +994,7 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
-    def _forward_prepare(
+    def _compute_qkv(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
@@ -990,7 +1002,9 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        cp_kv_async_sub: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[tuple]]:
+        cp_kv_pending = None
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1124,12 +1138,18 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
-                        kv.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                    if cp_kv_async_sub is not None:
+                        cp_kv_pending = self._cp_gather_async(
+                            kv, "cpkv", cp_kv_async_sub
+                        )
+                        kv = None
+                    else:
+                        kv = cp_all_gather_rerange_output(
+                            kv.contiguous(),
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -1152,7 +1172,34 @@ class MQALayer(MqaAttentionBase):
                 kv = None
 
         del qkv_a
+        return q, kv, q_lora, cp_kv_pending
 
+    def _cp_gather_async(self, x: torch.Tensor, kind: str, sub: int):
+        x = x.contiguous()
+        gathered = get_tbo_persistent_buffer(
+            (kind, sub, x.shape[1]),
+            x.shape[0] * self.cp_size,
+            x.shape[1],
+            x.dtype,
+            x.device,
+        )
+        comm = get_dp_tbo_comm_stream()
+        comm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(comm):
+            attn_cp_overlap_all_gather_into_tensor(gathered, x)
+            event = _tbo_event((kind, sub))
+            event.record(comm)
+        return gathered, event, x
+
+    def _cp_gather_finish(self, pending) -> torch.Tensor:
+        gathered, event, _keepalive = pending
+        torch.cuda.current_stream().wait_event(event)
+        shape = gathered.shape
+        return (
+            gathered.view(self.cp_size, -1, *shape[1:]).transpose(0, 1).reshape(shape)
+        )
+
+    def _run_index_compress(self, x, q_lora, forward_batch, attn_backend) -> None:
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1168,6 +1215,19 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
+    def _forward_prepare(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q, kv, q_lora, _ = self._compute_qkv(
+            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+        )
+        self._run_index_compress(x, q_lora, forward_batch, attn_backend)
         return q, kv
 
     def forward(
@@ -1196,23 +1256,7 @@ class MQALayer(MqaAttentionBase):
             and not (_is_hip and self.compressor is None)
         )
 
-        tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
+        tp_slice, q_padded, q_out = self._forward_setup_q(x)
         attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
@@ -1247,6 +1291,34 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        return self._forward_attend(
+            q, kv, tp_slice, q_padded, q_out, attn_sink, positions, forward_batch
+        )
+
+    def _forward_setup_q(self, x: torch.Tensor):
+        tp_slice, q_padded, q_out = slice(None), None, None
+        if self.attn_tp_size > 1:
+            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+            # this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            # Only [0:n_local_heads] is written below. Uninitialized padded TP
+            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
+            # there; other archs tolerate new_empty and skip the per-forward
+            # memset.
+            if _is_gfx942_supported:
+                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            else:
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            tp_slice = slice(0, self.n_local_heads)
+            q_out = q_padded[:, tp_slice, :]
+        return tp_slice, q_padded, q_out
+
+    def _forward_attend(
+        self, q, kv, tp_slice, q_padded, q_out, attn_sink, positions, forward_batch
+    ) -> torch.Tensor:
+        attn_backend = get_attn_backend()
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1370,6 +1442,52 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_prep(self, state):
+        x = state.pop("hidden_states_after_input_norm")
+        fb = state.forward_batch
+        sub = state.tbo_subbatch_index
+        attn_backend = get_attn_backend()
+        tp_slice, q_padded, q_out = self._forward_setup_q(x)
+        q, kv, q_lora, cp_kv_pending = self._compute_qkv(
+            x,
+            state.positions,
+            fb,
+            attn_backend,
+            q_out,
+            x_quant=state.pop("attn_x_quant"),
+            cp_kv_async_sub=sub,
+        )
+        state.attn_x = x
+        state.attn_q = q
+        state.attn_kv = kv
+        state.attn_kv_pending = cp_kv_pending
+        state.attn_q_lora = q_lora
+        state.attn_tp_slice = tp_slice
+        state.attn_q_padded = q_padded
+        state.attn_q_out = q_out
+        state.attn_sink = self._local_attn_sink()
+
+    def op_attn_core(self, state):
+        fb = state.forward_batch
+        attn_backend = get_attn_backend()
+        self._run_index_compress(
+            state.pop("attn_x"), state.pop("attn_q_lora"), fb, attn_backend
+        )
+        kv = state.pop("attn_kv")
+        pending = state.pop("attn_kv_pending")
+        if pending is not None:
+            kv = self._cp_gather_finish(pending)
+        state.hidden_states_after_attn = self._forward_attend(
+            state.pop("attn_q"),
+            kv,
+            state.pop("attn_tp_slice"),
+            state.pop("attn_q_padded"),
+            state.pop("attn_q_out"),
+            state.pop("attn_sink"),
+            state.positions,
+            fb,
         )
 
 
@@ -2127,6 +2245,81 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
 
+    def op_cp_gather_a(self, state):
+        local = state.pop("hidden_states_mlp_input").contiguous()
+        cp_size = get_parallel().attn_cp_size
+        sub = state.tbo_subbatch_index
+        global_hidden = get_tbo_persistent_buffer(
+            ("cpgh", sub),
+            local.shape[0] * cp_size,
+            local.shape[1],
+            local.dtype,
+            local.device,
+        )
+        if _CP_TBO_COMM_OVERLAP:
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            comm.wait_stream(compute)
+            with torch.cuda.stream(comm):
+                attn_cp_overlap_all_gather_into_tensor(global_hidden, local)
+                state.cp_gather_event = _tbo_event(("cpgather", sub))
+                state.cp_gather_event.record(comm)
+            state.cp_gather_keepalive = local
+        else:
+            attn_cp_all_gather_into_tensor(global_hidden, local)
+            state.cp_gather_event = None
+        state.global_hidden = global_hidden
+
+    def op_cp_gather_b(self, state):
+        ev = state.pop("cp_gather_event")
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+            state.pop("cp_gather_keepalive")
+
+    def op_cp_moe(self, state):
+        fb = state.forward_batch
+        global_hidden = state.pop("global_hidden")
+        global_ids = fb._cp_moe_input_ids
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.global_expert_out = self.mlp(
+                global_hidden,
+                fb,
+                input_ids=global_ids,
+                input_ids_global=global_ids,
+            )
+
+    def op_cp_combine_a(self, state):
+        global_out = state.pop("global_expert_out").contiguous()
+        cp_size = get_parallel().attn_cp_size
+        sub = state.tbo_subbatch_index
+        local_out = get_tbo_persistent_buffer(
+            ("cplo", sub),
+            global_out.shape[0] // cp_size,
+            global_out.shape[1],
+            global_out.dtype,
+            global_out.device,
+        )
+        if _CP_TBO_COMM_OVERLAP:
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            comm.wait_stream(compute)
+            with torch.cuda.stream(comm):
+                attn_cp_overlap_reduce_scatter_tensor(local_out, global_out)
+                state.cp_combine_event = _tbo_event(("cpcombine", sub))
+                state.cp_combine_event.record(comm)
+            state.cp_combine_keepalive = global_out
+        else:
+            attn_cp_reduce_scatter_tensor(local_out, global_out)
+            state.cp_combine_event = None
+        state.local_out = local_out
+
+    def op_cp_combine_b(self, state):
+        ev = state.pop("cp_combine_event")
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+            state.pop("cp_combine_keepalive")
+        state.hidden_states_mlp_output = state.pop("local_out")
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2232,26 +2425,41 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
-        """DSV4 prefill-only two-batch-overlap gate.
+    def _cp_children_splittable(self, forward_batch: ForwardBatch) -> bool:
+        children = forward_batch.tbo_children
+        if not children:
+            return False
+        cp_size = get_parallel().attn_cp_size
+        for child in children:
+            if child.batch_size <= 0 or child.extend_seq_lens_cpu is None:
+                return False
+            if sum(child.extend_seq_lens_cpu) < cp_size:
+                return False
+        return True
 
-        TBO batch prep (tbo_split_seq_index / tbo_children) is populated
-        model-agnostically when --enable-two-batch-overlap is set and the
-        DP-attention preparer allows it (mori `normal` mode permits prefill
-        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
-        """
+    def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
+        """DSV4 prefill-only two-batch-overlap gate."""
         from sglang.srt.layers.moe import is_tbo_enabled
 
+        if not _is_hip:
+            path_ok = not dsa_use_prefill_cp(forward_batch)
+        elif dsa_use_prefill_cp(forward_batch):
+            path_ok = (
+                is_dsa_prefill_cp_round_robin_split()
+                and get_moe_a2a_backend().is_none()
+                and self._cp_children_splittable(forward_batch)
+            )
+        else:
+            path_ok = (
+                not get_moe_a2a_backend().is_none() or get_parallel().attn_dp_size > 1
+            )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
             and forward_batch.global_forward_mode is not None
-            # MTP target-verify also reports is_extend(); only real prefill
-            # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
-            and not dsa_use_prefill_cp(forward_batch)
+            and path_ok
             and self.pp_group.world_size == 1
         )
 
@@ -2267,6 +2475,13 @@ class DeepseekV4Model(nn.Module):
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_outputs,
         )
+
+        if dsa_use_prefill_cp(forward_batch):
+            return self._forward_layers_tbo_cp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
         operations_strategy = OperationsStrategy.init_new_tbo(
@@ -2344,6 +2559,215 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _setup_child_cp_metadata(self, child: ForwardBatch, child_backend) -> None:
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        child.attn_cp_metadata = prepare_context_parallel_metadata(
+            len(child.input_ids),
+            cp_rank,
+            cp_size,
+            child.seq_lens_cpu.tolist(),
+            extend_seqs_len=child.extend_seq_lens_cpu,
+        )
+        if is_dsa_prefill_cp_round_robin_split():
+            metadata = child_backend.forward_metadata
+            core_meta = metadata.core_attn_metadata
+            core_meta.apply_cp_reindex()
+            core_meta.init_flashmla_related(is_prefill=True)
+            if metadata.indexer_metadata is not None:
+                metadata.indexer_metadata = child_backend.init_forward_metadata_indexer(
+                    core_meta
+                )
+
+    def _forward_layers_tbo_cp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.batch_overlap.operations import execute_overlapped_operations
+        from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+            _model_forward_tbo_merge_outputs,
+        )
+
+        if dsa_use_prefill_cp(forward_batch):
+            return self._forward_layers_tbo_cp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        operations_strategy = OperationsStrategy.init_new_tbo(
+            layers, forward_batch.global_forward_mode
+        )
+
+        # Split the per-rank batch into the 2 ubatches (token-range slice + pad
+        # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.
+        inputs_arr = [
+            _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                output_forward_batch=child,
+                tbo_subbatch_index=idx,
+            )
+            for idx, child in enumerate(forward_batch.tbo_children)
+        ]
+
+        # Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
+        # needs each ubatch's per-rank token counts, but tbo_padded_len is computed
+        # per-rank locally (not synced). All-gather both ubatches' padded lengths
+        # once across DP ranks, then populate each child's global_num_tokens +
+        # global_dp_buffer_len so the gatherv/reduce_scatterv buffers size correctly.
+        if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
+            tp_group = get_tp_group()
+            world = tp_group.world_size
+            children = forward_batch.tbo_children
+            local_lens = torch.tensor(
+                [int(c.tbo_padded_len) for c in children],
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            gathered = torch.empty(
+                (world, local_lens.shape[0]),
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            tp_group.all_gather_into_tensor(gathered, local_lens)
+            gathered_cpu = gathered.tolist()
+            rank = tp_group.rank_in_group
+            for idx, child in enumerate(children):
+                sizes = [gathered_cpu[r][idx] for r in range(world)]
+                child.global_num_tokens_cpu = sizes
+                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
+                child.global_dp_buffer_len = sum(sizes)
+                # Gather the ubatch's input_ids -> global ONCE here (cached on the
+                # child) instead of per-layer in op_gather_a. The hash MoE reads
+                # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
+                # VARYING size (-> RCCL registers a new internal buffer per size ->
+                # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
+                local_ids = child.input_ids
+                rows = sizes[rank]
+                if local_ids.shape[0] < rows:
+                    padded_ids = local_ids.new_zeros((rows,))
+                    padded_ids[: local_ids.shape[0]] = local_ids
+                elif local_ids.shape[0] > rows:
+                    padded_ids = local_ids[:rows]
+                else:
+                    padded_ids = local_ids
+                gids = torch.empty(
+                    (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
+                )
+                tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
+                child._tbo_global_input_ids = gids
+
+        outputs_arr = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        )
+
+        hidden_states, _ = _model_forward_tbo_merge_outputs(
+            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+        )
+        return hidden_states
+
+    def _setup_child_cp_metadata(self, child: ForwardBatch, child_backend) -> None:
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        child.attn_cp_metadata = prepare_context_parallel_metadata(
+            len(child.input_ids),
+            cp_rank,
+            cp_size,
+            child.seq_lens_cpu.tolist(),
+            extend_seqs_len=child.extend_seq_lens_cpu,
+        )
+        if is_dsa_prefill_cp_round_robin_split():
+            metadata = child_backend.forward_metadata
+            core_meta = metadata.core_attn_metadata
+            core_meta.apply_cp_reindex()
+            core_meta.init_flashmla_related(is_prefill=True)
+            if metadata.indexer_metadata is not None:
+                metadata.indexer_metadata = child_backend.init_forward_metadata_indexer(
+                    core_meta
+                )
+
+    def _forward_layers_tbo_cp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """CP + TBO prefill (DSA round-robin / interleave, moe_a2a_backend none).
+
+        Each of the two token-range ubatches (tbo_children) is independently
+        round-robin split across the CP group (token_idx % cp_size) and its
+        attention metadata is CP-reindexed on its own per-child backend. The two
+        ubatches then run through the operations engine, where op_cp_gather /
+        op_cp_moe / op_cp_combine handle the CP-group all-gather / reduce-scatter
+        around the TP-sharded MoE. Finally each child's local output is
+        all-gathered back to its full token range and the two ranges are merged
+        into the full-batch hidden (original token order).
+        """
+        from sglang.srt.batch_overlap.operations import execute_overlapped_operations
+        from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+            _model_forward_tbo_merge_outputs,
+        )
+
+        original_len = hidden_states.shape[0]
+        cp_size = get_parallel().attn_cp_size
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        operations_strategy = OperationsStrategy.init_new_tbo(
+            layers, forward_batch.global_forward_mode, use_cp=True
+        )
+
+        attn_backend = get_attn_backend()
+        children = forward_batch.tbo_children
+
+        inputs_arr = []
+        for idx, child in enumerate(children):
+            child_inputs = _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                output_forward_batch=child,
+                tbo_subbatch_index=idx,
+            )
+            self._setup_child_cp_metadata(child, attn_backend.children[idx])
+            if self.pp_group.is_first_rank:
+                child_inputs["hidden_states"] = cp_split_and_rebuild_data(
+                    child, child_inputs["hidden_states"]
+                )
+            child_inputs["positions"] = cp_split_and_rebuild_position(
+                child, child_inputs["positions"]
+            )
+            child._cp_moe_input_ids = cp_round_robin_input_ids(child.input_ids)
+            inputs_arr.append(child_inputs)
+
+        outputs_arr = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        )
+
+        if self.pp_group.is_last_rank:
+            for idx, child in enumerate(children):
+                outputs_arr[idx]["hidden_states"] = cp_all_gather_rerange_output(
+                    outputs_arr[idx]["hidden_states"],
+                    cp_size,
+                    child,
+                    torch.cuda.current_stream(),
+                )
+        hidden_states, _ = _model_forward_tbo_merge_outputs(
+            outputs_arr[0], outputs_arr[1], original_len
+        )
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2377,7 +2801,8 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        run_tbo = self._can_run_tbo(forward_batch)
+        if dsa_use_prefill_cp(forward_batch) and not run_tbo:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2399,7 +2824,7 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if run_tbo and not capture_dspark:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2444,7 +2869,11 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if (
+            self.pp_group.is_last_rank
+            and dsa_use_prefill_cp(forward_batch)
+            and not run_tbo
+        ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,

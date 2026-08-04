@@ -1858,6 +1858,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1893,6 +1894,10 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2183,6 +2188,7 @@ def initialize_model_parallel(
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2347,9 +2353,8 @@ def initialize_model_parallel(
     assert (
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
-    if attn_cp_size == tensor_model_parallel_size:
-        _ATTN_CP = _TP
-    else:
+
+    def _build_attn_cp_group_ranks():
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for dp_idx in range(attn_dp_size):
@@ -2366,12 +2371,33 @@ def initialize_model_parallel(
                     )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
+        return group_ranks
+
+    if attn_cp_size == tensor_model_parallel_size:
+        _ATTN_CP = _TP
+    else:
         _ATTN_CP = init_model_parallel_group(
-            group_ranks,
+            _build_attn_cp_group_ranks(),
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    global _ATTN_CP_OVERLAP
+    assert (
+        _ATTN_CP_OVERLAP is None
+    ), "attention context parallel overlap group is already initialized"
+    if duplicate_attn_cp_group and attn_cp_size > 1 and is_hip():
+        _ATTN_CP_OVERLAP = init_model_parallel_group(
+            _build_attn_cp_group_ranks(),
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=False,
+            group_name="attn_cp_overlap",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2778,12 +2804,16 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
+    if _ATTN_CP_OVERLAP:
+        _ATTN_CP_OVERLAP.destroy()
+    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
