@@ -895,7 +895,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_mamba_backup(self, state: _InsertWalkState) -> bool:
-        """Whether this insert added a Mamba state missing from Host."""
+        """Whether a Host-backed node has a device Mamba state missing from Host."""
         node = state.target_node
         return (
             self.enable_hicache
