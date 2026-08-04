@@ -65,6 +65,63 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_batched_cache_key_lists(self):
+        for field in ("extra_key", "cache_salt"):
+            with self.subTest(field=field):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=["A", "B"],
+                    **{field: ["tenant-a", "tenant-b"]},
+                )
+
+                internal, _ = self.sc._convert_to_internal_request(req)
+
+                self.assertEqual(internal.extra_key, ["tenant-a", "tenant-b"])
+
+    def test_batched_cache_salt_and_extra_key(self):
+        test_cases = [
+            ("salt-", "tenant", "salt-tenant"),
+            (
+                "salt-",
+                ["tenant-a", "tenant-b"],
+                ["salt-tenant-a", "salt-tenant-b"],
+            ),
+            (
+                ["salt-a-", "salt-b-"],
+                "tenant",
+                ["salt-a-tenant", "salt-b-tenant"],
+            ),
+            (
+                ["salt-a-", "salt-b-"],
+                ["tenant-a", "tenant-b"],
+                ["salt-a-tenant-a", "salt-b-tenant-b"],
+            ),
+        ]
+
+        for cache_salt, extra_key, expected_extra_key in test_cases:
+            with self.subTest(cache_salt=cache_salt, extra_key=extra_key):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=["A", "B"],
+                    cache_salt=cache_salt,
+                    extra_key=extra_key,
+                )
+
+                internal, _ = self.sc._convert_to_internal_request(req)
+
+                self.assertEqual(internal.extra_key, expected_extra_key)
+
+    def test_batched_cache_key_length_mismatch(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=["A", "B"],
+            cache_salt=["salt-a", "salt-b"],
+            extra_key=["tenant-a"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "must have the same length"):
+            self.sc._convert_to_internal_request(req)
+
     # ---------- echo-handling ----------
     def test_echo_with_list_of_strings_streaming(self):
         req = CompletionRequest(
