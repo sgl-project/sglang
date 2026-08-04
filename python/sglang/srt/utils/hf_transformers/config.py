@@ -231,8 +231,13 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        kwargs["gguf_file"] = model
+        gguf_file = model
         model = Path(model).parent
+        # Prefer an explicit adjacent HF config when one is supplied. This is
+        # required for architectures that SGLang supports before Transformers'
+        # GGUF metadata converter does (for example Kimi K3).
+        if not (model / "config.json").is_file():
+            kwargs["gguf_file"] = gguf_file
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
         model_config_parser = "hf"
