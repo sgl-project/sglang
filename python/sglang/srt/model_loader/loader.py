@@ -263,10 +263,11 @@ def _get_quantization_config(
                     ModelOptFp4Config,
                 )
 
-                # MTP MoE layers (model.decoder.*) are not NVFP4 quantized.
+                # Draft experts serialized under mtp.* remain source MXFP4.
+                # NextN exposes them as model.decoder.*; DSpark as stages.*.
                 nvfp4_exclude_modules = list(
                     nvfp4_meta.get("exclude_modules") or []
-                ) + ["model.decoder.*"]
+                ) + ["model.decoder.*", "stages.*"]
                 nvfp4_config = ModelOptFp4Config(
                     is_checkpoint_nvfp4_serialized=True,
                     group_size=int(nvfp4_meta["group_size"]),
