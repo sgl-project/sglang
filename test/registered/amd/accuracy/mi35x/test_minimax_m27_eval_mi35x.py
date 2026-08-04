@@ -8,10 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-minimax-m27 suite
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest

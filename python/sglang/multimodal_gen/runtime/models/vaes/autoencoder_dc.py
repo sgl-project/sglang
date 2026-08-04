@@ -3,11 +3,26 @@
 from collections.abc import Iterable
 
 import torch
+from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    gather_and_trim_height,
+    split_height_for_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    can_install_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
+    enable_diffusers_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -25,6 +40,32 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         self._config = config
         self._inner_model = None
         self._loaded_state_dict: dict[str, torch.Tensor] = {}
+        self._spatial_parallel_decode_enabled = False
+
+    @staticmethod
+    def _target_device_type(args, kwargs) -> str | None:
+        device = kwargs.get("device")
+        if device is None and args:
+            first_arg = args[0]
+            if isinstance(first_arg, torch.Tensor):
+                device = first_arg.device
+            elif isinstance(first_arg, (str, torch.device)):
+                device = first_arg
+        if device is None:
+            return None
+        return torch.device(device).type
+
+    @staticmethod
+    def _target_dtype(args, kwargs) -> torch.dtype | None:
+        dtype = kwargs.get("dtype")
+        if dtype is not None:
+            return dtype
+        for arg in args:
+            if isinstance(arg, torch.dtype):
+                return arg
+            if isinstance(arg, torch.Tensor) and arg.is_floating_point():
+                return arg.dtype
+        return None
 
     def _ensure_inner_model(self, state_dict: dict[str, torch.Tensor] | None = None):
         if self._inner_model is not None:
@@ -72,6 +113,9 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
                 self._loaded_state_dict.clear()
 
         self._inner_model = self._inner_model.to(device)
+        if can_install_spatial_shard_parallel_decode(self._config):
+            enable_diffusers_decoder_spatial_parallel(self._inner_model.decoder)
+            self._spatial_parallel_decode_enabled = True
 
     @property
     def config(self):
@@ -97,8 +141,41 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
 
     def decode(self, z: torch.Tensor, **kwargs):
         self._ensure_inner_model()
+        if z.device.type == "mps":
+            orig_device = z.device
+            torch.mps.synchronize()
+            self._inner_model = self._inner_model.to("cpu", dtype=torch.float32)
+            torch.mps.empty_cache()
+            z = z.to(device="cpu", dtype=torch.float32)
+            decoded = self._inner_model.decode(z, **kwargs)
+            if isinstance(decoded, DecoderOutput):
+                return DecoderOutput(sample=decoded.sample.to(device=orig_device))
+            if isinstance(decoded, tuple):
+                sample = decoded[0].to(device=orig_device)
+                return (sample, *decoded[1:])
+            if isinstance(decoded, torch.Tensor):
+                return decoded.to(device=orig_device)
+            return decoded
+
         z = z.to(dtype=self.dtype)
-        return self._inner_model.decode(z, **kwargs)
+        if not self._spatial_parallel_decode_enabled:
+            return self._inner_model.decode(z, **kwargs)
+
+        expected_height = (
+            z.shape[-2] * self._config.arch_config.spatial_compression_ratio
+        )
+        z, expected_height = split_height_for_parallel_decode(
+            z,
+            expected_height=expected_height,
+            world_size=get_decode_parallel_world_size(),
+            rank=get_decode_parallel_rank(),
+        )
+        decoded = self._inner_model.decode(z, **kwargs)
+        if isinstance(decoded, tuple):
+            sample = gather_and_trim_height(decoded[0], expected_height)
+            return (sample, *decoded[1:])
+        sample = gather_and_trim_height(decoded.sample, expected_height)
+        return decoded.__class__(sample=sample)
 
     def forward(self, x: torch.Tensor, **kwargs):
         self._ensure_inner_model()
@@ -126,6 +203,15 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         return loaded_params
 
     def to(self, *args, **kwargs):
+        if self._target_device_type(args, kwargs) == "mps":
+            # AutoencoderDC decode is unstable on MPS in the full Sana pipeline.
+            dtype = self._target_dtype(args, kwargs)
+            if dtype is not None:
+                if self._inner_model is not None:
+                    self._inner_model = self._inner_model.to(dtype=dtype)
+                return super().to(dtype=dtype)
+            return self
+
         if self._inner_model is not None:
             self._inner_model = self._inner_model.to(*args, **kwargs)
         return super().to(*args, **kwargs)

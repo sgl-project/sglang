@@ -74,7 +74,3 @@ class CPUWorker(GPUWorker):
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(self.server_args.tp_size)
         torch.ops.sgl_kernel.initialize(self.server_args.tp_size, self.rank)
-
-        @torch.library.register_fake("sgl_kernel::shm_allgather")
-        def _(data, dim):
-            return torch.cat([data] * self.server_args.tp_size, dim=dim)

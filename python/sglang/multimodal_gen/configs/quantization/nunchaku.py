@@ -69,7 +69,7 @@ class NunchakuSVDQuantArgs:
 
         return enable_svdquant, inferred_precision, inferred_rank
 
-    def _normalized(self) -> "NunchakuSVDQuantArgs":
+    def _normalized(self) -> NunchakuSVDQuantArgs:
         enable_svdquant, inferred_precision, inferred_rank = (
             self._infer_from_weights_path()
         )
@@ -204,7 +204,7 @@ class NunchakuSVDQuantArgs:
         )
 
     @classmethod
-    def from_dict(cls, kwargs: dict[str, Any]) -> "NunchakuSVDQuantArgs":
+    def from_dict(cls, kwargs: dict[str, Any]) -> NunchakuSVDQuantArgs:
         # Map CLI/config keys to dataclass fields (keep backwards compatibility).
         path = (
             kwargs.get("transformer_weights_path")

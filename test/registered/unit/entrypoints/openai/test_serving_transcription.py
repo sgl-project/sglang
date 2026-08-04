@@ -51,7 +51,10 @@ class _MockTokenizerManager:
         # Not a real ServerArgs, so base class sets allowed_custom_labels=None.
         # Default tests assume cumulative-text streaming (the sglang upstream
         # default); tests for incremental_streaming_output=True override this.
-        self.server_args = Mock(incremental_streaming_output=False)
+        self.server_args = Mock(
+            incremental_streaming_output=False,
+            asr_max_concurrent_sessions=32,
+        )
         self.tokenizer = Mock()
         self._stream_chunks = stream_chunks
 
@@ -255,7 +258,10 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
             for i, d in enumerate(chunk_deltas)
         ]
         tm = _MockTokenizerManager(chunks)
-        tm.server_args = Mock(incremental_streaming_output=True)
+        tm.server_args = Mock(
+            incremental_streaming_output=True,
+            asr_max_concurrent_sessions=32,
+        )
         serving = OpenAIServingTranscription(tm)
 
         request = TranscriptionRequest(model="whisper", stream=True)

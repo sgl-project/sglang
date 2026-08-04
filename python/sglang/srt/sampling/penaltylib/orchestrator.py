@@ -15,7 +15,7 @@ class BatchedPenalizerOrchestrator:
         self,
         vocab_size: int,
         batch: ScheduleBatch,
-        penalizers: Set[Type["_BatchedPenalizer"]],
+        penalizers: Set[Type[_BatchedPenalizer]],
     ):
         self.vocab_size = vocab_size
         self._batch_ref = weakref.ref(batch)
@@ -139,13 +139,13 @@ class BatchedPenalizerOrchestrator:
         self.is_required = False
 
     # Context manager support
-    def __enter__(self) -> "BatchedPenalizerOrchestrator":
+    def __enter__(self) -> BatchedPenalizerOrchestrator:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
 
-    def merge(self, their: "BatchedPenalizerOrchestrator"):
+    def merge(self, their: BatchedPenalizerOrchestrator):
         """
         Merge the penalizers of another orchestrator into this one.
 
@@ -227,7 +227,7 @@ class _BatchedPenalizer(abc.ABC):
 
         self._filter(keep_indices=keep_indices)
 
-    def merge(self, their: "_BatchedPenalizer"):
+    def merge(self, their: _BatchedPenalizer):
         if not self._is_prepared and not their._is_prepared:
             return
 
@@ -281,7 +281,7 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _merge(self, their: "_BatchedPenalizer"):
+    def _merge(self, their: _BatchedPenalizer):
         """
         Merge the penalizer with another penalizer.
         """

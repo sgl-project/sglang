@@ -1,6 +1,6 @@
 """Nightly performance benchmark for GLM-5.1 on MI30x.
 
-Tests GLM-5.1-FP8 with NSA attention backend using bench_one_batch
+Tests GLM-5.1-FP8 with DSA attention backend using bench_one_batch
 on 8 GPUs with TP=8, FP8 KV cache.
 
 Model path can be configured via GLM51_MODEL_PATH environment variable.
@@ -53,7 +53,7 @@ PROFILE_DIR = "performance_profiles_glm51"
 class TestNightlyGLM51Performance(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.1 on MI30x.
 
-    Tests GLM-5.1-FP8 with NSA attention backend on TP=8.
+    Tests GLM-5.1-FP8 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -74,9 +74,9 @@ class TestNightlyGLM51Performance(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",

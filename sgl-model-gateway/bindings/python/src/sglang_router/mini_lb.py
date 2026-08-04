@@ -336,7 +336,7 @@ async def _get_model_info_impl():
                 model_info_json = await response.json()
                 return ORJSONResponse(content=model_info_json)
 
-        except aiohttp.ClientError as e:
+        except aiohttp.ClientError:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 detail=f"Failed to get model info from backend",

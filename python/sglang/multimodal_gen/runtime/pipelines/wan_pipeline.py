@@ -15,6 +15,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.wan import (
+    WanProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -43,7 +49,12 @@ class WanPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self.add_standard_t2i_stages()
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self.add_progressive_denoising_stage(WanProgressiveDenoisingStage)
+        self.add_standard_decoding_stage()
 
 
 EntryClass = WanPipeline

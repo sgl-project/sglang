@@ -29,6 +29,8 @@ class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
+    TORCH_CUDNN_SDPA = enum.auto()
+    DYNAMIC_CUDNN_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
@@ -38,6 +40,9 @@ class AttentionBackendEnum(enum.Enum):
     AITER_SAGE = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
+    LASER_ATTN = enum.auto()
+    BLOCK_SPARSE_ATTN = enum.auto()
+    RAIN_FUSION_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -52,6 +57,9 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
+            AttentionBackendEnum.LASER_ATTN,
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
         }
 
 
@@ -114,10 +122,6 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
         return self.is_cuda_static()
-
-    @lru_cache(maxsize=1)
-    def is_npu(self) -> bool:
-        return self._enum == PlatformEnum.NPU
 
     @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
@@ -378,7 +382,7 @@ class Platform:
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,

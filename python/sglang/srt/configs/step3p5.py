@@ -28,6 +28,7 @@ class Step3p5Config(PretrainedConfig):
         norm_expert_weight: bool = True,
         layer_types: list[str] = None,
         sliding_window: Optional[int] = None,
+        yarn_only_types: Optional[list[str]] = None,
         moe_layers_enum: tuple[int] = (
             3,
             4,
@@ -94,6 +95,7 @@ class Step3p5Config(PretrainedConfig):
         self.moe_layers_enum = moe_layers_enum
         self.layer_types = layer_types
         self.sliding_window = sliding_window
+        self.yarn_only_types = yarn_only_types or []
         # The upstream Step-3.5-Flash config has layer_types with 48 entries
         # but num_hidden_layers=45. The extra 3 are for MTP/nextn predict
         # layers (indices 45-47) used by Step3p5DecoderLayer during EAGLE

@@ -27,6 +27,13 @@ import requests
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", type=str, default="http://localhost:30000")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        choices=["debug", "info", "warning", "error", "critical"],
+        help="Set runtime log level",
+    )
     parser.add_argument("--log-requests", action="store_true")
     parser.add_argument("--log-requests-level", type=int, default=3)
     parser.add_argument(
@@ -50,6 +57,7 @@ if __name__ == "__main__":
         "log_requests_level": args.log_requests_level,  # Log full requests
         "dump_requests_folder": args.dump_requests_folder,
         "dump_requests_threshold": args.dump_requests_threshold,
+        "log_level": args.log_level,
     }
     if args.dump_requests_exclude_meta_keys is not None:
         payload["dump_requests_exclude_meta_keys"] = [

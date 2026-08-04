@@ -18,6 +18,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -287,10 +288,9 @@ class GraniteMoeHybridConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self):
         """Returns the Mamba2 cache parameters for this configuration."""
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.mamba_intermediate_size,
             n_groups=self.mamba_n_groups,
             num_heads=self.mamba_n_heads,

@@ -12,8 +12,9 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
     SEQ_DIM_NAME,
     TOKEN_DIM_NAME,
     TokenLayout,
+    apply_dim_names,
+    get_dim_names,
     resolve_dim_by_name,
-    strip_dim_names,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 
@@ -77,16 +78,16 @@ def _collapse_bs_to_t(
         )
 
     lhs_pattern, rhs_pattern, new_names = _build_bs_collapse_pattern(
-        names=list(some_tensor.names),
+        names=list(get_dim_names(some_tensor)),
         batch_dim=batch_dim,
         seq_dim=seq_dim,
     )
 
     result: dict[int, torch.Tensor] = {}
     for step, tensor in tensor_of_step.items():
-        plain: torch.Tensor = strip_dim_names(tensor)
-        collapsed: torch.Tensor = rearrange(plain, f"{lhs_pattern} -> {rhs_pattern}")
-        result[step] = collapsed.refine_names(*new_names)
+        collapsed: torch.Tensor = rearrange(tensor, f"{lhs_pattern} -> {rhs_pattern}")
+        collapsed = apply_dim_names(collapsed, [n for n in new_names if n is not None])
+        result[step] = collapsed
 
     return result
 
@@ -121,7 +122,7 @@ def _build_bs_collapse_pattern(
 
 
 def _resolve_dim_or_fallback(tensor: torch.Tensor, name: str) -> int:
-    if tensor.names[0] is None:
+    if get_dim_names(tensor)[0] is None:
         return _UNNAMED_TOKEN_DIM_FALLBACK
     return resolve_dim_by_name(tensor, name)
 
@@ -143,7 +144,7 @@ def _extract_and_stack_tokens(
     token_dim: int = _resolve_dim_or_fallback(some_tensor, TOKEN_DIM_NAME)
 
     tokens: list[torch.Tensor] = [
-        strip_dim_names(tensor_of_step[s]).select(dim=token_dim, index=i)
+        tensor_of_step[s].select(dim=token_dim, index=i)
         for s, i in zip(locator.steps, locator.token_index_in_step)
     ]
     return torch.stack(tokens, dim=token_dim)

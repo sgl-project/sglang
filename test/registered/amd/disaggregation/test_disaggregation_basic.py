@@ -13,12 +13,11 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-35x-disaggregation-amd")
+register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -36,7 +35,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
         # DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -235,7 +234,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -347,7 +346,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             cls.rdma_devices = []
 
         os.environ["SGLANG_TEST_RETRACT"] = "true"
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = "Qwen/Qwen3-8B"
 
         # Non blocking start servers
         cls.start_prefill()

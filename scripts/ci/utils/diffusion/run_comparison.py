@@ -1,7 +1,9 @@
-"""Cross-framework comparison benchmark for diffusion serving.
+"""Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+Launches an SGLang-Diffusion server for each test case, sends a single
+request, measures end-to-end latency, and writes comparison-results.json.
+The runner still supports extra frameworks via --frameworks, but the nightly
+config tracks SGLang-Diffusion only.
 
 Usage:
     # Full run (requires GPU)
@@ -43,9 +45,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
 SGLANG_MASTER_PORT_OFFSET = 5
 SGLANG_SCHEDULER_PORT_OFFSET = 55
-HEALTH_TIMEOUT = (
-    2400  # seconds (40 min — FLUX.2-dev needs ~10 min download + torch.compile)
-)
+HEALTH_TIMEOUT = 2400  # seconds (40 min — keep large model download/warmup headroom)
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
 SERVER_FATAL_ERROR_PATTERNS = (
@@ -86,6 +86,10 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
+    # No explicit --warmup-resolutions: server-based warmup now defaults to the
+    # model's sampling-default resolution (see warmup_request_builder), which
+    # already matches these single-resolution cases — the default warmup is
+    # sufficient, so we don't pin a resolution here.
     return cmd
 
 
@@ -401,14 +405,16 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Image generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Image generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Image generated in {client_latency:.2f}s")
     return client_latency
 
@@ -452,14 +458,16 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Video generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Video generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
 
@@ -538,14 +546,16 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
 
@@ -791,18 +801,17 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # Warmup requests (not measured, no perf dump)
-        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
-        # torch.compile compilation; these external warmups just stabilize triton
-        # kernel specializations across requests.
-        WARMUP_STEPS = 3
-        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
-        for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
-            try:
-                send_request(base_url, warmup_case, framework, config)
-            except Exception as e:
-                raise RuntimeError(f"Warmup request {wi} failed: {e}") from e
+        # No client-side warmup: each framework relies on its own server-side
+        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
+        # resolves to server-based (synthetic) warmup that primes kernels at
+        # startup, before the health check passes. This goes through the internal
+        # warmup path that bypasses sampling-param preset validation (e.g.
+        # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
+        # special-casing is needed here.
+        # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
+        # cross-framework comparison is restored, they must add their own warmup
+        # to stay on equal footing — otherwise their measured request pays the
+        # full cold-start.
 
         # Measured request — pass perf_dump_path for SGLang server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
@@ -966,7 +975,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cross-framework diffusion serving comparison benchmark"
+        description="SGLang-Diffusion serving benchmark (nightly CI)"
     )
     parser.add_argument(
         "--config",

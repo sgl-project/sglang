@@ -1,6 +1,6 @@
 """AMD GLM-5.1 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GLM-5.1-FP8 with NSA attention backend using few-shot
+Tests GLM-5.1-FP8 with DSA attention backend using few-shot
 completion benchmark on MI325/MI300X.
 
 Registry: nightly-amd-accuracy-8-gpu-glm51 suite
@@ -58,16 +58,16 @@ GLM51_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
-        variant="nsa",
+        variant="dsa",
         other_args=[
             "--trust-remote-code",
             "--reasoning-parser",
             "glm45",
             "--tool-call-parser",
             "glm47",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--chunked-prefill-size",
             "131072",
@@ -161,7 +161,7 @@ class TestGLM51EvalAMD(unittest.TestCase):
     def setUpClass(cls):
         cls.models = GLM51_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_glm51_accuracy(self):
         all_results = []

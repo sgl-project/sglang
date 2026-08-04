@@ -3,21 +3,16 @@
 import asyncio
 import base64
 import copy
-import io
 import json
 import math
-import os
 import re
 import subprocess
-import time
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import List, Literal, Optional, Union
 
 import numpy as np
-import pybase64
 import requests
 import torch
 import torch.nn.functional as F
@@ -28,6 +23,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -38,19 +34,13 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.mimo_audio import (
+    AudioInput,
+    MiMoAudioPipeline,
+)
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.utils import ImageData, VideoData
 from sglang.utils import logger
-
-try:
-    import torchaudio
-    from torchaudio.transforms import MelSpectrogram
-except ImportError:
-    logger.warning(
-        "torchaudio is not installed; audio inputs will fail at request time"
-    )
-    torchaudio = None
-    MelSpectrogram = None
 
 
 @dataclass
@@ -109,45 +99,6 @@ class VideoInput:
         assert self.segment_type == "partial" or (
             self.start_time is None and self.end_time is None
         )
-
-
-@dataclass
-class AudioInput:
-    """
-    if audio is str or bytes, only load it as mel spectrogram.
-    if audio is tuple, it is (waveform, original_sr)
-    if audio is torch.Tensor, it is tokenized input ids with shape (T, n_vq+).
-    if audio is np.ndarray, it is a pre-loaded waveform (1D, already resampled).
-    """
-
-    audio: str | bytes | tuple | torch.Tensor | np.ndarray
-
-    def __post_init__(self):
-        if not isinstance(self.audio, (str, bytes, tuple, torch.Tensor, np.ndarray)):
-            raise ValueError(
-                f"audio must be a str, bytes, tuple, torch.Tensor, or np.ndarray, but got {type(self.audio)}"
-            )
-        if isinstance(self.audio, tuple):
-            if (
-                len(self.audio) != 2
-                or not isinstance(self.audio[0], torch.Tensor)
-                or not isinstance(self.audio[1], (int, float))
-            ):
-                raise ValueError(
-                    f"audio must be a tuple of (waveform-T, original_sr-int/float), but got {len(self.audio)} elements and {type(self.audio[0])} and {type(self.audio[1])}"
-                )
-            if self.audio[0].ndim != 1:
-                raise ValueError(
-                    f"waveform must be a 1D tensor, but got {self.audio[0].ndim}D tensor"
-                )
-            if self.audio[1] <= 0:
-                raise ValueError(
-                    f"original_sr must be a positive number, but got {self.audio[1]}"
-                )
-        if isinstance(self.audio, torch.Tensor) and self.audio.ndim != 2:
-            raise ValueError(
-                f"audio must be a 2D tensor, but got {self.audio.ndim}D tensor"
-            )
 
 
 @dataclass
@@ -333,11 +284,9 @@ class MiMoProcessor:
         audio_fmin=0,
         audio_fmax=None,
         audio_n_mels=128,
-        audio_segment_size=6000,
         audio_channels=8,
         audio_group_size=4,
         audio_input_id_per_second=25,
-        audio_zeroemb_idx=4096,
         image_min_pixels=None,
         image_max_pixels=None,
         video_min_pixels=None,
@@ -359,11 +308,13 @@ class MiMoProcessor:
         pad_token_id=None,
         rope_type="rope",
         video_process_num_threads=16,
+        video_decode_num_threads=0,
         device=None,
         **kwargs,
     ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
+        self.video_decode_num_threads = video_decode_num_threads
 
         if device is None:
             self.device = None
@@ -392,11 +343,8 @@ class MiMoProcessor:
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
-        self.audio_token_id = audio_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
-        self.audio_start_token_id = audio_start_token_id
-        self.audio_end_token_id = audio_end_token_id
         self.video_start_token_id = video_start_token_id
         self.video_end_token_id = video_end_token_id
         self.pad_token_id = pad_token_id
@@ -408,60 +356,24 @@ class MiMoProcessor:
 
         self.video_tokens_per_second = video_tokens_per_second
 
-        self.audio_sampling_rate = audio_sampling_rate
-        self.audio_nfft = audio_nfft
-        self.audio_hop_length = audio_hop_length
-        self.audio_window_size = audio_window_size
-        self.audio_fmin = audio_fmin
-        self.audio_fmax = audio_fmax
-        self.audio_n_mels = audio_n_mels
-
-        self.audio_segment_size = audio_segment_size
-
-        self.audio_kernel_size = audio_kernel_size
-        self.audio_stride_size = audio_stride_size
-        self.audio_avg_pooler = audio_avg_pooler
-
-        self.mel_spectrogram_kwargs = dict(
-            sample_rate=audio_sampling_rate,
-            n_fft=audio_nfft,
-            hop_length=audio_hop_length,
-            win_length=audio_window_size,
-            f_min=audio_fmin,
-            f_max=audio_fmax,
-            n_mels=audio_n_mels,
-            power=1.0,
-            center=True,
+        self.audio_pipeline = MiMoAudioPipeline(
+            audio_token_id=audio_token_id,
+            audio_start_token_id=audio_start_token_id,
+            audio_end_token_id=audio_end_token_id,
+            audio_kernel_size=audio_kernel_size,
+            audio_stride_size=audio_stride_size,
+            audio_avg_pooler=audio_avg_pooler,
+            audio_group_size=audio_group_size,
+            audio_channels=audio_channels,
+            audio_sampling_rate=audio_sampling_rate,
+            audio_nfft=audio_nfft,
+            audio_hop_length=audio_hop_length,
+            audio_window_size=audio_window_size,
+            audio_fmin=audio_fmin,
+            audio_fmax=audio_fmax,
+            audio_n_mels=audio_n_mels,
+            audio_input_id_per_second=audio_input_id_per_second,
         )
-        self._mel_spectrogram = None
-        self._resamplers = OrderedDict()
-        self._resamplers_max = 16
-
-        self.audio_channels = audio_channels
-        self.audio_group_size = audio_group_size
-        self.audio_input_id_per_second = audio_input_id_per_second
-        if isinstance(audio_zeroemb_idx, int):
-            self.audio_zeroemb_idxs = torch.tensor(
-                [audio_zeroemb_idx] * self.audio_channels, dtype=torch.int32
-            )
-        elif isinstance(audio_zeroemb_idx, list):
-            if len(audio_zeroemb_idx) == 1:
-                self.audio_zeroemb_idxs = torch.tensor(
-                    audio_zeroemb_idx * self.audio_channels, dtype=torch.int32
-                )
-            elif len(audio_zeroemb_idx) == self.audio_channels:
-                self.audio_zeroemb_idxs = torch.tensor(
-                    audio_zeroemb_idx, dtype=torch.int32
-                )
-            else:
-                raise ValueError(
-                    f"audio_zeroemb_idx must be a list of 1 or {self.audio_channels} integers, but got {len(audio_zeroemb_idx)}"
-                )
-        else:
-            raise ValueError(
-                f"audio_zeroemb_idx must be an integer or a list of {self.audio_channels} integers, but got {type(audio_zeroemb_idx)}"
-            )
-
         assert image_min_pixels is not None
         assert image_max_pixels is not None
         assert video_min_pixels is not None
@@ -484,9 +396,17 @@ class MiMoProcessor:
             "min_frames": min_frames,
         }
 
-        self.http_session = requests.Session()
         for k in kwargs:
             logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoProcessor")
+
+    def __getattr__(self, name):
+        # Delegate audio_pipeline fields so callers can use self.audio_token_id
+        # etc. directly. Only triggers when normal attribute lookup fails;
+        # __dict__.get avoids recursion before audio_pipeline is assigned.
+        pipeline = self.__dict__.get("audio_pipeline")
+        if pipeline is not None and hasattr(pipeline, name):
+            return getattr(pipeline, name)
+        raise AttributeError(name)
 
     @classmethod
     def from_hf_config(cls, hf_config, mm_config=None, **overrides):
@@ -546,6 +466,20 @@ class MiMoProcessor:
         if "sampling_rate" in audio_cfg and "audio_sampling_rate" not in kwargs:
             kwargs["audio_sampling_rate"] = audio_cfg["sampling_rate"]
 
+        image_cfg = (mm_config or {}).get("image", {})
+        if "device" in image_cfg:
+            kwargs["device"] = image_cfg["device"]
+
+        video_cfg = (mm_config or {}).get("video", {})
+        if "video_decode_num_threads" in video_cfg:
+            kwargs["video_decode_num_threads"] = video_cfg["video_decode_num_threads"]
+        else:
+            from sglang.srt.utils.common import get_int_env_var
+
+            kwargs["video_decode_num_threads"] = get_int_env_var(
+                "SGLANG_ENCODER_VIDEO_DECODE_NUM_THREADS", 0
+            )
+
         kwargs.update(overrides)
         return cls(**kwargs)
 
@@ -559,13 +493,13 @@ class MiMoProcessor:
             return _ffprobe_has_audio(path_or_data, stdin=None, label=path_or_data)
 
         if isinstance(path_or_data, bytes):
-            source = io.BytesIO(path_or_data)
+            source = BytesIO(path_or_data)
         elif (
             isinstance(path_or_data, str)
             and path_or_data.startswith("data:")
             and ";base64," in path_or_data
         ):
-            source = io.BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
+            source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
             source = path_or_data  # local path or file://
         try:
@@ -591,7 +525,11 @@ class MiMoProcessor:
                     f"Unsupported video input type for EPD encoder: {type(video_data)}"
                 )
 
-        vdw = VideoDecoderWrapper(video_blob, device="cpu")
+        vdw = VideoDecoderWrapper(
+            video_blob,
+            device="cpu",
+            num_decode_threads=self.video_decode_num_threads,
+        )
         try:
             video_tuple = _decode_frames_and_timestamps(
                 vdw, self.default_video_processor_kwargs
@@ -616,7 +554,11 @@ class MiMoProcessor:
             all_patches, all_grids = [], []
             for img in mm_data:
                 img_tensor, _, _ = self.get_visual_transform(
-                    img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+                    img,
+                    factor=factor,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                    device=self.device,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
                 all_patches.append(patches)
@@ -642,7 +584,9 @@ class MiMoProcessor:
                 all_timestamps.extend(aligned_ts[::step].tolist())
 
                 if self.has_audio_track(video_blob):
-                    audio_spec, audio_token_len = self.preprocess_audio(video_blob)
+                    audio_spec, audio_token_len = self.audio_pipeline.preprocess_audio(
+                        video_blob
+                    )
                     units = self._build_video_audio_units(
                         grid,
                         aligned_ts,
@@ -679,7 +623,7 @@ class MiMoProcessor:
             for audio in mm_data:
                 if isinstance(audio, np.ndarray):
                     audio = (torch.from_numpy(audio).float(), self.audio_sampling_rate)
-                spec, token_len = self.preprocess_audio(audio)
+                spec, token_len = self.audio_pipeline.preprocess_audio(audio)
                 all_specs.append(spec)
                 all_lens.append(token_len)
             return {
@@ -688,20 +632,6 @@ class MiMoProcessor:
             }
 
         raise ValueError(f"Unsupported modality for EPD preprocessing: {modality}")
-
-    @property
-    def mel_spectrogram(self):
-        self._ensure_audio_dependencies()
-        if self._mel_spectrogram is None:
-            self._mel_spectrogram = MelSpectrogram(**self.mel_spectrogram_kwargs)
-        return self._mel_spectrogram
-
-    @staticmethod
-    def _ensure_audio_dependencies():
-        if torchaudio is None or MelSpectrogram is None:
-            raise RuntimeError(
-                "torchaudio is required for audio inputs; install torchaudio"
-            )
 
     def prepare_image_kwargs(self, image: ImageInput):
         kwargs = {}
@@ -738,95 +668,6 @@ class MiMoProcessor:
         else:
             raise ValueError("Video sampling strategy not specified")
         return kwargs
-
-    def preprocess_audio(self, audio: str | bytes):
-        self._ensure_audio_dependencies()
-        """
-        - Input: audio filename string, bytes, or tuple of (waveform, original_sr)
-        - Output:
-            - mel spectrogram: torch.Tensor (T, n_mels)
-            - number of tokens: int
-        """
-        assert isinstance(
-            audio, (str, bytes, tuple)
-        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
-        if isinstance(audio, tuple):
-            waveform, original_sr = audio
-        else:
-            if isinstance(audio, bytes):
-                file = io.BytesIO(audio)
-            elif isinstance(audio, str):
-                if audio.startswith("data:"):
-                    file = io.BytesIO(
-                        pybase64.b64decode(audio.split(",")[1], validate=True)
-                    )
-                elif audio.startswith("http://") or audio.startswith("https://"):
-                    dl_start = time.perf_counter()
-                    timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-                    try:
-                        response = self.http_session.get(
-                            audio, stream=True, timeout=timeout
-                        )
-                        dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
-                        if dl_elapsed_ms > 1000.0:
-                            content_len = len(response.content)
-                            logger.warning(
-                                f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
-                                f"size={content_len / 1024:.1f}KB, url={audio}"
-                            )
-                        file = io.BytesIO(response.content)
-                        response.close()
-                    except Exception as e:
-                        dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
-                        logger.error(
-                            f"Failed to download audio: {dl_elapsed_ms:.2f}ms, "
-                            f"error={type(e).__name__}: {e}, url={audio}"
-                        )
-                        raise
-                else:
-                    file = audio
-            try:
-                samples = AudioDecoder(file).get_all_samples()
-            except RuntimeError as e:
-                audio_source = (
-                    audio
-                    if isinstance(audio, str)
-                    and (audio.startswith("http://") or audio.startswith("https://"))
-                    else "<bytes or base64>"
-                )
-                logger.error(f"Failed to decode audio: {e}, source={audio_source}")
-                raise ValueError(
-                    f"Invalid audio format: source={audio_source}, detail={e}"
-                ) from e
-            waveform = samples.data
-            original_sr = samples.sample_rate
-
-        if original_sr != self.audio_sampling_rate:
-            if original_sr in self._resamplers:
-                self._resamplers.move_to_end(original_sr)
-            else:
-                if len(self._resamplers) >= self._resamplers_max:
-                    self._resamplers.popitem(last=False)
-                self._resamplers[original_sr] = torchaudio.transforms.Resample(
-                    orig_freq=original_sr, new_freq=self.audio_sampling_rate
-                )
-            waveform = self._resamplers[original_sr](waveform)
-        if waveform.ndim == 2:
-            waveform = waveform.mean(dim=0)
-        spec = self.mel_spectrogram(waveform[None, :])
-        spec = torch.log(torch.clip(spec, min=1e-7)).squeeze()
-        spec = spec.transpose(0, 1)
-
-        audio_token_len = spec.shape[0] + 3 - self.audio_kernel_size
-        audio_token_len = (
-            audio_token_len + 2 - self.audio_kernel_size
-        ) // self.audio_stride_size + 1
-        audio_token_len = audio_token_len // self.audio_avg_pooler + int(
-            audio_token_len % self.audio_avg_pooler != 0
-        )
-        audio_token_len = math.ceil(audio_token_len / self.audio_group_size)
-
-        return spec, audio_token_len
 
     def process_image(self, image: ImageInput):
         kwargs = self.prepare_image_kwargs(image)
@@ -989,40 +830,6 @@ class MiMoProcessor:
         )
         return visual_patches, thw_grid, aligned_timestamps, video_meta
 
-    def process_audio(self, audio: AudioInput):
-        audio = audio.audio
-        if isinstance(audio, np.ndarray):
-            waveform = torch.from_numpy(audio).float()
-            audio = (waveform, self.audio_sampling_rate)
-        if isinstance(audio, (str, bytes, tuple)):
-            audio_spec, audio_token_len = self.preprocess_audio(audio)
-            return audio_spec, audio_token_len
-
-        assert (
-            audio.shape[1] >= self.audio_channels
-        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
-        T = audio.shape[0]
-        audio = audio[:, : self.audio_channels].to(torch.long)
-        padded_T = (
-            (T + self.audio_group_size - 1)
-            // self.audio_group_size
-            * self.audio_group_size
-        )
-        padded_audio = torch.cat(
-            [
-                audio,
-                torch.zeros(padded_T - T, self.audio_channels, dtype=torch.long)
-                + audio[-1, :],
-            ],
-            dim=0,
-        )
-        padded_audio = padded_audio.reshape(
-            padded_T // self.audio_group_size,
-            self.audio_group_size,
-            self.audio_channels,
-        )
-        return padded_audio
-
     def _process_videos_parallel(self, contents):
         video_contents_info = []
         for idx, content in enumerate(contents):
@@ -1146,29 +953,17 @@ class MiMoProcessor:
         }
 
     def _process_audio_content(self, content, verbose):
-        processed_audio = self.process_audio(content.content)
-        if isinstance(processed_audio, tuple):
-            is_tokenized = False
-            audio_spec, audio_token_len = processed_audio
-            audio_input = audio_spec
-        else:
-            is_tokenized = True
-            audio_token_len = processed_audio.shape[0]
-            audio_input = processed_audio
-        _input_ids = (
-            [self.audio_start_token_id]
-            + [self.audio_token_id] * audio_token_len
-            + [self.audio_end_token_id]
-        )
-
+        result = self.audio_pipeline.process_audio_input(content.content)
         verbose_str = ""
         if verbose:
-            verbose_str = f"Audio (is_tokenized={is_tokenized}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
-
+            verbose_str = (
+                f"Audio (is_tokenized={result['is_tokenized']}): "
+                f"[<audio_start> {result['audio_token_len']}*<audio> <audio_end>]\n"
+            )
         return {
-            "input_ids": _input_ids,
-            "audio_input": audio_input,
-            "is_tokenized": is_tokenized,
+            "input_ids": result["input_ids"],
+            "audio_input": result["audio_input"],
+            "is_tokenized": result["is_tokenized"],
             "verbose": verbose_str,
         }
 
@@ -1194,7 +989,7 @@ class MiMoProcessor:
         grid_t_timestamps = timestamps[
             :: self.temporal_patch_size * self.temporal_compression_ratio
         ]
-        audio_token_per_second = self.audio_input_id_per_second / self.audio_group_size
+        audio_token_per_second = self.audio_token_per_second
 
         units = []
         for i in range(len(grid_t_timestamps)):
@@ -1338,7 +1133,7 @@ class MiMoProcessor:
         self, content_idx, content, video_results, verbose
     ):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
-        processed_audio = self.process_audio(content.content)
+        processed_audio = self.audio_pipeline.process_audio(content.content)
 
         if isinstance(processed_audio, tuple):
             assert (
@@ -1791,9 +1586,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         self.video_end_token_id = self._require_config_value(
             processor_config, "video_end_token_id"
         )
-        self.use_image_processor_gpu = (
-            int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-        )
+        self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         device = server_args.device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoProcessor(
@@ -2083,7 +1876,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             input_text = f"{self.mm_tokens.audio_token}{input_text}"
 
         video_data = getattr(request_obj, "video_data", [])
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=video_data,
@@ -2185,6 +1978,11 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                         audio_source = raw_audio_item.get("url", loaded_audio)
                     elif isinstance(raw_audio_item, (str, bytes, torch.Tensor)):
                         audio_source = raw_audio_item
+                    else:
+                        raise ValueError(
+                            f"unsupported audio item: loaded={type(loaded_audio).__name__}, "
+                            f"raw={type(raw_audio_item).__name__}"
+                        )
 
                     contents.append(
                         Content(

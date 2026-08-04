@@ -11,10 +11,6 @@ Registry: nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from dataclasses import dataclass
 from typing import List, Optional
@@ -34,19 +30,6 @@ register_amd_ci(
     suite="nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla",
     nightly=True,
 )
-
-KIMI_K25_MXFP4_LOCAL_PATH = "/data/models/amd/Kimi-K2.5-MXFP4"
-KIMI_K25_MXFP4_HF_MODEL_ID = "moonshotai/Kimi-K2.5-MXFP4"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("KIMI_K25_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(KIMI_K25_MXFP4_LOCAL_PATH):
-        return KIMI_K25_MXFP4_LOCAL_PATH
-    return KIMI_K25_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -75,9 +58,8 @@ class ModelConfig:
 
 def get_kimi_k25_mxfp4_models() -> List[ModelConfig]:
     """Get Kimi-K2.5-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
     common_kwargs = {
-        "model_path": model_path,
+        "model_path": "moonshotai/Kimi-K2.5-MXFP4",
         "tp_size": 8,
         "accuracy_threshold": 0.92,
         "timeout": 3600,
@@ -131,18 +113,6 @@ class TestKimiK25MXFP4AiterMlaEvalMI35x(unittest.TestCase):
 
     def test_kimi_k25_mxfp4_accuracy(self):
         """Test Kimi-K2.5-MXFP4 with GSM8K completion benchmark (default & fp8kv)."""
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\nSKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"Using local model: {model_path}")
-        else:
-            print(f"Using HuggingFace model: {model_path}")
-
         from types import SimpleNamespace
 
         from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k

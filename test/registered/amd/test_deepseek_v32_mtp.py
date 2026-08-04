@@ -54,9 +54,9 @@ class TestDeepseekV32DPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(
@@ -146,9 +146,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         ]
         if is_in_amd_ci():
             other_args += [
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
             ]
         cls.process = popen_launch_server(

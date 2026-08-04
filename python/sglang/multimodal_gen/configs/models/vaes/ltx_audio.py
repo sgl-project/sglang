@@ -30,3 +30,5 @@ class LTXAudioVAEArchConfig(VAEArchConfig):
 @dataclass
 class LTXAudioVAEConfig(VAEConfig):
     arch_config: LTXAudioVAEArchConfig = field(default_factory=LTXAudioVAEArchConfig)
+    use_parallel_decode: bool = False
+    parallel_decode_mode: str = "tiled"

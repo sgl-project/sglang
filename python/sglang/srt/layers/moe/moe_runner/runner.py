@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -35,14 +35,37 @@ class MoeRunner:
         self.config = config
         self.lora_enabled = lora_enabled
 
+        # --moe-runner-backend hpc_ops makes the standard dispatcher keep
+        # global expert ids (skip_local_expert_mapping), so every MoE layer
+        # must actually run the hpc_ops runner. A quant method that falls
+        # back to another runner here (e.g. an unquantized MoE never enters
+        # the FP8 path) would consume global ids as local ones and misroute
+        # tokens under EP>1, so fail loudly at startup instead.
+        if get_moe_runner_backend().is_hpc_ops() and not runner_backend.is_hpc_ops():
+            raise ValueError(
+                "--moe-runner-backend hpc_ops was requested, but this MoE "
+                f"layer's quantization method selected the "
+                f"'{runner_backend.value}' runner (hpc_ops only supports FP8 "
+                "blockwise / per-tensor quantized MoE). Remove "
+                "--moe-runner-backend hpc_ops for this model."
+            )
+
         self.fused_func = None
 
         if runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
+        elif runner_backend.is_ascend():
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
+
+            self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
+
+            self.runner_core = HummingRunnerCore(config)
         elif runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 
@@ -61,6 +84,31 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
+        elif runner_backend.is_flashinfer_cutlass():
+            self.runner_core = None  # FlashInfer CUTLASS only supports fused path
+        elif runner_backend.is_flashinfer_mxfp4():
+            self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+            # Import flashinfer_cutlass here (not at module top, to avoid a circular
+            # import) to register the flashinfer_mxfp4 fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                flashinfer_cutlass,
+            )
+        elif runner_backend.is_cutlass():
+            self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
+        elif runner_backend.is_hpc_ops():
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
+            if major != 9:
+                raise ValueError(
+                    "--moe-runner-backend hpc_ops requires an SM90 (Hopper) "
+                    "GPU (the HPC-Ops kernels ship sm90a only), got "
+                    f"sm{major}{minor}."
+                )
+            self.runner_core = None  # HPC-Ops only supports the fused path
+            # Import here (not at module top, to avoid a circular import) to
+            # register the hpc_ops fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

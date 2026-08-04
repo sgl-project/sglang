@@ -21,7 +21,7 @@ class CFGBranch:
     is_conditional: bool
     kwargs: dict[str, Any]
 
-    def configure_batch(self, batch: "Req") -> None:
+    def configure_batch(self, batch: Req) -> None:
         """Set batch state before this branch's forward pass.
 
         Override for richer per-branch context (e.g. a branch index instead of
@@ -46,11 +46,11 @@ class CFGPolicy:
 
     def build(
         self,
-        batch: "Req",
+        batch: Req,
         image_kwargs: dict[str, Any],
         pos_cond_kwargs: dict[str, Any],
         neg_cond_kwargs: dict[str, Any],
-    ) -> "CFGPolicy":
+    ) -> CFGPolicy:
         """Return a new policy with branches populated.
 
         Called once before the denoising loop.  The returned policy is
@@ -66,7 +66,7 @@ class CFGPolicy:
     def combine(
         self,
         predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
-        batch: "Req",
+        batch: Req,
         cfg_scale: float,
         pipeline_config: Any,
         *,
@@ -117,7 +117,7 @@ def _unwrap(
 def _apply_cfg_postprocess(
     noise_pred: torch.Tensor,
     noise_pred_cond: torch.Tensor,
-    batch: "Req",
+    batch: Req,
     pipeline_config: Any,
 ) -> torch.Tensor:
     if batch.cfg_normalization and float(batch.cfg_normalization) > 0:

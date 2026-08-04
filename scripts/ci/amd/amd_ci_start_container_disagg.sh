@@ -23,7 +23,7 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -156,11 +156,17 @@ find_latest_image() {
     fi
   done
 
-  # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
+  echo "Exact version not found. Searching remote registry for versioned ${ROCM_VERSION}-${gpu_arch} images…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+      if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
+        echo "${tag}"
+        break
+      fi
+    done || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -168,9 +174,14 @@ find_latest_image() {
     fi
   done
 
-  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#rocm/sgl-dev:}"
+    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
+      echo "${image}"
+    fi
+  done | sort -r | head -n 1)
   if [[ -n "$any_local" ]]; then
       echo "Using cached fallback image: ${any_local}" >&2
       echo "${any_local}"
@@ -217,13 +228,36 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
 CACHE_HOST=/home/runner/sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
-    CACHE_VOLUME=""
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
 fi
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
+    fi
+    ;;
+  0|false|no|off|"")
+    CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""
@@ -313,6 +347,11 @@ docker run -dt --user root \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

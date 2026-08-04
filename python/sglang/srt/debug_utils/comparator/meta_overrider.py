@@ -50,7 +50,7 @@ class MetaOverrider:
         override_baseline_dims: list[str],
         override_target_dims: list[str],
         override_config: Optional[Path],
-    ) -> "MetaOverrider":
+    ) -> MetaOverrider:
         per_side_args: list[tuple[list[str], Literal["both", "baseline", "target"]]] = [
             (override_dims, "both"),
             (override_baseline_dims, "baseline"),

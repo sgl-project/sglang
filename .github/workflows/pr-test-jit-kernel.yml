@@ -9,6 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, means this job compiles them during install.'
+        type: string
+        default: ''
       runner_config:
         required: true
         type: string
@@ -39,9 +43,9 @@ env:
 
 jobs:
   jit-kernel-unit-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
@@ -56,19 +60,30 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -76,12 +91,12 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
 
   jit-kernel-multigpu-unit-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 8-gpu-h200
     timeout-minutes: 240
     steps:
@@ -94,19 +109,30 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -114,12 +140,12 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-8-gpu-h200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-8-gpu-h200
 
   jit-kernel-benchmark-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
@@ -134,19 +160,30 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -154,12 +191,12 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
 
   jit-kernel-b200-test:
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true'
+    # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
+    # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
+    # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -174,19 +211,30 @@ jobs:
       - name: Cleanup
         if: inputs.sgl_kernel == 'true'
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda13.0
 
+      - name: Download prebuilt Rust extensions
+        id: rust_ext
+        if: ${{ inputs.rust_ext_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.rust_ext_artifact }}
+          path: python/sglang/srt/
+
       - name: Install dependencies
         timeout-minutes: 20
+        env:
+          SGLANG_BUILD_RUST_EXTS: ${{ steps.rust_ext.outcome == 'success' && 'none' || '' }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
@@ -194,4 +242,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-b200
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-4-gpu-b200

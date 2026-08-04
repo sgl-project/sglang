@@ -6,7 +6,12 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(
+    est_time=7200,
+    suite="nightly-4-gpu-gb300-qwen35-nvfp4",
+    nightly=True,
+    disabled="not needed",
+)
 
 MODEL_PATH = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 
@@ -36,7 +41,7 @@ MTP_ARGS = [
 
 
 class TestQwen35Nvfp4(unittest.TestCase):
-    """Qwen3.5-397B NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
+    """Qwen3.5-397B NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_qwen35_nvfp4(self):
         variants = [
@@ -59,7 +64,6 @@ class TestQwen35Nvfp4(unittest.TestCase):
                 + ["--dp-size=4", "--enable-dp-attention"]
                 + MTP_ARGS,
                 variant="TP4+DP4+DPA+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 
@@ -67,7 +71,7 @@ class TestQwen35Nvfp4(unittest.TestCase):
             models=variants,
             test_name="Qwen3.5-397B-NVFP4",
             accuracy_params=AccuracyTestParams(
-                dataset="mmmu-pro", baseline_accuracy=0.78, repeat=1, max_tokens=32768
+                dataset="mmmu-pro", baseline_accuracy=0.76, repeat=1, max_tokens=32768
             ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",

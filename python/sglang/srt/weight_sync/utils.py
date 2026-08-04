@@ -7,7 +7,9 @@ from torch.distributed.tensor import DTensor
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
-from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    LocalSerializedTensor,
+)
 from sglang.srt.utils import MultiprocessingSerializer
 
 

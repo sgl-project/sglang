@@ -24,8 +24,6 @@ from transformers import OPTConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,6 +45,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -98,7 +97,7 @@ class OPTAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_parallel().tp_size
         total_num_heads = num_heads
         assert num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = total_num_heads // tensor_model_parallel_world_size
@@ -364,8 +363,8 @@ class OPTModel(nn.Module):
         )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
