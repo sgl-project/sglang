@@ -318,3 +318,15 @@ def test_cleanup_build_root_removes_registered_temporary_directory(tmp_path: Pat
 
     assert result.returncode == 0, result.stderr
     assert not build_root.exists()
+
+
+def test_build_and_report_ends_with_only_the_wheel_path(tmp_path: Path):
+    project_dir = tmp_path / "DeepEP"
+    output_dir = tmp_path / "wheels"
+    make_minimal_deepep_project(project_dir)
+
+    result = call_bash_function("build_and_report", str(project_dir), str(output_dir))
+
+    assert result.returncode == 0, result.stderr
+    wheel = next(output_dir.glob("deep_ep-*.whl"))
+    assert result.stdout.splitlines()[-1] == f"DeepEP wheel: {wheel}"

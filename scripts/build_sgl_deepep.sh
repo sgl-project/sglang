@@ -135,7 +135,19 @@ build_deepep() {
             "${PYTHON_BIN}" setup.py bdist_wheel -d "${output_dir}"
     )
 
-    find_single_wheel "${output_dir}"
+    find_single_wheel "${output_dir}" >/dev/null
+}
+
+
+build_and_report() {
+    local source_dir="$1"
+    local output_dir="$2"
+    local wheel_path
+
+    build_deepep "${source_dir}" "${output_dir}"
+    wheel_path="$(find_single_wheel "${output_dir}")"
+    echo "--- Done ---"
+    echo "DeepEP wheel: ${wheel_path}"
 }
 
 
@@ -277,7 +289,6 @@ main() {
     local cuda_major
     local deepep_branch
     local deepep_dir
-    local wheel_path
 
     arch="$(uname -m)"
     if [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
@@ -354,10 +365,7 @@ main() {
 
     export CUDA_HOME GDRCOPY_HOME
     echo "--- Building DeepEP wheel ---"
-    wheel_path="$(build_deepep "${deepep_dir}" "${output_dir}")"
-
-    echo "--- Done ---"
-    echo "DeepEP wheel: ${wheel_path}"
+    build_and_report "${deepep_dir}" "${output_dir}"
 }
 
 
