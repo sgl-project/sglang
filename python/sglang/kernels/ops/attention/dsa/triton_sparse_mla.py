@@ -54,6 +54,21 @@ def _kv_splits_heuristic(
     return _prev_pow2(min(splits_to_fill, max_kv_splits))
 
 
+def _row_strides(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """Return (tensor, token_stride, head_stride) for a [N, H, D] q tensor.
+
+    The kernels address q by explicit row strides, so a packed [N, H, D] layout is
+    not required -- only a unit-stride last dim. Callers that pass an already-
+    concatenated q (dsa_backend, GLM-5.2 path) hand us two strided views of one
+    [N, H, D_V + D_TAIL] buffer; copying those would cost two extra device kernels
+    per layer per forward for nothing. The fallback keeps the kernels' `+ g` / `+ dt`
+    addressing valid for exotic layouts -- no caller hits it today.
+    """
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    return x, x.stride(0), x.stride(1)
+
+
 def _prune_configs(configs, named_args, **kwargs):
     """Drop configs whose KV tile exceeds topk (pure waste)."""
     topk = named_args["topk"]
@@ -94,6 +109,10 @@ def _sparse_mla_fwd_split_dim_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    STRIDE_QN_T: tl.constexpr,
+    STRIDE_QN_H: tl.constexpr,
+    STRIDE_QR_T: tl.constexpr,
+    STRIDE_QR_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     s_i = tl.program_id(0)
@@ -102,22 +121,16 @@ def _sparse_mla_fwd_split_dim_kernel(
     dt = tl.arange(0, D_TAIL)
     g = tl.arange(0, _G)
 
-    q_base = q_nope_ptr + s_i * H * D_V
-    q0 = tl.load(q_base + h[:, None] * D_V + g[None, :]).to(q_nope_ptr.dtype.element_ty)
+    q_row = q_nope_ptr + s_i * STRIDE_QN_T + h[:, None] * STRIDE_QN_H
+    q0 = tl.load(q_row + g[None, :]).to(q_nope_ptr.dtype.element_ty)
     if NUM_GROUPS >= 2:
-        q1 = tl.load(q_base + h[:, None] * D_V + (_G + g)[None, :]).to(
-            q_nope_ptr.dtype.element_ty
-        )
+        q1 = tl.load(q_row + (_G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
     if NUM_GROUPS >= 3:
-        q2 = tl.load(q_base + h[:, None] * D_V + (2 * _G + g)[None, :]).to(
-            q_nope_ptr.dtype.element_ty
-        )
+        q2 = tl.load(q_row + (2 * _G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
     if NUM_GROUPS >= 4:
-        q3 = tl.load(q_base + h[:, None] * D_V + (3 * _G + g)[None, :]).to(
-            q_nope_ptr.dtype.element_ty
-        )
+        q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(q_nope_ptr.dtype.element_ty)
     q_tail = tl.load(
-        q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
+        q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
     ).to(q_nope_ptr.dtype.element_ty)
 
     neg_large = -3.4028234663852886e38
@@ -240,8 +253,8 @@ def _triton_sparse_mla_fwd_single(
     d_tail = q_rope.shape[-1]
     dim = kv.shape[-1]
     topk = indices.shape[-1]
-    q_nope = q_nope.contiguous()
-    q_rope = q_rope.contiguous()
+    q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
+    q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
     idx_flat = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
     qk_scale = float(sm_scale) * _LOG2E
@@ -257,6 +270,9 @@ def _triton_sparse_mla_fwd_single(
         )
         q_nope_pad[:, :H, :] = q_nope
         q_rope_pad[:, :H, :] = q_rope
+        # Freshly allocated and packed; re-read the strides for the padded shape.
+        q_nope_pad, stride_qn_t, stride_qn_h = _row_strides(q_nope_pad)
+        q_rope_pad, stride_qr_t, stride_qr_h = _row_strides(q_rope_pad)
         out_pad = torch.empty(
             seq, H_pad, d_v, device=q_nope.device, dtype=torch.bfloat16
         )
@@ -274,6 +290,10 @@ def _triton_sparse_mla_fwd_single(
             D_V=d_v,
             D_TAIL=d_tail,
             NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
         )
         out = out_pad[:, :H, :].contiguous()
     else:
@@ -291,6 +311,10 @@ def _triton_sparse_mla_fwd_single(
             D_V=d_v,
             D_TAIL=d_tail,
             NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
         )
     return out.unsqueeze(0)
 
@@ -322,6 +346,10 @@ def _sparse_mla_fused_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    STRIDE_QN_T: tl.constexpr,
+    STRIDE_QN_H: tl.constexpr,
+    STRIDE_QR_T: tl.constexpr,
+    STRIDE_QR_H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -337,30 +365,28 @@ def _sparse_mla_fused_kernel(
     fp8_type = q_nope_ptr.dtype.element_ty
     inv_fp8_max = 1.0 / fp8_max
 
-    qn_base = q_nope_ptr + t * H * D_V
-    q0 = tl.load(
-        qn_base + h_offs[:, None] * D_V + g[None, :], mask=h_mask[:, None], other=0.0
-    ).to(fp8_type)
+    qn_row = q_nope_ptr + t * STRIDE_QN_T + h_offs[:, None] * STRIDE_QN_H
+    q0 = tl.load(qn_row + g[None, :], mask=h_mask[:, None], other=0.0).to(fp8_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (_G + g)[None, :],
+            qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
+            qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
+            qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     q_tail = tl.load(
-        q_rope_ptr + t * H * D_TAIL + h_offs[:, None] * D_TAIL + dt[None, :],
+        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
@@ -491,6 +517,10 @@ def _sparse_mla_split_k_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    STRIDE_QN_T: tl.constexpr,
+    STRIDE_QN_H: tl.constexpr,
+    STRIDE_QR_T: tl.constexpr,
+    STRIDE_QR_H: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -508,30 +538,28 @@ def _sparse_mla_split_k_kernel(
     fp8_type = q_nope_ptr.dtype.element_ty
     inv_fp8_max = 1.0 / fp8_max
 
-    qn_base = q_nope_ptr + t * H * D_V
-    q0 = tl.load(
-        qn_base + h_offs[:, None] * D_V + g[None, :], mask=h_mask[:, None], other=0.0
-    ).to(fp8_type)
+    qn_row = q_nope_ptr + t * STRIDE_QN_T + h_offs[:, None] * STRIDE_QN_H
+    q0 = tl.load(qn_row + g[None, :], mask=h_mask[:, None], other=0.0).to(fp8_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (_G + g)[None, :],
+            qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
+            qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
+            qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     q_tail = tl.load(
-        q_rope_ptr + t * H * D_TAIL + h_offs[:, None] * D_TAIL + dt[None, :],
+        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
@@ -726,8 +754,8 @@ def _triton_sparse_mla_fwd_splitk(
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
     idx_flat = indices.squeeze(1).contiguous() if indices.dim() == 3 else indices
-    q_nope = q_nope.contiguous()
-    q_rope = q_rope.contiguous()
+    q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
+    q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
     BLOCK_K = 64
@@ -760,6 +788,10 @@ def _triton_sparse_mla_fwd_splitk(
             D_V=d_v,
             D_TAIL=d_tail,
             NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
             num_warps=4,
@@ -795,6 +827,10 @@ def _triton_sparse_mla_fwd_splitk(
         D_V=d_v,
         D_TAIL=d_tail,
         NUM_GROUPS=num_groups,
+        STRIDE_QN_T=stride_qn_t,
+        STRIDE_QN_H=stride_qn_h,
+        STRIDE_QR_T=stride_qr_t,
+        STRIDE_QR_H=stride_qr_h,
         KV_SPLITS=kv_splits,
         BLOCK_H=BLOCK_H,
         BLOCK_K=BLOCK_K,

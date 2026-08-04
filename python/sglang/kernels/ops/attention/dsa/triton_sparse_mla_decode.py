@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.triton_sparse_mla import _row_strides
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _IS_FNUZ = is_fp8_fnuz()
@@ -110,6 +111,10 @@ def _sparse_mla_decode_fused_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    STRIDE_QN_T: tl.constexpr,
+    STRIDE_QN_H: tl.constexpr,
+    STRIDE_QR_T: tl.constexpr,
+    STRIDE_QR_H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -124,32 +129,33 @@ def _sparse_mla_decode_fused_kernel(
     fp8_type = q_nope_ptr.dtype.element_ty
     inv_fp8_max = 1.0 / fp8_max
 
-    qn_base = q_nope_ptr + t * H * D_V
+    qn_base = q_nope_ptr + t * STRIDE_QN_T
+    qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
     q0 = tl.load(
-        qn_base + h_offs[:, None] * D_V + g[None, :],
+        qn_row + g[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (_G + g)[None, :],
+            qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
+            qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
+            qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     q_tail = tl.load(
-        q_rope_ptr + t * H * D_TAIL + h_offs[:, None] * D_TAIL + dt[None, :],
+        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
@@ -293,6 +299,10 @@ def _sparse_mla_decode_split_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    STRIDE_QN_T: tl.constexpr,
+    STRIDE_QN_H: tl.constexpr,
+    STRIDE_QR_T: tl.constexpr,
+    STRIDE_QR_H: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -309,32 +319,33 @@ def _sparse_mla_decode_split_kernel(
     fp8_type = q_nope_ptr.dtype.element_ty
     inv_fp8_max = 1.0 / fp8_max
 
-    qn_base = q_nope_ptr + t * H * D_V
+    qn_base = q_nope_ptr + t * STRIDE_QN_T
+    qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
     q0 = tl.load(
-        qn_base + h_offs[:, None] * D_V + g[None, :],
+        qn_row + g[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (_G + g)[None, :],
+            qn_row + (_G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
+            qn_row + (2 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
-            qn_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
+            qn_row + (3 * _G + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(fp8_type)
     q_tail = tl.load(
-        q_rope_ptr + t * H * D_TAIL + h_offs[:, None] * D_TAIL + dt[None, :],
+        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
         mask=h_mask[:, None],
         other=0.0,
     ).to(fp8_type)
@@ -547,8 +558,13 @@ def triton_sparse_mla_decode_splitk(
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
     idx_flat = indices.squeeze(1).contiguous()
-    q_nope = q_nope.contiguous()
-    q_rope = q_rope.contiguous()
+    # The kernels address q by explicit row strides, so a packed [N, H, D] layout
+    # is not required -- only a unit-stride last dim. Callers that pass an
+    # already-concatenated q (dsa_backend, GLM-5.2 path) hand us two strided views
+    # of one [N, H, D_V + D_TAIL] buffer; copying those would cost two extra
+    # device kernels per layer per forward for nothing.
+    q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
+    q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
     BLOCK_H = 16
     BLOCK_K = 64
@@ -587,6 +603,10 @@ def triton_sparse_mla_decode_splitk(
             D_V=d_v,
             D_TAIL=d_tail,
             NUM_GROUPS=num_groups,
+            STRIDE_QN_T=stride_qn_t,
+            STRIDE_QN_H=stride_qn_h,
+            STRIDE_QR_T=stride_qr_t,
+            STRIDE_QR_H=stride_qr_h,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
             num_warps=4,
@@ -621,6 +641,10 @@ def triton_sparse_mla_decode_splitk(
         D_V=d_v,
         D_TAIL=d_tail,
         NUM_GROUPS=num_groups,
+        STRIDE_QN_T=stride_qn_t,
+        STRIDE_QN_H=stride_qn_h,
+        STRIDE_QR_T=stride_qr_t,
+        STRIDE_QR_H=stride_qr_h,
         KV_SPLITS=kv_splits,
         BLOCK_H=BLOCK_H,
         BLOCK_K=BLOCK_K,
