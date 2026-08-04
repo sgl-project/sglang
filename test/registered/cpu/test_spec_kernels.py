@@ -1114,6 +1114,8 @@ class TestExtendAttentionTreeMask(CustomTestCase):
             o_extend,
             k_buffer,
             v_buffer,
+            None,  # k_buf_scale
+            None,  # v_buf_scale
             req_to_token,
             req_pool_indices,
             seq_lens,
