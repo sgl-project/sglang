@@ -66,7 +66,10 @@ class GSM8KAscendMixin(ABC):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
+        from sglang.test.ascend.npu_eval_accuracy_kit import (
+            _is_pr_pipeline,
+            run_npu_pr_smoke,
+        )
 
         if _is_pr_pipeline:
             run_npu_pr_smoke(self.base_url)
