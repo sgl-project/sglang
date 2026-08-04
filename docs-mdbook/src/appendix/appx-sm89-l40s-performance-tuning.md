@@ -745,6 +745,16 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - **限并发运行时可调（不用重启）**：`curl -X POST http://127.0.0.1:8080/admin/limits -H 'Content-Type: application/json' -d '{"tool_call": 12, "thinking": 16}'` 即时生效（重建信号量，在途请求不受影响）；启动默认值用脚本 `--proxy-tool-call-limit` / `--proxy-thinking-limit` 设置。调大后盯 TTFT 趋势，`num_queue_reqs` 上涨即回落。
 - **其它接口透传**：代理只对 `/v1/chat/completions` 做限并发 + priority；`/health`、`/metrics`、`/v1/completions`、`/v1/embeddings` 等其它接口由兜底路由原样转发（含查询串与流式），健康检查和指标采集可直接走代理端口（8080）。
 - **Anthropic 风格接口**：`/v1/messages` 按 `thinking.type == "enabled"` 分类并限并发（tool call / thinking 同信号量）；但 Anthropic 协议无 priority 字段，SGLang 的 anthropic 入口会拒绝未知字段，**无法注入 priority**——Anthropic 入口下 tool call 不能插队，只能靠限并发保底。
+- **代理依赖验证**：`sglang_proxy.py` 只依赖 fastapi / uvicorn / httpx。fastapi 与 uvicorn 是 SGLang 的直接依赖（`python/pyproject.toml`），镜像内必有；httpx 为传递依赖，需实际验证：
+
+```bash
+# pod 内
+kubectl exec <pod> -- python3.12 -c "import fastapi, uvicorn, httpx; print(fastapi.__version__, uvicorn.__version__, httpx.__version__)"
+# 或 pip 列表
+python3.12 -m pip list | grep -iE "fastapi|uvicorn|httpx"
+```
+
+判断：三个都有 → 代理直接用，无需安装；仅 httpx 缺失 → `pip install httpx` 后固化镜像；fastapi/uvicorn 缺失 → 镜像构建不完整，先查构建。
 
 **请求侧**：
 
