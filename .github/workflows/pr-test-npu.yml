@@ -609,7 +609,7 @@ jobs:
           #   runner: linux-aarch64-a3-4-
           #   test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
           #   test_type: 'accuracy'
-            
+
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
       runner: ${{ matrix.test_config.runner }}
