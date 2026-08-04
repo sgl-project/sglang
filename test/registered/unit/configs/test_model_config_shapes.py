@@ -1,9 +1,10 @@
 """Unit tests for ModelConfig shape normalization."""
 
+import math
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,6 +51,30 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(text_config.v_head_dim, 128)
         self.assertEqual(text_config.swa_head_dim, 128)
         self.assertEqual(text_config.swa_v_head_dim, 128)
+
+    def test_mla_branches_derive_scaling(self):
+        """Every branch that concludes AttentionArch.MLA must also derive
+        scaling: FlashInferMLA reads model_config.scaling at construction and
+        crashes with AttributeError otherwise (gh #29891)."""
+        cases = [
+            ("KimiVLForConditionalGeneration", {}),
+            ("MiniCPM3ForCausalLM", {}),
+            ("DeepseekVL2ForCausalLM", {"use_mla": True}),
+        ]
+        for arch, extra in cases:
+            with self.subTest(arch=arch):
+                text_config = _make_text_config(
+                    architectures=[arch],
+                    kv_lora_rank=512,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    rope_scaling=None,
+                    **extra,
+                )
+                model_config = self._derive_shapes(text_config)
+                self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+                self.assertAlmostEqual(model_config.scaling, 1 / math.sqrt(128 + 64))
 
     def test_explicit_head_dims_are_preserved(self):
         text_config = _make_text_config(
