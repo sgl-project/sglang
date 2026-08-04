@@ -87,8 +87,8 @@ curl -s http://localhost:30000/v1/chat/completions \
     {
       "message": {
         "role": "assistant",
-        "content": "\n\n**15% of 240 = 36**\n\n**Calculation:**\n240 × 0.15 = 36\n\n**Quick check:** 10% of 240 = 24, and 5% of 240 = 12. So 15% = 24 + 12 = **36** ✓\n\n",
-        "reasoning_content": "\n<think>\nThe question asks to find 15% of 240.\n\n15% = 0.15 = 15/100\n\n240 × 15/100 = 36\n\nVerification: 10% of 240 = 24, 5% of 240 = 12, so 15% = 24 + 12 = 36. ✓\n",
+        "content": "15% of 240 = **36**",
+        "reasoning_content": "The user is asking a simple percentage calculation: 15% of 240. This is straightforward: 0.15 × 240 = 36.",
         "tool_calls": null
       },
       "finish_reason": "stop"
@@ -143,13 +143,14 @@ curl -s http://localhost:30000/v1/chat/completions \
     {
       "message": {
         "role": "assistant",
-        "content": "Let me search for the latest news about AI for you!",
-        "reasoning_content": "\n<think>\nThe user wants me to search for the latest news about AI. I'll use the search tool to find relevant results.\n",
+        "content": "",
+        "reasoning_content": "The user wants me to search for the latest news about AI. I'll use the search tool with a query about the latest AI news.",
         "tool_calls": [
           {
-            "id": "call_605ef1b731fa46f5ba46fe16",
+            "id": "call_0822dd418aa34254aa5b19e1",
+            "index": 0,
             "type": "function",
-            "function": { "name": "search", "arguments": "{\"query\": \"latest news about AI\"}" }
+            "function": { "name": "search", "arguments": "{\"query\": \"latest news about AI 2025\"}" }
           }
         ]
       },
