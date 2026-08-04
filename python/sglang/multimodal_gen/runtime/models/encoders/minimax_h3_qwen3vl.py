@@ -70,6 +70,12 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def _align_rotary_buffer(self, device: torch.device) -> None:
+        rotary_emb = self.model.language_model.rotary_emb
+        inv_freq = getattr(rotary_emb, "inv_freq", None)
+        if isinstance(inv_freq, torch.Tensor) and inv_freq.device != device:
+            rotary_emb.inv_freq = inv_freq.to(device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -152,6 +158,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
+        self._align_rotary_buffer(ids.device)
         hidden = self.model(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
         expected_shape = [int(ids.shape[1]), self.hidden_dim]
         if list(hidden.shape) != expected_shape:
