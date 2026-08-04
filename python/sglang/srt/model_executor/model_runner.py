@@ -1199,6 +1199,17 @@ class ModelRunner:
             model_runner=self, init_new_workspace=init_new_workspace
         )
 
+    def _decode_cuda_graph_runner_cls(self):
+        """Decode CUDA-graph runner class to construct.
+
+        Subclasses can override this to install specialized decode graph runners.
+        """
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        return DecodeCudaGraphRunner
+
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
