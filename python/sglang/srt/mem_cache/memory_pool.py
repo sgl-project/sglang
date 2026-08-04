@@ -1593,6 +1593,7 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        allocation_label: Optional[str] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -1606,6 +1607,7 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+        self.allocation_label = allocation_label
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -1626,19 +1628,27 @@ class KVCache(abc.ABC):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
+        cache_name = (
+            f"{self.allocation_label} KV Cache"
+            if self.allocation_label is not None
+            else "KV Cache"
+        )
         kv_size_bytes = self.get_kv_size_bytes()
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"{cache_name} is allocated. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, "
+                f"V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"{cache_name} is allocated. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -1721,6 +1731,7 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        allocation_label: Optional[str] = None,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -1737,6 +1748,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            allocation_label,
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None

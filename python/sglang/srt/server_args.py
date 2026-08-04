@@ -8350,6 +8350,11 @@ class ServerArgs:
         if hasattr(self, "model_config"):
             return self.model_config
         self.model_config = ModelConfig.from_server_args(self)
+        if self.model_config.is_hybrid_swa:
+            logger.info(
+                "Hybrid SWA model detected. architectures=%s",
+                self.model_config.hf_config.architectures,
+            )
         return self.model_config
 
     def _resolved(self):
