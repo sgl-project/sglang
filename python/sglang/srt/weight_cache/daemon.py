@@ -271,6 +271,7 @@ class WeightCacheDaemon:
             dtype=str(model_config.dtype),
             revision=self.revision or "",
             **compute_env_stamp(),
+            **self.quant_states.compute_quant_stamp(),
         )
 
         # Initialize distributed backend (requires server_args + model_config)
@@ -508,7 +509,6 @@ class WeightCacheDaemon:
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
                     "module_attrs": self.quant_states.module_attrs,
-                    "moe_runner_backend": self.quant_states.moe_runner_backend,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.

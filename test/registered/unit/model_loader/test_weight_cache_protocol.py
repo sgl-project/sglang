@@ -60,6 +60,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         device_capability="8.0",
         torch_version="2.5.1",
         fp4_gemm_backend="",
+        moe_runner_backend="auto",
     )
     base.update(overrides)
     return CacheConfig(**base)
@@ -126,9 +127,11 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
-            # Differing FP4 backends change the exported param set, so this
-            # must be a clean mismatch rather than a silent wrong-layout load.
+            # Differing GEMM / MoE backends change the exported layout, so
+            # these must be clean mismatches rather than silent wrong-layout
+            # loads -- the tensors themselves would map without complaint.
             ("fp4_gemm_backend", "flashinfer_trtllm"),
+            ("moe_runner_backend", "flashinfer_cutlass"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),

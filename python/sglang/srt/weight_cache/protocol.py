@@ -68,7 +68,9 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # For quantization
     fp4_gemm_backend: str
+    moe_runner_backend: str
 
     def matches(self, other: CacheConfig) -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -302,7 +304,7 @@ class WeightCacheQuantStates:
         self._capture_attrs = self._registry[quant_method].capture_attrs
 
         # Resolve the backends the engine also resolves, for every method and
-        # not just FP4 ones: both feed compute_env_stamp(), which fingerprints
+        # not just FP4 ones: both feed compute_quant_stamp(), which fingerprints
         # every CacheConfig, so a daemon that skipped either would stamp an
         # unresolved value against a client's resolved one and never match.
         from sglang.srt.layers.moe import initialize_moe_config
@@ -375,12 +377,6 @@ class WeightCacheQuantStates:
                 setattr(module, key, value)
         return changed
 
-    @property
-    def moe_runner_backend(self) -> str:
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
-        return get_moe_runner_backend().value
-
     def ipc_reshapes_weights(self) -> bool:
         """Whether post-processing changes the shape of exported tensors."""
         raise NotImplementedError
@@ -388,6 +384,30 @@ class WeightCacheQuantStates:
     def ipc_rebind_after_import(self, layer: nn.Module) -> None:
         """Re-establish state that depends on tensor identity, per module."""
         raise NotImplementedError
+
+    @classmethod
+    def compute_quant_stamp(cls) -> Dict[str, str]:
+        fp4_gemm_backend = ""
+        moe_runner_backend = ""
+        try:
+            from sglang.srt.layers.quantization.fp4_utils import (
+                get_fp4_gemm_runner_backend,
+            )
+
+            fp4_gemm_backend = str(get_fp4_gemm_runner_backend().value)
+        except Exception:
+            logger.warning("[weight_cache] failed to resolve the FP4 GEMM backend")
+        try:
+            from sglang.srt.layers.moe import get_moe_runner_backend
+
+            moe_runner_backend = str(get_moe_runner_backend().value)
+        except Exception:
+            logger.warning("[weight_cache] failed to resolve the MoE runner backend")
+
+        return {
+            "fp4_gemm_backend": fp4_gemm_backend,
+            "moe_runner_backend": moe_runner_backend,
+        }
 
 
 @WeightCacheQuantStates.register("", is_supported_func=lambda _quant_config: True)
@@ -506,23 +526,26 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
 def compute_env_stamp() -> Dict[str, str]:
     """Local environment fingerprint for the IPC weight cache.
 
-    Returns the device compute capability, torch version, and resolved FP4 GEMM
-    backend of the current process. A daemon and a connecting client that differ
-    on any of these may have run different post-processing / kernel-selection
-    branches (or, for FP4, registered a different raw param set), producing
-    weights that map cleanly over IPC yet serve garbage; stamping these into
-    CacheConfig turns that into a clean mismatch. Imported lazily so protocol.py
-    stays cheap to import and usable on CPU-only hosts (all fields degrade to "").
+    Returns the device compute capability and torch version of the current
+    process; the quantization half of the fingerprint comes from
+    WeightCacheQuantStates.compute_quant_stamp(). A daemon and a connecting
+    client that differ on any of these may have run different post-processing /
+    kernel-selection branches, producing weights that map cleanly over IPC yet
+    serve garbage; stamping them into CacheConfig turns that into a clean
+    mismatch. Imported lazily so protocol.py stays cheap to import and usable on
+    CPU-only hosts (all fields degrade to "").
     """
     device_capability = ""
     torch_version = ""
-    fp4_gemm_backend = ""
+
     try:
         import torch
 
         torch_version = str(torch.__version__)
     except Exception:
-        pass
+        logger.warning(
+            "[weight_cache] failed to get torch version during compute_env_stamp"
+        )
     try:
         from sglang.srt.platforms import current_platform
 
@@ -530,19 +553,13 @@ def compute_env_stamp() -> Dict[str, str]:
         if cap is not None:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
-        pass
-    try:
-        from sglang.srt.layers.quantization.fp4_utils import (
-            get_fp4_gemm_runner_backend,
+        logger.warning(
+            "[weight_cache] failed to get device capability during compute_env_stamp"
         )
 
-        fp4_gemm_backend = str(get_fp4_gemm_runner_backend().value)
-    except Exception:
-        pass
     return {
         "device_capability": device_capability,
         "torch_version": torch_version,
-        "fp4_gemm_backend": fp4_gemm_backend,
     }
 
 

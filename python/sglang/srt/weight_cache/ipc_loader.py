@@ -132,7 +132,7 @@ class IpcModelLoader(BaseModelLoader):
 
         # Only now that we are certain we will map the daemon's tensors: this
         # gives us the per-method adaptation the daemon used (which shapes may
-        # differ, what has to be rewired), and constructing it resolves this
+        # differ, what has to be rewired). Constructing it resolves this
         # process's MoE/FP4 backends -- a no-op repeat of what the engine
         # already did, but it needs published server args, which the disk
         # fallback path above must not require.
@@ -152,7 +152,6 @@ class IpcModelLoader(BaseModelLoader):
             quant_config,
             quant_states=quant_states,
             module_attrs=cache_data.get("module_attrs") or {},
-            daemon_moe_runner_backend=cache_data.get("moe_runner_backend", ""),
         )
 
         # Rebuild stale tensor views. Some modules store tensor views as
@@ -306,7 +305,6 @@ class IpcModelLoader(BaseModelLoader):
         quant_config,
         quant_states: WeightCacheQuantStates,
         module_attrs: Optional[dict] = None,
-        daemon_moe_runner_backend: str = "",
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
@@ -314,7 +312,6 @@ class IpcModelLoader(BaseModelLoader):
         then each parameter's data is replaced with the IPC-mapped GPU tensor.
         The engine and daemon share the same physical GPU memory via CUDA IPC.
         """
-        from sglang.srt.layers.moe import get_moe_runner_backend
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         # Initialize model on meta device to avoid any GPU/CPU memory allocation.
@@ -402,21 +399,10 @@ class IpcModelLoader(BaseModelLoader):
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
 
-        client_moe_runner_backend = get_moe_runner_backend().value
-        if (
-            daemon_moe_runner_backend
-            and client_moe_runner_backend
-            and client_moe_runner_backend != daemon_moe_runner_backend
-        ):
-            raise RuntimeError(
-                f"[IpcModelLoader] MoE runner backend mismatch: the daemon's "
-                f"weights were post-processed for "
-                f"'{daemon_moe_runner_backend}' but this engine resolved "
-                f"'{client_moe_runner_backend}'. The expert weight layout is "
-                f"backend-specific, so serving these weights would produce "
-                f"wrong output. Launch both with the same --moe-runner-backend."
-            )
-
+        # Reproduce the parts of the daemon's post-processing pass that are not
+        # tensor data. A daemon that shuffled for a different MoE backend never
+        # reaches here: moe_runner_backend is part of the CacheConfig
+        # fingerprint, so it is rejected as a config mismatch at fetch time.
         if module_attrs:
             changed = quant_states.apply_module_attrs(model, module_attrs)
             logger.info(
@@ -563,6 +549,7 @@ class IpcModelLoader(BaseModelLoader):
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),
+                **WeightCacheQuantStates.compute_quant_stamp(),
             )
 
             logger.info(
