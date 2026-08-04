@@ -525,3 +525,44 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 | Worker 1 热点（11 running vs 5/5） | 监控 prefix 分布，排查 prefix-aware 路由倾斜 |
 | Abort 3.3% | 查原因分布（客户端超时 vs 服务端错误） |
 | 冷启动 | 10.6 定位 + 10.7 预热方案仍未回填，先落地再测稳态 TTFT |
+
+### 10.9 K8s 部署方案（两实例，无请求路由控制）
+
+> 前提：pod 镜像为附录 C 固化的版本（含 sgl_stubs.so、load_utils 补丁、sglang-kernel 源码编译产物、flashinfer 0.6.13）。启动脚本：[sglang_start.sh](appendix/sglang_start.sh)（已适配 K8s：按 `CUDA_VISIBLE_DEVICES` 计数、空 `GPU_IDS` 不再禁用显卡、默认值按验证结论 0.85/98304/12）。
+
+**为何是两实例而非三实例**：没有请求路由控制时，单卡轻量实例无法差异化——context 必须与其他实例一致（98304），否则长请求会被拒；而 98304 + TP=1 让它变成一个慢速通用实例，无意义。故放弃单卡实例，第 7 卡作热备/扩容预留。
+
+**架构**
+
+| 实例 | 卡数 | 架构 | 并发/worker | MTP | context |
+|------|------|------|------------|-----|---------|
+| tool call 主力 | 4 | TP=2 DP=2 | 5（可试 8） | NEXTN steps=2 draft=3 | 98304 |
+| 代码检视 | 2 | TP=2 DP=1 | 12 | NEXTN steps=3 draft=4 | 98304 |
+| 第 7 卡 | - | 热备/扩容预留 | - | - | - |
+
+**启动命令**（pod 内端口统一 8000，不传 `--gpu-ids`，K8s 自动分配）
+
+```bash
+# 1) tool call 主力（4 卡 → 自动 TP2 DP2）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 5 \
+    --enable-speculative --speculative-num-steps 2 --speculative-num-draft-tokens 3
+
+# 2) 代码检视（2 卡 → 自动 TP2 DP1）
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 12 \
+    --enable-speculative --speculative-num-steps 3 --speculative-num-draft-tokens 4
+```
+
+**注意事项**
+
+- 两实例各自独立：KV 池/RadixTree/预热，context 一致 98304；
+- 分流的真正前提是客户端能分别连接两个服务（如 agent 框架连 tool call 实例、检视应用连检视实例）；若所有请求都打同一个入口，拆分无效，退化为单实例 6 卡 + 优先级调度 + 网关限并发；
+- 第 7 卡：热备；若必须全用 7 卡，唯一方案是检视改 3 卡 TP=3（需先验证 TP3 与 hybrid mamba + MTP 的兼容性）；
+- tool call 实例并发先 5：`queue_time ≈ 0` 且 TTFT < 2s 再升到 8，TTFT 抬头即回落；
+- 预热每个实例单独做（`--warmup` 或 10.7 预热脚本，挂在 initContainer/启动后脚本）；
+- 横向扩容 = 加同配置 pod 副本 + 负载均衡，不要通过调高并发实现；
+- 上线后按 10.6 定位表盯三个指标：`queue_time_seconds` / `cache_hit_rate` / `kv_available`；
+- 请求侧参数（max_tokens / thinking_budget 等）按 9.2 / 9.3 场景取值。
