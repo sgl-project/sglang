@@ -403,57 +403,56 @@ class DSparkDraftMixin:
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        markov_weights = []
-        confidence_weights = []
-        backbone_weights = []
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
-                continue
-            if name.startswith("confidence_head."):
-                if self.confidence_head is None:
+        loaded_confidence_names = set()
+
+        def backbone_weights():
+            for name, loaded_weight in weights:
+                if any(name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES):
                     continue
-                confidence_weights.append((name, loaded_weight))
-            elif name.startswith("markov_head."):
-                markov_weights.append((name, loaded_weight))
-            else:
-                backbone_weights.append((name, loaded_weight))
+                if name.startswith("confidence_head."):
+                    if self.confidence_head is None:
+                        continue
+                    if name not in params_dict:
+                        raise ValueError(
+                            f"DSpark unexpected confidence weight {name!r} not "
+                            "found in model parameters."
+                        )
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_confidence_names.add(name)
+                elif name.startswith("markov_head."):
+                    if name not in params_dict:
+                        raise ValueError(
+                            f"DSpark unexpected markov weight {name!r} not found "
+                            "in model parameters (known markov params require a "
+                            f"{type(self.markov_head).__name__} head)."
+                        )
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                else:
+                    yield name, loaded_weight
 
-        super().load_weights(backbone_weights)
+        super().load_weights(backbone_weights())
 
-        for name, loaded_weight in markov_weights:
-            if name not in params_dict:
-                raise ValueError(
-                    f"DSpark unexpected markov weight {name!r} not found in model "
-                    f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
-                )
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-
-        self._load_confidence_weights(
-            confidence_weights=confidence_weights, params_dict=params_dict
+        self._assert_confidence_head_loaded(
+            loaded_names=loaded_confidence_names, params_dict=params_dict
         )
 
-    def _load_confidence_weights(
+    def _assert_confidence_head_loaded(
         self,
         *,
-        confidence_weights: list,
+        loaded_names: set,
         params_dict: dict,
     ) -> None:
         if self.confidence_head is None:
             return
-        loaded_names = set()
-        for name, loaded_weight in confidence_weights:
-            if name not in params_dict:
-                raise ValueError(
-                    f"DSpark unexpected confidence weight {name!r} not found in "
-                    "model parameters."
-                )
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_names.add(name)
 
         confidence_param_names = {
             name for name in params_dict if name.startswith("confidence_head.")
