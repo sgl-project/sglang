@@ -45,6 +45,9 @@ class NPUGSM8KMixin(GSM8KMixin):
     """NPU GSM8K accuracy mixin — 1% tolerance + up to 3 retries."""
 
     def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         threshold = self.gsm8k_score_threshold
         if threshold != threshold:  # NaN → legacy alias
             threshold = self.gsm8k_accuracy_thres

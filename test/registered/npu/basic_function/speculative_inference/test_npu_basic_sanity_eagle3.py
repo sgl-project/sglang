@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
+from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_8B_EAGLE3_WEIGHTS_PATH,
     QWEN3_8B_WEIGHTS_PATH,
@@ -10,7 +10,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -26,7 +25,7 @@ class TestBasicSanityEagle3(
     BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
-    GSM8KMixin,
+    NPUGSM8KMixin,
     CustomTestCase,
 ):
     served_model_name = QWEN3_8B_WEIGHTS_PATH
@@ -68,12 +67,6 @@ class TestBasicSanityEagle3(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        if _is_pr_pipeline:
-            run_npu_pr_smoke(self.base_url)
-            return
-        super().test_gsm8k()
 
 
 if __name__ == "__main__":
