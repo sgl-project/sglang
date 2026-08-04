@@ -80,6 +80,17 @@ ln -sf common_ops_sm90_build.abi3.so common_ops.abi3.so
 
 **问题**: `common_ops_sm90_build.abi3.so` 在动态加载时报 4 个专家特化函数符号的 undefined symbol（`fp8_blockwise_scaled_grouped_mm`、`es_fp8_blockwise_scaled_grouped_mm`、`es_sm100_mxfp8_blockscaled_grouped_mm`、`es_sm100_mxfp8_blockscaled_grouped_quant`）。这些符号对应 SM90/SM100 特化实现，在 SM89 + CUDA 12.1 环境下不可用。
 
+> **SM 含义**：SM = Streaming Multiprocessor（流式多处理器），NVIDIA GPU 的基本计算单元，CUDA 代码最终在其上执行。文档中的 SM89/SM90/SM100 是**按算力（compute capability）代称的架构代号**：
+>
+> | 代号 | 算力 | 架构 | 代表卡 |
+> |------|------|------|--------|
+> | SM80 | 8.0 | Ampere | A100 |
+> | SM89 | 8.9 | Ada Lovelace | **L40S（本部署）**、RTX 4090 |
+> | SM90 | 9.0 | Hopper | H100、H200 |
+> | SM100 | 10.0 | Blackwell | B200、GB200 |
+>
+> 即"SM100 特化实现"指为 Blackwell 新一代 SM 架构编译的内核，SM89（Ada）上不存在对应符号，动态加载时链接器报 undefined symbol。
+
 **解决方案**: 创建 stubs 共享库提供这些符号，运行时通过 LD_PRELOAD 注入。
 
 **stubs 源码** (`/usr1/project/sglang/python/sglang/kernels/aot/csrc/expert_specialization/stubs.cc`):
