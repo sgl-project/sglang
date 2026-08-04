@@ -544,6 +544,12 @@ def run_dp_sharded_vision_model(
     return vision_embeddings
 
 
+def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    """Concatenate multiple tensors without copying a singleton input."""
+
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
@@ -617,12 +623,12 @@ def run_dp_sharded_mrope_vision_model(
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
             if isinstance(image_embeds, list):
-                return torch.cat(image_embeds, dim=0)
+                return concat_or_single(image_embeds, dim=0)
             return image_embeds
         if rope_type == "rope_2d_packed":
             image_embeds = vision_model(pixel_values, grid_thw)
             if isinstance(image_embeds, list):
-                return torch.cat(image_embeds, dim=0)
+                return concat_or_single(image_embeds, dim=0)
             return image_embeds
         return vision_model(pixel_values, grid_thw=grid_thw)
 
@@ -719,7 +725,7 @@ def run_dp_sharded_mrope_vision_model(
             else:
                 image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
-                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
         else:
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
@@ -734,7 +740,7 @@ def run_dp_sharded_mrope_vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
             if isinstance(image_embeds_local, list):
-                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
         else:
             # Handle empty case
             out_dim = getattr(vision_model, "out_hidden_size", None)
