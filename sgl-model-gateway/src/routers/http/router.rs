@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
@@ -79,13 +82,13 @@ impl Router {
         })
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
+    fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
         let workers = self.worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
         if healthy_workers.is_empty() {
             Err("No workers are available".to_string())
         } else {
-            Ok(healthy_workers[0].url().to_string())
+            Ok(Arc::clone(healthy_workers[0]))
         }
     }
 
@@ -93,10 +96,22 @@ impl Router {
         let headers = header_utils::copy_request_headers(&req);
 
         match self.select_first_worker() {
-            Ok(worker_url) => {
+            Ok(worker) => {
+                let worker_url = worker.url();
+                let api_key = worker.api_key().clone();
+                let has_worker_api_key = api_key.is_some();
+
                 let mut request_builder = self.client.get(format!("{}/{}", worker_url, endpoint));
+
+                if let Some(key) = api_key {
+                    request_builder = request_builder.bearer_auth(&key);
+                }
+
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
+                        if has_worker_api_key && name == AUTHORIZATION.as_str() {
+                            continue;
+                        }
                         request_builder = request_builder.header(name, value);
                     }
                 }
@@ -380,6 +395,7 @@ impl Router {
                 let headers = filtered_headers.clone();
 
                 let api_key = worker.api_key().clone();
+                let has_worker_api_key = api_key.is_some();
 
                 async move {
                     let mut request_builder = match method {
@@ -394,13 +410,13 @@ impl Router {
                     };
 
                     if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
+                        request_builder = request_builder.bearer_auth(&key);
                     }
 
                     for (name, value) in headers {
+                        if has_worker_api_key && name == AUTHORIZATION.as_str() {
+                            continue;
+                        }
                         request_builder = request_builder.header(name.clone(), value.clone());
                     }
 
@@ -495,6 +511,7 @@ impl Router {
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
+        let has_worker_api_key = api_key.is_some();
 
         // Static key string to avoid per-request allocations
         const DP_RANK_KEY: &str = "data_parallel_rank";
@@ -544,20 +561,19 @@ impl Router {
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
-                .json(typed_req) // Use json() directly with typed request
+                .json(typed_req)
         };
 
         if let Some(key) = api_key {
-            // Pre-allocate string with capacity to avoid reallocation
-            let mut auth_header = String::with_capacity(7 + key.len());
-            auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
-            request_builder = request_builder.header("Authorization", auth_header);
+            request_builder = request_builder.bearer_auth(&key);
         }
 
         if let Some(headers) = headers {
             for (name, value) in headers {
                 if header_utils::should_forward_request_header(name.as_str()) {
+                    if has_worker_api_key && name == AUTHORIZATION {
+                        continue;
+                    }
                     request_builder = request_builder.header(name, value);
                 }
             }
@@ -907,7 +923,8 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
+        let worker = result.unwrap();
+        let url = worker.url();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
     }
@@ -918,9 +935,7 @@ mod tests {
         let result = router.select_first_worker();
 
         assert!(result.is_ok());
-        let url = result.unwrap();
-
-        let worker = router.worker_registry.get_by_url(&url).unwrap();
+        let worker = result.unwrap();
         assert!(worker.is_healthy());
     }
 }
