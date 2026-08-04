@@ -7,19 +7,34 @@ from bench_multiturn import (
     ReadyQueue,
     WorkloadGenerator,
     gen_payload,
+    gen_payload_openai,
     log_to_jsonl_file,
     parse_args,
 )
 from tqdm.asyncio import tqdm
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.test.kits.cache_hit_kit import async_request_sglang_generate
+from sglang.test.kits.cache_hit_kit import (
+    async_request_openai_chat_completions,
+    async_request_sglang_generate,
+)
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
     def __init__(self, args):
-        self.url = f"http://{args.host}:{args.port}/generate"
-        self.request_func = async_request_sglang_generate
+        # Honor --api-format the same way ``WorkloadGenerator.__init__``
+        # does; previously this subclass hard-coded the native
+        # ``/generate`` endpoint and silently ignored ``--api-format
+        # openai``, sending requests through the wrong API surface
+        # regardless of the user's choice.
+        self.api_format = args.api_format
+        self.model_path = args.model_path
+        if self.api_format == "openai":
+            self.url = f"http://{args.host}:{args.port}/v1/chat/completions"
+            self.request_func = async_request_openai_chat_completions
+        else:
+            self.url = f"http://{args.host}:{args.port}/generate"
+            self.request_func = async_request_sglang_generate
 
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
@@ -47,7 +62,16 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                     "input_ids"
                 ]
             )
-            init_requests.append((i, gen_payload(input_ids, output_len)))
+            # Match payload shape to the selected API: ``gen_payload``
+            # produces an ``input_ids`` / ``sampling_params`` body for
+            # ``/generate`` while ``gen_payload_openai`` produces a
+            # ``messages`` body for ``/v1/chat/completions``.
+            if self.api_format == "openai":
+                messages = [{"role": "user", "content": prompt_text}]
+                payload = gen_payload_openai(messages, output_len, self.model_path)
+            else:
+                payload = gen_payload(input_ids, output_len)
+            init_requests.append((i, payload))
         self.ready_queue = ReadyQueue(init_requests=init_requests)
 
         self.response_queue = queue.Queue()
