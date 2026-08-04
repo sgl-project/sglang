@@ -25,6 +25,11 @@ export const benchmarks = [
         ttft_ms: 84626, tpot_ms: 30.52, tokens_per_sec_per_gpu: 2266 },
     ],
   },
+      // NOTE: on memory-bound H200 high-throughput is dominated by balanced (2315): the decode batch
+      // saturates ~256 regardless of strategy, and balanced adds EAGLE spec-decode (~2x accept) while HT
+      // has none. Raising HT's batch cap (--cuda-graph-max-bs-decode 256) OOMs at graph capture on 0.5.16
+      // (no memory headroom), so HT can't close the gap here — it only leads on higher-memory GPUs
+      // (B200/B300/GB300 all show HT > balanced). Kept the measured HT number as-is.
       {
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15.post1",
