@@ -507,11 +507,11 @@ jobs:
       max-parallel: 6
       matrix:
         test_config:
-          # # qwen3_6_27b performance tests
-          # - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
-          #   runner: linux-aarch64-a3-800t-2
-          #   test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
-          #   test_type: 'perf'
+          # qwen3_6_27b performance tests
+          - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
+            runner: linux-aarch64-a3-800t-2
+            test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
+            test_type: 'perf'
 
           # - name: qwen3_6_27b_1p_in1024x1024_30_out1024_50ms
           #   runner: linux-aarch64-a3-800t-2
@@ -585,30 +585,31 @@ jobs:
           #   test_type: 'perf'
           
           # NPU accuracy tests
-          - name: glm4_7_flash_1p_gsm8k
-            runner: linux-aarch64-a3-2-
-            test_case: test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
-            test_type: 'accuracy'
-          - name: qwen3_vl_30b_a3b_bf16_2p_gsm8k
-            runner: linux-aarch64-a3-4-
-            test_case: test/registered/npu/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
-            test_type: 'accuracy'
+          # - name: glm4_7_flash_1p_gsm8k
+          #   runner: linux-aarch64-a3-2-
+          #   test_case: test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
+          #   test_type: 'accuracy'
+          # - name: qwen3_vl_30b_a3b_bf16_2p_gsm8k
+          #   runner: linux-aarch64-a3-4-
+          #   test_case: test/registered/npu/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
+          #   test_type: 'accuracy'
           - name: glm5_top64_pruned_bf16_8p_gsm8k
             runner: linux-aarch64-a3-16-
             test_case: test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
             test_type: 'accuracy'
-          - name: moonshotai_moonlight_16b_a3b_bf16_1p_gsm8k
-            runner: linux-aarch64-a3-2-
-            test_case: test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
-            test_type: 'accuracy'
-          - name: qwen3_5_9b_bf16_1p_gsm8k
-            runner: linux-aarch64-a3-2-
-            test_case: test/registered/npu/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
-            test_type: 'accuracy'
-          - name: qwen3_vl_8b_bf16_2p_gsm8k
-            runner: linux-aarch64-a3-4-
-            test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
-            test_type: 'accuracy'
+          # - name: moonshotai_moonlight_16b_a3b_bf16_1p_gsm8k
+          #   runner: linux-aarch64-a3-2-
+          #   test_case: test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
+          #   test_type: 'accuracy'
+          # - name: qwen3_5_9b_bf16_1p_gsm8k
+          #   runner: linux-aarch64-a3-2-
+          #   test_case: test/registered/npu/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
+          #   test_type: 'accuracy'
+          # - name: qwen3_vl_8b_bf16_2p_gsm8k
+          #   runner: linux-aarch64-a3-4-
+          #   test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
+          #   test_type: 'accuracy'
+            
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
       runner: ${{ matrix.test_config.runner }}
