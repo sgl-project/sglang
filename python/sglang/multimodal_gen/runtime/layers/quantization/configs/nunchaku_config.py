@@ -10,11 +10,22 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.loader.checkpoint_name_resolver import (
+    CheckpointNameResolver,
+)
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .base_config import QuantizationConfig, QuantizeMethodBase
 
 logger = init_logger(__name__)
+
+
+def _get_model_param_names_mapping(model: nn.Module) -> dict:
+    mapping = getattr(model, "param_names_mapping", None)
+    if mapping is not None:
+        return mapping
+    return getattr(getattr(model, "module", None), "param_names_mapping", {})
 
 
 @lru_cache(maxsize=1)
@@ -252,18 +263,24 @@ def _patch_nunchaku_scales(
 
     num_wtscale = 0
     num_wcscales = 0
+    resolver = CheckpointNameResolver(
+        get_param_names_mapping(_get_model_param_names_mapping(model))
+    )
+    metadata_maps = resolver.metadata_key_map(
+        state_dict.keys(), ("wtscale", "wcscales")
+    )
 
     from ..nunchaku_linear import NunchakuSVDQLinearMethod
 
     for name, module in model.named_modules():
-        wt = state_dict.get(f"{name}.wtscale")
+        wt = state_dict.get(metadata_maps["wtscale"].get(name, f"{name}.wtscale"))
         if wt is not None:
             if _patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
                 num_wtscale += 1
             elif _patch_sglang_svdq_linear(module, wt, NunchakuSVDQLinearMethod):
                 num_wtscale += 1
 
-        wc = state_dict.get(f"{name}.wcscales")
+        wc = state_dict.get(metadata_maps["wcscales"].get(name, f"{name}.wcscales"))
         if wc is not None:
             # Some modules may have wcscales as a direct attribute/Parameter.
             existing = getattr(module, "wcscales", None)
