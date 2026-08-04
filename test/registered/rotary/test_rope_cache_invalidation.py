@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -27,6 +28,9 @@ class TestRopeCacheInvalidation(CustomTestCase):
     """
 
     def setUp(self):
+        cpu_patch = patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+        cpu_patch.start()
+        self.addCleanup(cpu_patch.stop)
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         _ROPE_DICT.clear()
 
