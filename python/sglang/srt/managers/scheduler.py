@@ -3623,8 +3623,12 @@ class Scheduler(
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors. A non-last
                 # PP rank produced only proxy tensors, so there is nothing to copy.
+                # Under PP this result is not the one that gets processed -- every
+                # rank consumes the copy rebuilt from the output ring -- and the
+                # ring carries device tensors, so copying here would only move
+                # next_token_ids to the host behind the ring's back.
                 batch_result.copy_done = self.device_module.Event()
-                if batch_result.has_sampled_token_ids:
+                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
                     batch_result.copy_to_cpu(
                         return_logprob=batch.return_logprob,
                         return_hidden_states=batch.return_hidden_states,
