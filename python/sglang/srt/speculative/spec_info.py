@@ -127,6 +127,9 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_target_verify_war_read_done(self) -> bool:
+        return self.is_dflash_family()
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify

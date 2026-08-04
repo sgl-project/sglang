@@ -207,6 +207,102 @@ def test_metadata_update_records_inside_cuda_graph():
     )
 
 
+def test_graph_read_done_event_fences_slot_mutation():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    backend = _make_backend_for_hook_test()
+    backend.device = torch.device(DEVICE)
+    backend.page_size = 2
+    backend.max_num_pages = 2
+    backend.use_sliding_window_kv_pool = True
+    backend._swa_kv_pool = object()
+    backend.req_to_token = torch.tensor(
+        [[0, 1, 2, 3], [8, 9, 10, 11]], dtype=torch.int32, device=DEVICE
+    )
+    backend._swa_full_to_swa_mapping = (
+        torch.arange(32, dtype=torch.int64, device=DEVICE) * 2
+    )
+    backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+    forward_batch = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
+    )
+
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    backend.init_forward_metadata_in_graph(forward_batch)
+    torch.cuda.synchronize()
+
+    read_done = torch.cuda.Event(external=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.init_forward_metadata_in_graph(forward_batch)
+        read_done.record()
+
+    fence_stream = torch.cuda.Stream()
+    mutation_done = torch.cuda.Event()
+    graph.replay()
+    with torch.cuda.stream(fence_stream):
+        fence_stream.wait_event(read_done)
+        backend.req_to_token.copy_(
+            torch.tensor(
+                [[8, 9, 10, 11], [0, 1, 2, 3]],
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+        )
+        backend._swa_full_to_swa_mapping.add_(64)
+        mutation_done.record()
+    torch.cuda.current_stream().wait_event(mutation_done)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        backend.forward_metadata.page_table,
+        torch.tensor([[0, 1]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_page_table,
+        torch.tensor([[0, 2]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_out_cache_loc,
+        torch.tensor([6], dtype=torch.int64, device=DEVICE),
+    )
+
+    graph.replay()
+    with torch.cuda.stream(fence_stream):
+        fence_stream.wait_event(read_done)
+        backend.req_to_token.copy_(
+            torch.tensor(
+                [[0, 1, 2, 3], [8, 9, 10, 11]],
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+        )
+        backend._swa_full_to_swa_mapping.sub_(64)
+        mutation_done.record()
+    torch.cuda.current_stream().wait_event(mutation_done)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        backend.forward_metadata.page_table,
+        torch.tensor([[4, 5]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_page_table,
+        torch.tensor([[40, 42]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_out_cache_loc,
+        torch.tensor([70], dtype=torch.int64, device=DEVICE),
+    )
+
+
 def test_swa_cache_write_uses_metadata_slot_snapshot():
     snapshot = torch.tensor([6], dtype=torch.int64)
 
