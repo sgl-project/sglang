@@ -25,24 +25,6 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-
-
-def set_cp_tbo_kv_score(forward_batch, compressor, finish_fn) -> None:
-    """Hand a compressor its pre-gathered kv_score (CP+TBO prefill only).
-
-    op_attn_prep runs the projection and launches the all-gather on the comm
-    stream; `finish_fn` waits that gather and reranges, and is consumed by the
-    matching Compressor.compute_kv_score later in the same layer. Keyed per
-    compressor instance because a layer can hold two (attention + indexer).
-    """
-    Compressor._cp_tbo_slot(forward_batch)[id(compressor)] = finish_fn
-
-
-def take_cp_tbo_kv_score(forward_batch, compressor):
-    slot = getattr(forward_batch, "_cp_tbo_kv_score", None)
-    return slot.pop(id(compressor), None) if slot else None
-
-
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
@@ -429,14 +411,6 @@ class Compressor(MultiPlatformOp):
         param.data.copy_(loaded_weight)
         self._apply_ape_hotfix()
 
-    @staticmethod
-    def _cp_tbo_slot(forward_batch: ForwardBatch) -> dict:
-        slot = getattr(forward_batch, "_cp_tbo_kv_score", None)
-        if slot is None:
-            slot = {}
-            forward_batch._cp_tbo_kv_score = slot
-        return slot
-
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -447,23 +421,8 @@ class Compressor(MultiPlatformOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
-    def compute_kv_score_local(self, x: torch.Tensor) -> torch.Tensor:
-        """The wkv_gate projection, before any CP all-gather.
-
-        Split out so the CP+TBO prefill path can run it in op_attn_prep and
-        launch the all-gather early (see take_cp_tbo_kv_score).
-        """
-        return linear_bf16_fp32(x, self.wkv_gate.weight)
-
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        # CP+TBO: op_attn_prep already ran the projection and launched the
-        # all-gather on the comm stream; consume that instead of issuing a
-        # synchronous one on the compute stream.
-        pending = take_cp_tbo_kv_score(forward_batch, self)
-        if pending is not None:
-            return pending()
-
-        kv_score = self.compute_kv_score_local(x)
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -472,6 +431,9 @@ class Compressor(MultiPlatformOp):
                 get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+                # Set only by DSV4's CP+TBO path (HIP) when
+                # SGLANG_OPT_CP_TBO_KV_SCORE_COMM_STREAM is on; None everywhere else.
+                comm_stream=getattr(forward_batch, "_cp_kv_score_comm_stream", None),
             )
         return kv_score
 

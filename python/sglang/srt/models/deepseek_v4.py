@@ -2470,6 +2470,13 @@ class DeepseekV4Model(nn.Module):
 
         attn_backend = get_attn_backend()
         children = forward_batch.tbo_children
+        # A/B knob: route the compressor kv_score all-gather to the comm stream
+        # (the MoE collectives already live there) instead of the compute stream.
+        kv_score_comm_stream = (
+            get_dp_tbo_comm_stream()
+            if envs.SGLANG_OPT_CP_TBO_KV_SCORE_COMM_STREAM.get()
+            else None
+        )
 
         inputs_arr = []
         for idx, child in enumerate(children):
@@ -2489,6 +2496,7 @@ class DeepseekV4Model(nn.Module):
                 child, child_inputs["positions"]
             )
             child._cp_moe_input_ids = cp_round_robin_input_ids(child.input_ids)
+            child._cp_kv_score_comm_stream = kv_score_comm_stream
             inputs_arr.append(child_inputs)
 
         outputs_arr = execute_overlapped_operations(
