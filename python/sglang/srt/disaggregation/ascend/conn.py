@@ -114,7 +114,7 @@ class AscendKVManager(MooncakeKVManager):
             raise NotImplementedError(
                 "Ascend PD transfer does not support HiSparse "
                 "destination device KV indices"
-        )
+            )
 
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
