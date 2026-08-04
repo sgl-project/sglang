@@ -47,6 +47,12 @@ async def run_asr_chat(client, model_name, y, sr):
     )
     end_time = time.perf_counter()
 
+    if (
+        not response.choices
+        or response.choices[0].message is None
+        or response.choices[0].message.content is None
+    ):
+        raise ValueError("LLM returned empty or filtered response")
     asr_text = response.choices[0].message.content
     latency = end_time - start_time
     return latency, asr_text

@@ -63,6 +63,12 @@ class LiteLLM(BaseBackend):
             **self.client_params,
             **sampling_params.to_litellm_kwargs(),
         )
+        if (
+            not ret.choices
+            or ret.choices[0].message is None
+            or ret.choices[0].message.content is None
+        ):
+            raise ValueError("LLM returned empty or filtered response")
         comp = ret.choices[0].message.content
 
         return comp, {}
