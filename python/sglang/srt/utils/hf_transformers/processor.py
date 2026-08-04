@@ -13,6 +13,7 @@
 # ==============================================================================
 """Processor loading utilities."""
 
+import copy
 import json
 from pathlib import Path
 from typing import Optional
@@ -33,10 +34,12 @@ from .common import (
     _override_v_head_dim_if_zero,
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
+    check_gguf_file,
     download_from_hf,
     get_tokenizer_from_processor,
     resolve_runai_obj_uri,
 )
+from .config import get_config
 from .mistral_utils import (
     is_mistral_model,
     load_mistral_config,
@@ -163,12 +166,26 @@ def get_processor(
             revision=revision,
         )
     elif model_name is not None:
-        config = AutoConfig.from_pretrained(
-            model_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        if check_gguf_file(model_name):
+            # A local GGUF is a weight container, not JSON.  AutoConfig treats
+            # any existing local file as JSON and calls read() on the entire
+            # file.  Use SGLang's GGUF-aware resolver so an adjacent HF config
+            # is preferred and the multi-hundred-GiB payload is never read.
+            config = copy.deepcopy(
+                get_config(
+                    model_name,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            )
+        else:
+            config = AutoConfig.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
     else:
         config = AutoConfig.from_pretrained(
             tokenizer_name,

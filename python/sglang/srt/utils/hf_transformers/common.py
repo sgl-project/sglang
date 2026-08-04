@@ -487,6 +487,12 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    # A GGUF path is the weight container, not a configuration directory.
+    # Resolve optional generation metadata from the adjacent Hugging Face
+    # directory, matching get_config(), instead of handing the weight filename
+    # to generic Transformers path resolution.
+    if check_gguf_file(model):
+        model = str(Path(model).parent)
     try:
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
