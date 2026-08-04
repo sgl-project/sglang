@@ -600,7 +600,8 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
-      # aarch64 has no prebuild, so this stage compiles during install.
+      # aarch64 has no prebuild, so this stage compiles during install - which also
+      # makes it the only stage still covering that path. Keep it that way.
       rust_ext_artifact: ''
     secrets: inherit
 
