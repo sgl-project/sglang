@@ -88,6 +88,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # A no-op on the hosted default, which ships zstd; here for whatever
+      # restore_runs_on is pointed at, since a reader without it sees no entry.
+      - name: Ensure zstd so the saved entry is readable
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
       # setup.py counts because it selects which crates get built. pyproject.toml
       # is left out - it churns on bumps that cannot affect these modules.
       - name: Restore built modules
@@ -182,21 +187,10 @@ jobs:
           MAX_GLIBC: ${{ inputs.max_glibc }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
 
-      # actions/cache identifies an entry by key *and* a version derived from the
-      # compression tool, so a runner without zstd saves what the hosted restore job
-      # cannot find - a silent miss every run. Warn, not fail: a cold build still works.
+      # Without it the entry saved below lands under a version no reader with zstd
+      # can find. This runner's image ships without it.
       - name: Ensure zstd so the restore job can read what this job saves
-        run: |
-          set -uo pipefail
-          if ! command -v zstd >/dev/null 2>&1; then
-              if [ "$(id -u)" = "0" ]; then SUDO=""
-              elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
-              else SUDO=""; fi
-              ${SUDO} apt-get update || true
-              ${SUDO} apt-get install -y --no-install-recommends zstd || true
-          fi
-          command -v zstd >/dev/null 2>&1 \
-              || echo "::warning::zstd unavailable on ${RUNNER_NAME:-this runner}; the cache entry saved below will not be readable by the restore job"
+        run: bash scripts/ci/utils/ensure_zstd.sh
 
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
