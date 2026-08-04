@@ -777,3 +777,19 @@ async def guard(kind: str, timeout: float = 10.0):
 ```
 
 **预期效果**：round_robin 消 Worker 热点；priority=10 让 tool call 不被长 thinking 挡住；thinking 并发 ≤12 封顶后 TTFT 稳定（不再出现 100s 级队列）；tool call 并发 ≤8 防自爆。组合后 tool call TTFT 向 3~4s 收敛。
+
+**验证 priority 是否生效**：
+
+```bash
+curl -s localhost:8000/metrics | grep num_queue_reqs
+# 期望（有请求排队时）：
+# sglang:num_queue_reqs{priority="10", ...} N   ← tool call 排队数
+# sglang:num_queue_reqs{priority="0", ...}  M   ← thinking 排队数
+```
+
+- 出现 `priority="10"` 的 label → 请求侧字段生效，优先级调度在工作；
+- 所有排队请求都只有 `priority="0"` → tool call 没带上字段，检查 API 调用处；
+- 完全没有 priority label → 服务端未开 `--enable-priority-scheduling`（per-priority 统计依赖该开关）；
+- 启动日志：脚本打印 `priority-scheduling: on/off`；
+- 需要单条请求元数据时可开 `--log-requests`；
+- 注：未设 `--default-priority-value` 时，未带 priority 的请求会显示为 `priority="None"`；脚本已默认设为 0。
