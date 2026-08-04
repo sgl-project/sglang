@@ -134,7 +134,10 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # The extension's ABI tag must match the test runners, so pin their version.
+      # No crate sets abi3, so the ABI tag is minor-version specific and only the
+      # pools on this version can use the result - h20 ships 3.12 and falls back to
+      # compiling during install. Pinned rather than left to the image so the tag is
+      # at least predictable.
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
