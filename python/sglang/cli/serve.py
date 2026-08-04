@@ -22,7 +22,7 @@ def _extract_model_type_override(extra_argv):
         arg = extra_argv[i]
         if arg == "--model-type":
             if i + 1 >= len(extra_argv):
-                raise Exception(
+                raise ValueError(
                     "Error: --model-type requires a value. "
                     "Valid values are: auto, llm, diffusion."
                 )
@@ -39,7 +39,7 @@ def _extract_model_type_override(extra_argv):
         i += 1
 
     if model_type not in ("auto", "llm", "diffusion"):
-        raise Exception(
+        raise ValueError(
             f"Error: invalid --model-type '{model_type}'. "
             "Valid values are: auto, llm, diffusion."
         )
