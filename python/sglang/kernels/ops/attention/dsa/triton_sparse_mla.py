@@ -848,7 +848,7 @@ def triton_sparse_mla_fwd(
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
     kv_work_per_cta = topk // BLOCK_K
-    if base_ctas >= 2 * num_cu and kv_work_per_cta <= 4:
+    if base_ctas > num_cu:
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(
         _kv_splits_heuristic(
