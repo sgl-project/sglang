@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import unittest
 
+import flashinfer.mla._sparse_mla_sm120 as fi
 import torch
 
-import flashinfer.mla._sparse_mla_sm120 as fi
 from sglang.kernels.ops.attention import flash_mla_sm120 as fmod
 from sglang.kernels.ops.attention import flash_mla_sm120_triton as tmod
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
@@ -40,6 +40,9 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _SUPPORTED_TOPK_WIDTHS,
     _next_topk_bucket,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE
 _HEAD_DIM_QK = 512
