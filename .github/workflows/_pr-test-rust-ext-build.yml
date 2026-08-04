@@ -164,7 +164,9 @@ jobs:
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
-          uv venv /tmp/rust-ext-build --python python3.10 --seed
+          # `--clear`: the path is fixed and these runners are persistent, so the
+          # venv the previous job left behind must be replaced, not treated as an error.
+          uv venv --clear /tmp/rust-ext-build --python python3.10 --seed
           # shellcheck disable=SC1091
           source /tmp/rust-ext-build/bin/activate
           uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
