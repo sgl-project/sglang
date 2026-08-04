@@ -134,6 +134,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_enable_ipc_weight_cache,
+    maybe_precompile_model_kernels_after_loading,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -736,6 +737,14 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
+        return misc_utils.resolve_pp_proxy_residual_num_blocks(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
@@ -1060,6 +1069,8 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        self.maybe_precompile_model_kernels_after_loading()
+
         # Register model for layerwise NVTX profiling if enabled
         if get_exec().comm.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
@@ -1123,6 +1134,9 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
+
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
@@ -1190,7 +1204,9 @@ class ModelRunner:
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(
-                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                    spec_algorithm.is_dflash_family()
+                    if spec_algorithm is not None
+                    else False
                 ),
                 speculative_draft_attention_backend=getattr(
                     self.server_args, "speculative_draft_attention_backend", None

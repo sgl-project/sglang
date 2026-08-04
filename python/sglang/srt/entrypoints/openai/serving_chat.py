@@ -194,6 +194,7 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     _default_sampling_params_logged = False
+    _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
     def __init__(
         self,
@@ -649,6 +650,14 @@ class OpenAIServingChat(OpenAIServingBase):
         return UsageProcessor._details_if_cached(
             content["meta_info"].get("cached_tokens", 0)
         )
+
+    def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+        if self.chat_encoding_spec == "kimi_k3":
+            # K3's three-token assistant generation stub is model input, but the
+            # reference API excludes it from billed/reported prompt tokens.
+            prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
+        return prompt_tokens
 
     async def _generate_stream_content(
         self,
@@ -1493,7 +1502,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens[index] = self._reported_prompt_tokens(
+                    content["meta_info"]
+                )
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
                 )
@@ -1720,6 +1731,20 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        if self.chat_encoding_spec == "kimi_k3":
+            ret = [
+                {
+                    **item,
+                    "meta_info": {
+                        **item["meta_info"],
+                        "prompt_tokens": self._reported_prompt_tokens(
+                            item["meta_info"]
+                        ),
+                    },
+                }
+                for item in ret
+            ]
+
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)
@@ -2378,7 +2403,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
@@ -2431,7 +2456,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
                 reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
