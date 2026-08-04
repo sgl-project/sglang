@@ -87,22 +87,32 @@ class FusedGroupNormSiLU(nn.Module):
 
     def __init__(self, norm: nn.GroupNorm, gate: VaeFastPathGate) -> None:
         super().__init__()
-        self.norm = norm
+        # Keep the original GroupNorm state-dict layout (``weight``/``bias``)
+        # so checkpoint loading and component-accuracy weight transfer do not
+        # see wrapper-specific ``norm.*`` parameter names.
+        self.num_groups = norm.num_groups
+        self.num_channels = norm.num_channels
+        self.eps = norm.eps
+        self.affine = norm.affine
+        self.weight = norm.weight
+        self.bias = norm.bias
         self._sgl_gate = gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._sgl_gate.enabled and x.dim() == 4:
             y = group_norm_silu_4d(
                 x,
-                self.norm.weight,
-                self.norm.bias,
-                self.norm.num_groups,
-                self.norm.eps,
+                self.weight,
+                self.bias,
+                self.num_groups,
+                self.eps,
                 apply_silu=True,
             )
             if y is not None:
                 return y
-        return F.silu(self.norm(x))
+        return F.silu(
+            F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
+        )
 
 
 def _install_norm_silu(decoder, resnet_cls, gate: VaeFastPathGate) -> int:
@@ -181,7 +191,11 @@ class FusedUpsample2xConv2d(nn.Module):
 
     def __init__(self, upsample: nn.Module, gate: VaeFastPathGate) -> None:
         super().__init__()
-        self.orig = upsample
+        # Keep ``conv`` registered directly on the wrapper so parameter names
+        # remain ``...upsamplers.N.conv.*``. The unregistered original module
+        # is retained only to run its exact lossless forward implementation.
+        object.__setattr__(self, "_orig", upsample)
+        self.conv = upsample.conv
         self.channels = upsample.channels
         self._sgl_gate = gate
         self._fused_weight = None
@@ -192,8 +206,8 @@ class FusedUpsample2xConv2d(nn.Module):
             or output_size is not None
             or hidden_states.shape[1] != self.channels
         ):
-            return self.orig(hidden_states, output_size=output_size)
-        conv = self.orig.conv
+            return self._orig(hidden_states, output_size=output_size)
+        conv = self.conv
         w = self._fused_weight
         if w is None:
             w = _fold_upsample2x_conv2d_weight(conv)

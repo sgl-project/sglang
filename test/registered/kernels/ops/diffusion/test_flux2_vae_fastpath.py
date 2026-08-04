@@ -26,6 +26,7 @@ def test_flux2_vae_fastpath():
     )
     ref = F.silu(gn(x))
     fused_gn = vae_opt.FusedGroupNormSiLU(gn, gate)
+    assert set(fused_gn.state_dict()) == {"weight", "bias"}
     assert torch.equal(fused_gn(x), ref)
     assert (
         gn_kernel.group_norm_silu_4d(x.contiguous(), gn.weight, gn.bias, 32, 1e-6)
@@ -40,6 +41,7 @@ def test_flux2_vae_fastpath():
     gate.enabled = False
     up = Upsample2D(channels=32, use_conv=True).to("cuda", torch.bfloat16)
     fused_up = vae_opt.FusedUpsample2xConv2d(up, gate)
+    assert set(fused_up.state_dict()) == {"conv.weight", "conv.bias"}
     x = torch.randn(2, 32, 33, 29, device="cuda", dtype=torch.bfloat16)
     ref = up(x)
     assert torch.equal(fused_up(x), ref)
@@ -48,9 +50,8 @@ def test_flux2_vae_fastpath():
     gate.enabled = True
     fast = fused_up(x)
     assert fused_up._fused_weight is not None
-    relative_mse = (
-        F.mse_loss(fast.float(), ref.float()) / torch.ptp(ref.float()).square()
-    )
+    ref_range = ref.float().max() - ref.float().min()
+    relative_mse = F.mse_loss(fast.float(), ref.float()) / ref_range.square()
     assert relative_mse < 3.2e-5
 
 
