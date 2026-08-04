@@ -35,7 +35,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import get_flags, get_server_args, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -287,18 +287,20 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         capturing [chain-indices kernel + fold + conv scatters] after the
         draft forward removes the whole eager commit from the host seam.
         Rows >= raw_bs resolve to slot -1 and are skipped by every kernel."""
-        req_pool = getattr(eagle_worker, "req_to_token_pool", None)
-        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        req_pool = eagle_worker.req_to_token_pool
+        mamba_pool = (
+            req_pool.mamba_pool if isinstance(req_pool, HybridReqToTokenPool) else None
+        )
         self.replayssm_commit_in_graph = bool(
             mamba_pool is not None
-            and getattr(mamba_pool, "replayssm_spec_fold", False)
-            and not getattr(mamba_pool, "replayssm_is_kda", False)
-            and getattr(eagle_worker, "speculative_num_steps", 0) > 0
+            and mamba_pool.replayssm_spec_fold
+            and not mamba_pool.replayssm_is_kda
+            and eagle_worker.speculative_num_steps > 0
         )
         if not self.replayssm_commit_in_graph:
             return
-        from sglang.srt.runtime_context import get_server_args
-
         mamba_pool.replayssm_commit_deferred = True
         self._commit_spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         self._commit_mamba_map = req_pool.req_index_to_mamba_index_mapping

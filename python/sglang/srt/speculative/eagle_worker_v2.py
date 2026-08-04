@@ -883,8 +883,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         runner = self.cuda_graph_runner_for_draft_extend
         if (
-            runner is not None
-            and getattr(runner, "replayssm_commit_in_graph", False)
+            isinstance(runner, EAGLEDraftExtendCudaGraphRunner)
+            and runner.replayssm_commit_in_graph
             and not can_run_decode_cuda_graph
             and not batch.forward_mode.is_idle()
             and len(batch.seq_lens) > 0
