@@ -238,6 +238,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
+    "flashinfer_w4afp8",
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
@@ -3558,6 +3559,19 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "w4afp8":
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_w4afp8"
+                logger.info(
+                    "Use flashinfer_w4afp8 as the MoE runner backend for "
+                    "W4AFP8 quantization."
+                )
+            elif self.moe_runner_backend != "flashinfer_w4afp8":
+                raise ValueError(
+                    "--quantization w4afp8 supports only "
+                    "--moe-runner-backend auto or flashinfer_w4afp8."
+                )
+
         if self.quantization == "nvfp4_online":
             if not is_sm100_supported():
                 raise ValueError(

@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -316,9 +317,31 @@ def test_mxfp4_ep_topology_accepts_standard_local_id_contract():
     method._validate_mxfp4_ep_topology(
         layer,
         server_args=_valid_ep_server_args(),
-        runner_backend="auto",
+        runner_backend=MoeRunnerBackend.FLASHINFER_W4AFP8,
         a2a_backend="none",
     )
+
+
+def test_flashinfer_w4afp8_backend_is_explicit_and_autotunable(monkeypatch):
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    backend = MoeRunnerBackend("flashinfer_w4afp8")
+    assert backend.is_flashinfer_w4afp8()
+    assert not backend.is_flashinfer_mxfp4()
+
+    runner = object.__new__(ModelRunner)
+    runner.server_args = SimpleNamespace(
+        disable_flashinfer_autotune=False,
+        moe_runner_backend=backend.value,
+        moe_a2a_backend="none",
+    )
+    runner.model_config = SimpleNamespace(quantization="w4afp8")
+    runner.spec_algorithm = SimpleNamespace(is_speculative=lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+
+    assert runner._should_run_flashinfer_autotune()
+    runner.server_args.disable_flashinfer_autotune = True
+    assert not runner._should_run_flashinfer_autotune()
 
 
 @pytest.mark.parametrize(
@@ -549,7 +572,9 @@ def test_standard_dispatcher_ep_rank3_maps_global_ids_to_local_or_minus_one(
     )
     monkeypatch.setattr(standard, "get_moe_expert_parallel_rank", lambda: 3)
     monkeypatch.setattr(
-        standard, "get_moe_runner_backend", lambda: MoeRunnerBackend.AUTO
+        standard,
+        "get_moe_runner_backend",
+        lambda: MoeRunnerBackend.FLASHINFER_W4AFP8,
     )
     monkeypatch.setattr(standard, "get_device", lambda: torch.device("cpu"))
 

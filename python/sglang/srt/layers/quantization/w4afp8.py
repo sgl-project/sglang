@@ -616,9 +616,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             return str(getattr(value, "value", value))
 
         errors = []
-        if backend_name(runner_backend) != "auto":
+        if backend_name(runner_backend) not in ("auto", "flashinfer_w4afp8"):
             errors.append(
-                f"moe_runner_backend={backend_name(runner_backend)!r} (expected 'auto')"
+                f"moe_runner_backend={backend_name(runner_backend)!r} "
+                "(expected 'flashinfer_w4afp8')"
             )
         if backend_name(a2a_backend) != "none":
             errors.append(
@@ -682,7 +683,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 "MXFP4 x FP8 EP requires StandardDispatcher local-ID routing. "
                 f"Invalid topology/configuration: {details}. Launch with "
                 "--tp-size 8 --ep-size 8 --moe-a2a-backend none "
-                "--moe-runner-backend auto --ep-num-redundant-experts 0 "
+                "--moe-runner-backend flashinfer_w4afp8 "
+                "--ep-num-redundant-experts 0 "
                 "--disable-shared-experts-fusion, and leave EPLB, non-trivial "
                 "expert placement, and elastic expert backup disabled."
             )

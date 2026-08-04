@@ -2499,6 +2499,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
+            "flashinfer_w4afp8",
             "flashinfer_cutedsl",
             "flashinfer_cutlass",
         ]

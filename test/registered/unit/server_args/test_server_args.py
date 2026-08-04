@@ -147,6 +147,35 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
+class TestW4AFP8MoeRunnerBackend(unittest.TestCase):
+    def test_auto_resolves_to_flashinfer_w4afp8(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization="w4afp8",
+            moe_runner_backend="auto",
+        )
+        server_args._handle_moe_kernel_config()
+        self.assertEqual(server_args.moe_runner_backend, "flashinfer_w4afp8")
+
+    def test_explicit_flashinfer_w4afp8_is_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            quantization="w4afp8",
+            moe_runner_backend="flashinfer_w4afp8",
+        )
+        server_args._handle_moe_kernel_config()
+        self.assertEqual(server_args.moe_runner_backend, "flashinfer_w4afp8")
+
+    def test_other_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "supports only"):
+            server_args = ServerArgs(
+                model_path="dummy",
+                quantization="w4afp8",
+                moe_runner_backend="triton",
+            )
+            server_args._handle_moe_kernel_config()
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()
