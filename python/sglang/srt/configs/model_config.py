@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -125,6 +126,14 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+    )
+
+
+def is_nemotron_h(config) -> bool:
+    return _hf_arch(config) in (
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "NemotronHForCausalLMMTP",
     )
 
 
@@ -293,6 +302,11 @@ class ModelConfig:
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.embedding_model_spec = resolve_embedding_model_spec(
+            self.hf_config.architectures,
+            is_embedding_requested=bool(is_embedding),
+            is_embedding_gemma=self.is_embedding_gemma,
+        )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -488,7 +502,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -712,6 +726,17 @@ class ModelConfig:
     @cached_property
     def linear_attn_registry_result(self) -> Any:
         return get_linear_attn_config(self.hf_config)
+
+    @property
+    def has_asymmetric_kv(self) -> bool:
+        """Whether K and V rows differ in width (MiMoV2 is 192 / 128).
+
+        Not an ``__init__`` field because the MLA special-casing below still
+        rewrites ``v_head_dim``.
+        """
+        return (
+            self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
+        )
 
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
@@ -1076,6 +1101,14 @@ class ModelConfig:
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
 
+    def get_max_num_attention_heads(self) -> int:
+        """Max per-layer query head count; num_attention_heads unless the
+        model sets num_attention_heads_per_layer."""
+        per_layer = getattr(self.hf_text_config, "num_attention_heads_per_layer", None)
+        if per_layer:
+            return max(per_layer)
+        return self.num_attention_heads
+
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
         total_num_kv_heads = self.get_total_num_kv_heads()
@@ -1411,22 +1444,33 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
+                and quant_method == "modelopt_fp4"
+            )
+
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            if not preserve_online_draft_quantization:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]
@@ -1458,20 +1502,6 @@ class ModelConfig:
                         f"method specified in the `quantization` argument "
                         f"({self.quantization})."
                     )
-
-            # Warn if DeepGemm is enabled for a non-ue8m0 checkpoint on Blackwell.
-            # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
-            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if (
-                not self.use_scale_ue8m0
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and self.quantization != "mxfp8"
-            ):
-                logger.warning(
-                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
-                )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
@@ -1706,6 +1736,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
         or "Gemma2ForSequenceClassification" in model_architectures
+        or "Lfm2BidirectionalModel" in model_architectures
     ):
         return False
     else:

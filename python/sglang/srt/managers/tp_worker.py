@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -173,13 +174,18 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
+    def _deserialize_own_rank(self, serialized_named_tensors):
+        """Each rank deserializes only its own payload (index ps.tp_rank);
+        deserializing another rank's copy would break producer-side CUDA-IPC
+        refcounting."""
         monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.deserialize(
+            serialized_named_tensors[self.ps.tp_rank]
+        )
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.ps.tp_rank]
-            ),
+            named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
             load_format=recv_req.load_format,
         )
         return success, message
@@ -209,18 +215,16 @@ class BaseTpWorker(ABC):
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
-        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
+        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
         if recv_req.load_format == "flattened_bucket":
-            flattened_data = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_tensors
-            )
             bucket = FlattenedTensorBucket(
-                flattened_tensor=flattened_data["flattened_tensor"],
-                metadata=flattened_data["metadata"],
+                flattened_tensor=data["flattened_tensor"],
+                metadata=data["metadata"],
             )
             tensors = dict(bucket.reconstruct_tensors())
         else:
-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+            tensors = data
         if recv_req.expected_checksums is not None:
             import hashlib
 
@@ -245,12 +249,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -381,7 +385,9 @@ class TpModelWorker(BaseTpWorker):
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens
+            * self.model_runner.dcp_size
+            - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
 
@@ -405,14 +411,14 @@ class TpModelWorker(BaseTpWorker):
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=(
-                self.server_args.model_path
+                get_model().model_path
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_path
+                else get_spec().speculative_draft_model_path
             ),
             model_revision=(
-                self.server_args.revision
+                get_model().revision
                 if not self.is_draft_worker
-                else self.server_args.speculative_draft_model_revision
+                else get_spec().speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
@@ -423,7 +429,7 @@ class TpModelWorker(BaseTpWorker):
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
-            mem_fraction_static=self.server_args.mem_fraction_static,
+            mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
             ps=self.ps,
             nccl_port=self.nccl_port,
@@ -439,11 +445,11 @@ class TpModelWorker(BaseTpWorker):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self.model_runner_list.append(self.model_runner)
-        for i in range(1, self.server_args.speculative_num_steps):
+        for i in range(1, get_spec().speculative_num_steps):
             self.model_runner_list.append(
                 ModelRunner(
                     model_config=self.model_config,
-                    mem_fraction_static=self.server_args.mem_fraction_static,
+                    mem_fraction_static=get_schedule().mem_fraction_static,
                     gpu_id=self.gpu_id,
                     ps=self.ps,
                     nccl_port=self.nccl_port,
@@ -459,7 +465,7 @@ class TpModelWorker(BaseTpWorker):
     def _init_dllm_algorithm(self):
         from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 
-        if self.server_args.dllm_algorithm is not None:
+        if get_exec().dllm.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
         else:
             self.dllm_algorithm = None
@@ -481,13 +487,15 @@ class TpModelWorker(BaseTpWorker):
     def get_worker_info(self):
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
+            self.model_runner.effective_max_total_num_tokens
+            * self.model_runner.dcp_size
+            - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,
-            self.server_args.max_prefill_tokens,
+            get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
-            self.server_args.max_queued_requests,
+            get_schedule().max_queued_requests,
             max_req_len,
             max_req_len - 5,
             self.random_seed,

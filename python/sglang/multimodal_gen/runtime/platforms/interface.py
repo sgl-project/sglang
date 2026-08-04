@@ -124,10 +124,6 @@ class Platform:
         return self.is_cuda_static()
 
     @lru_cache(maxsize=1)
-    def is_npu(self) -> bool:
-        return self._enum == PlatformEnum.NPU
-
-    @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
         return self.is_rocm_static()
 
