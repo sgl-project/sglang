@@ -4474,6 +4474,7 @@ class ServerArgs:
             is_deepseek_v4,
             is_nemotron_h,
         )
+        from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
             # MLA prefill under BCG takes forward_mha, which has no eager
@@ -4500,7 +4501,8 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1,
+                lambda: self._resolved().attn_cp_size > 1
+                and not supports_prefill_cp_bcg(self),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4512,10 +4514,10 @@ class ServerArgs:
                 "two-batch overlap",
                 lambda: self.enable_two_batch_overlap,
             ),
-            # Only DeepEP's a2a is validated under BCG.
             (
-                "non-DeepEP a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
+                "unvalidated a2a backend",
+                lambda: resolved_view(self).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -4755,14 +4757,6 @@ class ServerArgs:
                 prefill_cuda_graph_config.max_bs = min(
                     prefill_cuda_graph_config.max_bs, 4096
                 )
-
-        # Clamp to context_length if explicitly set — prevents prefill CG
-        # warmup from compiling graphs with more tokens than the model
-        # buffers can hold, which causes illegal memory access (#21112).
-        if self.context_length is not None:
-            prefill_cuda_graph_config.max_bs = min(
-                prefill_cuda_graph_config.max_bs, self.context_length
-            )
 
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (
@@ -7250,6 +7244,49 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
+        # Step 3: DCP compatibility for the L2 (device<->host) path.
+        self._resolve_hicache_dcp_compatibility()
+
+    def _resolve_hicache_dcp_compatibility(self):
+        if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
+            return
+        if self.hicache_storage_backend is not None:
+            raise NotImplementedError(
+                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
+                "supported yet: under DCP each rank holds a distinct "
+                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
+                "backup and the storage keys must become dcp_rank-aware "
+                "first. Run HiCache+DCP with L1/L2 only."
+            )
+        if self.speculative_algorithm is not None:
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 does not support speculative "
+                "decoding yet (the draft-model host pool has no DCP index "
+                "translation)."
+            )
+        if self.enable_lmcache:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation."
+            )
+        if self.enable_hisparse:
+            raise NotImplementedError(
+                "--enable-hisparse with --dcp-size > 1 is not supported: the "
+                "HiSparse host pool is constructed without DCP translation."
+            )
+        if not self.use_mla_backend():
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 is only supported for MLA models: "
+                "the index translation lives in MLATokenToKVPoolHost, and the "
+                "MHA host pool has none."
+            )
+        logger.info(
+            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+            "logical slot accounting with per-rank physical translation at "
+            "the transfer boundary (dcp_size=%d).",
+            self.dcp_size,
+        )
+
     def _resolve_layout_io_compatibility(self):
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -9419,6 +9456,10 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+            elif is_rust_server:
+                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
+                # DataParallelController allocating worker ports.
+                scheduler_input_port = port_base + 6 + dp_rank
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
