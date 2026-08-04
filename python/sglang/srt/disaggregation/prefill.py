@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_npu
@@ -103,8 +104,6 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     The pool only knows this stage's own layer ids, so the count has to come from
     the model-wide layer table.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
     if not isinstance(pool, HybridLinearKVPool):
         return pool.start_layer
     return sum(

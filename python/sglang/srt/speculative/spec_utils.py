@@ -35,6 +35,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_self_pp_group,
+    patch_pipeline_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -673,11 +675,6 @@ def load_token_map(token_map_path: str) -> List[int]:
 def draft_pp_context():
     # The draft model is one layer and never spans pipeline stages; give it a
     # single-member pp group so it initializes as if pp were off.
-    from sglang.srt.distributed.parallel_state import (
-        get_self_pp_group,
-        patch_pipeline_parallel_group,
-    )
-
     with patch_pipeline_parallel_group(get_self_pp_group()):
         yield
 

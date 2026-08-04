@@ -1245,8 +1245,6 @@ class Scheduler(
             # not exist on ranks that do not host the draft (prefill-side PP builds
             # it only on the last stage), and the PD metadata wire schema has to be
             # identical on every rank.
-            from sglang.srt.configs.model_config import ModelConfig
-
             draft_model_config = ModelConfig.from_server_args(
                 self.server_args,
                 model_path=self.server_args.speculative_draft_model_path,
