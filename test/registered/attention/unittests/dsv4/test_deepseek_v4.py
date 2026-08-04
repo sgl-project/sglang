@@ -21,8 +21,10 @@ from unittest import mock
 
 import torch
 
-from sglang.jit_kernel.dsv4 import CompressorPrefillPlan
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
+from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
+    OnlineC128MTPController,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase

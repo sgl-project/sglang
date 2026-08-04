@@ -379,8 +379,8 @@ Supported:
   here but requires `PoolTransfer` + `PoolHitPolicy` plumbing in
   `FlexKVConnector`.
 * Write-back acks are per-request (one `dec_lock_ref` per
-  `cache_finished_req`), not per-page like HiCache's
-  `flush_write_through_acks`.
+  `cache_finished_req`), not per-page like HiCache's write-through
+  ack queues.
 * `--radix-cache-backend=flexkv` and `--enable-flexkv` are
   mutually equivalent today; we don't yet emit a deprecation
   warning if both are set.
