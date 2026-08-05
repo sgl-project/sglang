@@ -28,9 +28,9 @@ class TestHelionKDADispatcher(unittest.TestCase):
             ) as constructor,
         ):
             dispatcher = KDAKernelDispatcher(
-                decode_backend,
-                prefill_backend,
-                LinearAttnKernelBackend.TRITON,
+                decode_backend=decode_backend,
+                prefill_backend=prefill_backend,
+                verify_backend=LinearAttnKernelBackend.TRITON,
             )
         return dispatcher, helion_kernel, constructor
 
