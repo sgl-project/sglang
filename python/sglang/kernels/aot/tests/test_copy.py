@@ -6,7 +6,7 @@ import torch
 from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 
-@pytest.mark.parametrize("size", [64, 72])
+@pytest.mark.parametrize("size", [1, 16, 31, 32, 64, 72, 128, 256, 512])
 def test_copy_to_gpu_no_ce(size):
     tensor_cpu = torch.randint(0, 1000000, (size,), dtype=torch.int32, device="cpu")
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
