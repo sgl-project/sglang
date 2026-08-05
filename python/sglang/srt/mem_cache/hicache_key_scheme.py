@@ -31,12 +31,11 @@ coordinate is the rank's absolute layer range — any pipeline partition works,
 uneven stages included (61-layer models at any pp_size); partitions that
 differ simply derive disjoint keys and miss instead of colliding. On the head
 axis a rank owns ``local_kv_heads // head_group`` cells per page (head
-fan-out): fleets agree on the head grid via the existing ``tp_lcm_size``
-extra-config knob (``head_group = total_kv_heads / tp_lcm_size``), which this
-scheme subsumes — the canonical H indices coincide with the split-heads
-virtual ranks, so the proven multi-key read/write machinery
-(``get_split_heads_page_buffer_meta``, mooncake key fan-out) carries over
-under canonical names. Rank-replicated pools (MLA-family) have no head axis,
+fan-out): fleets agree on the head grid via the ``head_group`` extra-config
+knob (heads per cell — e.g. ``total_kv_heads / lcm`` of the fleet's TP
+sizes). The multi-key read/write transport
+(``get_split_heads_page_buffer_meta``, mooncake list-suffix fan-out) is
+shared with, but not coupled to, the legacy split-heads mechanism. Rank-replicated pools (MLA-family) have no head axis,
 so cross-TP-size reuse needs no head-grid agreement at all. Uniform layer
 grids with layer fan-out remain the follow-up and are rejected explicitly.
 
@@ -128,10 +127,11 @@ def namespace_digest(namespace: KVCacheNamespace) -> str:
 def load_namespace_descriptor(path: str) -> KVCacheNamespace:
     """Load and strictly decode an out-of-band descriptor file (JSON).
 
-    Not wired to a CLI flag yet: fleet descriptor files ship together with
-    head fan-out, where deployments must agree on a head grid finer than
-    their own shards. Kept (and tested) now so the schema, strictness, and
-    digest semantics are pinned from the first release of the key format.
+    Not wired to a CLI flag: the extra-config knobs (head_group,
+    layer_partition) cover today's grids, so fleet descriptor files remain a
+    follow-up for richer identities (numerics_id pinning, per-component
+    grids). Kept (and tested) now so the schema, strictness, and digest
+    semantics are pinned from the first release of the key format.
     """
     with open(path, "rb") as f:
         raw = f.read()
@@ -158,10 +158,10 @@ def derive_namespace(
 ) -> KVCacheNamespace:
     """Derive the namespace from deployment facts plus the fleet agreements.
 
-    ``head_group`` is the head-grid agreement: deployments that pass the same
-    ``tp_lcm_size`` derive ``head_group = total_kv_heads / tp_lcm_size`` and
-    land in one keyspace; without it, ``head_group`` = the rank's local head
-    count and only same-TP deployments share. ``layer_boundaries`` is the
+    ``head_group`` is the head-grid agreement (the ``head_group`` extra-config
+    knob): deployments passing the same value land in one keyspace; without
+    it, ``head_group`` = the rank's local head count and only same-TP
+    deployments share. ``layer_boundaries`` is the
     layer-partition agreement (``layer_partition`` in the extra config) that
     enables PP read-back across different pipeline splits; without it, layer
     cells are per-stage ranges and only same-partition deployments share.

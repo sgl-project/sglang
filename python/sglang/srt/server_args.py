@@ -7223,23 +7223,31 @@ class ServerArgs:
             try:
                 extra_dict = json.loads(extra)
                 tp_lcm_size = extra_dict.get("tp_lcm_size")
+                head_group = extra_dict.get("head_group")
                 layer_partition = extra_dict.get("layer_partition")
             except (ValueError, AttributeError):
                 tp_lcm_size = None
+                head_group = None
                 layer_partition = None
-            # Rank-replicated (MLA-family) pools ignore tp_lcm_size at
-            # attach (no head axis), so a shared fleet extra-config must not
-            # be rejected for them here.
-            if tp_lcm_size and not self.use_mla_backend():
+            if tp_lcm_size:
+                raise ValueError(
+                    "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                    "canonical-grid uses head_group in the extra config "
+                    "(heads per cell)."
+                )
+            # Rank-replicated (MLA-family) pools ignore head_group at attach
+            # (no head axis), so a shared fleet extra-config must not be
+            # rejected for them here.
+            if head_group and not self.use_mla_backend():
                 if self.hicache_storage_backend != "mooncake":
                     raise NotImplementedError(
-                        "canonical-grid with tp_lcm_size needs a "
+                        "canonical-grid with head_group needs a "
                         "multi-key-per-page backend; only mooncake supports "
                         "it."
                     )
                 if self.hicache_mem_layout != "page_head":
                     raise ValueError(
-                        "canonical-grid with tp_lcm_size requires "
+                        "canonical-grid with head_group requires "
                         "--hicache-mem-layout page_head on every "
                         "participating deployment (single-cell members "
                         "included: object byte order must match fleet-wide)."
@@ -7247,23 +7255,21 @@ class ServerArgs:
             if layer_partition is not None:
                 # Layer fan-out (PP read-back) prerequisites. layer_partition
                 # only matters when a stage spans >1 canonical range, which
-                # depends on the PP split — but the backend/layout
-                # requirements are static, so check them here.
+                # depends on the PP split — but the backend requirement is
+                # static; the page_first_direct layout requirement binds only
+                # under actual fan-out and is validated at attach.
                 if self.hicache_storage_backend != "mooncake":
                     raise NotImplementedError(
                         "canonical-grid layer_partition needs a "
                         "multi-key-per-page backend; only mooncake supports "
                         "it."
                     )
-                # The page_first_direct layout requirement only binds when a
-                # stage actually spans >1 canonical range, which depends on
-                # the PP split — validated at attach.
-                if tp_lcm_size and not self.use_mla_backend():
+                if head_group and not self.use_mla_backend():
                     raise NotImplementedError(
                         "canonical-grid layer fan-out and head fan-out "
                         "cannot combine yet (they require different host "
                         "layouts); set either layer_partition or "
-                        "tp_lcm_size, not both."
+                        "head_group, not both."
                     )
 
     def _resolve_hicache_dcp_compatibility(self):

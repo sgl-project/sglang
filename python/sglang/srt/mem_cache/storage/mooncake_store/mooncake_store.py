@@ -939,9 +939,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        # One cell per entry of the mha_suffix list (legacy split-heads
+        # virtual ranks or canonical head-group cells alike).
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
-                indices, self.split_factor
+                indices, len(self.mha_suffix)
             )
         )
         key_list = []
@@ -1023,7 +1025,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 return self._get_mla_layer_ranges_buffer_meta(keys, host_indices)
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            if self.should_split_heads:
+            if isinstance(self.mha_suffix, list):
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
@@ -1045,8 +1047,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             else:
                 key_multiplier = 2
-                if self.should_split_heads:
-                    key_multiplier *= self.split_factor
+                if isinstance(self.mha_suffix, list):
+                    key_multiplier *= len(self.mha_suffix)
 
         result_groups = [
             results[i : i + key_multiplier]
@@ -1288,12 +1290,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 1
         else:
             query_keys = []
-            if self.should_split_heads:
+            if isinstance(self.mha_suffix, list):
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
                         query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
+                key_multiplier = 2 * len(self.mha_suffix)
             else:
                 for key in keys:
                     query_keys.append(f"{key}_{self.mha_suffix}_k")

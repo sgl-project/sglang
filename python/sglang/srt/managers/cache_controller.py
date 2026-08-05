@@ -629,19 +629,27 @@ class HiCacheController:
         canonical_suffix = None
         canonical_layer_ranges = None
         layer_partition = storage_backend_extra_config.pop("layer_partition", None)
+        head_group_knob = storage_backend_extra_config.pop("head_group", None)
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
+            if tp_lcm_size:
+                raise ValueError(
+                    "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                    "canonical-grid uses head_group in the extra config "
+                    "(heads per cell, e.g. head_group = total_kv_heads / "
+                    "lcm of the fleet's TP sizes)."
+                )
             canonical_suffix, canonical_layer_ranges = self._build_canonical_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
-                tp_lcm_size=tp_lcm_size,
-                should_split_heads=should_split_heads,
+                head_group_knob=head_group_knob,
                 layer_partition=layer_partition,
             )
-        elif layer_partition is not None:
+        elif layer_partition is not None or head_group_knob is not None:
             raise ValueError(
-                "layer_partition in --hicache-storage-backend-extra-config "
-                "requires --hicache-storage-key-scheme canonical-grid."
+                "layer_partition / head_group in "
+                "--hicache-storage-backend-extra-config require "
+                "--hicache-storage-key-scheme canonical-grid."
             )
 
         return HiCacheStorageConfig(
@@ -668,8 +676,7 @@ class HiCacheController:
         model_name: Optional[str],
         is_rank_replicated: bool,
         attn_cp_size: int,
-        tp_lcm_size: Optional[int],
-        should_split_heads: bool,
+        head_group_knob: Optional[int] = None,
         layer_partition: Optional[List[int]] = None,
     ):
         """Attach-time construction of the canonical-grid cell suffix(es).
@@ -680,15 +687,15 @@ class HiCacheController:
 
         Returns ``(suffix, layer_ranges)``: one suffix string when this rank
         owns a single cell per page, or the list of owned-cell suffixes under
-        fan-out. Head fan-out (``tp_lcm_size`` > tp_size): the fleet head
-        grid is ``head_group = total_kv_heads / tp_lcm_size``, and the
-        canonical H indices coincide with the split-heads virtual ranks, so
-        the existing multi-key machinery carries it. Layer fan-out
-        (``layer_partition`` boundaries, PP read-back): the rank's stage
-        spans several canonical layer ranges; ``layer_ranges`` then carries
-        the LOCAL (start, end) ranges for the per-cell buffer metas and is
-        None otherwise. Layer fan-out is rank-replicated (MLA-family) only,
-        on mooncake with the page_first_direct layout.
+        fan-out. The two fleet agreements are canonical-grid's own knobs in
+        the extra config — no coupling to the legacy split-heads flags:
+        ``head_group`` (heads per cell; a rank owns local/head_group cells,
+        enabling cross-TP read-back) and ``layer_partition`` (canonical layer
+        boundaries; a stage owns one cell per contained range, enabling
+        cross-PP read-back — rank-replicated pools on mooncake with the
+        page_first_direct layout). ``layer_ranges`` carries the LOCAL
+        (start, end) ranges for the per-cell buffer metas when layer fan-out
+        is active, else None.
         """
         from sglang.srt.mem_cache.hicache_key_scheme import (
             build_canonical_cell_suffixes,
@@ -714,33 +721,31 @@ class HiCacheController:
                 "pools yet (the draft model needs its own namespace identity)."
             )
 
-        # Head fan-out: tp_lcm_size is the fleet head-grid agreement
-        # (identical role as under rank-suffix split-heads, which this
-        # subsumes). split_factor = cells this rank owns per page. These
-        # prerequisite checks run before any pool access so misconfiguration
-        # fails on config alone.
-        split_factor = 1
-        if tp_lcm_size and not is_rank_replicated:
-            # tp_lcm_size pins the whole fleet, split_factor == 1 members
-            # included: every participant must produce page_head-ordered
-            # object bytes, or a fan-out writer and a whole-page reader
-            # would exchange size-equal but byte-permuted objects. (The
-            # object_layout namespace field backstops this by digest, but
-            # the shared fleet keyspace only forms when everyone complies.)
+        # Head fan-out: head_group is canonical-grid's fleet head-grid
+        # agreement (heads per cell). These prerequisite checks run before
+        # any pool access so misconfiguration fails on config alone.
+        if head_group_knob is not None and not is_rank_replicated:
+            if head_group_knob <= 0:
+                raise ValueError(f"head_group must be positive: {head_group_knob}")
+            # head_group pins the whole fleet, single-cell members included:
+            # every participant must produce page_head-ordered object bytes,
+            # or a fan-out writer and a whole-page reader would exchange
+            # size-equal but byte-permuted objects. (The object_layout
+            # namespace field backstops this by digest, but the shared fleet
+            # keyspace only forms when everyone complies.)
             if self.storage_backend_type != "mooncake":
                 raise NotImplementedError(
-                    "canonical-grid with tp_lcm_size needs a "
+                    "canonical-grid with head_group needs a "
                     "multi-key-per-page backend; only mooncake supports it "
                     "(the file backend stores one object per page)."
                 )
             if self.mem_pool_host.layout != "page_head":
                 raise ValueError(
-                    "canonical-grid with tp_lcm_size requires "
+                    "canonical-grid with head_group requires "
                     "--hicache-mem-layout page_head on every participating "
                     "deployment (fan-out and single-cell members alike must "
                     "serialize objects in the same byte order)."
                 )
-            split_factor = tp_lcm_size // self.tp_size
 
         # Logical KV dtype, not the storage view: fp8 variants all store as
         # uint8, and e4m3/e5m2 deployments must land in distinct keyspaces.
@@ -750,24 +755,30 @@ class HiCacheController:
         local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
         model_id = model_name or ""
 
-        if split_factor > 1 and local_kv_heads % split_factor != 0:
-            raise ValueError(
-                f"tp_lcm_size={tp_lcm_size} needs {split_factor} head "
-                f"groups per rank, but this rank holds {local_kv_heads} "
-                f"kv heads; tp_lcm_size must not exceed the model's total "
-                f"kv heads."
-            )
+        head_group = local_kv_heads
+        if head_group_knob is not None and not is_rank_replicated:
+            if (
+                local_kv_heads % head_group_knob != 0
+                or head_group_knob > local_kv_heads
+            ):
+                raise ValueError(
+                    f"head_group={head_group_knob} must divide this rank's "
+                    f"{local_kv_heads} kv heads (grids coarser than a rank's "
+                    f"shard would need sub-object writes)."
+                )
+            head_group = head_group_knob
 
         if (
             not is_rank_replicated
             and local_kv_heads == 1
             and self.tp_size > 1
-            and not tp_lcm_size
+            and head_group_knob is None
         ):
-            # tp_lcm_size, when set, attests total_kv_heads >= tp_lcm_size >=
-            # tp_size (enforced by the divisibility asserts), which rules out
-            # kv-head replication — so the max-TP member of a head_group=1
-            # fleet attaches with H index == tp_rank.
+            # An explicit head_group is the operator's attestation that the
+            # head grid is a true sharding of the model's kv heads (it is set
+            # fleet-wide with the model in hand), so the max-TP member of a
+            # head_group=1 fleet attaches with H index == tp_rank. Without
+            # it, 1 head/rank is indistinguishable from kv-head replication.
             # One kv head per rank is ambiguous without model-level info: the
             # model may have exactly tp_size kv heads (sharded, safe) or
             # fewer (heads REPLICATED across ranks — several ranks hold the
@@ -783,7 +794,7 @@ class HiCacheController:
         # The namespace is derived from deployment facts; its digest prefixes
         # every key, so deployments agree on a keyspace iff model, logical KV
         # dtype (fp8 variants stay distinct), page size, and head grid all
-        # match. Deployments passing the same tp_lcm_size derive the same
+        # match. Deployments passing the same head_group derive the same
         # head grid and thereby share cache across TP sizes.
         namespace = derive_namespace(
             model_id=model_id,
@@ -791,7 +802,7 @@ class HiCacheController:
             page_size=self.page_size,
             rank_replicated=is_rank_replicated,
             total_kv_heads=local_kv_heads * self.tp_size,
-            head_group=0 if is_rank_replicated else local_kv_heads // split_factor,
+            head_group=0 if is_rank_replicated else head_group,
             object_layout=self.mem_pool_host.layout,
             layer_boundaries=layer_partition,
         )

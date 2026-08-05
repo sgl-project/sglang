@@ -407,8 +407,8 @@ class TestControllerGuards(CustomTestCase):
             model_name="m",
             is_rank_replicated=True,
             attn_cp_size=1,
-            tp_lcm_size=None,
-            should_split_heads=False,
+            head_group_knob=None,
+            layer_partition=None,
         )
         kwargs.update(overrides)
         return HiCacheController._build_canonical_suffix(controller, **kwargs)
@@ -441,25 +441,15 @@ class TestControllerGuards(CustomTestCase):
 
         stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
         stub.tp_size = 2
-        # tp_lcm_size > tp_size without should_split_heads means the layout
-        # prerequisite (page_head) is missing.
+        # head_group on a page_first pool: the layout prerequisite fails
+        # before any pool-geometry access.
         with self.assertRaisesRegex(ValueError, "page_head"):
-            self._build(
-                stub,
-                is_rank_replicated=False,
-                tp_lcm_size=4,
-                should_split_heads=False,
-            )
+            self._build(stub, is_rank_replicated=False, head_group_knob=2)
 
         file_stub = self._stub_controller(HiCacheController, "file", has_draft=False)
         file_stub.tp_size = 2
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
-            self._build(
-                file_stub,
-                is_rank_replicated=False,
-                tp_lcm_size=4,
-                should_split_heads=True,
-            )
+            self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
 
 
 class TestFileBackendSuffix(CustomTestCase):
