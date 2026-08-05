@@ -479,6 +479,7 @@ class TopK(MultiPlatformOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        force_balanced_topk: Optional[bool] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         topk_output = select_experts(
@@ -488,6 +489,7 @@ class TopK(MultiPlatformOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            allow_round_robin_simulation=force_balanced_topk is not False,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -579,6 +581,7 @@ class TopK(MultiPlatformOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        force_balanced_topk: Optional[bool] = None,
     ) -> TopKOutput:
 
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
@@ -590,6 +593,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             layer_id=self.layer_id,
+            force_balanced_topk=force_balanced_topk,
         )
 
     def empty_topk_output(
@@ -2061,6 +2065,7 @@ def select_experts(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    allow_round_robin_simulation: bool = True,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2258,7 +2263,7 @@ def select_experts(
             step = max(num_experts // k, 1)
             topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
             topk_weights = torch.ones_like(topk_weights) / k
-    elif simulate_round_robin_experts:
+    elif simulate_round_robin_experts and allow_round_robin_simulation:
         # Benchmark-only: override gating with deterministic expert assignment
         # to avoid routing noise from dummy/random weights. Do NOT use in production.
         num_tokens, k = topk_ids.shape
