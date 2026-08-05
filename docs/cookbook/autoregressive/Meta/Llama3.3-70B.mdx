@@ -45,6 +45,10 @@ import { Llama33Deployment } from "/src/snippets/autoregressive/llama33-70b-depl
 - **Tool Calling**: Enable with `--tool-call-parser llama3` for function calling support
 - **Higher Throughput**: Optional TP=2 or TP=4 can be used for increased throughput
 
+**Xeon CPU Deployment:**
+
+Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage

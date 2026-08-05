@@ -25,21 +25,6 @@ export const FluxDeployment = () => {
         items: [
           { id: 'flux1-dev', label: 'FLUX.1-dev', subtitle: '12B', default: true },
           { id: 'flux2-dev', label: 'FLUX.2-dev', subtitle: '32B', default: false }
-        ],
-        getDynamicItems: (values) => [
-          {
-            id: 'flux1-dev',
-            label: 'FLUX.1-dev',
-            subtitle: '12B',
-            default: values.hardware !== 'Arc B',
-            disabled: values.hardware === 'Arc B',
-          },
-          {
-            id: 'flux2-dev',
-            label: 'FLUX.2-dev',
-            subtitle: '32B',
-            default: values.hardware === 'Arc B',
-          },
         ]
       }
     },
@@ -170,6 +155,10 @@ sglang serve \\
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
+      if (prev.hardware === 'Arc B' && optionName === 'version' && value === 'flux1-dev') {
+        return prev;
+      }
+
       const nextValues = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'Arc B' && nextValues.version === 'flux1-dev') {
         nextValues.version = 'flux2-dev';
@@ -352,7 +341,11 @@ sglang serve \\
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isArcBVersionLocked =
+                    values.hardware === 'Arc B' &&
+                    option.name === 'version' &&
+                    item.id === 'flux1-dev';
+                  const isDisabled = Boolean(item.disabled || isArcBVersionLocked);
 
                   return (
                     <label
