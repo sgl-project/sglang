@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -21,6 +22,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionPatchMerger, Qwen2VisionTransformer
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
@@ -176,7 +179,10 @@ class POINTSV15ChatModel(nn.Module):
                         continue
                     param = params_dict[name]
                 except KeyError:
-                    print(params_dict.keys())
+                    logger.error(
+                        f"Weight '{name}' not found in params_dict "
+                        f"({len(params_dict)} params; sample: {list(params_dict)[:10]})"
+                    )
                     raise
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
