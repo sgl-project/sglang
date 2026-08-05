@@ -220,8 +220,18 @@ class LMCRadixCache(RadixCache):
         the held read locks and returns the radix-only result.
         """
         token_ids = key.raw_token_ids()
+        value_numel = int(value.numel())
+        chunk_size = self.lmcache_connector.chunk_size()
+        max_lmcache_match = len(token_ids) // chunk_size * chunk_size
+        # LMCache only returns complete chunks. If their aligned upper bound is
+        # already on device, LOOKUP cannot add any host-resident prefix.
+        if max_lmcache_match <= value_numel:
+            self._mp_load_back_markers.pop(req.rid, None)
+            self.lmcache_connector.release_pending(req.rid)
+            return base_res
+
         matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
-        if matched <= value.numel():
+        if matched <= value_numel:
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
             return base_res
@@ -230,14 +240,14 @@ class LMCRadixCache(RadixCache):
             token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
             key=RadixKey(token_ids, key.extra_key, key.is_bigram),
-            value_numel=int(value.numel()),
+            value_numel=value_numel,
         )
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
-            host_hit_length=matched - int(value.numel()),
+            host_hit_length=matched - value_numel,
         )
 
     def _ip_match_prefix(
