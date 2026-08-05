@@ -642,11 +642,12 @@ class HiCacheController:
             raise ValueError(f"head_group must be an integer, got {head_group_knob!r}.")
         if layer_partition is not None and (
             not isinstance(layer_partition, list)
+            or len(layer_partition) < 2
             or not all(_is_exact_int(b) for b in layer_partition)
         ):
             raise ValueError(
-                f"layer_partition must be a list of integers, got "
-                f"{layer_partition!r}."
+                f"layer_partition must be a list of at least two integer "
+                f"boundaries, got {layer_partition!r}."
             )
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
             if tp_lcm_size:
@@ -708,9 +709,12 @@ class HiCacheController:
         the remedy in the message; nothing degrades silently to rank-suffix
         keys (see DESIGN_l3_canonical_shard_grid.md section 2.2).
 
-        Returns ``(suffix, layer_ranges)``: one suffix string when this rank
-        owns a single cell per page, or the list of owned-cell suffixes under
-        fan-out. The two fleet agreements are canonical-grid's own knobs in
+        Returns ``(suffix, layer_ranges, head_ranges)``: one suffix string
+        when this rank owns a single cell per page under a zero-copy scheme,
+        or the list of owned-cell suffixes under fan-out (always a list in
+        adapter mode, whose objects use the layout-neutral canonical byte
+        order); ``layer_ranges``/``head_ranges`` carry the LOCAL cell grid
+        for the buffer metas when set. The two fleet agreements are canonical-grid's own knobs in
         the extra config — no coupling to the legacy split-heads flags:
         ``head_group`` (heads per cell; a rank owns local/head_group cells,
         enabling cross-TP read-back) and ``layer_partition`` (canonical layer
@@ -753,6 +757,26 @@ class HiCacheController:
             and layer_partition is not None
             and not is_rank_replicated
         )
+        if adapter_mode:
+            # The adapter waives the zero-copy layout requirements, but its
+            # gather/scatter supports only single-tensor page-first-family
+            # pools — fail at attach, not on the first backup (a raise on
+            # the storage threads would silently wedge write-back).
+            if self.mem_pool_host.layout not in (
+                "page_first",
+                "page_first_direct",
+                "page_head",
+            ):
+                raise ValueError(
+                    f"the cell adapter does not support the "
+                    f"{self.mem_pool_host.layout!r} host layout; use a "
+                    f"page-first-family --hicache-mem-layout."
+                )
+            if not torch.is_tensor(self.mem_pool_host.kv_buffer):
+                raise NotImplementedError(
+                    "the cell adapter does not support split K/V host pools "
+                    "(asymmetric MHA)."
+                )
 
         # Head fan-out: head_group is canonical-grid's fleet head-grid
         # agreement (heads per cell). These prerequisite checks run before

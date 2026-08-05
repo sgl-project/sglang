@@ -607,9 +607,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mla_suffix = storage_config.canonical_suffix
 
             self.registered_pools = {}
-            # Cell-adapter staging arena; allocated in register_mem_pool_host
-            # when the config carries canonical_head_ranges.
-            self.cell_arena = None
+            # Cell-adapter staging arenas; allocated in register_mem_pool_host
+            # when the config carries canonical_head_ranges. One arena per
+            # direction: backup (set) and prefetch (get) run on independent
+            # controller threads, and sharing one arena would race a gather
+            # against a concurrent RDMA get.
+            self.cell_arena_set = None
+            self.cell_arena_get = None
             self.cell_arena_pages = 0
 
             self.gb_per_page = None
@@ -727,16 +731,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             arena_bytes = max(int(arena_mb) << 20, page_cell_bytes)
             self.cell_arena_pages = arena_bytes // page_cell_bytes
-            self.cell_arena = torch.empty(
-                self.cell_arena_pages * page_cell_bytes,
-                dtype=torch.uint8,
-                pin_memory=True,
+            arena_numel = self.cell_arena_pages * page_cell_bytes
+            self.cell_arena_set = torch.empty(
+                arena_numel, dtype=torch.uint8, pin_memory=True
             )
-            super().register_buffer(self.cell_arena)
+            self.cell_arena_get = torch.empty(
+                arena_numel, dtype=torch.uint8, pin_memory=True
+            )
+            super().register_buffer(self.cell_arena_set)
+            super().register_buffer(self.cell_arena_get)
             logger.info(
-                "HiCache cell adapter: %d-page staging arena (%.1f MB).",
+                "HiCache cell adapter: 2 x %d-page staging arenas (%.1f MB "
+                "each) for the backup and prefetch threads.",
                 self.cell_arena_pages,
-                self.cell_arena.numel() / (1 << 20),
+                arena_numel / (1 << 20),
             )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
@@ -1130,8 +1138,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
         """Cell-adapter write: gather canonical cells into the registered
         arena per sub-batch, then zero-copy put from arena pointers."""
+        start_time = time.perf_counter()
         cfg = self.storage_config
-        arena_ptr = self.cell_arena.data_ptr()
+        arena = self.cell_arena_set
+        arena_ptr = arena.data_ptr()
         results: List[bool] = []
         pages_per_batch = self.cell_arena_pages
         for start in range(0, len(keys), pages_per_batch):
@@ -1145,7 +1155,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 indices,
                 cfg.canonical_layer_ranges,
                 cfg.canonical_head_ranges,
-                self.cell_arena,
+                arena,
             )
             key_strs = self._adapter_cell_keys(page_keys)
             assert len(key_strs) == len(offsets)
@@ -1179,13 +1189,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     set_results, is_set_operate=True, key_multiplier=multiplier
                 )
             )
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(len(keys))
+            self.backup_bandwidth.append(
+                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
+            )
         return results
 
     def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
         """Cell-adapter read: zero-copy get into the arena per sub-batch,
         then scatter successful pages' canonical cells into the host pool."""
+        start_time = time.perf_counter()
         cfg = self.storage_config
-        arena_ptr = self.cell_arena.data_ptr()
+        arena = self.cell_arena_get
+        arena_ptr = arena.data_ptr()
         page_size = self.mem_pool_host.page_size
         page_cell_bytes = self.mem_pool_host.cell_bytes(
             cfg.canonical_layer_ranges, cfg.canonical_head_ranges
@@ -1230,9 +1247,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     indices[i * page_size : (i + 1) * page_size],
                     cfg.canonical_layer_ranges,
                     cfg.canonical_head_ranges,
-                    self.cell_arena[i * page_cell_bytes : (i + 1) * page_cell_bytes],
+                    arena[i * page_cell_bytes : (i + 1) * page_cell_bytes],
                 )
             results.extend(page_ok)
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
+            )
         return results
 
     def batch_get_v1(
@@ -1248,7 +1270,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_arena is not None:
+        if self.cell_arena_get is not None:
             return self._batch_get_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1280,7 +1302,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
-        if self.cell_arena is not None:
+        if self.cell_arena_set is not None:
             return self._batch_set_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)

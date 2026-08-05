@@ -473,6 +473,20 @@ class TestControllerGuards(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
             self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
 
+    def test_adapter_rejects_unsupported_layout_at_attach(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
+        stub.tp_size = 2
+        stub.mem_pool_host = self._StubHostPool("layer_first")
+        with self.assertRaisesRegex(ValueError, "cell adapter"):
+            self._build(
+                stub,
+                is_rank_replicated=False,
+                head_group_knob=2,
+                layer_partition=[0, 30, 61],
+            )
+
     def test_nonpositive_head_group_rejected(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 

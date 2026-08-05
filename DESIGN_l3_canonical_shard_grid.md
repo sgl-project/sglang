@@ -127,6 +127,19 @@ cell key          = {ns}:{page_hash}:{component}:L{i}:H{j}
 > derive disjoint keys and miss instead of colliding — and `Lg` enters the
 > descriptor only when uniform-grid layer fan-out lands. The two forms are
 > equivalent where `Lg` divides every stage; the range form is a superset.
+>
+> Second implementation note (the **cell adapter**): when both fleet grids
+> are declared (`head_group` + `layer_partition`) on a sharded-KV pool, the
+> implementation switches the namespace to layout-neutral canonical cells —
+> `(head, layer, token, dim)` per K/V half, the `page_head_layer_direct`
+> byte order — gathered/scattered through pinned store-registered staging
+> arenas (one per IO direction). The `object_layout` identity becomes the
+> constant `cell-v1`, so any page-first-family host layout interops, and
+> the layout *mandates* in section 4.4 apply only to the zero-copy
+> single-axis schemes. Cost: one host memcpy per direction on the async
+> backup/prefetch threads; this is the section 4.4 "optional new layout"
+> trade taken in staging-copy form, with the byte order pinned so a future
+> zero-copy `page_head_layer_direct` layout is drop-in compatible.
 
 - `component` is the `PoolName` axis. **In v1 only `kv` is supported** — the
   side pools are *not* orthogonal to sharding (§8) and models that have them

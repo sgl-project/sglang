@@ -7271,10 +7271,10 @@ class ServerArgs:
                         "multi-key-per-page backend; only mooncake supports "
                         "it."
                     )
-                # head_group + layer_partition together is legal when each
-                # stage spans exactly one canonical range (no layer fan-out)
-                # — whether fan-out actually occurs depends on the PP split,
-                # so the combination is validated at attach, not here.
+                # head_group + layer_partition together selects the cell
+                # adapter (layout-neutral canonical object bytes staged
+                # through a registered arena); pool prerequisites are
+                # validated at attach.
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
