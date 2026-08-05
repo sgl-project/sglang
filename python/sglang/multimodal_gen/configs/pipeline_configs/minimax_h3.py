@@ -169,12 +169,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
-        attention_backend = self._server_arg_value(server_args.attention_backend)
-        if str(attention_backend).strip().lower() == "sage_attn":
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
 
     def select_vae_weight_files(
         self,
