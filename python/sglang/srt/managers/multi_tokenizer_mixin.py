@@ -397,7 +397,7 @@ class MultiHttpWorkerDetokenizerMixin:
             self.socket_mapping.clear_all_sockets()
 
     def multi_http_worker_event_loop(self: DetokenizerManager):
-        """The event loop that handles requests, for multi multi-http-worker mode"""
+        """The event loop that handles requests, for multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
         # paused while waiting for input and fed once per processed message.

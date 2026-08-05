@@ -176,7 +176,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     def _determine_chunk_size(self, forward_batch: ForwardBatch) -> int:
         """
-        Heuristically determine the chunk size based on token token number in a batch.
+        Heuristically determine the chunk size based on token number in a batch.
 
         Args:
             forward_batch (ForwardBatch): The batch information containing sequence lengths.
