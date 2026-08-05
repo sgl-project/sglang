@@ -243,13 +243,10 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     # Launch multi-tokenizer manager process
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
-    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
+    tokenizer_manager, template_manager = init_tokenizer_manager(
+        server_args,
+        port_args,
+        TokenizerManagerClass=tokenizer_worker_class,
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
