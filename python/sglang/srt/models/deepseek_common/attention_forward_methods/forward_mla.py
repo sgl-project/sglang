@@ -149,6 +149,10 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 if _use_aiter_gfx95:
+    from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+        _get_config as _get_mxfp4_bmm_config,
+    )
+    from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -160,6 +164,84 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def _get_single_split_mxfp4_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config, _ = _get_mxfp4_bmm_config(x.shape[1], weight.shape[1], x.shape[2])
+    config = config.copy()
+    # AITER's split-K batched A16WFP4 path can reduce uninitialized extra splits
+    # for small decode M (ROCm/aiter#3766). Keep the opt-in GLM path on K-split 1.
+    config["NUM_KSPLIT"] = 1
+    return config
+
+
+def _get_glm_mxfp4_k_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    config = _get_single_split_mxfp4_bmm_config(x, weight)
+    # GLM's K-up has K=192. Larger blocks over-read its six E8M0 scale groups.
+    config["BLOCK_SIZE_K"] = 64
+    return config
+
+
+def _get_glm_mxfp4_v_bmm_config(x: torch.Tensor, weight: torch.Tensor) -> dict:
+    return _get_single_split_mxfp4_bmm_config(x, weight)
+
+
+def _run_mxfp4_k_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_k_bmm_config(x, weight),
+            transpose_bm=False,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+        return
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output,
+    )
+
+
+def _run_mxfp4_v_bmm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if envs.SGLANG_USE_MXFP4_MLA_BMM.get():
+        return batched_gemm_a16wfp4(
+            x,
+            weight,
+            weight_scale,
+            y=output,
+            config=_get_glm_mxfp4_v_bmm_config(x, weight),
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            dtype=torch.bfloat16,
+        )
+
+    batched_gemm_afp4wfp4_pre_quant(
+        x,
+        weight,
+        weight_scale,
+        torch.bfloat16,
+        output.transpose(0, 1),
+    )
+    return output
 
 
 def _should_defer_dsa_cp_kv_gather(
@@ -650,11 +732,10 @@ class DeepseekMLAForwardMixin:
                         device=x.device,
                         dtype=torch.bfloat16,
                     )
-                    batched_gemm_afp4wfp4_pre_quant(
+                    _run_mxfp4_k_bmm(
                         x,
                         self.w_kc.transpose(-2, -1),
                         self.w_scale_k.transpose(-2, -1),
-                        torch.bfloat16,
                         q_nope_out,
                     )
                 else:
@@ -1105,38 +1186,48 @@ class DeepseekMLAForwardMixin:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
-                B_heads, M_batch = x.shape[0], x.shape[1]
-                N_vdim = self.w_vc.shape[2]
-                # Allocate in (batch, heads, dim) so the post-GEMM
-                # transpose+flatten is a free view instead of a copy.
                 _bmm_buf = torch.empty(
-                    M_batch,
-                    B_heads,
-                    N_vdim,
+                    x.shape[1],
+                    x.shape[0],
+                    self.w_vc.shape[2],
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
-                attn_bmm_output = _bmm_buf.transpose(0, 1)
-                batched_gemm_afp4wfp4_pre_quant(
+                _bmm_buf = _run_mxfp4_v_bmm(
                     x,
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
-                    torch.bfloat16,
-                    attn_bmm_output,
+                    _bmm_buf,
                 )
+                attn_bmm_output = _bmm_buf
             else:
                 _bmm_buf = None
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-                    attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                    # Write the absorbed v_up bmm output batch-major
+                    # (tokens, heads, v_head_dim) via transpose_bm=True so the
+                    # downstream flatten(1, 2) in the `_bmm_buf is not None` block is
+                    # a free view. With the old transpose_bm=False the output was
+                    # (heads, tokens, v) and needed a transpose(0,1).flatten copy =
+                    # a per-layer direct_copy (elementwise_manual_unroll ~5us/layer),
+                    # which ATOM / the MXFP4 path do not pay.
+                    _bmm_buf = torch.empty(
+                        attn_output.shape[0],
+                        self.num_local_heads,
+                        self.w_vc.shape[-1],
+                        device=attn_output.device,
+                        dtype=torch.bfloat16,
+                    )
+                    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
                         w_scale=self.w_scale,
                         group_size=128,
-                        YQ=None,
-                        transpose_bm=False,
+                        YQ=_bmm_buf,
+                        transpose_bm=True,
                         transpose_bm_in=True,
                         dtype=torch.bfloat16,
                     )
+                    attn_bmm_output = _bmm_buf
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
