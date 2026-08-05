@@ -923,10 +923,12 @@ curl -s localhost:8000/metrics | grep num_queue_reqs
 | 指标 | 值 |
 |------|-----|
 | 单日总请求 | 16,454 |
+| Aborted | 310（1.88%） |
 | AVG TTFT | 8.37s |
 | AVG E2E | 33.6s |
 | 配置 | 6卡 TP2 DP3 + MTP + 代理（tool_call=16 / thinking=12） |
 
+> 对照：无 MTP 基线 abort 2.2%（2294 req）；MTP 高并发 3.3%（2162 req）。1.88% 为各版本最低，可接受（<2%）。
 > 对照：无 MTP 基线 TTFT 4.37s / E2E 89.2s（2294 req）；MTP 高并发实测 TTFT 8.76s（2162 req）。8.37s 属 MTP 高并发正常水位，E2E 33.6s 中 decode 约 25.2s（长输出占比上升所致）。
 
 **Qwen3.6-27B 上下文 262144 可行性**
