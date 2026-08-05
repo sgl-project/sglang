@@ -178,15 +178,18 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             bs, num_tokens, forward_mode, seq_lens, device
         )
         if get_parallel().dcp_enabled:
-            if forward_mode.is_target_verify():
-                self.forward_decode_metadata.global_seq_lens_k = torch.zeros_like(
-                    self.forward_decode_metadata.seq_lens_k
+            metadata = self.forward_decode_metadata
+            if metadata.global_seq_lens_k is None:
+                # Plain decode under DCP also keeps the int32 GLOBAL lens in a
+                # capture-stable buffer (super allocates it only for verify):
+                # the DCP kernel consumes both the rank-local and the global
+                # lens every MLA layer, so both are maintained once per step.
+                metadata.global_seq_lens_k = torch.zeros(
+                    (bs,), dtype=torch.int32, device=device
                 )
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.max_context_len
-                    + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
-                )
+            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                self.max_context_len
+                + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
             )
 
     def _apply_cuda_graph_metadata(
@@ -224,7 +227,13 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
         else:
             seq_lens = seq_lens[:bs]
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Hoist: refresh the int32 global + rank-local lens once per step
+            # into the capture-stable buffers; forward_decode reads them
+            # instead of recomputing get_dcp_lens + two int32 casts per MLA
+            # layer.
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
+            local_seq_lens = metadata.seq_lens_k
 
         self._fill_dcp_block_kv_indices(
             metadata.block_kv_indices,
@@ -244,6 +253,19 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             )
         ):
             if forward_batch.forward_mode.is_target_verify():
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.forward_decode_metadata.seq_lens_k is not None
+            ):
+                # Same hoist as verify: the parent stored the int32 GLOBAL
+                # lens in seq_lens_k; keep it as global_seq_lens_k and derive
+                # the rank-local view once per step (forward_decode consumes
+                # both every MLA layer).
                 metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(
@@ -349,12 +371,30 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         # Query / KV preparation mirrors the base cute-dsl decode (both FP16 and
         # FP8 KV), then swaps to the DCP kernel call + rank-local return.
         merge_query = q_rope is not None
+        query = None
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if (
+                    save_kv_cache
+                    and self._fused_set_kv_concat_q_fp8
+                    and not self._unified_mla
+                ):
+                    # Static pool: out_cache_loc is already the physical loc.
+                    # Fused: bf16->fp8 quantize + KV scatter + q concat in one
+                    # launch; None when not covered.
+                    query = self._set_kv_and_concat_q_fp8_fused(
+                        layer=layer,
+                        loc=forward_batch.out_cache_loc,
+                        q=q,
+                        q_rope=q_rope,
+                        k=k,
+                        k_rope=k_rope,
+                    )
+                if query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -369,13 +409,15 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 )
             merge_query = False
 
-        if save_kv_cache:
+        if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
-        if merge_query:
+        if query is not None:
+            pass  # fused fp8 path already built the query and wrote KV
+        elif merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
@@ -404,8 +446,14 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
-        global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
-        local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
+        if metadata.seq_lens_k is not None and metadata.global_seq_lens_k is not None:
+            # Hoisted path: int32 rank-local + global lens maintained once per
+            # step by metadata init / graph replay-prep.
+            local_seq_lens = metadata.seq_lens_k[: forward_batch.batch_size]
+            global_seq_lens = metadata.global_seq_lens_k[: forward_batch.batch_size]
+        else:
+            global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+            local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
         raw_out, lse = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
