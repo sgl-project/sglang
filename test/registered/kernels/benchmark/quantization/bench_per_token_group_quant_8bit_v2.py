@@ -1,16 +1,16 @@
-import torch
 from sgl_kernel import sgl_per_token_group_quant_8bit
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
-    fp8_dtype,
     fp8_max,
     fp8_min,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
+)
+from sglang.kernels.ops.quantization.quant_format import (
+    create_group_quant_outputs,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -51,14 +51,14 @@ FN = {"aot_v2": _aot_v2, "jit_v2": _jit_v2}
 @marker.benchmark("impl", ["aot_v2", "jit_v2"])
 def benchmark(num_tokens: int, impl: str):
     x = create_random(num_tokens, HIDDEN)
-    x_q = torch.empty(num_tokens, HIDDEN, device="cuda", dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=(num_tokens, HIDDEN),
         device="cuda",
         group_size=G,
         column_major_scales=True,
         scale_tma_aligned=True,
         scale_ue8m0=False,
+        pack_ue8m0=True,
     )
     return marker.do_bench(FN[impl], input_args=(x, x_q, x_s), graph_clone_args=(0,))
 

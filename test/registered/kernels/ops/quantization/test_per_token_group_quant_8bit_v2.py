@@ -7,6 +7,9 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
+from sglang.kernels.ops.quantization.quant_format import (
+    create_group_quant_outputs,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -22,8 +25,6 @@ if sgl_per_token_group_quant_8bit is None:
     raise ImportError("sgl_kernel AOT reference op is unavailable")
 
 from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
-    create_per_token_group_quant_fp8_output_scale,
-    fp8_dtype,
     fp8_max,
     fp8_min,
 )
@@ -34,15 +35,16 @@ G = 128
 def _alloc(x_shape, scale_ue8m0):
     """Pre-allocated (zeroed) output_q + output_s for a given input/output shape.
     Zeroing makes the unwritten (padding / aligned) regions compare equal."""
-    x_q = torch.zeros(x_shape, device="cuda", dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=x_shape,
         device="cuda",
         group_size=G,
         column_major_scales=True,
         scale_tma_aligned=True,
         scale_ue8m0=scale_ue8m0,
+        pack_ue8m0=True,
     )
+    x_q.zero_()
     x_s.zero_()
     return x_q, x_s
 

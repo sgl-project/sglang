@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,19 +13,6 @@ from sglang.kernels.jit.utils import (
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-
-@cache_once
-def _jit_module(group_size: int) -> Module:
-    args = make_cpp_args(group_size, is_arch_support_pdl())
-    return load_jit(
-        "minimax_per_token_quant_ue8m0",
-        *args,
-        cuda_files=["minimax/per_token_quant_ue8m0.cuh"],
-        cuda_wrappers=[
-            ("per_token_quant_ue8m0", f"per_token_quant_ue8m0<{args}>"),
-        ],
-    )
 
 
 @cache_once
@@ -45,32 +32,6 @@ def _jit_scatter_module(group_size: int, topk: int) -> Module:
     )
 
 
-def per_token_quant_fp8_ue8m0(
-    x: torch.Tensor, group_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-token group quant to FP8-e4m3 with a fused UE8M0 (int32-packed) scale.
-
-    Returns ``(x_q, x_sf)`` where ``x_q`` is fp8_e4m3 ``[num_tokens, hidden]`` and
-    ``x_sf`` is the int32-packed UE8M0 scale ``[num_tokens, hidden//group_size//4]``
-    (row-major). Byte-identical to ``per_token_group_quant_fp8(scale_ue8m0=True)``
-    followed by ``transform_sf_into_required_layout`` (both ceil-round the scale),
-    but does it in a single kernel -- no separate transpose/pack launch.
-    """
-    assert x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
-    assert x.is_contiguous()
-    num_tokens, hidden = x.shape
-    assert hidden % group_size == 0
-    num_groups = hidden // group_size
-    assert num_groups % 4 == 0, "num_groups must be a multiple of 4 for int32 packing"
-
-    x_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    x_sf = torch.empty(
-        (num_tokens, num_groups // 4), dtype=torch.int32, device=x.device
-    )
-    _jit_module(group_size).per_token_quant_ue8m0(x, x_q, x_sf)
-    return x_q, x_sf
-
-
 def per_token_quant_fp8_ue8m0_scatter(
     x: torch.Tensor,
     gateup_input: torch.Tensor,
@@ -82,7 +43,7 @@ def per_token_quant_fp8_ue8m0_scatter(
     group_size: int = 128,
 ) -> None:
     """Fused per-token FP8/UE8M0 quant **and** scatter into the permuted grouped-GEMM
-    input -- a single kernel replacing ``per_token_quant_fp8_ue8m0`` +
+    input -- a single kernel replacing ``per_token_group_quant`` +
     ``fill_gateup_input_triton_kernel``.
 
     For each source token it computes the fp8 row + int32-packed UE8M0 scale once,

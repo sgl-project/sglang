@@ -33,9 +33,6 @@ from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
-)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -370,20 +367,9 @@ class DeepseekV2MLP(nn.Module):
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
             M, N = gate_up.shape
-            down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
             scale_block_size = 128
-            down_input_scale = create_per_token_group_quant_fp8_output_scale(
-                x_shape=(M, N // 2),
-                device=gate_up.device,
-                group_size=scale_block_size,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
-            silu_and_mul_contig_post_quant(
+            down_input_fp8, down_input_scale = silu_and_mul_contig_post_quant(
                 input=gate_up,
-                output=down_input_fp8,
-                output_scale=down_input_scale,
                 quant_group_size=scale_block_size,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,

@@ -5,8 +5,6 @@ import torch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_empty, create_random
 from sglang.kernels.ops.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
-    fp8_dtype,
     fp8_max,
     fp8_min,
 )
@@ -18,6 +16,9 @@ from sglang.kernels.ops.quantization.per_token_group_quant import (
 )
 from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
+)
+from sglang.kernels.ops.quantization.quant_format import (
+    create_group_quant_outputs,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -93,14 +94,14 @@ def benchmark(
     expected_m = math.ceil(max_tokens * topk / num_local_experts)
     in_hidden = hidden_size * (2 if fuse_silu else 1)
     x = create_random(num_local_experts, padded_tokens, in_hidden)
-    x_q = create_empty(num_local_experts, padded_tokens, hidden_size, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=(num_local_experts, padded_tokens, hidden_size),
         device="cuda",
         group_size=group_size,
         column_major_scales=True,
         scale_tma_aligned=True,
         scale_ue8m0=True,
+        pack_ue8m0=True,
     )
     if balanced:  # simulation
         topk_ids = torch.randint(0, num_local_experts, (num_tokens * topk,))

@@ -16,7 +16,6 @@ import functools
 import json
 import logging
 import os
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -30,6 +29,17 @@ except:
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+
+# Re-exported: these live in a leaf module so per_token_group_quant can reach
+# them without the fp8_kernel import cycle. Kept importable from here for the
+# ~60 existing callers.
+from sglang.kernels.ops.quantization.quant_format import (  # noqa: F401
+    create_group_quant_outputs,
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
+    is_fp8_fnuz,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -107,23 +117,6 @@ if _is_musa:
 
 
 logger = logging.getLogger(__name__)
-
-
-@lru_cache()
-def is_fp8_fnuz() -> bool:
-    if _is_hip:
-        # only device 0 is checked, this assumes MI300 platforms are homogeneous
-        return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
-    return False
-
-
-if is_fp8_fnuz():
-    fp8_dtype = torch.float8_e4m3fnuz
-    fp8_max = 224.0
-else:
-    fp8_dtype = torch.float8_e4m3fn
-    fp8_max = torch.finfo(fp8_dtype).max
-fp8_min = -fp8_max
 
 
 @register_custom_op(mutates_args=["C"])
@@ -284,14 +277,14 @@ def _per_token_group_quant_8bit_raw(
         bit8_max = info.max
         bit8_min = info.min
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=x.shape,
         device=x.device,
         group_size=group_size,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=False,
+        out_dtype=dtype,
     )
 
     M = x.numel() // group_size
@@ -454,68 +447,16 @@ def per_token_group_quant_8bit(
         )
 
 
-def create_per_token_group_quant_fp8_output_scale(
-    x_shape,
-    device,
-    group_size,
-    column_major_scales: bool,
-    scale_tma_aligned: bool,
-    scale_ue8m0: bool,
-):
-    if scale_ue8m0:
-        if column_major_scales and scale_tma_aligned:
-            *x_batch, x_q_mn, x_q_k = x_shape
-            x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
-            aligned_mn = ceil_align(x_s_mn, 4)
-            aligned_k = ceil_align(x_s_k, 4)
-            # TODO(FIXME): Fix cuda kernel and recover here to empty.
-            return torch.empty(
-                (*x_batch, aligned_k // 4, aligned_mn),
-                device=device,
-                dtype=torch.int,
-            ).transpose(-1, -2)[..., :x_s_mn, :]
-        else:
-            assert not column_major_scales, (
-                "column_major_scales requires scale_tma_aligned=True "
-                "when scale_ue8m0 is enabled"
-            )
-            # Row-major UE8M0 keeps the scale as float32 power-of-two values,
-            # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
-            return torch.empty(
-                x_shape[:-1] + (x_shape[-1] // group_size,),
-                device=device,
-                dtype=torch.float32,
-            )
-    elif column_major_scales:
-        if scale_tma_aligned:
-            # TODO extract "align" function
-            # aligned to 4 * sizeof(float)
-            aligned_size = (x_shape[-2] + 3) // 4 * 4
-            # `...` so batched (e.g. masked [E, T, H]) shapes slice the token
-            # axis, not dim 0.
-            return torch.empty(
-                x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(-1, -2)[..., : x_shape[-2], :]
-        else:
-            return torch.empty(
-                (x_shape[-1] // group_size,) + x_shape[:-1],
-                device=device,
-                dtype=torch.float32,
-            ).permute(-1, -2)
-    else:
-        return torch.empty(
-            x_shape[:-1] + (x_shape[-1] // group_size,),
-            device=device,
-            dtype=torch.float32,
-        )
-
-
 # AOT v2 (the MUSA path) runtime-switches on these; the JIT
 # per_token_group_quant kernel also templates on 256.
 _MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
 _V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
+
+# The JIT kernel bakes the group-absmax floor in at compile time (QuantTrait::
+# kAmaxFloor in gemm/per_token_group_quant.cuh), so it is not a per-call knob and
+# the entry points below do not expose one. Named here for the MUSA AOT op, which
+# still takes it as a runtime argument.
+PER_TOKEN_GROUP_QUANT_EPS = 1e-10
 
 
 def _run_per_token_group_quant_8bit_kernel(
@@ -523,7 +464,6 @@ def _run_per_token_group_quant_8bit_kernel(
     x_q: torch.Tensor,
     x_s: torch.Tensor,
     group_size: int,
-    eps: float,
     fp8_min: float,
     fp8_max: float,
     *,
@@ -553,7 +493,7 @@ def _run_per_token_group_quant_8bit_kernel(
             output_q=x_q,
             output_s=x_s,
             group_size=group_size,
-            eps=eps,
+            eps=PER_TOKEN_GROUP_QUANT_EPS,
             min_8bit=fp8_min,
             max_8bit=fp8_max,
             scale_ue8m0=scale_ue8m0,
@@ -568,7 +508,7 @@ def _run_per_token_group_quant_8bit_kernel(
             x_q,
             x_s,
             group_size,
-            eps,
+            PER_TOKEN_GROUP_QUANT_EPS,
             fp8_min,
             fp8_max,
             scale_ue8m0,
@@ -578,9 +518,6 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
         f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
@@ -600,7 +537,6 @@ def _run_per_token_group_quant_8bit_kernel(
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -625,14 +561,18 @@ def sglang_per_token_group_quant_fp8(
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
+    x_q, x_s = create_group_quant_outputs(
         x_shape=out_shape,
         device=x.device,
         group_size=group_size,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        # This entry point's UE8M0 storage has always followed its layout: packed
+        # exponent bytes when column-major, fp32 2^(e-127) (the deep_gemm
+        # ceil_to_ue8m0 form) when row-major. Stated here rather than left for
+        # the allocator to infer.
+        pack_ue8m0=column_major_scales,
     )
 
     if x.shape[0] > 0:
@@ -641,7 +581,6 @@ def sglang_per_token_group_quant_fp8(
             x_q,
             x_s,
             group_size,
-            eps,
             fp8_min,
             fp8_max,
             scale_ue8m0=scale_ue8m0,
@@ -655,7 +594,6 @@ def sglang_per_token_group_quant_fp8(
 def sglang_per_token_group_quant_fp8_row_padded(
     x: torch.Tensor,
     group_size: int,
-    eps: float = 1e-10,
     row_alignment: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quant writing into row-padded buffers (col-major scales).
@@ -681,25 +619,27 @@ def sglang_per_token_group_quant_fp8_row_padded(
     )
     if group_size not in supported_group_sizes:
         # Keep the legacy unpadded path and let the GEMM wrapper do the padding.
-        return sglang_per_token_group_quant_fp8(
-            x, group_size, eps, column_major_scales=True
-        )
+        return sglang_per_token_group_quant_fp8(x, group_size, column_major_scales=True)
 
     m, k = x.shape
     m_pad = ceil_align(m, row_alignment)
-    # mat_a buffer: (m_pad, k) row-major fp8
-    x_q = torch.empty((m_pad, k), device=x.device, dtype=fp8_dtype)
-    # scales_a buffer: column-major (stride(0) == 1), shape (m_pad, k // group)
-    x_s = torch.empty(
-        (k // group_size, m_pad), device=x.device, dtype=torch.float32
-    ).transpose(0, 1)
+    # Both buffers use the PADDED row count so the rows the GEMM reads are
+    # contiguous; the quant below writes only [:m]. scales_a is column-major
+    # (stride(0) == 1), shape (m_pad, k // group).
+    x_q, x_s = create_group_quant_outputs(
+        x_shape=(m_pad, k),
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    )
     if m > 0:
         _run_per_token_group_quant_8bit_kernel(
             x,
             x_q[:m],
             x_s[:m],
             group_size,
-            eps,
             fp8_min,
             fp8_max,
             scale_ue8m0=False,
@@ -714,52 +654,11 @@ def sglang_per_token_group_quant_fp8_row_padded(
     return x_q, x_s
 
 
-def sglang_per_token_group_quant_fp8_ue8m0(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert (
-        x.shape[-1] % group_size == 0
-    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
-    assert x.is_contiguous(), "x must be contiguous"
-
-    *x_batch, x_q_mn, x_q_k = x.shape
-    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
-
-    x_s_mn = x_q_mn
-    x_s_k = x_q_k // group_size
-    aligned_mn = ceil_align(x_s_mn, 4)
-    aligned_k = ceil_align(x_s_k, 4)
-    x_s = torch.empty(
-        (*x_batch, aligned_k // 4, aligned_mn),
-        device=x.device,
-        dtype=torch.int,
-    ).transpose(-1, -2)[..., :x_s_mn, :]
-
-    if x.shape[0] > 0:
-        _run_per_token_group_quant_8bit_kernel(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0=True,
-            fuse_silu_and_mul=False,
-            masked_m=None,
-        )
-
-    return x_q, x_s
-
-
 # TODO maybe unify int8 and fp8 code later
 def sglang_per_token_group_quant_8bit(
     x: torch.Tensor,
     group_size: int,
     dst_dtype: torch.dtype,
-    eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -778,14 +677,12 @@ def sglang_per_token_group_quant_8bit(
         return sglang_per_token_group_quant_int8(
             x=x,
             group_size=group_size,
-            eps=eps,
             dtype=dst_dtype,
         )
 
     return sglang_per_token_group_quant_fp8(
         x=x,
         group_size=group_size,
-        eps=eps,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
