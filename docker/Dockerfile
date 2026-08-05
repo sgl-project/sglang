@@ -610,6 +610,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing.
+# release-docker-dev.yml resolves one version with wheels for both architectures;
+# version-tagged release/runtime images leave it empty and skip the install.
+ARG DYNAMO_VERSION=
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "$DYNAMO_VERSION" ]; then \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+    fi
+
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
@@ -667,6 +676,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG DYNAMO_VERSION=
 
 WORKDIR /sgl-workspace
 
@@ -723,8 +733,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+# When ai-dynamo is installed (dev image), reinstall the gateway wheel with
+# --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
+# Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    if [ -n "$DYNAMO_VERSION" ]; then \
+        python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
+    else \
+        python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
+    fi \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory

@@ -50,6 +50,8 @@ jobs:
       overlay_cudas_json: ${{ steps.config.outputs.overlay_cudas_json }}
       overlay_tags_json: ${{ steps.config.outputs.overlay_tags_json }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Compute build configuration
         id: config
         env:
@@ -66,11 +68,19 @@ jobs:
             echo "checkout_ref=" >> $GITHUB_OUTPUT
           fi
 
-          # Determine extra build args
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          DYNAMO_VERSION="$(python3 scripts/ci/utils/resolve_dynamo_version.py)"
+          DYNAMO_BUILD_ARG=""
+          if [ -n "$DYNAMO_VERSION" ]; then
+            echo "Using multi-architecture Dynamo nightly ${DYNAMO_VERSION}"
+            DYNAMO_BUILD_ARG="--build-arg DYNAMO_VERSION=${DYNAMO_VERSION}"
           else
-            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+            echo "::warning title=Dynamo installation skipped::No nightly has ai-dynamo plus x86_64 and aarch64 runtime wheels"
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 ${DYNAMO_BUILD_ARG} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          else
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local ${DYNAMO_BUILD_ARG} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
           fi
 
           # Determine tag suffix
