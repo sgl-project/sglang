@@ -37,6 +37,9 @@ class _FakeResponse:
         self._output_ids = output_ids
         self._meta_info = meta_info
 
+    def raise_for_status(self):
+        return None
+
     def json(self):
         data = {"output_ids": self._output_ids}
         if self._meta_info is not None:

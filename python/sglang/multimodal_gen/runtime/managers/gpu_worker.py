@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
@@ -371,6 +371,54 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
         )
 
+    def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        group_start_time = time.monotonic()
+
+        try:
+            for req in batch:
+                output_count = (
+                    max(1, int(req.num_outputs_per_prompt or 1))
+                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    else 1
+                )
+                output_batch = self._execute_forward_common(
+                    req,
+                    forward_fn=lambda results=results, output_count=output_count: (
+                        self._collect_sequential_outputs(results, output_count)
+                    ),
+                    log_reqs=[req],
+                    return_req=False,
+                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                        req, output_batch
+                    ),
+                    error_context=f"grouped request {req.request_id}",
+                    execution_start_time=group_start_time,
+                    propagate_forward_errors=True,
+                )
+                assert isinstance(output_batch, OutputBatch)
+                yield output_batch
+                del output_batch
+        finally:
+            close = getattr(results, "close", None)
+            if close is not None:
+                close()
+
+    def _collect_sequential_outputs(
+        self,
+        results: Iterator[OutputBatch | Req],
+        output_count: int,
+    ) -> OutputBatch | Req:
+        if output_count == 1:
+            return next(results)
+
+        output_batches = [
+            self._to_output_batch(next(results)) for _ in range(output_count)
+        ]
+        return self._merge_expanded_output_batches(output_batches)
+
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
@@ -396,17 +444,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
+        propagate_forward_errors: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        forward_failed = False
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
@@ -425,7 +480,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                except Exception:
+                    forward_failed = True
+                    raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -456,11 +515,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_output_transport(output_batch, req, save_output_paths)
 
             if (
-                torch.cuda.is_initialized()
+                not current_platform.is_cpu()
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.cuda.empty_cache()
+                torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -479,6 +538,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     tag="server_perf_dump",
                 )
         except Exception as e:
+            if propagate_forward_errors and forward_failed:
+                if isinstance(e, StopIteration):
+                    raise RuntimeError(
+                        "Grouped pipeline returned fewer outputs than requests."
+                    ) from e
+                raise
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
@@ -490,8 +555,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if not current_platform.is_cpu():
+                torch.get_device_module().empty_cache()
         return output_batch
 
     def _materialize_output_transport(
