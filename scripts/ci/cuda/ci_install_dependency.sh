@@ -238,8 +238,7 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
-    # sglang-kernel stays: install_sglang_kernel reinstalls it on any version
-    # or CUDA-tag mismatch, so a matching wheel need not be cycled every job.
+    # sglang-kernel stays: install_sglang_kernel version-gates and reinstalls it.
     $PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
     mark_step_done "${FUNCNAME[0]}"
@@ -386,12 +385,11 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-# Trust an installed wheel only if the version matches AND every RECORD file is
-# on disk - dist-info can survive a partial install (same failure mode as the
-# cusparselt guard in install_sglang). reject-local additionally refuses wheels
-# installed from a local file: a kernel-PR job installs its own build under the
-# SAME +cuXXX version string, and only file:// provenance (PEP 610
-# direct_url.json; index installs record none) tells it apart from the index wheel.
+# Trust an installed wheel only if the version matches and every RECORD file is
+# on disk (dist-info can survive a partial install - cf. the cusparselt guard).
+# reject-local refuses wheels installed from a local file: a kernel-PR job
+# installs its own build under the SAME +cuXXX version string, and only file://
+# provenance (PEP 610; index installs record none) tells them apart.
 installed_wheel_ok() {
     WHEEL_DIST="$1" WHEEL_WANTED="$2" WHEEL_REJECT_LOCAL="${3:-}" python3 - <<'EOF'
 import importlib.metadata as md
@@ -484,8 +482,7 @@ install_sglang_kernel() {
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
         # The PyPI default wheel tracks one CUDA version (currently cu130);
-        # runners on a different CUDA need the +${CU_VERSION}-tagged wheel from
-        # the sglang index. A verified match means the right wheel is in place.
+        # other runners need the +${CU_VERSION}-tagged wheel from the sglang index.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
         if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
@@ -501,8 +498,7 @@ install_sglang_kernel() {
     else
         SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
     fi
-    # No reject-local: nothing builds sgl-deep-gemm locally, and its cu129
-    # wheel installs from a direct URL, which legitimately records provenance.
+    # No reject-local: nothing builds sgl-deep-gemm locally.
     if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
         echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
     elif [ "$CU_MAJOR" = "13" ]; then
