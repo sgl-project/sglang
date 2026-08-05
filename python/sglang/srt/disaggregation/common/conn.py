@@ -47,20 +47,6 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
-# libzmq caps sockets per context at ZMQ_MAX_SOCKETS, default 1023. A prefill
-# rank creates two sockets per decode endpoint (PUSH + PAIR monitor), so a
-# large decode fleet (e.g. 16 replicas x 32 DP ranks = 512 endpoints -> 1025
-# sockets) exhausts the default and every further connect raises "Too many
-# open files" regardless of the OS nofile limit. Must be set on a context
-# before it creates any socket.
-ZMQ_CTX_MAX_SOCKETS = 4096
-
-# Bound for the per-endpoint PUSH-socket LRU cache. Invariant: two sockets per
-# cached endpoint plus the PULL server socket stay well under
-# ZMQ_CTX_MAX_SOCKETS (2 * 1024 + 1 = 2049 < 4096), so endpoint churn
-# (autoscaling, decode replica restarts) can no longer exhaust the context.
-SOCKET_CACHE_MAX_ENDPOINTS = 1024
-
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
@@ -211,18 +197,34 @@ class CommonKVManager(BaseKVManager):
             or hybrid_decode_pulls_all_ranks
         )
 
+        # libzmq caps sockets per context (default 1023); the KV manager holds
+        # two sockets per decode endpoint (PUSH + PAIR monitor), so a large
+        # decode fleet exhausts the default regardless of the OS nofile limit.
+        zmq_max_sockets = envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+        self._socket_cache_max_endpoints = (
+            envs.SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS.get()
+        )
+        if 2 * self._socket_cache_max_endpoints + 1 > zmq_max_sockets:
+            logger.warning(
+                f"SGLANG_DISAGGREGATION_SOCKET_CACHE_MAX_ENDPOINTS="
+                f"{self._socket_cache_max_endpoints} needs "
+                f"{2 * self._socket_cache_max_endpoints + 1} sockets but "
+                f"SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS={zmq_max_sockets}; "
+                f"raise the socket cap or lower the cache bound."
+            )
+
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
         # Raise the per-context socket cap before any socket exists; the
         # option does not apply retroactively.
-        self._zmq_ctx.set(zmq.MAX_SOCKETS, ZMQ_CTX_MAX_SOCKETS)
+        self._zmq_ctx.set(zmq.MAX_SOCKETS, zmq_max_sockets)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        # LRU over decode endpoints, bounded by SOCKET_CACHE_MAX_ENDPOINTS;
+        # LRU over decode endpoints, bounded by _socket_cache_max_endpoints;
         # _monitor_cache and _socket_send_locks are kept in lockstep with it
         # under _socket_lock.
         self._socket_cache: OrderedDict[str, zmq.Socket] = OrderedDict()
@@ -804,7 +806,7 @@ class CommonKVManager(BaseKVManager):
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
 
-            while len(self._socket_cache) >= SOCKET_CACHE_MAX_ENDPOINTS:
+            while len(self._socket_cache) >= self._socket_cache_max_endpoints:
                 self._evict_lru_endpoint_locked()
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
@@ -1298,7 +1300,8 @@ class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
     # One PUSH socket per prefill rank endpoint (no monitor socket); raise the
     # cap so a large prefill fleet cannot exhaust the default 1023 either.
-    _ctx.set(zmq.MAX_SOCKETS, ZMQ_CTX_MAX_SOCKETS)
+    # Read at import time: the class-level context is created once per process.
+    _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
