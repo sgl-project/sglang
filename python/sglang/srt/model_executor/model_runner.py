@@ -103,6 +103,10 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.graph_memory_usage import (
+    replace_graph_memory_usage,
+    replace_graph_time_usage,
+)
 from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
@@ -130,6 +134,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_enable_ipc_weight_cache,
+    maybe_precompile_model_kernels_after_loading,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -310,6 +315,8 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
+        self.init_startup_observability()
+
         self.init_remote_instance_weight_transporter()
 
         self.init_msprobe()
@@ -410,6 +417,11 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+    def init_startup_observability(self) -> None:
+        self.weight_load_time = 0.0
+        self.graph_memory_usage: dict[str, float] = {}
+        self.graph_time_usage: dict[str, float] = {}
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
@@ -725,6 +737,14 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
+        return misc_utils.resolve_pp_proxy_residual_num_blocks(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
@@ -925,9 +945,10 @@ class ModelRunner:
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
         self.eager_runner = capture.eager_runner
-        self.prefill_cuda_graph_runner = capture.prefill_runner
+        self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
-        self.graph_mem_usage = capture.decode.graph_mem_usage
+        self.graph_memory_usage = capture.memory_usage
+        self.graph_time_usage = capture.time_usage
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1048,6 +1069,8 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        self.maybe_precompile_model_kernels_after_loading()
+
         # Register model for layerwise NVTX profiling if enabled
         if get_exec().comm.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
@@ -1068,13 +1091,14 @@ class ModelRunner:
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        self.weight_load_time = time.perf_counter() - tic_total
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
         logger.info(
             f"Load weight end. "
-            f"elapsed={time.perf_counter() - tic_total:.2f} s, "
+            f"elapsed={self.weight_load_time:.2f} s, "
             f"type={type(self.model).__name__}, "
             f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
@@ -1110,6 +1134,9 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,
         )
+
+    def maybe_precompile_model_kernels_after_loading(self) -> None:
+        maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
@@ -1177,7 +1204,9 @@ class ModelRunner:
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(
-                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                    spec_algorithm.is_dflash_family()
+                    if spec_algorithm is not None
+                    else False
                 ),
                 speculative_draft_attention_backend=getattr(
                     self.server_args, "speculative_draft_attention_backend", None
@@ -1199,19 +1228,49 @@ class ModelRunner:
             model_runner=self, init_new_workspace=init_new_workspace
         )
 
+    def _decode_cuda_graph_runner_cls(self):
+        """Decode CUDA-graph runner class to construct.
+
+        Subclasses can override this to install specialized decode graph runners.
+        """
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        return DecodeCudaGraphRunner
+
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
-        self.graph_mem_usage = capture.graph_mem_usage
+        self.graph_memory_usage = replace_graph_memory_usage(
+            self.graph_memory_usage,
+            capture.memory_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
+        self.graph_time_usage = replace_graph_time_usage(
+            self.graph_time_usage,
+            capture.time_usage,
+            phases=("decode", "target_verify", "draft_decode"),
+        )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        self.prefill_cuda_graph_runner = capture_prefill_graph(
+        capture = capture_prefill_graph(
             model_runner=self,
             eager_runner=self.eager_runner,
             force_for_draft_worker=force_for_draft_worker,
+        )
+        self.prefill_cuda_graph_runner = capture.runner
+        self.graph_memory_usage = replace_graph_memory_usage(
+            self.graph_memory_usage,
+            capture.memory_usage,
+            phases=("prefill", "draft_prefill"),
+        )
+        self.graph_time_usage = replace_graph_time_usage(
+            self.graph_time_usage,
+            capture.time_usage,
+            phases=("prefill", "draft_prefill"),
         )
 
     def init_threads_binding(self):
