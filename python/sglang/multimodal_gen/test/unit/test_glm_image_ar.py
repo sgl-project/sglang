@@ -32,6 +32,9 @@ class _FakeResponse:
     def __init__(self, output_ids):
         self._output_ids = output_ids
 
+    def raise_for_status(self):
+        return None
+
     def json(self):
         return {"output_ids": self._output_ids}
 
