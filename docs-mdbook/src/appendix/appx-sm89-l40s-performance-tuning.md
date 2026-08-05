@@ -776,10 +776,36 @@ bash sglang_start.sh \
 | priority 调度 | 开 | `--priority-scheduling` 仍可显式传 |
 | per-worker 并发 | 12（TP2 DP3 → 容量 36） | `--max-running-requests N` |
 | mem / context | 0.85 / 98304 | `--mem-fraction-static` / `--context-length` |
+| 自适应限流 | 关 | `--adaptive-limit` 开启（需代理已开） |
 
 > tool call 上限由启动参数固化（默认 16），运行中热调不持久化，pod 重启恢复启动默认值。
 >
 > 注意：**多实例拆分**（如 7 卡 4+2+1）时各实例默认都会起代理占用 8080，必须用 `--no-proxy` 或分别指定 `--proxy-port`，避免端口冲突。
+
+**自适应限流（可选，替代人工盯曲线手调）**
+
+`sglang_start.sh --adaptive-limit` 会额外拉起 [sglang_adaptive_limits.py](appendix/sglang_adaptive_limits.py) 控制器：定时读后端 `/metrics` 的 `sglang:num_queue_reqs` 与 `sglang:token_usage`，按规则自动调代理 `/admin/limits`（只调 tool_call；thinking 是保护阀默认不动，除非 `--adaptive-thinking` 显式开启）：
+
+```bash
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --adaptive-limit \
+    --adaptive-interval 15 \
+    --adaptive-min-tool-call 4 \
+    --adaptive-max-tool-call 24
+```
+
+| 规则 | 条件 | 动作 |
+|------|------|------|
+| 放宽 | 排队 > 6 且 token_usage < 0.92 | tool_call +4（后端有容量，放更多请求进） |
+| 收紧 | 排队 < 2 且 KV 空闲（< 0.60）或已近上限 | tool_call −4（避免无谓占用 GPU/KV） |
+| 收紧 | KV 吃紧（≥ 0.92）且仍有排队 | tool_call −4（防止驱逐风暴 / 请求超时） |
+| 维持 | 其他情况 | 不动 |
+
+- tool_call 波动区间默认 [4, 24]（`--adaptive-min/max-tool-call`），每次 ±4（`--step`），每 15s 评估一次（`--interval`）；
+- 启动时先读代理当前 limits 作为基线（尊重人工热调值），读不到再用启动参数兜底；
+- 后端 `/metrics` 连续不可达 12 次（约 3 分钟）自动退出，不影响代理与 SGLang；
+- 控制器随脚本退出清理，`--kill-existing` 也会一并杀掉；
+- 上线建议：先不加 `--adaptive-limit` 观察 1~2 天 baseline，再开启对比排队/TTFT 曲线，确认收敛行为符合预期；若想同时调 thinking，显式加 `--adaptive-thinking`（风险自担）。
 
 启动后从 pod 外验证：
 

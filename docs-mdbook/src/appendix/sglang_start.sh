@@ -18,6 +18,7 @@
 # 默认值即生产配置（无需额外参数）: MTP 开 / 代理 8080 / tool_call=16 / thinking=12 /
 #   keep-alive 开 / 预热开 / priority 开 / round_robin / mem=0.85 / context=98304 / max-running=12
 # 覆盖开关: --no-speculative / --no-proxy / --proxy-port 0 / --no-keep-alive / --skip-warmup
+# 自适应限流: --adaptive-limit 开启（控制器自动调代理 limits，默认关）
 # 注意: 多实例拆分（如 7 卡 4+2+1）时各实例必须用 --no-proxy 或不同 --proxy-port，
 #        避免都占用默认 8080。
 
@@ -53,6 +54,10 @@ ENABLE_PRIORITY=true
 PROXY_PORT=8080
 PROXY_TOOL_CALL_LIMIT=16
 PROXY_THINKING_LIMIT=12
+ADAPTIVE_LIMIT=false
+ADAPTIVE_INTERVAL=15
+ADAPTIVE_MIN_TOOL_CALL=4
+ADAPTIVE_MAX_TOOL_CALL=24
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -82,6 +87,10 @@ while [[ $# -gt 0 ]]; do
         --no-proxy) PROXY_PORT=0; shift ;;
         --proxy-tool-call-limit) PROXY_TOOL_CALL_LIMIT="$2"; shift 2 ;;
         --proxy-thinking-limit) PROXY_THINKING_LIMIT="$2"; shift 2 ;;
+        --adaptive-limit) ADAPTIVE_LIMIT=true; shift ;;
+        --adaptive-interval) ADAPTIVE_INTERVAL="$2"; shift 2 ;;
+        --adaptive-min-tool-call) ADAPTIVE_MIN_TOOL_CALL="$2"; shift 2 ;;
+        --adaptive-max-tool-call) ADAPTIVE_MAX_TOOL_CALL="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -157,7 +166,7 @@ export TERM=dumb
 
 if [ "$KILL_EXISTING" = true ] && pgrep -f "sglang.launch_server|sglang_proxy.py" > /dev/null 2>&1; then
     echo "终止残留进程（server + proxy）..."
-    pkill -9 -f "sglang.launch_server|sglang_proxy.py" 2>/dev/null || true
+    pkill -9 -f "sglang.launch_server|sglang_proxy.py|sglang_adaptive_limits.py" 2>/dev/null || true
     sleep 5
 fi
 
@@ -176,6 +185,7 @@ echo " load-balance: $LOAD_BALANCE_METHOD (DP 路由; round_robin 避免前缀�
 echo " priority-scheduling: $([ "$ENABLE_PRIORITY" = true ] && echo on || echo off)"
 echo " proxy: $([ "$PROXY_PORT" != "0" ] && echo "on 端口$PROXY_PORT (限并发+priority)" || echo off)"
 echo " proxy-limits: tool_call=$PROXY_TOOL_CALL_LIMIT thinking=$PROXY_THINKING_LIMIT (运行时可调: POST /admin/limits)"
+echo " adaptive-limit: $([ "$ADAPTIVE_LIMIT" = true ] && echo "on (自动调 tool_call ${ADAPTIVE_MIN_TOOL_CALL}~${ADAPTIVE_MAX_TOOL_CALL}, 每${ADAPTIVE_INTERVAL}s)" || echo off)"
 echo "=========================================="
 
 # ==================== 常驻 keep-alive ====================
@@ -220,9 +230,32 @@ if [ "$PROXY_PORT" != "0" ]; then
     ) &
 fi
 
+# ==================== 自适应限流控制器 ====================
+# 定时读后端 /metrics（num_queue_reqs/token_usage），自动调代理 /admin/limits
+ADAPTIVE_PID=""
+if [ "$ADAPTIVE_LIMIT" = true ] && [ "$PROXY_PORT" != "0" ]; then
+    (
+        # 等代理就绪再启动控制器（最多 2 分钟）
+        for i in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$PROXY_PORT/health" && break
+            sleep 2
+        done
+        python3.12 "$SCRIPT_DIR/sglang_adaptive_limits.py" \
+            --backend "http://127.0.0.1:$PORT" \
+            --proxy "http://127.0.0.1:$PROXY_PORT" \
+            --tool-call "$PROXY_TOOL_CALL_LIMIT" \
+            --thinking "$PROXY_THINKING_LIMIT" \
+            --min-tool-call "$ADAPTIVE_MIN_TOOL_CALL" \
+            --max-tool-call "$ADAPTIVE_MAX_TOOL_CALL" \
+            --interval "$ADAPTIVE_INTERVAL"
+    ) &
+    ADAPTIVE_PID=$!
+fi
+
 MANAGED_PIDS=""
 [ -n "$KEEP_ALIVE_PID" ] && MANAGED_PIDS="$MANAGED_PIDS $KEEP_ALIVE_PID"
 [ -n "$PROXY_PID" ] && MANAGED_PIDS="$MANAGED_PIDS $PROXY_PID"
+[ -n "$ADAPTIVE_PID" ] && MANAGED_PIDS="$MANAGED_PIDS $ADAPTIVE_PID"
 trap 'kill $MANAGED_PIDS 2>/dev/null || true' EXIT
 
 # K8s pod 内 GPU_IDS 为空时沿用环境已有的 CUDA_VISIBLE_DEVICES（否则空值会禁用全部 GPU）
