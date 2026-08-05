@@ -10,15 +10,22 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
+    SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=215, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=250, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestEagle3Page64(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeatureKit):
+class TestEagle3Page64(
+    Eagle3Base,
+    SpecCorrectnessKit,
+    SpecAccuracyKit,
+    SpecLogprobKit,
+    SpecFeatureKit,
+):
     """Overlap scheduler, page_size=64: + logprob losslessness."""
 
     page_size = 64

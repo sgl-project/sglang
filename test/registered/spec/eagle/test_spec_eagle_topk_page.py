@@ -18,7 +18,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
-register_cuda_ci(est_time=330, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=365, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEagle3Page4Topk8(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeatureKit):
@@ -28,7 +28,8 @@ class TestEagle3Page4Topk8(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeat
     spec_topk = 8
     spec_tokens = 32
     disable_overlap = False
-    # Tuned for the topk=8 tree; the preset value is a topk=1 number.
+    # The preset accept-length numbers are topk=1 values, so they are loose
+    # for a topk=8 tree; tighten once CI reports the actuals.
     gsm8k_accept_len_thres = 2.0
     cuda_graph_max_bs_decode = 5
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
