@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any, Callable, List
 
 import torch
@@ -68,14 +69,19 @@ class ParallelExecutor(PipelineExecutor):
         # component offload moves modules between stages under shared
         # residency state, which concurrent members would race; resident
         # deployments keep the overlap
-        allow_concurrency = allow_concurrency and not (
-            server_args.dit_cpu_offload
-            or server_args.dit_layerwise_offload
-            or server_args.text_encoder_cpu_offload
-            or server_args.image_encoder_cpu_offload
-            or server_args.vae_cpu_offload
-            or server_args.layerwise_offload_components
-            or self._runtime_offload_active()
+        allow_concurrency = (
+            allow_concurrency
+            and getattr(server_args, "parallel_stage_execution", "auto") == "auto"
+            and self._parallel_execution_supported()
+            and not (
+                server_args.dit_cpu_offload
+                or server_args.dit_layerwise_offload
+                or server_args.text_encoder_cpu_offload
+                or server_args.image_encoder_cpu_offload
+                or server_args.vae_cpu_offload
+                or server_args.layerwise_offload_components
+                or self._runtime_offload_active()
+            )
         )
 
         with self._component_residency_request(stages, batch, server_args):
@@ -90,9 +96,13 @@ class ParallelExecutor(PipelineExecutor):
                         and member.concurrency_safe
                         for member in level
                     )
+                    and sum(member.may_use_collectives for member in level) <= 1
+                    and self._parallel_level_uses_resident_components(
+                        level, server_args
+                    )
                 ):
                     batch = self._run_parallel_level(
-                        level, stage_index, batch, server_args, run_stage, use_nvtx
+                        level, batch, server_args, run_stage, use_nvtx
                     )
                 else:
                     for member_index, member in enumerate(level):
@@ -109,6 +119,24 @@ class ParallelExecutor(PipelineExecutor):
                         )
                 stage_index += len(level)
         return batch
+
+    @staticmethod
+    def _parallel_execution_supported() -> bool:
+        """CUDA streams are required to overlap stage forwards safely."""
+        return torch.cuda.is_available()
+
+    def _parallel_level_uses_resident_components(
+        self, level: List[PipelineStage], server_args: ServerArgs
+    ) -> bool:
+        manager = self.component_residency_manager
+        supports_parallel_group = getattr(
+            manager, "supports_parallel_stage_group", None
+        )
+        return (
+            manager is None
+            or supports_parallel_group is None
+            or bool(supports_parallel_group(level, server_args))
+        )
 
     def _runtime_offload_active(self) -> bool:
         """Whether any pipeline module is currently layerwise-offloaded.
@@ -134,7 +162,6 @@ class ParallelExecutor(PipelineExecutor):
     def _run_parallel_level(
         self,
         level: List[PipelineStage],
-        first_stage_index: int,
         payload: Any,
         server_args: ServerArgs,
         run_stage: Callable[[PipelineStage, Any], Any],
@@ -180,13 +207,15 @@ class ParallelExecutor(PipelineExecutor):
                 return torch.inference_mode()
             return torch.set_grad_enabled(caller_grad_enabled)
 
-        # residency bookkeeping mutates shared per-stage state, so it runs
-        # serially before any member starts; the concurrent portion is the
-        # stage forwards themselves
-        for member_index, stage in enumerate(level):
-            self.before_stage(
-                stage, first_stage_index + member_index, payload, server_args
-            )
+        for stage in level:
+            stage.set_component_residency_manager(self.component_residency_manager)
+
+        manager = self.component_residency_manager
+        residency_context = (
+            manager.parallel_stage_group()
+            if getattr(manager, "parallel_stage_group", None) is not None
+            else nullcontext()
+        )
 
         def run_member(member_index: int, stage: PipelineStage) -> Any:
             stage_name = stage._component_stage_name()
@@ -207,22 +236,23 @@ class ParallelExecutor(PipelineExecutor):
                 with torch.cuda.stream(stream):
                     return call()
 
-        futures = [
-            self._level_thread_pool.submit(run_member, index, stage)
-            for index, stage in enumerate(level[1:], start=1)
-        ]
-        first_error: BaseException | None = None
-        results = [None] * len(level)
-        try:
-            results[0] = run_member(0, level[0])
-        except BaseException as error:  # noqa: BLE001 - re-raised after join
-            first_error = error
-        for index, future in enumerate(futures, start=1):
+        with residency_context:
+            futures = [
+                self._level_thread_pool.submit(run_member, index, stage)
+                for index, stage in enumerate(level[1:], start=1)
+            ]
+            first_error: BaseException | None = None
             try:
-                results[index] = future.result()
+                results = [None] * len(level)
+                results[0] = run_member(0, level[0])
             except BaseException as error:  # noqa: BLE001 - keep first error
-                if first_error is None:
-                    first_error = error
+                first_error = error
+            for index, future in enumerate(futures, start=1):
+                try:
+                    results[index] = future.result()
+                except BaseException as error:  # noqa: BLE001 - keep first error
+                    if first_error is None:
+                        first_error = error
         if cuda_ready:
             for stream in self._level_streams[:side_count]:
                 current_stream.wait_stream(stream)

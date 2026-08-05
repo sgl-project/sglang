@@ -232,6 +232,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # (see --encoder-parallel); fold shards the weights at load time, so it is
     # mutually exclusive with dp/replicate for the lifetime of the model
     encoder_parallel: str = "auto"
+    # auto overlaps pipeline stages only when their declared component and
+    # collective contracts are safe; serial avoids the transient VRAM increase
+    parallel_stage_execution: Literal["auto", "serial"] = "auto"
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -1487,6 +1490,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder weights; `dp` never folds and splits the batch across "
                 "ranks (best batched throughput; requires TP=1 and DP=1); "
                 "`replicate` disables both. The default is `auto`."
+            ),
+        )
+        parser.add_argument(
+            "--parallel-stage-execution",
+            choices=["auto", "serial"],
+            default=ServerArgs.parallel_stage_execution,
+            help=(
+                "Execution policy for declared independent pipeline stages. "
+                "`auto` overlaps safe CUDA-resident stages; `serial` keeps "
+                "declaration order and avoids the overlap's transient VRAM use."
             ),
         )
         parser.add_argument(

@@ -19,7 +19,10 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -152,17 +155,16 @@ class ImageEncodingStage(PipelineStage):
 
     @property
     def concurrency_safe(self) -> bool:
-        """Overlappable only as a pure image encoder on a replicated model.
+        """Pipeline declarations determine whether request writes are disjoint."""
+        return True
 
-        With a text_encoder this stage writes prompt embeddings — state the
-        text encoding stage owns — and a folded encoder communicates across
-        ranks; both must keep declaration order.
-        """
-        if self.text_encoder is not None:
-            return False
-        return (
-            self.image_encoder is None
-            or self.image_encoder.config.parallel_folding_mode is None
+    @property
+    def may_use_collectives(self) -> bool:
+        """Whether the configured encoder can enter a distributed collective."""
+        encoder = self.image_encoder or self.text_encoder
+        return encoder is not None and (
+            get_tp_world_size() > 1
+            or getattr(encoder.config, "parallel_folding_mode", None) is not None
         )
 
     def component_uses(

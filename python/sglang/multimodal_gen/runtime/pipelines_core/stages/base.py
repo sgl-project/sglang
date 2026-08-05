@@ -155,13 +155,14 @@ class PipelineStage(StageDedupMixin, ABC):
     # independent (ComposedPipelineBase.add_parallel_stages) and may run
     # concurrently; None keeps strict declaration-order execution
     _execution_group: str | None = None
-    # a stage may only overlap with its group siblings after declaring it
-    # issues no cross-rank communication: concurrent members interleave
-    # collectives in a different order on every rank, which mismatches or
-    # deadlocks the process group (observed as a gloo size mismatch when two
-    # communicating stages overlapped). Default False keeps every existing
-    # stage serial-safe.
+    # a stage may only overlap with its group siblings after it opts in. The
+    # pipeline declaration remains responsible for avoiding request-state
+    # write conflicts between its members.
     concurrency_safe: bool = False
+
+    # executor permits at most one collective-issuing member per execution
+    # level, preserving a deterministic collective order across ranks
+    may_use_collectives: bool = False
 
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
@@ -223,7 +224,7 @@ class PipelineStage(StageDedupMixin, ABC):
         target_dtype: torch.dtype | None = None,
     ) -> ComponentUse:
         manager = self._component_residency_manager
-        stage_name = self._active_component_stage_name()
+        stage_name = self._component_stage_name()
         server_args = manager.server_args if manager is not None else self.server_args
         for use in self.component_uses(server_args, stage_name):
             if use.component_name != component_name:

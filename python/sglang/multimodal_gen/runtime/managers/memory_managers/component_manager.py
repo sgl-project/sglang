@@ -135,7 +135,8 @@ class ComponentResidencyManager:
         finish request: finish active use and schedule preferred next-request prefetch.
 
     The manager instance is global and rebound to the active pipeline before request execution.
-    This manager is designed only for sequential execution order for now
+    Parallel stage groups are supported only when every referenced component
+    stays resident; they bypass the single active-use interval.
     """
 
     def __init__(
@@ -150,12 +151,11 @@ class ComponentResidencyManager:
         self._current_use_index: int = -1
         self._active_use: ComponentUse | None = None
         self._active_use_module: nn.Module | None = None
-        # stages a pipeline declared mutually independent may enter their
-        # active-use intervals from concurrent threads; the timeline slot
-        # stays consistent under this lock, and resident components make the
-        # interleaved finish/prepare transitions metadata-only (executors
-        # fall back to sequential levels whenever offload is enabled)
+        # The regular component-use timeline is serialized. A parallel stage
+        # group temporarily bypasses it after verifying all components remain
+        # resident, so no module move or shared NVTX hook is needed.
         self._use_lock = threading.RLock()
+        self._parallel_stage_group_depth = 0
         self._active_nvtx_key: tuple[str, str, str | None] | None = None
         self._nvtx_hooks_by_use_key: dict[
             tuple[str, str, str | None], tuple[int, DiffusionNvtxHooks]
@@ -236,6 +236,34 @@ class ComponentResidencyManager:
         self.state.stage_name = self.stage_name(stage)
         self.state.next_stage_name = self._next_stage_name(stage_index)
 
+    def supports_parallel_stage_group(
+        self,
+        stages: Sequence[ComponentResidencyStage],
+        server_args: ServerArgs,
+    ) -> bool:
+        """Whether the group avoids component offload transitions."""
+        for stage in stages:
+            stage_name = self.stage_name(stage)
+            for use in stage.component_uses(server_args, stage_name):
+                module = self.get_module(use.component_name)
+                if module is not None and not isinstance(
+                    self.strategy_for(use.component_name, module), ResidentStrategy
+                ):
+                    return False
+        return True
+
+    @contextmanager
+    def parallel_stage_group(self) -> Iterator[None]:
+        """Prepare resident components without a shared active-use interval."""
+        with self._use_lock:
+            self.finish_active_use(prefetch_next=False)
+            self._parallel_stage_group_depth += 1
+        try:
+            yield
+        finally:
+            with self._use_lock:
+                self._parallel_stage_group_depth -= 1
+
     def begin_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Begin one sequential component use interval. this is idempotent
 
@@ -249,6 +277,9 @@ class ComponentResidencyManager:
     def _begin_use_locked(
         self, use: ComponentUse, module: nn.Module | None = None
     ) -> None:
+        if self._parallel_stage_group_depth:
+            self._prepare_parallel_use_locked(use, module)
+            return
         if self._active_use is not None and self._same_use(self._active_use, use):
             if self._use_key(self._active_use) != self._use_key(use):
                 self._mark_current_use(use)
@@ -279,6 +310,22 @@ class ComponentResidencyManager:
         self._enable_nvtx_for_use(use, module)
         self._prefetch_next_memory_intensive_use()
 
+    def _prepare_parallel_use_locked(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
+        module = module or self.get_module(use.component_name)
+        if module is None:
+            return
+        strategy = self.strategy_for(use.component_name, module)
+        if not isinstance(strategy, ResidentStrategy):
+            raise RuntimeError("parallel stage group requires resident components")
+        self._uses_seen[use.component_name] = use
+        strategy.prepare_for_use(
+            module,
+            use,
+            ResidencyState(batch_is_warmup=self.state.batch_is_warmup),
+        )
+
     def end_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """End one sequential component use interval.
 
@@ -292,6 +339,8 @@ class ComponentResidencyManager:
     def _end_use_locked(
         self, use: ComponentUse, module: nn.Module | None = None
     ) -> None:
+        if self._parallel_stage_group_depth:
+            return
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
         self._disable_active_nvtx()

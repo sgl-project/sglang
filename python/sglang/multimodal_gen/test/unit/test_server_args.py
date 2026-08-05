@@ -129,6 +129,16 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
         self.assertEqual(args.model_path, "/data/my-model")
 
+    def test_parallel_stage_execution_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args, _unknown_args = parser.parse_known_args(
+            ["--model-path", "/fake", "--parallel-stage-execution", "serial"]
+        )
+
+        self.assertEqual(args.parallel_stage_execution, "serial")
+
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
             {

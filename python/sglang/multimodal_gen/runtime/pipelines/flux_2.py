@@ -58,6 +58,7 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
             vae_image_processor=vae_image_processor,
             prompt_encoding="text",
             image_vae_stage_kwargs={"vae_image_processor": vae_image_processor},
+            overlap_condition_encoders=True,
             prepare_extra_timestep_kwargs=[compute_empirical_mu],
             progressive_denoising_stage_cls=Flux2ProgressiveDenoisingStage,
         )

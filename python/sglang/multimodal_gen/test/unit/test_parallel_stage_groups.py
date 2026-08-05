@@ -9,6 +9,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+    ComponentResidencyStrategy,
+    ResidentStrategy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor import (
     ParallelExecutor,
 )
@@ -27,6 +35,7 @@ class _FakeStage:
     role_affinity = None
     parallelism_type = StageParallelismType.REPLICATED
     concurrency_safe = True
+    may_use_collectives = False
 
     def __init__(self, name, body=None):
         self._name = name
@@ -61,6 +70,27 @@ class _FakeStage:
         return payload
 
 
+class _ComponentStage:
+    def __init__(self, name, component_name):
+        self.name = name
+        self.component_name = component_name
+
+    def component_uses(self, _server_args, stage_name=None):
+        return [ComponentUse(stage_name or self.name, self.component_name)]
+
+
+class _CountingResidentStrategy(ResidentStrategy):
+    def __init__(self):
+        self.prepared = []
+        self.finished = []
+
+    def prepare_for_use(self, module, use, state):
+        self.prepared.append((module, use, state))
+
+    def finish_use(self, module, use, state):
+        self.finished.append((module, use, state))
+
+
 def _server_args(**overrides):
     defaults = dict(
         enable_layerwise_nvtx_marker=False,
@@ -72,6 +102,7 @@ def _server_args(**overrides):
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
         layerwise_offload_components=None,
+        parallel_stage_execution="auto",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -88,9 +119,21 @@ _EXECUTOR_MODULE = (
 )
 
 
-def _run(executor, stages, payload, server_args, allow_concurrency=True):
+def _run(
+    executor,
+    stages,
+    payload,
+    server_args,
+    allow_concurrency=True,
+    parallel_supported=True,
+):
     with (
         patch.object(ParallelExecutor, "before_stage", lambda *a, **k: None),
+        patch.object(
+            ParallelExecutor,
+            "_parallel_execution_supported",
+            return_value=parallel_supported,
+        ),
         patch.object(
             ParallelExecutor,
             "_component_residency_request",
@@ -197,9 +240,8 @@ class TestParallelLevelExecution(unittest.TestCase):
                 _server_args(),
             )
 
-    def test_communicating_member_downgrades_to_serial(self):
-        """A member that has not declared itself communication-free keeps
-        the whole level in declaration order."""
+    def test_unsafe_member_downgrades_to_serial(self):
+        """A stage that has not opted in keeps the whole level serial."""
         order = []
         stages = [
             _FakeStage("a", body=lambda p: (order.append("a"), p)[1]),
@@ -210,6 +252,58 @@ class TestParallelLevelExecution(unittest.TestCase):
             token_stage.set_execution_group("g1")
         payload = SimpleNamespace()
         _run(_executor(), stages, payload, _server_args())
+        self.assertEqual(order, ["a", "b"])
+
+    def test_two_collective_members_downgrade_to_serial(self):
+        """Two independent collective streams could order differently by rank."""
+        order = []
+        stages = [
+            _FakeStage("a", body=lambda p: (order.append("a"), p)[1]),
+            _FakeStage("b", body=lambda p: (order.append("b"), p)[1]),
+        ]
+        for stage in stages:
+            stage.set_execution_group("g1")
+            stage.may_use_collectives = True
+
+        _run(_executor(), stages, SimpleNamespace(), _server_args())
+
+        self.assertEqual(order, ["a", "b"])
+
+    def test_serial_policy_downgrades_to_serial(self):
+        order = []
+        stages = [
+            _FakeStage("a", body=lambda p: (order.append("a"), p)[1]),
+            _FakeStage("b", body=lambda p: (order.append("b"), p)[1]),
+        ]
+        for stage in stages:
+            stage.set_execution_group("g1")
+
+        _run(
+            _executor(),
+            stages,
+            SimpleNamespace(),
+            _server_args(parallel_stage_execution="serial"),
+        )
+
+        self.assertEqual(order, ["a", "b"])
+
+    def test_non_cuda_downgrades_to_serial(self):
+        order = []
+        stages = [
+            _FakeStage("a", body=lambda p: (order.append("a"), p)[1]),
+            _FakeStage("b", body=lambda p: (order.append("b"), p)[1]),
+        ]
+        for stage in stages:
+            stage.set_execution_group("g1")
+
+        _run(
+            _executor(),
+            stages,
+            SimpleNamespace(),
+            _server_args(),
+            parallel_supported=False,
+        )
+
         self.assertEqual(order, ["a", "b"])
 
     def test_offload_flags_downgrade_to_serial(self):
@@ -331,6 +425,56 @@ class TestParallelLevelExecution(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "member failed"):
             _run(_executor(), [failing, healthy], SimpleNamespace(), _server_args())
+
+
+class TestParallelComponentResidency(unittest.TestCase):
+    def _manager(self):
+        modules = {
+            "first": torch.nn.Linear(1, 1),
+            "second": torch.nn.Linear(1, 1),
+        }
+        pipeline = SimpleNamespace(
+            modules=modules,
+            _stage_name_mapping={},
+            component_residency_strategies={},
+        )
+        manager = ComponentResidencyManager(
+            pipeline, SimpleNamespace(enable_layerwise_nvtx_marker=False)
+        )
+        return manager, modules
+
+    def test_parallel_group_prepares_resident_components_without_active_use(self):
+        manager, modules = self._manager()
+        strategy = _CountingResidentStrategy()
+        manager.strategy_for = lambda _name, _module: strategy
+        stages = [
+            _ComponentStage("first", "first"),
+            _ComponentStage("second", "second"),
+        ]
+
+        self.assertTrue(manager.supports_parallel_stage_group(stages, _server_args()))
+        with manager.parallel_stage_group():
+            for stage in stages:
+                use = stage.component_uses(_server_args())[0]
+                manager.begin_use(use, modules[use.component_name])
+                manager.end_use(use, modules[use.component_name])
+            self.assertIsNone(manager._active_use)
+
+        self.assertEqual(
+            [use.component_name for _, use, _ in strategy.prepared], ["first", "second"]
+        )
+        self.assertEqual(strategy.finished, [])
+        self.assertEqual(manager._parallel_stage_group_depth, 0)
+
+    def test_nonresident_component_rejects_parallel_group(self):
+        manager, _ = self._manager()
+        manager.strategy_for = lambda _name, _module: ComponentResidencyStrategy()
+
+        self.assertFalse(
+            manager.supports_parallel_stage_group(
+                [_ComponentStage("first", "first")], _server_args()
+            )
+        )
 
 
 class TestAddParallelStagesDeclaration(unittest.TestCase):

@@ -57,6 +57,11 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}><a href="./encoder_parallel">Encoder Parallelism</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}><code>--parallel-stage-execution</code></td>
+      <td style={{padding: "9px 12px"}}>Independent text, image, and VAE conditioning encoders dominate pre-denoising latency and GPU memory has headroom.</td>
+      <td style={{padding: "9px 12px"}}>Use <code>auto</code> by default; select <code>serial</code> when avoiding the temporary overlap peak is more important.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Attention backend</td>
       <td style={{padding: "9px 12px"}}>Kernel choice dominates DiT latency or memory.</td>
       <td style={{padding: "9px 12px"}}><a href="./attention_backends">Attention Backends</a></td>
@@ -68,6 +73,20 @@ These settings should preserve model behavior while changing residency, parallel
     </tr>
   </tbody>
 </table>
+
+## Parallel Conditioning Stages
+
+`--parallel-stage-execution auto` is the default. It overlaps explicitly
+declared independent conditioning stages on separate CUDA streams, without
+changing the denoising graph or sampling parameters. The current native
+pipelines cover Wan I2V and I2V-DMD, Flux2, Qwen Image Edit, Joy Image Edit,
+MOVA, LongLive2, and the independent text/image branches of LingBot realtime.
+
+Overlapping stages can increase the temporary activation and workspace peak. Use
+`--parallel-stage-execution serial` to retain declaration-order execution when a
+model is close to its VRAM limit. SGLang also selects serial execution
+automatically for CPU/layerwise offload, non-CUDA execution, or a group that can
+issue more than one distributed collective; these cases cannot safely overlap.
 
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 
