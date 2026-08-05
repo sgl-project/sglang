@@ -64,7 +64,7 @@ class _FakeStage:
     def _active_component_stage_name(self):
         return self._name
 
-    def component_uses(self, server_args, stage_name):
+    def component_uses(self, server_args, stage_name=None):
         return ()
 
     def __call__(self, payload, server_args):
