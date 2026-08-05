@@ -313,6 +313,83 @@ class TestDeepSeekChatTemplateToolCalls(unittest.TestCase):
                     '\\"city\\"', output, f"{version}: Should not double-escape"
                 )
 
+    def test_assistant_marker_after_tool_output(self):
+        """Test that Assistant marker is present after tool output in multi-turn conversation."""
+        # This tests that when an assistant responds after receiving tool output,
+        # the <｜Assistant｜> marker is correctly added
+
+        for version in ["v3.1", "v3.2"]:
+            with self.subTest(version=version):
+                messages = [
+                    {"role": "user", "content": "What's the weather in NYC?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": {"city": "New York"},
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": '{"temperature": 72, "condition": "sunny"}',
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "The weather in New York is sunny with a temperature of 72°F.",
+                    },
+                ]
+
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather information",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        },
+                    }
+                ]
+
+                output = self._render_template(
+                    version, messages, tools, add_generation_prompt=False
+                )
+
+                # Count occurrences of <｜Assistant｜> - should be 2:
+                # 1. After user message (before tool call)
+                # 2. After tool output (before final response)
+                assistant_marker_count = output.count("<｜Assistant｜>")
+                self.assertEqual(
+                    assistant_marker_count,
+                    2,
+                    f"{version}: Should have 2 Assistant markers, got {assistant_marker_count}. Output:\n{output}",
+                )
+
+                # Verify the structure: tool output should be followed by Assistant marker
+                tool_output_end = "<｜tool▁output▁end｜>"
+                assistant_marker = "<｜Assistant｜>"
+
+                self.assertIn(
+                    tool_output_end, output, f"{version}: Should have tool output"
+                )
+
+                # Find position of tool output end and verify Assistant marker follows
+                tool_end_pos = output.find(tool_output_end)
+                next_assistant_pos = output.find(assistant_marker, tool_end_pos)
+                self.assertNotEqual(
+                    next_assistant_pos,
+                    -1,
+                    f"{version}: Assistant marker should appear after tool output",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

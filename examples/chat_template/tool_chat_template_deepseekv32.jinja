@@ -57,7 +57,7 @@
     {{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}
   {%- endif %}
   {%- if message['role'] == 'assistant' and (message['tool_calls'] is not defined or message['tool_calls'] is none) %}
-    {%- if ns.is_last_user %}
+    {%- if ns.is_last_user or ns.is_tool %}
       {{'<｜Assistant｜>'}}
       {%- if message['prefix'] is defined and message['prefix'] and thinking %}
         {{'<think>'}}
