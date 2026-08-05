@@ -169,11 +169,19 @@ class TestInklingRenderer(unittest.TestCase):
         )
         self.assertEqual(actual, expected)
 
-    def test_empty_assistant_message_does_not_emit_bare_terminator(self):
-        """Bug regression: an assistant message that renders zero blocks
-        (content None, no reasoning, no tool calls) appended a bare
-        <|content_model_end_sampling|> with no preceding model block —
-        injecting a malformed turn terminator into the prompt."""
+    def test_empty_assistant_string_emits_text_block(self):
+        actual = render_inkling_messages(
+            [{"role": "assistant", "content": ""}],
+            self.tokenizer,
+        )
+        expected = (
+            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
+            + _block(MESSAGE_MODEL, CONTENT_TEXT, "")
+            + [INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]]
+        )
+        self.assertEqual(actual, expected)
+
+    def test_null_assistant_content_emits_only_sampling_terminator(self):
         actual = render_inkling_messages(
             [
                 {"role": "user", "content": "hi"},
@@ -182,7 +190,53 @@ class TestInklingRenderer(unittest.TestCase):
             ],
             self.tokenizer,
         )
-        self.assertNotIn(INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING], actual)
+        expected = (
+            _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.9")
+            + _block(MESSAGE_USER, CONTENT_TEXT, "hi")
+            + [INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]]
+            + _block(MESSAGE_USER, CONTENT_TEXT, "again")
+        )
+        self.assertEqual(actual, expected)
+
+    def test_missing_content_does_not_emit_text_block(self):
+        effort = _block(
+            MESSAGE_SYSTEM,
+            CONTENT_TEXT,
+            "Thinking effort level: 0.9",
+        )
+        cases = (
+            ([{"role": "user"}], effort),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "weather",
+                                    "arguments": {"city": "SF"},
+                                },
+                            }
+                        ],
+                    }
+                ],
+                effort
+                + _block(
+                    MESSAGE_MODEL,
+                    CONTENT_INVOKE_TOOL_JSON,
+                    '{"name":"weather","args":{"city":"SF"}}',
+                    author="weather",
+                )
+                + [INKLING_SPECIAL_TOKEN_IDS[CONTENT_MODEL_END_SAMPLING]],
+            ),
+        )
+        for messages, expected in cases:
+            with self.subTest(messages=messages):
+                self.assertEqual(
+                    render_inkling_messages(messages, self.tokenizer),
+                    expected,
+                )
 
     def test_reasoning_content_cannot_reorder_thinking_parts(self):
         with self.assertRaisesRegex(ValueError, "cannot mix"):

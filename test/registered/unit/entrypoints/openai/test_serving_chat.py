@@ -1689,6 +1689,100 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
+    def test_non_streaming_inkling_tool_call_only_response_uses_null_content(self):
+        from sglang.srt.parser.inkling_tokenizer import (
+            CONTENT_INVOKE_TOOL_JSON,
+            CONTENT_MODEL_END_SAMPLING,
+            CONTENT_TEXT,
+            END_MESSAGE,
+            MESSAGE_MODEL,
+        )
+
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat.reasoning_parser = "inkling"
+        self.chat.tool_call_parser = "inkling"
+        for separate_reasoning in (True, False):
+            req = ChatCompletionRequest(
+                model="thinkingmachines/Inkling-Small-NVFP4",
+                messages=[{"role": "user", "content": "What's the weather?"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                separate_reasoning=separate_reasoning,
+            )
+            ret = [
+                {
+                    "text": (
+                        f"{MESSAGE_MODEL}get_weather{CONTENT_INVOKE_TOOL_JSON}"
+                        f'{{"name":"get_weather","args":{{"query":"{CONTENT_TEXT}"}}}}'
+                        f"{END_MESSAGE}{CONTENT_MODEL_END_SAMPLING}"
+                    ),
+                    "meta_info": {
+                        "id": "chatcmpl-inkling-tool-call",
+                        "prompt_tokens": 5,
+                        "completion_tokens": 8,
+                        "cached_tokens": 0,
+                        "finish_reason": {"type": "stop", "matched": None},
+                        "weight_version": "default",
+                    },
+                }
+            ]
+
+            response = self.chat._build_chat_response(req, ret, created=123)
+
+            with self.subTest(separate_reasoning=separate_reasoning):
+                message = response.choices[0].message
+                self.assertIsNone(message.content)
+                self.assertEqual(message.tool_calls[0].function.name, "get_weather")
+                self.assertEqual(
+                    json.loads(message.tool_calls[0].function.arguments),
+                    {"query": CONTENT_TEXT},
+                )
+
+    def test_non_streaming_inkling_explicit_empty_text_block_uses_empty_content(
+        self,
+    ):
+        from sglang.srt.parser.inkling_tokenizer import (
+            CONTENT_MODEL_END_SAMPLING,
+            CONTENT_TEXT,
+            END_MESSAGE,
+            MESSAGE_MODEL,
+        )
+
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat.reasoning_parser = "inkling"
+        req = ChatCompletionRequest(
+            model="thinkingmachines/Inkling-Small-NVFP4",
+            messages=[{"role": "user", "content": "Say nothing."}],
+            separate_reasoning=True,
+        )
+        ret = [
+            {
+                "text": (
+                    f"{MESSAGE_MODEL}{CONTENT_TEXT}{END_MESSAGE}"
+                    f"{CONTENT_MODEL_END_SAMPLING}"
+                ),
+                "meta_info": {
+                    "id": "chatcmpl-inkling-empty-text",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 4,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=123)
+
+        self.assertEqual(response.choices[0].message.content, "")
+
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming chat responses emit cached token details in sglext."""
 

@@ -69,7 +69,7 @@ from sglang.srt.function_call.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import InklingDetector, ReasoningParser
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1495,6 +1495,8 @@ class OpenAIServingChat(OpenAIServingBase):
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+            raw_text = text
+            inkling_has_text_block = None
 
             # Handle reasoning content
             reasoning_text = None
@@ -1512,6 +1514,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenizer=self.tokenizer_manager.tokenizer,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
+                    if self.chat_encoding_spec == "inkling" and isinstance(
+                        parser.detector, InklingDetector
+                    ):
+                        inkling_has_text_block = parser.detector.saw_content_block
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -1546,16 +1552,25 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
-            # NOTE: content should not be None but empty string to make sure retokenize consistency.
             reasoning_text, tool_calls = self._get_parsed_response_fields(
                 reasoning_text, tool_calls
             )
+            message_content = text if text else ""
+            if self.chat_encoding_spec == "inkling" and not text:
+                if inkling_has_text_block is None:
+                    detector = InklingDetector(stream_reasoning=False)
+                    detector.detect_and_parse(raw_text)
+                    inkling_has_text_block = detector.saw_content_block
+                # Inkling distinguishes a missing text block from an explicit
+                # empty block when the response is rendered into the next turn.
+                if not inkling_has_text_block:
+                    message_content = None
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else "",
+                    content=message_content,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
