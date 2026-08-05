@@ -567,6 +567,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 "DSV4 A5 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
+        # A zero-token write is a no-op for the pre-A5 index_put paths, but
+        # kv_compress_epilog rejects an empty input ("x dimensions must be
+        # positive"). Keep both paths equivalent for callers with nothing to write.
+        if cache_2d.shape[0] == 0:
+            return
 
         torch.ops.custom.kv_compress_epilog(
             buf.view(-1, 1, buf.shape[-1]),
