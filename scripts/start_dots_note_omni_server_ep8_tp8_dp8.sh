@@ -56,7 +56,6 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --page-size 64 \
   --moe-dense-tp-size 1 \
   --watchdog-timeout "${WATCHDOG_TIMEOUT:-1800}" \
-  --disable-overlap-schedule \
   --disable-cuda-graph \
   --speculative-algorithm NEXTN \
   --speculative-num-steps "${SPECULATIVE_NUM_STEPS:-3}" \
