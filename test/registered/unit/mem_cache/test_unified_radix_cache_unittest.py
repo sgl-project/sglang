@@ -3826,6 +3826,10 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
+        full_host_available = cache.cache_controller.mem_pool_host.available_size()
+        mamba_host_available = cache.components[
+            ComponentType.MAMBA
+        ]._mamba_pool_host.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -3843,12 +3847,26 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool,
             tokens[:branching_seqlen],
         )
+        cache.writing_check(write_back=True)
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.available_size(),
+            full_host_available,
+        )
+        self.assertEqual(
+            cache.components[ComponentType.MAMBA]._mamba_pool_host.available_size(),
+            mamba_host_available - 1,
+        )
+
         second_match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
 
         self.assertEqual(len(second_match.device_indices), branching_seqlen)
         self.assertIsNone(second_match.mamba_branching_seqlen)
+        branching_node = cache.resolve_node_handle(second_match.last_device_node)
+        self.assertIsNotNone(
+            branching_node.component_data[ComponentType.MAMBA].host_value
+        )
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -4948,6 +4966,60 @@ class UnifiedRadixCacheSuite:
             parent.backuped, "parent must NOT be backed up under write_back"
         )
 
+        cache.sanity_check()
+
+    def test_hicache_write_back_repairs_missing_mamba_backup(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("requires Full+Mamba")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        tokens = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        node = cache.resolve_node_handle(match.last_device_node)
+        self._backup_node(cache, node)
+
+        full_host_value = node.component_data[ComponentType.FULL].host_value.clone()
+        full_host_available = cache.cache_controller.mem_pool_host.available_size()
+        mamba_component = cache.components[ComponentType.MAMBA]
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        tracker = {ct: 0 for ct in cache.tree_components}
+        cache.tree_core._evict_component_and_detach_lru(
+            node,
+            mamba_component,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            target=EvictLayer.HOST,
+            tracker=tracker,
+        )
+        cache._free_values(device_frees, host_frees)
+        mamba_host_available = mamba_component._mamba_pool_host.available_size()
+
+        self.assertIsNotNone(node.component_data[ComponentType.MAMBA].value)
+        self.assertIsNone(node.component_data[ComponentType.MAMBA].host_value)
+
+        result = cache.evict(EvictParams(num_tokens=len(tokens)))
+
+        self.assertGreaterEqual(result.num_tokens_evicted, len(tokens))
+        self.assertTrue(node.evicted)
+        self.assertTrue(
+            torch.equal(
+                node.component_data[ComponentType.FULL].host_value,
+                full_host_value,
+            )
+        )
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.available_size(),
+            full_host_available,
+        )
+        self.assertIsNotNone(node.component_data[ComponentType.MAMBA].host_value)
+        self.assertEqual(
+            mamba_component._mamba_pool_host.available_size(),
+            mamba_host_available - 1,
+        )
         cache.sanity_check()
 
     def test_build_backup_kv_action_orders_ancestors_first(self):
