@@ -611,7 +611,7 @@ class CommonKVManager(BaseKVManager):
             # without CP — with CP active the shard axis is the CP group and
             # the CP fan-in below handles it): every decode rank pulls its
             # full latent KV from ALL prefill TP ranks (each sends the pages
-            # it owns, paired positionally). v1 requires equal TP sizes.
+            # it owns, paired positionally), which needs equal TP sizes.
             assert self.attn_tp_size == info.attn_tp_size, (
                 "MLA KV cache sharding requires equal prefill/decode attn TP "
                 f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"

@@ -544,10 +544,9 @@ class PrefillAdder:
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         # Logical-page KV sharding: the physical-page quantum all mid-request
-        # chunk boundaries must land on (the allocator's working page under
-        # the classed rewrite); 0 when sharding is off. v1 also restricts
-        # sharded prefill batches to a single request (the assembly scratch
-        # is sized for one request's [prefix | chunk]).
+        # chunk boundaries must land on; 0 when sharding is off. A sharded
+        # batch may hold several requests, but only as many as the assembly
+        # scratch fits — _kv_shard_reserve_scratch gates each admission.
         from sglang.srt.mem_cache.allocator.page_interleave import (
             page_interleave_shard_size,
         )
