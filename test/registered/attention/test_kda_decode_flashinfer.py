@@ -261,7 +261,7 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     )
 
 
-def test_kda_decode_cake_matches_triton_gqa():
+def test_kda_decode_cake_falls_back_for_gqa():
     torch.manual_seed(4800)
     data = _make_decode_inputs(4, num_heads=4, num_value_heads=8)
     cake, triton = CakeKDAKernel(), TritonKDAKernel()
@@ -272,14 +272,8 @@ def test_kda_decode_cake_matches_triton_gqa():
     output_cake = _decode(cake, data, state_cake, lower_bound=-5.0).float()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(output_cake, output_ref, atol=1e-2, rtol=1e-2)
-    selected = data["cache_indices"].long()
-    torch.testing.assert_close(
-        state_cake[selected].float(),
-        state_ref[selected].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    torch.testing.assert_close(output_cake, output_ref)
+    torch.testing.assert_close(state_cake, state_ref)
 
 
 @pytest.mark.parametrize("batch_size,num_spec", [(1, 7), (8, 7), (32, 3)])
