@@ -68,4 +68,18 @@ jobs:
           python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
             --hours ${{ (github.event_name == 'pull_request' && '0.34') || inputs.hours || '24' }} \
+            --output runner-utilization.md \
             ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}
+
+      - name: Upload report artifact
+        # The script also appends the report to $GITHUB_STEP_SUMMARY (that
+        # behavior is unchanged); uploading the same file as an artifact makes
+        # the report retrievable via the REST API, which the step summary is
+        # not, so external dashboards can consume it.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-utilization-report
+          path: runner-utilization.md
+          if-no-files-found: ignore
+          retention-days: 30
