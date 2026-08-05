@@ -198,6 +198,14 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        # Raise libzmq's per-context socket cap (default 1023): this manager
+        # caches 2 sockets per decode endpoint (PUSH + PAIR monitor), so a
+        # large decode fleet exhausts the default regardless of the OS nofile
+        # limit. Must be set before the context creates any socket; the
+        # option is not retroactive.
+        self._zmq_ctx.set(
+            zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+        )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
@@ -1244,6 +1252,9 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+    # One PUSH socket per prefill rank endpoint; raise the cap so a large
+    # prefill fleet cannot exhaust the default 1023 either.
+    _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
