@@ -62,6 +62,12 @@ _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 _MPS_MLP_TOKEN_CHUNK_SIZE = 1024
+# Keep the MPS attention projection below the allocator's high-watermark.  The
+# model's regular path materializes [tokens, 3 * hidden] at once, which is more
+# than 1 GiB for a 768px H3 request.  This only affects MPS; CUDA keeps its
+# fused full-sequence projection.
+_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 1024
+_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -400,6 +406,18 @@ def _apply_rope_qk(
     return q, k
 
 
+def _apply_rope(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the eager (non-CUDA) H3 RoPE path to one Q or K tensor."""
+    half = cos_sin_cache.shape[-1] // 2
+    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+    return _apply_rope_cos_sin(x, cos, sin)
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(
         self,
@@ -613,6 +631,109 @@ class MiniMaxH3Attention(nn.Module):
         else:
             weight.weight_loader = _weight_loader
 
+    def _forward_mps_streamed_attention(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run MPS attention without materializing the full QKV activation.
+
+        H3's fused QKV output alone is roughly 1.45 GiB at 768px.  MPS shares
+        unified memory with the host, so retaining it alongside the packed
+        residual and SDPA workspace can evict the OS.  Build normalized K/V
+        once, then project Q a small chunk at a time and immediately consume it
+        through attention and the output projection.  The formula, weights,
+        and complete K/V context are unchanged; this is intentionally limited
+        to single-device MPS where Ulysses collectives are not active.
+        """
+        total = x.shape[0]
+        key = torch.empty(
+            (total, self.num_heads, self.head_dim), dtype=x.dtype, device=x.device
+        )
+        value = torch.empty_like(key)
+        cos_sin_cache = None if rope_cache is None else rope_cache[0]
+
+        # Do not retain Q while producing the K/V cache.  Dropping the chunk
+        # before the next transfer keeps only two full-width attention tensors.
+        for start in range(0, total, _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE):
+            stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, total)
+            qkv, _ = self.qkv_proj(x[start:stop])
+            q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+            del q_chunk
+            k_chunk = self.k_norm(k_chunk.view(-1, self.num_heads, self.head_dim))
+            if cos_sin_cache is not None:
+                k_chunk = _apply_rope(k_chunk, cos_sin_cache[start:stop])
+            key[start:stop].copy_(k_chunk)
+            value[start:stop].copy_(v_chunk.view(-1, self.num_heads, self.head_dim))
+            del qkv, k_chunk, v_chunk
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+
+        if self._attention_impl is None:
+            self._set_attention_backend(
+                get_attn_backend(
+                    self.head_dim,
+                    x.dtype,
+                    supported_attention_backends=self._supported_attention_backends,
+                )
+            )
+        bounds = (
+            cu_seqlens_host
+            if cu_seqlens_host is not None
+            else tuple(int(item) for item in cu_seqlens.tolist())
+        )
+        out = torch.empty_like(x)
+        for sequence_start, sequence_stop in zip(bounds[:-1], bounds[1:]):
+            if sequence_start == sequence_stop:
+                continue
+            keys = key[sequence_start:sequence_stop].unsqueeze(0)
+            values = value[sequence_start:sequence_stop].unsqueeze(0)
+            for start in range(
+                sequence_start,
+                sequence_stop,
+                _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE,
+            ):
+                stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, sequence_stop)
+                qkv, _ = self.qkv_proj(x[start:stop])
+                q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
+                del k_chunk, v_chunk
+                for query_start in range(
+                    start, stop, _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE
+                ):
+                    query_stop = min(
+                        query_start + _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE, stop
+                    )
+                    q = self.q_norm(
+                        q_chunk[query_start - start : query_stop - start].view(
+                            -1, self.num_heads, self.head_dim
+                        )
+                    )
+                    if cos_sin_cache is not None:
+                        q = _apply_rope(q, cos_sin_cache[query_start:query_stop])
+                    attention_out = self._attention_impl.forward(
+                        q.unsqueeze(0), keys, values, None
+                    )[0]
+                    projected, _ = self.out_proj(
+                        attention_out.reshape(
+                            query_stop - query_start, self.local_inner_dim
+                        )
+                    )
+                    out[query_start:query_stop].copy_(projected)
+                    del q, attention_out, projected
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
+                del qkv, q_chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+
+        del key, value
+        torch.mps.empty_cache()
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -634,6 +755,15 @@ class MiniMaxH3Attention(nn.Module):
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
         """
+        if x.device.type == "mps" and not ulysses_active:
+            return self._forward_mps_streamed_attention(
+                x,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+            )
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.split(self.local_inner_dim, dim=-1)
