@@ -305,8 +305,13 @@ nb::tuple rope_pool_fused_py(
 
 }  // namespace
 
+// Defined in rms_norm.cpp; registered into the shared _metal module below.
+void register_rms_norm(nb::module_& m);
+
 NB_MODULE(_metal, m) {
   m.def("register_library", &register_library_impl, nb::arg("path"));
+
+  register_rms_norm(m);
 
   m.def(
       "rope_pool_fused",
