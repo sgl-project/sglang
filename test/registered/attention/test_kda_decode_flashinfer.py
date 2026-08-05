@@ -217,7 +217,7 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
     ), f"decode state mean diff {s_err.mean().item():.2e}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 8, 64])
+@pytest.mark.parametrize("batch_size", [1, 8, 64, 128])
 @pytest.mark.skipif(
     not CAKE_ARCH_SUPPORTED,
     reason="CAKE KDA decode requires SM100 or SM103.",
@@ -253,17 +253,186 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     ].to(torch.int32)
 
     cake, tri = CakeKDAKernel(), TritonKDAKernel()
+    cake_calls = []
+    run_cake = cake._recurrent_kda
+
+    def track_cake_call(**kwargs):
+        cake_calls.append(kwargs)
+        return run_cake(**kwargs)
+
+    cake._recurrent_kda = track_cake_call
     st_ref = d["ssm"].clone()
     ref_out = _decode(tri, d, st_ref, lower_bound=-5.0).float()
     st_cake = d["ssm"].clone()
+    st_cake_before = st_cake.clone()
     out = _decode(cake, d, st_cake, lower_bound=-5.0).float()
     torch.cuda.synchronize()
 
+    assert len(cake_calls) == 1
+    assert cake_calls[0]["initial_state"].data_ptr() == st_cake.data_ptr()
+    assert (
+        cake_calls[0]["ssm_state_indices"].data_ptr() == d["cache_indices"].data_ptr()
+    )
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
     idx = d["cache_indices"].long()
     torch.testing.assert_close(
         st_cake[idx].float(), st_ref[idx].float(), atol=1e-2, rtol=1e-2
     )
+    selected = torch.zeros(pool_size, dtype=torch.bool, device="cuda")
+    selected[idx] = True
+    torch.testing.assert_close(
+        st_cake[~selected], st_cake_before[~selected], atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(
+    not CAKE_ARCH_SUPPORTED,
+    reason="CAKE KDA decode requires SM100 or SM103.",
+)
+def test_kda_decode_cake_masks_negative_state_indices():
+    """CUDA-graph padding rows must neither touch slot zero nor emit output."""
+    batch_size = 8
+    torch.manual_seed(12200)
+    d = _make_decode_inputs(batch_size, num_heads=12, num_value_heads=12)
+    d["cache_indices"] = torch.tensor(
+        [11, -1, 3, 7, -1, 1, 15, 4],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    active_rows = d["cache_indices"] >= 0
+
+    # The Triton oracle only receives active rows, avoiding any dependency on
+    # its own negative-index padding convention.
+    active = dict(d)
+    for name in ("q", "k", "v"):
+        active[name] = d[name][:, active_rows].contiguous()
+    for name in ("a", "b"):
+        active[name] = d[name][active_rows].contiguous()
+    active["B"] = int(active_rows.sum().item())
+    active["cache_indices"] = d["cache_indices"][active_rows].contiguous()
+    active["qsl"] = torch.arange(
+        active["B"] + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    cake, tri = CakeKDAKernel(), TritonKDAKernel()
+    state_ref = d["ssm"].clone()
+    output_ref = _decode(tri, active, state_ref, lower_bound=-5.0).float()
+    state_cake = d["ssm"].clone()
+    state_before = state_cake.clone()
+    output_cake = _decode(cake, d, state_cake, lower_bound=-5.0).float()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        output_cake[active_rows], output_ref, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        output_cake[~active_rows],
+        torch.zeros_like(output_cake[~active_rows]),
+        atol=0,
+        rtol=0,
+    )
+    active_indices = d["cache_indices"][active_rows].long()
+    torch.testing.assert_close(
+        state_cake[active_indices].float(),
+        state_ref[active_indices].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    selected = torch.zeros(state_cake.shape[0], dtype=torch.bool, device="cuda")
+    selected[active_indices] = True
+    torch.testing.assert_close(
+        state_cake[~selected], state_before[~selected], atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(
+    not CAKE_ARCH_SUPPORTED,
+    reason="CAKE KDA decode requires SM100 or SM103.",
+)
+def test_kda_decode_cake_indexed_state_cuda_graph_replay():
+    """Replay must read changed values from the same static index buffer."""
+    batch_size = 64
+    torch.manual_seed(12300)
+    d = _make_decode_inputs(batch_size, num_heads=12, num_value_heads=12)
+    pool_size = d["ssm"].shape[0]
+    initial_state = d["ssm"].clone()
+    graph_state = initial_state.clone()
+    graph_indices = d["cache_indices"]
+    cake, tri = CakeKDAKernel(), TritonKDAKernel()
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        _decode(cake, d, graph_state, lower_bound=-5.0)
+        graph_state.copy_(initial_state)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output = _decode(cake, d, graph_state, lower_bound=-5.0)
+
+    permutations = [
+        torch.randperm(pool_size, device="cuda", dtype=torch.int32)[:batch_size],
+        torch.cat(
+            (
+                torch.randperm(pool_size, device="cuda", dtype=torch.int32)[
+                    : batch_size - 8
+                ],
+                torch.full((8,), -1, device="cuda", dtype=torch.int32),
+            )
+        ),
+    ]
+    for indices in permutations:
+        active_rows = indices >= 0
+        active_indices = indices[active_rows].long()
+        active = dict(d)
+        for name in ("q", "k", "v"):
+            active[name] = d[name][:, active_rows].contiguous()
+        for name in ("a", "b"):
+            active[name] = d[name][active_rows].contiguous()
+        active["B"] = int(active_rows.sum().item())
+        active["cache_indices"] = indices[active_rows].contiguous()
+        active["qsl"] = torch.arange(
+            active["B"] + 1,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        state_ref = initial_state.clone()
+        output_ref = _decode(tri, active, state_ref, lower_bound=-5.0).float()
+
+        with torch.cuda.stream(capture_stream):
+            graph_state.copy_(initial_state)
+            graph_indices.copy_(indices)
+        capture_stream.synchronize()
+        with torch.cuda.stream(capture_stream):
+            graph.replay()
+        capture_stream.synchronize()
+
+        torch.testing.assert_close(
+            captured_output[active_rows].float(),
+            output_ref,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            captured_output[~active_rows],
+            torch.zeros_like(captured_output[~active_rows]),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            graph_state[active_indices].float(),
+            state_ref[active_indices].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        selected = torch.zeros(pool_size, dtype=torch.bool, device="cuda")
+        selected[active_indices] = True
+        torch.testing.assert_close(
+            graph_state[~selected], initial_state[~selected], atol=0, rtol=0
+        )
 
 
 @pytest.mark.skipif(
