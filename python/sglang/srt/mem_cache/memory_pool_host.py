@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 import numpy as np
 import psutil
 import torch
-
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
@@ -64,6 +63,7 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 
 class MambaPoolHost(HostKVCache):
+    _uses_staged_write_back = False
 
     def __init__(
         self,
@@ -356,11 +356,6 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # host_indices may be on CPU (kept there by start_writing when
-            # can_use_write_back_jit is True on the HostPoolGroup).
-            if src_indices.device.type != "cuda":
-                src_indices = src_indices.to(dst_indices.device, non_blocking=True)
             transfer_kv_mamba_pf_lf(
                 src=src,
                 dst=dst,
@@ -398,12 +393,6 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # When can_use_write_back_jit is True on the HostPoolGroup,
-            # start_writing() keeps host_indices on CPU (for MLA staged kernel).
-            # Move dst_indices to CUDA here to satisfy the kernel's requirement.
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
                 dst=dst,
