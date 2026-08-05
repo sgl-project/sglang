@@ -494,13 +494,8 @@ class LayerwiseOffloadManager:
         if not self.enabled or layer_idx not in self._gpu_layers:
             return
         if self._synchronous_mps:
-            for name in self._mps_cpu_weights.get(layer_idx, {}):
-                target = self.get_target_with_name(name)
-                # checkpoint-backed safetensors can be read-only, so a writeback
-                # replaces the mapping with a new CPU tensor
-                self._mps_cpu_weights[layer_idx][name] = (
-                    self._to_local_tensor(target).to("cpu").detach()
-                )
+            # inference does not mutate parameters; retain the original mapped
+            # tensor instead of materializing a CPU copy after every layer
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
