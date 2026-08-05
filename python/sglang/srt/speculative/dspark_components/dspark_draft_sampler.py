@@ -134,7 +134,7 @@ class DsparkDraftSampler:
             self.confidence_out[:bs].copy_(confidence)
 
 
-def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
+def _resolve_folded_sampling(*, model, gamma, max_bs, device, gpu_id, tp_rank) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
@@ -146,7 +146,7 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
+    available_gb = get_available_gpu_memory(device, gpu_id)
     if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
@@ -168,6 +168,7 @@ def maybe_build_draft_sampler(
     gamma: int,
     max_bs: int,
     device,
+    gpu_id: int,
     tp_rank: int,
     confidence_fn=None,
     out=None,
@@ -187,7 +188,12 @@ def maybe_build_draft_sampler(
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
     folded_sampling = _resolve_folded_sampling(
-        model=draft_model, gamma=gamma, max_bs=max_bs, device=device, tp_rank=tp_rank
+        model=draft_model,
+        gamma=gamma,
+        max_bs=max_bs,
+        device=device,
+        gpu_id=gpu_id,
+        tp_rank=tp_rank,
     )
     if tp_rank == 0:
         logger.info(
