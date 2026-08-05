@@ -1095,7 +1095,6 @@ def apply_qk_norm_rope(
         rotary_dim=head_dim,
         use_precomputed_cache=False,
         is_neox_style=is_neox,
-        is_interleaved=not is_neox,
     )
     return rotary_emb(
         query=q,

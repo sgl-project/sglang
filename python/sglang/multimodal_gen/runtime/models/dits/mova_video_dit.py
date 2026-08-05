@@ -116,7 +116,6 @@ class SelfAttention(nn.Module):
             rotary_dim=self.head_dim,
             use_precomputed_cache=False,
             is_neox_style=False,
-            is_interleaved=True,
         )
         self.attn = USPAttention(
             # Local heads per TP rank.
