@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
+    SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
@@ -251,6 +252,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For image generation task depends on image quality and the model config
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+    # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
+    # the padded layout, instead of the packed-varlen path. Applies only when
+    # sequence parallelism is active and the mask is derived purely from the
+    # shard pad span.
+    "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
