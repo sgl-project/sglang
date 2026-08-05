@@ -539,22 +539,25 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / Wan VAE decoder fast paths.
 
         Requests with quality == "high" run the fast paths; the "lossless"
         default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt for details.
+        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
                 maybe_optimize_flux2_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                maybe_optimize_wan_vae,
+            )
 
             vae = maybe_optimize_flux2_vae(vae)
+            vae = maybe_optimize_wan_vae(vae)
         except Exception:
             logger.warning(
-                "Failed to apply CUDA FLUX.2 VAE optimizations; "
-                "using the unmodified VAE.",
+                "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",
                 exc_info=True,
             )
         return vae
