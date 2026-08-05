@@ -38,10 +38,11 @@ from sglang.srt.entrypoints.openai.realtime.audio_buffer import (
 )
 from sglang.srt.entrypoints.openai.streaming_asr import (
     DecoderSuffixUpdate,
+    GeneratedTranscript,
     StreamingASRState,
-    generate_asr_text,
+    generate_asr_transcript,
+    has_no_word_boundaries,
     is_cjk_char,
-    is_cjk_no_whitespace,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
@@ -87,6 +88,8 @@ class RealtimeASRState(msgspec.Struct):
     encoder_window_disabled: bool = False
     # True after cumulative transcript state has handed off to suffix decoding.
     encoder_window_active: bool = False
+    # A length-limited intermediate decode needs one full-budget commit replay.
+    final_replay_required: bool = False
 
     @property
     def has_audio(self) -> bool:
@@ -121,6 +124,7 @@ class _TranscriptionOutcome(msgspec.Struct, frozen=True):
     audio_processed: bool
     cumulative_delta: str = ""
     decoder_update: Optional[DecoderSuffixUpdate] = None
+    final_replay_required: bool = False
 
     @property
     def delta(self) -> str:
@@ -163,7 +167,9 @@ class RealtimeASRProcessor:
         state = StreamingASRState(**self.adapter.chunked_streaming_config)
         self.chunk_size_bytes = int(state.chunk_size_sec * self.pcm_bytes_per_second)
         self.max_buffer_bytes = self.max_buffer_seconds * self.pcm_bytes_per_second
-        self._encoder_window_policy = self._resolve_encoder_window_policy(state)
+        self._encoder_window_policy = self._resolve_encoder_window_policy(
+            state, server_args
+        )
 
     def create_state(self) -> RealtimeASRState:
         return RealtimeASRState(
@@ -179,13 +185,28 @@ class RealtimeASRProcessor:
         )
 
     def _resolve_encoder_window_policy(
-        self, state: StreamingASRState
+        self, state: StreamingASRState, server_args: ServerArgs
     ) -> Optional[_EncoderWindowPolicy]:
         """Resolve optional realtime encoder-window settings."""
         declared = self.adapter.realtime_encoder_window_config
         if not isinstance(declared, dict):
             return None
+        if server_args.asr_long_audio_strategy != "encoder_window":
+            return None
         if "max_audio_context_windows" not in declared:
+            return None
+        if (
+            server_args.tp_size != 1
+            or server_args.dp_size != 1
+            or server_args.pp_size != 1
+            or server_args.nnodes != 1
+            or server_args.language_only
+            or server_args.disaggregation_mode != "null"
+        ):
+            logger.warning(
+                "[realtime] encoder windowing currently requires a local "
+                "single-GPU runtime; using cumulative ASR"
+            )
             return None
         mm_processor = self.tokenizer_manager.mm_processor
         if mm_processor is None or self.tokenizer_manager.tokenizer is None:
@@ -344,13 +365,13 @@ class RealtimeASRProcessor:
         samples = await self._snapshot_samples(
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
-        text = await self._generate_transcript(
+        generation = await self._generate_transcript(
             samples,
             sampling_params,
             self.adapter.prompt_template + step.decoder_prefix,
         )
         delta = state.transcript.reconcile_cumulative_transcript(
-            text, is_last=step.is_last
+            generation.text, is_last=step.is_last
         )
         return _TranscriptionOutcome(audio_processed=True, cumulative_delta=delta)
 
@@ -386,27 +407,29 @@ class RealtimeASRProcessor:
                 else max_suffix_tokens
             )
 
-        text = await self._generate_transcript(
+        generation = await self._generate_transcript(
             samples,
             sampling_params,
             self.adapter.prompt_template + step.decoder_prefix,
             encoder_window_config=policy.encoder_window_config,
         )
+        text = generation.text
+        text = state.transcript.trim_decoder_prefix_echo(text, step.decoder_prefix)
+
+        new_pcm = state.audio.snapshot(
+            state.audio.last_processed_offset_bytes, step.end_offset_bytes
+        )
+        if not text and new_pcm and not is_near_silent_pcm(new_pcm):
+            if step.is_last:
+                raise RuntimeError(
+                    "final realtime ASR decode returned empty for voiced audio"
+                )
+            # Keep every untranscribed voiced byte recoverable. The next append
+            # may submit more than the nominal context until decoding recovers.
+            return _TranscriptionOutcome(audio_processed=False)
 
         if not state.encoder_window_active:
             text = state.transcript.prepend_unemitted_cumulative_text(text)
-        elif not step.is_last and not text:
-            new_pcm = state.audio.snapshot(
-                state.audio.last_processed_offset_bytes, step.end_offset_bytes
-            )
-            # Defer a voiced-but-empty decode so the next request re-covers
-            # it, at most one window so a stuck decoder cannot grow requests.
-            if (
-                new_pcm
-                and not is_near_silent_pcm(new_pcm)
-                and len(new_pcm) <= policy.window_bytes
-            ):
-                return _TranscriptionOutcome(audio_processed=False)
 
         update = state.transcript.reconcile_decoder_suffix(
             text,
@@ -416,6 +439,9 @@ class RealtimeASRProcessor:
         return _TranscriptionOutcome(
             audio_processed=True,
             decoder_update=update,
+            final_replay_required=(
+                not step.is_last and generation.finish_reason == "length"
+            ),
         )
 
     async def _snapshot_samples(
@@ -431,8 +457,8 @@ class RealtimeASRProcessor:
         prompt: str,
         *,
         encoder_window_config: Optional[AudioEncoderWindowConfig] = None,
-    ) -> str:
-        text = await generate_asr_text(
+    ) -> GeneratedTranscript:
+        result = await generate_asr_transcript(
             tokenizer_manager=self.tokenizer_manager,
             adapter=self.adapter,
             audio_data=samples,
@@ -440,9 +466,9 @@ class RealtimeASRProcessor:
             prompt=prompt,
             mm_processor_kwargs={"audio_encoder_window_config": encoder_window_config},
         )
-        if text is None:
+        if result is None:
             raise RuntimeError("realtime ASR request returned no response")
-        return text
+        return result
 
     def _commit_outcome(
         self,
@@ -460,6 +486,7 @@ class RealtimeASRProcessor:
                 is_last=step.is_last,
             )
             state.encoder_window_active = True
+            state.final_replay_required = outcome.final_replay_required
         if not outcome.audio_processed:
             return
         audio.last_processed_offset_bytes = step.end_offset_bytes
@@ -480,5 +507,5 @@ class RealtimeASRProcessor:
             step.uses_encoder_windows
             and not state.encoder_window_active
             and outcome.decoder_update is not None
-            and is_cjk_no_whitespace(outcome.decoder_update.pending_suffix or "")
+            and has_no_word_boundaries(outcome.decoder_update.pending_suffix or "")
         )

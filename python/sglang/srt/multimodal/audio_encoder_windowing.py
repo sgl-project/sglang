@@ -151,16 +151,17 @@ def _build_audio_window_items(
     offset_start = placeholder_position
     for index, window in enumerate(window_features):
         offset_end = offset_start + window.token_count - 1
-        # The mutable tail changes every request; only complete windows get a
-        # stable identity in the embedding cache.
+        # The encoder reads both tensors. Including the mask prevents padded
+        # tails from sharing a Radix/cache identity with a complete window that
+        # has identical zero-padded features but a different effective length.
+        item_hash = hash_mm_item(
+            hash_feature([window.feature, window.attention_mask]),
+            Modality.AUDIO,
+            [(offset_start, offset_end)],
+        )
+        # The mutable tail changes every request and must not evict reusable
+        # complete-window embeddings, even though its Radix identity is valid.
         use_embedding_cache = index < complete_window_count
-        item_hash = None
-        if use_embedding_cache:
-            item_hash = hash_mm_item(
-                hash_feature(window.feature),
-                Modality.AUDIO,
-                [(offset_start, offset_end)],
-            )
         mm_items.append(
             MultimodalDataItem(
                 modality=Modality.AUDIO,

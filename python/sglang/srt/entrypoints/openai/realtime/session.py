@@ -479,7 +479,9 @@ class RealtimeConnection:
             / self.asr_processor.pcm_bytes_per_second
         )
 
-        if has_new_audio:
+        # A length-limited intermediate decode needs one full-budget replay;
+        # a normally stopped decode can commit by flushing its pending suffix.
+        if has_new_audio or self.asr_state.final_replay_required:
             ok = await self._run_inference(is_last=True)
             if not ok:
                 # _run_inference already emitted transcription.failed and

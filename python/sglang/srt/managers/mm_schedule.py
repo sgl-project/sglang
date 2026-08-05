@@ -382,6 +382,7 @@ def _batch_encode_per_item_misses(
             split_embeddings = [
                 emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
             ]
+            split_from_concatenated_tensor = False
             if any(
                 _embedding_token_count(embedding) != token_count
                 for embedding, token_count in zip(split_embeddings, token_counts)
@@ -400,8 +401,13 @@ def _batch_encode_per_item_misses(
                     f"actual={all_miss_embedding.shape[0]}"
                 )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            split_from_concatenated_tensor = True
         for (h, (item, _)), emb in zip(unique_misses.items(), split_embeddings):
             if item.use_embedding_cache:
+                # torch.split returns views. Clone cacheable slices so one small
+                # entry does not keep the full batched encoder output alive.
+                if split_from_concatenated_tensor:
+                    emb = emb.clone()
                 embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[h] = emb
@@ -473,6 +479,7 @@ def _get_chunked_embedding_by_item(
             split_embeddings = [
                 emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
             ]
+            split_from_concatenated_tensor = False
             token_counts = [end - start + 1 for _, _, start, end in miss_items]
             if any(
                 _embedding_token_count(embedding) != token_count
@@ -494,11 +501,15 @@ def _get_chunked_embedding_by_item(
                     f"actual={all_miss_embedding.shape[0]}"
                 )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            split_from_concatenated_tensor = True
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
-            cached_embeddings[idx] = emb
             if item.use_embedding_cache:
+                # Avoid retaining the complete encoder batch through a split view.
+                if split_from_concatenated_tensor:
+                    emb = emb.clone()
                 embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+            cached_embeddings[idx] = emb
 
     chunk_slices = []
     for idx, _, start, end in overlapping:

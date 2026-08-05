@@ -44,6 +44,13 @@ class DecoderSuffixUpdate(msgspec.Struct, frozen=True):
     pending_suffix: Optional[str]
 
 
+class GeneratedTranscript(msgspec.Struct, frozen=True):
+    """Normalized ASR text plus the backend stop reason."""
+
+    text: str
+    finish_reason: Optional[str]
+
+
 @dataclass
 class StreamingASRState:
     """Reconcile decoded text into a stable stream of transcript deltas.
@@ -51,7 +58,7 @@ class StreamingASRState:
     Text state only: no audio buffer, GPU state, or scheduler state lives here.
     Two machines share the emitted-text anchor and the trim helpers:
 
-    - Cumulative machine (below the gate, and no-whitespace CJK): every decode
+    - Cumulative machine (below the gate, and text without word boundaries): every decode
       re-transcribes all audio, so ``reconcile_cumulative_transcript()`` and
       ``flush_cumulative_transcript()`` emit only the words that stopped
       changing between decodes (word/char rollback).
@@ -178,8 +185,8 @@ class StreamingASRState:
     def is_decoder_prefix_compatible(self) -> bool:
         """Whether cumulative text is compatible with word-based suffix state."""
         return not (
-            is_cjk_no_whitespace(self.emitted_text)
-            or is_cjk_no_whitespace(self.latest_text)
+            has_no_word_boundaries(self.emitted_text)
+            or has_no_word_boundaries(self.latest_text)
         )
 
     def get_bounded_decoder_prefix(
@@ -220,7 +227,6 @@ class StreamingASRState:
         self, decoded_suffix: str, *, is_last: bool = False, holdback_words: int
     ) -> DecoderSuffixUpdate:
         """Reconcile a decode with the pending suffix without mutating state."""
-        decoded_suffix = self._trim_large_prompt_echo(decoded_suffix)
         if self.emitted_text and (not self.pending_suffix or is_last):
             decoded_suffix, _ = _trim_word_overlap(self.emitted_text, decoded_suffix)
         previous_suffix = self.pending_suffix
@@ -259,6 +265,21 @@ class StreamingASRState:
             delta=" ".join(decoded_words[:emit_count]),
             pending_suffix=" ".join(decoded_words[emit_count:]),
         )
+
+    def trim_decoder_prefix_echo(self, decoded_suffix: str, decoder_prefix: str) -> str:
+        """Remove an implausibly large echo of the exact requested prefix."""
+        decoded_words = decoded_suffix.split()
+        prefix_words = decoder_prefix.split()
+        max_words_for_chunk = max(24, int(self.chunk_size_sec * 16))
+        if len(prefix_words) < max_words_for_chunk or len(decoded_words) < len(
+            prefix_words
+        ):
+            return decoded_suffix
+        if _normalized_word_prefix_len(prefix_words, decoded_words) != len(
+            prefix_words
+        ):
+            return decoded_suffix
+        return " ".join(decoded_words[len(prefix_words) :])
 
     def commit_decoder_suffix_update(
         self, update: DecoderSuffixUpdate, *, is_last: bool
@@ -366,7 +387,7 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
 
 
 def normalize_whitespace(text: str) -> str:
-    return _PUNCT_WS_RE.sub(r"\1", text)
+    return _PUNCT_WS_RE.sub(r"\1", text).strip()
 
 
 _NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
@@ -404,10 +425,23 @@ def _is_word_char(c: str) -> bool:
 
 
 def is_cjk_no_whitespace(text: str) -> bool:
+    text = text.strip()
     return (
         bool(text)
         and not any(c.isspace() for c in text)
         and any(_is_cjk_script_char(c) for c in text)
+    )
+
+
+def has_no_word_boundaries(text: str) -> bool:
+    """Whether word-based suffix reconciliation is unsafe for this text."""
+    text = text.strip()
+    return (
+        bool(text)
+        and not any(c.isspace() for c in text)
+        and any(
+            _is_cjk_script_char(c) or 0x0E00 <= ord(c) <= 0x0E7F for c in text  # Thai
+        )
     )
 
 
@@ -515,7 +549,7 @@ def _trim_word_overlap(emitted_text: str, decoded_text: str) -> "tuple[str, bool
     return " ".join(decoded_words[cut:]), True
 
 
-async def generate_asr_text(
+async def generate_asr_transcript(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
     audio_data: Union[bytes, np.ndarray],
@@ -524,8 +558,8 @@ async def generate_asr_text(
     raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
     mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """Run one stateless backend request and return normalized model text."""
+) -> Optional[GeneratedTranscript]:
+    """Run one stateless backend request and return text with its stop reason."""
     chunk_request = GenerateReqInput(
         text=prompt,
         audio_data=audio_data,
@@ -551,7 +585,37 @@ async def generate_asr_text(
         logger.warning("[streaming_asr] ASR request returned no response")
         return None
 
-    return normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
+    finish_reason = ret.get("meta_info", {}).get("finish_reason")
+    if isinstance(finish_reason, dict):
+        finish_reason = finish_reason.get("type")
+    return GeneratedTranscript(
+        text=normalize_whitespace(adapter.postprocess_text(ret.get("text", ""))),
+        finish_reason=finish_reason,
+    )
+
+
+async def generate_asr_text(
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
+    audio_data: Union[bytes, np.ndarray],
+    sampling_params: Dict[str, Any],
+    prompt: str,
+    raw_request: Optional[Request] = None,
+    routing_key: Optional[str] = None,
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Run one stateless backend request and return normalized model text."""
+    result = await generate_asr_transcript(
+        tokenizer_manager=tokenizer_manager,
+        adapter=adapter,
+        audio_data=audio_data,
+        sampling_params=sampling_params,
+        prompt=prompt,
+        raw_request=raw_request,
+        routing_key=routing_key,
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    return None if result is None else result.text
 
 
 async def process_asr_chunk(

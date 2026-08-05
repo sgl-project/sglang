@@ -74,7 +74,12 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertEqual(
             first_items[0].hash,
             hash_mm_item(
-                hash_feature(first_items[0].feature),
+                hash_feature(
+                    [
+                        first_items[0].feature,
+                        first_items[0].model_specific_data["feature_attention_mask"],
+                    ]
+                ),
                 Modality.AUDIO,
                 first_items[0].offsets,
             ),
@@ -91,6 +96,36 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertEqual(int((input_ids == 99).sum()), 18)
         self.assertEqual(tiny_tail_items[-1].offsets, [(17, 18)])
         self.assertFalse(tiny_tail_items[-1].use_embedding_cache)
+
+    def test_tail_mask_prevents_complete_window_identity_collision(self):
+        processor = SimpleNamespace(
+            feature_extractor=_FeatureExtractor(),
+            _get_feat_extract_output_lengths=lambda lengths: (
+                (torch.as_tensor(lengths) + 1) // 2
+            ),
+        )
+        config = resolve_audio_encoder_window_config(
+            window_frames=8,
+            alignment_frames=4,
+            processor=processor,
+            model_sample_rate=16,
+        )
+
+        def build(sample_count):
+            return build_audio_encoder_window_items(
+                samples=np.zeros(sample_count, dtype=np.float32),
+                input_ids=torch.tensor([10, 99, 11]),
+                placeholder_token_id=99,
+                config=config,
+                processor=processor,
+            )[0]
+
+        tail = build(30)[1]
+        complete = build(32)[1]
+
+        self.assertTrue(torch.equal(tail.feature, complete.feature))
+        self.assertEqual(tail.offsets, complete.offsets)
+        self.assertNotEqual(tail.hash, complete.hash)
 
 
 if __name__ == "__main__":
