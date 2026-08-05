@@ -488,28 +488,14 @@ def _minimax_h3_attention_core_impl(
                 supported_attention_backends=attention._supported_attention_backends,
             )
         )
-    if attention._attention_backend == AttentionBackendEnum.LASER_ATTN:
-        padding_start = (
-            int(cu_seqlens[1].item()) if cu_seqlens_host is None else cu_seqlens_host[1]
-        )
-        out = attention._attention_impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-            padding_start=padding_start,
-        )
-    else:
-        out = attention._attention_impl.forward_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-        )
+    out = attention._attention_impl.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cu_seqlens_host=cu_seqlens_host,
+    )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out
@@ -542,7 +528,6 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self._supported_attention_backends = arch._supported_attention_backends
-        self._attention_backend: AttentionBackendEnum | None = None
         self._attention_impl = None
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
@@ -592,7 +577,6 @@ class MiniMaxH3Attention(nn.Module):
             softmax_scale=self.softmax_scale,
             num_kv_heads=self.num_heads,
         )
-        self._attention_backend = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
