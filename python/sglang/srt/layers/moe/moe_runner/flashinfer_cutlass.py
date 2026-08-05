@@ -59,6 +59,11 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
 
+    # Optional per-expert SwiGLU overrides, fp32 [E].
+    swiglu_alpha: Optional[torch.Tensor] = None
+    swiglu_beta: Optional[torch.Tensor] = None
+    swiglu_limit: Optional[torch.Tensor] = None
+
 
 @dataclass
 class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
@@ -235,6 +240,9 @@ def _run_flashinfer_cutlass(
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
+        swiglu_alpha=quant_info.swiglu_alpha,
+        swiglu_beta=quant_info.swiglu_beta,
+        swiglu_limit=quant_info.swiglu_limit,
     )[0]
 
     if quant_info.quant_type in ("bf16", "fp8"):
