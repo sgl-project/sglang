@@ -806,9 +806,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            # Chain-constant under sharding: the tail node's values continue
-            # the matched prefix's rotation (guaranteed by the decline guard
-            # above plus the bs=1 sharded alloc).
+            # Chain-constant under sharding: the decline guard above
+            # guarantees the tail continues the matched prefix's rotation.
             new_node.rotation_base = rotation_base
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node

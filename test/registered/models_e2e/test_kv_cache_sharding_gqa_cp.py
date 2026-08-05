@@ -19,8 +19,8 @@ stripe (~CPx unique KV capacity for the group), extend attention reads the
 assembled scratch through the translated FA3 page table, and each CP rank
 sends only its owned pages to decode.
 
-Modeled on the DSA cache-layer-split E2E test; PD-disaggregation fixture,
-8 GPUs: prefill TP4 (attn-CP 2) on GPUs 0-3, decode TP4 on GPUs 4-7.
+PD-disaggregation fixture, 8 GPUs: prefill TP4 (attn-CP 2) on GPUs 0-3,
+decode TP2 on GPUs 4-5.
 """
 
 import unittest

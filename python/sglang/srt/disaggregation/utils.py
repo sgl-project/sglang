@@ -735,10 +735,9 @@ def filter_kv_indices_for_shard_rank(
     the entry value is the LOGICAL page id ``l = loc // ps``, identical on
     every rank (mirrored ``req_to_token``). Ownership is derived from the
     value — owner rank ``l % shard_size`` — so the filter is independent of
-    the allocator's placement policy (rotated owner-classed allocation puts
-    no owner information in positions). The owned entries are emitted as
-    wire values ``l // shard_size``: the owner's local page id in its own
-    pool, the same integer the position-congruent scheme put on the wire.
+    the allocator's placement policy. The owned entries are emitted as wire
+    values ``l // shard_size``: the owner's local page id in its own pool, so
+    the decode side needs no change.
 
     Returns the owned wire values and an int64 positions array (in the
     request's canonical send-position space) replacing the contiguous

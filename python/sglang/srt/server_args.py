@@ -6502,10 +6502,8 @@ class ServerArgs:
                     "attn_cp_size > 1."
                 )
 
-        # Every chunk boundary must land on a logical-page boundary so each
-        # chunk's writes cover whole groups and the prefix gather stays a
-        # regular allgather. page_size is a resolvable field, so mid-resolution
-        # it must be read through the pass view rather than off self.
+        # page_size is a resolvable field, so mid-resolution it must be read
+        # through the pass view rather than off self.
         resolved_page_size = view.page_size if view.page_size is not None else 1
         if resolved_page_size <= 1:
             raise ValueError(

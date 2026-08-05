@@ -55,16 +55,17 @@ class PageShardSpec(msgspec.Struct, frozen=True):
 
     @property
     def logical_page_size(self) -> int:
-        """The allocation granule. The radix-tree match quantum stays at the
-        physical ``page_size``, so a prefix can be reused sub-granule."""
+        """The N*page_size span of one logical page. It bounds the assembly
+        scratch and rounds chunked_prefill_size; the allocator and the tree
+        both keep drawing and matching at the physical ``page_size``."""
         return self.shard_size * self.page_size
 
 
 class PageInterleavePlacement:
     """``loc = Q*(N*ps) + r*ps + o`` -> owner ``r``, local physical row ``Q*ps + o``.
 
-    Pure, stateless, and invertible — the reason no virtual-to-physical table
-    or per-page ownership metadata exists anywhere. Because the allocator is
+    Pure, stateless and invertible, so nothing has to be stored or kept
+    coherent to translate. Because the allocator is
     mirrored, logical group ``Q`` resolves to local rows ``[Q*ps, (Q+1)*ps)``
     on every rank, so a reader computes a peer's source offset from arithmetic
     alone. Owned tokens form ``page_size``-long contiguous runs in both the
@@ -133,9 +134,8 @@ def get_kv_shard_group_info(
 
 def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
     """Fixed HBM cost of the double-buffered assembly scratch, charged against
-    the KV budget before pool sizing (the layer-split ``remote_kv_buffer``
-    precedent). Two slots, each ``[max prefix | chunk | trash page]`` rows of
-    ONE layer's KV."""
+    the KV budget before pool sizing. Two slots, each ``[max prefix | chunk |
+    trash page]`` rows of ONE layer's KV."""
     shard_rank, shard_size = get_kv_shard_group_info(kvc)
     if shard_rank is None:
         return 0

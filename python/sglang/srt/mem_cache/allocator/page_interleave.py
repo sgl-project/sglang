@@ -76,8 +76,6 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         need_sort: bool,
         shard_spec=None,
     ):
-        # size              — PHYSICAL token slots of one rank's pool (1x HBM)
-        # size * shard_size — logical slots managed (index-space widening only)
         assert shard_size > 1, "PageInterleavePoolAllocator requires shard_size > 1"
         # Set before super().__init__: the base constructor calls clear(),
         # which builds the class lists from these.
@@ -149,10 +147,8 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
     def least_full_class(self) -> int:
         """Rotation base for a new chain: the class with the most free pages,
         ties broken by the lowest class id. A pure function of the mirrored
-        class fills (SPMD-safe). Least-full seeding is required, not
-        cosmetic: oblivious round-robin drifts unboundedly under adversarial
-        traffic, least-full self-corrects the per-chain <= 1-page remainders
-        to multinomial noise."""
+        class fills (SPMD-safe). Least-full seeding self-corrects the
+        per-chain <= 1-page remainders instead of letting them drift."""
         counts = self.class_free_page_counts()
         return max(range(self.shard_size), key=lambda r: (counts[r], -r))
 

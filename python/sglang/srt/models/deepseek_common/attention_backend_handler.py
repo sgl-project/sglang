@@ -91,7 +91,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     # assembled scratch. Under prefill CP (shard axis = attn-CP) the
     # CP-aware absorbed-MLA path is required — it reads the scratch through
     # the translated page table (get_key_buffer). Without CP the
-    # chunked-prefix MHA path is the validated reader: it fetches the prefix
+    # chunked-prefix MHA path is used: it fetches the prefix
     # through get_mla_kv_buffer and attends the current chunk from
     # activations.
     if (

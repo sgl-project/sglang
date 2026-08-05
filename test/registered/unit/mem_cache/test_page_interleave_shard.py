@@ -205,9 +205,7 @@ class TestClassedAllocator(CustomTestCase):
 
     def test_least_full_root_seeding(self):
         """Roots draw from the class with the most free pages (ties: lowest
-        id). Uniform 1-page roots therefore spread with skew <= 1 — the
-        oblivious policies (fixed class, round-robin from a fixed origin)
-        the design rejects concentrate on one class and drift."""
+        id). Uniform 1-page roots therefore spread with skew <= 1."""
         alloc = _make_allocator(pages_per_rank=32)
         for i in range(2 * N + 1):
             base = alloc.least_full_class()
@@ -500,14 +498,12 @@ class _GraftReq:
 
 
 class TestRotationGraftDecline(CustomTestCase):
-    """Bug regression (adversarial-review finding, 2026-07-20): the overlap
-    disagg-prefill loop plans batch t+1 before batch t's radix insert lands,
-    so two requests sharing a prefix can allocate under different rotation
-    bases; the second one's insert then dedups the shared prefix and used to
-    GRAFT its differently-rotated tail under the first chain. The grafted
-    path's page owners are not one cyclic run, so a later reader either
-    crashes on a negative allgather pad or silently reads the wrong rank's
-    scratch rows. Inserts must refuse the graft instead."""
+    """The overlap disagg-prefill loop plans batch t+1 before batch t's radix
+    insert lands, so two requests sharing a prefix can allocate under
+    different rotation bases. Grafting the second one's tail under the first
+    chain leaves the cached path's page owners not one cyclic run, so a later
+    reader either crashes on a negative allgather pad or silently reads the
+    wrong rank's scratch rows. Inserts must refuse the graft."""
 
     PS = 4  # tree quantum for these tests
 
@@ -548,10 +544,9 @@ class TestRotationGraftDecline(CustomTestCase):
         self.assertEqual(len(m.device_indices), 8)
 
     def test_empty_page_aligned_key_insert(self):
-        """Bug regression (bs>1 review): a finished request with fewer
-        cached tokens than one tree page inserts an EMPTY page-aligned key;
-        the empty-key early return must match insert()'s 3-tuple unpack
-        (ValueError crash after the graft-decline change)."""
+        """A finished request with fewer cached tokens than one tree page
+        inserts an EMPTY page-aligned key; the empty-key early return must
+        match insert()'s 3-tuple unpack."""
         tree = RadixCache.create_simulated(page_size=self.PS)
         res = tree.insert(
             InsertParams(
@@ -952,7 +947,7 @@ class TestWritePlan(CustomTestCase):
 class TestShardSendFilter(CustomTestCase):
     """Value-derived P/D ownership partition: owner = logical page % N, wire
     value = logical page // N — independent of positions, so it stays
-    correct under any placement policy (rotation, future re-seeds)."""
+    correct under any placement policy."""
 
     def test_partition_and_positional_pairing(self):
         mgr = SimpleNamespace(kv_shard_rank=0, kv_shard_size=N)
@@ -971,10 +966,9 @@ class TestShardSendFilter(CustomTestCase):
         all_pos = np.sort(np.concatenate([got[r][1] for r in range(N)]))
         np.testing.assert_array_equal(all_pos, np.arange(9))
 
-    def test_wire_value_matches_unrotated_scheme(self):
-        """The wire byte contract: l // N == loc // (N * ps) — the same
-        owner-local page id the position-congruent scheme sent, so decode
-        needs no change."""
+    def test_wire_value_is_the_owner_local_page(self):
+        """The wire byte contract: l // N == loc // (N * ps) — the owner-local
+        page id, so the decode side needs no change."""
         mgr = SimpleNamespace(kv_shard_rank=1, kv_shard_size=N)
         logical_pages = np.array(_chain_pages(base=0, n_pages=8), dtype=np.int64)
         locs = logical_pages * PS  # page-head loc of each entry
@@ -993,10 +987,8 @@ class TestShardSendFilter(CustomTestCase):
         np.testing.assert_array_equal(wire, logical_pages[pos - 20] // N)
 
     def test_rank_owning_nothing_in_chunk(self):
-        """A short chunk can leave a rank with zero pages — the case whose
-        skipped NIXL notif hung the receiver (the prep-commit fix sends the
-        empty chunk notif standalone). The filter itself must return empty
-        arrays, not error."""
+        """A short chunk can leave a rank with zero pages; the filter must
+        return empty arrays, not error."""
         mgr = SimpleNamespace(kv_shard_rank=3, kv_shard_size=N)
         pages = np.array(_chain_pages(base=0, n_pages=2), dtype=np.int64)  # owners 0,1
         wire, pos = filter_kv_indices_for_shard_rank(mgr, pages, slice(0, 2))

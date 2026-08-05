@@ -150,8 +150,8 @@ class SchedulerInvariantChecker:
         )
         msg += class_watermark_msg
         if leak and widened_page_alloc:
-            # Radix/Mamba cache accounting is logical-token based while the
-            # widened-page allocation is page based. Partial allocator pages
+            # Radix/Mamba cache accounting is logical-token based while
+            # allocation is page based. Partial allocator pages
             # can leave a small page-level slack even when all pages are owned
             # by either the allocator or the prefix cache.
             return False, f"{msg}, widened_page_slack_allowed=True"

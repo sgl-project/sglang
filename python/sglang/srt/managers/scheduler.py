@@ -2046,8 +2046,6 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            # Under logical-page KV sharding the allocator's index space (and
-            # every counter the checker sums) is in widened logical units.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             server_args=self.server_args,
             tree_cache=self.tree_cache,
@@ -2083,8 +2081,7 @@ class Scheduler(
             ps=self.ps,
             server_args=self.server_args,
             # KV sharding widens the allocator's index space, so the capacity
-            # reported to the router has to be widened with it. DCP is left at
-            # upstream's unwidened value.
+            # reported to the router is widened too. DCP is deliberately not.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,

@@ -26,7 +26,6 @@ Two phases, run in separate process groups (one mp.spawn each):
 
 Run: CUDA_VISIBLE_DEVICES=0,1 python test/manual/test_page_interleave_gather.py
 
-Modeled on test/manual/test_dsa_layer_split_broadcast.py.
 """
 
 import os

@@ -1113,9 +1113,8 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
-            # The allocator granule can be wider than the kernel page (a DCP
-            # physical page; a logical page under KV cache sharding) and a
-            # radix hit may end inside one. The regular final send covers the
+            # Under DCP the allocator page is wider than the kernel page and
+            # a radix hit may end inside one. The regular final send covers the
             # full range; only this optional early send is skipped.
             return
         # Early-send issues the KV read before this step's forward is enqueued,

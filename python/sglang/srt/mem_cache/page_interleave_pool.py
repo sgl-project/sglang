@@ -25,10 +25,10 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
 
 - The prefix is NCCL-allgathered from the shard group into the slot one layer
   ahead, on a dedicated side stream with a dedicated ``PyNcclCommunicator``
-  (the ``dsa_cache_layer_split.py`` broadcast template). Under rotated
+  ahead. Under rotated
   owner-classed allocation the owners of a cached prefix's pages are exactly
   cyclic, so per-rank owned counts differ by <= 1: each rank sends its own
-  prefix pages in position order, padded to ``ceil(prefix_pages / N)`` pages
+  prefix pages in local-page order, padded to ``ceil(prefix_pages / N)`` pages
   with the (never referenced) trash page — a *regular* in-place allgather,
   owner-major output, no reorder pass.
 - The chunk region is staged locally on the compute stream where the write
@@ -130,8 +130,7 @@ class PageInterleaveKVPoolMixin:
         self.device_module = torch.get_device_module(self.device)
 
         # Dedicated communicator + stream so the layer-ahead gathers never
-        # interleave with the group's main collectives (the layer-split
-        # template: dsa_cache_layer_split.py::_init_layer_broadcast_comm).
+        # interleave with the group's main collectives.
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
             group=shard_group.cpu_group, device=shard_group.device
         )
@@ -431,8 +430,7 @@ class PageInterleaveKVPoolMixin:
         ``set_kv_buffer``; the prefix ``kv_indices`` at every layer's
         ``get_mla_kv_buffer``) arrive at all layers of a forward, and the
         plan is frozen per epoch — so each distinct loc tensor is translated
-        once per batch instead of once per layer (~18 elementwise launches
-        per call; the ``_get_write_plan`` precedent below). The dict holds
+        once per batch instead of once per layer. The dict holds
         one entry per distinct loc tensor of the batch and is dropped on
         epoch change."""
         if self._translate_cache_epoch != self._epoch:

@@ -1175,8 +1175,6 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        # (KV sharding batches freely: admission is gated by the assembly-
-        # scratch reservation, _kv_shard_reserve_scratch.)
         if self.dsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
@@ -1350,12 +1348,10 @@ class PrefillAdder:
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
                 if self.kv_shard_granule:
-                    # Logical-page KV sharding: floor the absolute boundary
-                    # to the physical page so later chunks' prefixes stay
-                    # page-aligned (see add_chunked_req). Deferring (<= 0
-                    # below) when the budget cannot reach the first page
-                    # boundary matches the truncation_align_size behavior
-                    # above.
+                    # Floor the absolute boundary to the sharding granule so
+                    # later chunks' prefixes stay aligned. Redundant while the
+                    # granule equals self.page_size, and load-bearing if it
+                    # ever widens.
                     now_input_len = (
                         now_input_len // self.kv_shard_granule * self.kv_shard_granule
                     )

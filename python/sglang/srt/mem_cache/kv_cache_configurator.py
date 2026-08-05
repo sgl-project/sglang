@@ -1618,9 +1618,8 @@ class KVCacheConfigurator:
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
                     elif self.kv_shard_size > 1:
-                        # Logical-page sharding: index space widened xN over the
-                        # stock 1x pool, allocation granule = N physical pages
-                        # (the DCP configuration at page granularity).
+                        # Logical-page sharding: index space widened xN over
+                        # the stock 1x pool; the allocator page stays physical.
                         from sglang.srt.mem_cache.allocator.page_interleave import (
                             PageInterleavePoolAllocator,
                         )
@@ -1633,8 +1632,6 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
-                            # Carries the assembly-scratch capacities the
-                            # PrefillAdder gates batch admission on.
                             shard_spec=self.kv_shard_spec,
                         )
                     elif (

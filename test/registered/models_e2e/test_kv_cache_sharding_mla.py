@@ -19,9 +19,8 @@ page-interleaved stripe (~TPx unique KV capacity for the group), reads the
 prefix through the assembled scratch (chunked-prefix MHA path), and sends only
 its owned pages to decode (which pulls from every prefill TP rank).
 
-Modeled on the DSA cache-layer-split E2E test; uses the PD-disaggregation
-fixture because KV sharding is a PD-prefill-only feature. 4 GPUs: prefill
-TP2 on GPUs 0-1, decode TP2 on GPUs 2-3.
+Uses the PD-disaggregation fixture because KV sharding is a PD-prefill-only
+feature. 4 GPUs: prefill TP2 on GPUs 0-1, decode TP2 on GPUs 2-3.
 """
 
 import unittest
