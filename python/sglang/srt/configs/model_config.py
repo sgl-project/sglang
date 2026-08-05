@@ -192,13 +192,13 @@ def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
 
 
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_topk
 
 
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
-    assert is_deepseek_dsa(config)
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
 
     pattern = getattr(config, "index_topk_pattern", None)
     if pattern is not None:
@@ -220,7 +220,7 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_n_heads
 
 
