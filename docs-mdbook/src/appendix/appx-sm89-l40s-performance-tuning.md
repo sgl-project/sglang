@@ -915,3 +915,51 @@ curl -s localhost:8000/metrics | grep num_queue_reqs
 - 启动日志：脚本打印 `priority-scheduling: on/off`；
 - 需要单条请求元数据时可开 `--log-requests`；
 - 注：未设 `--default-priority-value` 时，未带 priority 的请求会显示为 `priority="None"`；脚本已默认设为 0。
+
+### 11.10 上下文窗口扩展分析（96K → 256K）与当前生产基线
+
+**当前生产基线（2026-08 线上，供后续对比）**
+
+| 指标 | 值 |
+|------|-----|
+| 单日总请求 | 16,454 |
+| AVG TTFT | 8.37s |
+| AVG E2E | 33.6s |
+| 配置 | 6卡 TP2 DP3 + MTP + 代理（tool_call=16 / thinking=12） |
+
+> 对照：无 MTP 基线 TTFT 4.37s / E2E 89.2s（2294 req）；MTP 高并发实测 TTFT 8.76s（2162 req）。8.37s 属 MTP 高并发正常水位，E2E 33.6s 中 decode 约 25.2s（长输出占比上升所致）。
+
+**Qwen3.6-27B 上下文 262144 可行性**
+
+模型支持 262144（原生 max_position_embeddings），L40S 上**技术上可行，但并发要砍到约 1/3**：
+
+| 项目 | 96K（现状） | 262144（目标） |
+|------|------------|---------------|
+| 每请求每卡 KV（TP2 分摊） | ~2GB（48K tokens/卡） | ~5.4GB（128K tokens/卡） |
+| KV 池（0.85，约 16GB/卡） | 793K tokens/卡 | 793K tokens/卡（不变） |
+| 满长度并发上限 | 12/worker（实测） | 约 3~4/worker |
+| MTP draft 头占用 | ~46K tokens/卡 | 同左 |
+
+推算依据：96K × 12/worker 时池子占用 ~99.7%（available 仅 2~4K），池子容量不变，256K 单请求占用为 96K 的 2.67 倍 → 12 ÷ 2.67 ≈ 4.5，留 MTP 与余量后 3~4/worker 较稳，DP3 总并发约 9~12。
+
+**真正的代价（不只是并发）**
+
+1. **TTFT 变长**：96K 单请求 prefill 约 1.35s，256K ≈ 3.5~4s+（无缓存），长请求一多互相拖，TTFT 破 10s 是常态；
+2. **缓存命中率下降**：池子被 256K 占满后 evict 更频繁，43% 命中率会下滑，prefill 计算量反增；
+3. **MTP 收益变小**：spec buffer 固定占 ~46K，长上下文下池子更紧，accept rate 可能下降。
+
+**结论与建议**
+
+- 先量实际 prompt 分布：代码检视若真实输入仅 20~50K，96K 上限完全够用（context-length 是上限不是常驻占用），**不要为参数好看牺牲并发**；
+- 确认有 150K+ 真实需求再做实验，验证命令：
+
+```bash
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --context-length 262144 \
+    --max-running-requests 3 \
+    --mem-fraction-static 0.88 \
+    --no-proxy
+```
+
+- 盯三个数：启动日志有无 "reduced from the requested"（池子被钳）、TTFT（长 prefill 底线）、`nvidia-smi` 显存；OOM 则退回 mem=0.85；
+- 生产若真上 256K，建议 PD 分离（长 prefill 单独处理）而非单实例硬扛。
