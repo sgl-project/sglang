@@ -74,8 +74,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
                     "ReplaySSM decode kernel; disable --enable-linear-replayssm."
                 )
             K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
+            # lower_bound is now supported in the ReplaySSM kernel
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
+                lower_bound=lower_bound,
                 a=a.reshape(B, num_v_heads, K).contiguous(),
                 b=b.reshape(B, num_v_heads).contiguous(),
                 A_log=A_log.reshape(-1),

@@ -33,7 +33,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda() or is_musa():
+if is_cuda() or is_musa() or is_hip():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
