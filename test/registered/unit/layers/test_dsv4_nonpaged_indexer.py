@@ -69,6 +69,110 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         self.assertIsNone(metadata.deep_gemm_metadata)
 
 
+class TestDSV4TopKDispatch(CustomTestCase):
+    def _run_raw_output_dispatch(self, *, use_v2: bool):
+        query_rows = 2
+        page_table = torch.tensor([[3, 1], [5, 2]], dtype=torch.int32)
+        c4_seq_lens = torch.tensor([64, 65], dtype=torch.int32)
+        page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        topk_metadata = torch.tensor([[0, 0]], dtype=torch.int32)
+
+        indexer_metadata = object.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.page_table = page_table
+        indexer_metadata.c4_seq_lens = c4_seq_lens
+        indexer_metadata.topk_metadata = topk_metadata
+
+        core_metadata = SimpleNamespace(
+            positions=torch.arange(query_rows, dtype=torch.int64),
+            page_table=page_table,
+            c4_sparse_page_indices=page_indices,
+            c4_sparse_raw_indices=raw_indices,
+        )
+        logits = torch.empty((query_rows, 65), dtype=torch.float32)
+        backend = SimpleNamespace(
+            token_to_kv_pool=object(),
+            forward_metadata=SimpleNamespace(
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+            ),
+            debug_use_external_c4_sparse_indices=False,
+            hisparse_coordinator=None,
+            dsa_topk_backend=SimpleNamespace(
+                is_torch=lambda: False,
+                is_flashinfer=lambda: False,
+            ),
+            _forward_prepare_normal=MagicMock(
+                return_value=(
+                    torch.empty((query_rows, 1, 128)),
+                    torch.empty((query_rows, 1, 1)),
+                )
+            ),
+            _get_nonpaged_indexer_plan=MagicMock(return_value=object()),
+            _forward_nonpaged_indexer=MagicMock(return_value=logits),
+        )
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=0)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        topk_v1 = MagicMock()
+        topk_v2 = MagicMock()
+        deep_gemm = SimpleNamespace(fp8_paged_mqa_logits=MagicMock())
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(use_v2),
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
+            patch(f"{_INDEXER}.topk_transform_512", topk_v1),
+            patch(f"{_INDEXER}.topk_transform_512_v2", topk_v2),
+        ):
+            C4IndexerBackendMixin.forward_c4_indexer(
+                backend,
+                x=torch.empty((query_rows, 1)),
+                q_lora=torch.empty((query_rows, 1)),
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+            )
+
+        return SimpleNamespace(
+            logits=logits,
+            c4_seq_lens=c4_seq_lens,
+            page_table=page_table,
+            page_indices=page_indices,
+            raw_indices=raw_indices,
+            topk_metadata=topk_metadata,
+            topk_v1=topk_v1,
+            topk_v2=topk_v2,
+        )
+
+    def test_raw_output_uses_v2_and_preserves_v1_fallback(self):
+        result = self._run_raw_output_dispatch(use_v2=True)
+        result.topk_v2.assert_called_once_with(
+            result.logits,
+            result.c4_seq_lens,
+            result.page_table,
+            result.page_indices,
+            64,
+            result.topk_metadata,
+            result.raw_indices,
+        )
+        result.topk_v1.assert_not_called()
+
+        result = self._run_raw_output_dispatch(use_v2=False)
+        result.topk_v1.assert_called_once_with(
+            result.logits,
+            result.c4_seq_lens,
+            result.page_table,
+            result.page_indices,
+            64,
+            result.raw_indices,
+        )
+        result.topk_v2.assert_not_called()
+
+
 class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
