@@ -12,7 +12,7 @@ output tensor must be untouched by the mode (bitwise equal).
 
 Tolerance is bf16-bound: production rings store rawk/rawv in conv dtype
 (bf16), so the fold re-quantizes k/v while the baseline snapshot keeps them
-in fp32 registers. SM100-only (CuTe DSL kernel contract).
+in fp32 registers.
 """
 
 import pytest
@@ -20,11 +20,16 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+# The verify backend this kernel serves is pinned to nv_cutedsl for any Kimi
+# hybrid model running speculative decoding, with no architecture gate (see
+# ``arg_groups/kimi_k3_hook.apply_kimi_k3_spec_backend_defaults``), so the
+# kernel is reachable on pre-Blackwell parts too and the parity check follows
+# it there. The GDN CuTe ring-verify parity test runs on the same pool.
+if not torch.cuda.is_available():
     pytest.skip(
-        "KDA CuTe MTP ReplaySSM ring parity needs SM100 (CuTe DSL kernel).",
+        "KDA CuTe MTP ReplaySSM ring parity needs CUDA.",
         allow_module_level=True,
     )
 
