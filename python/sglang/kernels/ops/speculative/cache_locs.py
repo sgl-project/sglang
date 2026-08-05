@@ -389,6 +389,89 @@ def assign_extend_cache_locs_uniform(
         tl.store(out_cache_ptr + o, data, mask=mask)
 
 
+@triton.jit
+def assign_extend_cache_locs_uniform_with_track(
+    req_pool_indices,
+    req_to_token,
+    start_offset,
+    out_cache_loc,
+    track_positions,
+    track_buffer_mapping,
+    track_indices_out,
+    track_map_stride,
+    pool_len: tl.constexpr,
+    draft_token_num: tl.constexpr,
+):
+    """assign_extend_cache_locs_uniform plus the mamba verify-track lookup
+    (``mapping[req_pool_indices[i], track_positions[i]]``), folding the
+    index_select + gather pair that set_mamba_track_indices_from_reqs would
+    launch into the same program."""
+    BLOCK_SIZE: tl.constexpr = 64
+    pid = tl.program_id(axis=0)
+    req = tl.load(req_pool_indices + pid).to(tl.int64)
+    kv_start = tl.load(start_offset + pid)
+    token_pool = req_to_token + req * pool_len
+    out_cache_ptr = out_cache_loc + pid * draft_token_num
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(draft_token_num, BLOCK_SIZE)
+    for i in range(num_loop):
+        o = offs + i * BLOCK_SIZE
+        mask = o < draft_token_num
+        data = tl.load(token_pool + kv_start + o, mask=mask)
+        tl.store(out_cache_ptr + o, data, mask=mask)
+
+    pos = tl.load(track_positions + pid).to(tl.int64)
+    track_index = tl.load(track_buffer_mapping + req * track_map_stride + pos)
+    tl.store(track_indices_out + pid, track_index)
+
+
+def assign_extend_cache_locs_uniform_with_track_func(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    track_positions: torch.Tensor,
+    track_buffer_mapping: torch.Tensor,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused spec verify prep: one launch producing both out_cache_loc and
+    the per-request mamba track indices."""
+    if _is_cuda or _is_hip or _is_musa or _is_xpu:
+        out_cache_loc = torch.empty(
+            (batch_size * draft_token_num,), dtype=torch.int64, device=device
+        )
+        track_indices = torch.empty((batch_size,), dtype=torch.int64, device=device)
+        assign_extend_cache_locs_uniform_with_track[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            out_cache_loc,
+            track_positions,
+            track_buffer_mapping,
+            track_indices,
+            track_buffer_mapping.stride(0),
+            req_to_token.shape[1],
+            draft_token_num,
+        )
+        return out_cache_loc, track_indices
+
+    out_cache_loc = assign_extend_cache_locs_uniform_func(
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        start_offset=start_offset,
+        batch_size=batch_size,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
+    track_indices = torch.gather(
+        track_buffer_mapping[req_pool_indices], 1, track_positions.unsqueeze(1)
+    ).squeeze(1)
+    return out_cache_loc, track_indices
+
+
 def assign_extend_cache_locs_uniform_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,

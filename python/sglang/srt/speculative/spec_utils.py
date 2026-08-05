@@ -761,10 +761,20 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
+    track_positions = mamba_verify_track_positions(batch)
+    if track_positions is None:
+        return
+    set_mamba_track_indices_from_reqs(batch, track_positions)
+    batch.mamba_track_mask = None
+    batch.mamba_track_seqlens = None
+
+
+def mamba_verify_track_positions(batch: ScheduleBatch) -> Optional[List[int]]:
+    """Per-req ping-pong track positions for TARGET_VERIFY prep; None when
+    the extra buffer is off."""
     server_args = get_server_args()
     if not server_args.enable_mamba_extra_buffer():
-        return
-    track_positions = None
+        return None
     if server_args.enable_mamba_extra_buffer_lazy():
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
@@ -773,9 +783,11 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
-    batch.mamba_track_mask = None
-    batch.mamba_track_seqlens = None
+        return track_positions
+    return [
+        req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+        for req in batch.reqs
+    ]
 
 
 def _verify_commit_step_indices(

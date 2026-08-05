@@ -495,13 +495,14 @@ def eagle_prepare_for_verify(
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
+        assign_extend_cache_locs_uniform_with_track_func,
     )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+    from sglang.srt.speculative.spec_utils import mamba_verify_track_positions
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -516,21 +517,42 @@ def eagle_prepare_for_verify(
         device = batch.device
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
-        # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        # critical path (bs=1 MTP inter-phase seam). With the mamba extra
+        # buffer, the same launch also resolves the verify track indices
+        # (mapping[req, ping_pong_pos]) that used to take an index_select +
+        # gather pair in prepare_mamba_track_for_verify.
+        track_positions = mamba_verify_track_positions(batch)
+        if track_positions is None:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
+        else:
+            track_positions_device = torch.tensor(
+                track_positions, dtype=torch.int64, pin_memory=True
+            ).to(device=device, non_blocking=True)
+            batch.out_cache_loc, batch.mamba_track_indices = (
+                assign_extend_cache_locs_uniform_with_track_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    start_offset=batch.seq_lens,
+                    batch_size=bs,
+                    draft_token_num=verify_input.draft_token_num,
+                    track_positions=track_positions_device,
+                    track_buffer_mapping=req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                    device=device,
+                )
+            )
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
         )
-
-        prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
         verify_input.seq_lens_cpu = batch.seq_lens_cpu
