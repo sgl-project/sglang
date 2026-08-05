@@ -12,14 +12,15 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=5,
+    stage="base-b",
+    runner_config="1-gpu-small",
+    disabled="refactor-fragile source-parsing unit test; skipped on CI",
+)
 
 # Skipped on CI: this hermetic check re-parses the InklingMoE forward source and
 # pins its exact stream-order, so it breaks on unrelated refactors of that
-# method. Skip until it is rebuilt against a stable seam.
-pytestmark = pytest.mark.skip(
-    reason="refactor-fragile source-parsing unit test; skipped on CI"
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 MOE_PATH = REPO_ROOT / "python/sglang/srt/models/inkling_common/moe.py"
