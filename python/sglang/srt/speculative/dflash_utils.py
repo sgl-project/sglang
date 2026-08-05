@@ -54,7 +54,17 @@ elif is_hip():
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
 
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    try:
+        from sgl_kernel import tree_speculative_sampling_target_only
+
+        # The ROCm sgl-kernel build omits csrc/speculative/speculative_sampling.cu
+        # while still shipping the Python wrapper, so importing the wrapper says
+        # nothing about callability; probe the registered op table instead.
+        _DFLASH_SAMPLING_VERIFY_AVAILABLE = hasattr(
+            torch.ops.sgl_kernel, "tree_speculative_sampling_target_only"
+        )
+    except Exception:
+        tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
