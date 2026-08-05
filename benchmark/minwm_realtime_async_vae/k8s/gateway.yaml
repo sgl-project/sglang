@@ -59,6 +59,7 @@ spec:
               --output-queue-depth=32
               --output-enqueue-timeout-s=0.5
               --lease-renew-interval-s=10
+              --release-grace-s=0.5
               --trace-log-group=${TRACE_LOG_GROUP}
           env:
             - name: POD_IP

@@ -35,6 +35,7 @@ class _Coordinator:
         self.denoiser_endpoint = denoiser_endpoint
         self.admitted = []
         self.released = []
+        self.released_at = None
 
     async def health(self):
         return {"status": "ready"}
@@ -71,6 +72,7 @@ class _Coordinator:
         return assignment
 
     async def release(self, assignment):
+        self.released_at = time.monotonic()
         self.released.append(assignment)
 
 
@@ -106,8 +108,10 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
     async def run():
         gateway_port = _free_port()
         denoiser_port = _free_port()
+        denoiser_close_started_at = None
 
         async def denoiser(connection):
+            nonlocal denoiser_close_started_at
             query = parse_qs(urlsplit(connection.request.path).query)
             session_id = query["session_id"][0]
             generation_id = query["generation_id"][0]
@@ -142,6 +146,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                         num_frames=1,
                     )
                 )
+                denoiser_close_started_at = time.monotonic()
                 await connection.close(code=1000, reason="generation complete")
 
         coordinator = _Coordinator(
@@ -155,6 +160,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                 f"ws://127.0.0.1:{gateway_port}/v1/internal/realtime_output"
             ),
             trace_query=_TraceQuery(),
+            release_grace_s=0.05,
         )
 
         async with serve(denoiser, "127.0.0.1", denoiser_port):
@@ -186,8 +192,8 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                     try:
                         while True:
                             messages.append(
-                                decode_message(
-                                    await asyncio.wait_for(browser.recv(), 2)
+                                    decode_message(
+                                    await asyncio.wait_for(browser.recv(), 4)
                                 )
                             )
                     except ConnectionClosedOK:
@@ -214,5 +220,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
 
         assert len(coordinator.admitted) == 1
         assert len(coordinator.released) == 1
+        assert denoiser_close_started_at is not None
+        assert coordinator.released_at - denoiser_close_started_at >= 0.045
 
     asyncio.run(run())

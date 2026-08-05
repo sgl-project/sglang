@@ -88,6 +88,30 @@ class _State(BaseRealtimeState):
         self.disposed = True
 
 
+def test_realtime_session_cleanup_precedes_server_close(monkeypatch):
+    events = []
+
+    async def cleanup(*_args):
+        events.append("cleanup")
+
+    async def close(*_args, **_kwargs):
+        events.append("close")
+
+    monkeypatch.setattr(realtime_video_api, "_cleanup_realtime_session", cleanup)
+    monkeypatch.setattr(realtime_video_api, "_close_realtime_websocket", close)
+    asyncio.run(
+        realtime_video_api._cleanup_realtime_session_then_close(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            None,
+            None,
+            (1000, "generation complete"),
+        )
+    )
+
+    assert events == ["cleanup", "close"]
+
+
 class _TestRealtimeDiffusionStage(RealtimeDiffusionStage):
     def forward(self, batch, component_manager=None):
         del batch, component_manager

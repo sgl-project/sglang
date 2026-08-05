@@ -1441,6 +1441,19 @@ async def _close_realtime_websocket(
         pass
 
 
+async def _cleanup_realtime_session_then_close(
+    websocket: WebSocket,
+    session: GenerateSession,
+    generate_task: asyncio.Task | None,
+    listen_task: asyncio.Task | None,
+    close_after_cleanup: tuple[int, str] | None,
+) -> None:
+    await _cleanup_realtime_session(session, generate_task, listen_task)
+    if close_after_cleanup is not None:
+        code, reason = close_after_cleanup
+        await _close_realtime_websocket(websocket, code=code, reason=reason)
+
+
 async def _wait_for_server_warmup(websocket: WebSocket) -> None:
     warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
     if warmup_done is not None and not warmup_done.is_set():
@@ -1509,6 +1522,7 @@ async def generate(websocket: WebSocket):
     generate_task = None
     listen_task = None
     watchdog_task = None
+    close_after_cleanup = None
     try:
         if controller is not None:
             try:
@@ -1581,11 +1595,7 @@ async def generate(websocket: WebSocket):
                 reason=init_close_reason,
                 phase="initialization",
             )
-            await _close_realtime_websocket(
-                ws,
-                code=1000,
-                reason=init_close_reason,
-            )
+            close_after_cleanup = (1000, init_close_reason)
             return
 
         # continuously generate video chunk
@@ -1597,11 +1607,7 @@ async def generate(websocket: WebSocket):
             wait_tasks.append(watchdog_task)
         await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
         if generate_task.done() and session.reached_max_chunks():
-            await _close_realtime_websocket(
-                ws,
-                code=1000,
-                reason="generation complete",
-            )
+            close_after_cleanup = (1000, "generation complete")
         elif watchdog_task is not None and watchdog_task.done():
             reason = await watchdog_task
             log_realtime_trace(
@@ -1610,7 +1616,7 @@ async def generate(websocket: WebSocket):
                 "server.session_watchdog_closed",
                 reason=reason,
             )
-            await _close_realtime_websocket(ws, code=1000, reason=reason)
+            close_after_cleanup = (1000, reason)
 
     except WebSocketDisconnect:
         log_realtime_trace(logger, session, "server.client_disconnected")
@@ -1623,7 +1629,13 @@ async def generate(websocket: WebSocket):
             if initialization_task is not None and not initialization_task.done():
                 initialization_task.cancel()
                 await _await_realtime_task(initialization_task)
-            await _cleanup_realtime_session(session, generate_task, listen_task)
+            await _cleanup_realtime_session_then_close(
+                ws,
+                session,
+                generate_task,
+                listen_task,
+                close_after_cleanup,
+            )
         finally:
             if lease is not None and controller is not None:
                 await controller.release(lease)

@@ -191,10 +191,13 @@ def create_app(
     output_queue_depth: int = 2,
     output_enqueue_timeout_s: float = 1.0,
     lease_renew_interval_s: float = 10.0,
+    release_grace_s: float = 0.5,
     connect_factory=connect,
     ui_config: dict[str, Any] | None = None,
     trace_query=None,
 ) -> FastAPI:
+    if release_grace_s < 0:
+        raise ValueError("release_grace_s must be non-negative")
     registry = GatewayOutputRegistry(
         queue_depth=output_queue_depth,
         enqueue_timeout_s=output_enqueue_timeout_s,
@@ -445,6 +448,8 @@ def create_app(
             await _cancel_tasks(tasks)
             if upstream is not None:
                 await upstream.close()
+                if release_grace_s:
+                    await asyncio.sleep(release_grace_s)
             if route is not None:
                 await registry.unregister(
                     session_id, generation_id, token=output_token
@@ -482,6 +487,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-queue-depth", type=int, default=2)
     parser.add_argument("--output-enqueue-timeout-s", type=float, default=1.0)
     parser.add_argument("--lease-renew-interval-s", type=float, default=10.0)
+    parser.add_argument("--release-grace-s", type=float, default=0.5)
     parser.add_argument("--trace-log-group")
     return parser.parse_args()
 
@@ -512,6 +518,7 @@ def main() -> None:
         output_queue_depth=args.output_queue_depth,
         output_enqueue_timeout_s=args.output_enqueue_timeout_s,
         lease_renew_interval_s=args.lease_renew_interval_s,
+        release_grace_s=args.release_grace_s,
         trace_query=trace_query,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
