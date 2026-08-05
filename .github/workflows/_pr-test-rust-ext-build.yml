@@ -36,9 +36,9 @@ on:
         type: string
         default: rust-ext-x86_64
       cache_key_prefix:
-        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch, since the modules are not portable across architectures.'
+        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
         type: string
-        default: rust-ext-x86_64
+        default: rust-ext-x86_64-cp310-cp312
       max_glibc:
         description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
         type: string
@@ -139,14 +139,25 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No crate sets abi3, so the ABI tag is minor-version specific and only the
-      # pools on this version can use the result - h20 ships 3.12 and falls back to
-      # compiling during install. Pinned rather than left to the image so the tag is
-      # at least predictable.
+      # No crate sets abi3, so the ABI tag is minor-version specific. Build one
+      # module set per interpreter minor the test pools run - the images are not
+      # on one version (h100 ships 3.10, h20 ships 3.12) - so every pool skips
+      # the install-time compile, not only the 3.10 ones. The EXT_SUFFIX in the
+      # filename keeps the sets apart in one cache entry, and
+      # require_prebuilt_rust_exts picks whichever matches the local
+      # interpreter. Pinned rather than left to the image so the tags are at
+      # least predictable.
       - name: Set up Python 3.10
+        id: py310
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Set up Python 3.12
+        id: py312
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install protoc and Rust toolchain
         run: bash scripts/ci/utils/install_rust_protoc.sh
@@ -171,16 +182,22 @@ jobs:
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
           # Per-job path: these runners are persistent and shared, so a fixed one
           # both inherits the previous job's venv and races a concurrent build.
-          venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv}" || true' EXIT
-          uv venv "${venv}" --python python3.10 --seed
-          # shellcheck disable=SC1091
-          source "${venv}/bin/activate"
-          uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
-          cd python
-          SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace
+          trap 'rm -rf "${venv_root}" || true' EXIT
+          # One venv and one inplace build per interpreter; the EXT_SUFFIX names
+          # keep the module sets from clobbering each other.
+          for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
+              minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+              venv="${venv_root}/py${minor}"
+              uv venv "${venv}" --python "${python_bin}" --seed
+              # shellcheck disable=SC1091
+              source "${venv}/bin/activate"
+              uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
+              (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+              deactivate
+          done
 
       - name: Verify modules and stage for upload
         env:
