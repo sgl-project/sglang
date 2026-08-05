@@ -62,14 +62,26 @@ pub(super) fn apply_event_transformations_inplace(
     let mut changed = false;
 
     // 1. Apply rewrite_streaming_block logic (store, previous_response_id, tools masking)
-    // Get event_type as owned String to avoid borrow conflict with mutable operations below
-    let event_type = parsed_data
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let should_patch = is_response_event(event_type);
-    // Need owned copy for the match below since we mutate parsed_data
-    let event_type = event_type.to_string();
+    // Classify the event type into an enum before taking any mutable borrow of
+    // parsed_data. This avoids the previous pattern of calling `.to_string()` on
+    // every token just to appease the borrow checker.
+    enum EventAction {
+        AddedOrDone,
+        ArgsDone,
+        Other,
+    }
+    let (should_patch, event_action) = {
+        let t = parsed_data
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let action = match t {
+            OutputItemEvent::ADDED | OutputItemEvent::DONE => EventAction::AddedOrDone,
+            FunctionCallEvent::ARGUMENTS_DONE => EventAction::ArgsDone,
+            _ => EventAction::Other,
+        };
+        (is_response_event(t), action)
+    };
 
     if should_patch {
         if let Some(response_obj) = parsed_data
@@ -124,8 +136,8 @@ pub(super) fn apply_event_transformations_inplace(
     }
 
     // 2. Apply transform_streaming_event logic (function_call → mcp_call)
-    match event_type.as_str() {
-        OutputItemEvent::ADDED | OutputItemEvent::DONE => {
+    match event_action {
+        EventAction::AddedOrDone => {
             if let Some(item) = parsed_data.get_mut("item") {
                 if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                     if is_function_call_type(item_type) {
@@ -145,7 +157,7 @@ pub(super) fn apply_event_transformations_inplace(
                 }
             }
         }
-        FunctionCallEvent::ARGUMENTS_DONE => {
+        EventAction::ArgsDone => {
             parsed_data["type"] = json!(McpEvent::CALL_ARGUMENTS_DONE);
 
             // Transform item_id from fc_* to mcp_*
@@ -158,7 +170,7 @@ pub(super) fn apply_event_transformations_inplace(
 
             changed = true;
         }
-        _ => {}
+        EventAction::Other => {}
     }
 
     changed
