@@ -143,6 +143,51 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if algo is not None:
         algo.handle_server_args(server_args)
 
+    _validate_dcp_spec_topk(server_args)
+
+
+def _validate_dcp_spec_topk(server_args: ServerArgs) -> None:
+    """Reject tree drafting (topk > 1) under decode context parallelism.
+
+    The DCP verify path resolves each draft token's causal bound from its
+    GLOBAL position (``causal_seqs`` = prefix + T), which can only express a
+    linear draft chain; a tree draft would need tree-causal masking in the
+    verify kernel, which is not implemented.
+
+    Scoped to the EAGLE family on purpose: DSPARK draws a one-shot block and
+    does not resolve ``speculative_eagle_topk``, so gating it here would risk
+    newly rejecting the Kimi-Linear + DSPARK + DCP path that already ships.
+
+    Runs after the per-algorithm handler so speculative_eagle_topk is resolved
+    (auto-choose -> int, DFLASH forced to 1). getattr: unit tests drive this
+    hook with duck-typed ServerArgs mocks.
+    """
+    if (
+        server_args.speculative_algorithm is None
+        or getattr(server_args, "dcp_size", 1) <= 1
+    ):
+        return
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    # NB: is_dflash(), NOT is_dflash_family() -- the latter is
+    # is_dflash() or is_dspark(), which would pull DSPARK back in.
+    chain_drafting_algo = getattr(algo, "is_eagle", lambda: False)() or getattr(
+        algo, "is_dflash", lambda: False
+    )()
+    if not chain_drafting_algo:
+        return
+
+    topk = getattr(server_args, "speculative_eagle_topk", None)
+    if (topk or 1) > 1:
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) supports only chain "
+            "speculative drafts: the DCP verify path folds the draft tokens as "
+            "a linear causal chain. Set --speculative-eagle-topk 1, or run "
+            "without --dcp-size."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
