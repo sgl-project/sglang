@@ -373,7 +373,12 @@ def maybe_write_dsv4_decode(
         )
 
 
-def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
+def maybe_build_dsv4_verify_bundle(
+    batch: ScheduleBatch,
+    draft_token_num: int,
+    *,
+    live_seq_lens_cpu: torch.Tensor | None = None,
+):
     """Build the DSV4 cache-location view for one target-verify pass.
 
     Spec-v2 reserves cache ahead of time, so target verify must select only the
@@ -388,13 +393,22 @@ def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
         return None
 
     req_indices = batch.req_pool_indices_cpu.tolist()
-    seq_lens = batch.seq_lens_cpu.tolist()
+
+    if live_seq_lens_cpu is None:
+        live_seq_lens_cpu = batch.seq_lens_cpu
+    if live_seq_lens_cpu is None:
+        live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
+    live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
+
+    verify_lens = [int(draft_token_num)] * len(req_indices)
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         chunks = []
-        for req_idx, seq_len in zip(req_indices, seq_lens):
-            start = int(seq_len) // ratio
-            end = (int(seq_len) + draft_token_num) // ratio
+        for req_idx, live_seq_len, verify_len in zip(
+            req_indices, live_seq_lens, verify_lens
+        ):
+            start = int(live_seq_len) // ratio
+            end = (int(live_seq_len) + int(verify_len)) // ratio
             if end > start:
                 chunks.append(table[int(req_idx), start:end])
         return torch.cat(chunks) if chunks else table.new_empty((0,))

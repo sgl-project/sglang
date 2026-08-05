@@ -430,12 +430,23 @@ class DraftBlockProposer:
     ) -> None:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        # Graph bucket selection uses the raw per-rank request counts.  Keep
+        # them separate from global_num_tokens_cpu below, which is scaled into
+        # draft-token units for DP/MoE synchronization.
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
+        num_token_non_padded = int(forward_batch.input_ids.numel())
+        forward_batch.num_token_non_padded = torch.tensor(
+            num_token_non_padded,
+            dtype=torch.int32,
+            device=device,
+        )
+        forward_batch.num_token_non_padded_cpu = num_token_non_padded
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
