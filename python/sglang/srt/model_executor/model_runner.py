@@ -1148,6 +1148,16 @@ class ModelRunner:
         self.startup_weight_load.start_prefetch()
 
     def finalize_startup_weight_load(self) -> None:
+        """Commit the real weights, then run the post-load barrier.
+
+        The barrier moves here because ``load_model`` returns with sentinel
+        values under overlap, so this is the first point at which "weights are
+        loaded" is true for this rank. It follows the commit and its validation
+        deliberately: a rank that fails to commit must not report readiness. A
+        commit failure is terminal for the process, so peer ranks observe it as
+        a barrier timeout rather than a clean collective abort, which matches
+        the existing startup contract for load failures.
+        """
         assert self.startup_weight_load is not None
         self.startup_weight_load.finalize()
         dist_barrier_after_load(

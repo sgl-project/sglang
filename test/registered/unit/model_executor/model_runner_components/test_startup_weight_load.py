@@ -454,6 +454,32 @@ class TestStartupWeightLoadManager(CustomTestCase):
         warning.assert_called_once()
         self.assertIn("falling back", warning.call_args.args[2])
 
+    def test_stop_timeout_after_commit_does_not_fail_startup(self):
+        trace = []
+        model = _TiedWeightModel()
+        loader = _RecordingLoader(model, trace)
+
+        def _stop_times_out(timeout=None):
+            trace.append("stop_prefetch")
+            raise TimeoutError("Timed out waiting for checkpoint prefetching")
+
+        loader.prefetch_handle.stop = _stop_times_out
+        manager = self._manager(loader)
+        manager.prepare()
+        manager.start_prefetch()
+
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+            patch(f"{_STARTUP_MODULE}.logger.warning") as warning,
+        ):
+            manager.finalize()
+
+        self.assertEqual(manager.state, StartupWeightLoadState.READY)
+        self.assertIn("stop_prefetch", trace)
+        warning.assert_called_once()
+        self.assertIn("did not stop within its timeout", warning.call_args.args[0])
+
     def test_start_prefetch_requires_capture_ready_and_starts_once(self):
         trace = []
         manager = self._manager(_RecordingLoader(nn.Linear(2, 2), trace))

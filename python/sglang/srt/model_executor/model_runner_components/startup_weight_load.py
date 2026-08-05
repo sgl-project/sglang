@@ -187,6 +187,11 @@ class ModelStorageManifest:
                 (f"{kind}:{name}", TensorStorageMetadata.from_tensor(tensor))
                 for name, tensor in tensors
             )
+        # Sort by name only. The explicit key is required, not stylistic: a bare
+        # sorted() would fall back to comparing TensorStorageMetadata whenever two
+        # entries share a name, and that dataclass is intentionally not ordered.
+        # Sorting also makes unchanged_parameter_names() report a deterministic
+        # name for tensors aliased under several names (e.g. tied embeddings).
         return cls(tensors=tuple(sorted(entries, key=lambda entry: entry[0])))
 
     def changed_names(self, model: nn.Module) -> Tuple[str, ...]:
@@ -201,6 +206,16 @@ class ModelStorageManifest:
         )
 
     def unchanged_parameter_names(self, value: float) -> Tuple[str, ...]:
+        """Return floating-point parameters still entirely equal to ``value``.
+
+        This is the capture-sentinel check, and it is deliberately strict: every
+        floating-point parameter must be rewritten by ``model.load_weights()``.
+        A model that keeps an ``__init__``-computed floating-point parameter with
+        no checkpoint entry will fail startup here rather than silently serve the
+        sentinel, so this doubles as the admission gate for widening
+        ``_SUPPORTED_ARCHITECTURES``. Buffers are excluded because
+        ``initialize_capture_safe_weights`` never overwrites them.
+        """
         names = []
         checks = []
         seen_tensor_ids = set()
@@ -249,6 +264,34 @@ class StartupWeightLoadManager:
         self._prefetch_failure_reported = False
 
     @classmethod
+    def create_from_server_args(
+        cls,
+        *,
+        loader,
+        model_config: ModelConfig,
+        load_config: LoadConfig,
+        device_config: DeviceConfig,
+        server_args: ServerArgs,
+        is_draft_worker: bool,
+    ) -> StartupWeightLoadManager:
+        """Build a manager straight from ``ServerArgs``.
+
+        Callers on the model-loading path only decide *whether* to overlap; the
+        knowledge of which server arguments matter, and every support rule,
+        stays in this module.
+        """
+        return cls.create(
+            loader=loader,
+            model_config=model_config,
+            load_config=load_config,
+            device_config=device_config,
+            options=StartupWeightLoadOptions.from_server_args(
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
+            ),
+        )
+
+    @classmethod
     def create(
         cls,
         *,
@@ -285,9 +328,18 @@ class StartupWeightLoadManager:
         options: StartupWeightLoadOptions,
     ) -> Optional[str]:
         architectures = tuple(model_config.hf_config.architectures or ())
-        # NOTE(2026-08): TP1/TP2 and FP16/BF16 are deliberate hard gates for
-        # the first overlap rollout. Broaden them only with storage-stability,
-        # capture-sentinel, and startup correctness coverage for the new case.
+        # NOTE(2026-08): every rule below is a hard gate for the first overlap
+        # rollout, and TP<=2 plus FP16/BF16 are the two the support matrix is
+        # most likely to be widened past. Broadening any of them requires
+        # storage-stability, capture-sentinel, and startup correctness coverage
+        # for the new case; the staged plan is described in the PR that
+        # introduced this module and lands in its PR 2 / PR 3 follow-ups.
+        #
+        # The rules stay here, on the manager, rather than being split into a
+        # ServerArgs pre-check: they are evaluated against the resolved loader,
+        # load format, model config, and model class, so a ServerArgs-only copy
+        # would cover a strict subset and would be a second place to keep in
+        # sync. ServerArgs only owns the mode value itself.
         basic_rules = (
             (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
@@ -507,10 +559,20 @@ class StartupWeightLoadManager:
     def _stop_prefetch(self) -> None:
         if self._prefetch_handle is None:
             return
-        if self._prefetch_handle.done:
-            self._prefetch_handle.wait()
-        else:
-            self._prefetch_handle.stop()
+        try:
+            if self._prefetch_handle.done:
+                self._prefetch_handle.wait()
+            else:
+                self._prefetch_handle.stop()
+        except TimeoutError:
+            # Only reached after the real weights are committed and validated,
+            # so a stager that outlives its stop timeout must not fail an
+            # otherwise-successful startup. The worker is a daemon thread and
+            # cannot keep the process alive.
+            logger.warning(
+                "Checkpoint prefetch did not stop within its timeout after the "
+                "weight commit; leaving the daemon stager to exit on its own."
+            )
         self._report_prefetch_failure(falling_back=False)
         self._prefetch_handle = None
 

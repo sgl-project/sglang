@@ -297,18 +297,15 @@ def load_model_with_memory_saver(
         if server_args.is_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
-                StartupWeightLoadOptions,
             )
 
-            startup_weight_load = StartupWeightLoadManager.create(
+            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
                 loader=loader,
                 model_config=model_config,
                 load_config=load_config,
                 device_config=device_config,
-                options=StartupWeightLoadOptions.from_server_args(
-                    server_args=server_args,
-                    is_draft_worker=is_draft_worker,
-                ),
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
             )
             model = startup_weight_load.prepare()
         else:

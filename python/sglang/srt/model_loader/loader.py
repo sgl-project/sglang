@@ -809,7 +809,22 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
         model_config: ModelConfig,
     ) -> nn.Module:
-        """Initialize final storage with values safe for graph warmup."""
+        """Initialize final storage with values safe for graph warmup.
+
+        Mirrors the post-initialization sequence of ``DummyModelLoader``, except
+        that parameters are filled with a detectable sentinel instead of random
+        values so ``commit_model_weights`` can prove every one of them was
+        replaced.
+
+        Note that this runs ``process_weights_after_loading`` on the sentinel
+        values, and ``commit_model_weights`` runs it again on the real weights,
+        so overlap invokes it once more than the serial path. That is safe for
+        the currently supported matrix, where the CUDA unquantized path is a
+        no-op, and it is not covered by the storage manifest, which proves
+        tensor identity rather than idempotence. Any quantization method that
+        mutates weights in place therefore has to be evaluated here before its
+        configuration is added to the supported set.
+        """
         with set_default_torch_dtype(model_config.dtype):
             initialize_capture_safe_weights(model)
             _post_load_weights(model)
