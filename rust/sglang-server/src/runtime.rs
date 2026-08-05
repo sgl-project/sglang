@@ -27,6 +27,7 @@ use crate::ring::{
 };
 use crate::runtime::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::utils::sock::bind_tcp_listener;
 use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
 
 // Re-export so stages keep importing `crate::runtime::Runnable`.
@@ -92,33 +93,6 @@ impl Drop for Runtime {
 /// so the Python caller regains control of the GIL immediately. `Err` on a
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
-    // Bind the API server port before spawning any thread, so an unavailable
-    // port (EADDRINUSE) is a hard startup error. socket2 rather than
-    // `std::net::TcpListener` so SO_RCVBUF can be set before `listen`.
-    let addr = cfg.rust_server_args.http_addr;
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )
-    .map_err(|e| format!("socket for {addr} failed: {e}"))?;
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| format!("set_reuseaddr failed: {e}"))?;
-    if let Err(e) = socket.set_recv_buffer_size(16 * 1024 * 1024) {
-        eprintln!("warning: set_recv_buffer_size on listener failed: {e}");
-    }
-    socket
-        .bind(&addr.into())
-        .map_err(|e| format!("bind {addr} failed: {e}"))?;
-    socket
-        .listen(1024)
-        .map_err(|e| format!("listen on {addr} failed: {e}"))?;
-    let listener: std::net::TcpListener = socket.into();
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
-
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -268,6 +242,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let senders = senders.clone();
         let api_activity = egress_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
+        // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
+        // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
+        // launcher process.
+        let http_addr = cfg.rust_server_args.http_addr;
+        let listener = bind_tcp_listener(http_addr)
+            .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
