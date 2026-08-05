@@ -126,7 +126,7 @@ class EncoderScheduler:
                 pending.future.cancel()
             req_id = request.get("req_id")
             # Free anything the abandoned batch may still stage for this rid.
-            self.encoder.discard_embedding(req_id)
+            await self.encoder.release_request(req_id)
             logger.error(
                 f"EncoderScheduler.submit timed out after {self.request_timeout}s "
                 f"for req_id={req_id}"
@@ -189,6 +189,12 @@ class EncoderScheduler:
     async def _dispatch_group(
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
+        # A request may time out while queued. Never start work that no caller
+        # can observe, or its eventual staged embedding would have no owner.
+        group = [pending for pending in group if not pending.future.done()]
+        if not group:
+            return
+
         # Video can't fuse (per-video preprocess kwargs vary).
         if modality not in _BATCHABLE_MODALITIES:
             await self._dispatch_per_request(group, modality)
@@ -272,6 +278,8 @@ class EncoderScheduler:
     ) -> None:
         modality_str = modality.name.lower()
         for p in group:
+            if p.future.done():
+                continue
             req = p.request
             try:
                 start = time.time()
@@ -281,7 +289,14 @@ class EncoderScheduler:
                     )
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))
-                result = await self.encoder.encode_request(req, modality)
+                result = await self.encoder.encode(
+                    mm_items=req["mm_items"],
+                    modality=modality,
+                    req_id=req["req_id"],
+                    num_parts=req["num_parts"],
+                    part_idx=req["part_idx"],
+                    hashes=req.get("hashes"),
+                )
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
@@ -337,6 +352,7 @@ class DPDispatcher:
             {} for _ in range(dp_size)
         ]
         self.req_id_to_rank: Dict[str, int] = {}
+        self._mapping_condition = asyncio.Condition()
         self._rr_counter = 0
         self._broadcast_counter = 0
         self._dead_ranks: Set[int] = set()
@@ -402,6 +418,10 @@ class DPDispatcher:
         ).to_host_port_str()
         return f"{req_id}_send_{endpoint}"
 
+    @staticmethod
+    def _register_req_key(req_id: str, request: dict) -> str:
+        return f"{req_id}_register_{request['receive_url']}"
+
     def _fail_pending_for_rank(self, rank: int, reason: str, error_type: str) -> None:
         # Resolve a rank's outstanding futures with 503 so awaiters don't hang.
         pending = self.pending_futures[rank]
@@ -453,7 +473,6 @@ class DPDispatcher:
         rank = candidates[self._rr_counter % len(candidates)]
         self._rr_counter += 1
         req_id = request["req_id"]
-        self.req_id_to_rank[req_id] = rank
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
         self._update_pending_gauge()
@@ -464,7 +483,21 @@ class DPDispatcher:
         )
 
         try:
-            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
+            # Do not let a concurrent /scheduler_receive_url route to this
+            # worker until the corresponding encode message is enqueued first.
+            # Both messages share the same PUSH socket, so releasing the
+            # condition after send preserves their required order.
+            async with self._mapping_condition:
+                self.req_id_to_rank[req_id] = rank
+                try:
+                    await async_sock_send(
+                        self.dispatch_sockets[rank], wrap_as_pickle(request)
+                    )
+                except BaseException:
+                    self._drop_pending_and_mapping(rank, req_id)
+                    self._mapping_condition.notify_all()
+                    raise
+                self._mapping_condition.notify_all()
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
             # the watchdog, so bound the wait explicitly.
             return await asyncio.wait_for(
@@ -479,6 +512,68 @@ class DPDispatcher:
             )
         except BaseException:
             self._drop_pending_and_mapping(rank, req_id)
+            raise
+
+    async def dispatch_register_destinations(self, request: dict) -> dict:
+        """Route a scheduler receive URL to the DP worker owning ``req_id``."""
+        req_id = request["req_id"]
+        deadline = time.monotonic() + min(5.0, encode_server_module.ENCODER_REQ_TIMEOUT)
+        async with self._mapping_condition:
+            while req_id not in self.req_id_to_rank:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "req_id": req_id,
+                        "_error": f"Unknown req_id: {req_id}",
+                        "_error_code": int(HTTPStatus.NOT_FOUND),
+                    }
+                try:
+                    await asyncio.wait_for(
+                        self._mapping_condition.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    return {
+                        "req_id": req_id,
+                        "_error": f"Unknown req_id: {req_id}",
+                        "_error_code": int(HTTPStatus.NOT_FOUND),
+                    }
+            rank = self.req_id_to_rank[req_id]
+
+        if rank in self._dead_ranks:
+            return {
+                "req_id": req_id,
+                "_error": f"DP worker rank={rank} died before URL registration",
+                "_error_code": int(HTTPStatus.SERVICE_UNAVAILABLE),
+            }
+
+        key = self._register_req_key(req_id, request)
+        future = asyncio.get_running_loop().create_future()
+        self.pending_futures[rank][key] = future
+        self._update_pending_gauge()
+        worker_request = {
+            **request,
+            "_dp_type": "register_destinations",
+            "_dp_register_key": key,
+        }
+        try:
+            await async_sock_send(
+                self.dispatch_sockets[rank], wrap_as_pickle(worker_request)
+            )
+            return await asyncio.wait_for(
+                future, timeout=encode_server_module.ENCODER_REQ_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            self.pending_futures[rank].pop(key, None)
+            self._update_pending_gauge()
+            return self._timeout_envelope(
+                req_id,
+                "register_destinations",
+                f"Encoder DP rank={rank} URL registration timed out after "
+                f"{encode_server_module.ENCODER_REQ_TIMEOUT}s",
+            )
+        except BaseException:
+            self.pending_futures[rank].pop(key, None)
+            self._update_pending_gauge()
             raise
 
     async def dispatch_send(self, request: dict) -> dict:
@@ -679,6 +774,14 @@ class DPDispatcher:
                         f"for req_id={req_id}, dropping"
                     )
                     continue
+            elif dp_type == "register_destinations":
+                key = msg.get("_dp_register_key")
+                if key is None:
+                    logger.warning(
+                        f"_result_listener: URL registration envelope without "
+                        f"_dp_register_key for req_id={req_id}, dropping"
+                    )
+                    continue
             else:
                 key = req_id
             rank = self.req_id_to_rank.get(req_id)
@@ -693,12 +796,21 @@ class DPDispatcher:
             # Each decoder TP rank sends against the same req_id, so dropping the
             # mapping on the first /send leaves the siblings unroutable. Refresh
             # the timestamp instead and let the stale-mapping sweep evict it.
-            keep_mapping = dp_type == "send" or (
-                dp_type == "encode" and msg.get("content") is not None
+            register_prefix = f"{req_id}_register_"
+            has_pending_registration = any(
+                pending_key.startswith(register_prefix)
+                for pending_key in self.pending_futures[rank]
             )
-            if keep_mapping:
+            keep_mapping = (
+                dp_type in ("send", "register_destinations")
+                or (dp_type == "encode" and msg.get("content") is not None)
+                or has_pending_registration
+            )
+            if dp_type == "send" or (
+                dp_type == "encode" and msg.get("content") is not None
+            ):
                 self._pending_send_at[req_id] = time.monotonic()
-            else:
+            if not keep_mapping:
                 self.req_id_to_rank.pop(req_id, None)
             try:
                 future.set_result(msg)
@@ -708,6 +820,15 @@ class DPDispatcher:
                     f"_result_listener: future already done for "
                     f"req_id={req_id}, dp_type={dp_type}, key={key}"
                 )
+
+            if dp_type == "register_destinations":
+                encode_still_pending = req_id in self.pending_futures[rank]
+                other_registration_pending = any(
+                    pending_key.startswith(register_prefix)
+                    for pending_key in self.pending_futures[rank]
+                )
+                if not encode_still_pending and not other_registration_pending:
+                    self.req_id_to_rank.pop(req_id, None)
 
     async def _cleanup_stale_mappings(self) -> None:
         # Evict req_id->rank mappings whose /send never came. The worker frees
@@ -729,44 +850,78 @@ class DPDispatcher:
                 )
 
 
-async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
-    # No-op for mooncake (its /send is separate). embedding_port=None is
-    # rejected upfront, so ports is always a concrete list here.
+async def _push_embedding_to_prefill(
+    enc: MMEncoder,
+    request: dict,
+    *,
+    background_url_send: bool = False,
+) -> None:
+    """Deliver a staged ZMQ result and release it after the send completes."""
     req_id = request["req_id"]
-    backend = enc.server_args.encoder_transfer_backend
+    backend = enc.transfer_backend
+
+    if backend == "mooncake":
+        return
+
+    if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
+        send_coro = enc.send_with_url(req_id=req_id)
+        if background_url_send:
+            task = asyncio.create_task(send_coro)
+            enc.background_tasks.add(task)
+            task.add_done_callback(enc.background_tasks.discard)
+        else:
+            await send_coro
+        return
 
     if backend == "zmq_to_tokenizer":
-        await enc.send(
-            req_id=req_id,
-            prefill_host=request["prefill_host"],
-            embedding_port=request["embedding_port"],
-        )
-        enc.discard_embedding(req_id)
+        try:
+            await enc.send(
+                req_id=req_id,
+                prefill_host=request["prefill_host"],
+                embedding_port=request["embedding_port"],
+            )
+        finally:
+            await enc.release_request(req_id)
         return
 
     if backend == "zmq_to_scheduler":
         ports = request["embedding_port"]
         assert isinstance(ports, list)
-        await asyncio.gather(
-            *(
-                enc.send(
-                    req_id=req_id,
-                    prefill_host=request["prefill_host"],
-                    embedding_port=p,
+        try:
+            await asyncio.gather(
+                *(
+                    enc.send(
+                        req_id=req_id,
+                        prefill_host=request["prefill_host"],
+                        embedding_port=p,
+                    )
+                    for p in ports
                 )
-                for p in ports
             )
+        finally:
+            await enc.release_request(req_id)
+
+
+def _record_pipeline_result(modality: Modality, status: str) -> None:
+    if encode_server_module.encoder_metrics_collector is not None:
+        encode_server_module.encoder_metrics_collector.inc_requests_total(
+            modality=modality.name.lower(), status=status
         )
-        enc.discard_embedding(req_id)
 
 
-async def _dp_worker_encode_and_send(
+async def execute_encode_pipeline(
     enc: MMEncoder,
     sched: Optional[EncoderScheduler],
     request: dict,
+    *,
+    send_sockets: Optional[List[zmq.Socket]] = None,
 ) -> Optional[dict]:
-    # Mooncake returns metadata for main to forward; zmq inlines the send.
-    # Soft errors raise MMError so the dispatcher route maps them to HTTP.
+    """Run the shared HTTP/DP and Mooncake/ZMQ request lifecycle.
+
+    Every backend publishes preprocess metadata. Mooncake has early consumers
+    and keeps the result until follow-up /send calls complete. ZMQ has no early
+    consumer: it waits for encode, sends the embedding, releases it, then returns.
+    """
     req_id = request["req_id"]
     time_stats_json = request.pop("time_stats_json", None)
     time_stats = EncoderReqTimeStats()
@@ -774,66 +929,111 @@ async def _dp_worker_encode_and_send(
         time_stats.decode_json(time_stats_json)
     request["enter_time"] = time.time()
     modality = Modality.from_str(request["modality"])
-    time_stats.modality = modality.name.lower()
+    modality_str = modality.name.lower()
+    time_stats.modality = modality_str
     time_stats.set_metrics_collector(encode_server_module.encoder_metrics_collector)
-    backend = enc.server_args.encoder_transfer_backend
+    backend = enc.transfer_backend
 
-    # URL state lives in main process module globals; workers don't see it.
-    if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
-        raise MMError(
-            "Encoder DP mode does not support zmq_to_scheduler with "
-            "embedding_port=None (URL state isn't synchronised to workers). "
-            "Provide an explicit embedding_port list, switch to mooncake / "
-            "zmq_to_tokenizer, or run without --dp-size.",
-            code=HTTPStatus.BAD_REQUEST,
+    if encode_server_module.encoder_metrics_collector is not None:
+        encode_server_module.encoder_metrics_collector.inc_requests_received(
+            modality=modality_str
         )
 
     time_stats.set_mm_encode_start_time()
-    encode_coro = (
-        sched.submit(request)
-        if sched is not None and modality in _BATCHABLE_MODALITIES
-        else enc.encode_request(request, modality)
-    )
     try:
-        nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+        if sched is not None and modality in _BATCHABLE_MODALITIES:
+            result = await sched.submit(request)
+        elif send_sockets is not None:
+            # Non-DP TP followers must enter collectives in the same order as rank 0.
+            async with enc.encode_dispatch_lock:
+                for socket in send_sockets:
+                    sock_send(socket, wrap_as_pickle(request))
+                result = await enc.encode(
+                    mm_items=request["mm_items"],
+                    modality=modality,
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                    hashes=request.get("hashes"),
+                )
+        else:
+            result = await enc.encode(
+                mm_items=request["mm_items"],
+                modality=modality,
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+                hashes=request.get("hashes"),
+            )
     except asyncio.TimeoutError:
-        time_stats.trace_ctx.abort(abort_info={"reason": "encoder batch timed out"})
+        error_msg = "encoder batch timed out"
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        await encode_server_module.meta_registry.publish(
+            req_id, 0, 0, 0, error=error_msg
+        )
+        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        _record_pipeline_result(modality, "error")
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        await encode_server_module.meta_registry.publish(
+            req_id, 0, 0, 0, error=error_msg
+        )
+        await enc.release_request(req_id, preserve_metadata=backend == "mooncake")
+        _record_pipeline_result(modality, "error")
         raise
 
+    nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        # zmq backends still forward an error EmbeddingData to P so it
-        # doesn't block; send failures here are swallowed.
-        try:
-            await _push_embedding_to_prefill(enc, request)
-        except Exception as e:
-            logger.error(
-                f"DP error-send failed for req_id={req_id}: {e}", exc_info=True
-            )
-        # Free the error EmbeddingData or it pins /health into "busy": mooncake's
-        # _push_embedding_to_prefill is a no-op and a swallowed zmq send failure
-        # above skips its own pop. The main process publishes the error.
-        enc.discard_embedding(req_id)
+        await encode_server_module.meta_registry.publish(
+            req_id, 0, 0, 0, error=error_msg
+        )
+        if backend == "mooncake":
+            await enc.release_request(req_id, preserve_metadata=True)
+        else:
+            try:
+                await _push_embedding_to_prefill(
+                    enc,
+                    request,
+                    background_url_send=True,
+                )
+            except Exception as send_err:
+                logger.error(
+                    f"Error-send failed for req_id={req_id}: {send_err}",
+                    exc_info=True,
+                )
+        _record_pipeline_result(modality, "error")
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
 
     time_stats.set_mm_encode_end_time()
-
-    if backend == "mooncake":
-        request.pop("mm_items", None)
-        request.update(
-            embedding_size=nbytes,
-            embedding_len=embedding_len,
-            embedding_dim=embedding_dim,
-        )
-        # Arm this worker's own sweep in case the follow-up /send never arrives;
-        # the main process publishes separately to serve the decoder's pull.
+    try:
+        # Publish the actual result for every backend. ZMQ does not consume this
+        # early and removes it when its synchronous send releases the request.
         await encode_server_module.meta_registry.publish(
             req_id, nbytes, embedding_len, embedding_dim
         )
-        return request
 
-    await _push_embedding_to_prefill(enc, request)
-    return None
+        if backend == "mooncake":
+            request.pop("mm_items", None)
+            request.update(
+                embedding_size=nbytes,
+                embedding_len=embedding_len,
+                embedding_dim=embedding_dim,
+            )
+            content = request
+        else:
+            await _push_embedding_to_prefill(enc, request)
+            content = None
+    except Exception as e:
+        time_stats.trace_ctx.abort(abort_info={"reason": str(e)})
+        await enc.release_request(req_id)
+        _record_pipeline_result(modality, "error")
+        raise
+
+    _record_pipeline_result(modality, "success")
+    return content
 
 
 async def _dp_worker_health_encode(enc: MMEncoder) -> None:
@@ -875,7 +1075,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
         )
     finally:
         # Never leave the dummy embedding sitting in the send map.
-        enc.discard_embedding(req_id)
+        await enc.release_request(req_id)
 
     if error_msg:
         raise MMError(error_msg, code=error_code or HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -912,22 +1112,18 @@ async def _dp_worker_handle_request(
     dp_type: str,
 ) -> None:
     t0 = time.time()
-    modality_str = str(request.get("modality", "image")).lower()
-    is_encode = dp_type not in (
-        "start_profile",
-        "stop_profile",
-        "health_encode",
-        "send",
-    )
-    if is_encode and encode_server_module.encoder_metrics_collector is not None:
-        encode_server_module.encoder_metrics_collector.inc_requests_received(
-            modality=modality_str
-        )
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
         elif dp_type == "health_encode":
             content = await _dp_worker_health_encode(enc)
+        elif dp_type == "register_destinations":
+            await enc.register_embedding_destinations(
+                request["req_id"],
+                request["receive_count"],
+                [request["receive_url"]],
+            )
+            content = None
         elif dp_type == "send":
             req_id = request["req_id"]
             sent = await enc.send(
@@ -952,10 +1148,10 @@ async def _dp_worker_handle_request(
                     req_id, receive_count
                 )
             else:
-                enc.discard_embedding(req_id)
+                await enc.release_request(req_id)
             content = None
         else:
-            content = await _dp_worker_encode_and_send(enc, sched, request)
+            content = await execute_encode_pipeline(enc, sched, request)
 
         logger.info(
             f"MM-Encoder [dp_rank={dp_rank}] {dp_type} done: "
@@ -963,10 +1159,6 @@ async def _dp_worker_handle_request(
             f"modality={request.get('modality', 'image')}, "
             f"cost={(time.time() - t0) * 1000:.1f}ms"
         )
-        if is_encode and encode_server_module.encoder_metrics_collector is not None:
-            encode_server_module.encoder_metrics_collector.inc_requests_total(
-                modality=modality_str, status="success"
-            )
         envelope = {
             "req_id": request.get("req_id", ""),
             "_dp_type": dp_type,
@@ -974,16 +1166,17 @@ async def _dp_worker_handle_request(
         }
         if dp_type == "send" and request.get("_dp_send_key") is not None:
             envelope["_dp_send_key"] = request["_dp_send_key"]
+        if (
+            dp_type == "register_destinations"
+            and request.get("_dp_register_key") is not None
+        ):
+            envelope["_dp_register_key"] = request["_dp_register_key"]
     except Exception as e:
         logger.error(
             f"DP worker {dp_rank} error on {dp_type} "
             f"req_id={request.get('req_id', '?')}: {e}",
             exc_info=True,
         )
-        if is_encode and encode_server_module.encoder_metrics_collector is not None:
-            encode_server_module.encoder_metrics_collector.inc_requests_total(
-                modality=modality_str, status="error"
-            )
         err_code = int(getattr(e, "code", None) or HTTPStatus.INTERNAL_SERVER_ERROR)
         envelope = {
             "req_id": request.get("req_id", ""),
@@ -995,6 +1188,11 @@ async def _dp_worker_handle_request(
         }
         if dp_type == "send" and request.get("_dp_send_key") is not None:
             envelope["_dp_send_key"] = request["_dp_send_key"]
+        if (
+            dp_type == "register_destinations"
+            and request.get("_dp_register_key") is not None
+        ):
+            envelope["_dp_register_key"] = request["_dp_register_key"]
 
     # pyzmq async send isn't safe for concurrent senders.
     try:
