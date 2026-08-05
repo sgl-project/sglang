@@ -35,6 +35,12 @@ from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
+# Register model-specific BlockAdapters BEFORE any code path calls
+# BlockAdapterRegister.is_supported(). The import side-effect is what makes
+# the SGLang-owned LTX2 adapter win the prefix match over cache-dit's broader
+# "LTX" adapter (which would pull in Diffusers LTX symbols).
+from sglang.multimodal_gen.runtime.cache import ltx2_block_adapter  # noqa: F401,E402
+
 _original_similarity = None
 
 
