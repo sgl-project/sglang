@@ -126,7 +126,7 @@ jobs:
             mkdir -p ${METRICS_DATA_FILE}
             echo "Metrics file path: ${METRICS_DATA_FILE}"
           fi
-          
+
           export TRANSFORMERS_VERSION_FOR_SGLANG="${{ inputs.transformers_version }}"
           PYTHON_FOR_SGLANG="python"
           PIP_FOR_SGLANG="pip"
