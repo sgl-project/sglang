@@ -67,7 +67,6 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
-    get_int_env_var,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -6625,8 +6624,8 @@ class ServerArgs:
         ):
             return
         required_tokens = self.cutedsl_moe_max_num_tokens()
-        max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024
+        max_dispatch_tokens_per_rank = (
+            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
         )
         max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
         if max_cutedsl_tokens < required_tokens:
