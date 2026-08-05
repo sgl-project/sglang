@@ -28,20 +28,23 @@ class _RecordingCallback:
 
 
 class _FakeTokenizerManager:
-    def __init__(self, responses):
+    def __init__(self, responses, *, incremental=False):
         self.responses = responses
+        self.server_args = SimpleNamespace(incremental_streaming_output=incremental)
 
-    def generate_request(self, obj, request=None):
+    def generate_request(self, obj, request=None, **kwargs):
         async def generate():
             for response in self.responses:
+                if isinstance(response, BaseException):
+                    raise response
                 yield response
 
         return generate()
 
 
-def _make_runtime_handle(responses):
+def _make_runtime_handle(responses, *, incremental=False):
     handle = RuntimeHandle.__new__(RuntimeHandle)
-    handle.tokenizer_manager = _FakeTokenizerManager(responses)
+    handle.tokenizer_manager = _FakeTokenizerManager(responses, incremental=incremental)
     return handle
 
 
@@ -50,8 +53,20 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         callback = _RecordingCallback()
         responses = [
             [
-                {"output_ids": [1], "meta_info": {"id": "choice-0"}},
-                {"output_ids": [2], "meta_info": {"id": "choice-1"}},
+                {
+                    "output_ids": [1],
+                    "meta_info": {
+                        "id": "choice-0",
+                        "finish_reason": {"type": "stop"},
+                    },
+                },
+                {
+                    "output_ids": [2],
+                    "meta_info": {
+                        "id": "choice-1",
+                        "finish_reason": {"type": "length"},
+                    },
+                },
             ]
         ]
         handle = _make_runtime_handle(responses)
@@ -63,13 +78,18 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=False,
                 request=None,
+                choice_aware=True,
             )
         )
 
         self.assertEqual([call[0]["output_ids"] for call in callback.calls], [[1], [2]])
+        self.assertEqual(
+            [call[0]["delta_output_ids"] for call in callback.calls], [[1], [2]]
+        )
+        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1])
         self.assertEqual([call[1] for call in callback.calls], [False, True])
 
-    def test_streaming_first_finished_choice_is_not_batch_terminal(self):
+    def test_streaming_preserves_interleaved_choice_identity_and_deltas(self):
         callback = _RecordingCallback()
         responses = [
             {
@@ -78,8 +98,13 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 "meta_info": {"id": "choice-0", "finish_reason": None},
             },
             {
+                "index": 1,
+                "output_ids": [3],
+                "meta_info": {"id": "choice-1", "finish_reason": None},
+            },
+            {
                 "index": 0,
-                "output_ids": [2],
+                "output_ids": [1, 2],
                 "meta_info": {
                     "id": "choice-0",
                     "finish_reason": {"type": "stop"},
@@ -87,10 +112,10 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             },
             {
                 "index": 1,
-                "output_ids": [3],
+                "output_ids": [3, 4],
                 "meta_info": {
                     "id": "choice-1",
-                    "finish_reason": {"type": "stop"},
+                    "finish_reason": {"type": "length"},
                 },
             },
         ]
@@ -103,14 +128,88 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=True,
                 request=None,
+                choice_aware=True,
+            )
+        )
+
+        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1, 0, 1])
+        self.assertEqual(
+            [call[0]["output_ids"] for call in callback.calls],
+            [[1], [3], [1, 2], [3, 4]],
+        )
+        self.assertEqual(
+            [call[0]["delta_output_ids"] for call in callback.calls],
+            [[1], [3], [2], [4]],
+        )
+        self.assertEqual(
+            [call[1] for call in callback.calls], [False, False, False, True]
+        )
+
+    def test_generation_error_terminates_each_unfinished_choice(self):
+        callback = _RecordingCallback()
+        responses = [
+            {
+                "index": 0,
+                "output_ids": [1],
+                "meta_info": {
+                    "id": "choice-0",
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+            RuntimeError("scheduler failed"),
+        ]
+        handle = _make_runtime_handle(responses)
+        obj = SimpleNamespace(rid="logical", batch_size=1, parallel_sample_num=2)
+
+        asyncio.run(
+            handle._run_generate(
+                obj,
+                callback,
+                stream=True,
+                request=None,
+                choice_aware=True,
+            )
+        )
+
+        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1])
+        self.assertEqual(
+            callback.calls[1][0]["meta_info"]["finish_reason"]["type"], "error"
+        )
+        self.assertEqual([call[1] for call in callback.calls], [False, True])
+
+    def test_incremental_streaming_retains_legacy_cumulative_output(self):
+        callback = _RecordingCallback()
+        responses = [
+            {
+                "index": 0,
+                "output_ids": [1],
+                "meta_info": {"finish_reason": None},
+            },
+            {
+                "index": 0,
+                "output_ids": [2],
+                "meta_info": {"finish_reason": {"type": "stop"}},
+            },
+        ]
+        handle = _make_runtime_handle(responses, incremental=True)
+        obj = SimpleNamespace(rid="logical", batch_size=1, parallel_sample_num=1)
+
+        asyncio.run(
+            handle._run_generate(
+                obj,
+                callback,
+                stream=True,
+                request=None,
+                choice_aware=True,
             )
         )
 
         self.assertEqual(
-            [call[0]["output_ids"] for call in callback.calls],
-            [[1], [2], [3]],
+            [call[0]["output_ids"] for call in callback.calls], [[1], [1, 2]]
         )
-        self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+        self.assertEqual(
+            [call[0]["delta_output_ids"] for call in callback.calls], [[1], [2]]
+        )
 
 
 class TestNativeGrpcRequestLifecycle(CustomTestCase):

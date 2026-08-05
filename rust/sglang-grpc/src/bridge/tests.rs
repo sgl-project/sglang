@@ -35,6 +35,7 @@ async fn stale_request_key_cannot_abort_reused_request_id() {
             ActiveChannel {
                 incarnation: current_key.incarnation,
                 sender,
+                preserve_on_explicit_abort: false,
             },
         );
         state.pending_sends.insert(old_key.clone());
@@ -50,4 +51,27 @@ async fn stale_request_key_cannot_abort_reused_request_id() {
         current_key.incarnation
     );
     assert!(!state.pending_sends.contains(&old_key));
+}
+
+#[test]
+fn explicit_abort_keeps_choice_aware_channel_for_terminal_errors() {
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let key = RequestKey {
+        rid: "multi-choice".to_string(),
+        incarnation: 1,
+    };
+    let mut state = BridgeState::default();
+    state.channels.insert(
+        key.rid.clone(),
+        ActiveChannel {
+            incarnation: key.incarnation,
+            sender,
+            preserve_on_explicit_abort: true,
+        },
+    );
+
+    finalize_explicit_abort_locked(&mut state, &key);
+
+    assert!(state.channels.contains_key(key.rid()));
+    assert!(!state.terminal_errors.contains_key(&key));
 }
