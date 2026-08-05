@@ -5,57 +5,15 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     capture_routed_experts_if_allowed,
     select_experts,
 )
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
-
-
-_BALANCED_TOPK_CACHE: dict[tuple, torch.Tensor] = {}
-
-
-def _get_balanced_topk_ids(
-    num_tokens: int,
-    topk: int,
-    num_experts: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Build a deterministic, TP-staggered route with uniform expert counts."""
-    if num_tokens == 0:
-        return torch.empty((0, topk), dtype=dtype, device=device)
-    if topk <= 0 or topk > num_experts:
-        raise ValueError(
-            f"Invalid balanced MoE routing shape: {topk=} and {num_experts=}"
-        )
-
-    parallel = get_parallel()
-    tp_rank = parallel.tp_rank
-    tp_size = parallel.tp_size
-    cache_key = (device, dtype, topk, num_experts, tp_rank, tp_size)
-    cached = _BALANCED_TOPK_CACHE.get(cache_key)
-
-    if cached is None or cached.shape[0] < num_tokens:
-        expert_ids = torch.arange(num_experts, dtype=dtype, device=device)
-        expert_ids = torch.cat((expert_ids[::2], expert_ids[1::2]))
-        shift = tp_rank * num_experts // tp_size
-        expert_ids = torch.cat((expert_ids[shift:], expert_ids[:shift]))
-
-        capacity = max(num_tokens, 16 * 1024)
-        num_values = capacity * topk
-        repeats = (num_values + num_experts - 1) // num_experts
-        cached = expert_ids.repeat(repeats)[:num_values].view(capacity, topk)
-        _BALANCED_TOPK_CACHE[cache_key] = cached
-
-    return cached[:num_tokens]
 
 
 def _apply_routed_scaling_after_renorm(
@@ -79,7 +37,6 @@ def fused_topk_npu(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
-    force_balanced_topk: Optional[bool] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -165,34 +122,6 @@ def fused_topk_npu(
             topk_config=topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
-            allow_round_robin_simulation=force_balanced_topk is not False,
-        )
-
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
-        raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
-        )
-
-    if simulate_uniform_experts:
-        num_tokens, topk = topk_ids.shape
-        num_experts = router_logits.shape[1]
-        offsets = torch.randint(
-            0, num_experts, (num_tokens, 1), device=topk_ids.device
-        )
-        steps = torch.arange(topk, device=topk_ids.device).unsqueeze(0)
-        step = max(num_experts // topk, 1)
-        topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
-        topk_weights = torch.full_like(topk_weights, 1.0 / topk)
-    elif simulate_round_robin_experts and force_balanced_topk is not False:
-        topk_ids = _get_balanced_topk_ids(
-            hidden_states.shape[0],
-            topk_ids.shape[1],
-            router_logits.shape[1],
-            device=topk_ids.device,
-            dtype=topk_ids.dtype,
         )
 
     if expert_location_dispatch_info is not None:

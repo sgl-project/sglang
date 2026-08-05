@@ -148,11 +148,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -603,7 +599,6 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-        self.is_deepseek_v4 = is_deepseek_v4
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -860,26 +855,6 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
-    def _npu_prefill_balanced_topk_kwargs(
-        self, forward_batch: Optional[ForwardBatch]
-    ) -> dict:
-        """Enable benchmark-only balanced routing for pure DSV4 prefill."""
-        if (
-            not self.is_deepseek_v4
-            or not _is_npu
-            or getattr(self, "is_hash", False)
-            or forward_batch is None
-        ):
-            return {}
-
-        forward_mode = (
-            forward_batch.global_forward_mode or forward_batch.forward_mode
-        )
-        return {
-            "force_balanced_topk": forward_mode
-            in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
-        }
-
     def _can_dual_stream_graph(
         self, hidden_states: torch.Tensor, server_args=None
     ) -> bool:
@@ -946,7 +921,6 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
-                    forward_batch=forward_batch,
                 )
             else:
                 return self.forward_normal(
@@ -955,7 +929,6 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
-                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -968,7 +941,6 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1007,9 +979,6 @@ class DeepseekV2MoE(nn.Module):
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
                 else {}
-            )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
             )
             topk_output = self.topk(
                 hidden_states,
@@ -1087,7 +1056,6 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1128,9 +1096,6 @@ class DeepseekV2MoE(nn.Module):
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
                 else {}
-            )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
             )
             topk_output = self.topk(
                 hidden_states,
@@ -1318,9 +1283,6 @@ class DeepseekV2MoE(nn.Module):
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
                 else {}
-            )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
             )
             topk_output = self.topk(
                 hidden_states,
@@ -1672,9 +1634,6 @@ class DeepseekV2MoE(nn.Module):
         topk_kwargs = {}
         if getattr(self, "is_hash", False):
             topk_kwargs["input_ids"] = state.forward_batch.input_ids
-        topk_kwargs.update(
-            self._npu_prefill_balanced_topk_kwargs(state.forward_batch)
-        )
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
