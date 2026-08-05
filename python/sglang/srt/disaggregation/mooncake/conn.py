@@ -4,6 +4,7 @@ import concurrent.futures
 import dataclasses
 import logging
 import os
+import signal
 import struct
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import psutil
 import zmq
 from prometheus_client import Counter
 
@@ -1769,11 +1771,23 @@ class MooncakeKVManager(CommonKVManager):
                                 self._staging_ctx.prefetch_requested.discard(key)
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
-            except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+            except Exception:
+                # A raise here would only kill this daemon thread: the rank's
+                # HTTP process stays "healthy" while its transfer capacity
+                # silently drains away (each dead worker orphans one transfer
+                # queue). Treat it as fatal for the rank instead — signal the
+                # parent like a Scheduler crash does, so the launcher tears
+                # the rank down and the router ejects/restarts it.
+                logger.exception(
+                    f"Transfer worker {worker_index} failed; terminating rank "
+                    f"(bootstrap_port={self.bootstrap_port})."
                 )
+                parent = psutil.Process().parent()
+                if parent is not None:
+                    parent.send_signal(signal.SIGQUIT)
+                else:
+                    os.kill(os.getpid(), signal.SIGQUIT)
+                return
 
     def start_prefill_thread(self):
         def bootstrap_thread():

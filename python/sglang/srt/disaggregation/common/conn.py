@@ -6,7 +6,8 @@ import dataclasses
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -45,6 +46,20 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+# libzmq caps sockets per context at ZMQ_MAX_SOCKETS, default 1023. A prefill
+# rank creates two sockets per decode endpoint (PUSH + PAIR monitor), so a
+# large decode fleet (e.g. 16 replicas x 32 DP ranks = 512 endpoints -> 1025
+# sockets) exhausts the default and every further connect raises "Too many
+# open files" regardless of the OS nofile limit. Must be set on a context
+# before it creates any socket.
+ZMQ_CTX_MAX_SOCKETS = 4096
+
+# Bound for the per-endpoint PUSH-socket LRU cache. Invariant: two sockets per
+# cached endpoint plus the PULL server socket stay well under
+# ZMQ_CTX_MAX_SOCKETS (2 * 1024 + 1 = 2049 < 4096), so endpoint churn
+# (autoscaling, decode replica restarts) can no longer exhaust the context.
+SOCKET_CACHE_MAX_ENDPOINTS = 1024
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -198,13 +213,19 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        # Raise the per-context socket cap before any socket exists; the
+        # option does not apply retroactively.
+        self._zmq_ctx.set(zmq.MAX_SOCKETS, ZMQ_CTX_MAX_SOCKETS)
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
-        self._socket_cache: Dict[str, zmq.Socket] = {}
+        # LRU over decode endpoints, bounded by SOCKET_CACHE_MAX_ENDPOINTS;
+        # _monitor_cache and _socket_send_locks are kept in lockstep with it
+        # under _socket_lock.
+        self._socket_cache: OrderedDict[str, zmq.Socket] = OrderedDict()
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
@@ -740,7 +761,27 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
+    def _evict_lru_endpoint_locked(self):
+        """Close and drop the least-recently-used cached endpoint.
+
+        Caller must hold ``_socket_lock``. Takes the victim's send lock so an
+        in-flight send finishes before its socket closes; a sender that loses
+        this race gets a ``zmq.ZMQError`` and retries via
+        ``_send_multipart_locked``. Safe to acquire under ``_socket_lock``:
+        senders never wait on ``_socket_lock`` while holding a send lock.
+        """
+        victim, sock = self._socket_cache.popitem(last=False)
+        monitor = self._monitor_cache.pop(victim, None)
+        send_lock = self._socket_send_locks.pop(victim, None)
+        with send_lock if send_lock is not None else nullcontext():
+            sock.close(linger=0)
+            if monitor is not None:
+                monitor.close()
+        logger.debug(f"Evicted LRU decode endpoint socket: {victim}")
+
+    def _connect(
+        self, endpoint: str, is_ipv6: bool = False
+    ) -> Tuple[zmq.Socket, threading.Lock]:
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
@@ -755,12 +796,16 @@ class CommonKVManager(BaseKVManager):
                     except zmq.ZMQError:
                         disconnected = True
                 if not disconnected:
-                    return sock
+                    self._socket_cache.move_to_end(endpoint)
+                    return sock, self._socket_send_locks[endpoint]
                 sock.close(linger=0)
                 if monitor is not None:
                     monitor.close()
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+
+            while len(self._socket_cache) >= SOCKET_CACHE_MAX_ENDPOINTS:
+                self._evict_lru_endpoint_locked()
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -777,17 +822,24 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
-            return sock
+            send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
+            return sock, send_lock
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
     ):
         # Cached sockets are shared across sender threads and zmq sockets are
-        # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
+        # not thread-safe; serialize sends per endpoint. One retry: LRU
+        # eviction may close the socket between lookup and send.
+        for attempt in range(2):
+            sock, send_lock = self._connect(endpoint, is_ipv6=is_ipv6)
+            with send_lock:
+                try:
+                    sock.send_multipart(parts)
+                    return
+                except zmq.ZMQError:
+                    if attempt == 1:
+                        raise
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1244,6 +1296,9 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+    # One PUSH socket per prefill rank endpoint (no monitor socket); raise the
+    # cap so a large prefill fleet cannot exhaust the default 1023 either.
+    _ctx.set(zmq.MAX_SOCKETS, ZMQ_CTX_MAX_SOCKETS)
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
