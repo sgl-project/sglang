@@ -129,6 +129,10 @@ impl MockWorker {
         Ok(url)
     }
 
+    pub async fn port(&self) -> u16 {
+        self.config.read().await.port
+    }
+
     /// Stop the mock worker server
     pub async fn stop(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
@@ -718,6 +722,7 @@ async fn responses_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_response_request(config.port, &payload);
 
     if should_fail(&config).await {
         return (
@@ -1340,6 +1345,32 @@ async fn responses_handler(
             }))
             .into_response()
         }
+    }
+}
+
+// --- Responses request capture (for payload forwarding tests) ---
+static RESPONSE_REQUESTS: OnceLock<Mutex<HashMap<u16, Vec<serde_json::Value>>>> = OnceLock::new();
+
+fn get_response_requests() -> &'static Mutex<HashMap<u16, Vec<serde_json::Value>>> {
+    RESPONSE_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Start capturing `/v1/responses` request payloads for a worker port.
+pub fn start_response_request_capture(port: u16) {
+    let mut requests = get_response_requests().lock().unwrap();
+    requests.insert(port, Vec::new());
+}
+
+/// Take all captured `/v1/responses` request payloads for a worker port.
+pub fn take_response_requests(port: u16) -> Vec<serde_json::Value> {
+    let mut requests = get_response_requests().lock().unwrap();
+    requests.remove(&port).unwrap_or_default()
+}
+
+fn record_response_request(port: u16, payload: &serde_json::Value) {
+    let mut requests = get_response_requests().lock().unwrap();
+    if let Some(captured) = requests.get_mut(&port) {
+        captured.push(payload.clone());
     }
 }
 
