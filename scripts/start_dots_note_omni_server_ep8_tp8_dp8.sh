@@ -56,7 +56,14 @@ exec "${PYTHON_BIN}" -m sglang.launch_server \
   --page-size 64 \
   --moe-dense-tp-size 1 \
   --watchdog-timeout "${WATCHDOG_TIMEOUT:-1800}" \
+  --disable-overlap-schedule \
   --disable-cuda-graph \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps "${SPECULATIVE_NUM_STEPS:-3}" \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens "${SPECULATIVE_NUM_DRAFT_TOKENS:-4}" \
+  --speculative-draft-model-path "${MODEL_PATH}" \
+  --speculative-draft-attention-backend fa3 \
   --moe-a2a-backend deepep \
   --deepep-mode auto \
   --enable-nccl-nvls \
