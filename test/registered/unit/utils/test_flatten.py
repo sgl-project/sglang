@@ -1,12 +1,24 @@
 """CPU contract tests for srt/utils/flatten.py."""
 
+import math
 import unittest
+from array import array
 
-from sglang.srt.utils.flatten import flatten_hidden, flatten_ragged
+from sglang.srt.utils.flatten import (
+    FlatPairColumns,
+    flatten_hidden,
+    flatten_ragged,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def _decode_array(typecode: str, payload: bytes) -> list:
+    decoded = array(typecode)
+    decoded.frombytes(payload)
+    return decoded.tolist()
 
 
 class TestFlattenHelpers(CustomTestCase):
@@ -54,6 +66,58 @@ class TestFlattenHelpers(CustomTestCase):
         for hidden_states in (None, []):
             with self.subTest(hidden_states=hidden_states):
                 self.assertEqual(flatten_hidden(hidden_states), ([], []))
+
+
+class TestFlatPairColumns(CustomTestCase):
+    def test_columns_expose_original_sources(self):
+        values = [[0.25]]
+        token_ids = [[7]]
+        columns = FlatPairColumns("scores", values, token_ids)
+
+        self.assertEqual(
+            columns.columns(),
+            (("scores_val", values), ("scores_idx", token_ids)),
+        )
+
+    def test_accumulates_requests_and_encodes_32_bit_buffers(self):
+        values = [[None, 0.5], [1.25], None]
+        token_ids = [[101, 102], [103], None]
+        columns = FlatPairColumns(
+            "scores",
+            values,
+            token_ids,
+            first_none_to_nan=True,
+        )
+
+        for request_index in range(3):
+            columns.accept(request_index)
+
+        self.assertEqual(array("f").itemsize, 4)
+        self.assertEqual(array("i").itemsize, 4)
+        self.assertEqual(columns.header_cols(), [[2, 1, 0]])
+
+        value_bytes, index_bytes = columns.data_cols()
+        self.assertEqual(len(value_bytes), 3 * 4)
+        self.assertEqual(len(index_bytes), 3 * 4)
+
+        decoded_values = _decode_array("f", value_bytes)
+        self.assertTrue(math.isnan(decoded_values[0]))
+        self.assertAlmostEqual(decoded_values[1], 0.5)
+        self.assertAlmostEqual(decoded_values[2], 1.25)
+        self.assertEqual(_decode_array("i", index_bytes), [101, 102, 103])
+
+    def test_rejects_mismatched_value_and_index_counts(self):
+        columns = FlatPairColumns(
+            "scores",
+            [[0.25, 0.5]],
+            [[7]],
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "scores: request 0 has 1 idx entries but 2 vals",
+        ):
+            columns.accept(0)
 
 
 if __name__ == "__main__":
