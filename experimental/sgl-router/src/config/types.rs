@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 pub struct Config {
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
+    pub admin: AdminConfig,
     pub model: ModelConfig,
     /// Selected discovery backend. Built from CLI flags by
     /// [`crate::config::cli::Cli::into_config`]: the static-vs-k8s choice
@@ -16,6 +17,14 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+}
+
+/// Inbound router-admin authentication. When `api_key` is unset, admin
+/// endpoints keep their legacy unauthenticated behavior; when set, callers
+/// must present `Authorization: Bearer <api_key>`.
+#[derive(Debug, Clone, Default)]
+pub struct AdminConfig {
+    pub api_key: Option<String>,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
