@@ -8,6 +8,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -55,7 +56,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -63,9 +63,19 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_USE_NPU_KERNELS = get_bool_env_var(
-    "SGLANG_MINIMAX_H3_USE_NPU_KERNELS", default="true"
+_NPU_KERNEL_CHOICES = frozenset({"none", "rope", "swiglu", "gate", "all"})
+_NPU_KERNEL_MODE = (
+    os.getenv("SGLANG_MINIMAX_H3_USE_NPU_KERNELS", "all").strip().lower()
 )
+if _NPU_KERNEL_MODE not in _NPU_KERNEL_CHOICES:
+    raise ValueError(
+        "SGLANG_MINIMAX_H3_USE_NPU_KERNELS must be one of: "
+        + ", ".join(sorted(_NPU_KERNEL_CHOICES))
+    )
+
+
+def _npu_kernel_enabled(name: str) -> bool:
+    return _NPU_KERNEL_MODE == "all" or _NPU_KERNEL_MODE == name
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -278,7 +288,7 @@ def _modulate_gate(
     ):
         return indexed_gate_bf16_(x, gate, other, indices)
     selected_gate = gate.index_select(0, indices)
-    if current_platform.is_npu() and not _USE_NPU_KERNELS:
+    if current_platform.is_npu() and not _npu_kernel_enabled("gate"):
         return (x + selected_gate * other).to(dtype)
     return torch.addcmul(x, selected_gate, other).to(dtype)
 
@@ -384,7 +394,7 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if current_platform.is_npu() and _USE_NPU_KERNELS:
+    if current_platform.is_npu() and _npu_kernel_enabled("rope"):
         from sglang.kernels.ops.diffusion.triton.npu_fallback import (
             apply_rotary_embedding_native,
         )
@@ -767,7 +777,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        if current_platform.is_npu() and _USE_NPU_KERNELS:
+        if current_platform.is_npu() and _npu_kernel_enabled("swiglu"):
             hidden = self.act_fn(hidden)
         else:
             hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
