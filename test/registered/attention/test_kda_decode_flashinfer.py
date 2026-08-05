@@ -43,6 +43,7 @@ if not _available:
 
 # KDA: head_k_dim == head_v_dim == 128; single q/v head group (HV == H) here.
 H, HV, K, V = 16, 16, 128, 128
+CAKE_ARCH_SUPPORTED = torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +218,10 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 64])
+@pytest.mark.skipif(
+    not CAKE_ARCH_SUPPORTED,
+    reason="CAKE KDA decode requires SM100 or SM103.",
+)
 def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     """The SGLang adapter must exercise CAKE on Kimi-K3's TP8-local H=12
     safe-gate contract, including non-identity state-pool rows."""
@@ -261,6 +266,10 @@ def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
     )
 
 
+@pytest.mark.skipif(
+    not CAKE_ARCH_SUPPORTED,
+    reason="CAKE KDA decode requires SM100 or SM103.",
+)
 def test_kda_decode_cake_falls_back_for_gqa():
     torch.manual_seed(4800)
     data = _make_decode_inputs(4, num_heads=4, num_value_heads=8)
