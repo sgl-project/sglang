@@ -28,6 +28,13 @@ spec:
     spec:
       serviceAccountName: minwm-realtime-gateway
       terminationGracePeriodSeconds: 30
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-realtime-cpu
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Equal
+          value: minwm-realtime-cpu
+          effect: NoSchedule
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

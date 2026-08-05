@@ -36,8 +36,8 @@ spec:
           operator: In
           values: [p5.4xlarge]
       taints:
-        - key: seedleap.ai/task
-          value: minwm-async-denoiser
+        - key: nvidia.com/gpu
+          value: "true"
           effect: NoSchedule
 ---
 apiVersion: apps/v1
@@ -73,9 +73,9 @@ spec:
         karpenter.sh/nodepool: minwm-async-denoiser-h100
         karpenter.sh/capacity-type: spot
       tolerations:
-        - key: seedleap.ai/task
+        - key: nvidia.com/gpu
           operator: Equal
-          value: minwm-async-denoiser
+          value: "true"
           effect: NoSchedule
       securityContext:
         seLinuxOptions:

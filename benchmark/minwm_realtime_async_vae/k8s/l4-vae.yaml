@@ -39,8 +39,8 @@ spec:
           operator: In
           values: [g6.2xlarge, g6.4xlarge]
       taints:
-        - key: seedleap.ai/task
-          value: minwm-async-vae
+        - key: nvidia.com/gpu
+          value: "true"
           effect: NoSchedule
 ---
 apiVersion: apps/v1
@@ -76,9 +76,9 @@ spec:
         seedleap.ai/vae-worker: "true"
         karpenter.sh/capacity-type: spot
       tolerations:
-        - key: seedleap.ai/task
+        - key: nvidia.com/gpu
           operator: Equal
-          value: minwm-async-vae
+          value: "true"
           effect: NoSchedule
       containers:
         - name: vae

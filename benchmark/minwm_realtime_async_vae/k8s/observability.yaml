@@ -79,6 +79,13 @@ spec:
         app.kubernetes.io/part-of: minwm-realtime
     spec:
       serviceAccountName: minwm-realtime-adot
+      nodeSelector:
+        karpenter.sh/nodepool: minwm-realtime-cpu
+      tolerations:
+        - key: seedleap.ai/task
+          operator: Equal
+          value: minwm-realtime-cpu
+          effect: NoSchedule
       containers:
         - name: adot
           image: REPLACE_WITH_ADOT_IMAGE_DIGEST

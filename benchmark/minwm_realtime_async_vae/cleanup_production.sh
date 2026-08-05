@@ -7,6 +7,7 @@ STACK_NAME="${STACK_NAME:-minwm-realtime-benchmark}"
 DELETE_CONTROL_PLANE="${DELETE_CONTROL_PLANE:-1}"
 LABEL="seedleap.ai/test-run=minwm-async-vae-benchmark"
 NODEPOOLS=(
+  minwm-realtime-cpu
   minwm-async-denoiser-h100
   minwm-async-vae-l4
   minwm-async-vae-l40s

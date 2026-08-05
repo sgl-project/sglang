@@ -17,6 +17,15 @@ def _container(deployment, name):
 def test_gpu_nodepools_are_spot_only_and_bounded():
     documents = load_documents()
     validate(documents)
+    for pool_name in ("minwm-async-denoiser-h100", "minwm-async-vae-l4"):
+        node_pool = find(documents, "NodePool", pool_name)
+        assert node_pool["spec"]["template"]["spec"]["taints"] == [
+            {
+                "key": "nvidia.com/gpu",
+                "value": "true",
+                "effect": "NoSchedule",
+            }
+        ]
 
 
 def test_kustomize_does_not_namespace_cluster_scoped_resources():
@@ -209,10 +218,34 @@ def test_coordinator_is_an_independent_durable_cpu_control_plane():
 
 
 def test_cpu_control_planes_are_disruption_protected_and_autoscaled():
-    documents = load_documents(("gateway.yaml", "coordinator.yaml", "autoscaling.yaml"))
+    documents = load_documents(
+        (
+            "cpu-control-plane.yaml",
+            "gateway.yaml",
+            "coordinator.yaml",
+            "autoscaling.yaml",
+        )
+    )
+    node_pool = find(documents, "NodePool", "minwm-realtime-cpu")
+    requirements = {
+        item["key"]: item["values"]
+        for item in node_pool["spec"]["template"]["spec"]["requirements"]
+    }
+    assert requirements["karpenter.sh/capacity-type"] == ["on-demand"]
+    assert node_pool["spec"]["template"]["spec"]["taints"] == [
+        {
+            "key": "seedleap.ai/task",
+            "value": "minwm-realtime-cpu",
+            "effect": "NoSchedule",
+        }
+    ]
     for name in ("minwm-realtime-gateway", "minwm-realtime-coordinator"):
+        deployment = find(documents, "Deployment", name)
         pdb = find(documents, "PodDisruptionBudget", name)
         hpa = find(documents, "HorizontalPodAutoscaler", name)
+        assert deployment["spec"]["template"]["spec"]["nodeSelector"] == {
+            "karpenter.sh/nodepool": "minwm-realtime-cpu"
+        }
         assert pdb["spec"]["minAvailable"] == 1
         assert hpa["spec"]["minReplicas"] == 2
         assert hpa["spec"]["maxReplicas"] >= 4
@@ -232,6 +265,8 @@ def test_gpu_pools_have_independent_bounded_scheduled_elasticity():
 
     scale_up = find(documents, "CronJob", "minwm-realtime-gpu-scale-up")
     scale_down = find(documents, "CronJob", "minwm-realtime-gpu-scale-down")
+    assert scale_up["spec"]["suspend"] == "REPLACE_WITH_GPU_SCALE_UP_SUSPEND"
+    assert scale_down["spec"]["suspend"] == "REPLACE_WITH_GPU_SCALE_DOWN_SUSPEND"
     assert scale_up["spec"]["timeZone"] == "REPLACE_WITH_GPU_SCALE_TIME_ZONE"
     assert scale_down["spec"]["timeZone"] == "REPLACE_WITH_GPU_SCALE_TIME_ZONE"
 
@@ -250,6 +285,8 @@ def test_gpu_pools_have_independent_bounded_scheduled_elasticity():
     for variable in (
         "GPU_SCALE_UP_SCHEDULE",
         "GPU_SCALE_DOWN_SCHEDULE",
+        "GPU_SCALE_UP_SUSPEND",
+        "GPU_SCALE_DOWN_SUSPEND",
         "DENOISER_PEAK_REPLICAS",
         "VAE_PEAK_REPLICAS",
     ):

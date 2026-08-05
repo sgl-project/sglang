@@ -36,6 +36,7 @@ metadata:
   namespace: minwm-realtime
 spec:
   schedule: REPLACE_WITH_GPU_SCALE_UP_SCHEDULE
+  suspend: REPLACE_WITH_GPU_SCALE_UP_SUSPEND
   timeZone: REPLACE_WITH_GPU_SCALE_TIME_ZONE
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
@@ -52,6 +53,13 @@ spec:
         spec:
           serviceAccountName: minwm-realtime-gpu-scaler
           restartPolicy: Never
+          nodeSelector:
+            karpenter.sh/nodepool: minwm-realtime-cpu
+          tolerations:
+            - key: seedleap.ai/task
+              operator: Equal
+              value: minwm-realtime-cpu
+              effect: NoSchedule
           containers:
             - name: scaler
               image: REPLACE_WITH_GATEWAY_IMAGE_DIGEST
@@ -75,6 +83,7 @@ metadata:
   namespace: minwm-realtime
 spec:
   schedule: REPLACE_WITH_GPU_SCALE_DOWN_SCHEDULE
+  suspend: REPLACE_WITH_GPU_SCALE_DOWN_SUSPEND
   timeZone: REPLACE_WITH_GPU_SCALE_TIME_ZONE
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
@@ -91,6 +100,13 @@ spec:
         spec:
           serviceAccountName: minwm-realtime-gpu-scaler
           restartPolicy: Never
+          nodeSelector:
+            karpenter.sh/nodepool: minwm-realtime-cpu
+          tolerations:
+            - key: seedleap.ai/task
+              operator: Equal
+              value: minwm-realtime-cpu
+              effect: NoSchedule
           containers:
             - name: scaler
               image: REPLACE_WITH_GATEWAY_IMAGE_DIGEST
