@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -675,14 +675,62 @@ class HybridCacheController(BaseHiCacheController):
         operation.pool_transfers_done = True
 
     def _page_backup(self, operation):
-        # Backup extra pools
-        if operation.pool_transfers:
+        # MLA KV is replicated across TP ranks and should still be written only
+        # by TP0. On follower ranks, only the rank-sharded Mamba/KDA pool is
+        # owned by the rank and must be written here. Do not replicate other
+        # sidecar pools (for example SWA or indexer state) accidentally.
+        backup_transfers = operation.pool_transfers
+        if self.backup_skip:
+            backup_transfers = [
+                transfer
+                for transfer in operation.pool_transfers or []
+                if transfer.name == PoolName.MAMBA
+            ]
+
+        if backup_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(backup_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
-        # Backup kv pools
-        super()._page_backup(operation)
+        if not self.backup_skip:
+            super()._page_backup(operation)
+        else:
+            sidecar_ok = bool(backup_transfers)
+            if sidecar_ok:
+                for transfer in backup_transfers:
+                    result = results.get(transfer.name)
+                    if result is None:
+                        result = results.get(transfer.name.value)
+                    expected = len(transfer.keys or [])
+                    if expected == 0 and transfer.host_indices is not None:
+                        expected = int(transfer.host_indices.numel())
+                    if (
+                        not isinstance(result, (list, tuple))
+                        or len(result) != expected
+                        or not all(bool(ok) for ok in result)
+                    ):
+                        sidecar_ok = False
+                        break
+            operation.completed_tokens = (
+                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+            )
+
+    def backup_thread_func(self):
+        """Back up rank-sharded sidecars on every TP rank.
+
+        The base implementation skips the entire operation on non-zero MLA TP
+        ranks. That optimization is valid for replicated MLA KV, but not for
+        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
+        """
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
+            except Empty:
+                continue
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

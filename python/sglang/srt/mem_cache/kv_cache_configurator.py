@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    kimi_linear_config,
+    mambaish_config,
+)
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
@@ -702,9 +706,16 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            enable_gdn_replayssm_spec=(
-                get_exec().mamba.enable_gdn_replayssm_spec
-                and self.hybrid_gdn_config is not None
+            # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
+            # fold); activate the pool machinery only for those, so any other
+            # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
+            # flag set stays byte-identical to flag-off.
+            enable_linear_replayssm_spec=(
+                get_exec().mamba.enable_linear_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
             ),
         )
         return req_to_token_pool
@@ -738,6 +749,18 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
+        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        _algo = (self.server_args.speculative_algorithm or "").upper()
+        if (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and _algo in ("DSPARK", "DFLASH")
+            and kimi_linear_config(self.model_config) is None
+        ):
+            raise ValueError(
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
+                "(kimi_linear) model; got a non-KDA model."
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -762,9 +785,16 @@ class KVCacheConfigurator:
             enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
-            enable_gdn_replayssm_spec=(
-                get_exec().mamba.enable_gdn_replayssm_spec
-                and self.hybrid_gdn_config is not None
+            # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
+            # fold); activate the pool machinery only for those, so any other
+            # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
+            # flag set stays byte-identical to flag-off.
+            enable_linear_replayssm_spec=(
+                get_exec().mamba.enable_linear_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
             ),
         )
         return req_to_token_pool
@@ -1688,11 +1718,23 @@ class KVCacheConfigurator:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
+        capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, get_schedule().max_mamba_cache_size // ratio
-            )
+            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            if mamba_cap < max_num_reqs:
+                capped_by_mamba = True
+                logger.warning(
+                    "max_running_requests is capped to %d by the mamba state "
+                    "cache (max_mamba_cache_size=%d, %d state slots per "
+                    "request). To raise it: increase --mamba-full-memory-ratio "
+                    "or --max-mamba-cache-size, or halve the state size with "
+                    "--mamba-ssm-dtype bfloat16.",
+                    mamba_cap,
+                    get_schedule().max_mamba_cache_size,
+                    ratio,
+                )
+            max_num_reqs = min(max_num_reqs, mamba_cap)
 
             if max_num_reqs <= 0:
                 raise RuntimeError(
@@ -1703,7 +1745,11 @@ class KVCacheConfigurator:
                     f"(2) increase --mem-fraction-static, or "
                     f"(3) use GPUs with more memory."
                 )
-        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
+        if (
+            requested_per_worker is not None
+            and max_num_reqs < requested_per_worker
+            and not capped_by_mamba
+        ):
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
                 "(per dp worker) due to the available KV cache capacity.",
@@ -1760,18 +1806,25 @@ class KVCacheConfigurator:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
+        # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
+        # budget goes to persistent slots (K sized like non-spec), which is how the
+        # freed ~9GB turns into higher max_running.
         # The ring is allocated per slot but is not part of mamba_cache_per_req;
         # the solve must charge it too or num_slots is over-provisioned.
-        replayssm_active = (
-            get_exec().mamba.enable_gdn_replayssm_spec
-            and self.hybrid_gdn_config is not None
+        replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
+            self.hybrid_gdn_config is not None
+            or kimi_linear_config(self.model_config) is not None
         )
         if replayssm_active:
-            record_len = (
-                server_args.max_speculative_num_draft_tokens
-                if server_args.max_speculative_num_draft_tokens is not None
-                else get_exec().mamba.linear_replayssm_cache_len
-            )
+            # GDN sizes the fold window to the draft maximum; the KDA ring
+            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            if kimi_linear_config(self.model_config) is not None:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
+            elif server_args.max_speculative_num_draft_tokens is not None:
+                record_len = server_args.max_speculative_num_draft_tokens
+            else:
+                record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
@@ -1790,7 +1843,9 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
+            # Reserve intermediate memory based on capped max_num_reqs (+1: the
+            # pool's padding slot, see memory_pool.py). Skipped under replayssm
+            # (no intermediate_ssm allocated).
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
@@ -1813,7 +1868,8 @@ class KVCacheConfigurator:
                 max_mamba_cache_size=get_schedule().max_running_requests
                 // self.ps.attn_dp_size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs (+1 padding slot)
+            # Reserve intermediate memory based on capped max_num_reqs (+1: the
+            # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
@@ -1880,7 +1936,9 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1: the pool's padding slot
+        # +1: the pool's padding slot is allocated alongside the request slots.
+        # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
+        # the ring is not allocated).
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1)
             * (config.mamba2_cache_params.mamba_cache_per_req + replayssm_ring_per_req)
