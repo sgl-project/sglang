@@ -170,3 +170,33 @@ def test_cloudwatch_trace_query_survives_waiter_cancellation_and_cleans_inflight
         assert query._inflight == {}
 
     asyncio.run(run())
+
+
+def test_cloudwatch_trace_query_retries_transient_api_throttling():
+    class ThrottlingException(Exception):
+        response = {"Error": {"Code": "ThrottlingException"}}
+
+    class FakeLogs:
+        def __init__(self):
+            self.started = 0
+
+        def start_query(self, **_kwargs):
+            self.started += 1
+            if self.started == 1:
+                raise ThrottlingException("rate exceeded")
+            return {"queryId": "query-retried"}
+
+        def get_query_results(self, *, queryId):
+            assert queryId == "query-retried"
+            return {"status": "Complete", "results": []}
+
+    async def run():
+        logs = FakeLogs()
+        query = CloudWatchTraceQuery(logs, log_group="logs")
+
+        result = await query.query("trace-retry")
+
+        assert result["events"] == []
+        assert logs.started == 2
+
+    asyncio.run(run())

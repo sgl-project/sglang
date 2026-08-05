@@ -14,6 +14,14 @@ from typing import Any, Callable
 
 
 _TRACE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_RETRYABLE_LOGS_ERROR_CODES = {
+    "InternalFailure",
+    "InternalServiceError",
+    "LimitExceededException",
+    "ServiceUnavailableException",
+    "Throttling",
+    "ThrottlingException",
+}
 
 
 @dataclass(slots=True)
@@ -141,7 +149,8 @@ class CloudWatchTraceQuery:
             "| sort @timestamp desc "
             f"| limit {limit}"
         )
-        started = self.logs_client.start_query(
+        started = self._call_logs_api(
+            self.logs_client.start_query,
             logGroupName=self.log_group,
             startTime=end_time - window_s,
             endTime=end_time,
@@ -151,7 +160,9 @@ class CloudWatchTraceQuery:
         query_id = started["queryId"]
         deadline = time.monotonic() + self.query_timeout_s
         while True:
-            result = self.logs_client.get_query_results(queryId=query_id)
+            result = self._call_logs_api(
+                self.logs_client.get_query_results, queryId=query_id
+            )
             status = result.get("status")
             if status == "Complete":
                 break
@@ -190,6 +201,19 @@ class CloudWatchTraceQuery:
             "next_cursor": next_cursor,
             "window_s": window_s,
         }
+
+    @staticmethod
+    def _call_logs_api(method, **kwargs):
+        for attempt in range(3):
+            try:
+                return method(**kwargs)
+            except Exception as exc:
+                response = getattr(exc, "response", {})
+                code = response.get("Error", {}).get("Code")
+                if code not in _RETRYABLE_LOGS_ERROR_CODES or attempt == 2:
+                    raise
+                time.sleep(0.05 * (2**attempt))
+        raise RuntimeError("unreachable CloudWatch retry state")
 
     @staticmethod
     def _parse_message(message: str) -> dict[str, Any] | None:
