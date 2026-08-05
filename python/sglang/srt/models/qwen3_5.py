@@ -94,6 +94,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_stream,
 )
@@ -575,8 +576,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         if not _fuse_gdn_qkvzba or _is_cpu or _is_npu:
             return None
-        server_args = get_server_args()
-        if bool(server_args.lora_paths) or server_args.enable_lora:
+        lora = get_lora()
+        if bool(lora.lora_paths) or lora.enable_lora:
             # supported_lora_modules names in_proj_qkvz, which the merge removes.
             return None
 
