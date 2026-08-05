@@ -34,7 +34,6 @@ class TestFlashMLAMTP(CustomTestCase):
                 [
                     "--cuda-graph-max-bs-decode",
                     "4",
-                    "--disable-radix",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
                     "1",
@@ -43,11 +42,11 @@ class TestFlashMLAMTP(CustomTestCase):
                     "--speculative-draft-model-path",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "2",
+                    "3",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
-                    "3",
+                    "4",
                     "--attention-backend",
                     "flashmla",
                 ]
@@ -86,7 +85,7 @@ class TestFlashMLAMTP(CustomTestCase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.4)
+        self.assertGreater(avg_spec_accept_length, 2.5)
 
 
 if __name__ == "__main__":
