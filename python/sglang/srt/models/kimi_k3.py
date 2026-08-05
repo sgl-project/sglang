@@ -160,8 +160,7 @@ def _k3_bf16_gemm(
             if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
-                if out.is_contiguous():
-                    return cutedsl_bf16_gemm_out(x, weight, out)
+                return cutedsl_bf16_gemm_out(x, weight, out)
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
