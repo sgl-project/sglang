@@ -227,13 +227,7 @@ impl Server {
             self.rt.mm_sidecar.clone(),
         )
         .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
-        let handles = mm::spawn_workers(
-            self.rt.mm.clone(),
-            self.rt.tm.clone(),
-            workers,
-            std::sync::Arc::new(ctx),
-        );
-        self.rt.adopt_threads(handles);
+        self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
         Ok(())
     }
 

@@ -67,8 +67,10 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
         let budget = Arc::clone(&budget);
         async move {
             let _permit = PERMITS.acquire().await.expect("semaphore never closed");
-            // Blocking I/O: tokio's blocking threads are unpinned and lazily
-            // spawned, so they never contend with the CPU stages.
+            // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
+            // an API worker. Those threads are pinned round-robin over the api
+            // core set (see `on_thread_start` in `runtime::start`) — off the
+            // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
             tokio::task::spawn_blocking(move || fetch_bytes_budgeted(&src, &budget))
                 .await
                 .map_err(|e| format!("media prefetch: {e}"))?

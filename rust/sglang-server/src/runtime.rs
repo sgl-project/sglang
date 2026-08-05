@@ -8,6 +8,8 @@
 //!   * Detokenizer  — M pinned OS threads / shards (CPU bound), core set C
 //!   * TM ingress   — 1 thread driving the ingress FSM
 //!   * TM egress    — 1 thread draining the egress ring → detok shards
+//!   * MM workers   — K unpinned OS threads, spawned late via
+//!     [`Runtime::spawn_mm_pool`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! axum's worker threads.
@@ -61,10 +63,19 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
-    /// Adopt late-spawned worker threads — the MM pool, which starts only once
-    /// Python has built the mm spec — into the shutdown join set.
-    pub fn adopt_threads(&self, handles: Vec<JoinHandle<()>>) {
-        self.threads.lock().unwrap().extend(handles);
+    /// Spawn `workers` `mm-worker-{i}` threads into the shutdown join set —
+    /// late, once Python has built the mm spec (`Server::start_mm_workers`).
+    ///
+    /// Deliberately unpinned: the threads inherit the launch thread's affinity,
+    /// already narrowed by `RustServer.launch` to the server cores, so bursty
+    /// MM preprocessing floats over that whole set (rather than owning cores
+    /// that idle between bursts) and never preempts the scheduler's reserved
+    /// cores.
+    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::mm::Context>) {
+        let mut threads = self.threads.lock().unwrap();
+        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
+            crate::mm::MmWorker::new(self.mm.clone(), self.tm.clone(), ctx.clone())
+        });
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).

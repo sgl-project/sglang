@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::message::MmRequest;
+use crate::runtime::Runnable;
 use crate::tokenizer::TextTokenizer;
 use crate::tokenizer_manager::TmEvent;
 
@@ -272,38 +273,25 @@ fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> FeatureStore {
     FeatureStore::Shm(segments)
 }
 
-/// Spawn `workers` `mm-worker-{i}` threads; the handles go to the runtime's
-/// shutdown join. Not pinned here — they inherit the launch thread's affinity,
-/// which `RustServer.launch` has already narrowed to the server cores so MM
-/// work never preempts the scheduler on its reserved ones.
-pub fn spawn_workers(
-    rx: flume::Receiver<MmRequest>,
-    tm: flume::Sender<TmEvent>,
-    workers: usize,
-    ctx: Arc<Context>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    (0..workers.max(1))
-        .map(|i| {
-            let worker = MmWorker {
-                rx: rx.clone(),
-                tm: tm.clone(),
-                ctx: ctx.clone(),
-            };
-            std::thread::Builder::new()
-                .name(format!("mm-worker-{i}"))
-                .spawn(move || worker.run())
-                .expect("spawn mm worker")
-        })
-        .collect()
-}
-
-struct MmWorker {
+/// One MM worker, spawned via `Runtime::spawn_mm_pool` (which owns the
+/// pinning policy for this pool — see its docs).
+pub struct MmWorker {
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
     ctx: Arc<Context>,
 }
 
 impl MmWorker {
+    pub fn new(
+        rx: flume::Receiver<MmRequest>,
+        tm: flume::Sender<TmEvent>,
+        ctx: Arc<Context>,
+    ) -> Self {
+        Self { rx, tm, ctx }
+    }
+}
+
+impl Runnable for MmWorker {
     /// Drain until the mm channel closes (tm-ingress drops its sender on
     /// shutdown). One request at a time, so the pool size bounds MM
     /// concurrency; an error rejects the request back to the client.
