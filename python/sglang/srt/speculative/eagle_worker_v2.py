@@ -576,8 +576,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
-        # Preserve a draft-extend seed for step 0; the context manager clears
-        # reuse state even if a draft step raises.
         with IndexTopKShareState.mtp_iteration(
             forward_batch,
             enabled=self.index_share_for_mtp_iteration,

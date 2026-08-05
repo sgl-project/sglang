@@ -10,11 +10,7 @@ if TYPE_CHECKING:
 
 
 class IndexTopKShareState:
-    """Carries DSA indexer topk between layers and publishes it for MTP reuse.
-
-    MTP publication uses ``spec_info.dsa_topk_indices`` because per-step
-    ForwardBatch copies drop ForwardBatch-only state (#29654).
-    """
+    """Carries DSA indexer top-k across layers and MTP draft steps."""
 
     def __init__(
         self,
@@ -39,8 +35,6 @@ class IndexTopKShareState:
 
     @property
     def _seed_buf(self) -> Optional[torch.Tensor]:
-        """Draft-extend seed buffer: publish the last-token indexer top-k there
-        so the draft-decode loop reuses it instead of recomputing."""
         if self._forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             return self._forward_batch.spec_info.dsa_seed_topk_capture
         return None
