@@ -493,6 +493,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
         if isinstance(module, LayerwiseOffloadableModuleMixin):
             if current_platform.is_mps():
                 module.to(get_local_torch_device())
+                return
             module.prepare_for_next_req()
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:

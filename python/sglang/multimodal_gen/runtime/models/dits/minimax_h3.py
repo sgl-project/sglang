@@ -1166,7 +1166,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 for index in range(arch.num_layers)
             ]
         )
-        self.layer_names = ["blocks"]
+        self.layer_names = ["token_refiner.blocks", "blocks"]
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
