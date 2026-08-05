@@ -56,10 +56,11 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 export SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-# Keep the draft transformer in CUDA Graph, but run the proposal head eagerly.
-# The folded proposal remains available as an explicit A/B opt-in while its
-# candidate-token equivalence on Ascend is being validated.
-export SGLANG_DSPARK_FOLDED_PROPOSAL="${SGLANG_DSPARK_FOLDED_PROPOSAL:-0}"
+# Keep the validated greedy proposal head inside the draft graph.  The folded
+# sampling path adds work for temperature-zero serving and lowered steady-state
+# acceptance on Ascend, so leave it as an explicit opt-in.
+export SGLANG_DSPARK_FOLDED_PROPOSAL="${SGLANG_DSPARK_FOLDED_PROPOSAL:-1}"
+export SGLANG_DSPARK_FOLDED_SAMPLING="${SGLANG_DSPARK_FOLDED_SAMPLING:-0}"
 export SGLANG_K3_SHARED_EXPERTS_ATTN_TP="${SGLANG_K3_SHARED_EXPERTS_ATTN_TP:-1}"
 export SGLANG_K3_DENSE_MLP_ATTN_TP="${SGLANG_K3_DENSE_MLP_ATTN_TP:-1}"
 export SGLANG_RAGGED_VERIFY_MODE=static
