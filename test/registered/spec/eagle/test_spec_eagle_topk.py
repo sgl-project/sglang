@@ -9,6 +9,7 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.abort_timeout_kit import AbortAllMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
@@ -19,7 +20,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=830, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=870, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEagle3Topk16(
@@ -54,9 +55,16 @@ class TestEagleLlama2Suite(
     SpecLogprobKit,
     SpecPenaltyKit,
     SpecFeatureKit,
+    AbortAllMixin,
 ):
-    """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases)."""
+    """EAGLE/Llama-2 topk=8 full coverage (kits listed in bases).
 
+    Hosts AbortAllMixin: aborting mid-decode has to release the tree draft
+    state, and the strict mem check below turns a leak into a failure. It needs
+    no server flags of its own, so it rides this launch.
+    """
+
+    abort_all_max_new_tokens = 4000
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
