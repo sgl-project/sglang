@@ -1,0 +1,10 @@
+ARG GPU_RUNTIME_IMAGE
+
+FROM ${GPU_RUNTIME_IMAGE}
+ARG GIT_SHA
+
+COPY python/sglang /opt/sglang/python/sglang
+LABEL org.opencontainers.image.revision=${GIT_SHA} \
+      seedleap.minwm.image.layer="gpu-code-overlay"
+
+WORKDIR /opt/sglang

@@ -484,6 +484,17 @@ def test_role_image_build_requires_digest_pinned_bases_and_precreated_ecr():
     assert "create-repository" not in build_script
 
 
+def test_gpu_code_overlay_reuses_the_prebuilt_dependency_runtime():
+    overlay = (
+        ROOT.parent / "docker" / "Dockerfile.gpu-code-overlay"
+    ).read_text()
+
+    assert "ARG GPU_RUNTIME_IMAGE" in overlay
+    assert "FROM ${GPU_RUNTIME_IMAGE}" in overlay
+    assert "COPY python/sglang /opt/sglang/python/sglang" in overlay
+    assert "pip install" not in overlay
+
+
 def test_model_artifact_is_published_immutably_before_runtime_deploy():
     publisher = (ROOT.parent / "publish_model_artifact.py").read_text()
     publish_script = (ROOT.parent / "publish_model_artifact.sh").read_text()
