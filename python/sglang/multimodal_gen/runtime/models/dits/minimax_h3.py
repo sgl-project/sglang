@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -485,7 +488,7 @@ def _minimax_h3_attention_core_impl(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
-                requires_packed_varlen=True,
+                attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
     out = attention._attention_impl.forward_varlen(
@@ -1176,7 +1179,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
-            requires_packed_varlen=True,
+            attention_requirements=AttentionRequirements(packed_varlen=True),
         )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):

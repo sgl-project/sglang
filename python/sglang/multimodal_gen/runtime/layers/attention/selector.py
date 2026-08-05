@@ -14,6 +14,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
+    AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -151,7 +152,7 @@ def get_attn_backend(
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
     selected_attention_backend: AttentionBackendEnum | None = None,
-    requires_packed_varlen: bool = False,
+    attention_requirements: AttentionRequirements | None = None,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -189,9 +190,13 @@ def get_attn_backend(
     )
 
     backend_name = attention_backend_cls.get_enum().name.lower()
-    if requires_packed_varlen and not attention_backend_cls.supports_packed_varlen():
+    unsupported_requirements = attention_backend_cls.unsupported_requirements(
+        attention_requirements or AttentionRequirements()
+    )
+    if unsupported_requirements:
         raise ValueError(
-            f"Attention backend '{backend_name}' does not implement packed varlen attention"
+            f"Attention backend '{backend_name}' does not implement "
+            f"{', '.join(unsupported_requirements)}"
         )
     reason = "component constraint" if backend_name == constraint_backend else None
     if not _record_component_attn_backend(backend_name, reason):
@@ -223,12 +228,10 @@ def _cached_get_attn_backend(
             supported_attention_backend.__str__()
             for supported_attention_backend in supported_attention_backends
         ]
-        logger.debug(
-            "Selected attention backend: '%s' not in supported attention backends: %s",
-            selected_backend,
-            supported_attention_backends_str,
+        raise ValueError(
+            f"Attention backend '{selected_backend}' is not supported by this "
+            f"attention layer; supported backends: {supported_attention_backends_str}"
         )
-        selected_backend = None
 
     attention_cls = current_platform.get_attn_backend_cls_str(
         selected_backend, head_size, dtype

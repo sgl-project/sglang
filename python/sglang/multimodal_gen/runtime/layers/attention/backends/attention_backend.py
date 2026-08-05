@@ -16,6 +16,13 @@ from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
+@dataclass(frozen=True)
+class AttentionRequirements:
+    """Semantic attention operations required by a caller."""
+
+    packed_varlen: bool = False
+
+
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
@@ -37,6 +44,14 @@ class AttentionBackend(ABC):
     @classmethod
     def supports_packed_varlen(cls) -> bool:
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
+
+    @classmethod
+    def unsupported_requirements(
+        cls, requirements: AttentionRequirements
+    ) -> tuple[str, ...]:
+        if requirements.packed_varlen and not cls.supports_packed_varlen():
+            return ("packed varlen attention",)
+        return ()
 
     @staticmethod
     @abstractmethod

@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingPar
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -316,7 +319,7 @@ def test_quality_admission_fails_closed_outside_validated_request():
         128,
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.SAGE_ATTN,
-        requires_packed_varlen=True,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
     )
 
     batch.sampling_params.quality = "ultra"

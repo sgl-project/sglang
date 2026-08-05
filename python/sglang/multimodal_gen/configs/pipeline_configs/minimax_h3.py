@@ -21,6 +21,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -190,7 +193,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
             selected_attention_backend=selected_backend,
-            requires_packed_varlen=True,
+            attention_requirements=AttentionRequirements(packed_varlen=True),
         )
 
     def select_vae_weight_files(
