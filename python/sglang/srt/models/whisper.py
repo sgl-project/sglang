@@ -18,6 +18,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -504,9 +505,17 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         # (encoder_lens all zero) — e.g. the text-only warmup request. This
         # mirrors mllama / moss_vl and avoids feeding a zero-length encoder KV
         # region to the paged attention kernel, which hangs the XPU backend.
-        skip_cross_attention = forward_batch.encoder_lens is not None and bool(
-            forward_batch.encoder_lens.max() == 0
-        )
+        if get_is_capture_mode():
+            from sglang.srt.model_executor.cpu_graph_runner import (
+                get_capture_skip_cross_attention,
+            )
+
+            _override = get_capture_skip_cross_attention()
+            skip_cross_attention = _override if _override is not None else False
+        else:
+            skip_cross_attention = forward_batch.encoder_lens is not None and bool(
+                forward_batch.encoder_lens.max() == 0
+            )
 
         decoder_outputs = self.decoder(
             input_ids,

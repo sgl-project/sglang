@@ -9,6 +9,11 @@ is offset/stripped by the padded reserve. ``ceil_align(x, 1) == x`` so page_size
 The encoder is cached all-or-nothing, so ``len(prefix_indices)`` is only ever 0
 (fresh) or >= encoder_len (cached); the branch predicate is
 ``len(prefix_indices) < encoder_len``.
+
+This module also guards the *consumer* side of the same reserve: the flashinfer
+cross-attention updaters must read decoder self-attention KV starting at that
+page-aligned reserve (``kv_start_idx == ceil_align(encoder_len, page_size)``),
+not at the raw ``encoder_len`` (see TestFlashInferCrossAttnKvStartIdx).
 """
 
 import types
@@ -23,6 +28,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.attention.flashinfer_backend import (  # noqa: E402
+    FlashInferIndicesUpdaterDecode,
+    FlashInferIndicesUpdaterPrefill,
+)
 from sglang.srt.managers.schedule_batch import ForwardMode, ScheduleBatch  # noqa: E402
 from sglang.srt.utils.common import ceil_align  # noqa: E402
 
@@ -218,6 +227,125 @@ class TestEncoderDecoderPageAlignment(CustomTestCase):
         )
         self.assertTrue(torch.equal(batch.extend_input_logprob_token_ids, expected))
         self.assertEqual(batch.extend_logprob_start_lens, [0, 0])
+
+
+class TestFlashInferCrossAttnKvStartIdx(CustomTestCase):
+    """FlashInfer self-attn ``kv_start_idx`` must be the page-aligned encoder
+    reserve, not the raw encoder length.
+
+    The flashinfer self-attention wrapper (wrapper_id == 0 in the decode and
+    prefill cross-attention updaters) reads decoder KV via a raw ``req_to_token``
+    column offset ``kv_start_idx`` that the kv-indices kernel adds *without*
+    dividing by page_size. It must equal ``ceil_align(encoder_len, page_size)``
+    — the same reserve prepare_encoder_info_extend leaves above. The pre-fix code
+    used ``kv_start_idx = encoder_lens`` (raw), which lands the decoder read in the
+    unwritten ``[encoder_len, reserve)`` gap when page_size > 1. Reverting to the
+    raw length turns the page_size > 1 cases red; page_size == 1 is a no-op
+    (``ceil_align(x, 1) == x``, the CUDA flashinfer default).
+    """
+
+    DECODE_LEN = 4
+
+    def _decode_kv_start_idx(self, page_size, encoder_len):
+        """Capture (self_attn, cross_attn) kv_start_idx from the decode updater."""
+        updater = FlashInferIndicesUpdaterDecode.__new__(FlashInferIndicesUpdaterDecode)
+        updater.attn_backend = types.SimpleNamespace(page_size=page_size)
+        updater.kv_indptr = [0, 1]  # indexed by wrapper_id; value unused by the stub
+
+        captured = []
+
+        def fake_call_begin_forward(
+            wrapper,
+            req_pool_indices,
+            paged_kernel_lens,
+            paged_kernel_lens_sum,
+            kv_indptr,
+            kv_start_idx,
+            spec_info,
+            **kwargs,
+        ):
+            captured.append(kv_start_idx)
+
+        updater.call_begin_forward = fake_call_begin_forward
+
+        encoder_lens = torch.tensor([encoder_len], dtype=torch.int32)
+        seq_lens = torch.tensor([encoder_len + self.DECODE_LEN], dtype=torch.int32)
+        updater.update_cross_attention(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            seq_lens_sum=int(seq_lens.sum()),
+            decode_wrappers=[object(), object()],
+            encoder_lens=encoder_lens,
+            spec_info=None,
+        )
+        # wrapper_id == 0 is self-attention; wrapper_id == 1 is cross-attention.
+        return captured[0], captured[1]
+
+    def _prefill_kv_start_idx(self, page_size, encoder_len):
+        """Capture (self_attn, cross_attn) kv_start_idx from the prefill updater."""
+        updater = FlashInferIndicesUpdaterPrefill.__new__(
+            FlashInferIndicesUpdaterPrefill
+        )
+        updater.attn_backend = types.SimpleNamespace(page_size=page_size)
+        updater.kv_indptr = [0, 1]
+        updater.qo_indptr = [0, 1]
+        updater.prefill_wrapper_ragged = object()
+
+        captured = []
+
+        def fake_call_begin_forward(
+            wrapper_ragged,
+            wrapper_paged,
+            req_pool_indices,
+            paged_kernel_lens,
+            paged_kernel_lens_sum,
+            seq_lens,
+            prefix_lens,
+            kv_start_idx,
+            *args,
+            **kwargs,
+        ):
+            captured.append(kv_start_idx)
+
+        updater.call_begin_forward = fake_call_begin_forward
+
+        encoder_lens = torch.tensor([encoder_len], dtype=torch.int32)
+        seq_lens = torch.tensor([encoder_len + self.DECODE_LEN], dtype=torch.int32)
+        updater.update_cross_attention(
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            seq_lens_sum=int(seq_lens.sum()),
+            prefix_lens=torch.zeros(1, dtype=torch.int32),
+            prefill_wrappers=[object(), object()],
+            use_ragged=False,
+            encoder_lens=encoder_lens,
+            spec_info=None,
+        )
+        return captured[0], captured[1]
+
+    def test_decode_self_attn_kv_start_idx_is_page_aligned(self):
+        for page_size, encoder_len in ALIGNMENT_CASES:
+            with self.subTest(page_size=page_size, encoder_len=encoder_len):
+                self_ks, cross_ks = self._decode_kv_start_idx(page_size, encoder_len)
+                expected = ceil_align(encoder_len, page_size)
+                self.assertEqual(
+                    int(self_ks.item()),
+                    expected,
+                    f"self-attn kv_start_idx must be ceil_align({encoder_len}, "
+                    f"{page_size})={expected}, got {int(self_ks.item())}",
+                )
+                # Cross-attention wrapper attends to encoder tokens from index 0.
+                self.assertEqual(int(cross_ks.item()), 0)
+
+    def test_prefill_self_attn_kv_start_idx_is_page_aligned(self):
+        for page_size, encoder_len in ALIGNMENT_CASES:
+            with self.subTest(page_size=page_size, encoder_len=encoder_len):
+                self_ks, cross_ks = self._prefill_kv_start_idx(page_size, encoder_len)
+                expected = ceil_align(encoder_len, page_size)
+                self.assertEqual(int(self_ks.item()), expected)
+                self.assertEqual(int(cross_ks.item()), 0)
 
 
 if __name__ == "__main__":

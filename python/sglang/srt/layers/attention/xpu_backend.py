@@ -880,25 +880,6 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
             if layer.is_cross_attention:
-                import os as _os
-
-                if _os.environ.get("SGL_XPU_DEBUG_PT") == "1":
-                    torch.xpu.synchronize()
-                    _num_pages = key_cache.shape[0]
-                    _ept = metadata.encoder_page_table
-                    _eptmax = int(_ept.max().item()) if _ept.numel() else -1
-                    print(
-                        f"[XPU_DBG decode-CROSS L{layer.layer_id}] page_size={self.page_size} "
-                        f"key_cache_pages={_num_pages} enc_page_table.shape={tuple(_ept.shape)} "
-                        f"ept_max={_eptmax} encoder_lens={metadata.encoder_lens_int32.tolist()}",
-                        flush=True,
-                    )
-                    if _eptmax >= _num_pages:
-                        print(
-                            f"[XPU_DBG] !!! CROSS OOB page index: ept_max={_eptmax} >= "
-                            f"key_cache_pages={_num_pages}",
-                            flush=True,
-                        )
                 # Always use non-chunked logic for cross-attention
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -961,31 +942,6 @@ class XPUAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
-
-                import os as _os
-
-                if _os.environ.get("SGL_XPU_DEBUG_PT") == "1":
-                    torch.xpu.synchronize()
-                    _num_pages = key_cache.shape[0]
-                    _pt = page_table
-                    _cs = cache_seqlens
-                    _ptmax = int(_pt.max().item()) if _pt.numel() else -1
-                    _ptmin = int(_pt.min().item()) if _pt.numel() else -1
-                    print(
-                        f"[XPU_DBG decode L{layer.layer_id} cross={layer.is_cross_attention}] "
-                        f"page_size={self.page_size} key_cache_pages={_num_pages} "
-                        f"page_table.shape={tuple(_pt.shape)} pt_min={_ptmin} pt_max={_ptmax} "
-                        f"cache_seqlens={_cs.tolist()} max_seqlen_q={max_seqlen_q} "
-                        f"cu_seqlens_q={metadata.cu_seqlens_q.tolist()}",
-                        flush=True,
-                    )
-                    # Page indices must be < number of physical pages.
-                    if _ptmax >= _num_pages:
-                        print(
-                            f"[XPU_DBG] !!! OOB page index: pt_max={_ptmax} >= "
-                            f"key_cache_pages={_num_pages} (page_size={self.page_size})",
-                            flush=True,
-                        )
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
