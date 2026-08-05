@@ -33,6 +33,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -75,6 +77,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.ps = ps
@@ -88,8 +92,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
-        attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
-        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
+        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._decode_graph_allowed = (
+            not server_args.disable_cuda_graph and not self._is_pd_prefill
+        )
+        if (
+            server_args.enable_dp_attention
+            and self._draft_is_moe
+            and ps.attn_tp_size > 1
+        ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
@@ -169,7 +180,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
@@ -197,7 +208,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
@@ -258,6 +269,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
+        if self._is_pd_prefill and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -307,7 +321,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        capture_decode_cuda_graph = self._decode_graph_allowed
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -416,6 +430,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
+        # Must inject before prefill returns: the scheduler may update radix
+        # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
         draft_seq_lens = torch.tensor(
@@ -432,6 +448,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=batch.out_cache_loc,
             positions=positions,
         )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
@@ -592,6 +609,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
+            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # sampling batches must take the eager accept path even when the
+            # draft proposal itself folded.
+            and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
