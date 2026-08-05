@@ -62,7 +62,13 @@ def validate(documents: list[dict]) -> None:
         "p5.4xlarge"
     ]
     assert requirement_values(denoiser_8x, "node.kubernetes.io/instance-type") == [
-        "p5.48xlarge"
+        "p5.48xlarge",
+        "p6-b200.48xlarge",
+    ]
+    assert requirement_values(denoiser_8x, "topology.kubernetes.io/zone") == [
+        "us-east-2a",
+        "us-east-2b",
+        "us-east-2c",
     ]
     assert all(value.startswith("g6.") for value in requirement_values(
         vae, "node.kubernetes.io/instance-type"

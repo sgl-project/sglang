@@ -58,10 +58,13 @@ def test_h100_pool_uses_one_fully_utilized_eight_gpu_node():
         "p5.4xlarge"
     ]
     assert requirement_values(packed, "node.kubernetes.io/instance-type") == [
-        "p5.48xlarge"
+        "p5.48xlarge",
+        "p6-b200.48xlarge",
     ]
     assert requirement_values(packed, "topology.kubernetes.io/zone") == [
-        "us-east-2a"
+        "us-east-2a",
+        "us-east-2b",
+        "us-east-2c",
     ]
     assert deployment["spec"]["replicas"] == "REPLACE_WITH_DENOISER_BASE_REPLICAS"
     selector = deployment["spec"]["template"]["spec"]["nodeSelector"]

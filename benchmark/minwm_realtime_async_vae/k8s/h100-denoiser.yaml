@@ -76,10 +76,10 @@ spec:
           values: [amd64]
         - key: topology.kubernetes.io/zone
           operator: In
-          values: [us-east-2a]
+          values: [us-east-2a, us-east-2b, us-east-2c]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [p5.48xlarge]
+          values: [p5.48xlarge, p6-b200.48xlarge]
       taints:
         - key: nvidia.com/gpu
           value: "true"
