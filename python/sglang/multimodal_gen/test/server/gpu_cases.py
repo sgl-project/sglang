@@ -592,7 +592,127 @@ else:
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
+MINIMAX_H3_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "minimax_h3_fl2va_first_frame_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            num_gpus=4,
+            tp_size=2,
+            ulysses_degree=2,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "speed",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp; preserve the album-cover "
+                "composition, brick storefronts, muted teal and amber colors, "
+                "subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "fl2va",
+                "conditions": [
+                    {
+                        "type": "image",
+                        "uri": (
+                            "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/"
+                            "5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/"
+                            "825646124206.jpg/600x600bb.jpg"
+                        ),
+                        "role": "keyframe",
+                        "frame_index": 0,
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 2,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+]
+
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "minimax_h3_t2va_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp, brick storefronts, muted teal "
+                "and amber colors, subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
     DiffusionTestCase(
         "flux2_modelopt_fp8_tp2_t2i",
         DiffusionServerArgs(
@@ -968,6 +1088,9 @@ FILE_SUITES = {
     "1-gpu-b200": [
         "test_server_b200.py",
     ],
+    "4-gpu-h100": [
+        "test_server_4_gpu_h100.py",
+    ],
 }
 
 PARAMETRIZED_CASE_GROUPS = {
@@ -994,8 +1117,23 @@ STANDALONE_FILES = {
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
+        "../single_test_file/test_ipc_a2a_2_gpu.py",
     ],
 }
+
+# test_update_weights_from_disk fails deterministically on ROCm: the diffusion
+# weight-update-from-disk reload path does not reconcile the diffusers
+# checkpoint layout with the sglang transformer parameters (shape mismatch ->
+# HTTP 400). Tracked in #31924. NVIDIA does not run standalone files, so this
+# test is AMD-only; skip it on ROCm until the reload path is fixed. Remove
+# this block (keeping the STANDALONE_FILES / est-time entry above) to
+# re-enable once #31924 lands.
+if current_platform.is_hip():
+    STANDALONE_FILES["1-gpu"] = [
+        f
+        for f in STANDALONE_FILES["1-gpu"]
+        if f != "../single_test_file/test_update_weights_from_disk.py"
+    ]
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
@@ -1012,6 +1150,8 @@ STANDALONE_FILE_EST_TIMES = {
         # Raise if CI reports a higher measured time.
         "../single_test_file/test_disagg_server.py": 600.0,
         "../single_test_file/test_ar_models.py": 600.0,
+        # no model load; the cost is the one-time JIT build of the sync kernels
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
     },
 }
 
