@@ -4,10 +4,17 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
     GDNKernelDispatcher,
-    maybe_set_default_flashinfer_gdn_prefill,
+    flashinfer_gdn_prefill_default,
+)
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -34,14 +41,6 @@ def make_runner(
     )
     for name, value in arg_overrides.items():
         setattr(args, name, value)
-
-    # The policy routes its load-time default through the audited mutation entry
-    # (server_args.override); mirror that on the stub so the write lands.
-    def _override(source, **fields):
-        for _field, _value in fields.items():
-            setattr(args, _field, _value)
-
-    args.override = _override
 
     return SimpleNamespace(
         server_args=args,
@@ -83,24 +82,25 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 return_value=flashinfer_available,
             ),
         ):
-            maybe_set_default_flashinfer_gdn_prefill(runner)
-        return runner.server_args.linear_attn_prefill_backend
+            return flashinfer_gdn_prefill_default(runner)
 
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
-    def test_selects_flashinfer_for_no_buffer_radix_cache(self):
-        runner = make_runner(
-            uses_mamba_radix_cache=True,
-            mamba_radix_cache_strategy="no_buffer",
-        )
-        self.assertEqual(self.apply_policy(runner), "flashinfer")
+    def test_selects_flashinfer_for_radix_cache_strategies(self):
+        for strategy in ("no_buffer", "extra_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                runner = make_runner(
+                    uses_mamba_radix_cache=True,
+                    mamba_radix_cache_strategy=strategy,
+                )
+                self.assertEqual(self.apply_policy(runner), "flashinfer")
 
-    def test_preserves_explicit_prefill_override(self):
+    def test_declines_when_the_prefill_backend_is_explicit(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
                 runner = make_runner(linear_attn_prefill_backend=backend)
-                self.assertEqual(self.apply_policy(runner), backend)
+                self.assertIsNone(self.apply_policy(runner))
 
     def test_rejects_unsupported_capability(self):
         cases = (
@@ -128,20 +128,6 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
             ("page_major_kv", {"enable_page_major_kv_layout": True}),
-            (
-                "extra_buffer",
-                {
-                    "uses_mamba_radix_cache": True,
-                    "mamba_radix_cache_strategy": "extra_buffer",
-                },
-            ),
-            (
-                "extra_buffer_lazy",
-                {
-                    "uses_mamba_radix_cache": True,
-                    "mamba_radix_cache_strategy": "extra_buffer_lazy",
-                },
-            ),
             ("dynamic_chunk", {"enable_dynamic_chunking": True}),
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),
@@ -150,6 +136,53 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         for name, runner_args in cases:
             with self.subTest(name=name):
                 self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
+
+    def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
+            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
+            # 65 on the 128-token sequence represents an interior S64
+            # boundary encoded as S64 + 1 by the scheduler.
+            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
+            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(4),
+            track_ssm_h_dst=torch.empty(4),
+        )
+
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+            "get_server_args",
+            return_value=SimpleNamespace(mamba_cache_chunk_size=64),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+
+        torch.testing.assert_close(
+            metadata.state_checkpoint_cu_starts,
+            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
+        )
+        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
+        self.assertEqual(metadata.num_state_checkpoints, 7)
+        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
+
+    def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.device = "cpu"
+        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
+        forward_batch = SimpleNamespace(
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_indices=torch.tensor([7]),
+        )
+
+        def init_base(instance, _forward_batch):
+            instance.forward_metadata = metadata
+
+        with patch.object(MambaAttnBackendBase, "init_forward_metadata", init_base):
+            backend.init_forward_metadata(forward_batch)
+
+        torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

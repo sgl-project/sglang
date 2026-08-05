@@ -254,6 +254,48 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         return F.linear(x, layer.weight, bias)
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
+            and _use_cutedsl_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm_out,
+            )
+
+            return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+
+        if x.ndim != 2:
+            raise ValueError("caller-owned linear output currently requires a 2D input")
+        if output.shape != (x.shape[0], layer.weight.shape[0]):
+            raise ValueError(
+                f"linear output has shape {output.shape}, expected "
+                f"{(x.shape[0], layer.weight.shape[0])}"
+            )
+        torch.mm(x, layer.weight.t(), out=output)
+        if bias is not None:
+            output.add_(bias)
+        return output
+
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
@@ -365,7 +407,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
-            and get_moe_a2a_backend().is_deepep()
+            and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip
             and hasattr(layer, "dispatcher")
@@ -374,6 +416,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
+            # The cached indices are GPU tensors. Colocated weight offloading
+            # can release their backing memory between reloads, so rebuild them
+            # once per post-processing cycle.
+            self._cache_permute_indices.clear()
+
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
                 convert_to_block_layout,
@@ -438,10 +485,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
         if _is_npu:
+            # The kernels set the dispatcher output dtype themselves -- they are
+            # the ones that know what their gmms expect. NPUUnquantMoEMethod
+            # already sets bf16 here, and hardcoding it a second time would
+            # clobber a subclass that attached a quantized kernel instead.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
 

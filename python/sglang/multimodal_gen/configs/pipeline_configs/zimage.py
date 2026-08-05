@@ -57,10 +57,6 @@ def zimage_postprocess_text(
     return pad_text_embeddings_with_mask(split_hidden_states)
 
 
-class TransformersModelConfig(EncoderConfig):
-    tokenizer_kwargs: dict = field(default_factory=lambda: {})
-
-
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False

@@ -8,7 +8,7 @@ import torch
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu
 from sglang.utils import logger
 
@@ -203,10 +203,9 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
-    server_args = get_server_args()
-    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+    # The pool's recycler counts the whole TP group, so the acknowledgement must
     # match that count even when an attention subgroup is smaller.
-    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+    consumer_count = max(parallel.tp_size, 1)
     for item in items:
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
@@ -327,11 +326,24 @@ def _batch_encode_per_image_misses(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
 
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached). Mirrors
+            # _get_chunked_embedding_by_item.
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for h, emb in zip(ordered_hashes, split_embeddings):
             embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
@@ -574,7 +586,7 @@ def _adjust_embedding_length(
             f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_server_args().chunked_prefill_size
+            chunked_prefill_size = get_schedule().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"

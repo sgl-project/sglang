@@ -50,10 +50,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ class LagunaMoE(nn.Module):
         self.gate = LagunaMoEGate(config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -566,6 +567,31 @@ class LagunaModel(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """LoRA input/output dims for a module, honoring Laguna's per-layer
+        attention widths.
+
+        Laguna sizes each layer's attention from
+        ``num_attention_heads_per_layer[layer_idx]`` (see ``LagunaAttention``),
+        so ``config.num_attention_heads`` — a single global value — is wrong for
+        any layer with a different head count. The generic
+        :func:`get_default_hidden_dim` fallback would use that global value and
+        mis-size the ``qkv_proj`` / ``o_proj`` LoRA buffers, crashing at
+        generation with ``sgemm_lora_a.py: assert x.shape[-1] == K``. We
+        override just those two attention projections and delegate every other
+        module (MLP, MoE, embed, lm_head, ...) to the shared helper.
+        """
+        config = self.config
+        # No fallback; Laguna's head_dim is non-standard.
+        head_dim = config.head_dim
+        num_heads = config.num_attention_heads_per_layer[layer_idx]
+        num_kv_heads = config.num_key_value_heads
+        if module_name == "qkv_proj":
+            return config.hidden_size, head_dim * (num_heads + num_kv_heads * 2)
+        elif module_name == "o_proj":
+            return head_dim * num_heads, config.hidden_size
+        return get_default_hidden_dim(module_name, config, layer_idx)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -640,7 +666,7 @@ class LagunaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -695,6 +721,9 @@ class LagunaForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        return self.model.get_hidden_dim(module_name, layer_idx)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

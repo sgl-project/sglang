@@ -82,6 +82,7 @@ PER_COMMIT_SUITES = {
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
+        "base-c-test-8-gpu-b300",
         "base-c-test-deepep-4-gpu-h100",
         "base-c-test-deepep-4-gpu-b200",
         "base-c-test-deepep-8-gpu-h200",
@@ -99,9 +100,11 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.NPU: [
         "base-a-test-1-gpu-small",
-        "stage-b-test-1-npu-a2",
-        "stage-b-test-2-npu-a2",
+        "stage-a-unit-test-npu",
+        "stage-b-test-1-npu-a3",
+        "stage-b-test-2-npu-a3",
         "stage-b-test-4-npu-a3",
+        "stage-b-test-8-npu-a3",
         "stage-b-test-16-npu-a3",
     ],
     HWBackend.XPU: [
@@ -337,6 +340,7 @@ def run_a_suite(args):
         if not f.endswith("/conftest.py")
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
+        and not f.endswith("/run_tests.py")
     ]
 
     # Strict: all discovered files must have proper registration
