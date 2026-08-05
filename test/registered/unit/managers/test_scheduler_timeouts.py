@@ -23,8 +23,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class _FakeReq:
-    """Minimal stand-in; must stay hashable because the waiting-timeout path
-    collects dropped requests in a set."""
+    """Must stay hashable: the waiting-timeout path collects drops in a set."""
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid

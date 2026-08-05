@@ -37,13 +37,13 @@ TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
 )
 _CLS_NUM_LABELS = AutoConfig.from_pretrained(TEST_CLASSIFICATION_BASE_MODEL).num_labels
 
-# Engines are shared across classes by config: score() is stateless and the
-# radix cache is off everywhere here, so booting the same config once per class
-# only cost wall time.
+# Engines are shared by config across classes and test methods: score() is
+# stateless and the radix cache is off everywhere here, so re-booting the same
+# config only cost wall time.
 #
-# The bound must stay strictly above the most engines any single class holds at
-# once (two, for the MIS vs non-MIS comparisons) -- otherwise eviction could
-# shut down an engine a live class still references through cls.engine.
+# The bound must stay strictly above the most engines one class holds at once
+# (two, for the MIS vs non-MIS comparisons), or eviction could shut down an
+# engine a live class still references through cls.engine.
 _MAX_LIVE_ENGINES = 3
 _ENGINE_CACHE = OrderedDict()
 
@@ -178,8 +178,6 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        # One engine for the whole class: score() is stateless and the radix
-        # cache is off, so the per-method boot this used to do bought nothing.
         cls.engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
