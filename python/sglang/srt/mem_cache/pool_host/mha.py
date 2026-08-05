@@ -553,7 +553,8 @@ class MHATokenToKVPoolHost(HostKVCache):
                 "layer-range cells require the page_first_direct layout "
                 f"(layer-major page blocks); got {self.layout!r}."
             )
-        if self.kv_buffer is None:
+        if not torch.is_tensor(self.kv_buffer):
+            # Asymmetric MHA pools hold a (k_buffer, v_buffer) tuple.
             raise NotImplementedError(
                 "layer-range cells are not supported for split K/V host "
                 "pools (asymmetric MHA)."

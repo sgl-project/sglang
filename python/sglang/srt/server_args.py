@@ -7208,7 +7208,9 @@ class ServerArgs:
                 "DCP rank holds an interleaved token shard (needs the "
                 "token-granule extension)."
             )
-        if self.attn_cp_size > 1:
+        # attn_cp_size is resolvable (prefill-CP overrides stash it without
+        # mutating the raw field), so read it through the resolved view.
+        if self._resolved().attn_cp_size > 1:
             raise NotImplementedError(
                 "canonical-grid with --attn-cp-size > 1 is not supported: "
                 "CP ranks hold sub-page slices or replicated pages (needs "
@@ -7216,7 +7218,8 @@ class ServerArgs:
             )
         # Best-effort early check of head fan-out prerequisites when the
         # extra config is inline JSON (the '@file' form is re-validated at
-        # attach). tp_lcm_size is the fleet head-grid agreement; fan-out
+        # attach). head_group is the fleet head-grid agreement (tp_lcm_size
+        # is the legacy rank-suffix knob and is rejected below); fan-out
         # needs a multi-key backend and per-head-group contiguous layout.
         extra = self.hicache_storage_backend_extra_config
         if extra and not extra.startswith("@"):
@@ -7264,13 +7267,10 @@ class ServerArgs:
                         "multi-key-per-page backend; only mooncake supports "
                         "it."
                     )
-                if head_group and not self.use_mla_backend():
-                    raise NotImplementedError(
-                        "canonical-grid layer fan-out and head fan-out "
-                        "cannot combine yet (they require different host "
-                        "layouts); set either layer_partition or "
-                        "head_group, not both."
-                    )
+                # head_group + layer_partition together is legal when each
+                # stage spans exactly one canonical range (no layer fan-out)
+                # — whether fan-out actually occurs depends on the PP split,
+                # so the combination is validated at attach, not here.
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:

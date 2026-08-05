@@ -630,6 +630,23 @@ class HiCacheController:
         canonical_layer_ranges = None
         layer_partition = storage_backend_extra_config.pop("layer_partition", None)
         head_group_knob = storage_backend_extra_config.pop("head_group", None)
+
+        # The knobs arrive from operator JSON: enforce exact integers, or
+        # floats/bools would leak into key coordinates (L30.0-61 forks the
+        # keyspace) and into zero-copy pointer arithmetic.
+        def _is_exact_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        if head_group_knob is not None and not _is_exact_int(head_group_knob):
+            raise ValueError(f"head_group must be an integer, got {head_group_knob!r}.")
+        if layer_partition is not None and (
+            not isinstance(layer_partition, list)
+            or not all(_is_exact_int(b) for b in layer_partition)
+        ):
+            raise ValueError(
+                f"layer_partition must be a list of integers, got "
+                f"{layer_partition!r}."
+            )
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
             if tp_lcm_size:
                 raise ValueError(

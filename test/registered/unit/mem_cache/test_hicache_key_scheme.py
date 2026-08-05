@@ -305,10 +305,32 @@ class TestCellSuffixes(CustomTestCase):
             ({"page_size": 32}, "page_size"),
             ({"model_id": "other/model"}, "model_id"),
             ({"rank_replicated": True}, "rank_replicated"),
+            ({"object_layout": "page_first"}, "object_layout"),
         ]
         for deployment_override, expected_msg in cases:
             with self.assertRaisesRegex(ValueError, expected_msg):
                 _gqa_suffixes(tp_rank=0, tp_size=4, **deployment_override)
+
+    def test_local_heads_must_tile_head_group(self):
+        # 12 heads at TP4 -> 3 heads/rank: 12 % 2 == 0 passes the product
+        # check, but 3 % 2 != 0 must hit the tiling branch, not silently
+        # floor the cell count.
+        namespace = _gqa_namespace(total_kv_heads=12, head_group=2)
+        with self.assertRaisesRegex(ValueError, "tile"):
+            build_canonical_cell_suffixes(
+                namespace,
+                attn_tp_rank=0,
+                attn_tp_size=4,
+                attn_cp_size=1,
+                start_layer=0,
+                end_layer=40,
+                local_kv_heads=3,
+                dtype="bfloat16",
+                page_size=64,
+                model_id="meta-llama/Llama-3-70B",
+                rank_replicated=False,
+                object_layout="page_head",
+            )
 
     def test_wrong_namespace_head_count_fails(self):
         # Also the kv-head replication case: a truthful namespace for an
@@ -450,6 +472,14 @@ class TestControllerGuards(CustomTestCase):
         file_stub.tp_size = 2
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
             self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
+
+    def test_nonpositive_head_group_rejected(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        stub = self._stub_controller(HiCacheController, "mooncake", has_draft=False)
+        stub.tp_size = 2
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self._build(stub, is_rank_replicated=False, head_group_knob=0)
 
 
 class TestFileBackendSuffix(CustomTestCase):
@@ -733,6 +763,15 @@ class TestMhaLayerRangeBufferMeta(CustomTestCase):
             self._stub_pool(layout="page_head").get_layer_range_page_buffer_meta(
                 torch.tensor([0, 1, 2, 3]), [(0, 2)]
             )
+
+    def test_rejects_split_kv_pools(self):
+        import torch
+
+        pool = self._stub_pool()
+        # Asymmetric MHA pools hold a (k_buffer, v_buffer) tuple.
+        pool.kv_buffer = (pool.kv_buffer, pool.kv_buffer)
+        with self.assertRaisesRegex(NotImplementedError, "asymmetric"):
+            pool.get_layer_range_page_buffer_meta(torch.tensor([0, 1, 2, 3]), [(0, 2)])
 
 
 if __name__ == "__main__":
