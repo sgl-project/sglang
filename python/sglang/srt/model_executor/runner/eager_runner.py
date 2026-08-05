@@ -264,10 +264,17 @@ class EagerRunner(BaseRunner):
             prepare_cp_forward(forward_batch)
 
         if forward_batch.needs_forward_metadata_init() or cp_v2_active:
-            if model_runner.dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.dcp_size > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                and not forward_batch.forward_mode.is_target_verify()
             ):
-                # prepare kv cache buffer for dcp to gather kv cache
+                # prepare kv cache buffer for dcp to gather kv cache.
+                # Target-verify is extend-class but carries no
+                # extend_prefix_lens; its DCP metadata is built by the
+                # attention backend in init_forward_metadata instead.
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
                         forward_batch.seq_lens,
