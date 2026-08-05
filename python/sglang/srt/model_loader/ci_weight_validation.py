@@ -32,57 +32,6 @@ from sglang.srt.utils import log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 
-def _remote_file_exists(
-    repo_id: str, filename: str, revision: Optional[str], allow_remote_check: bool
-) -> Optional[bool]:
-    """
-    Check if a file exists on Hugging Face Hub for a specific revision.
-
-    Args:
-        repo_id: Repository ID (e.g., "meta-llama/Llama-2-7b-hf")
-        filename: File name to check (e.g., "hf_quant_config.json")
-        revision: Git revision (commit hash, branch, or tag). None means default branch.
-        allow_remote_check: Whether remote checks are allowed (e.g., CI validation phase)
-
-    Returns:
-        True if file exists on hub, False if it doesn't exist, None if we cannot determine
-        (network error or remote check not allowed - be conservative and assume incomplete)
-    """
-    if not allow_remote_check:
-        logger.debug(
-            "Remote check disabled for %s/%s, returning None (unknown)",
-            repo_id,
-            filename,
-        )
-        return None
-
-    try:
-        from huggingface_hub import HfApi
-
-        api = HfApi()
-        exists = api.file_exists(repo_id=repo_id, filename=filename, revision=revision)
-        logger.debug(
-            "Remote file check: %s/%s (revision=%s) exists=%s",
-            repo_id,
-            filename,
-            revision or "default",
-            exists,
-        )
-        return exists
-    except Exception as e:
-        # Network errors, auth issues, repo not found, etc.
-        # Return None (unknown) - caller will treat as optional
-        logger.debug(
-            "Failed to check remote file existence for %s/%s (revision=%s): %s. "
-            "Will treat as optional.",
-            repo_id,
-            filename,
-            revision or "default",
-            e,
-        )
-        return None
-
-
 def _get_per_run_marker_dir() -> str:
     """
     Get the directory for per-run validation markers.

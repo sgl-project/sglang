@@ -2,13 +2,14 @@
 """
 Clean up stale HuggingFace cache artifacts from previous failed downloads.
 
-This script removes incomplete marker files, temporary files, and lock files
-from the HuggingFace cache directory. These artifacts can accumulate from
-interrupted or failed downloads and may interfere with future downloads.
+This script removes incomplete marker files and temporary files from the
+HuggingFace cache directory. These artifacts can accumulate from interrupted
+or failed downloads and may interfere with future downloads.
 """
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List
 
@@ -57,9 +58,21 @@ def find_stale_artifacts(cache_dir: str) -> List[Path]:
         "**/*.tmp",  # Temporary files
     ]
 
+    # A match is only stale once it has been quiet for a while: another
+    # co-mounted container may still be appending to its blobs/*.incomplete,
+    # and unlinking that breaks the download's final os.replace into the blob.
+    min_stale_age_seconds = 2 * 60 * 60
+
     stale_files = []
+    now = time.time()
     for pattern in patterns:
-        stale_files.extend(cache_path.glob(pattern))
+        for path in cache_path.glob(pattern):
+            try:
+                if now - path.stat().st_mtime < min_stale_age_seconds:
+                    continue
+            except OSError:
+                continue  # vanished mid-scan - nothing left to clean
+            stale_files.append(path)
 
     return stale_files
 

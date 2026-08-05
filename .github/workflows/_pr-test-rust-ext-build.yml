@@ -163,16 +163,19 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Same path ci_install_dependency.sh uses, so a runner that also runs test
-          # stages keeps one warm cache. Its guard is repeated here because nothing
-          # prunes the tree on a runner that only ever builds.
-          export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
-          mkdir -p "${CARGO_TARGET_DIR}"
-          used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+          # Same root ci_install_dependency.sh uses, but one subdir per
+          # interpreter (set in the loop below): PyO3's build fingerprint tracks
+          # the interpreter, so in a shared dir the two ABI builds would
+          # invalidate each other's pyo3-dependent crates on every run. The
+          # disk-pressure guard is repeated here because nothing prunes the
+          # tree on a runner that only ever builds.
+          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+          mkdir -p "${cargo_target_root}"
+          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
           if [ "${used:-0}" -ge 85 ]; then
-              echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
-              rm -rf "${CARGO_TARGET_DIR}"
-              mkdir -p "${CARGO_TARGET_DIR}"
+              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
+              rm -rf "${cargo_target_root}"
+              mkdir -p "${cargo_target_root}"
           fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
@@ -185,6 +188,7 @@ jobs:
           trap 'rm -rf "${venv_root}" || true' EXIT
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+              export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
               venv="${venv_root}/py${minor}"
               uv venv "${venv}" --python "${python_bin}" --seed
               # shellcheck disable=SC1091
