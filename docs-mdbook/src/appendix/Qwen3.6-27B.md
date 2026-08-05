@@ -452,3 +452,36 @@ bash sglang_start.sh \
 
 > 注：PD 分离在**当前 6 卡 L40S 上收益有限**（权重双份加载、并发下降、PCIe KV 传输），
 > 详见附录 D 11.12；"长期"是指扩容到 12+ 卡后再评估。
+
+### 8.6 待实施优化：Python 代理网关（预期收益）
+
+> 现状：生产**未开代理**（`sglang_start.sh` 默认 `PROXY_PORT=0`）。脚本已内置 `--proxy-port 8080` 拉起 [sglang_proxy.py](appendix/sglang_proxy.py)（限并发 + 注入 priority + 429 兜底），无需改客户端。
+
+**收益不在总量，在混合流量下的分配**。当前稳态已不错（TTFT 5.69s / abort 1.56%），代理预期带来三块收益：
+
+| 收益点 | 机制 | 预期 |
+|--------|------|------|
+| tool call TTFT | 自动注入 `priority=10`（当前客户端不带 priority，服务端默认 0 = 没插队） | tool call TTFT 向 **3~4s** 收敛（tool call 占大头时最明显） |
+| 高峰稳定性 / abort | thinking 封顶 12 并发，KV 永远给 tool call 留空间 | 高峰抖动变小，abort 均值可能变化不大但**方差下降** |
+| 过载保护 | 代理等待 >10s 直接 429，不让请求进 SGLang 排队 | 突发流量"快速失败"而非"越来越慢"（前提：客户端有重试/降级） |
+
+**收益明显 / 不明显场景**：
+
+| 流量特征 | 代理收益 |
+|---------|---------|
+| tool call 与 thinking 混合、tool call 占比大 | **明显**（priority 插队 + KV 保护） |
+| 有明显高峰突发 | **明显**（429 兜底 + 限并发） |
+| 纯 thinking 或纯 tool call、无混合 | 有限（没有竞争就没有分配问题） |
+| 一直低负载 | 几乎无感（还多一层转发） |
+
+**落地方式与验证**：
+
+```bash
+# 按默认参数开（tool_call=16 / thinking=12），客户端连 8080
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 --proxy-port 8080
+```
+
+- 对比两个数：tool call 排队（`num_queue_reqs{priority="10"}`）是否下降、高峰 abort；
+- 若 tool call 占比确实大，1~2 天内可见排队与 TTFT 改善；无改善再调 thinking 上限；
+- 附录 D 11.9 有完整机制说明（限并发语义、热调、K8s 外部访问），附录 G 有监控方法。
