@@ -959,6 +959,7 @@ class Envs:
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
     # VLM Item CUDA IPC Transport
+    SGLANG_DISABLE_SHM_MM = EnvBool(False)
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This
     # has no effect unless CUDA IPC feature transport is explicitly selected.
