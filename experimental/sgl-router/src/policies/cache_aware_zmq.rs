@@ -237,6 +237,30 @@ impl WorkerLoads {
     }
 }
 
+/// Outcome of [`CacheAwareZmqPolicy::match_request`] — the matched cache
+/// owners plus the best-mode stats the caller logs and meters. In a uniform
+/// fleet these describe the single established hashing mode; in a bimodal
+/// fleet they are the union of owners and the best-matching mode's numbers.
+struct MatchOutcome {
+    /// URLs of workers owning a matched prefix, drawn only from hashing modes
+    /// whose per-mode overlap cleared `cache_threshold`. Empty ⇒ no affinity.
+    owner_urls: std::collections::HashSet<String>,
+    /// Best (max-rate) mode's matched-block count — logging / metrics only.
+    matched_blocks: usize,
+    /// Best mode's query-block count — the match_rate denominator and the
+    /// query-blocks metric sample.
+    query_blocks: usize,
+    /// Best mode's match_rate.
+    match_rate: f32,
+    /// True once some mode produced query blocks (else too few tokens to hash).
+    had_blocks: bool,
+    /// True when some mode cleared the threshold even if its matched node had
+    /// no live owner — lets the caller separate "unowned" from "below threshold".
+    any_above_threshold: bool,
+    /// "bigram" | "unigram" | "dual", for the debug log.
+    label: &'static str,
+}
+
 impl CacheAwareZmqPolicy {
     pub fn new(
         config: CacheAwareConfig,
@@ -343,6 +367,82 @@ impl CacheAwareZmqPolicy {
             max_load,
             abs_diff,
             imbalanced,
+        }
+    }
+
+    /// Match the request against the tree across one or both hashing modes.
+    ///
+    /// Uniform fleet (oracle not bimodal): hash once with the established mode
+    /// — the historical fast path, one hash + one lookup. Bimodal fleet
+    /// (EAGLE-family + non-EAGLE behind one base model): hash the request BOTH
+    /// ways, look up each, and union the owners of every mode whose per-mode
+    /// overlap cleared `cache_threshold`. The two hash spaces are disjoint
+    /// (SHA256 over different preimages), so each mode's query only matches its
+    /// own family's tree entries and the union cannot cross-contaminate.
+    fn match_request(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        primary_bigram: bool,
+    ) -> MatchOutcome {
+        let bimodal = self.block_size_oracle.is_bimodal();
+        // Primary mode first; append the opposite only when the fleet is mixed.
+        let modes: &[bool] = match (bimodal, primary_bigram) {
+            (false, true) => &[true],
+            (false, false) => &[false],
+            (true, true) => &[true, false],
+            (true, false) => &[false, true],
+        };
+
+        let mut owner_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut had_blocks = false;
+        let mut any_above_threshold = false;
+        // (rate, matched_blocks, query_blocks) of the best-matching mode, for
+        // logging + metrics. Seeded by the first hashed mode so a zero-match
+        // request still reports a real query-block denominator.
+        let mut best: Option<(f32, usize, usize)> = None;
+
+        for &mode_bigram in modes {
+            let hashes = if mode_bigram {
+                compute_block_hashes_bigram(tokens, block_size)
+            } else {
+                compute_block_hashes(tokens, block_size)
+            };
+            if hashes.is_empty() {
+                continue;
+            }
+            had_blocks = true;
+            let matched = self.tree.match_prefix(None, &hashes);
+            debug_assert!(matched.matched_blocks <= hashes.len());
+            let rate = matched.matched_blocks as f32 / hashes.len() as f32;
+            if best.is_none_or(|(r, _, _)| rate > r) {
+                best = Some((rate, matched.matched_blocks, hashes.len()));
+            }
+            // Per-mode threshold BEFORE unioning: a mode contributes owners only
+            // if its own overlap cleared the bar, so a strong match in one family
+            // never drags in a weak match's owners from the other.
+            if rate > self.config.cache_threshold {
+                any_above_threshold = true;
+                for w in matched.workers {
+                    owner_urls.insert(w.url);
+                }
+            }
+        }
+
+        let (match_rate, matched_blocks, query_blocks) = best.unwrap_or((0.0, 0, 0));
+        let label = match (bimodal, primary_bigram) {
+            (true, _) => "dual",
+            (false, true) => "bigram",
+            (false, false) => "unigram",
+        };
+        MatchOutcome {
+            owner_urls,
+            matched_blocks,
+            query_blocks,
+            match_rate,
+            had_blocks,
+            any_above_threshold,
+            label,
         }
     }
 }
@@ -503,70 +603,58 @@ impl Policy for CacheAwareZmqPolicy {
             }
             return Self::pick_min_load(workers, &loads, &self.config.load_gate);
         };
-        // EAGLE-family workers hash KV blocks over token bigrams; query hashes
-        // must use the same worker-reported mode or overlap always stays zero.
-        let block_hashes = if is_bigram {
-            compute_block_hashes_bigram(tokens, block_size as usize)
-        } else {
-            compute_block_hashes(tokens, block_size as usize)
-        };
-        if block_hashes.is_empty() {
+        // Uniform fleet: hash once with the established mode. Bimodal fleet
+        // (EAGLE-family + non-EAGLE behind one base model): hash both ways and
+        // union the eligible owners, so a prefix warm on either family is a hit.
+        let outcome = self.match_request(tokens, block_size as usize, is_bigram);
+        if !outcome.had_blocks {
             self.record_decision(model_id, CacheAwareDecision::NoHashBlocks);
             return Self::pick_min_load(workers, &loads, &self.config.load_gate);
         }
-        let matched = self.tree.match_prefix(None, &block_hashes);
-        debug_assert!(matched.matched_blocks <= block_hashes.len());
-        let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
         tracing::debug!(
             model = %ctx.model(),
-            hashing = if is_bigram { "bigram" } else { "unigram" },
-            n_blocks = block_hashes.len(),
-            matched_blocks = matched.matched_blocks,
-            matched_workers = matched.workers.len(),
-            match_rate,
+            hashing = outcome.label,
+            n_blocks = outcome.query_blocks,
+            matched_blocks = outcome.matched_blocks,
+            matched_workers = outcome.owner_urls.len(),
+            match_rate = outcome.match_rate,
             cache_threshold = self.config.cache_threshold,
             "cache-aware-zmq match_prefix",
         );
-        // Record the matched overlap into `sgl_router_overlap_blocks` before
-        // the threshold branch, so the histogram captures the full
-        // distribution — including low-overlap selections that fall back to
-        // min-load. This is the quantitative signal that cache-aware routing
-        // is matching prefixes at all.
+        // Record overlap + query-block count before the affinity branch so the
+        // histogram captures the full distribution, including below-threshold
+        // selections. In a bimodal fleet these are the best-matching mode's
+        // numbers, keeping one sample per request.
         if let Some(m) = self.metrics.get() {
-            m.observe_overlap_blocks(model_id, matched.matched_blocks as u64);
-            m.add_cache_aware_query_blocks(model_id, block_hashes.len() as u64);
+            m.observe_overlap_blocks(model_id, outcome.matched_blocks as u64);
+            m.add_cache_aware_query_blocks(model_id, outcome.query_blocks as u64);
         }
-        if match_rate <= self.config.cache_threshold {
-            self.record_decision(model_id, CacheAwareDecision::BelowThreshold);
+        if outcome.owner_urls.is_empty() {
+            // Same taxonomy as the single-mode path: a cleared-threshold match
+            // whose node has no live owner is distinct from no match at all.
+            let decision = if outcome.any_above_threshold {
+                CacheAwareDecision::MatchedNodeUnowned
+            } else {
+                CacheAwareDecision::BelowThreshold
+            };
+            self.record_decision(model_id, decision);
             tracing::debug!(
                 model = %ctx.model(),
-                n_blocks = block_hashes.len(),
-                matched_blocks = matched.matched_blocks,
-                matched_workers = matched.workers.len(),
-                match_rate,
+                n_blocks = outcome.query_blocks,
+                matched_blocks = outcome.matched_blocks,
+                match_rate = outcome.match_rate,
                 cache_threshold = self.config.cache_threshold,
-                "cache-aware-zmq: overlap below threshold, falling back to min-load",
+                "cache-aware-zmq: no eligible cache owner, falling back to min-load",
             );
             return Self::pick_min_load(workers, &loads, &self.config.load_gate);
         }
-        if matched.workers.is_empty() {
-            self.record_decision(model_id, CacheAwareDecision::MatchedNodeUnowned);
-            tracing::debug!(
-                model = %ctx.model(),
-                n_blocks = block_hashes.len(),
-                matched_blocks = matched.matched_blocks,
-                match_rate,
-                "cache-aware-zmq: matched prefix has no worker owners, falling back to min-load",
-            );
-            return Self::pick_min_load(workers, &loads, &self.config.load_gate);
-        }
-        // Among workers in the matched set, pick the lowest-load one that is not
-        // already queueing. The gate and the tiebreak read different quantities
-        // — queue length vs total depth — so filtering the whole set is not the
-        // same as vetoing its minimum: the least-loaded prefix owner can be the
-        // one with a backlog, while a slightly busier owner has none.
-        let matched_urls: std::collections::HashSet<&str> =
-            matched.workers.iter().map(|kw| kw.url.as_str()).collect();
+        // Among the matched owners (either family, in a bimodal fleet), pick the
+        // lowest-load one that is not already queueing. The gate and the tiebreak
+        // read different quantities — queue length vs total depth — so filtering
+        // the whole set is not the same as vetoing its minimum: the least-loaded
+        // prefix owner can be the one with a backlog, while a slightly busier
+        // owner has none.
+        let matched_urls = &outcome.owner_urls;
         let best_matched: Option<Arc<Worker>> = workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
@@ -612,7 +700,7 @@ impl Policy for CacheAwareZmqPolicy {
             // for small waits.
             if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
                 if let Some(m) = self.metrics.get() {
-                    m.observe_diverted_overlap_blocks(model_id, matched.matched_blocks as u64);
+                    m.observe_diverted_overlap_blocks(model_id, outcome.matched_blocks as u64);
                 }
             }
             if should_log(&MATCHED_FALLBACK_LOG_COUNTER) {
@@ -626,9 +714,9 @@ impl Policy for CacheAwareZmqPolicy {
                         .filter(|w| matched_urls.contains(w.url.as_str()))
                         .filter_map(|w| loads.waiting_of(w))
                         .min(),
-                    n_blocks = block_hashes.len(),
-                    matched_blocks = matched.matched_blocks,
-                    matched_workers = matched.workers.len(),
+                    n_blocks = outcome.query_blocks,
+                    matched_blocks = outcome.matched_blocks,
+                    matched_workers = matched_urls.len(),
                     worker_queue_limit = queue_limit,
                     owners_present,
                     landed_on_owner,
@@ -643,7 +731,7 @@ impl Policy for CacheAwareZmqPolicy {
         tracing::debug!(
             model = %ctx.model(),
             worker = %chosen.url,
-            matched_blocks = matched.matched_blocks,
+            matched_blocks = outcome.matched_blocks,
             "cache-aware-zmq: selected worker by cache overlap",
         );
         Some(chosen)
@@ -841,6 +929,164 @@ mod tests {
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    /// Helper: an oracle for a **bimodal** fleet — `primary_bigram` established
+    /// first, then the opposite mode registers, latching `is_bimodal()`.
+    /// Mirrors `add_worker` seeing an EAGLE-family worker and a non-EAGLE worker
+    /// behind the same base model.
+    fn bimodal_oracle(block_size: u32, primary_bigram: bool) -> Arc<BlockSizeOracle> {
+        let o = BlockSizeOracle::new();
+        o.try_set(block_size)
+            .expect("fresh oracle accepts first set");
+        o.set_bigram(primary_bigram); // primary mode
+        o.set_bigram(!primary_bigram); // opposite mode -> bimodal
+        assert!(o.is_bimodal(), "two opposite modes must latch bimodal");
+        o
+    }
+
+    /// Bimodal fleet, primary = bigram (EAGLE). A prefix cached ONLY on the
+    /// unigram (DSPARK) worker is still matched: the query is dual-hashed, so
+    /// the unigram entry is found even though the established primary is bigram.
+    /// Without dual-hashing a bigram-only query never touches the unigram tree
+    /// entry and the DSPARK worker is starved to min-load — the exact
+    /// mixed-fleet artifact this change fixes.
+    #[test]
+    fn bimodal_matches_unigram_owner_under_bigram_primary() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        // DSPARK worker publishes UNIGRAM block hashes.
+        let hashes = compute_block_hashes(&ids, block_size as usize);
+        assert!(!hashes.is_empty());
+        tree.insert(
+            &KvWorkerId::new("http://dspark:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0, // any match counts
+                ..Default::default()
+            },
+            tree,
+            registry,
+            bimodal_oracle(4, /* primary_bigram= */ true),
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_dspark = worker("http://dspark:30000", "tiny");
+        // Skew load so min-load would pick the EAGLE worker; only cache affinity
+        // (via the unigram/secondary hash) can select the DSPARK owner.
+        let _g1 = w_dspark.load_guard();
+        let _g2 = w_dspark.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_dspark)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://dspark:30000",
+            "dual-hash must find the unigram owner despite a bigram primary",
+        );
+    }
+
+    /// Gate guard: the SAME unigram-only prefix under a UNIMODAL bigram oracle
+    /// is NOT matched — the query hashes bigram only, misses the unigram entry,
+    /// and falls back to min-load (the EAGLE worker). Pins that dual-hashing
+    /// engages strictly when the fleet is bimodal, not on every request.
+    #[test]
+    fn unimodal_bigram_does_not_match_unigram_owner() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        let hashes = compute_block_hashes(&ids, block_size as usize);
+        tree.insert(
+            &KvWorkerId::new("http://dspark:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        // Unimodal bigram oracle: only set_bigram(true), never the opposite.
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(4).unwrap();
+        oracle.set_bigram(true);
+        assert!(!oracle.is_bimodal());
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            oracle,
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_dspark = worker("http://dspark:30000", "tiny");
+        // dspark holds the prefix but has higher load; a bigram-only query can't
+        // see its unigram entry, so min-load (eagle) wins.
+        let _g1 = w_dspark.load_guard();
+        let _g2 = w_dspark.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_dspark)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://eagle:30000",
+            "unimodal bigram must not match a unigram entry (no dual-hash)",
+        );
+    }
+
+    /// Symmetric direction: bimodal fleet, primary = unigram (DSPARK). A prefix
+    /// cached only on the bigram (EAGLE) worker is matched via the secondary
+    /// bigram hash — proving dual-hash works regardless of which mode is primary.
+    #[test]
+    fn bimodal_matches_bigram_owner_under_unigram_primary() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let block_size = 4u32;
+        // EAGLE worker publishes BIGRAM block hashes.
+        let hashes = compute_block_hashes_bigram(&ids, block_size as usize);
+        assert!(!hashes.is_empty());
+        tree.insert(
+            &KvWorkerId::new("http://eagle:30000".into(), 0),
+            None,
+            &hashes,
+        );
+
+        let policy = new_policy(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                ..Default::default()
+            },
+            tree,
+            registry,
+            bimodal_oracle(4, /* primary_bigram= */ false),
+        );
+        let w_eagle = worker("http://eagle:30000", "tiny");
+        let w_dspark = worker("http://dspark:30000", "tiny");
+        let _g1 = w_eagle.load_guard();
+        let _g2 = w_eagle.load_guard();
+        let workers = vec![Arc::clone(&w_eagle), Arc::clone(&w_dspark)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://eagle:30000",
+            "dual-hash must find the bigram owner despite a unigram primary",
+        );
     }
 
     /// The cache-aware path records the matched prefix-overlap block count
