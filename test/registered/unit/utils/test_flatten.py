@@ -28,9 +28,7 @@ class TestFlattenHelpers(CustomTestCase):
         values = [[0.25, -1.5], None, [], [2.0]]
         token_ids = [[7, 8], None, [], [9]]
 
-        flat_values, flat_ids, position_lengths = flatten_ragged(
-            values, token_ids
-        )
+        flat_values, flat_ids, position_lengths = flatten_ragged(values, token_ids)
 
         self.assertEqual(flat_values, [0.25, -1.5, 2.0])
         self.assertEqual(flat_ids, [7, 8, 9])
@@ -57,9 +55,7 @@ class TestFlattenHelpers(CustomTestCase):
                     flatten_ragged(values, token_ids)
 
     def test_flatten_hidden_preserves_recursive_row_boundaries(self):
-        values, row_lengths = flatten_hidden(
-            [[1, 2.5], [], 3, [[4], [5.5, 6]]]
-        )
+        values, row_lengths = flatten_hidden([[1, 2.5], [], 3, [[4], [5.5, 6]]])
 
         self.assertEqual(values, [1.0, 2.5, 3.0, 4.0, 5.5, 6.0])
         self.assertEqual(row_lengths, [2, 0, 1, 3])
