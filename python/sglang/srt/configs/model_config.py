@@ -374,7 +374,6 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
-                "Glm5NextForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
