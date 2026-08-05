@@ -36,8 +36,9 @@ _ALGO_NAMES = {
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
 }
 
-# ``pull_arg`` of the all-reduce kernel: a row of the graph-params pointer
-# table selects graph mode; a plain bool selects multicast (True) / eager.
+# ``pull_arg``: a row of the graph-params pointer table selects graph mode (the
+# registered peer VAs, or a 1-wide multicast-VA row); a plain bool selects eager.
+# The ``multicast`` flag (NVLS multimem vs SM pull) is orthogonal.
 PullArg = Union[torch.Tensor, bool]
 
 if TYPE_CHECKING:
@@ -155,9 +156,10 @@ def custom_all_reduce(
     input: torch.Tensor,
     algo: AllReduceAlgo,
     pull_arg: PullArg,
+    multicast: bool = False,
 ) -> tvm_ffi.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    return module.all_reduce(comm, input, algo.algo_name, pull_arg)
+    return module.all_reduce(comm, input, algo.algo_name, pull_arg, multicast)
 
 
 @cache_once

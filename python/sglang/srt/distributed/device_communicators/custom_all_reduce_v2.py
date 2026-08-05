@@ -43,6 +43,7 @@ from .custom_all_reduce_utils import (
     is_one_nvlink_clique,
     is_weak_contiguous,
 )
+from .fabric_multicast import FabricMulticastRegistry
 from .vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -65,9 +66,10 @@ _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
 class _PullMode(enum.Enum):
-    EAGER = enum.auto()  # pull_arg = False (also used for 1shot_push)
-    MULTICAST = enum.auto()  # pull_arg = True
-    GRAPH = enum.auto()  # pull_arg = a graph_params row
+    EAGER = enum.auto()  # pull_arg=False, multicast=False (also 1shot_push)
+    EAGER_MULTICAST = enum.auto()  # pull_arg=False, multicast=True
+    GRAPH = enum.auto()  # pull_arg=graph_params row, multicast=False
+    GRAPH_MULTICAST = enum.auto()  # pull_arg=graph_mc_params row, multicast=True
 
 
 def _ceil_align(nbytes: int, align: int) -> int:
@@ -126,6 +128,7 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
+        self.multi_node = not all(in_the_same_node_as(self.group, source_rank=0))
         base_config = get_all_reduce_config(self.world_size)
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
@@ -189,6 +192,19 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        self._warned_non_vmm_staging = False
+        # GraphMulticast path: per-input multicast VAs (one each, vs graph_params'
+        # world_size peer row), bound post-capture by the fabric mc registry.
+        self.graph_mc_params = torch.zeros(
+            (_MAX_GRAPH_INPUTS, 1), dtype=torch.uint64, device=self.device
+        )
+        self._graph_mc_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
+        self._graph_mc_counter = 0
+        self._fabric_mc_registry = (
+            FabricMulticastRegistry(self.group)
+            if self.config.num_mc_blocks is not None
+            else None
+        )
         self.disabled = False
 
     def _init_workspace(self) -> None:
@@ -315,7 +331,10 @@ class CustomAllReduceV2:
         if nbytes <= heuristic.one_shot_pull_threshold:
             return AllReduceAlgo.ONE_SHOT_PULL, default_mode
         if use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceAlgo.TWO_SHOT_PULL, _PullMode.MULTICAST
+            if can_use_graph and self._fabric_mc_registry is not None:
+                # zero-copy: multicast-reduce the registered input in place, no staging
+                return AllReduceAlgo.TWO_SHOT_PULL, _PullMode.GRAPH_MULTICAST
+            return AllReduceAlgo.TWO_SHOT_PULL, _PullMode.EAGER_MULTICAST
         if nbytes <= heuristic.two_shot_pull_threshold:
             return AllReduceAlgo.TWO_SHOT_PULL, default_mode
         return None, _PullMode.EAGER
@@ -349,11 +368,33 @@ class CustomAllReduceV2:
         else:
             algo, mode = self._pick_algo(nbytes, can_use_graph=can_use_graph)
             assert algo is not None, f"No algo for {nbytes} bytes"
+        mode = self._stage_if_non_vmm(mode, input)
         if mode == _PullMode.GRAPH:
             pull_arg: torch.Tensor | bool = self._allocate_graph_row(input, nbytes)
+        elif mode == _PullMode.GRAPH_MULTICAST:
+            pull_arg = self._allocate_graph_mc_row(input, nbytes)
         else:
-            pull_arg = mode == _PullMode.MULTICAST
-        return torch.from_dlpack(custom_all_reduce(self.obj, input, algo, pull_arg))
+            pull_arg = False  # eager: no graph row; the multicast flag carries mc-ness
+        multicast = mode in (_PullMode.EAGER_MULTICAST, _PullMode.GRAPH_MULTICAST)
+        return torch.from_dlpack(
+            custom_all_reduce(self.obj, input, algo, pull_arg, multicast)
+        )
+
+    def _stage_if_non_vmm(self, mode: _PullMode, input: torch.Tensor) -> _PullMode:
+        if mode not in (_PullMode.GRAPH, _PullMode.GRAPH_MULTICAST):
+            return mode
+        if not self.multi_node or is_vmm_pointer(input.data_ptr()):
+            return mode
+        if not self._warned_non_vmm_staging:
+            logger.warning(
+                "custom-AR-v2: multi-node graph input is not VMM-backed "
+                "(expandable_segments off) -> staging through the workspace; set "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True for zero-copy."
+            )
+            self._warned_non_vmm_staging = True
+        if mode == _PullMode.GRAPH_MULTICAST:
+            return _PullMode.EAGER_MULTICAST
+        return _PullMode.EAGER
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
@@ -362,6 +403,14 @@ class CustomAllReduceV2:
         ), "Graph input table overflow, increase _MAX_GRAPH_INPUTS!"
         self._graph_inputs.append((input.data_ptr(), nbytes))
         return self.graph_params[index]
+
+    def _allocate_graph_mc_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
+        index = self._graph_mc_counter + len(self._graph_mc_inputs)
+        assert (
+            index < _MAX_GRAPH_INPUTS
+        ), "Graph mc input table overflow, increase _MAX_GRAPH_INPUTS!"
+        self._graph_mc_inputs.append((input.data_ptr(), nbytes))
+        return self.graph_mc_params[index]
 
     # ------------------------------------------------------------------
     # CUDA-graph input registration
@@ -383,14 +432,41 @@ class CustomAllReduceV2:
         self._register_graph_inputs()
 
     def _register_graph_inputs(self) -> None:
-        if not self._graph_inputs:
+        if self._graph_inputs:
+            first_ptr = self._graph_inputs[0][0]
+            if is_vmm_pointer(first_ptr):
+                # calls back into get_graph_capture_bases / register_peer_mapped_inputs
+                self._vmm_graph_input_manager.register_graph_inputs()
+            elif self.multi_node:
+                # Unreachable: custom_all_reduce stages non-VMM multi-node inputs
+                # (eager) rather than registering them. Fail loud if that breaks.
+                raise RuntimeError(
+                    "custom-AR-v2: non-VMM multi-node graph input reached "
+                    "registration; should have been staged in custom_all_reduce"
+                )
+            else:
+                self._register_graph_inputs_ipc()
+        self._register_graph_mc_inputs()
+
+    def _register_graph_mc_inputs(self) -> None:
+        if not self._graph_mc_inputs:
             return
-        first_ptr = self._graph_inputs[0][0]
-        if is_vmm_pointer(first_ptr):
-            # calls back into get_graph_capture_bases / register_peer_mapped_inputs
-            self._vmm_graph_input_manager.register_graph_inputs()
-        else:
-            self._register_graph_inputs_ipc()
+        assert self._fabric_mc_registry is not None
+        count = len(self._graph_mc_inputs)
+        mc_addrs = [
+            self._fabric_mc_registry.register_ptr(dp, nbytes)
+            for dp, nbytes in self._graph_mc_inputs
+        ]
+        rows = torch.tensor(mc_addrs, dtype=torch.uint64, device=self.device).view(
+            count, 1
+        )
+        self.graph_mc_params[
+            self._graph_mc_counter : self._graph_mc_counter + count
+        ].copy_(rows)
+        # the rows must be visible before any (PDL-chained) graph replay
+        torch.cuda.synchronize()
+        self._graph_mc_counter += count
+        self._graph_mc_inputs.clear()
 
     def _register_graph_inputs_ipc(self) -> None:
         """Register graph capture inputs via cudaIpc handles.
@@ -441,6 +517,11 @@ class CustomAllReduceV2:
             del self.obj  # drop the pointer holder before the workspace tensors
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
+        if (
+            hasattr(self, "_fabric_mc_registry")
+            and self._fabric_mc_registry is not None
+        ):
+            self._fabric_mc_registry.release()
 
     def __del__(self):
         self.close()
