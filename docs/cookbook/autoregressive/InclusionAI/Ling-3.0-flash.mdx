@@ -25,8 +25,9 @@ Pick your hardware + recipe to generate the launch command. Two serving strategi
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-flash.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-flash-benchmarks.jsx";
 
-<Deployment config={config} />
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## Playground
 

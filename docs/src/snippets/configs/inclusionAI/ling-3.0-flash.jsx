@@ -5,9 +5,8 @@ export const config = {
   groupHardware: false,
 
   hardware: [
-    { id: "h20-3e", label: "H20-3e", vram: "141GB", vendor: "nvidia" },
-    { id: "h800", label: "H800", vram: "80GB", vendor: "nvidia" },
-    { id: "gb300", label: "GB300", vram: "288GB", vendor: "nvidia" },
+    { id: "h20-3e", label: "H20-3e", vram: "141GB", vendor: "hopper" },
+    { id: "h800", label: "H800", vram: "80GB", vendor: "hopper" },
   ],
 
   variants: [
