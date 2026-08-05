@@ -65,7 +65,7 @@ _MPS_MLP_TOKEN_CHUNK_SIZE = 256
 # keep MPS activation chunks below the allocator high-watermark; CUDA keeps
 # its fused full-sequence projection
 _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 256
-_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 192
+_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
 
 _MPS_EMBED_WEIGHT_PREFIXES = (
     "condition_proj",
