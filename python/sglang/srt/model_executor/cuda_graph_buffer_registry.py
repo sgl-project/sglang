@@ -877,20 +877,13 @@ def build_prefill_registry(
                 )
             )
             if deepstack_replay_width > 0:
-                # Optional slot for archs that explicitly declare
-                # supports_bcg_deepstack_replay=True AND report
-                # num_deepstack_embeddings > 0 at build time. Symmetric
-                # with input_embeds — the runner copies the live
-                # input_deepstack_embeds tensor into this slot before
-                # backend.replay(), and the capture pass writes the slot
-                # buffer through so the LM's DeepStack add_ branch is
-                # traced into the graph. The slot is skipped for every
-                # model that does not opt in.
-                _ds_width = deepstack_replay_width
+                # Optional DeepStack replay slot — same lifecycle as
+                # input_embeds but wider on the feature axis (LM unpacks
+                # per-layer contributions from it).
                 slots.append(
                     GraphSlot(
                         "input_deepstack_embeds",
-                        lambda _bs2, mt, _w=_ds_width: (mt, _w),
+                        lambda _bs2, mt: (mt, deepstack_replay_width),
                         embed_dtype,
                         axis="tokens",
                         padding_policy=PaddingPolicy.ZERO,

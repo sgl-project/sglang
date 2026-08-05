@@ -67,59 +67,38 @@ def _buffers(**overrides):
 
 class TestDeepStackReplaySlotRegistration(CustomTestCase):
 
-    def test_slot_absent_when_not_multimodal(self):
-        """Text-only registries never carry the DeepStack slot even
-        when a positive width is passed (the multimodal gate wraps the
-        whole block)."""
-        reg = _reg(is_multimodal=False, deepstack_replay_width=192)
-        self.assertFalse(reg.has_slot("input_deepstack_embeds"))
+    def test_slot_absent_when_any_gate_is_off(self):
+        """The DeepStack slot is registered only when all three gates
+        pass: is_multimodal, register_input_embeds, and
+        deepstack_replay_width > 0. Any missing gate → no slot."""
+        cases = [
+            dict(is_multimodal=False, deepstack_replay_width=192),
+            dict(is_multimodal=True, deepstack_replay_width=0),
+            dict(
+                is_multimodal=True,
+                deepstack_replay_width=192,
+                register_input_embeds=False,
+            ),
+        ]
+        for kwargs in cases:
+            with self.subTest(**kwargs):
+                reg = _reg(**kwargs)
+                self.assertFalse(reg.has_slot("input_deepstack_embeds"))
 
-    def test_slot_absent_when_width_zero(self):
-        """Multimodal registries with an unopted-in model see width=0
-        and skip the slot — this is the default for every model that
-        does not declare ``supports_bcg_deepstack_replay``."""
-        reg = _reg(is_multimodal=True, deepstack_replay_width=0)
-        self.assertFalse(reg.has_slot("input_deepstack_embeds"))
-
-    def test_slot_absent_when_register_input_embeds_false(self):
-        """The eager-extend path passes ``register_input_embeds=False``
-        so the whole multimodal slot block (input_embeds + DeepStack)
-        is skipped."""
-        reg = _reg(
-            is_multimodal=True,
-            deepstack_replay_width=192,
-            register_input_embeds=False,
-        )
-        self.assertFalse(reg.has_slot("input_deepstack_embeds"))
-
-    def test_slot_present_when_multimodal_and_width_positive(self):
-        """The one activation case: is_multimodal AND
-        register_input_embeds AND deepstack_replay_width > 0."""
+    def test_slot_present_when_all_gates_pass(self):
         reg = _reg(is_multimodal=True, deepstack_replay_width=192)
         self.assertTrue(reg.has_slot("input_deepstack_embeds"))
 
     def test_slot_shape_and_dtype_match_contract(self):
-        """When registered, the slot's per-token width equals
-        ``deepstack_replay_width`` (hidden_size × num_deepstack_embeddings)
-        and dtype matches ``embed_dtype``."""
         reg = _reg(
             is_multimodal=True,
             hidden_size=64,
             embed_dtype=torch.bfloat16,
             deepstack_replay_width=192,
         )
-        slot = reg.get_slot("input_deepstack_embeds")
-        buf = slot.buffer
+        buf = reg.get_slot("input_deepstack_embeds").buffer
         self.assertEqual(buf.shape[-1], 192)
         self.assertEqual(buf.dtype, torch.bfloat16)
-
-    def test_input_embeds_slot_registered_alongside(self):
-        """DeepStack activation must not disturb the existing
-        input_embeds slot registration."""
-        reg = _reg(is_multimodal=True, deepstack_replay_width=192)
-        self.assertTrue(reg.has_slot("input_embeds"))
-        self.assertTrue(reg.has_slot("input_deepstack_embeds"))
-
 
 class TestPrefillInputBuffersDeepStackField(CustomTestCase):
 

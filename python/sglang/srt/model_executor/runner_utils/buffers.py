@@ -380,12 +380,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             if is_multimodal:
                 input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
                 mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
-                # Optional DeepStack replay buffer — allocated only when
-                # the caller passed a positive deepstack_replay_width
-                # (which the caller only does when the model explicitly
-                # opts in via supports_bcg_deepstack_replay + reports
-                # num_deepstack_embeddings > 0). All other multimodal
-                # models leave it None → zero extra memory.
+                # Optional DeepStack replay buffer — only when opted in.
                 if deepstack_replay_width > 0:
                     input_deepstack_embeds = torch.zeros(
                         (max_num_tokens, deepstack_replay_width), dtype=dtype
