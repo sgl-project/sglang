@@ -1016,9 +1016,10 @@ def set_cuda_arch():
         )
 
 
-def mxfp_supported():
-    """
-    Returns whether the current platform supports MX types.
+def is_gfx95_supported():
+    """Whether the device is an AMD gfx95 GPU (the MX-capable ROCm arch).
+
+    False on every non-HIP build, so callers do not need their own is_hip().
     """
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName

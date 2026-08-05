@@ -13,7 +13,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike, mxfp_supported
+from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -35,7 +35,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 f"test requires {cls.tp} devices, only {torch.cuda.device_count()} are available."
             )
 
-        if not mxfp_supported():
+        if not is_gfx95_supported():
             raise unittest.SkipTest(
                 "online MXFP4 quantization requires an AMD ROCm device with "
                 "FP4 hardware support (gfx95x, e.g. MI355x)"
