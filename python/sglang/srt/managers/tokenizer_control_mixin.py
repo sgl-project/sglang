@@ -587,9 +587,11 @@ class TokenizerControlMixin:
             self.lora_update_lock.locked()
         ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
 
-        # Unregister the LoRA adapter from the registry to stop new requests for this adapter
-        # from being started.
-        lora_id = await self.lora_registry.unregister(obj.lora_name)
+        lora_id = self.pending_lora_unloads.get(obj.lora_name)
+        if lora_id is None:
+            # Stop new requests from using this adapter before unloading it.
+            lora_id = await self.lora_registry.unregister(obj.lora_name)
+            self.pending_lora_unloads[obj.lora_name] = lora_id
         obj.lora_id = lora_id
 
         # Initiate the actual unloading operation at the backend processes only after all
@@ -598,7 +600,8 @@ class TokenizerControlMixin:
         result = _merge_lora_update_results(
             await self.update_lora_adapter_communicator(obj)
         )
-
+        if result.success:
+            self.pending_lora_unloads.pop(obj.lora_name)
         return result
 
     async def load_lora_adapter(
@@ -624,6 +627,12 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -636,11 +645,11 @@ class TokenizerControlMixin:
                 result = _merge_lora_update_results(
                     await self.update_lora_adapter_communicator(obj)
                 )
-
-                # Register the LoRA adapter only after loading is successful.
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                else:
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
 
                 if self.server_args.max_loaded_loras is not None:
                     while (
@@ -705,6 +714,12 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
+                if obj.lora_name in self.pending_lora_unloads:
+                    raise ValueError(
+                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                        "Retry the unload before loading it again."
+                    )
+
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
@@ -714,10 +729,12 @@ class TokenizerControlMixin:
                 result = _merge_lora_update_results(
                     await self.update_lora_adapter_communicator(obj)
                 )
-
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+                else:
+                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
+
                 if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras

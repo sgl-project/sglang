@@ -194,12 +194,12 @@ class LoRARegistry:
         assert (
             lora_id not in self._registry
         ), "wait_for_unload should only be called after the LoRA adapter has been unregistered. "
-        assert (
-            lora_id in self._counters
-        ), "The LoRA ID should still have a counter if it has been registered before."
+        counter = self._counters.get(lora_id)
+        if counter is None:
+            return
 
         # Wait until no requests are using this LoRA adapter.
-        await self._counters[lora_id].wait_for_zero()
+        await counter.wait_for_zero()
         del self._counters[lora_id]
 
     async def get_unregistered_loras(self, lora_name: set[str]):
