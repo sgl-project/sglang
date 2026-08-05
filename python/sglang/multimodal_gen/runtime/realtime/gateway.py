@@ -130,8 +130,6 @@ class GatewayOutputRoute:
                 raise OutputProtocolError("duplicate frame batch")
         elif frame_batch_index != 0:
             raise OutputProtocolError("new chunk must start at frame batch zero")
-        self._last_chunk_index = chunk_index
-        self._last_frame_batch_index = frame_batch_index
         try:
             await asyncio.wait_for(
                 self._queue.put(wire), timeout=self.enqueue_timeout_s
@@ -140,6 +138,8 @@ class GatewayOutputRoute:
             raise OutputBackpressureError(
                 "Gateway output queue remained full"
             ) from exc
+        self._last_chunk_index = chunk_index
+        self._last_frame_batch_index = frame_batch_index
 
     async def get(self) -> bytes:
         wire = await self._queue.get()

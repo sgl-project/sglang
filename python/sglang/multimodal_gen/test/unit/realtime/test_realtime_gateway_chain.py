@@ -9,6 +9,7 @@ import httpx
 import uvicorn
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosedOK
 
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
     create_app,
@@ -141,7 +142,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                         num_frames=1,
                     )
                 )
-                await connection.wait_closed()
+                await connection.close(code=1000, reason="generation complete")
 
         coordinator = _Coordinator(
             f"ws://127.0.0.1:{denoiser_port}/v1/realtime_video/generate"
@@ -164,10 +165,16 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                     "?user_id=user-a&trace_id=trace-a"
                 )
                 async with connect(url, max_size=None, compression=None) as browser:
-                    messages = [
-                        decode_message(await asyncio.wait_for(browser.recv(), 2)),
-                        decode_message(await asyncio.wait_for(browser.recv(), 2)),
-                    ]
+                    messages = []
+                    try:
+                        while True:
+                            messages.append(
+                                decode_message(
+                                    await asyncio.wait_for(browser.recv(), 2)
+                                )
+                            )
+                    except ConnectionClosedOK:
+                        pass
                 assert {message["type"] for message in messages} == {
                     "session_ready",
                     "frame_batch",

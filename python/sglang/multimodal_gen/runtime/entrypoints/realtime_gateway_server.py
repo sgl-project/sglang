@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosedOK
 
 from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
     ProtocolViolation,
@@ -380,16 +381,21 @@ def create_app(
                     await upstream.send(await _receive_browser(websocket))
 
             async def worker_to_browser():
-                while True:
-                    wire = await upstream.recv()
-                    if isinstance(wire, str):
-                        raise ProtocolViolation("Denoiser control messages must be binary")
-                    if not worker_message_allowed(wire):
-                        message_type = worker_message_type(wire)
-                        raise ProtocolViolation(
-                            f"Denoiser emitted forbidden message: {message_type}"
-                        )
-                    await sender.send(wire)
+                try:
+                    while True:
+                        wire = await upstream.recv()
+                        if isinstance(wire, str):
+                            raise ProtocolViolation(
+                                "Denoiser control messages must be binary"
+                            )
+                        if not worker_message_allowed(wire):
+                            message_type = worker_message_type(wire)
+                            raise ProtocolViolation(
+                                f"Denoiser emitted forbidden message: {message_type}"
+                            )
+                        await sender.send(wire)
+                except ConnectionClosedOK:
+                    return
 
             async def output_to_browser():
                 while True:
