@@ -273,12 +273,12 @@ class ParallelExecutor(PipelineExecutor):
                 ]
                 first_error: BaseException | None = None
                 try:
-                    results[epoch[0]] = run_member(0, epoch[0])
+                    results[id(epoch[0])] = run_member(0, epoch[0])
                 except BaseException as error:  # noqa: BLE001 - keep first error
                     first_error = error
                 for stage, future in zip(epoch[1:], futures):
                     try:
-                        results[stage] = future.result()
+                        results[id(stage)] = future.result()
                     except BaseException as error:  # noqa: BLE001 - keep first error
                         if first_error is None:
                             first_error = error
@@ -288,7 +288,7 @@ class ParallelExecutor(PipelineExecutor):
                 if first_error is not None:
                     raise first_error
         for stage in level:
-            result = results[stage]
+            result = results[id(stage)]
             if result is not payload:
                 raise RuntimeError(
                     f"parallel stage {stage._component_stage_name()} must "
