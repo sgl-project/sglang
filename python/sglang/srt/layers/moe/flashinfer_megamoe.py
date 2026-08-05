@@ -23,6 +23,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -145,6 +146,19 @@ def _resolve_max_tokens_per_rank() -> int:
     if server_args is not None:
         derived = server_args.cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
+
+
+def _keep_topk_ids_int32() -> bool:
+    """Whether to keep int32 router IDs for fused staging.
+
+    The opt-out is a benchmark control for comparing the old adapter behavior;
+    production defaults to the copy-free int32 path.
+    """
+    return os.environ.get("SGLANG_FLASHINFER_MEGA_KEEP_TOPK_INT32", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -551,9 +565,14 @@ def run_flashinfer_megamoe(
     mega = quant_info.mega
     _ensure_shared_workspace(mega)
 
+    if not _keep_topk_ids_int32():
+        topk_ids = topk_ids.to(torch.int64)
+
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
-        topk_ids=topk_ids.to(torch.int64),
+        # FlashInfer's fused staging accepts the int32 router output and widens
+        # directly into its final int64 workspace buffer. Keep this path copy-free.
+        topk_ids=topk_ids,
         topk_weights=topk_weights.to(torch.float32),
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
