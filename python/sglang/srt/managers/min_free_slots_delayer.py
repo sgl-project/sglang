@@ -10,23 +10,16 @@ def resolve_min_free_slots(
 
     An explicit user value always wins, capped by max_running_requests
     (<= 1 disables). When unset, DFlash workloads fall back to the legacy
-    formula (preserving the always-on behavior); other workloads stay
-    disabled. Also disabled when max_running_requests < 8.
+    formula (preserving the always-on behavior, disabled when
+    max_running_requests < 8); other workloads stay disabled.
     """
     max_running_requests = max(0, int(max_running_requests))
-    formula = min(4, max(2, (max_running_requests + 5) // 6))
     if user_value is not None:
-        min_free_slots = min(user_value, max_running_requests)
-    elif is_dflash_family:
-        min_free_slots = formula
-    else:
-        min_free_slots = None
-
-    if min_free_slots is None or min_free_slots <= 1:
-        return None
-    if max_running_requests < 8:
-        return None
-    return min_free_slots
+        threshold = min(user_value, max_running_requests)
+        return threshold if threshold > 1 else None
+    if is_dflash_family and max_running_requests >= 8:
+        return min(4, max(2, (max_running_requests + 5) // 6))
+    return None
 
 
 class MinFreeSlotsDelayer:
