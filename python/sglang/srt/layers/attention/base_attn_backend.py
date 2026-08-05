@@ -9,7 +9,10 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+        BaseIndexerMetadata,
+    )
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
@@ -166,13 +169,10 @@ class AttentionBackend(ABC):
         """
         pass
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers of verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
-        return [None, None]
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        """The mask the draft stage fills in place, if this backend has one."""
+        return None
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]

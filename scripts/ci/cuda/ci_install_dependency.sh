@@ -171,9 +171,53 @@ clean_site_packages() {
         set -x
     fi
 
+    # An orphaned sglang/ shadows the checkout: `uv pip uninstall` deletes only
+    # what RECORD lists, so __pycache__ keeps the directory alive without
+    # __init__.py, PathFinder claims it as a namespace portion, and the editable
+    # install's _EditableFinder sits at the END of sys.meta_path - submodule
+    # imports fail. No install leaves this directory without __init__.py.
+    if [ -d "$SITE_PACKAGES/sglang" ] && [ ! -f "$SITE_PACKAGES/sglang/__init__.py" ]; then
+        echo "Removing orphaned sglang skeleton that would shadow the checkout: $SITE_PACKAGES/sglang"
+        find "$SITE_PACKAGES/sglang" -maxdepth 2 | head -20
+        rm -rf "$SITE_PACKAGES/sglang"
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
+    # Same-step counterpart of the PATH export above: install_rustup.sh exports
+    # RUSTUP_TOOLCHAIN too, but as a child process only reaches later steps.
+    # rust-toolchain.toml does not cover it either - setuptools-rust runs cargo
+    # from python/, outside the pin's cwd scope - so without this an image's own
+    # older rustc builds the crates and fails their MSRV.
+    RUST_PINNED_CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "${REPO_ROOT}/rust/rust-toolchain.toml" 2>/dev/null || true)
+    if [ -n "${RUST_PINNED_CHANNEL}" ]; then
+        export RUSTUP_TOOLCHAIN="${RUST_PINNED_CHANNEL}"
+        echo "Using pinned Rust toolchain ${RUST_PINNED_CHANNEL} for this install"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+setup_cargo_cache() {
+    # actions/checkout's `git clean -ffdx` deletes the gitignored in-repo
+    # rust/target, so every job recompiles the whole dependency graph. Move the
+    # target dir out of the tree: setuptools-rust has no target-dir option of its
+    # own and defers to CARGO_TARGET_DIR, which uv passes to the build backend.
+    export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+    mkdir -p "${CARGO_TARGET_DIR}"
+
+    # Same disk-pressure guard as the uv cache in ci_cleanup_venv.sh (which
+    # carries the ENOSPC story). cargo cannot prune partially, so drop the whole
+    # tree and pay one cold build.
+    local used
+    used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+    if [ "${used:-0}" -ge 85 ]; then
+        echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+        rm -rf "${CARGO_TARGET_DIR}"
+        mkdir -p "${CARGO_TARGET_DIR}"
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -282,6 +326,40 @@ uninstall_stale_flashinfer() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+require_prebuilt_rust_exts() {
+    # Stages whose download succeeded set this to none. Runs before
+    # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
+    # install_sglang below - setup.py reads it from the environment at build time.
+    if [ "${SGLANG_BUILD_RUST_EXTS:-}" != "none" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
+    # Exact EXT_SUFFIX rather than a _core*.so glob: no crate sets abi3, so a module
+    # built for another minor version satisfies the glob while the import system
+    # ignores it, leaving is_rust_server_built() false and the Rust-server tests
+    # silently skipped. Stages have no setup-python, so the interpreter is whatever
+    # the image ships, and the pools are not on one version (h20 is 3.12 while
+    # h100 is 3.10) - a mismatch is drift to route around, not a failure.
+    local suffix
+    suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+    local missing=()
+    local pkg
+    for pkg in server grpc multimodal; do
+        [ -f "python/sglang/srt/${pkg}/_core${suffix}" ] || missing+=("${pkg}")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "::warning::no prebuilt _core${suffix} for: ${missing[*]}; building from source"
+        ls -l python/sglang/srt/*/_core*.so 2>/dev/null || echo "(no extension modules at all)"
+        export SGLANG_BUILD_RUST_EXTS=
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    echo "Using prebuilt Rust extension modules; skipping the cargo build."
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 install_sglang() {
     EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
@@ -304,28 +382,28 @@ install_sglang() {
 }
 
 install_sglang_kernel() {
-    SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
+    SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' python/sglang/kernels/aot/pyproject.toml)
     SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
     echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
-        ls -alh sgl-kernel/dist
+    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "python/sglang/kernels/aot/dist" ]; then
+        ls -alh python/sglang/kernels/aot/dist
         if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
             WHEEL_ARCH="aarch64"
         else
             WHEEL_ARCH="x86_64"
         fi
-        KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
+        KERNEL_WHL=$(ls python/sglang/kernels/aot/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
         if [ -z "$KERNEL_WHL" ]; then
-            echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
-            ls -alh sgl-kernel/dist/
+            echo "ERROR: No matching sgl-kernel wheel found in python/sglang/kernels/aot/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
+            ls -alh python/sglang/kernels/aot/dist/
             exit 1
         fi
         echo "Installing sgl-kernel wheel: $KERNEL_WHL"
         $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
     else
-        if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
-            echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but sgl-kernel/dist not found."
+        if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "python/sglang/kernels/aot/dist" ]; then
+            echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but python/sglang/kernels/aot/dist not found."
             echo "This usually happens when rerunning a stage without the sgl-kernel-build-wheels job."
             echo "Please re-run the full workflow using /tag-and-rerun-ci to rebuild the kernel."
             exit 1
@@ -577,6 +655,37 @@ verify_imports() {
     python3 -c "import torch; print(torch.version.cuda)"
     python3 -c "import cutlass; import cutlass.cute;"
 
+    # A shadowed sglang still imports, so without this the failure only surfaces
+    # as a missing submodule during the test step. find_spec, not import: the
+    # finders alone answer this and importing would pull in torch for nothing.
+    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import importlib.util, os
+want = os.environ["SGLANG_EXPECTED_INIT"]
+spec = importlib.util.find_spec("sglang")
+if spec is None:
+    raise SystemExit("sglang is not importable at all after install")
+if spec.origin != want:
+    raise SystemExit(
+        f"sglang resolves to origin={spec.origin} "
+        f"(search={list(spec.submodule_search_locations or [])}), expected {want}; "
+        "something in site-packages is shadowing the checkout"
+    )
+print(f"sglang resolves to {spec.origin}")
+'
+
+    # Import, not find_spec: the finders locate an extension without dlopening it,
+    # so a .so that cannot load passes find_spec and only fails inside some suite.
+    python3 -c '
+import importlib
+for mod in ("server", "grpc", "multimodal"):
+    name = f"sglang.srt.{mod}._core"
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        raise SystemExit(f"{name} is present but does not load: {exc!r}")
+    print(f"{name} loads")
+'
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -591,6 +700,8 @@ main() {
     cleanup_stale_shm
     install_apt_packages
     clean_site_packages
+    setup_cargo_cache
+    require_prebuilt_rust_exts
     setup_pip_toolchain
     remove_stale_cuda12_nvidia_wheels
     uninstall_stale_flashinfer

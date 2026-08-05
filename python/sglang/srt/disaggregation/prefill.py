@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -64,6 +65,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -182,6 +184,9 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.kv_cache_dtype_str = (
+            self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
+        )
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
@@ -331,7 +336,8 @@ class PrefillBootstrapQueue:
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
         num_pages = kv_to_page_num(
-            num_kv_indices_to_send, self.token_to_kv_pool.page_size
+            num_kv_indices_to_send,
+            self.scheduler.token_to_kv_pool_allocator.page_size,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
@@ -365,13 +371,15 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        rids_to_check: Optional[List[str]] = None,
-    ) -> List[Req]:
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
+    ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        pp_good_rids: RIDs that PP consensus determined as WaitingForInput.
+        pp_bad_rids: RIDs that PP consensus determined as Failed.
         """
 
         bootstrapped_reqs = []
@@ -384,21 +392,32 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
-        )
+        if self.pp_size > 1:
+            polls = poll_and_all_reduce_pp(
+                (req.rid for req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_good_rids,
+                pp_bad_rids,
+            )
+            uncovered = [i for i, poll in enumerate(polls) if poll is None]
+            if uncovered:
+                local_polls = poll_and_all_reduce_attn_cp_tp_group(
+                    [self.queue[i].disagg_kv_sender for i in uncovered],
+                    self.scheduler.attn_cp_cpu_group,
+                    self.scheduler.attn_tp_cpu_group,
+                )
+                for i, local_poll in zip(uncovered, local_polls):
+                    if local_poll == KVPoll.Failed:
+                        polls[i] = KVPoll.Failed
+        else:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
-                and poll != KVPoll.Failed
-            ):
-                # In PP mode, successful bootstrap still requires cross-rank
-                # consensus. Local failures are terminal and must be drained
-                # even if an earlier PP rank has already removed the request.
+            if poll is None:
                 continue
 
             if poll == KVPoll.Failed:
@@ -849,9 +868,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1068,7 +1087,11 @@ class SchedulerDisaggregationPrefillMixin:
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
             return
-        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
+            # DCP radix hits can end on a logical cache-page boundary that is
+            # not a complete physical DCP page. The regular final send covers
+            # the full range; only skip this optional early-send optimization.
+            return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
@@ -1221,12 +1244,16 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(
+            page_indices,
+            state_indices,
+            num_kv_tokens=end_idx - start_idx,
+        )
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        max_attempts = self.server_args.optimistic_prefill_attempts
+        max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -65,7 +65,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_server_args().attention_backend):
+    if support_triton(get_exec().kernel.attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -106,7 +106,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_server_args().attention_backend
+    attn_backend = get_exec().kernel.attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
@@ -146,14 +146,9 @@ def get_last_loc_torch(
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
-    backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, num_tokens)
-
-    state = None
-    if backup_state:
-        state = allocator.backup_state()
 
     out_cache_loc = allocator.alloc(num_tokens)
 
@@ -168,7 +163,7 @@ def alloc_token_slots(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
-    return (out_cache_loc, state) if backup_state else out_cache_loc
+    return out_cache_loc
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -203,7 +198,6 @@ def alloc_paged_token_slots_extend(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     extend_num_tokens: int,
-    backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
@@ -212,10 +206,6 @@ def alloc_paged_token_slots_extend(
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
-
-    state = None
-    if backup_state:
-        state = allocator.backup_state()
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
@@ -256,7 +246,7 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
-    return (out_cache_loc, state) if backup_state else out_cache_loc
+    return out_cache_loc
 
 
 def alloc_req_slots(
@@ -362,7 +352,7 @@ def alloc_for_extend(
     else:
         # Paged allocation - build last_loc
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
