@@ -572,6 +572,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "TeleChat4ForCausalLM",
     ]:
         if server_args.speculative_draft_model_path is None:
             server_args.speculative_draft_model_path = server_args.model_path
