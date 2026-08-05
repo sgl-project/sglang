@@ -1173,11 +1173,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
-        """Evict one device leaf.
-
-        A write-back node with missing Host data returns a BackupKV to execute
-        before demotion. A fully backed node is demoted directly.
-        """
+        """Evict one device leaf (demote if backuped, delete if write-through);
+        for an unbacked write-back node, the result carries the BackupKV for
+        the cache to execute and then demote."""
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
@@ -1651,7 +1649,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._build_backup_spec(self.node_by_id(node_id))
 
     def _build_backup_spec(self, node: UnifiedTreeNode):
-        """Gather device value backup spec."""
+        """Gather missing Full and component transfers for Host backup."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         assert device_value is not None
         if node.backuped:
