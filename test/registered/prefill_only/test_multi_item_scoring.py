@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=211, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=175, stage="base-b", runner_config="1-gpu-small")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
@@ -153,8 +153,11 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     NUM_LABELS = _CLS_NUM_LABELS
 
-    def setUp(self):
-        self.engine = Engine(
+    @classmethod
+    def setUpClass(cls):
+        # One engine for the whole class: score() is stateless and the radix
+        # cache is off, so the per-method boot this used to do bought nothing.
+        cls.engine = Engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -163,9 +166,10 @@ class TestMultiItemScoringClassification(CustomTestCase):
             mem_fraction_static=0.15,
         )
 
-    def tearDown(self):
-        if self.engine is not None:
-            self.engine.shutdown()
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine is not None:
+            cls.engine.shutdown()
             torch.cuda.empty_cache()
 
     def test_classification_mis_basic(self):
