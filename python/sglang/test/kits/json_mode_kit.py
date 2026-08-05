@@ -7,14 +7,14 @@ import json
 
 
 class JSONModeMixin:
-    """Mixin class containing JSON mode test methods"""
-
     def test_json_mode_response(self):
-        """Test that response_format json_object (also known as "json mode") produces valid JSON, even without a system prompt that mentions JSON."""
+        """json_object without a JSON-mentioning system prompt must still
+        produce valid JSON."""
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                # We are deliberately omitting "That produces JSON" or similar phrases from the assistant prompt so that we don't have misleading test results
+                # No JSON hint in the prompt on purpose -- the format must be
+                # enforced by response_format, not by the instruction.
                 {
                     "role": "system",
                     "content": "You are a helpful AI assistant that gives a short answer.",
@@ -29,21 +29,20 @@ class JSONModeMixin:
 
         print(f"Response ({len(text)} characters): {text}")
 
-        # Verify the response is valid JSON
         try:
             js_obj = json.loads(text)
         except json.JSONDecodeError as e:
             self.fail(f"Response is not valid JSON. Error: {e}. Response: {text}")
 
-        # Verify it's actually an object (dict)
         self.assertIsInstance(js_obj, dict, f"Response is not a JSON object: {text}")
 
     def test_json_mode_with_streaming(self):
-        """Test that streaming with json_object response (also known as "json mode") format works correctly, even without a system prompt that mentions JSON."""
+        """Same contract over a stream: the concatenated chunks must parse."""
         stream = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                # We are deliberately omitting "That produces JSON" or similar phrases from the assistant prompt so that we don't have misleading test results
+                # No JSON hint in the prompt on purpose -- the format must be
+                # enforced by response_format, not by the instruction.
                 {
                     "role": "system",
                     "content": "You are a helpful AI assistant that gives a short answer.",
@@ -56,7 +55,6 @@ class JSONModeMixin:
             stream=True,
         )
 
-        # Collect all chunks
         chunks = []
         for chunk in stream:
             if chunk.choices[0].delta.content is not None:
@@ -67,7 +65,6 @@ class JSONModeMixin:
             f"Concatenated Response ({len(full_response)} characters): {full_response}"
         )
 
-        # Verify the combined response is valid JSON
         try:
             js_obj = json.loads(full_response)
         except json.JSONDecodeError as e:

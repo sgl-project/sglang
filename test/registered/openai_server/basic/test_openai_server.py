@@ -55,10 +55,7 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
         kill_process_tree(cls.process.pid)
 
     def test_ignore_eos(self):
-        """
-        Test that ignore_eos=True allows generation to continue beyond EOS token
-        and reach the max_tokens limit.
-        """
+        """ignore_eos=True must keep generating past EOS up to max_tokens."""
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         max_tokens = 200
@@ -108,10 +105,7 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
         )
 
     def test_ebnf(self):
-        """
-        Ensure we can pass `ebnf` to the local openai server
-        and that it enforces the grammar.
-        """
+        """`ebnf` in extra_body must be enforced by the grammar backend."""
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         ebnf_grammar = r"""
         root ::= "Hello" | "Hi" | "Hey"
@@ -133,10 +127,7 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
         self.assertRegex(text, pattern, f"Text '{text}' doesn't match EBNF choices")
 
     def test_ebnf_strict_json(self):
-        """
-        A stricter EBNF that produces exactly {"name":"Alice"} format
-        with no trailing punctuation or extra fields.
-        """
+        """Stricter EBNF: exact {"name":"Alice"} shape, no extra fields."""
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         ebnf_grammar = r"""
         root    ::= "{" pair "}"

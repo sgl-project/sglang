@@ -24,7 +24,6 @@ class AnthropicMessagesMixin:
         return self.anthropic_base_url + "/v1/messages"
 
     def _make_request(self, payload, stream=False):
-        """Send a request to the /v1/messages endpoint."""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
