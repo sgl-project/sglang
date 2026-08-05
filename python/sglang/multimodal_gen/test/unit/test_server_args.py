@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
@@ -19,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanCo
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -39,9 +43,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_non_diffusers_pipeline_name,
+    is_known_non_diffusers_multimodal_model,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
+)
+from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
+    MiniMaxH3Pipeline,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -687,7 +698,65 @@ class TestWarmupImageIsModelValid(unittest.TestCase):
         self.assertGreaterEqual(height, 64)
 
 
+class TestDiffusionModelDetection(unittest.TestCase):
+    def test_registered_local_model_path_is_detected_as_diffusion(self):
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "Z-Image-Turbo")
+            os.mkdir(model_path)
+            self.assertTrue(get_is_diffusion_model(model_path))
+
+
+class TestMiniMaxH3Routing(unittest.TestCase):
+
+    def test_semantic_variants_map_to_checkpoint_partitions(self):
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
+        )
+        self.assertEqual(
+            MiniMaxH3Pipeline.model_subfolder_for_variant("ref2va"), "Ref2VA"
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported MiniMax H3 model variant"):
+            MiniMaxH3Pipeline.model_subfolder_for_variant("v2v")
+
+    def test_modelscope_id_resolves_to_the_huggingface_config(self):
+        expected = _get_config_info("MiniMaxAI/MiniMax-H3")
+        actual = _get_config_info("MiniMax/MiniMax-H3")
+        self.assertIsNotNone(expected)
+        self.assertIs(actual, expected)
+        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("/models/MiniMax-H3"),
+            "MiniMaxH3Pipeline",
+        )
+
+
 class TestOffloadDefaults(unittest.TestCase):
+    def test_wan_decode_precision_defaults(self):
+        for pipeline_config in (
+            WanT2V480PConfig(),
+            WanI2V480PConfig(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "bf16")
+
+        for pipeline_config in (
+            FastWan2_2_TI2V_5B_Config(),
+            Wan2_2_T2V_A14B_Config(),
+            Wan2_2_I2V_A14B_Config(),
+        ):
+            with self.subTest(pipeline_config=pipeline_config.__class__.__name__):
+                self.assertEqual(pipeline_config.vae_precision, "fp32")
+                self.assertEqual(pipeline_config.vae_decode_precision, "fp32")
+
+        generic_config = PipelineConfig()
+        self.assertEqual(generic_config.vae_precision, "fp32")
+        self.assertIsNone(generic_config.vae_decode_precision)
+
     def _from_dict_with_pipeline_config(
         self,
         pipeline_config,
@@ -1484,6 +1553,73 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         self.assertFalse(args.vae_cpu_offload)
 
+    def test_auto_minimax_h3_keeps_large_components_resident_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=141,
+            available_memory_gb=130,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertNotIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertNotIn("vae", args.layerwise_offload_components or [])
+
+    def test_auto_minimax_h3_keeps_memory_policy_below_residency_threshold(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            memory_gb=96,
+            available_memory_gb=90,
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_memory_minimax_h3_combines_fsdp_with_aux_layerwise_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            MiniMaxH3PipelineConfig(),
+            kwargs={
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "num_gpus": 8,
+                "ulysses_degree": 8,
+                "performance_mode": "memory",
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertIn("text_encoder", args.layerwise_offload_components or [])
+        self.assertIn("vae", args.layerwise_offload_components or [])
+
+    def test_minimax_h3_rejects_explicit_cfg_parallel(self):
+        with self.assertRaisesRegex(
+            ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
+        ):
+            self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "cfg_parallel_degree": 2,
+                },
+            )
+
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
@@ -1537,6 +1673,20 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.enable_torch_compile)
+
+    def test_speed_mode_uses_minimax_h3_compile_policy(self):
+        for explicit, expected in ((None, False), (True, True)):
+            kwargs = {
+                "model_path": "MiniMaxAI/MiniMax-H3",
+                "performance_mode": "speed",
+            }
+            if explicit is not None:
+                kwargs["enable_torch_compile"] = explicit
+            with self.subTest(explicit=explicit):
+                args = self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=kwargs
+                )
+                self.assertEqual(args.enable_torch_compile, expected)
 
     def test_auto_mode_leaves_torch_compile_off(self):
         args = self._from_dict_with_pipeline_config(
