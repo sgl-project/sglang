@@ -122,7 +122,8 @@ class TestBenchmarkCacheFlush(CustomTestCase):
 
             flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
             post.assert_called_once_with(
-                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+                "http://127.0.0.1:8000/reset_prefix_cache",
+                headers={},
             )
             post.reset_mock()
 
