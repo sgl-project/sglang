@@ -19,7 +19,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_server_args
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -422,9 +422,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # (FI cuda-graph path reading the persistent conv-out views on the bf16 state
         # pool, or Triton with a flat k/v stash otherwise).
         if self.use_state_pool:
-            from sglang.srt.server_args import get_global_server_args
-
-            if get_global_server_args().gdn_mtp_cache_mode == "none":
+            if get_exec().mamba.gdn_mtp_cache_mode == "none":
                 from flashinfer.gdn_kernels import (
                     gated_delta_rule_mtp_wy_output_only,
                 )

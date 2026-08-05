@@ -2530,6 +2530,7 @@ class ServerArgs:
             "freeing the intermediate_ssm buffer.",
             choices=["full", "none"],
         ),
+        NS("exec.mamba"),
     ] = "full"
     enable_int8_mamba_checkpoint: A[
         bool,
@@ -5685,7 +5686,7 @@ class ServerArgs:
         if self.enable_linear_replayssm_spec or self.enable_linear_replayssm:
             raise ValueError(
                 "--gdn-mtp-cache-mode=none is mutually exclusive with ReplaySSM "
-                "(--enable-gdn-replayssm-spec / --enable-linear-replayssm). "
+                "(--enable-linear-replayssm-spec / --enable-linear-replayssm). "
                 "RecoverSSM rebuilds the accepted state after verify and commits "
                 "it straight to the SSM pool, which neither ReplaySSM ring's "
                 "cursor protocol accounts for -- enable only one."

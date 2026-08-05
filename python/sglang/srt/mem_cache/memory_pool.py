@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -382,7 +382,7 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under BOTH --enable-gdn-replayssm-spec (spec ring owns rollback via
+        # None under BOTH --enable-linear-replayssm-spec (spec ring owns rollback via
         # cursors) and gdn_mtp_cache_mode=none (recovery reconstructs h_K after
         # verify); the two are mutually exclusive.
         intermediate_ssm: Optional[torch.Tensor] = None
@@ -682,16 +682,14 @@ class MambaPool:
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 #
                 # Skipped (dead weight, ~46x the conv state) when EITHER:
-                #  * ReplaySSM (--enable-gdn-replayssm-spec): ring + cursors own
+                #  * ReplaySSM (--enable-linear-replayssm-spec): ring + cursors own
                 #    rollback; the verify kernel never writes per-draft snapshots and
                 #    the commit never reads them.
                 #  * gdn_mtp_cache_mode=none: recovery reconstructs h_K from the
                 #    committed h_0 after verify.
                 # (The two are mutually exclusive.) The conv intermediate windows
                 # below STAY in both cases (conv rollback consumes them).
-                from sglang.srt.server_args import get_global_server_args
-
-                cache_mode = get_global_server_args().gdn_mtp_cache_mode
+                cache_mode = get_exec().mamba.gdn_mtp_cache_mode
                 if enable_linear_replayssm_spec or cache_mode == "none":
                     intermediate_ssm_state_cache = None
                 else:

@@ -20,7 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def make_server_args(
     *,
     gdn_mtp_cache_mode="none",
-    enable_gdn_replayssm_spec=False,
+    enable_linear_replayssm_spec=False,
     enable_linear_replayssm=False,
     speculative_eagle_topk=None,
     disable_radix_cache=True,
@@ -28,7 +28,7 @@ def make_server_args(
 ):
     sa = ServerArgs.__new__(ServerArgs)
     sa.gdn_mtp_cache_mode = gdn_mtp_cache_mode
-    sa.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
+    sa.enable_linear_replayssm_spec = enable_linear_replayssm_spec
     sa.enable_linear_replayssm = enable_linear_replayssm
     sa.speculative_eagle_topk = speculative_eagle_topk
     sa.disable_radix_cache = disable_radix_cache
@@ -42,7 +42,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
             with self.subTest(mode=mode):
                 sa = make_server_args(
                     gdn_mtp_cache_mode=mode,
-                    enable_gdn_replayssm_spec=True,
+                    enable_linear_replayssm_spec=True,
                     enable_linear_replayssm=True,
                     speculative_eagle_topk=8,
                     disable_radix_cache=False,
@@ -57,7 +57,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
         # protocols from both claiming the verify-commit path. --enable-linear-
         # replayssm is separately reachable: it requires no_buffer, which
         # none-mode also permits, so no other guard excludes the combination.
-        for flag in ("enable_gdn_replayssm_spec", "enable_linear_replayssm"):
+        for flag in ("enable_linear_replayssm_spec", "enable_linear_replayssm"):
             with self.subTest(flag=flag):
                 sa = make_server_args(**{flag: True}, speculative_eagle_topk=1)
                 with self.assertRaises(ValueError) as cm:
@@ -69,7 +69,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
 
     def test_replayssm_guard_wins_over_topk_guard(self):
         sa = make_server_args(
-            enable_gdn_replayssm_spec=True,
+            enable_linear_replayssm_spec=True,
             speculative_eagle_topk=8,
         )
         with self.assertRaises(ValueError) as cm:
