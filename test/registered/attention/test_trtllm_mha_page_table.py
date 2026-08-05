@@ -62,6 +62,8 @@ def _build_page_table_kernel(
     page_size: int,
     max_num_pages: int,
     full_to_swa: Optional[torch.Tensor] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Device-side impl."""
     dev = req_to_token.device
@@ -80,6 +82,8 @@ def _build_page_table_kernel(
         page_size=page_size,
         swa_page_table=swa_page_table,
         full_to_swa=full_to_swa,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )
     return page_table, swa_page_table
 
@@ -148,6 +152,62 @@ class TestTrtllmMhaPageTable(CustomTestCase):
                     self._run_case(
                         max_ctx, page_size, num_reqs=max(64, bs), bs=bs, swa=True
                     )
+
+    def test_dcp_page_table_matches_round_robin_local_layout(self):
+        torch.manual_seed(0)
+        dev = "cuda"
+        dcp_size = 4
+        page_size = 64
+        max_context_len = 4096
+        num_reqs = 16
+        bs = 7
+        req_to_token = torch.randint(
+            0,
+            num_reqs * max_context_len,
+            (num_reqs, max_context_len),
+            dtype=torch.int32,
+            device=dev,
+        )
+        req_pool_indices = torch.randperm(num_reqs, device=dev)[:bs].to(torch.int32)
+        global_lens = torch.randint(
+            1, max_context_len + 1, (bs,), dtype=torch.int32, device=dev
+        )
+        max_local_pages = (
+            (max_context_len + dcp_size - 1) // dcp_size + page_size - 1
+        ) // page_size
+
+        for dcp_rank in range(dcp_size):
+            local_lens = (
+                global_lens // dcp_size + (dcp_rank < global_lens % dcp_size)
+            ).to(torch.int32)
+            page_table, _ = _build_page_table_kernel(
+                req_to_token,
+                req_pool_indices,
+                local_lens,
+                page_size,
+                max_local_pages,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
+
+            local_page_starts = (
+                torch.arange(max_local_pages, device=dev, dtype=torch.int64)
+                * page_size
+                * dcp_size
+                + dcp_rank
+            )
+            slots = req_to_token[req_pool_indices[:, None], local_page_starts[None, :]]
+            reference = (slots // dcp_size) // page_size
+            for req_idx in range(bs):
+                num_pages = (
+                    int(local_lens[req_idx].item()) + page_size - 1
+                ) // page_size
+                torch.testing.assert_close(
+                    page_table[req_idx, :num_pages],
+                    reference[req_idx, :num_pages],
+                    rtol=0,
+                    atol=0,
+                )
 
     def _run_self_guard_case(self, max_context_len, page_size, bs, swa=False):
         """Short sequences against a full static buffer -- the GPU-only shape.

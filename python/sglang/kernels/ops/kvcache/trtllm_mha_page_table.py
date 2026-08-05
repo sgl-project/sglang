@@ -48,6 +48,8 @@ def create_trtllm_mha_kv_indices_triton(
     req_to_token_stride: tl.constexpr,
     page_table_stride: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
     HAS_SWA: tl.constexpr,
 ):
     """Fill ``page_table_ptr`` (and ``swa_page_table_ptr`` when ``HAS_SWA``).
@@ -74,7 +76,10 @@ def create_trtllm_mha_kv_indices_triton(
 
     req_pool_index = tl.load(req_pool_indices_ptr + pid_req)
     page_idx = tl.arange(0, PAGES_PER_BLOCK) + pid_blk * PAGES_PER_BLOCK
-    token_pos = page_idx.to(tl.int64) * PAGE_SIZE
+    # DCP stores only the round-robin token positions owned by this rank.
+    # The scheduler allocates global slots in PAGE_SIZE * DCP_SIZE pages and
+    # the KV writer maps them to the local pool with slot // DCP_SIZE.
+    token_pos = page_idx.to(tl.int64) * PAGE_SIZE * DCP_SIZE + DCP_RANK
     mask = page_idx < num_pages
 
     slot = tl.load(
@@ -84,7 +89,12 @@ def create_trtllm_mha_kv_indices_triton(
         mask=mask,
     )
     out_off = pid_req * page_table_stride + page_idx
-    tl.store(page_table_ptr + out_off, (slot // PAGE_SIZE).to(tl.int32), mask=mask)
+    local_slot = slot // DCP_SIZE
+    tl.store(
+        page_table_ptr + out_off,
+        (local_slot // PAGE_SIZE).to(tl.int32),
+        mask=mask,
+    )
     if HAS_SWA:
         swa_index = tl.minimum(tl.maximum(slot, 0), full_to_swa_numel - 1)
         swa_slot = tl.load(full_to_swa_ptr + swa_index.to(tl.int64), mask=mask)
@@ -103,6 +113,8 @@ def build_trtllm_mha_page_table(
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     full_to_swa: Optional[torch.Tensor] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """Fill ``page_table`` (and ``swa_page_table`` when SWA) on-device, no D2H sync.
 
@@ -134,5 +146,7 @@ def build_trtllm_mha_page_table(
         req_to_token.stride(0),
         page_table.stride(0),
         PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         HAS_SWA=has_swa,
     )

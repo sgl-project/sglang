@@ -57,6 +57,8 @@ def update_trtllm_mha_graph_metadata_kernel(
     swa_page_table_stride,
     # constexpr
     PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
     HAS_SWA: tl.constexpr,
     HAS_SWA_OUT: tl.constexpr,
     Q_MODE: tl.constexpr,
@@ -68,7 +70,10 @@ def update_trtllm_mha_graph_metadata_kernel(
     if pid < bs:
         # One program per batch row: cache_seqlens + page table row(s).
         req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
-        seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
+        global_seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
+        seqlen = (global_seqlen // DCP_SIZE + (DCP_RANK < global_seqlen % DCP_SIZE)).to(
+            tl.int32
+        )
         tl.store(cache_seqlens_ptr + pid, seqlen)
 
         row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
@@ -82,9 +87,12 @@ def update_trtllm_mha_graph_metadata_kernel(
             page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
             mask = page_idx < num_live_pages
             token = tl.load(
-                row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+                row_in + page_idx.to(tl.int64) * PAGE_SIZE * DCP_SIZE + DCP_RANK,
+                mask=mask,
+                other=0,
             )
-            tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+            local_token = token // DCP_SIZE
+            tl.store(row_out + page_idx, local_token // PAGE_SIZE, mask=mask)
             if HAS_SWA:
                 token64 = token.to(tl.int64)
                 # Real req_to_token slots are >=0; the token>=0 guard + other=-1 mirror
@@ -98,8 +106,13 @@ def update_trtllm_mha_graph_metadata_kernel(
         # Single program: cu_seqlens_k (+ optional cu_seqlens_q) cumsum.
         offs = tl.arange(0, BS_BLOCK)
         mask = offs < bs
-        seqlens = (tl.load(seq_lens_ptr + offs, mask=mask, other=0)).to(tl.int32)
-        seqlens = tl.where(mask, seqlens + seqlen_offset, 0)
+        global_seqlens = (
+            tl.load(seq_lens_ptr + offs, mask=mask, other=0) + seqlen_offset
+        ).to(tl.int32)
+        seqlens = (
+            global_seqlens // DCP_SIZE + (DCP_RANK < global_seqlens % DCP_SIZE)
+        ).to(tl.int32)
+        seqlens = tl.where(mask, seqlens, 0)
         tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(seqlens, axis=0), mask=mask)
         if Q_MODE == 1:  # Q_MODE_CUMSUM
             qlens = tl.load(qlens_ptr + offs, mask=mask, other=0).to(tl.int32)
@@ -145,6 +158,8 @@ def update_trtllm_mha_graph_metadata(
     qlens=None,
     q_stride: int = 0,
     q_mode: int = Q_MODE_NONE,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Launch the fused metadata update (one kernel for the whole replay init).
 
@@ -198,6 +213,8 @@ def update_trtllm_mha_graph_metadata(
         page_table.stride(0),
         swa_page_table.stride(0) if has_swa else 0,
         PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         HAS_SWA=has_swa,
         HAS_SWA_OUT=has_swa_out,
         Q_MODE=q_mode,
