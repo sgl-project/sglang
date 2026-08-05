@@ -84,11 +84,26 @@ async def collect_trace_events(
     deadline = time.monotonic() + timeout_s
     try:
         while time.monotonic() < deadline:
-            response = await client.get(
-                endpoint,
-                params={"after": cursor, "limit": 500},
-            )
-            response.raise_for_status()
+            try:
+                response = await client.get(
+                    endpoint,
+                    params={"after": cursor, "limit": 500},
+                )
+                response.raise_for_status()
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+                if time.monotonic() >= deadline:
+                    raise
+                if poll_interval_s > 0:
+                    await asyncio.sleep(poll_interval_s)
+                continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {429, 500, 502, 503, 504}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                if poll_interval_s > 0:
+                    await asyncio.sleep(poll_interval_s)
+                continue
             payload = response.json()
             added = 0
             for raw_event in payload.get("events") or []:

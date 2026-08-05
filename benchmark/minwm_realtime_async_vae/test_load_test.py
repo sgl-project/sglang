@@ -116,6 +116,44 @@ def test_collect_trace_events_polls_incrementally_and_deduplicates():
     asyncio.run(run())
 
 
+def test_collect_trace_events_retries_a_transient_transport_timeout():
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "events": [{"event": "server.chunk_complete", "trace_seq": 1}],
+                "next_cursor": 1,
+            }
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, _url, *, params):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("transient trace read timeout")
+            return Response()
+
+    async def run():
+        client = Client()
+        events = await collect_trace_events(
+            "http://gateway",
+            "trace-retry",
+            client=client,
+            timeout_s=0.1,
+            poll_interval_s=0,
+            stable_polls=1,
+        )
+
+        assert [event["trace_seq"] for event in events] == [1]
+        assert client.calls == 3
+
+    asyncio.run(run())
+
+
 def test_stage_values_backfills_overlap_after_next_denoise_completes():
     events = [
         {
