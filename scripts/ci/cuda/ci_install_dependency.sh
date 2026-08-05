@@ -386,6 +386,36 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+# Trust an installed wheel only if the version matches AND every RECORD file is
+# on disk - dist-info can survive a partial install (same failure mode as the
+# cusparselt guard in install_sglang). reject-local additionally refuses wheels
+# installed from a local file: a kernel-PR job installs its own build under the
+# SAME +cuXXX version string, and only file:// provenance (PEP 610
+# direct_url.json; index installs record none) tells it apart from the index wheel.
+installed_wheel_ok() {
+    WHEEL_DIST="$1" WHEEL_WANTED="$2" WHEEL_REJECT_LOCAL="${3:-}" python3 - <<'EOF'
+import importlib.metadata as md
+import os
+import sys
+
+try:
+    dist = md.distribution(os.environ["WHEEL_DIST"])
+except md.PackageNotFoundError:
+    sys.exit(1)
+if dist.version != os.environ["WHEEL_WANTED"]:
+    sys.exit(1)
+if os.environ["WHEEL_REJECT_LOCAL"] and "file://" in (dist.read_text("direct_url.json") or ""):
+    print(f"{dist.name} came from a locally built wheel; reinstalling from the index")
+    sys.exit(1)
+if dist.files is None:
+    sys.exit(1)
+missing = [str(f) for f in dist.files if not dist.locate_file(f).exists()]
+if missing:
+    print(f"{dist.name} is missing {len(missing)} installed files (e.g. {missing[0]}); reinstalling")
+    sys.exit(1)
+EOF
+}
+
 install_sglang_kernel() {
     SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' python/sglang/kernels/aot/pyproject.toml)
     SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
@@ -455,10 +485,9 @@ install_sglang_kernel() {
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
         # The PyPI default wheel tracks one CUDA version (currently cu130);
         # runners on a different CUDA need the +${CU_VERSION}-tagged wheel from
-        # the sglang index. A tag match means the right wheel is already there.
+        # the sglang index. A verified match means the right wheel is in place.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
-        SGL_KERNEL_INSTALLED=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-        if [ "$SGL_KERNEL_INSTALLED" = "$SGL_KERNEL_WANTED" ]; then
+        if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
         else
             $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
@@ -472,8 +501,9 @@ install_sglang_kernel() {
     else
         SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
     fi
-    SGL_DEEP_GEMM_INSTALLED=$(pip show sgl-deep-gemm 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$SGL_DEEP_GEMM_INSTALLED" = "$SGL_DEEP_GEMM_WANTED" ]; then
+    # No reject-local: nothing builds sgl-deep-gemm locally, and its cu129
+    # wheel installs from a direct URL, which legitimately records provenance.
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
         echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
     elif [ "$CU_MAJOR" = "13" ]; then
         $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
