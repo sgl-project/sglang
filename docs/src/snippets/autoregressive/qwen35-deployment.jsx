@@ -41,19 +41,16 @@ export const Qwen35Deployment = () => {
     model: {
       name: 'model',
       title: 'Model Variant',
-      getDynamicItems: (values) => {
-        const isArcB = values.hardware === 'Arc B';
-        return [
-          { id: '397b',  label: '397B', subtitle: 'MoE', default: !isArcB, disabled: isArcB },
-          { id: '122b',  label: '122B', subtitle: 'MoE', default: false, disabled: isArcB },
-          { id: '35b',   label: '35B',  subtitle: 'MoE', default: isArcB, disabled: false },
-          { id: '27b',   label: '27B',  subtitle: 'Dense', default: false, disabled: isArcB },
-          { id: '9b',    label: '9B',   subtitle: 'Dense', default: false, disabled: false },
-          { id: '4b',    label: '4B',   subtitle: 'Dense', default: false, disabled: false },
-          { id: '2b',    label: '2B',   subtitle: 'Dense', default: false, disabled: isArcB },
-          { id: '0.8b',  label: '0.8B', subtitle: 'Dense', default: false, disabled: isArcB },
-        ];
-      }
+      items: [
+        { id: '397b',  label: '397B', subtitle: 'MoE', default: true  },
+        { id: '122b',  label: '122B', subtitle: 'MoE', default: false },
+        { id: '35b',   label: '35B',  subtitle: 'MoE', default: false },
+        { id: '27b',   label: '27B',  subtitle: 'Dense', default: false },
+        { id: '9b',    label: '9B',   subtitle: 'Dense', default: false },
+        { id: '4b',    label: '4B',   subtitle: 'Dense', default: false },
+        { id: '2b',    label: '2B',   subtitle: 'Dense', default: false },
+        { id: '0.8b',  label: '0.8B', subtitle: 'Dense', default: false },
+      ]
     },
     hardware: {
       name: 'hardware',
@@ -283,7 +280,17 @@ export const Qwen35Deployment = () => {
   }, [values.hardware, values.model]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      if (prev.hardware === 'Arc B' && optionName === 'model' && !['35b', '9b', '4b'].includes(value)) {
+        return prev;
+      }
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'Arc B' && !['35b', '9b', '4b'].includes(next.model)) {
+        next.model = '35b';
+      }
+      return next;
+    });
   };
 
   // Multi-node flag template — mirrors DeepSeek-V4 cookbook's multiNodeFlags.
@@ -347,6 +354,7 @@ export const Qwen35Deployment = () => {
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (hardware === 'Arc B') {
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }
     if (tpValue > 1) {
@@ -542,7 +550,11 @@ export const Qwen35Deployment = () => {
             <div style={itemsStyle}>
               {items.map(item => {
                 const isChecked = values[option.name] === item.id;
-                const isDisabled = !!item.disabled;
+                const isArcBModelLocked =
+                  values.hardware === 'Arc B' &&
+                  option.name === 'model' &&
+                  !['35b', '9b', '4b'].includes(item.id);
+                const isDisabled = !!item.disabled || isArcBModelLocked;
                 return (
                   <label
                     key={item.id}

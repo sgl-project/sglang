@@ -15,27 +15,21 @@ export const Nemotron3NanoDeployment = () => {
     modelVariant: {
       name: 'modelVariant',
       title: 'Model Variant',
-      getDynamicItems: (values) => {
-        const isArcB = values.hardware === 'Arc B';
-        return [
-          { id: 'bf16', label: 'BF16', default: true },
-          { id: 'fp8', label: 'FP8', default: false, disabled: isArcB },
-          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: isArcB }
-        ];
-      }
+      items: [
+        { id: 'bf16', label: 'BF16', default: true },
+        { id: 'fp8', label: 'FP8', default: false },
+        { id: 'nvfp4', label: 'NVFP4', default: false }
+      ]
     },
     tp: {
       name: 'tp',
       title: 'Tensor Parallel (TP)',
-      getDynamicItems: (values) => {
-        const isArcB = values.hardware === 'Arc B';
-        return [
-          { id: '1', label: 'TP=1', default: !isArcB, disabled: isArcB },
-          { id: '2', label: 'TP=2', default: false, disabled: isArcB },
-          { id: '4', label: 'TP=4', default: isArcB, disabled: false },
-          { id: '8', label: 'TP=8', default: false, disabled: isArcB }
-        ];
-      }
+      items: [
+        { id: '1', label: 'TP=1', default: true },
+        { id: '2', label: 'TP=2', default: false },
+        { id: '4', label: 'TP=4', default: false },
+        { id: '8', label: 'TP=8', default: false }
+      ]
     },
     kvcache: {
       name: 'kvcache',
@@ -84,7 +78,8 @@ export const Nemotron3NanoDeployment = () => {
     }
 
     if (hardware === 'Arc B') {
-      cmd += `  --device xpu \\n`;
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
+      cmd += `  --device xpu \\\n`;
     }
 
     // Add thinking parser and tool call parser if enabled
@@ -165,6 +160,10 @@ export const Nemotron3NanoDeployment = () => {
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
+      if (prev.hardware === 'Arc B' && optionName === 'modelVariant' && value !== 'bf16') {
+        return prev;
+      }
+
       const next = { ...prev, [optionName]: value };
       if (optionName === 'hardware' && value === 'Arc B') {
         next.modelVariant = 'bf16';
@@ -345,7 +344,11 @@ export const Nemotron3NanoDeployment = () => {
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isArcBModelLocked =
+                    values.hardware === 'Arc B' &&
+                    option.name === 'modelVariant' &&
+                    item.id !== 'bf16';
+                  const isDisabled = Boolean(item.disabled || isArcBModelLocked);
                   return (
                     <label
                       key={item.id}
