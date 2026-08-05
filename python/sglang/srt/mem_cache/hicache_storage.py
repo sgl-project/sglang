@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
 
 import torch
 
@@ -39,11 +39,14 @@ class HiCacheStorageConfig:
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
     # canonical-grid key scheme: when set, backends MUST use this topology-free
-    # cell coordinate ("{ns_digest}_L{i}[_H{j}]") verbatim as the key suffix
-    # instead of their hand-rolled rank/pp/cp suffixes. Built and validated in
-    # HiCacheController._generate_storage_config via hicache_key_scheme.py;
+    # cell coordinate ("{ns_digest}_L{s}-{e}[_H{j}]") verbatim as the key
+    # suffix instead of their hand-rolled rank/pp/cp suffixes. A list means
+    # head fan-out (this rank owns several head-group cells per page, in
+    # ascending head order — mirrors the split-heads mha_suffix list); only
+    # multi-key backends (mooncake) accept the list form. Built and validated
+    # in HiCacheController._generate_storage_config via hicache_key_scheme.py;
     # None under the legacy rank-suffix scheme.
-    canonical_suffix: Optional[str] = None
+    canonical_suffix: Optional[Union[str, List[str]]] = None
 
 
 @dataclass
@@ -385,6 +388,13 @@ class HiCacheFile(HiCacheStorage):
             # canonical-grid scheme: the topology-free cell coordinate (model
             # identity lives inside the namespace digest) replaces the whole
             # rank/pp/cp suffix family. CP is rejected upstream at attach.
+            if not isinstance(storage_config.canonical_suffix, str):
+                # Head fan-out produces several keys per page; this backend
+                # stores one object per page. Guarded at attach too.
+                raise NotImplementedError(
+                    "the file backend does not support canonical-grid head "
+                    "fan-out (multiple cells per page); use mooncake."
+                )
             self.config_suffix = f"_{storage_config.canonical_suffix}"
         else:
             self.config_suffix = f"_{model_name}"

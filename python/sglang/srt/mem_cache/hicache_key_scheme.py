@@ -26,17 +26,19 @@ whose shard tiles the namespace grid derives identical keys for identical
 data, which makes cross-topology reuse a pure key-selection problem. Design:
 ``DESIGN_l3_canonical_shard_grid.md``.
 
-v1 scope (enforced in :func:`build_canonical_cell_suffix`): exactly one cell
-per rank per page. The layer coordinate is the rank's absolute layer range —
-any pipeline partition works, uneven stages included (61-layer models at any
-pp_size); partitions that differ simply derive disjoint keys and miss instead
-of colliding. The head axis requires ``head_group`` == the rank's local
-kv-head count. Objects are therefore byte-identical to the rank-suffix
-scheme's; only the names change. Uniform layer grids with multi-cell fan-out
-(and head fan-out subsuming the mooncake ``tp_lcm_size`` split-heads
-mechanism) are the follow-up and are rejected with explicit errors here.
-Rank-replicated pools (MLA-family) have no head axis, so cross-TP-size reuse
-works immediately.
+Scope (enforced in :func:`build_canonical_cell_suffixes`): the layer
+coordinate is the rank's absolute layer range — any pipeline partition works,
+uneven stages included (61-layer models at any pp_size); partitions that
+differ simply derive disjoint keys and miss instead of colliding. On the head
+axis a rank owns ``local_kv_heads // head_group`` cells per page (head
+fan-out): fleets agree on the head grid via the existing ``tp_lcm_size``
+extra-config knob (``head_group = total_kv_heads / tp_lcm_size``), which this
+scheme subsumes — the canonical H indices coincide with the split-heads
+virtual ranks, so the proven multi-key read/write machinery
+(``get_split_heads_page_buffer_meta``, mooncake key fan-out) carries over
+under canonical names. Rank-replicated pools (MLA-family) have no head axis,
+so cross-TP-size reuse needs no head-grid agreement at all. Uniform layer
+grids with layer fan-out remain the follow-up and are rejected explicitly.
 
 The namespace is derived from deployment facts (model, logical KV dtype,
 page size, head grid) and its digest prefixes every key: deployments share
@@ -136,15 +138,17 @@ def derive_namespace(
     page_size: int,
     rank_replicated: bool,
     total_kv_heads: int,
-    local_kv_heads: int,
+    head_group: int,
 ) -> KVCacheNamespace:
-    """Default descriptor when no file is given: head grid == this deployment.
+    """Derive the namespace from deployment facts plus the fleet head grid.
 
-    Deployments with different topologies then derive different digests and
-    land in disjoint keyspaces — safe (never a geometry collision) but with no
-    cross-topology sharing. Fleets that want sharing distribute one descriptor
-    file instead. Layer cells are per-stage ranges, so the derived namespace
-    is PP-partition-independent: only the head grid enters the identity.
+    ``head_group`` is the fleet agreement: deployments that pass the same
+    ``tp_lcm_size`` derive ``head_group = total_kv_heads / tp_lcm_size`` and
+    land in one keyspace; without it, ``head_group`` = the rank's local head
+    count and only same-TP deployments share. Layer cells are per-stage
+    ranges, so the derived namespace is PP-partition-independent. All other
+    mismatches (model, logical dtype, page size) partition into disjoint
+    keyspaces — safe, never a geometry collision.
     """
     namespace = KVCacheNamespace(
         model_id=model_id,
@@ -152,7 +156,7 @@ def derive_namespace(
         page_size=page_size,
         rank_replicated=rank_replicated,
         total_kv_heads=0 if rank_replicated else total_kv_heads,
-        head_group=0 if rank_replicated else local_kv_heads,
+        head_group=0 if rank_replicated else head_group,
     )
     _validate_grid(namespace)
     return namespace
@@ -191,7 +195,7 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
         )
 
 
-def build_canonical_cell_suffix(
+def build_canonical_cell_suffixes(
     namespace: KVCacheNamespace,
     *,
     attn_tp_rank: int,
@@ -204,12 +208,19 @@ def build_canonical_cell_suffix(
     page_size: int,
     model_id: str,
     rank_replicated: bool,
-) -> str:
-    """Validate this rank against the namespace and return its cell suffix.
+) -> list[str]:
+    """Validate this rank against the namespace; return its owned cell suffixes.
 
     The attach-time compatibility check of the design's section 2.2: the
     rank's shard must tile the grid, and every identity field must match.
     Raises with the remedy in the message; never degrades silently.
+
+    Returns one suffix per owned cell, in ascending head-group order. A rank
+    whose kv-head shard is coarser than ``head_group`` owns
+    ``local_kv_heads // head_group`` cells (head fan-out): rank ``r`` owns
+    head groups ``[r * n, (r + 1) * n)`` — the same arithmetic as the
+    mooncake split-heads virtual ranks, re-keyed canonically. Rank-replicated
+    namespaces always return exactly one suffix.
     """
     _validate_grid(namespace)
     _check_identity(
@@ -236,13 +247,13 @@ def build_canonical_cell_suffix(
 
     digest = namespace_digest(namespace)
     if namespace.rank_replicated:
-        return f"{digest}_{layer_coord}"
+        return [f"{digest}_{layer_coord}"]
 
     if namespace.total_kv_heads != local_kv_heads * attn_tp_size:
         raise ValueError(
             f"namespace total_kv_heads={namespace.total_kv_heads} != "
             f"local_kv_heads({local_kv_heads}) x attn_tp_size({attn_tp_size}): "
-            f"either the descriptor does not match this model/parallelism, or "
+            f"either the namespace does not match this model/parallelism, or "
             f"kv heads are replicated across ranks (tp_size > model kv heads),"
             f" which needs writer election (follow-up). Use "
             f"--hicache-storage-key-scheme rank-suffix meanwhile."
@@ -252,17 +263,11 @@ def build_canonical_cell_suffix(
             f"this rank's {local_kv_heads} kv heads do not tile "
             f"head_group={namespace.head_group}."
         )
-    if local_kv_heads != namespace.head_group:
-        raise NotImplementedError(
-            f"head fan-out is not implemented: this rank holds "
-            f"{local_kv_heads} kv heads but the namespace head_group is "
-            f"{namespace.head_group} ({local_kv_heads // namespace.head_group} "
-            f"cells per page). v1 requires head_group == the rank's local kv "
-            f"heads; for cross-TP-size reuse today use the rank-suffix scheme "
-            f"with tp_lcm_size split-heads."
-        )
-    head_index = (attn_tp_rank * local_kv_heads) // namespace.head_group
-    return f"{digest}_{layer_coord}_H{head_index}"
+    cells_per_rank = local_kv_heads // namespace.head_group
+    first_head_index = attn_tp_rank * cells_per_rank
+    return [
+        f"{digest}_{layer_coord}_H{first_head_index + i}" for i in range(cells_per_rank)
+    ]
 
 
 def _check_identity(

@@ -7214,6 +7214,29 @@ class ServerArgs:
                 "CP ranks hold sub-page slices or replicated pages (needs "
                 "token-granule cells / writer election)."
             )
+        # Best-effort early check of head fan-out prerequisites when the
+        # extra config is inline JSON (the '@file' form is re-validated at
+        # attach). tp_lcm_size is the fleet head-grid agreement; fan-out
+        # needs a multi-key backend and per-head-group contiguous layout.
+        extra = self.hicache_storage_backend_extra_config
+        if extra and not extra.startswith("@"):
+            try:
+                tp_lcm_size = json.loads(extra).get("tp_lcm_size")
+            except (ValueError, AttributeError):
+                tp_lcm_size = None
+            if tp_lcm_size and tp_lcm_size > self.tp_size:
+                if self.hicache_storage_backend != "mooncake":
+                    raise NotImplementedError(
+                        "canonical-grid head fan-out (tp_lcm_size > tp_size) "
+                        "needs a multi-key-per-page backend; only mooncake "
+                        "supports it."
+                    )
+                if self.hicache_mem_layout != "page_head":
+                    raise ValueError(
+                        "canonical-grid head fan-out requires "
+                        "--hicache-mem-layout page_head (per-head-group "
+                        "contiguous buffer metas)."
+                    )
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:

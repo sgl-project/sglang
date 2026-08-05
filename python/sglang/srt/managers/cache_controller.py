@@ -628,16 +628,12 @@ class HiCacheController:
 
         canonical_suffix = None
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
-            if tp_lcm_size:
-                raise ValueError(
-                    "canonical-grid and tp_lcm_size split-heads are mutually "
-                    "exclusive: the namespace head_group subsumes tp_lcm_size "
-                    "(multi-cell head fan-out is the follow-up)."
-                )
             canonical_suffix = self._build_canonical_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
+                tp_lcm_size=tp_lcm_size,
+                should_split_heads=should_split_heads,
             )
 
         return HiCacheStorageConfig(
@@ -659,16 +655,28 @@ class HiCacheController:
         )
 
     def _build_canonical_suffix(
-        self, model_name: Optional[str], is_rank_replicated: bool, attn_cp_size: int
-    ) -> str:
-        """Attach-time construction of the canonical-grid cell suffix.
+        self,
+        model_name: Optional[str],
+        is_rank_replicated: bool,
+        attn_cp_size: int,
+        tp_lcm_size: Optional[int],
+        should_split_heads: bool,
+    ):
+        """Attach-time construction of the canonical-grid cell suffix(es).
 
         Fail-fast attach validation: every unsupported combination raises with
         the remedy in the message; nothing degrades silently to rank-suffix
         keys (see DESIGN_l3_canonical_shard_grid.md section 2.2).
+
+        Returns one suffix string when this rank owns a single cell per page,
+        or the list of owned-cell suffixes under head fan-out
+        (``tp_lcm_size`` > tp_size): the fleet head grid is
+        ``head_group = total_kv_heads / tp_lcm_size``, and the canonical H
+        indices coincide with the split-heads virtual ranks, so the existing
+        multi-key machinery carries the fan-out.
         """
         from sglang.srt.mem_cache.hicache_key_scheme import (
-            build_canonical_cell_suffix,
+            build_canonical_cell_suffixes,
             derive_namespace,
             namespace_digest,
             normalize_dtype,
@@ -691,6 +699,29 @@ class HiCacheController:
                 "pools yet (the draft model needs its own namespace identity)."
             )
 
+        # Head fan-out: tp_lcm_size is the fleet head-grid agreement
+        # (identical role as under rank-suffix split-heads, which this
+        # subsumes). split_factor = cells this rank owns per page. These
+        # prerequisite checks run before any pool access so misconfiguration
+        # fails on config alone.
+        split_factor = 1
+        if tp_lcm_size and not is_rank_replicated and tp_lcm_size > self.tp_size:
+            if self.storage_backend_type != "mooncake":
+                raise NotImplementedError(
+                    "canonical-grid head fan-out needs a multi-key-per-page "
+                    "backend; only mooncake supports it (the file backend "
+                    "stores one object per page)."
+                )
+            if not should_split_heads:
+                # should_split_heads additionally requires the page_head host
+                # layout (per-head-group contiguity for the multi-key metas).
+                raise ValueError(
+                    "canonical-grid with tp_lcm_size head fan-out requires "
+                    "--hicache-mem-layout page_head (per-head-group "
+                    "contiguous buffer metas)."
+                )
+            split_factor = tp_lcm_size // self.tp_size
+
         # Logical KV dtype, not the storage view: fp8 variants all store as
         # uint8, and e4m3/e5m2 deployments must land in distinct keyspaces.
         dtype = normalize_dtype(self.mem_pool_device.dtype)
@@ -699,14 +730,21 @@ class HiCacheController:
         local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
         model_id = model_name or ""
 
+        if split_factor > 1 and local_kv_heads % split_factor != 0:
+            raise ValueError(
+                f"tp_lcm_size={tp_lcm_size} needs {split_factor} head "
+                f"groups per rank, but this rank holds {local_kv_heads} "
+                f"kv heads; tp_lcm_size must not exceed the model's total "
+                f"kv heads."
+            )
+
         if not is_rank_replicated and local_kv_heads == 1 and self.tp_size > 1:
             # One kv head per rank is ambiguous without model-level info: the
             # model may have exactly tp_size kv heads (sharded, safe) or
             # fewer (heads REPLICATED across ranks — several ranks hold the
             # same head, and per-rank H indices would mislabel it). The
             # derived namespace fabricates total_kv_heads = local*tp, so it
-            # cannot tell these apart; the fleet-descriptor mechanism of the
-            # head fan-out follow-up carries the model's true head count.
+            # cannot tell these apart.
             raise NotImplementedError(
                 "canonical-grid cannot derive a namespace at 1 kv head per "
                 "rank (possible kv-head replication when tp_size exceeds the "
@@ -716,17 +754,18 @@ class HiCacheController:
         # The namespace is derived from deployment facts; its digest prefixes
         # every key, so deployments agree on a keyspace iff model, logical KV
         # dtype (fp8 variants stay distinct), page size, and head grid all
-        # match. Fleet-level descriptor files arrive with head fan-out.
+        # match. Deployments passing the same tp_lcm_size derive the same
+        # head grid and thereby share cache across TP sizes.
         namespace = derive_namespace(
             model_id=model_id,
             dtype=dtype,
             page_size=self.page_size,
             rank_replicated=is_rank_replicated,
             total_kv_heads=local_kv_heads * self.tp_size,
-            local_kv_heads=local_kv_heads,
+            head_group=0 if is_rank_replicated else local_kv_heads // split_factor,
         )
 
-        suffix = build_canonical_cell_suffix(
+        suffixes = build_canonical_cell_suffixes(
             namespace,
             attn_tp_rank=self.tp_rank,
             attn_tp_size=self.tp_size,
@@ -740,11 +779,11 @@ class HiCacheController:
             rank_replicated=is_rank_replicated,
         )
         logger.info(
-            "HiCache canonical-grid L3 keys: namespace=%s cell=%s",
+            "HiCache canonical-grid L3 keys: namespace=%s cells=%s",
             namespace_digest(namespace),
-            suffix,
+            suffixes,
         )
-        return suffix
+        return suffixes[0] if len(suffixes) == 1 else suffixes
 
     def reset(self):
         self.storage_stop_event.set()
