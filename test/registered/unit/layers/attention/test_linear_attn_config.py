@@ -52,6 +52,11 @@ class TestLinearAttnConfig(CustomTestCase):
         self.assertEqual(prefill, LinearAttnKernelBackend.TRITON)
         self.assertEqual(decode, LinearAttnKernelBackend.TRITON)
 
+    def test_cake_base_selects_both_kernel_phases(self):
+        prefill, decode = self._init(linear_attn_backend="cake")
+        self.assertEqual(prefill, LinearAttnKernelBackend.CAKE)
+        self.assertEqual(decode, LinearAttnKernelBackend.CAKE)
+
     def test_a_recorded_default_shows_in_the_resolved_config(self):
         from sglang.srt.runtime_context import get_context, get_exec
 

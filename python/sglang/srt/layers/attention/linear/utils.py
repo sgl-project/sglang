@@ -17,6 +17,7 @@ class LinearAttnKernelBackend(Enum):
     CUTEDSL = "cutedsl"
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
+    CAKE = "cake"
     FLASHKDA = "flashkda"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
@@ -37,6 +38,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_flashinfer(self):
         return self == LinearAttnKernelBackend.FLASHINFER
+
+    def is_cake(self):
+        return self == LinearAttnKernelBackend.CAKE
 
     def is_flashkda(self):
         return self == LinearAttnKernelBackend.FLASHKDA

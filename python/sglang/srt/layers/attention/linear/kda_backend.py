@@ -68,10 +68,21 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = FlashInferKDAKernel()
+        elif decode_backend.is_cake():
+            # Exported CAKE recurrent_kda T=1 backend. Its strict public
+            # contract differs from the default FlashInfer CuTe-DSL path, so
+            # the wrapper performs the gate/state adaptation explicitly.
+            if not is_cuda():
+                raise ValueError("KDA CAKE backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                CakeKDAKernel,
+            )
+
+            self.decode_kernel = CakeKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'cutedsl', 'flashinfer', or 'cake'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -110,6 +121,17 @@ class KDAKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_cake():
+            if not is_cuda():
+                raise ValueError("KDA CAKE prefill backend requires CUDA")
+            if decode_backend.is_cake():
+                self.extend_kernel = self.decode_kernel
+            else:
+                from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+                    CakeKDAKernel,
+                )
+
+                self.extend_kernel = CakeKDAKernel()
         elif prefill_backend.is_flashkda():
             from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
                 FlashKDAKernel,
@@ -166,8 +188,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', 'cutedsl', 'nvidia_kda', or "
-                "'ptx_kda' (cutedsl/nvidia_kda prefill need SM100, ptx_kda SM103)."
+                "KDA supports 'triton', 'cake', 'flashkda', 'cutedsl', "
+                "'nvidia_kda', or 'ptx_kda' (cake/cutedsl/nvidia_kda prefill "
+                "need SM100, ptx_kda SM103)."
             )
 
         self.supports_packed_decode = getattr(
@@ -375,6 +398,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        self._allow_fused_decode = getattr(
+            self.kernel_dispatcher.decode_kernel,
+            "supports_k3_fused_decode",
+            True,
+        )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -436,7 +464,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
+        if self._allow_fused_decode and replayssm_d is None:
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (

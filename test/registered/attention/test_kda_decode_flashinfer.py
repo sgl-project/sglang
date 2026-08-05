@@ -26,6 +26,7 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 1
     )
 
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (  # noqa: E402
+    CakeKDAKernel,
     FlashInferKDAKernel,
     _get_flashinfer_kda_kernel,
 )
@@ -48,19 +49,35 @@ H, HV, K, V = 16, 16, 128, 128
 # Inputs (matched to the sglang KDA decode/verify contract: raw per-K gate `a`,
 # beta logit `b`, SSM pool [N, HV, V, K], decode cu_seqlens = query_start_loc).
 # ---------------------------------------------------------------------------
-def _make_decode_inputs(batch_size, device="cuda", dtype=torch.bfloat16):
+def _make_decode_inputs(
+    batch_size,
+    device="cuda",
+    dtype=torch.bfloat16,
+    num_heads=H,
+    num_value_heads=HV,
+):
     B, pool = batch_size, batch_size + 16
     return dict(
         B=B,
-        q=(torch.randn(1, B, H, K, device=device, dtype=dtype) * 0.5).contiguous(),
-        k=(torch.randn(1, B, H, K, device=device, dtype=dtype) * 0.5).contiguous(),
-        v=(torch.randn(1, B, HV, V, device=device, dtype=dtype) * 0.5).contiguous(),
-        a=(torch.randn(B, HV * K, device=device, dtype=dtype) * 0.5 - 1.0).contiguous(),
-        b=(torch.randn(B, HV, device=device, dtype=dtype) * 0.5).contiguous(),
-        A_log=torch.randn(HV, device=device, dtype=torch.float32) * 0.2,
-        dt_bias=torch.randn(HV * K, device=device, dtype=torch.float32) * 0.1,
+        q=(
+            torch.randn(1, B, num_heads, K, device=device, dtype=dtype) * 0.5
+        ).contiguous(),
+        k=(
+            torch.randn(1, B, num_heads, K, device=device, dtype=dtype) * 0.5
+        ).contiguous(),
+        v=(
+            torch.randn(1, B, num_value_heads, V, device=device, dtype=dtype) * 0.5
+        ).contiguous(),
+        a=(
+            torch.randn(B, num_value_heads * K, device=device, dtype=dtype) * 0.5 - 1.0
+        ).contiguous(),
+        b=(
+            torch.randn(B, num_value_heads, device=device, dtype=dtype) * 0.5
+        ).contiguous(),
+        A_log=torch.randn(num_heads, device=device, dtype=torch.float32) * 0.2,
+        dt_bias=torch.randn(num_heads * K, device=device, dtype=torch.float32) * 0.1,
         ssm=(
-            torch.randn(pool, HV, V, K, device=device, dtype=dtype) * 0.01
+            torch.randn(pool, num_value_heads, V, K, device=device, dtype=dtype) * 0.01
         ).contiguous(),
         cache_indices=torch.arange(B, device=device, dtype=torch.int32),
         qsl=torch.arange(B + 1, device=device, dtype=torch.int32),
@@ -104,7 +121,7 @@ def _make_verify_inputs(
     )
 
 
-def _decode(kern, d, ssm):
+def _decode(kern, d, ssm, lower_bound=None):
     # `ssm` is updated in place (committed-pool decode step); pass a fresh clone.
     return kern.decode(
         d["q"],
@@ -117,7 +134,8 @@ def _decode(kern, d, ssm):
         ssm_states=ssm,
         cache_indices=d["cache_indices"],
         query_start_loc=d["qsl"],
-    ).reshape(d["B"], HV, V)
+        lower_bound=lower_bound,
+    ).reshape(d["B"], d["v"].shape[2], d["v"].shape[3])
 
 
 def _verify(kern, d, ssm, intermediate_states):
@@ -196,6 +214,72 @@ def test_kda_decode_flashinfer_matches_triton(batch_size):
     assert (
         s_err.mean().item() < 1e-2
     ), f"decode state mean diff {s_err.mean().item():.2e}"
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 64])
+def test_kda_decode_cake_matches_triton_kimi_k3_h12(batch_size):
+    """The SGLang adapter must exercise CAKE on Kimi-K3's TP8-local H=12
+    safe-gate contract, including non-identity state-pool rows."""
+    torch.manual_seed(12000 + batch_size)
+    d = _make_decode_inputs(batch_size, num_heads=12, num_value_heads=12)
+    # Match forward_decode's real layout: q/k/v are gapped views produced by
+    # splitting one fused conv output, not independently contiguous tensors.
+    segment = 12 * K
+    mixed_qkv = torch.randn(
+        batch_size,
+        3 * segment,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q, k, v = mixed_qkv.split([segment, segment, segment], dim=-1)
+    d["q"] = q.unflatten(-1, (12, K)).unsqueeze(0)
+    d["k"] = k.unflatten(-1, (12, K)).unsqueeze(0)
+    d["v"] = v.unflatten(-1, (12, V)).unsqueeze(0)
+    # For B=1 PyTorch legitimately reports these gapped split views as
+    # contiguous because the only strided outer dimension is a singleton.
+    # Larger batches exercise the real non-contiguous qkv-split layout.
+    if batch_size > 1:
+        assert not d["q"].is_contiguous()
+        assert not d["k"].is_contiguous()
+        assert not d["v"].is_contiguous()
+    pool_size = d["ssm"].shape[0]
+    d["cache_indices"] = torch.randperm(pool_size, device="cuda", dtype=torch.int64)[
+        :batch_size
+    ].to(torch.int32)
+
+    cake, tri = CakeKDAKernel(), TritonKDAKernel()
+    st_ref = d["ssm"].clone()
+    ref_out = _decode(tri, d, st_ref, lower_bound=-5.0).float()
+    st_cake = d["ssm"].clone()
+    out = _decode(cake, d, st_cake, lower_bound=-5.0).float()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+    idx = d["cache_indices"].long()
+    torch.testing.assert_close(
+        st_cake[idx].float(), st_ref[idx].float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_kda_decode_cake_matches_triton_gqa():
+    torch.manual_seed(4800)
+    data = _make_decode_inputs(4, num_heads=4, num_value_heads=8)
+    cake, triton = CakeKDAKernel(), TritonKDAKernel()
+
+    state_ref = data["ssm"].clone()
+    output_ref = _decode(triton, data, state_ref, lower_bound=-5.0).float()
+    state_cake = data["ssm"].clone()
+    output_cake = _decode(cake, data, state_cake, lower_bound=-5.0).float()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output_cake, output_ref, atol=1e-2, rtol=1e-2)
+    selected = data["cache_indices"].long()
+    torch.testing.assert_close(
+        state_cake[selected].float(),
+        state_ref[selected].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.parametrize("batch_size,num_spec", [(1, 7), (8, 7), (32, 3)])
