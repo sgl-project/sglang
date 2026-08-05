@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _ipc_input_a2a_qkv,
     _usp_input_all_to_all,
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
@@ -226,6 +227,14 @@ class UlyssesAttention(nn.Module):
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "UlyssesAttention's all-to-all spans the combined sequence "
+                "parallel group and is not ring-aware; it would silently "
+                "shuffle across ring ranks instead of rotating KV within "
+                "them. Ring parallelism is not supported for models still "
+                "using UlyssesAttention -- use USPAttention instead."
+            )
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -619,6 +628,7 @@ class USPAttention(nn.Module):
         num_replicated_kv_prefix: int = 0,
         skip_sequence_parallel_override: bool = False,
         attn_mask_meta: dict | None = None,
+        qkv_pre_all_to_all: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -769,10 +779,14 @@ class USPAttention(nn.Module):
                 )
 
             sp_size = get_ulysses_parallel_world_size()
-            if sp_size > 1:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+            if sp_size > 1 and not qkv_pre_all_to_all:
+                qkv_fast = _ipc_input_a2a_qkv(q, k, v)
+                if qkv_fast is not None:
+                    q, k, v = qkv_fast
+                else:
+                    q = _usp_input_all_to_all(q, head_dim=2)
+                    k = _usp_input_all_to_all(k, head_dim=2)
+                    v = _usp_input_all_to_all(v, head_dim=2)
 
             if (
                 _VARLEN_FA_ENABLED
@@ -953,7 +967,7 @@ class USPAttention(nn.Module):
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
-        if sp_size > 1:
+        if sp_size > 1 and not qkv_pre_all_to_all:
             # -> [B, S, H_local, D]
             if self.enable_packed_qkv_input_a2a and q.device.type == "cuda":
                 q, k, v = async_a2a_communicate(
@@ -1011,6 +1025,11 @@ class USPAttention(nn.Module):
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
         """
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-prefix/suffix path does not support "
+                "ring parallelism yet."
+            )
         sp_size = get_ulysses_parallel_world_size()
         sp_rank = get_sp_parallel_rank()
 
@@ -1118,6 +1137,11 @@ class USPAttention(nn.Module):
         ctx_attn_metadata,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
+        if get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "USPAttention replicated-kv-prefix path does not support "
+                "ring parallelism yet."
+            )
         sp_rank = get_sp_parallel_rank()
 
         if q.device.type == "cuda":

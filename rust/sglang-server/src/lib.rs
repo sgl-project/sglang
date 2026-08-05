@@ -61,7 +61,6 @@ impl Server {
         egress_ring_cap = 8192,
         channel_cap = 8192,
         cores = None,
-
         server_args_json = "{}",
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
