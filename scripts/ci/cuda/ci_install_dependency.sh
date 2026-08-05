@@ -488,16 +488,70 @@ install_extra_deps() {
         NIXL_BIN_NAME="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
+
+    # TEMPORARY: install Mooncake PR #3272 wheels from its successful CI run.
+    # This is explicit so callers that use this shared script without the PR
+    # regression gate continue installing the published Mooncake package.
+    # ci_install_deepep.sh sources this file, so the gate covers the existing
+    # DeepEP and H20 suites as well.
+    MOONCAKE_ARTIFACT_ID=""
+    if [ "${MOONCAKE_PR_3272_WHEEL:-0}" = "1" ] && [ "$(uname -m)" = "x86_64" ]; then
+        case "${CU_MAJOR}:${SYS_PYTHON_VER}" in
+            12:3.10) MOONCAKE_ARTIFACT_ID="8914670761" ;;
+            12:3.12) MOONCAKE_ARTIFACT_ID="8914632483" ;;
+            13:3.10) MOONCAKE_ARTIFACT_ID="8914719140" ;;
+            13:3.12) MOONCAKE_ARTIFACT_ID="8914652456" ;;
+            *)
+                echo "FATAL: Mooncake PR #3272 has no wheel for CUDA ${CU_MAJOR} " \
+                     "and Python ${SYS_PYTHON_VER} on x86_64"
+                exit 1
+                ;;
+        esac
+    fi
+
+    MOONCAKE_WHEEL=""
+    if [ -n "$MOONCAKE_ARTIFACT_ID" ]; then
+        MOONCAKE_WHEEL_DIR=$(mktemp -d)
+        MOONCAKE_WHEEL_URL="https://api.github.com/repos/kvcache-ai/Mooncake/actions/artifacts/${MOONCAKE_ARTIFACT_ID}/zip"
+        # GitHub's artifact endpoint requires a token even for a public
+        # repository. Keep tracing off while expanding the authorization
+        # header because this installer otherwise runs under `set -x`.
+        { set +x; } 2>/dev/null
+        if [ -z "${MOONCAKE_ARTIFACT_TOKEN:-}" ]; then
+            echo "FATAL: MOONCAKE_ARTIFACT_TOKEN is required to download Mooncake PR #3272 artifacts"
+            exit 1
+        fi
+        curl -fSL --retry 3 --retry-delay 2 \
+            -H "Authorization: Bearer ${MOONCAKE_ARTIFACT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -o "${MOONCAKE_WHEEL_DIR}/wheel.zip" "$MOONCAKE_WHEEL_URL"
+        set -x
+        unzip -q "${MOONCAKE_WHEEL_DIR}/wheel.zip" -d "$MOONCAKE_WHEEL_DIR"
+        mapfile -t MOONCAKE_WHEELS < <(find "$MOONCAKE_WHEEL_DIR" -name '*.whl' -type f)
+        if [ "${#MOONCAKE_WHEELS[@]}" -ne 1 ]; then
+            echo "FATAL: expected one Mooncake wheel in ${MOONCAKE_WHEEL_URL}, found ${#MOONCAKE_WHEELS[@]}"
+            exit 1
+        fi
+        MOONCAKE_WHEEL="${MOONCAKE_WHEELS[0]}"
+        echo "Installing Mooncake PR #3272 wheel: ${MOONCAKE_WHEEL}"
+    fi
+
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
-    # files that the live variant's RECORD still references, so we force a
-    # reinstall to restore them — pip would otherwise see "already satisfied"
-    # and skip.
-    if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
+    # files that the live variant's RECORD still references, so reinstall the
+    # selected package to restore them.
+    if [ -n "$MOONCAKE_WHEEL" ]; then
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
-        $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "$MOONCAKE_WHEEL" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        rm -rf "$MOONCAKE_WHEEL_DIR"
+    else
+        if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
+            $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
+            $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        fi
+        $PIP_CMD install ${MOONCAKE_PKG} $PIP_INSTALL_SUFFIX
     fi
-    $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+    $PIP_CMD install ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
