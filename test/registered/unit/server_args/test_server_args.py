@@ -187,11 +187,27 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(server_args.mm_feature_transport, "cpu")
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
-    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+    def test_cuda_ipc_accepts_rocm(self, _mock_is_cuda, _mock_is_hip):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
 
-        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+        # patch.dict restores os.environ: acceptance writes the legacy IPC
+        # env var, which must not leak into later tests.
+        with patch.dict(os.environ):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_ipc_rejects_non_cuda_alike_platforms(
+        self, _mock_is_cuda, _mock_is_hip
+    ):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA or AMD ROCm/HIP"):
             server_args._handle_multimodal_feature_transport()
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
