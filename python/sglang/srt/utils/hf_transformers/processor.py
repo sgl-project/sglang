@@ -272,7 +272,11 @@ def get_processor(
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    # llava may load a slow tokenizer in this branch
+    if (
+        type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+        and "llava" not in config.model_type
+    ):
         from .tokenizer import get_tokenizer
 
         logger.warning(
