@@ -10,9 +10,11 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def _details_if_cached(count: int) -> PromptTokensDetails:
+        """Build cache details. Callers gate on enable_cache_report, so a count
+        of 0 is still reported (distinguishing "enabled, nothing cached" from
+        "reporting disabled")."""
+        return PromptTokensDetails(cached_tokens=count)
 
     @staticmethod
     def calculate_response_usage(
