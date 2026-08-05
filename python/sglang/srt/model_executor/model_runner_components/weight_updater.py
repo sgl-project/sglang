@@ -303,8 +303,6 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
-        # Drop the cached CUDA-IPC imports; nothing else reaps them under
-        # torch_memory_saver offload.
         del named_tensors
         torch.cuda.ipc_collect()
         return True, "Success"
