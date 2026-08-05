@@ -105,6 +105,9 @@ class DFlashVerifyInput(SpecInput):
         bs = len(req_pool_indices)
 
         layout = self.ragged_verify_layout
+        if layout is not None and layout.bs != bs:
+            # Graph replay pads the batch to the captured slots; match it.
+            layout = layout.padded_to_bucket(padded_bs=bs)
 
         if layout is None:
             qo_indptr = torch.arange(
