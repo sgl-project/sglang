@@ -134,6 +134,52 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(req.swa_uuid_for_lock, 17)
         self.assertEqual(req.skip_lock_node_ids, {ComponentType.SWA: {41, 42}})
 
+    def test_hicache_restore_commit_replays_both_ownership_tokens(self):
+        """The HiCache restore handoff releases the ADMISSION lock and hands the
+        RESTORE lock to the request. Each release must replay the token of the
+        acquire it matches: releasing the admission lock with an empty token
+        walks past the SWA window boundary to the root and drops locks another
+        request holds; carrying the admission token onto the restored node makes
+        the request's own later release do the same."""
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+        )
+
+        queue = DecodeHiCacheTransferMixin.__new__(DecodeHiCacheTransferMixin)
+        queue.tree_cache = MagicMock()
+
+        admission_node, restored_node = object(), object()
+        req = MagicMock()
+        req.swa_uuid_for_lock = 17
+        req.skip_lock_node_ids = {ComponentType.SWA: {41}}
+
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.hicache_restored_node = restored_node
+        decode_req.hicache_restored_lock = DecLockRefParams(
+            swa_uuid_for_lock=99, skip_lock_node_ids={ComponentType.SWA: {7}}
+        )
+        decode_req.hicache_restored_kv_indices = torch.arange(2, dtype=torch.int64)
+        decode_req.prefix_match = MagicMock(
+            needs_local_restore=True,
+            last_device_node=admission_node,
+            l1_prefix_len=0,
+            decode_prefix_len=2,
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+        )
+
+        queue._commit_hicache_local_restore_to_req(decode_req)
+
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            admission_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=17, skip_lock_node_ids={ComponentType.SWA: {41}}
+            ),
+        )
+        self.assertIs(req.last_node, restored_node)
+        self.assertEqual(req.swa_uuid_for_lock, 99)
+        self.assertEqual(req.skip_lock_node_ids, {ComponentType.SWA: {7}})
+
     def test_swa_admission_charge_matches_the_allocator_path(self):
         """`_pre_alloc` only takes the tail-only SWA path from an empty prefix
         (`uses_swa_tail = ... and prefix_len == 0`). On a decode-radix hit it
@@ -168,6 +214,39 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             queue._required_alloc_tokens(fill_len=fill_len, prefix_len=prefix_len),
         )
         self.assertEqual(swa_on_hit, fill_len - prefix_len)
+
+    def test_admission_falls_back_to_miss_when_the_hit_costs_too_much_swa(self):
+        """Because a radix hit disables tail-only SWA allocation, the hit-path
+        SWA charge can exceed the pool while the miss-path charge fits. If
+        admission just gave up there, the request would requeue, re-derive the
+        same hit, and head-of-line-block the whole decode queue forever. It must
+        fall back to prefix_len=0 instead."""
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.num_reserved_decode_tokens = 0
+        queue.scheduler = MagicMock()
+        queue.scheduler.sliding_window_size = 128
+        queue.scheduler.server_args.disable_radix_cache = False
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+
+        fill_len = 1024
+        req = MagicMock()
+        req.sampling_params.max_new_tokens = 0
+        queue._pre_alloc_fill_len = MagicMock(return_value=fill_len)
+
+        # SWA pool fits one window (128) but not the 896-token hit-path delta.
+        budget = dict(
+            origin_input_len=fill_len,
+            full_allocatable_tokens=10**9,
+            swa_allocatable_tokens=256,
+            retractable_tokens=0,
+            retractable_swa_tokens=0,
+            uses_swa_tail_prealloc=True,
+        )
+        fits_hit, _ = queue._admission_fits(req, prefix_len=128, **budget)
+        fits_miss, _ = queue._admission_fits(req, prefix_len=0, **budget)
+        self.assertFalse(fits_hit)
+        self.assertTrue(fits_miss)
 
     def test_incremental_transfer_success(self):
         """Scenario 1: prefix match > 0, transfer succeeds.

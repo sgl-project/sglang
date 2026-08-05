@@ -282,6 +282,10 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    # Ownership token for the lock held on `hicache_restored_node`. Kept apart
+    # from the request's own token, which still covers the admission-time lock
+    # on `prefix_match.last_device_node` until the restore is committed.
+    hicache_restored_lock: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -433,6 +437,54 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_len + self.num_reserved_decode_tokens,
             swa_len + swa_reserved,
         )
+
+    def _admission_fits(
+        self,
+        req: Req,
+        *,
+        prefix_len: int,
+        origin_input_len: int,
+        full_allocatable_tokens: int,
+        swa_allocatable_tokens: int,
+        retractable_tokens: int,
+        retractable_swa_tokens: int,
+        uses_swa_tail_prealloc: bool,
+    ) -> Tuple[bool, int]:
+        """Whether `req` fits both pools when admitted against `prefix_len`.
+
+        Returns (fits, required_alloc_tokens). Both pool charges depend on
+        `prefix_len`, and they move in OPPOSITE directions: a larger prefix
+        shrinks the FULL charge but grows the SWA one, because `_pre_alloc`
+        only takes the cheap tail-only SWA path from an empty prefix.
+        """
+        fill_len = self._pre_alloc_fill_len(req)
+        required_alloc_tokens = self._required_alloc_tokens(
+            fill_len=fill_len, prefix_len=prefix_len
+        )
+        required_tokens_for_request = (
+            required_alloc_tokens + self.num_reserved_decode_tokens
+        )
+        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+
+        if (
+            max(
+                required_tokens_for_request,
+                origin_input_len - prefix_len + max_new_tokens - retractable_tokens,
+            )
+            > full_allocatable_tokens
+        ):
+            return False, required_alloc_tokens
+
+        if uses_swa_tail_prealloc:
+            _, swa_required = self._prealloc_required_tokens(req, prefix_len=prefix_len)
+            _, swa_len = self._prealloc_kv_lens(req, prefix_len=prefix_len)
+            if (
+                max(swa_required, swa_len + max_new_tokens - retractable_swa_tokens)
+                > swa_allocatable_tokens
+            ):
+                return False, required_alloc_tokens
+
+        return True, required_alloc_tokens
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -1065,10 +1117,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
 
-                fill_len = self._pre_alloc_fill_len(decode_req.req)
-                required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
@@ -1082,56 +1130,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
+
+            budget_kwargs = dict(
+                origin_input_len=origin_input_len,
+                full_allocatable_tokens=full_allocatable_tokens,
+                swa_allocatable_tokens=swa_allocatable_tokens,
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=retractable_swa_tokens,
+                uses_swa_tail_prealloc=uses_swa_tail_prealloc,
+            )
+            fits, required_alloc_tokens = self._admission_fits(
+                decode_req.req, prefix_len=prefix_len, **budget_kwargs
+            )
+            if not fits and prefix_len > 0:
+                # A radix hit costs MORE SWA than a miss: `_pre_alloc` only takes
+                # the tail-only path from an empty prefix. Breaking here would
+                # head-of-line-block the whole queue on a request a miss would
+                # have admitted -- forever, since the next poll re-derives the
+                # same hit. Drop the prefix and retry this request as a miss.
+                self._release_prefix_lock(decode_req.req)
+                prefix_match = None
+                prefix_indices = None
+                prefix_len = 0
+                total_prefix_len = 0
+                fits, required_alloc_tokens = self._admission_fits(
+                    decode_req.req, prefix_len=0, **budget_kwargs
+                )
+            if not fits:
+                break
 
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
-
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                > full_allocatable_tokens
-            ):
-                if prefix_len > 0:
-                    self._release_prefix_lock(decode_req.req)
-                break
-            if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self._release_prefix_lock(decode_req.req)
-                break
-
-            if uses_swa_tail_prealloc:
-                # prefix_len decides which allocator path `_pre_alloc` takes,
-                # so the SWA charge has to see it -- see `_prealloc_kv_lens`.
-                _, swa_required = self._prealloc_required_tokens(
-                    decode_req.req, prefix_len=prefix_len
-                )
-                _, swa_len = self._prealloc_kv_lens(
-                    decode_req.req, prefix_len=prefix_len
-                )
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
-                if (
-                    max(
-                        swa_required,
-                        swa_len + max_new_tokens - retractable_swa_tokens,
-                    )
-                    > swa_allocatable_tokens
-                ):
-                    if prefix_len > 0:
-                        self._release_prefix_lock(decode_req.req)
-                    break
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
@@ -1166,7 +1196,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             if uses_swa_tail_prealloc:
                 # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                # the SWA pool, so page-rounding drift is negligible). Charge
+                # against the prefix this request was actually admitted with --
+                # the miss-retry above may have dropped it back to 0.
+                _, swa_required = self._prealloc_required_tokens(
+                    decode_req.req, prefix_len=prefix_len
+                )
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
