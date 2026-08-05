@@ -363,6 +363,7 @@ class DecodingStage(PipelineStage):
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,
+            usage=batch.usage,
         )
 
         return output_batch
