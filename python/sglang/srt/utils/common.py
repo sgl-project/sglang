@@ -309,9 +309,8 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
-# GB10 (DGX Spark and OEM equivalents): consumer-Blackwell shared memory capacity
-# (99 KB per block) on a cc 12.1 device, vs datacenter Blackwell's 228 KB. Not
-# expressible via _check_cuda_device_version, which only matches on the major.
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
 @lru_cache(maxsize=1)
 def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
