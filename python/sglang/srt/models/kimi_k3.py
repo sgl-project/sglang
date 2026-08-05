@@ -108,7 +108,7 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
+from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -120,6 +120,7 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 _k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
@@ -677,7 +678,7 @@ class KimiK3MoE(nn.Module):
         # regular parameters on other devices avoids a large transient copy
         # during post-load processing and leaves their native kernels in
         # control of weight layout.
-        if self.gate.weight.device.type != "cuda":
+        if _is_npu:
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -1656,7 +1657,7 @@ class KimiK3DeltaAttention(nn.Module):
         cuda graph capture)."""
         if not self.use_full_rank_gate:
             return
-        if self.f_a_proj.weight.device.type != "cuda":
+        if _is_npu:
             return
         self._bfa_w, sizes = _merge_weights_as_views(
             [self.f_a_proj, self.b_proj], pad_rows_to=8
@@ -1676,7 +1677,7 @@ class KimiK3DeltaAttention(nn.Module):
             return
         layer = self.attn
         w = layer.conv_weights
-        if w is not None and w.device.type != "cuda":
+        if _is_npu:
             return
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
         if (
@@ -3064,7 +3065,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn, KimiK3DeltaAttention
             ):
                 continue
-            if layer.self_attn.dt_bias.device.type != "cuda":
+            if _is_npu:
                 continue
             from sglang.kernels.ops.attention.fla.kda import (
                 precompile_k3_recompute_w_u_kernel,
