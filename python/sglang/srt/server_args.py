@@ -3234,10 +3234,11 @@ class ServerArgs:
             "Hold new prefills until at least N running-request slots have freed "
             "up, so they are admitted in one batch instead of one at a time. "
             "Useful when each admission is disproportionately expensive, e.g. "
-            "speculative decoding with a separate draft prefill pass. Capped to "
-            "the DFlash formula (disabled when max-running-requests < 8; "
-            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "speculative decoding with a separate draft prefill pass. An "
+            "explicit value always wins, capped by max-running-requests "
+            "(1 disables). When unset, DFlash workloads auto-enable the "
+            "formula; other workloads stay disabled. Not supported with "
+            "pipeline parallelism."
         ),
         NS("schedule"),
     ] = None
@@ -8722,6 +8723,11 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.min_free_slots_delay is None, (
+                "--min-free-slots-delay is not supported with pipeline "
+                "parallelism: allocatable slots per microbatch are bounded by "
+                "pp-max-micro-batch-size, so the threshold may never be reached"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
