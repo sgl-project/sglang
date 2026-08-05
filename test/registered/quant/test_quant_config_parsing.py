@@ -1,12 +1,86 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
+from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.parameter import BlockQuantScaleParameter
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    SUPPORTED_STRATEGIES,
+    CompressedTensorsW8A16Fp8,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestCompressedTensorsW8A16Fp8(CustomTestCase):
+    def test_block_strategy_registers_block_scale(self):
+        def noop_loader(*args, **kwargs):
+            pass
+
+        block_scheme = CompressedTensorsW8A16Fp8(
+            strategy=QuantizationStrategy.BLOCK,
+            is_static_input_scheme=False,
+            weight_block_size=[128, 128],
+        )
+        layer = torch.nn.Module()
+        block_scheme.create_weights(
+            layer=layer,
+            input_size=1024,
+            output_partition_sizes=[2048],
+            input_size_per_partition=1024,
+            params_dtype=torch.bfloat16,
+            weight_loader=noop_loader,
+        )
+
+        self.assertIn(QuantizationStrategy.BLOCK, SUPPORTED_STRATEGIES)
+        self.assertEqual(layer.weight_block_size, [128, 128])
+        self.assertIsInstance(layer.weight_scale, BlockQuantScaleParameter)
+        self.assertEqual(tuple(layer.weight_scale.shape), (16, 8))
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+
+        static_block_scheme = CompressedTensorsW8A16Fp8(
+            strategy=QuantizationStrategy.BLOCK,
+            is_static_input_scheme=True,
+            weight_block_size=[128, 128],
+        )
+        static_layer = torch.nn.Module()
+        static_block_scheme.create_weights(
+            layer=static_layer,
+            input_size=1024,
+            output_partition_sizes=[2048],
+            input_size_per_partition=1024,
+            params_dtype=torch.bfloat16,
+            weight_loader=noop_loader,
+        )
+        with patch(
+            "sglang.srt.layers.quantization.compressed_tensors.schemes."
+            "compressed_tensors_w8a16_fp8.prepare_fp8_layer_for_marlin"
+        ):
+            static_block_scheme.process_weights_after_loading(static_layer)
+
+        self.assertIsInstance(static_layer.input_scale, torch.nn.Parameter)
+        self.assertTrue(hasattr(static_layer, "weight_scale_inv"))
+
+        channel_scheme = CompressedTensorsW8A16Fp8(
+            strategy=QuantizationStrategy.CHANNEL,
+            is_static_input_scheme=False,
+        )
+        channel_layer = torch.nn.Module()
+        channel_scheme.create_weights(
+            layer=channel_layer,
+            input_size=1024,
+            output_partition_sizes=[2048],
+            input_size_per_partition=1024,
+            params_dtype=torch.bfloat16,
+            weight_loader=noop_loader,
+        )
+
+        self.assertIsNone(channel_layer.weight_block_size)
 
 
 class TestQuantLogString(CustomTestCase):
