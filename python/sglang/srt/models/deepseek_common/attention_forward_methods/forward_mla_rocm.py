@@ -285,7 +285,7 @@ def _fused_rope_cat_and_cache(
     )
 
 
-class DeepseekMLAAbsorbRocmForwardMixin:
+class DeepseekMLARocmForwardMixin:
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,

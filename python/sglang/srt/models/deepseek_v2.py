@@ -166,9 +166,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
     DeepseekMHAForwardMixin,
     DeepseekMHARocmForwardMixin,
-    DeepseekMLAAbsorbRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
     DeepseekMLAForwardMixin,
+    DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLARocmForwardMixin,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
@@ -1724,8 +1724,8 @@ class DeepseekV2AttentionMLA(
     DeepseekMHAForwardMixin,
     DeepseekMHARocmForwardMixin,
     DeepseekMLAForwardMixin,
-    DeepseekMLAAbsorbRocmForwardMixin,
     DeepseekMLARocmForwardMixin,
+    DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
 

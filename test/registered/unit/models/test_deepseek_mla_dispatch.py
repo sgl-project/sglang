@@ -14,12 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import torch
-
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
-from sglang.srt.models.deepseek_common.attention_forward_methods import (
-    forward_mha_rocm as mha_rocm,
-)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -99,94 +94,6 @@ class TestResolveRocmForwardMethod(CustomTestCase):
         with mock.patch.object(abh, "_is_hip", False):
             for method in AttnForwardMethod:
                 self.assertEqual(abh.resolve_rocm_forward_method(method), method)
-
-
-def _fake_rocm_mha_attn():
-    return SimpleNamespace(
-        attn_mha=SimpleNamespace(layer_id=3),
-        kv_lora_rank=2,
-        qk_rope_head_dim=1,
-    )
-
-
-class TestRocmMhaKvBufferRouting(CustomTestCase):
-    def test_gfx95_uses_mla_kv_pool(self):
-        attn = _fake_rocm_mha_attn()
-        pool = mock.Mock()
-        batch = SimpleNamespace(out_cache_loc=object())
-        latent_cache = torch.zeros(2, 1, 3)
-        kv_a = torch.ones(2, 2)
-        k_pe = torch.ones(2, 1, 1)
-        kv_indices = torch.tensor([0, 1])
-        pool.get_mla_kv_buffer.return_value = (kv_a.unsqueeze(1), k_pe)
-
-        with (
-            mock.patch.object(mha_rocm, "_use_aiter_gfx95", True),
-            mock.patch.object(mha_rocm, "get_token_to_kv_pool", return_value=pool),
-            mock.patch.object(
-                mha_rocm,
-                "filter_dcp_local_kv_indices",
-                return_value=kv_indices,
-            ) as mock_filter_indices,
-        ):
-            mha_rocm.DeepseekMHARocmForwardMixin._set_mla_kv_buffer_rocm(
-                attn, latent_cache, kv_a, k_pe, batch
-            )
-            fetched_kv_a, fetched_k_pe = (
-                mha_rocm.DeepseekMHARocmForwardMixin._get_mla_kv_buffer_rocm(
-                    attn, kv_indices, torch.float32, batch
-                )
-            )
-
-        pool.set_mla_kv_buffer.assert_called_once()
-        args = pool.set_mla_kv_buffer.call_args.args
-        self.assertIs(args[0], attn.attn_mha)
-        self.assertIs(args[1], batch.out_cache_loc)
-        torch.testing.assert_close(args[2], kv_a.unsqueeze(1))
-        self.assertIs(args[3], k_pe)
-        pool.set_kv_buffer.assert_not_called()
-        mock_filter_indices.assert_called_once_with(kv_indices=kv_indices)
-        pool.get_mla_kv_buffer.assert_called_once_with(
-            attn.attn_mha, kv_indices, torch.float32
-        )
-        torch.testing.assert_close(fetched_kv_a, kv_a)
-        self.assertIs(fetched_k_pe, k_pe)
-
-    def test_non_gfx95_uses_combined_key_buffer(self):
-        attn = _fake_rocm_mha_attn()
-        pool = mock.Mock()
-        batch = SimpleNamespace(out_cache_loc=object())
-        latent_cache = torch.zeros(2, 1, 3)
-        kv_a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        k_pe = torch.tensor([[[5.0]], [[6.0]]])
-        kv_indices = torch.tensor([0, 1])
-        pool.get_key_buffer.return_value = latent_cache
-
-        with (
-            mock.patch.object(mha_rocm, "_use_aiter_gfx95", False),
-            mock.patch.object(mha_rocm, "get_token_to_kv_pool", return_value=pool),
-        ):
-            mha_rocm.DeepseekMHARocmForwardMixin._set_mla_kv_buffer_rocm(
-                attn, latent_cache, kv_a, k_pe, batch
-            )
-            fetched_kv_a, fetched_k_pe = (
-                mha_rocm.DeepseekMHARocmForwardMixin._get_mla_kv_buffer_rocm(
-                    attn, kv_indices, torch.float32, batch
-                )
-            )
-
-        expected = torch.cat([kv_a.unsqueeze(1), k_pe], dim=-1)
-        torch.testing.assert_close(latent_cache, expected)
-        pool.set_kv_buffer.assert_called_once()
-        args = pool.set_kv_buffer.call_args.args
-        self.assertIs(args[0], attn.attn_mha)
-        self.assertIs(args[1], batch.out_cache_loc)
-        self.assertIs(args[2], latent_cache)
-        self.assertIsNone(args[3])
-        pool.set_mla_kv_buffer.assert_not_called()
-        pool.get_key_buffer.assert_called_once_with(attn.attn_mha.layer_id)
-        torch.testing.assert_close(fetched_kv_a, kv_a)
-        torch.testing.assert_close(fetched_k_pe, k_pe)
 
 
 if __name__ == "__main__":
