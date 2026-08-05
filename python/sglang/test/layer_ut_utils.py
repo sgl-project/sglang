@@ -8,9 +8,9 @@ import os
 import torch
 
 
-def init_single_process_dist(master_port: int = 29632):
-    """world=1 gloo dist + model-parallel groups; srt layers require them
-    even at tp=1."""
+def init_single_process_dist(master_port: int = 29632, backend: str = "gloo"):
+    """world=1 dist + model-parallel groups; srt layers require them even
+    at tp=1."""
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(master_port))
     os.environ.setdefault("RANK", "0")
@@ -23,13 +23,17 @@ def init_single_process_dist(master_port: int = 29632):
     )
 
     if not torch.distributed.is_initialized():
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+        init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, backend=backend
+        )
     if not model_parallel_is_initialized():
+        # kwargs only: a positional backend would land in the
+        # attention_data_parallel_size slot and explode on int // str.
         initialize_model_parallel(
             tensor_model_parallel_size=1,
             expert_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            backend="gloo",
+            backend=backend,
         )
 
 
