@@ -68,54 +68,74 @@ class RotaryEmbedding(CustomOp):
 
     def forward_npu(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
         position_offset: int = 0,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
         complex_freqs: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        if query.dim() != 4 or key.dim() != 4:
+            raise ValueError(
+                f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
+                f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
+            )
+
+        if hasattr(self, "cos_sin_cache"):
+            if offsets is not None:
+                positions = positions + offsets
+            pos_flat = positions.flatten()
+            cos_sin = self.cos_sin_cache.index_select(0, pos_flat)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+
         batch_size, seq_len, num_heads, head_dim = query.shape
         total_tokens = batch_size * seq_len
-        if not self.is_neox_style:
-            can_use_complex = (
-                complex_freqs is not None
-                and query.dim() == 4
-                and key.dim() == 4
-                and complex_freqs.dim() == 3
-                and self.is_neox_style == False
-            )
-            if can_use_complex:
-                return (
-                    _apply_rotary_emb_complex(query, complex_freqs),
-                    _apply_rotary_emb_complex(key, complex_freqs),
-                )
 
-            if complex_freqs is None:
-                if cos is not None and sin is not None:
-                    q_flat = query.reshape(total_tokens, num_heads, head_dim)
-                    k_flat = key.reshape(total_tokens, num_heads, head_dim)
-                    q_rot = _apply_rotary_emb(
-                        q_flat, cos, sin, is_neox_style=False, interleaved=True
-                    )
-                    k_rot = _apply_rotary_emb(
-                        k_flat, cos, sin, is_neox_style=False, interleaved=True
-                    )
-                    return q_rot.view(
-                        batch_size, seq_len, num_heads, head_dim
-                    ), k_rot.view(batch_size, seq_len, num_heads, head_dim)
+        can_use_complex = (
+            complex_freqs is not None
+            and complex_freqs.dim() == 3
+            and self.is_neox_style == False
+        )
+        if can_use_complex:
+            return (
+                _apply_rotary_emb_complex(query, complex_freqs),
+                _apply_rotary_emb_complex(key, complex_freqs),
+            )
+
         if cos is not None and sin is not None:
             q_flat = query.reshape(total_tokens, num_heads, head_dim)
+            q_rot = q_flat[..., : self.rotary_dim]
+            q_pass = q_flat[..., self.rotary_dim :]
+
             k_flat = key.reshape(total_tokens, num_heads, head_dim)
-            q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox_style=True)
-            k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox_style=True)
-            return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
+            k_rot = k_flat[..., : self.rotary_dim]
+            k_pass = k_flat[..., self.rotary_dim :]
+
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            q = torch.cat((q_rotated, q_pass), dim=-1)
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k = torch.cat((k_rotated, k_pass), dim=-1)
+            return q.view(batch_size, seq_len, num_heads, head_dim), k.view(
                 batch_size, seq_len, num_heads, head_dim
             )
+
         if cos_sin_cache is not None:
             return self.forward_native(
                 query=query,
@@ -131,14 +151,15 @@ class RotaryEmbedding(CustomOp):
 
     def forward_cuda(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
         position_offset: int = 0,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
         complex_freqs: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -188,15 +209,15 @@ class RotaryEmbedding(CustomOp):
 
     def forward_native(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
+        key: Optional[torch.Tensor] = None,
         position_offset: int = 0,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
         complex_freqs: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor | None] = None,
+        offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
@@ -206,6 +227,14 @@ class RotaryEmbedding(CustomOp):
                 f"query and key must be [batch_size, seq_len, num_heads, head_dim],"
                 f"got query: {tuple(query.shape)}, key: {tuple(key.shape)}"
             )
+
+        if hasattr(self, "cos_sin_cache"):
+            if offsets is not None:
+                positions = positions + offsets
+            pos_flat = positions.flatten()
+            cos_sin = self.cos_sin_cache.index_select(0, pos_flat)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+
         batch_size, seq_len, num_heads, head_dim = query.shape
         total_tokens = batch_size * seq_len
 
@@ -224,58 +253,53 @@ class RotaryEmbedding(CustomOp):
                 )
             positions = positions.to(device=query.device, dtype=torch.long)
 
-        if not self.is_neox_style:
-            if complex_freqs is not None:
-                return (
-                    _apply_rotary_emb_complex(query, complex_freqs),
-                    _apply_rotary_emb_complex(key, complex_freqs),
-                )
-            if cos is not None and sin is not None:
-                freqs = torch.complex(cos.float(), sin.float())
-                if freqs.dim() == 2:
-                    freqs = freqs.unsqueeze(-2)
-                return (
-                    _apply_rotary_emb_complex(query, freqs),
-                    _apply_rotary_emb_complex(key, freqs),
-                )
+        if complex_freqs is not None:
+            return (
+                _apply_rotary_emb_complex(query, complex_freqs),
+                _apply_rotary_emb_complex(key, complex_freqs),
+            )
+        if cos is not None and sin is not None:
+            q_flat = query.reshape(total_tokens, num_heads, head_dim)
+            q_rot = q_flat[..., : self.rotary_dim]
+            q_pass = q_flat[..., self.rotary_dim :]
 
-            if cos_sin_cache is not None:
-                return apply_flashinfer_rope_qk_inplace(
-                    q=query,
-                    k=key,
-                    cos_sin_cache=cos_sin_cache,
-                    head_size=head_dim,
-                    is_neox=False,
-                    positions=positions,
-                )
+            k_flat = key.reshape(total_tokens, num_heads, head_dim)
+            k_rot = k_flat[..., : self.rotary_dim]
+            k_pass = k_flat[..., self.rotary_dim :]
 
-            raise ValueError(
-                "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+            q_rotated = _apply_rotary_emb(
+                q_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            q = torch.cat((q_rotated, q_pass), dim=-1)
+            k_rotated = _apply_rotary_emb(
+                k_rot,
+                cos,
+                sin,
+                is_neox_style=self.is_neox_style,
+                interleaved=not self.is_neox_style,
+            )
+            k = torch.cat((k_rotated, k_pass), dim=-1)
+            return q.view(batch_size, seq_len, num_heads, head_dim), k.view(
+                batch_size, seq_len, num_heads, head_dim
             )
 
-        else:
-            if cos is not None and sin is not None:
-                q_flat = query.reshape(total_tokens, num_heads, head_dim)
-                k_flat = key.reshape(total_tokens, num_heads, head_dim)
-                q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox_style=True)
-                k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox_style=True)
-                return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
-                    batch_size, seq_len, num_heads, head_dim
-                )
-
-            if cos_sin_cache is not None:
-                return apply_flashinfer_rope_qk_inplace(
-                    q=query,
-                    k=key,
-                    cos_sin_cache=cos_sin_cache,
-                    head_size=head_dim,
-                    is_neox=True,
-                    positions=positions,
-                )
-
-            raise ValueError(
-                "No valid inputs (cos/sin or cos_sin_cache) for NeoX RoPE."
+        if cos_sin_cache is not None:
+            return apply_flashinfer_rope_qk_inplace(
+                q=query,
+                k=key,
+                cos_sin_cache=cos_sin_cache,
+                head_size=head_dim,
+                is_neox=self.is_neox_style,
+                positions=positions,
             )
+
+        raise ValueError(
+            "No valid inputs (complex_freqs, cos/sin, or cos_sin_cache) for interleaved RoPE."
+        )
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
