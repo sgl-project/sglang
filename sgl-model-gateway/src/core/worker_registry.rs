@@ -241,8 +241,52 @@ impl WorkerRegistry {
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
         let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
-            // Worker with this URL already exists, update it
-            existing_id.clone()
+            let id = existing_id.clone();
+            // Clean up old indices before re-registration
+            if let Some(old_worker) = self.workers.get(&id) {
+                let old_worker = old_worker.clone();
+                let old_model_id = old_worker.model_id().to_string();
+
+                // Clean old model_index entry
+                if let Some(mut entry) = self.model_index.get_mut(&old_model_id) {
+                    let new_workers: Vec<Arc<dyn Worker>> = entry
+                        .iter()
+                        .filter(|w| w.url() != worker.url())
+                        .cloned()
+                        .collect();
+                    *entry = Arc::from(new_workers.into_boxed_slice());
+                }
+
+                // Rebuild hash ring if model changed
+                if old_model_id != worker.model_id() {
+                    self.rebuild_hash_ring(&old_model_id);
+                }
+
+                // Clean old type_workers entry
+                if let Some(mut type_workers) =
+                    self.type_workers.get_mut(old_worker.worker_type())
+                {
+                    type_workers.retain(|wid| wid != &id);
+                }
+
+                // Clean old connection_workers entry
+                if let Some(mut conn_workers) =
+                    self.connection_workers.get_mut(old_worker.connection_mode())
+                {
+                    conn_workers.retain(|wid| wid != &id);
+                }
+
+                // Log worker type change
+                if old_worker.worker_type() != worker.worker_type() {
+                    tracing::warn!(
+                        "Worker at {} changed type: {:?} -> {:?}",
+                        worker.url(),
+                        old_worker.worker_type(),
+                        worker.worker_type()
+                    );
+                }
+            }
+            id
         } else {
             WorkerId::new()
         };
@@ -831,5 +875,89 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_register_same_url_different_type_cleans_indices() {
+        let registry = WorkerRegistry::new();
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "llama-3".to_string());
+
+        // Register as Prefill
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://10.0.0.5:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .labels(labels.clone())
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        let id1 = registry.register(Arc::from(prefill_worker));
+
+        // Verify initial state
+        assert_eq!(registry.get_by_type(&WorkerType::Prefill { bootstrap_port: None }).len(), 1);
+        assert_eq!(registry.get_decode_workers().len(), 0);
+        assert_eq!(registry.get_by_model("llama-3").len(), 1);
+
+        // Re-register same URL as Decode
+        let decode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://10.0.0.5:8080")
+                .worker_type(WorkerType::Decode)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        let id2 = registry.register(Arc::from(decode_worker));
+
+        // Same URL should reuse the same WorkerId
+        assert_eq!(id1, id2);
+
+        // Worker should only appear in Decode pool, not Prefill
+        assert_eq!(registry.get_by_type(&WorkerType::Prefill { bootstrap_port: None }).len(), 0);
+        assert_eq!(registry.get_decode_workers().len(), 1);
+
+        // Model index should have exactly one entry, no duplicates
+        let model_workers = registry.get_by_model("llama-3");
+        assert_eq!(model_workers.len(), 1);
+        assert_eq!(model_workers[0].url(), "http://10.0.0.5:8080");
+
+        // Only one worker total
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_register_same_url_same_type_no_duplicates() {
+        let registry = WorkerRegistry::new();
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "llama-3".to_string());
+
+        // Register worker
+        let worker1: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels.clone())
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        registry.register(Arc::from(worker1));
+
+        // Re-register same URL with same type
+        let worker2: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        );
+        registry.register(Arc::from(worker2));
+
+        // Should not accumulate duplicates
+        assert_eq!(registry.get_by_model("llama-3").len(), 1);
+        assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
+        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
+        assert_eq!(registry.len(), 1);
     }
 }
