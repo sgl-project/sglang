@@ -790,6 +790,12 @@ class HummingMoEMethod(FusedMoEMethodBase):
         if getattr(self, "processed", False):
             return
         self.processed = True
+        from sglang.srt.layers.quantization.humming_utils import (
+            configure_humming_deepep_dispatch,
+            make_humming_deepep_input_schema,
+        )
+
+        use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
         self.weight_schemas = {}
         self.input_schemas = {}
         for sublayer_name, configs in layer.sublayer_configs.items():
@@ -869,6 +875,12 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
                 del tensors
 
+            if use_deepep_fp8_dispatch:
+                input_schema = make_humming_deepep_input_schema(
+                    sublayer_name, configs["shape_k"]
+                )
+            self.input_schemas[sublayer_name] = input_schema
+
             # prepare layer config from humming kernel
             HummingMethod.prepare_layer_meta(
                 layer=layer,
@@ -886,9 +898,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
             # preprocess weight for inference
             HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
-
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def create_moe_runner(
         self,
