@@ -283,3 +283,7 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Generated deployment outputs (contain account-specific ARNs and image digests)
+benchmark/minwm_realtime_async_vae/.env.aws
+benchmark/minwm_realtime_async_vae/.env.images

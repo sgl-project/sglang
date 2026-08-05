@@ -343,9 +343,16 @@ def test_model_publisher_has_a_dedicated_sized_ephemeral_node():
     assert node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] == (
         "minwm-model-artifact-publisher"
     )
-    assert requirement_values(
-        node_pool, "node.kubernetes.io/instance-type"
-    ) == ["r7i.8xlarge"]
+    assert set(
+        requirement_values(node_pool, "node.kubernetes.io/instance-type")
+    ) == {
+        "r5.8xlarge",
+        "r5a.8xlarge",
+        "r6a.8xlarge",
+        "r6i.8xlarge",
+        "r7a.8xlarge",
+        "r7i.8xlarge",
+    }
 
 
 def test_gpu_workers_register_only_internal_pod_endpoints():

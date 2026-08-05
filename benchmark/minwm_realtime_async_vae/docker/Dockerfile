@@ -54,6 +54,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --no-cache-dir --no-deps \
       "taehv @ git+https://github.com/madebyollin/taehv.git@${TAEHV_REVISION}" \
       --root-user-action=ignore
+COPY benchmark/minwm_realtime_async_vae/docker/requirements-aws.lock /tmp/requirements-aws.lock
+RUN python3 -m pip install \
+      --require-hashes \
+      --no-deps \
+      --no-cache-dir \
+      -r /tmp/requirements-aws.lock && \
+    python3 -c 'import boto3, botocore, jmespath, s3transfer'
 RUN install -d -m 0755 /opt/taehv
 ADD --checksum=sha256:d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b74c559a \
     https://raw.githubusercontent.com/madebyollin/taehv/093b918971d59001a0bad6dfd6e0409b5e1752cf/taew2_2.pth \

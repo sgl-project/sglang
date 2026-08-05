@@ -73,7 +73,13 @@ spec:
           values: [amd64]
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: [r7i.8xlarge]
+          values:
+            - r5.8xlarge
+            - r5a.8xlarge
+            - r6a.8xlarge
+            - r6i.8xlarge
+            - r7a.8xlarge
+            - r7i.8xlarge
       taints:
         - key: seedleap.ai/task
           value: minwm-model-artifact-publisher
