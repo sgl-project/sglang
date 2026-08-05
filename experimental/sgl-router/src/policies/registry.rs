@@ -34,6 +34,7 @@
 //!    — only the resolver has the cohort context to tell which is which.
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::server::metrics::DecodeAffinityOutcome;
 use crate::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -79,6 +80,14 @@ pub enum PdResolveError {
     /// PD-mode deployment whose decode pool is empty.
     /// Surfaced as 503 `no_decode_workers_available`.
     NoDecodeWorkersAvailable,
+}
+
+/// Successful decode-affinity selection, including the metric outcome that
+/// explains which affinity branch produced the chosen worker.
+#[derive(Debug, Clone)]
+pub struct DecodeAffinitySelection {
+    pub worker: Arc<Worker>,
+    pub outcome: DecodeAffinityOutcome,
 }
 
 /// Thin façade over [`WorkerRegistry`] that returns the per-pool
@@ -195,8 +204,20 @@ impl PdPoolResolver {
         &self,
         model: &ModelId,
         prefill_url: &str,
-    ) -> Result<Arc<Worker>, PdResolveError> {
-        let candidates = self.decode_candidates(model)?;
+    ) -> Result<DecodeAffinitySelection, PdResolveError> {
+        let candidates = match self.resolve(model)? {
+            PdPools::Plain { workers } => workers,
+            PdPools::Pd { decode, .. } => {
+                if decode.is_empty() {
+                    return Err(PdResolveError::NoDecodeWorkersAvailable);
+                }
+                self.workers
+                    .workers_for(model)
+                    .into_iter()
+                    .filter(|w| w.mode() == WorkerMode::Decode)
+                    .collect()
+            }
+        };
         select_decode_with_affinity(prefill_url, &candidates)
             .ok_or(PdResolveError::NoDecodeWorkersAvailable)
     }
@@ -235,7 +256,7 @@ impl PdPoolResolver {
 pub fn select_decode_with_affinity(
     prefill_url: &str,
     candidates: &[Arc<Worker>],
-) -> Option<Arc<Worker>> {
+) -> Option<DecodeAffinitySelection> {
     if candidates.is_empty() {
         return None;
     }
@@ -263,6 +284,16 @@ pub fn select_decode_with_affinity(
         ((median as f64) * AFFINITY_LOAD_TOLERANCE).ceil() as usize
     };
 
+    let same_host_candidates: Vec<&Arc<Worker>> = prefill_host
+        .as_deref()
+        .map(|host| {
+            candidates
+                .iter()
+                .filter(|w| host_of(&w.url).as_deref() == Some(host))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Rule 1: same-host AND healthy AND not overloaded.
     if let Some(host) = prefill_host.as_deref() {
         let affinity_peer = healthy.iter().find(|w| {
@@ -270,19 +301,40 @@ pub fn select_decode_with_affinity(
                 && (load_tolerance == 0 || w.active_load() <= load_tolerance)
         });
         if let Some(w) = affinity_peer {
-            return Some(Arc::clone(w));
+            return Some(DecodeAffinitySelection {
+                worker: Arc::clone(w),
+                outcome: DecodeAffinityOutcome::SameHostPicked,
+            });
         }
     }
 
+    let fallback_outcome = if prefill_host.is_none() || same_host_candidates.is_empty() {
+        DecodeAffinityOutcome::FallbackNoSameHost
+    } else if same_host_candidates.iter().any(|w| w.breaker.would_allow()) {
+        DecodeAffinityOutcome::FallbackLoadImbalance
+    } else {
+        DecodeAffinityOutcome::FallbackBreaker
+    };
+
     // Rule 2: min-load among healthy.
     if let Some(w) = healthy.iter().min_by_key(|w| w.active_load()) {
-        return Some(Arc::clone(w));
+        return Some(DecodeAffinitySelection {
+            worker: Arc::clone(w),
+            outcome: fallback_outcome,
+        });
     }
 
     // Rule 3: last-resort min-load over all candidates (every
     // breaker is open). The caller's dispatch will likely fail and
     // surface `BreakerOpen`, but the selection function stays total.
-    candidates.iter().min_by_key(|w| w.active_load()).cloned()
+    candidates
+        .iter()
+        .min_by_key(|w| w.active_load())
+        .cloned()
+        .map(|worker| DecodeAffinitySelection {
+            worker,
+            outcome: fallback_outcome,
+        })
 }
 
 /// Parse the host portion of a worker URL. Returns `None` when the URL
@@ -502,6 +554,15 @@ mod tests {
         }
     }
 
+    fn assert_selection(
+        selection: DecodeAffinitySelection,
+        expected_url: &str,
+        expected_outcome: DecodeAffinityOutcome,
+    ) {
+        assert_eq!(selection.worker.url, expected_url);
+        assert_eq!(selection.outcome, expected_outcome);
+    }
+
     /// Same-host affinity: a request that lands on `prefill@host_a`
     /// picks `decode@host_a` even when `decode@host_b` has lower load.
     /// Pin: the affinity branch wins over load tiebreak when both
@@ -516,12 +577,13 @@ mod tests {
         let resolver = PdPoolResolver::new(r);
         let prefill_url = "http://host_a:30000";
 
-        let chosen = resolver
+        let selection = resolver
             .decode_with_affinity(&ModelId("m".into()), prefill_url)
             .unwrap();
-        assert_eq!(
-            chosen.url, "http://host_a:30001",
-            "same-host decode peer must win over remote peer",
+        assert_selection(
+            selection,
+            "http://host_a:30001",
+            DecodeAffinityOutcome::SameHostPicked,
         );
     }
 
@@ -551,12 +613,13 @@ mod tests {
         }
         assert!(!d1.breaker.allow(), "d1 breaker must be open");
 
-        let chosen = resolver
+        let selection = resolver
             .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
             .unwrap();
-        assert_eq!(
-            chosen.url, "http://host_b:30001",
-            "breaker-open affinity peer must fall back to the remote healthy peer",
+        assert_selection(
+            selection,
+            "http://host_b:30001",
+            DecodeAffinityOutcome::FallbackBreaker,
         );
     }
 
@@ -603,13 +666,18 @@ mod tests {
             guards.push(d3.load_guard());
         }
 
-        let chosen = resolver
+        let selection = resolver
             .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
             .unwrap();
         assert!(
-            chosen.url == "http://host_b:30001" || chosen.url == "http://host_c:30001",
+            selection.worker.url == "http://host_b:30001"
+                || selection.worker.url == "http://host_c:30001",
             "overloaded affinity peer must fall back to a remote min-load peer, got: {}",
-            chosen.url,
+            selection.worker.url,
+        );
+        assert_eq!(
+            selection.outcome,
+            DecodeAffinityOutcome::FallbackLoadImbalance
         );
         // Drop guards explicitly so the test cleanup doesn't depend on
         // RAII order against the resolver / registry.
@@ -639,12 +707,13 @@ mod tests {
             .unwrap();
         let _g = d1.load_guard();
 
-        let chosen = resolver
+        let selection = resolver
             .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
             .unwrap();
-        assert_eq!(
-            chosen.url, "http://host_c:30001",
-            "no same-host peer → min-load fallback over remote candidates",
+        assert_selection(
+            selection,
+            "http://host_c:30001",
+            DecodeAffinityOutcome::FallbackNoSameHost,
         );
     }
 
@@ -675,17 +744,19 @@ mod tests {
             spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
         ]);
         let resolver = PdPoolResolver::new(r);
-        let chosen = resolver
+        let selection = resolver
             .decode_with_affinity(&ModelId("m".into()), "not-a-url")
             .unwrap();
         // Both d1 and d2 are at load 0 → either is acceptable. The
         // assertion is only that the function returns Some, not None
         // / panic.
         assert!(
-            chosen.url == "http://host_a:30001" || chosen.url == "http://host_b:30001",
+            selection.worker.url == "http://host_a:30001"
+                || selection.worker.url == "http://host_b:30001",
             "unexpected decode worker chosen: {}",
-            chosen.url,
+            selection.worker.url,
         );
+        assert_eq!(selection.outcome, DecodeAffinityOutcome::FallbackNoSameHost);
     }
 
     /// All decode peers' breakers are open → `decode_with_affinity`
@@ -733,9 +804,10 @@ mod tests {
         // stays total, caller sees `BreakerOpen` on dispatch.
         let any = select_decode_with_affinity("http://host_a:30000", &pool).unwrap();
         assert!(
-            any.url == "http://host_a:30001" || any.url == "http://host_b:30001",
+            any.worker.url == "http://host_a:30001" || any.worker.url == "http://host_b:30001",
             "last-resort path must return some candidate, got: {}",
-            any.url,
+            any.worker.url,
         );
+        assert_eq!(any.outcome, DecodeAffinityOutcome::FallbackBreaker);
     }
 }
