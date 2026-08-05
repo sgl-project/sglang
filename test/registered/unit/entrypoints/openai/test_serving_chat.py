@@ -11,14 +11,19 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import tempfile
 import unittest
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai.chat_encoding import (
+    resolve_dsv4_reasoning_effort_profile,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
@@ -35,6 +40,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+_DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
+_DSV4_OFFICIAL_ENCODER = (
+    "REASONING_EFFORT_PROMPTS: Dict[str, str] = "
+    '{"low": "", "high": "h", "max": "m"}\n'
+    'DEFAULT_REASONING_EFFORT = "low"\n'
+)
+
+
+def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
+    model_dir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(model_dir.cleanup)
+    encoder_path = Path(model_dir.name) / "encoding" / "encoding_dsv4.py"
+    encoder_path.parent.mkdir(parents=True)
+    encoder_path.write_text(source, encoding="utf-8")
+    return model_dir.name
+
 
 class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
@@ -42,18 +63,22 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
+            model_path="deepseek-ai/DeepSeek-V4-Flash",
+            revision=None,
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
             default_chat_template_kwargs=None,
         )
+        self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
 
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
+        mock_hf_config.to_dict.return_value = {}
         self.model_config.hf_config = mock_hf_config
 
         self.chat_template_name: Optional[str] = "llama-3"
@@ -268,6 +293,29 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
+
+    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 2035,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -1000,6 +1048,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders should reject history tool call scalars as BadRequest."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1037,6 +1086,7 @@ class ServingChatTestCase(unittest.TestCase):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
 
         for chat_encoding_spec in ("dsv4", "dsv32"):
             with self.subTest(chat_encoding_spec=chat_encoding_spec):
@@ -1513,6 +1563,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
+        mock_hf_config.to_dict.return_value = {}
         tm.model_config.hf_config = mock_hf_config
 
         # Case 1: No chat template + DeepSeek V3.2 arch -> should use dsv32 encoding
@@ -1534,6 +1585,10 @@ class ServingChatTestCase(unittest.TestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        mock_hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "preview"
+        }
+        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
         tm.tokenizer.chat_template = "stale v3 jinja"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
@@ -1704,6 +1759,135 @@ class ServingChatTestCase(unittest.TestCase):
             out.index("<｜User｜>"),
         )
         self.assertIn("<｜Assistant｜>", out)
+
+    def test_dsv4_reasoning_effort_profiles(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Solve this."},
+        ]
+        absolute_maximum = (
+            "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+            "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+            "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+        )
+        beyond_maximum = (
+            "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+            "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+            "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+        )
+
+        def encode(profile, effort):
+            return encoding_dsv4.encode_messages(
+                messages,
+                thinking_mode="thinking",
+                reasoning_effort=effort,
+                reasoning_effort_profile=profile,
+            )
+
+        preview_high = encode("preview", "high")
+        preview_max = encode("preview", "max")
+        official_low = encode("official", "low")
+        official_high = encode("official", "high")
+        official_max = encode("official", "max")
+
+        self.assertNotIn("Reasoning Effort:", preview_high)
+        self.assertTrue(
+            preview_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
+        )
+        self.assertNotIn("Reasoning Effort:", official_low)
+        self.assertEqual(
+            official_high,
+            encoding_dsv4.bos_token
+            + absolute_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
+        )
+        self.assertEqual(
+            official_max,
+            encoding_dsv4.bos_token
+            + beyond_maximum
+            + official_low.removeprefix(encoding_dsv4.bos_token),
+        )
+        self.assertEqual(encode("preview", None), preview_high)
+        self.assertEqual(encode("official", None), official_low)
+        self.assertEqual(len({official_low, official_high, official_max}), 3)
+
+        with self.assertRaises(ValueError):
+            encode("preview", "low")
+
+    def test_dsv4_reasoning_effort_profile_resolution(self):
+        resolve = resolve_dsv4_reasoning_effort_profile
+        preview_model_path = _create_dsv4_checkpoint(self, _DSV4_PREVIEW_ENCODER)
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        inconclusive_model_path = _create_dsv4_checkpoint(
+            self, 'UNRELATED_METADATA = "value"\n'
+        )
+        self.assertEqual(resolve(model_path=preview_model_path), "preview")
+        self.assertEqual(resolve(model_path=official_model_path), "official")
+        self.assertEqual(resolve(model_path=inconclusive_model_path), "preview")
+
+        self.assertEqual(
+            resolve(model_path="renamed/model", override="official"), "official"
+        )
+        self.assertEqual(
+            resolve(model_path="renamed/model", override="preview"), "preview"
+        )
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            resolve(model_path="renamed/model", override="auto")
+
+    def test_dsv4_reasoning_effort_profile_from_checkpoint(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {}
+        tm.model_config.hf_config.dspark_block_size = 5
+        tm.model_config.hf_config.dspark_markov_rank = 256
+        tm.model_path = official_model_path
+        tm.server_args.model_path = tm.model_path
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+        serving_chat._process_messages(request, is_multimodal=False)
+        prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
+
+    def test_dsv4_reasoning_effort_profile_override_from_model_config(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "official"
+        }
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hello"}],
+            reasoning_effort="max",
+        )
+
+        serving_chat._process_messages(request, is_multimodal=False)
+
+        prompt = tm.tokenizer.encode.call_args.args[0]
+        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
+
+    def test_dsv4_invalid_profile_override_fails_at_construction(self):
+        from sglang.srt.parser.template_manager import TemplateManager
+
+        tm = _MockTokenizerManager()
+        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.model_config.hf_config.to_dict.return_value = {
+            "dsv4_reasoning_effort_profile": "invalid"
+        }
+        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
+            OpenAIServingChat(tm, TemplateManager())
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
