@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -39,6 +40,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+aster_iq2_moe_a8_vec = None
 
 if _is_cuda:
     from sgl_kernel import moe_align_block_size, moe_sum
@@ -53,6 +55,10 @@ if _is_cuda:
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
     from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+    if os.environ.get("SGLANG_ASTER_IQ2_KERNEL"):
+        from sglang.srt.layers.quantization.aster_iq2_moe import (
+            aster_iq2_moe_a8_vec,
+        )
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -70,6 +76,27 @@ else:
         warnings.warn("Only CUDA, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
+
+
+def _ggml_moe_a8_vec_dispatch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    qtype: int,
+    rows: int,
+    tokens: int,
+) -> torch.Tensor:
+    if aster_iq2_moe_a8_vec is not None and qtype in (
+        int(WeightType.IQ2_XXS),
+        int(WeightType.IQ2_XS),
+    ):
+        return aster_iq2_moe_a8_vec(
+            x, weight, topk_ids, top_k, qtype, rows, tokens
+        )
+    return ggml_moe_a8_vec(
+        x, weight, topk_ids, top_k, qtype, rows, tokens
+    )
 
 
 class GGUFConfig(QuantizationConfig):
@@ -276,10 +303,12 @@ def fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
+        out = _ggml_moe_a8_vec_dispatch(
+            x, w1, topk_ids, top_k, qweight_type, N, num_tokens
+        )
         out = act(out)
 
-        out = ggml_moe_a8_vec(
+        out = _ggml_moe_a8_vec_dispatch(
             out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(

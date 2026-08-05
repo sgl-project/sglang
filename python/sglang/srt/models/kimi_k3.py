@@ -1546,21 +1546,23 @@ class KimiK3DeltaAttention(nn.Module):
         weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
         attention layer for the KDA backend; when the shapes do not match
         the compiled kernel the stash stays unset and decode keeps the
-        unfused chain. Called once from load_weights (after all weights are
+        unfused chain. ``seg`` follows the local attention TP width so the
+        same per-head fused kernel can cover both TP8 (12 heads) and TP4
+        (24 heads). Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
             # The fused KDA decode kernel is NVIDIA-only
             return
         layer = self.attn
         w = layer.conv_weights
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        seg = self.local_num_heads * self.head_dim
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != self.local_num_heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -1587,11 +1589,15 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [local heads]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
         self._kda_fused_decode_ready = True
+        rank0_log(
+            "K3 fused KDA decode prepared "
+            f"(local_heads={self.local_num_heads}, segment_width={seg})"
+        )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:

@@ -253,9 +253,10 @@ static void moe_vec_iq2_xxs_q8_1_cuda(
     const int nrows,
     const int token_stride,
     cudaStream_t stream) {
-  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  constexpr int iq2_moe_mmv_y = 4;
+  const int block_num_y = (nrows + iq2_moe_mmv_y - 1) / iq2_moe_mmv_y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
-  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  const dim3 block_dims(WARP_SIZE, iq2_moe_mmv_y, 1);
   moe_vec_q<scalar_t, QK_K, QI2_XXS, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
 }
@@ -272,9 +273,10 @@ static void moe_vec_iq2_xs_q8_1_cuda(
     const int nrows,
     const int token_stride,
     cudaStream_t stream) {
-  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  constexpr int iq2_moe_mmv_y = 4;
+  const int block_num_y = (nrows + iq2_moe_mmv_y - 1) / iq2_moe_mmv_y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
-  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  const dim3 block_dims(WARP_SIZE, iq2_moe_mmv_y, 1);
   moe_vec_q<scalar_t, QK_K, QI2_XS, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
 }

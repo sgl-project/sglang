@@ -1751,6 +1751,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
       &x_ql[index_x], &y_qs[index_y], sc, x_dmf[i * (WARP_SIZE_GGUF / QI6_K) + i / QI6_K], &y_df[index_y / QI8_1]);
 }
 
+// Adapted from ggml-org/llama.cpp's current CUDA IQ2 vec-dot path.  Keep the
+// scale expressions below identical to the previous SGLang implementation so
+// this changes only how the integer dot product is accumulated.
+static __device__ __forceinline__ uint32_t unpack_iq2_signs(const uint8_t value) {
+  const uint32_t parity = __popc(value) & 1;
+  const uint32_t signs = value ^ (parity << 7);
+  return signs * 0x01010101U;
+}
+
 static __device__ __forceinline__ float
 vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
   const block_iq2_xxs* bq2 = (const block_iq2_xxs*)vbq;
@@ -1758,16 +1767,19 @@ vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict_
   const int ib32 = iqs;
   const uint16_t* q2 = bq2->qs + 4 * ib32;
   const uint8_t* aux8 = (const uint8_t*)q2;
-  const int8_t* q8 = bq8_1[ib32].qs;
+  const int* q8 = (const int*)bq8_1[ib32].qs;
   uint32_t aux32 = q2[2] | (q2[3] << 16);
   int sumi = 0;
+#pragma unroll
   for (int l = 0; l < 4; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[l]);
-    const uint8_t signs = ksigns_iq2xs[aux32 & 127];
-    for (int j = 0; j < 8; ++j) {
-      sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-    }
-    q8 += 8;
+    const uint2 grid = ((const uint2*)iq2xxs_grid)[aux8[l]];
+    const uint32_t signs = unpack_iq2_signs(aux32 & 127);
+    const int signs_low = __vcmpne4(signs & 0x08040201U, 0);
+    const int signed_grid_low = __vsub4(grid.x ^ signs_low, signs_low);
+    sumi = __dp4a(signed_grid_low, q8[2 * l], sumi);
+    const int signs_high = __vcmpne4(signs & 0x80402010U, 0);
+    const int signed_grid_high = __vsub4(grid.y ^ signs_high, signs_high);
+    sumi = __dp4a(signed_grid_high, q8[2 * l + 1], sumi);
     aux32 >>= 7;
   }
   const float d = __half2float(bq2->d) * (0.5f + aux32) * __half2float(bq8_1[ib32].ds.x) * 0.25f;
@@ -1780,26 +1792,22 @@ vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
 
   const int ib32 = iqs;
   const uint16_t* q2 = bq2->qs + 4 * ib32;
-  const int8_t* q8 = bq8_1[ib32].qs;
+  const int* q8 = (const int*)bq8_1[ib32].qs;
   const uint8_t ls1 = bq2->scales[ib32] & 0xf;
   const uint8_t ls2 = bq2->scales[ib32] >> 4;
   int sumi1 = 0;
-  for (int l = 0; l < 2; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
-    const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
-    for (int j = 0; j < 8; ++j) {
-      sumi1 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-    }
-    q8 += 8;
-  }
   int sumi2 = 0;
-  for (int l = 2; l < 4; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
-    const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
-    for (int j = 0; j < 8; ++j) {
-      sumi2 += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-    }
-    q8 += 8;
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const uint2 grid = ((const uint2*)iq2xs_grid)[q2[l] & 511];
+    const uint32_t signs = unpack_iq2_signs(q2[l] >> 9);
+    const int signs_low = __vcmpne4(signs & 0x08040201U, 0);
+    const int signed_grid_low = __vsub4(grid.x ^ signs_low, signs_low);
+    const int signs_high = __vcmpne4(signs & 0x80402010U, 0);
+    const int signed_grid_high = __vsub4(grid.y ^ signs_high, signs_high);
+    int& sumi = l < 2 ? sumi1 : sumi2;
+    sumi = __dp4a(signed_grid_low, q8[2 * l], sumi);
+    sumi = __dp4a(signed_grid_high, q8[2 * l + 1], sumi);
   }
   const float d = __half2float(bq2->d) * __half2float(bq8_1[ib32].ds.x) * 0.25f;
   return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
