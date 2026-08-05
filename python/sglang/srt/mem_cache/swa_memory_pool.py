@@ -239,15 +239,17 @@ class SWAKVPool(BaseSWAKVPool):
                 filtered.append([])
                 continue
 
-            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
-            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
-            k_cpu = k_cpu[row_mask]
-            v_cpu = v_cpu[row_mask]
+            tensor_count = len(layer_chunks[0])
+            assert all(len(chunk) == tensor_count for chunk in layer_chunks)
+            tensors_cpu = [
+                torch.cat([chunk[j] for chunk in layer_chunks], dim=0)[row_mask]
+                for j in range(tensor_count)
+            ]
 
             filtered_layer = []
-            for i in range(0, len(k_cpu), chunk_size):
+            for i in range(0, len(tensors_cpu[0]), chunk_size):
                 filtered_layer.append(
-                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                    [tensor[i : i + chunk_size] for tensor in tensors_cpu]
                 )
             filtered.append(filtered_layer)
         return filtered
