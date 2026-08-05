@@ -867,6 +867,15 @@ class CompressorAscendBackendMixin:
                     if kv_scale is not None:
                         kv_scale = kv_scale[valid]
 
+        # Eager verify keeps no row when no request completed a compression block
+        # this step (loc is then all-zero, the skip sentinel), and prefill can hand
+        # us an empty chunk. Nothing to write: the pre-A5 scatter treated that as a
+        # no-op, while both A5 fused epilog kernels reject a zero-row input. Unlike
+        # the `loc is None` check below (missing metadata = a bug), an empty write is
+        # a legitimate step outcome. Static shape read, so graph capture is unaffected.
+        if kv.shape[0] == 0:
+            return
+
         if fused_fp8_indexer_write:
             if loc is None:
                 raise RuntimeError(
