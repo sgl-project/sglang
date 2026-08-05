@@ -70,6 +70,8 @@ spec:
               value: wan22-5b-stage3-dmd-30-gs1800
             - name: VAE_FINGERPRINT
               value: taew2_2-d053e216
+            - name: REALTIME_UI_CONFIG_JSON
+              value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
             - name: TRACE_LOG_GROUP
               value: REPLACE_WITH_TRACE_LOG_GROUP
             - name: OTEL_SERVICE_NAME

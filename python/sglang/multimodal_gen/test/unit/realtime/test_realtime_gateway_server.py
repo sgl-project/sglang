@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints import realtime_gateway_server
 from sglang.multimodal_gen.runtime.entrypoints.realtime_gateway_server import (
+    _parse_ui_config,
     create_app,
 )
 
@@ -31,6 +32,15 @@ class _TraceQuery:
             "events": [{"event": "server.chunk_complete", "trace_seq": 9}],
             "next_cursor": 9,
         }
+
+
+def test_gateway_parses_ui_config_for_the_served_webui():
+    assert _parse_ui_config(
+        '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"t2v"}'
+    ) == {
+        "generationModes": ["i2v", "t2v"],
+        "defaultGenerationMode": "t2v",
+    }
 
 
 def test_gateway_trace_events_use_the_independent_otlp_log_plane():

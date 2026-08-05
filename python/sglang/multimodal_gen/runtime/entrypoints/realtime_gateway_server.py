@@ -55,6 +55,16 @@ WEBUI_ROOT = Path(__file__).resolve().parents[2] / "apps" / "realtime_webui"
 logger = logging.getLogger(__name__)
 
 
+def _parse_ui_config(raw: str) -> dict[str, Any]:
+    try:
+        config = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("UI config must be valid JSON") from exc
+    if not isinstance(config, dict):
+        raise ValueError("UI config must be a JSON object")
+    return config
+
+
 def _log_gateway_trace(trace_id: str, event: str, **fields: Any) -> None:
     now_ms = int(time.time() * 1000)
     payload = {
@@ -489,6 +499,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lease-renew-interval-s", type=float, default=10.0)
     parser.add_argument("--release-grace-s", type=float, default=0.5)
     parser.add_argument("--trace-log-group")
+    parser.add_argument(
+        "--ui-config-json",
+        default=os.environ.get("REALTIME_UI_CONFIG_JSON", "{}"),
+    )
     return parser.parse_args()
 
 
@@ -496,6 +510,10 @@ def main() -> None:
     args = _parse_args()
     if not args.internal_output_url:
         raise SystemExit("--internal-output-url is required")
+    try:
+        ui_config = _parse_ui_config(args.ui_config_json)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     coordinator = HTTPCoordinatorClient(args.coordinator_url)
     trace_query = None
     if args.trace_log_group:
@@ -519,6 +537,7 @@ def main() -> None:
         output_enqueue_timeout_s=args.output_enqueue_timeout_s,
         lease_renew_interval_s=args.lease_renew_interval_s,
         release_grace_s=args.release_grace_s,
+        ui_config=ui_config,
         trace_query=trace_query,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

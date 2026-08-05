@@ -144,9 +144,16 @@ def test_wan22_5b_uses_the_matching_taehv_checkpoint():
 
 
 def test_webui_enables_i2v_and_t2v_in_production_manifest():
-    manifest = (Path(__file__).parent / "h100-denoiser.yaml").read_text()
-    assert '"generationModes":["i2v","t2v"]' in manifest
-    assert '"t2vDefaultNumFrames":121' in manifest
+    gateway = find(
+        load_documents(("gateway.yaml",)), "Deployment", "minwm-realtime-gateway"
+    )
+    env = {
+        item["name"]: item.get("value")
+        for item in _container(gateway, "gateway").get("env", [])
+    }
+
+    assert '"generationModes":["i2v","t2v"]' in env["REALTIME_UI_CONFIG_JSON"]
+    assert '"t2vDefaultNumFrames":121' in env["REALTIME_UI_CONFIG_JSON"]
 
 
 def test_west_model_artifact_uses_a_matching_read_only_s3_mount():
