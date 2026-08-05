@@ -30,6 +30,7 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -39,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
+    get_device_name,
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
@@ -48,6 +50,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_mnnvl_fabric_device,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -313,6 +316,234 @@ def _register_for(*architectures: str):
         return fn
 
     return decorator
+
+
+def _dspark_verify_on_decode_backend(
+    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
+) -> bool:
+    """Whether the MLA decode backend can serve a q_len-wide target verify."""
+    if backend == "trtllm_mla":
+        return True
+    if backend == "tokenspeed_mla":
+        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
+    if backend == "cutedsl_mla":
+        # The cute-dsl kernel rejects q_len >= 5 with no fallback.
+        return q_len <= 4
+    return False
+
+
+_KIMI_K3_DCP_PATCH_URL = (
+    "https://github.com/sgl-project/sglang/blob/"
+    "b701464720ca22aa1851d5dda7144e84a410f2c7/"
+    "docker/kimi_k3/kimi_k3_cu13.Dockerfile#L116-L123"
+)
+
+
+def _require_kimi_k3_cutedsl_dcp_support() -> None:
+    try:
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+
+        parameters = inspect.signature(trtllm_batch_decode_with_kv_cache_mla).parameters
+    except (ImportError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
+            "a DCP-patched FlashInfer "
+            "trtllm_batch_decode_with_kv_cache_mla exposing enable_dcp in its "
+            f"signature. Apply the patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+        ) from exc
+
+    if "enable_dcp" not in parameters:
+        raise RuntimeError(
+            "Kimi-K3 DCP with decode_attention_backend='cutedsl_mla' requires "
+            "enable_dcp in the signature of "
+            "flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla. Apply "
+            f"the FlashInfer DCP patch as shown in {_KIMI_K3_DCP_PATCH_URL}."
+        )
+
+
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
+    if server_args.dcp_size > 1:
+        overrides = {}
+        if server_args.enable_symm_mem:
+            logger.warning(
+                "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
+                "graph correctness issues."
+            )
+            overrides["enable_symm_mem"] = False
+
+        if server_args.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            ragged_mode = read_ragged_verify_mode()
+            if ragged_mode is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3 DCP + DSPARK currently requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept are "
+                    f"not validated under DCP (got {ragged_mode.value!r})."
+                )
+
+            # DSPARK target-verify + draft-extend must run on the decode
+            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
+            # signature (causal_seqs / cp_world / cp_rank). The default
+            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
+            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
+            overrides["speculative_attention_mode"] = "decode"
+
+        prefill_backend, decode_backend = attention_backends_of(server_args)
+        if decode_backend == "cutedsl_mla" or decode_backend is None:
+            _require_kimi_k3_cutedsl_dcp_support()
+            logger.info(
+                "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
+                f"(prefill={prefill_backend!r} -> 'trtllm_mla')."
+            )
+            overrides.update(
+                prefill_attention_backend="trtllm_mla",
+                decode_attention_backend="cutedsl_mla",
+            )
+        elif decode_backend == "tokenspeed_mla":
+            logger.info(
+                "Kimi-K3 DCP overrides attention backends: "
+                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
+                "'tokenspeed_mla'."
+            )
+            logger.info(
+                "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
+                f"{server_args.kv_cache_dtype!r} -> 'fp8_e4m3'."
+            )
+            overrides.update(
+                prefill_attention_backend="tokenspeed_mla",
+                decode_attention_backend="tokenspeed_mla",
+                kv_cache_dtype="fp8_e4m3",
+            )
+        else:
+            raise AssertionError(
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+            )
+
+        if server_args.dcp_replicate_q_proj is None:
+            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
+
+        device_name = get_device_name()
+        dcp_comm_backend = "fi_a2a" if is_mnnvl_fabric_device() else "a2a"
+        logger.info(
+            "Kimi-K3 DCP selects communication backend on "
+            f"{device_name!r}: {server_args.dcp_comm_backend!r} -> "
+            f"{dcp_comm_backend!r}."
+        )
+        overrides["dcp_comm_backend"] = dcp_comm_backend
+        return overrides
+
+    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+        return {}
+    backends_unset = server_args.is_attention_backend_not_set()
+    if server_args.speculative_algorithm != "DSPARK":
+        if not backends_unset:
+            return {}
+        logger.info(
+            "Use trtllm_mla as the default prefill and decode attention "
+            "backend for Kimi-K3 on SM100/SM103."
+        )
+        return {
+            "decode_attention_backend": "trtllm_mla",
+            "prefill_attention_backend": "trtllm_mla",
+        }
+    # DSPARK: verify runs on the decode backend (mode=decode below), so this
+    # picks the verify kernel -- mode=prefill routes it to flashinfer, which is
+    # slow and syncs, while plain decode is cold under dspark.
+    q_len = server_args.speculative_num_draft_tokens or (
+        server_args.speculative_dspark_block_size + 1
+        if server_args.speculative_dspark_block_size is not None
+        # Checkpoint auto-infer happens after overrides; K3 draft uses block 7.
+        else 8
+    )
+    overrides = {}
+    if backends_unset:
+        backend = "trtllm_mla"
+        overrides["decode_attention_backend"] = backend
+        overrides["prefill_attention_backend"] = "trtllm_mla"
+    else:
+        # Explicit backend knobs keep priority, but the mode is a separate knob
+        # that still needs declaring -- else verify stays on the prefill backend,
+        # whose host-side plan (flashinfer by default) forces a per-step D2H.
+        _, backend = attention_backends_of(server_args)
+    if _dspark_verify_on_decode_backend(backend, q_len, server_args.kv_cache_dtype):
+        overrides["speculative_attention_mode"] = "decode"
+        logger.info(
+            "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
+            f"{backend} (speculative_attention_mode=decode)."
+        )
+    else:
+        logger.warning(
+            f"Kimi-K3 DSPARK: decode attention backend {backend!r} cannot serve "
+            f"target verify at q_len={q_len}, so verify runs on the prefill "
+            "backend (speculative_attention_mode=prefill). A host-plan prefill "
+            "backend costs a per-step seq_lens D2H sync; leave the attention "
+            "backend knobs unset for the sync-free default."
+        )
+    return overrides
+
+
+def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
+    qc = getattr(
+        getattr(hf_config, "text_config", hf_config), "quantization_config", None
+    )
+    if not isinstance(qc, dict):
+        return False
+    groups = qc.get("config_groups") or {}
+    return any(
+        "mxfp4" in str(g.get("format", ""))
+        for g in groups.values()
+        if isinstance(g, dict)
+    )
+
+
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    # MoE runner default, independent of the attention-backend gate above.
+    # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
+    # it hard-requires the SiTU cubin pool on the box (K3's SiTU activation has
+    # no public cubins). Do not silently trade W4A8 for Marlin W4A16 when the
+    # default cannot start; explicit non-FlashInfer runner choices still win.
+    if server_args.moe_runner_backend not in ("auto", "flashinfer_mxfp4"):
+        return {}
+    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+        return {}
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return {}
+    from sglang.kernels.ops.moe.trtllm_gen_moe import available as _trtllm_gen_moe_ok
+
+    if not _trtllm_gen_moe_ok():
+        raise RuntimeError(
+            "Kimi-K3 on Blackwell with moe_runner_backend='auto' or "
+            "'flashinfer_mxfp4' requires a valid "
+            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL. Install it with:\n"
+            "wget https://github.com/sgl-project/whl/releases/download/"
+            "trtllm_gen_moe_cubin_20260617/"
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip\n"
+            "sudo mkdir -p /opt/trtllm_gen_moe_cubin_pool\n"
+            "sudo unzip -q "
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip -d "
+            "/opt/trtllm_gen_moe_cubin_pool\n"
+            "export "
+            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool/"
+            "trtllm_gen_moe_cubin_pool_20260617_v0613rc1\n"
+            "To use Marlin "
+            "instead, set --moe-runner-backend marlin explicitly."
+        )
+
+    if server_args.moe_runner_backend == "auto":
+        logger.info(
+            "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+            "(trtllm-gen SiTU cubin pool found)."
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
+    return {}
 
 
 @_register_for(
@@ -1175,6 +1406,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
+        "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1208,6 +1440,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
+        # KDA backend's track-snapshot writes (decode + extend) so donated
+        # slots hold real states for prefix-cache restores.
+        "KimiK3ForConditionalGeneration",
     }
 )
 
@@ -2235,6 +2471,12 @@ def _a2a_backend_overrides(view: Any) -> dict:
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
     if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
+        if view.ep_size != view.tp_size:
+            logger.info(
+                f"{view.moe_a2a_backend} MoE is enabled. The expert parallel size "
+                f"is adjusted from {view.ep_size} to the tensor parallel size "
+                f"[{view.tp_size}]."
+            )
         return {"ep_size": view.tp_size}
     return {}
 

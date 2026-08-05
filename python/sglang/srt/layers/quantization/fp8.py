@@ -484,7 +484,6 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_parallel().tp_size
         block_n, block_k = (
             quant_config.weight_block_size[0],
             quant_config.weight_block_size[1],
@@ -495,6 +494,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 "Skipping block quantization checks for weight partition."
             )
         else:
+            tp_size = get_parallel().tp_size
             # Required by row parallel
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
@@ -1603,7 +1603,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
-            from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
@@ -1677,20 +1676,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                if requant_block_scale_ue8m0_for_deepgemm(
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    weight_block_size,
-                    use_deepgemm_runner=will_use_deepgemm,
+                for weight, weight_scale in (
+                    (layer.w13_weight, layer.w13_weight_scale_inv),
+                    (layer.w2_weight, layer.w2_weight_scale_inv),
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
                     requant_block_scale_ue8m0_for_deepgemm(
-                        layer.w2_weight,
-                        layer.w2_weight_scale_inv,
+                        weight,
+                        weight_scale,
                         weight_block_size,
-                        use_deepgemm_runner=True,
+                        use_deepgemm_runner=will_use_deepgemm,
+                        output_dtype=torch.bfloat16,
+                        weight_shape=weight.shape[-2:],
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
