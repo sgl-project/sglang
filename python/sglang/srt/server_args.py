@@ -3234,10 +3234,11 @@ class ServerArgs:
             "Hold new prefills until at least N running-request slots have freed "
             "up, so they are admitted in one batch instead of one at a time. "
             "Useful when each admission is disproportionately expensive, e.g. "
-            "speculative decoding with a separate draft prefill pass. Capped to "
-            "the DFlash formula (disabled when max-running-requests < 8; "
-            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
-            "this with the formula when unset; other workloads stay disabled."
+            "speculative decoding with a separate draft prefill pass. An "
+            "explicit value always wins, capped by max-running-requests "
+            "(1 disables). When unset, DFlash workloads auto-enable the "
+            "formula; other workloads stay disabled. Not supported with "
+            "pipeline parallelism."
         ),
         NS("schedule"),
     ] = None
@@ -3475,13 +3476,6 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
-
-        if self.default_chat_template_kwargs is not None and not isinstance(
-            self.default_chat_template_kwargs, dict
-        ):
-            raise ValueError(
-                "--default-chat-template-kwargs must decode to a JSON object"
-            )
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -7336,7 +7330,7 @@ class ServerArgs:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for consolidated*.safetensors with no competing
-        model-*.safetensors; when both weight formats ship in the
+        model*.safetensors; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
@@ -7369,7 +7363,7 @@ class ServerArgs:
                     )
                 ),
                 has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                    glob.glob(os.path.join(self.model_path, "model*.safetensors"))
                 ),
             )
 
@@ -7384,7 +7378,10 @@ class ServerArgs:
                     for f in files
                 ),
                 has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                    f.startswith("model")
+                    and f.endswith(".safetensors")
+                    and "/" not in f
+                    for f in files
                 ),
             )
         except Exception:
@@ -8091,6 +8088,12 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
 
         # Handle optimistic prefill validation
         if (
@@ -8723,6 +8726,11 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.min_free_slots_delay is None, (
+                "--min-free-slots-delay is not supported with pipeline "
+                "parallelism: allocatable slots per microbatch are bounded by "
+                "pp-max-micro-batch-size, so the threshold may never be reached"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
