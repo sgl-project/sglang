@@ -47,7 +47,7 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
     sglang_version: "PR #33561 @ 51bcd89c",
-    accuracy: { gsm8k_pct: 96.97 },
+    accuracy: { gsm8k_pct: 96.44 },
   },
 
   // ====================================================================

@@ -29,6 +29,8 @@ export const config = {
     HOST_IP:      { target: "command", label: "Bind host",          default: "0.0.0.0"              },
     PORT:         { target: "command", label: "Bind port",          default: "30000"                },
     HF_TOKEN:     { target: "command", label: "HF token (Docker)",  default: "<your-hf-token>"      },
+    MOONCAKE_MASTER: { target: "command", label: "Mooncake master", default: "127.0.0.1:50171"      },
+    MOONCAKE_METADATA_SERVER: { target: "command", label: "Mooncake metadata", default: "http://127.0.0.1:8290/metadata" },
     CURL_HOST:    { target: "curl",    label: "Server host",        default: "localhost"            },
     CURL_PORT:    { target: "curl",    label: "Server port",        default: "30000"                },
   },
@@ -45,6 +47,9 @@ export const config = {
     "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
+
+  dockerHostNetworkWhen: (_sel, { flags }) =>
+    flags.some((flag) => flag === "--hicache-storage-backend mooncake"),
 
   benchmarkCommands: {
     speed: `python3 -m sglang.bench_serving \\
@@ -88,6 +93,30 @@ sgl-eval run gsm8k \\
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off (greedy)" },
         { id: "nextn", label: "NEXTN (built-in MTP)", flags: ["--speculative-algorithm NEXTN"] },
+      ],
+    },
+    hicache: {
+      defaultBackend: "mooncake",
+      requiredFlags: [
+        "--mamba-scheduler-strategy extra_buffer",
+        "--enable-cache-report",
+      ],
+      backends: [
+        {
+          id: "mooncake",
+          label: "Mooncake",
+          flags: [
+            "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
+          ],
+          env: [
+            "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+            "MOONCAKE_PROTOCOL=tcp",
+            "MC_MS_AUTO_DISC=0",
+            "MOONCAKE_DEVICE=",
+            "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+          ],
+        },
       ],
     },
   },
@@ -454,17 +483,20 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // HiCache + Mooncake tiered cache. Requires a running mooncake master +
-    // client next to this server (see the platform docs for the mooncake
-    // bring-up; the generic flags stay the same). The
-    // hicache_storage_pass_prefix_keys extra config is required on the
-    // hybrid-KDA path — without it nothing ever reaches the store.
-    // Verified only for prompts at or below chunked_prefill_size
-    // (default 8192); longer prompts currently skip write-through upstream.
+    // Hybrid KDA must pass prefix keys to Mooncake; otherwise storage writes are empty.
+    // Cold uncached extends above chunked_prefill_size skip write-through for that influx.
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
       verified: true,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
+        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+        "MOONCAKE_PROTOCOL=tcp",
+        "MC_MS_AUTO_DISC=0",
+        "MOONCAKE_DEVICE=",
+        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -487,7 +519,15 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
+        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+        "MOONCAKE_PROTOCOL=tcp",
+        "MC_MS_AUTO_DISC=0",
+        "MOONCAKE_DEVICE=",
+        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -511,7 +551,15 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
+        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+        "MOONCAKE_PROTOCOL=tcp",
+        "MC_MS_AUTO_DISC=0",
+        "MOONCAKE_DEVICE=",
+        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -534,7 +582,15 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "hicache", nodes: "single" },
       verified: false,
-      env: ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"],
+      env: [
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1",
+        "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+        "MOONCAKE_PROTOCOL=tcp",
+        "MC_MS_AUTO_DISC=0",
+        "MOONCAKE_DEVICE=",
+        "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA_SERVER}}",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE=0",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
