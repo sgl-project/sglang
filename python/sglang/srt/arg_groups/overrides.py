@@ -327,8 +327,9 @@ def _dspark_verify_on_decode_backend(
     if backend == "tokenspeed_mla":
         return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
-        # The cute-dsl kernel rejects q_len >= 5 with no fallback.
-        return q_len <= 4
+        # flashinfer's monolithic cute-dsl MLA decode folds seq_len_q into the
+        # head dim (fold_sq), so q_len > 4 is supported (flashinfer >= 0.6.15).
+        return q_len <= 8
     return False
 
 
