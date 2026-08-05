@@ -28,7 +28,7 @@ LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+CUSTOM_IMAGE_SUFFIX="${AMD_CI_CUSTOM_IMAGE_SUFFIX:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
-    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --custom-image-suffix) CUSTOM_IMAGE_SUFFIX="$2"; shift 2;;
     --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     --rocm-version)
@@ -50,7 +50,8 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --custom-image-suffix SFX  Append suffix to arch-specific daily image tags"
+      echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE_SUFFIX"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
@@ -233,14 +234,56 @@ find_latest_image() {
   esac
 }
 
+image_from_suffix() {
+  local gpu_arch=$1
+  local suffix=$2
+  local base_tag days_back image_tag image_id
+
+  if [[ "${suffix}" != -* ]]; then
+    suffix="-${suffix}"
+  fi
+
+  case "${gpu_arch}" in
+      mi30x) base_tag="${MI30X_BASE_TAG}" ;;
+      mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
+  esac
+
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${suffix}"
+    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
+    if [[ -n "$image_id" ]]; then
+      echo "Found cached custom image locally: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
+    fi
+  done
+
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${suffix}"
+    echo "Checking for custom image: rocm/sgl-dev:${image_tag}" >&2
+    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
+      echo "Found available custom image: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
+    fi
+  done
+
+  image_tag="${base_tag}-$(date +%Y%m%d)${suffix}"
+  echo "No public custom image found for suffix '${suffix}'. Trying today's tag: rocm/sgl-dev:${image_tag}" >&2
+  echo "rocm/sgl-dev:${image_tag}"
+}
+
 # Determine which image to use
-if [[ -n "${CUSTOM_IMAGE}" ]]; then
-  # Use explicitly provided custom image
-  IMAGE="${CUSTOM_IMAGE}"
-  echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    docker pull "${IMAGE}"
+if [[ -n "${CUSTOM_IMAGE_SUFFIX}" ]]; then
+  IMAGE=$(image_from_suffix "${GPU_ARCH}" "${CUSTOM_IMAGE_SUFFIX}")
+  echo "Using custom image suffix '${CUSTOM_IMAGE_SUFFIX}' for ${GPU_ARCH}: ${IMAGE}"
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     retry_with_backoff 6 docker pull "${IMAGE}"
   fi
 elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
