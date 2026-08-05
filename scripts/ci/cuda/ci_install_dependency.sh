@@ -223,7 +223,12 @@ setup_cargo_cache() {
 }
 
 setup_pip_toolchain() {
-    python3 -m pip install --upgrade pip
+    if [ "$USE_VENV" = "1" ]; then
+        # configure_environment upgraded system pip before the venv existed;
+        # this one upgrades the venv's own pip. Without a venv the two would
+        # target the same interpreter, so skip the duplicate.
+        python3 -m pip install --upgrade pip
+    fi
 
     if [ "$USE_VENV" != "1" ]; then
         export UV_SYSTEM_PYTHON=1
@@ -468,7 +473,6 @@ install_sglang_kernel() {
 
 install_sglang_router() {
     $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
-    $PIP_CMD list
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -632,9 +636,12 @@ prepare_runner() {
 
 setup_ld_library_path() {
     # NVIDIA pip packages and torch ship .so files under site-packages that are
-    # not on the default LD_LIBRARY_PATH.
+    # not on the default LD_LIBRARY_PATH. Scoped to the nvidia/ package rather
+    # than all of site-packages: the wheels nest lib/ at varying depths (e.g.
+    # nvidia/cudnn/lib, nvidia/cu13/cccl/lib), but always under nvidia/, and an
+    # unscoped find walks the whole tree (torch, flashinfer cubins) for nothing.
     SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
-    NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null | tr '\n' ':')
+    NVIDIA_LIBS=$( (find "$SITE_PACKAGES/nvidia" -type d -name lib 2>/dev/null || true) | tr '\n' ':')
     TORCH_LIB="$SITE_PACKAGES/torch/lib"
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -652,13 +659,20 @@ setup_ld_library_path() {
 
 verify_imports() {
     $PIP_CMD list
-    python3 -c "import torch; print(torch.version.cuda)"
-    python3 -c "import cutlass; import cutlass.cute;"
 
-    # A shadowed sglang still imports, so without this the failure only surfaces
-    # as a missing submodule during the test step. find_spec, not import: the
-    # finders alone answer this and importing would pull in torch for nothing.
+    # One process for every probe, so the interpreter and torch load once
+    # instead of once per check. torch and cutlass do not import sglang, so
+    # the find_spec check below still sees the finders' resolution before any
+    # sglang import in this process.
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import torch
+print(torch.version.cuda)
+import cutlass
+import cutlass.cute
+
+# A shadowed sglang still imports, so without this the failure only surfaces
+# as a missing submodule during the test step. find_spec, not import: the
+# finders alone answer this without importing sglang.
 import importlib.util, os
 want = os.environ["SGLANG_EXPECTED_INIT"]
 spec = importlib.util.find_spec("sglang")
@@ -671,11 +685,9 @@ if spec.origin != want:
         "something in site-packages is shadowing the checkout"
     )
 print(f"sglang resolves to {spec.origin}")
-'
 
-    # Import, not find_spec: the finders locate an extension without dlopening it,
-    # so a .so that cannot load passes find_spec and only fails inside some suite.
-    python3 -c '
+# Import, not find_spec: the finders locate an extension without dlopening it,
+# so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 for mod in ("server", "grpc", "multimodal"):
     name = f"sglang.srt.{mod}._core"
