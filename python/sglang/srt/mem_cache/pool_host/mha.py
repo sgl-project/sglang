@@ -538,6 +538,98 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
 
+    def _page_kv_view_canonical(self, index: int):
+        """One page's KV as a (2, head, layer, page_size, dim) strided view.
+
+        The canonical cell byte order — (head, layer, token, dim) per K/V
+        half — is the page_head_layer_direct order, so cells gathered here
+        stay byte-compatible with a future zero-copy layout. Works for every
+        page-first-family layout because torch handles the strided permute.
+        """
+        if self.layout == "page_first":
+            page = self.kv_buffer[:, index : index + self.page_size]
+            return page.permute(0, 3, 2, 1, 4)
+        if self.layout == "page_first_direct":
+            page = self.kv_buffer[:, index // self.page_size]
+            return page.permute(0, 3, 1, 2, 4)
+        if self.layout == "page_head":
+            page = self.kv_buffer[:, index // self.page_size]
+            return page.permute(0, 1, 3, 2, 4)
+        raise ValueError(f"cell adapter does not support the {self.layout!r} layout.")
+
+    def cell_bytes(self, layer_ranges, head_ranges) -> int:
+        """Total staging bytes for one page's cells (K and V halves)."""
+        layers = sum(end - start for start, end in layer_ranges)
+        heads = sum(end - start for start, end in head_ranges)
+        return 2 * layers * heads * self.page_size * self.head_dim * self.dtype.itemsize
+
+    def gather_cells_canonical(self, indices, layer_ranges, head_ranges, arena):
+        """Pack cells into ``arena`` in canonical order; return per-slab sizes.
+
+        Order: page-major, layer-range-major, head-range-minor, K slab then V
+        slab per cell — matching the canonical suffix list and the mooncake
+        key fan-out. Returns (offsets, sizes) of the packed slabs within
+        ``arena`` (a pinned uint8 tensor registered with the store).
+        """
+        if not torch.is_tensor(self.kv_buffer):
+            raise NotImplementedError(
+                "cell adapter is not supported for split K/V host pools "
+                "(asymmetric MHA)."
+            )
+        assert len(indices) % self.page_size == 0
+        itemsize = self.dtype.itemsize
+        offsets = []
+        sizes = []
+        cursor = 0
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.page_size):
+            view = self._page_kv_view_canonical(indices[index])
+            for l0, l1 in layer_ranges:
+                for h0, h1 in head_ranges:
+                    slab_elems = (h1 - h0) * (l1 - l0) * self.page_size * self.head_dim
+                    slab_bytes = slab_elems * itemsize
+                    for kv in range(2):  # K slab, then V slab
+                        dst = arena[cursor : cursor + slab_bytes].view(self.dtype)
+                        dst.view(h1 - h0, l1 - l0, self.page_size, self.head_dim).copy_(
+                            view[kv, h0:h1, l0:l1]
+                        )
+                        offsets.append(cursor)
+                        sizes.append(slab_bytes)
+                        cursor += slab_bytes
+        return offsets, sizes
+
+    def scatter_cells_canonical(self, indices, layer_ranges, head_ranges, arena):
+        """Inverse of gather_cells_canonical: arena slabs into the pool."""
+        if not torch.is_tensor(self.kv_buffer):
+            raise NotImplementedError(
+                "cell adapter is not supported for split K/V host pools "
+                "(asymmetric MHA)."
+            )
+        assert len(indices) % self.page_size == 0
+        itemsize = self.dtype.itemsize
+        cursor = 0
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.page_size):
+            view = self._page_kv_view_canonical(indices[index])
+            for l0, l1 in layer_ranges:
+                for h0, h1 in head_ranges:
+                    slab_bytes = (
+                        (h1 - h0)
+                        * (l1 - l0)
+                        * self.page_size
+                        * self.head_dim
+                        * itemsize
+                    )
+                    for kv in range(2):
+                        src = (
+                            arena[cursor : cursor + slab_bytes]
+                            .view(self.dtype)
+                            .view(h1 - h0, l1 - l0, self.page_size, self.head_dim)
+                        )
+                        view[kv, h0:h1, l0:l1].copy_(src)
+                        cursor += slab_bytes
+        return cursor
+
     def get_layer_range_page_buffer_meta(self, indices, layer_ranges):
         """Zero-copy metas for canonical-grid layer fan-out cells (MHA/GQA).
 

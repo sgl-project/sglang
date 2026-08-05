@@ -628,6 +628,7 @@ class HiCacheController:
 
         canonical_suffix = None
         canonical_layer_ranges = None
+        canonical_head_ranges = None
         layer_partition = storage_backend_extra_config.pop("layer_partition", None)
         head_group_knob = storage_backend_extra_config.pop("head_group", None)
 
@@ -655,7 +656,11 @@ class HiCacheController:
                     "(heads per cell, e.g. head_group = total_kv_heads / "
                     "lcm of the fleet's TP sizes)."
                 )
-            canonical_suffix, canonical_layer_ranges = self._build_canonical_suffix(
+            (
+                canonical_suffix,
+                canonical_layer_ranges,
+                canonical_head_ranges,
+            ) = self._build_canonical_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
@@ -686,6 +691,7 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
             canonical_suffix=canonical_suffix,
             canonical_layer_ranges=canonical_layer_ranges,
+            canonical_head_ranges=canonical_head_ranges,
         )
 
     def _build_canonical_suffix(
@@ -738,6 +744,16 @@ class HiCacheController:
                 "pools yet (the draft model needs its own namespace identity)."
             )
 
+        # Cell-adapter mode: BOTH fleet grids declared on a sharded-KV pool.
+        # Objects then use the layout-neutral canonical byte order, gathered
+        # through a registered staging arena, so no host-layout requirement
+        # applies (any page-first-family layout interops).
+        adapter_mode = (
+            head_group_knob is not None
+            and layer_partition is not None
+            and not is_rank_replicated
+        )
+
         # Head fan-out: head_group is canonical-grid's fleet head-grid
         # agreement (heads per cell). These prerequisite checks run before
         # any pool access so misconfiguration fails on config alone.
@@ -745,18 +761,18 @@ class HiCacheController:
             if head_group_knob <= 0:
                 raise ValueError(f"head_group must be positive: {head_group_knob}")
             # head_group pins the whole fleet, single-cell members included:
-            # every participant must produce page_head-ordered object bytes,
-            # or a fan-out writer and a whole-page reader would exchange
-            # size-equal but byte-permuted objects. (The object_layout
-            # namespace field backstops this by digest, but the shared fleet
-            # keyspace only forms when everyone complies.)
+            # every participant must serialize objects in the same byte
+            # order — page_head for zero-copy head cells, or the canonical
+            # adapter order when layer_partition is also set. (The
+            # object_layout namespace field backstops this by digest, but
+            # the shared fleet keyspace only forms when everyone complies.)
             if self.storage_backend_type != "mooncake":
                 raise NotImplementedError(
                     "canonical-grid with head_group needs a "
                     "multi-key-per-page backend; only mooncake supports it "
                     "(the file backend stores one object per page)."
                 )
-            if self.mem_pool_host.layout != "page_head":
+            if not adapter_mode and self.mem_pool_host.layout != "page_head":
                 raise ValueError(
                     "canonical-grid with head_group requires "
                     "--hicache-mem-layout page_head on every participating "
@@ -820,7 +836,10 @@ class HiCacheController:
             rank_replicated=is_rank_replicated,
             total_kv_heads=local_kv_heads * self.tp_size,
             head_group=0 if is_rank_replicated else head_group,
-            object_layout=self.mem_pool_host.layout,
+            # Adapter cells are layout-neutral: any page-first-family pool
+            # produces identical canonical bytes, so the identity field is a
+            # constant and mixed-layout fleets share one keyspace.
+            object_layout="cell-v1" if adapter_mode else self.mem_pool_host.layout,
             layer_boundaries=layer_partition,
         )
 
@@ -836,25 +855,28 @@ class HiCacheController:
             page_size=self.page_size,
             model_id=model_id,
             rank_replicated=is_rank_replicated,
-            object_layout=self.mem_pool_host.layout,
+            object_layout="cell-v1" if adapter_mode else self.mem_pool_host.layout,
         )
 
         canonical_layer_ranges = None
-        if (
-            layer_partition
-            and len(suffixes) > 1
-            and (is_rank_replicated or head_group == local_kv_heads)
+        canonical_head_ranges = None
+        if layer_partition and (
+            adapter_mode
+            or (
+                len(suffixes) > 1
+                and (is_rank_replicated or head_group == local_kv_heads)
+            )
         ):
-            # Layer fan-out (PP read-back): the module validated boundary
-            # alignment; here the physical prerequisites. Local ranges feed
-            # get_layer_range_page_buffer_meta in page-major/range-minor
-            # order matching the suffix list.
+            # Layer fan-out (PP read-back) and/or the cell adapter: the
+            # module validated boundary alignment; here the physical
+            # prerequisites. Local ranges feed the buffer metas in the same
+            # order as the suffix list.
             if self.storage_backend_type != "mooncake":
                 raise NotImplementedError(
                     "canonical-grid layer fan-out needs a multi-key-per-page "
                     "backend; only mooncake supports it."
                 )
-            if self.mem_pool_host.layout != "page_first_direct":
+            if not adapter_mode and self.mem_pool_host.layout != "page_first_direct":
                 raise ValueError(
                     "canonical-grid layer fan-out requires "
                     "--hicache-mem-layout page_first_direct (layer-major "
@@ -865,15 +887,32 @@ class HiCacheController:
                 (a - start_layer, b - start_layer)
                 for a, b in zip(boundaries, boundaries[1:])
             ]
-            assert len(canonical_layer_ranges) == len(suffixes)
+            if adapter_mode:
+                # Cell adapter: objects are canonical-order gathers, so the
+                # backend also needs the local head ranges; the suffix list
+                # is the (layer-major, head-minor) cross product and stays a
+                # list even for a single cell (the byte format differs from
+                # the raw-layout fast paths regardless of cell count).
+                cells = local_kv_heads // head_group
+                canonical_head_ranges = [
+                    (i * head_group, (i + 1) * head_group) for i in range(cells)
+                ]
+                assert len(suffixes) == len(canonical_layer_ranges) * len(
+                    canonical_head_ranges
+                )
+            else:
+                assert len(canonical_layer_ranges) == len(suffixes)
 
         logger.info(
             "HiCache canonical-grid L3 keys: namespace=%s cells=%s",
             namespace_digest(namespace),
             suffixes,
         )
-        suffix = suffixes[0] if len(suffixes) == 1 else suffixes
-        return suffix, canonical_layer_ranges
+        if adapter_mode:
+            suffix = list(suffixes)
+        else:
+            suffix = suffixes[0] if len(suffixes) == 1 else suffixes
+        return suffix, canonical_layer_ranges, canonical_head_ranges
 
     def reset(self):
         self.storage_stop_event.set()

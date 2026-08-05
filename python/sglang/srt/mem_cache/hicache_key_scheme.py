@@ -38,8 +38,13 @@ sizes). The multi-key read/write transport
 shared with, but not coupled to, the legacy split-heads mechanism. Rank-replicated pools (MLA-family) have no head axis,
 so cross-TP-size reuse needs no head-grid agreement at all. Layer
 fan-out applies to both families (MLA single-slab cells; MHA/GQA K+V slab
-pairs), always under the page_first_direct layout; combining head and layer
-fan-out is rejected (conflicting layouts).
+pairs) under the page_first_direct layout. Combining head and layer fan-out
+switches the namespace to the **cell adapter**: objects carry a
+layout-neutral canonical byte order ((head, layer, token, dim) per K/V
+half — the page_head_layer_direct order, so a future zero-copy layout is
+byte-compatible), gathered/scattered through a registered staging arena;
+``object_layout`` is then the constant ``cell-v1`` and members may run any
+page-first-family host layout.
 
 The namespace is derived from deployment facts (model, logical KV dtype,
 page size, head grid) and its digest prefixes every key: deployments share
@@ -318,17 +323,12 @@ def build_canonical_cell_suffixes(
         )
     cells_per_rank = local_kv_heads // namespace.head_group
     first_head_index = attn_tp_rank * cells_per_rank
-    if len(layer_coords) > 1:
-        if cells_per_rank > 1:
-            raise NotImplementedError(
-                "head fan-out and layer fan-out cannot combine yet: they "
-                "require different host layouts (page_head vs "
-                "page_first_direct). Set either head_group or a "
-                "layer_partition your stages span, not both."
-            )
-        return [f"{digest}_{coord}_H{first_head_index}" for coord in layer_coords]
+    # The general case is the cross product, layer-major / head-minor — the
+    # same order the cell-adapter arena packs bytes in. Single-axis fan-outs
+    # are the degenerate cases (one coordinate list has length 1).
     return [
-        f"{digest}_{layer_coords[0]}_H{first_head_index + i}"
+        f"{digest}_{coord}_H{first_head_index + i}"
+        for coord in layer_coords
         for i in range(cells_per_rank)
     ]
 

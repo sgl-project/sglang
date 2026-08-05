@@ -49,10 +49,15 @@ class HiCacheStorageConfig:
     canonical_suffix: Optional[Union[str, List[str]]] = None
     # Layer fan-out (PP read-back): the LOCAL half-open layer ranges of this
     # rank's cells, one per canonical range the stage spans, in the same
-    # order as the canonical_suffix list. Set only when the stage spans more
-    # than one canonical range (rank-replicated pools on mooncake with the
-    # page_first_direct layout); None otherwise.
+    # order as the canonical_suffix list; None when the stage spans a single
+    # range and the cell adapter is off.
     canonical_layer_ranges: Optional[List[Tuple[int, int]]] = None
+    # Cell adapter (head x layer fan-out): the LOCAL half-open kv-head ranges
+    # of this rank's cells. When set, objects use the layout-neutral
+    # canonical byte order and the backend gathers/scatters them through a
+    # registered staging arena (canonical_layer_ranges is then always set
+    # too, possibly a single range). None outside adapter namespaces.
+    canonical_head_ranges: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass

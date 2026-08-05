@@ -7248,7 +7248,11 @@ class ServerArgs:
                         "multi-key-per-page backend; only mooncake supports "
                         "it."
                     )
-                if self.hicache_mem_layout != "page_head":
+                # With layer_partition also set, the cell adapter serializes
+                # objects in the layout-neutral canonical order — no host
+                # layout requirement. Without it, zero-copy head cells need
+                # page_head fleet-wide.
+                if layer_partition is None and self.hicache_mem_layout != "page_head":
                     raise ValueError(
                         "canonical-grid with head_group requires "
                         "--hicache-mem-layout page_head on every "
