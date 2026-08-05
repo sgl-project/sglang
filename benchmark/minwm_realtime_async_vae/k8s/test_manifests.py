@@ -154,6 +154,8 @@ def test_webui_enables_i2v_and_t2v_in_production_manifest():
 
     assert '"generationModes":["i2v","t2v"]' in env["REALTIME_UI_CONFIG_JSON"]
     assert '"t2vDefaultNumFrames":121' in env["REALTIME_UI_CONFIG_JSON"]
+    assert env["AWS_REGION"] == "REPLACE_WITH_AWS_REGION"
+    assert env["AWS_DEFAULT_REGION"] == "REPLACE_WITH_AWS_REGION"
 
 
 def test_west_model_artifact_uses_a_matching_read_only_s3_mount():

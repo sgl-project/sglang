@@ -150,7 +150,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
-          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:311d01a7f85b05df8f4128186288d2fcd821313c7dd66f98aac26464432314de
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:d32767be2bd16754024ead80cde73f79c3ce3c21d29ca6eeb5cc915b04d15272
           imagePullPolicy: IfNotPresent
           command: [/bin/sh, -ec]
           args:

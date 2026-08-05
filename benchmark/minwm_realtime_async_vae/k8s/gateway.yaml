@@ -74,6 +74,10 @@ spec:
               value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
             - name: TRACE_LOG_GROUP
               value: REPLACE_WITH_TRACE_LOG_GROUP
+            - name: AWS_REGION
+              value: REPLACE_WITH_AWS_REGION
+            - name: AWS_DEFAULT_REGION
+              value: REPLACE_WITH_AWS_REGION
             - name: OTEL_SERVICE_NAME
               value: minwm-realtime-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
