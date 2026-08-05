@@ -60,6 +60,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    stride_init_state,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -113,9 +114,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    # Slot stride comes from the caller (initial_state.stride(0)): the state pool
+    # may be an envelope-strided view (page-major / unified memory), where the
+    # per-slot pitch spans ALL layers' state, not H*V*K. int64: envelope pitches
+    # overflow an int32 index product.
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    h0 = initial_state + index * stride_init_state
+    ht = initial_state + index * stride_init_state
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -355,6 +360,9 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
