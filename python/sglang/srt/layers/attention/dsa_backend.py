@@ -83,7 +83,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_parallel
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
