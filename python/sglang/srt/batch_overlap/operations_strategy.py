@@ -96,8 +96,33 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
         forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
     ):
         return _compute_moe_deepseek_blog_decode(layer)
+    elif forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+        return _compute_moe_deepseek_draft_extend(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_deepseek_draft_extend(layer):
+    """Draft-extend (#7892): the decode op order plus the DSA seed-topk channel.
+
+    The plain decode strategy discards the topk that forward_core returns
+    (target TBO never relays it), but NextN's draft-extend must publish it as
+    the next draft loop's seed. Swap in the topk-keeping attn core and capture
+    the seed right after it, in the same stage, so the state key is consumed
+    before op_comm_postprocess_layer's state.clear.
+    """
+    from sglang.srt.batch_overlap.two_batch_overlap import op_capture_dsa_seed_topk
+
+    base = _compute_moe_deepseek_blog_decode(layer)
+    ops = list[Operation](base.operations)
+    core_index = ops.index(layer.self_attn.op_core)
+    ops[core_index] = layer.self_attn.op_core_with_topk
+    ops.insert(core_index + 1, op_capture_dsa_seed_topk)
+    return OperationsStrategy(
+        deep_gemm_num_sms=base.deep_gemm_num_sms,
+        tbo_delta_stages=base.tbo_delta_stages,
+        operations=ops,
+    )
 
 
 def _compute_moe_deepseek_blog_prefill(layer):

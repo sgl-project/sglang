@@ -47,7 +47,10 @@ from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftExtendInput,
+        EagleVerifyInput,
+    )
 
 _is_hip = is_hip()
 
@@ -65,6 +68,8 @@ def get_token_num_per_seq(
 ):
     if forward_mode.is_target_verify():
         return spec_info.draft_token_num
+    elif forward_mode.is_draft_extend_v2():
+        return spec_info.num_tokens_per_req
     elif forward_mode.is_decode():
         return 1
     elif forward_mode.is_idle():
@@ -84,7 +89,11 @@ def compute_split_seq_index(
     if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
-    elif forward_mode.is_target_verify() or forward_mode.is_decode():
+    elif (
+        forward_mode.is_target_verify()
+        or forward_mode.is_decode()
+        or forward_mode.is_draft_extend_v2()
+    ):
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
     elif forward_mode.is_idle() or forward_mode.is_prebuilt():
@@ -210,7 +219,7 @@ def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) 
 
 
 def split_spec_info(
-    spec_info: Optional[EagleVerifyInput],
+    spec_info: EagleVerifyInput | EagleDraftExtendInput | None,
     start_seq_index: int,
     end_seq_index: int,
     start_token_index: int,
@@ -218,6 +227,18 @@ def split_spec_info(
 ):
     if spec_info is None:
         return None
+
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    if isinstance(spec_info, EagleDraftExtendInput):
+        return _split_draft_extend_spec_info(
+            spec_info=spec_info,
+            start_seq_index=start_seq_index,
+            end_seq_index=end_seq_index,
+            start_token_index=start_token_index,
+            end_token_index=end_token_index,
+        )
+
     if spec_info.draft_token is not None:
         draft_token = spec_info.draft_token[start_token_index:end_token_index]
     else:
@@ -283,6 +304,112 @@ def split_spec_info(
     return output_spec_info
 
 
+# EagleDraftExtendInput split taxonomy (fixed-width draft-extend). Every
+# declared or instance-attached field must appear in exactly one bucket here
+# or in the special-cased set inside _split_draft_extend_spec_info — unlisted
+# fields fail loudly there, forcing new fields to pick a split rule.
+_DRAFT_EXTEND_TOKEN_FIELDS = ("input_ids", "positions", "hidden_states")
+_DRAFT_EXTEND_SEQ_FIELDS = (
+    "num_correct_drafts",
+    "num_accept_tokens",
+    "seq_lens",
+    "seq_lens_cpu",
+    "req_pool_indices",
+    "bonus_tokens",
+)
+_DRAFT_EXTEND_SCALAR_FIELDS = (
+    "num_front_tokens",
+    "capture_hidden_mode",
+    "num_tokens_per_req",
+    "num_tokens_for_logprob_per_req",
+)
+_DRAFT_EXTEND_SPECIAL_FIELDS = (
+    "num_accept_tokens_cpu",
+    "kv_indptr",
+    "select_index",
+    "dsa_seed_topk_select",
+    "dsa_seed_topk_capture",
+)
+
+
+def _split_draft_extend_spec_info(
+    spec_info: "EagleDraftExtendInput",
+    start_seq_index: int,
+    end_seq_index: int,
+    start_token_index: int,
+    end_token_index: int,
+):
+    width = spec_info.num_tokens_per_req
+    assert width > 0, f"draft-extend split needs a positive width, got {width=}"
+    # Widening (num_front_tokens > 0) makes the real per-req row count
+    # num_draft_tokens + front — a different width than num_tokens_per_req —
+    # so this fixed-width split would silently mis-slice. No TBO-wrapped
+    # worker widens today (only the multi-layer worker does, without the
+    # wrap); fail loudly so a future multi-layer enablement implements
+    # widening-aware slicing first instead of corrupting requests.
+    assert spec_info.num_front_tokens == 0, f"{spec_info.num_front_tokens=}"
+    # Fixed width: the request-ruler cut and the token-ruler cut must be the
+    # same knife position, or token and request fields would desynchronize.
+    # The parent's END may exceed batch_size * width by a sub-request tail:
+    # attn-tp alignment can pad input_ids (e.g. width=3, 15 tokens -> 16)
+    # with rows that belong to no request, and prepare_mlp_sync_batch floors
+    # batch_size to padded_len // width — so the excess is always < width.
+    # Child B absorbs those rows (token slices clamp to real tensor lengths).
+    assert start_token_index == start_seq_index * width and (
+        0 <= end_token_index - end_seq_index * width < width
+    ), f"{start_seq_index=} {end_seq_index=} {start_token_index=} {end_token_index=} {width=}"
+
+    # Fail loudly on any field without a split rule: silently dropping or
+    # mis-slicing one corrupts requests instead of crashing.
+    handled = (
+        set(_DRAFT_EXTEND_TOKEN_FIELDS)
+        | set(_DRAFT_EXTEND_SEQ_FIELDS)
+        | set(_DRAFT_EXTEND_SCALAR_FIELDS)
+        | set(_DRAFT_EXTEND_SPECIAL_FIELDS)
+    )
+    declared = {field.name for field in dataclasses.fields(spec_info)}
+    unhandled = (declared | set(vars(spec_info))) - handled - {"spec_input_type"}
+    assert not unhandled, f"unclassified EagleDraftExtendInput fields: {unhandled}"
+
+    updates = {}
+    for name in _DRAFT_EXTEND_TOKEN_FIELDS:
+        value = getattr(spec_info, name)
+        if value is not None:
+            updates[name] = value[start_token_index:end_token_index]
+    for name in _DRAFT_EXTEND_SEQ_FIELDS:
+        value = getattr(spec_info, name)
+        if value is not None:
+            updates[name] = value[start_seq_index:end_seq_index]
+    # Scalars (_DRAFT_EXTEND_SCALAR_FIELDS) carry over via replace() unchanged.
+
+    if spec_info.num_accept_tokens_cpu is not None:
+        updates["num_accept_tokens_cpu"] = spec_info.num_accept_tokens_cpu[
+            start_seq_index:end_seq_index
+        ]
+    if spec_info.kv_indptr is not None:
+        # Cumulative array: take bs+1 entries and rebase to the child's origin.
+        kv_indptr = spec_info.kv_indptr[start_seq_index : end_seq_index + 1]
+        updates["kv_indptr"] = kv_indptr - kv_indptr[0]
+    # Per-request values that point at flat token rows: slice by request,
+    # then shift into the child's token coordinate system.
+    if spec_info.select_index is not None:
+        updates["select_index"] = (
+            spec_info.select_index[start_seq_index:end_seq_index] - start_token_index
+        )
+    if spec_info.dsa_seed_topk_select is not None:
+        updates["dsa_seed_topk_select"] = (
+            spec_info.dsa_seed_topk_select[start_seq_index:end_seq_index]
+            - start_token_index
+        )
+    if spec_info.dsa_seed_topk_capture is not None:
+        # Output buffer: keep it a VIEW so child writes land in the parent.
+        updates["dsa_seed_topk_capture"] = spec_info.dsa_seed_topk_capture[
+            start_token_index:end_token_index
+        ]
+
+    return replace(spec_info, **updates)
+
+
 def compute_split_token_index(
     split_seq_index: int,
     forward_mode: ForwardMode,
@@ -294,7 +421,11 @@ def compute_split_token_index(
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
         return sum(extend_seq_lens[:split_seq_index])
-    elif forward_mode.is_target_verify() or forward_mode.is_decode():
+    elif (
+        forward_mode.is_target_verify()
+        or forward_mode.is_decode()
+        or forward_mode.is_draft_extend_v2()
+    ):
         assert token_num_per_seq is not None
         return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
@@ -503,7 +634,14 @@ class TboDPAttentionPreparer:
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
-        if batch.tbo_split_seq_index is None or is_draft_worker:
+        if batch.tbo_split_seq_index is None:
+            return
+        if is_draft_worker and not cls._should_prepare_draft_extend_children(
+            forward_mode=batch.forward_mode,
+            global_forward_mode=batch.global_forward_mode,
+            spec_info=batch.spec_info,
+            attn_backend=get_attn_backend(),
+        ):
             return
 
         tbo_children_num_token_non_padded = (
@@ -511,6 +649,45 @@ class TboForwardBatchPreparer:
         )
         cls.prepare_raw(
             batch, tbo_children_num_token_non_padded=tbo_children_num_token_non_padded
+        )
+
+    @staticmethod
+    def _should_prepare_draft_extend_children(
+        *,
+        forward_mode: ForwardMode,
+        global_forward_mode: Optional[ForwardMode],
+        spec_info: Optional[SpecInput],
+        attn_backend,
+    ) -> bool:
+        """Draft-worker gate for TBO children (#7892).
+
+        Only fixed-width draft-extend batches split; draft multi-step decode
+        forwards (mode DECODE, EagleDraftInput spec_info) stay monolithic. The
+        worker opts in by wrapping its draft-extend backend in TboAttnBackend,
+        so the backend type doubles as the configuration-static capability
+        signal (model arch, TBO flag, and the draft-extend-graph env are all
+        decided at that wrap site); prepare_raw asserts on that backend type,
+        so gating on it also keeps the assert unreachable while closed.
+        Idle draft-extend ranks must also split ([0, 0] children) so every DP
+        rank runs the same two dispatch/combine collectives (P0-3) — but only
+        under a global DECODE ticket. During a prefill step the active draft
+        ranks run draft-extend as plain EXTEND (monolithic, one dispatch), so
+        an idle rank splitting there would run two collectives against their
+        one and hang the EP group.
+        """
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        if not isinstance(attn_backend, TboAttnBackend):
+            return False
+        if not isinstance(spec_info, EagleDraftExtendInput):
+            return False
+        if forward_mode.is_draft_extend_v2():
+            return True
+        return (
+            forward_mode.is_idle()
+            and global_forward_mode is not None
+            and global_forward_mode.is_decode()
         )
 
     @classmethod
@@ -558,10 +735,20 @@ class TboForwardBatchPreparer:
             ),
             out_num_token_non_padded=out_num_token_non_padded_a,
         )
+        if batch.forward_mode.is_draft_extend_v2():
+            # Draft-extend's spec tensors are sized to the real bs * width
+            # rows, while input_ids may carry an attn-TP padding tail. The
+            # padded tail must not leak into child_b's slice — children carry
+            # only real rows and re-pad for themselves.
+            end_token_index_b = batch.batch_size * get_token_num_per_seq(
+                forward_mode=batch.forward_mode, spec_info=batch.spec_info
+            )
+        else:
+            end_token_index_b = batch.input_ids.shape[0]
         child_b = cls.filter_batch(
             batch,
             start_token_index=tbo_split_token_index,
-            end_token_index=batch.input_ids.shape[0],
+            end_token_index=end_token_index_b,
             start_seq_index=batch.tbo_split_seq_index,
             end_seq_index=batch.batch_size,
             out_num_token_non_padded=out_num_token_non_padded_b,
@@ -702,6 +889,25 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            elif key == "extend_start_loc" and batch.forward_mode.is_draft_extend_v2():
+                # Fixed-width draft-extend: rebuild the child's flat-token
+                # offsets (arange * width) rather than slicing the parent's.
+                # The parent copy holds PARENT coordinates, and DP MAX_LEN
+                # padding can grow batch_size without extending per-seq
+                # metadata like this one — a slice would then be short or
+                # stale, while the rebuild is exact for any child size.
+                width = get_token_num_per_seq(
+                    forward_mode=batch.forward_mode, spec_info=batch.spec_info
+                )
+                output_dict[key] = (
+                    torch.arange(
+                        end_seq_index - start_seq_index,
+                        dtype=old_value.dtype,
+                        device=old_value.device,
+                    )
+                    * width
+                )
+                continue
             elif key == "rids" and len(old_value) != num_seqs:
                 output_dict[key] = old_value[
                     start_seq_index : min(end_seq_index, len(old_value))
@@ -747,7 +953,13 @@ class TboForwardBatchPreparer:
         else:
             output_dict["mrope_positions"] = None
 
-        if not batch.forward_mode.is_target_verify():
+        # Uniform-width spec parents (target-verify, draft-extend) may carry an
+        # attn-TP padding tail in input_ids that extend_num_tokens excludes,
+        # so the row-count identity only holds for the other modes.
+        if not (
+            batch.forward_mode.is_target_verify()
+            or batch.forward_mode.is_draft_extend_v2()
+        ):
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
                 == batch.extend_num_tokens
@@ -858,12 +1070,43 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
         or forward_mode.is_target_verify()
     ):
         return None
-    elif forward_mode.is_extend():
+    elif forward_mode.is_extend(include_draft_extend_v2=True):
+        # Draft-extend children mirror the parent's extend_num_tokens
+        # (= bs * num_tokens_per_req) with their own slice's token count.
         return input_ids.shape[0]
     raise NotImplementedError
 
 
 # -------------------------------- Execution ---------------------------------------
+
+
+def op_capture_dsa_seed_topk(state):
+    """Draft-extend TBO op: publish the DSA seed topk through spec_info.
+
+    Mirrors the tail of ``DeepseekModelNextN.forward``. Under TBO each child's
+    ``spec_info`` holds a *view* slice of the parent's capture buffer (and a
+    rebased ``dsa_seed_topk_select``), so writing through the child lands in
+    the parent rows exactly like the monolithic write. No-op when the batch
+    did not request a seed capture (non-DSA, or the graph path owns the
+    buffer).
+    """
+    topk_indices = state.pop("topk_indices_after_attn")
+    spec_info = state.forward_batch.spec_info
+    seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
+    if seed_buf is None or topk_indices is None:
+        return
+    # The reuse channel belongs to the draft multi-step decode loop
+    # (eagle_worker_v2 toggles it around that loop only); a draft-extend
+    # forward never sets it, so this op does not implement that write-back.
+    assert not state.forward_batch.reuse_dsa_topk_indices
+    # Decode-path draft-extend leaves select None (the worker gathers rows
+    # post-forward via select_index) and sizes the buffer per token, which is
+    # what makes the per-child view write equal the monolithic write. A
+    # non-None select implies the prefill capture layout ((bs, k) buffer),
+    # whose write targets the TBO split does not preserve — fail loud.
+    assert spec_info.dsa_seed_topk_select is None
+    src = topk_indices[: seed_buf.shape[0]]
+    seed_buf[: src.shape[0]].copy_(src)
 
 
 def model_forward_maybe_tbo(
@@ -875,6 +1118,8 @@ def model_forward_maybe_tbo(
     input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
+    *,
+    strategy_forward_mode: Optional[ForwardMode] = None,
 ):
     inputs = dict(
         positions=positions,
@@ -884,8 +1129,14 @@ def model_forward_maybe_tbo(
         zero_allocator=zero_allocator,
     )
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    if strategy_forward_mode is None:
+        # Cross-rank agreed mode from the DP vote. Idle ranks must build the
+        # same op list as active ranks, hence global rather than local mode.
+        # Call sites whose phase the vote cannot express (draft-extend runs
+        # under a DECODE ticket) pass their mode explicitly.
+        strategy_forward_mode = forward_batch.global_forward_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        layers=layers, forward_mode=strategy_forward_mode
     )
     if enable_tbo:
         return _model_forward_tbo(

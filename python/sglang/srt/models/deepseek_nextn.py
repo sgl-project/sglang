@@ -25,6 +25,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
@@ -55,7 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -189,6 +190,55 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def _forward_decoder(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        use_cp_v1: bool,
+    ):
+        """Run the single decoder layer, TBO-split or monolithic.
+
+        Returns (hidden_states, residual, topk_indices). On the TBO path
+        topk_indices is None: the DSA seed is published inside
+        op_capture_dsa_seed_topk (each child writes its view slice of the
+        parent capture buffer), so nothing flows back to forward()'s tail.
+        """
+        if forward_batch.tbo_children is not None:
+            # Draft-extend TBO (#7892): run the two micro-batches interleaved
+            # through the op pipeline.
+            assert not use_cp_v1
+            assert not forward_batch.reuse_dsa_topk_indices
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=[self.decoder],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                input_data_scatter_mode=(
+                    self.decoder.layer_scatter_modes.layer_input_mode
+                ),
+                residual=residual,
+                zero_allocator=zero_allocator,
+                strategy_forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            )
+            return hidden_states, residual, None
+        return self.decoder(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            prev_topk_indices=(
+                forward_batch.spec_info.dsa_topk_indices
+                if forward_batch.reuse_dsa_topk_indices
+                else None
+            ),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -210,7 +260,10 @@ class DeepseekModelNextN(nn.Module):
 
         try:
             zero_allocator = BumpAllocator(
-                buffer_size=2,
+                # 2 per layer per micro-batch; under TBO both children draw
+                # from this allocator (same formula as DeepseekV2Model.forward
+                # with total_num_layers=1).
+                buffer_size=2 * (2 if forward_batch.can_run_tbo else 1),
                 dtype=torch.float32,
                 device=(
                     input_embeds.device
@@ -270,17 +323,13 @@ class DeepseekModelNextN(nn.Module):
                 forward_batch.reuse_dsa_topk_indices or seed_buf is not None
             )
             with get_global_expert_distribution_recorder().disable_this_region():
-                hidden_states, residual, topk_indices = self.decoder(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.spec_info.dsa_topk_indices
-                        if forward_batch.reuse_dsa_topk_indices
-                        else None
-                    ),
+                hidden_states, residual, topk_indices = self._forward_decoder(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    residual=residual,
+                    zero_allocator=zero_allocator,
+                    use_cp_v1=use_cp_v1,
                 )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:

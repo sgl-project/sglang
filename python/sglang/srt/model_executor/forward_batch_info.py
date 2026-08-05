@@ -1434,6 +1434,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
 
+        self._plan_tbo_children_if_preplanned(model_runner.attn_backend)
+
+    def _plan_tbo_children_if_preplanned(self, attn_backend) -> None:
+        if not (self.tbo_children and self.forward_metadata_ready):
+            return
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        assert isinstance(attn_backend, TboAttnBackend)
+        for child_backend, child in zip(
+            attn_backend.children, self.tbo_children, strict=True
+        ):
+            if child.batch_size > 0:
+                child_backend.init_forward_metadata(forward_batch=child)
+
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]

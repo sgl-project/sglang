@@ -2049,6 +2049,18 @@ class DeepseekV2AttentionMLA(
         else:
             state.hidden_states_after_attn = result
 
+    def op_core_with_topk(self, state):
+        # op_core variant for the draft-extend TBO strategy: keep the DSA seed
+        # topk for op_capture_dsa_seed_topk (which pops the key) instead of
+        # discarding it. NextN publishes it into spec_info's capture buffer;
+        # there is no next layer, so no cross-layer relay is involved.
+        result = self.forward_core(state.pop("attn_intermediate_state"))
+        if isinstance(result, tuple):
+            state.hidden_states_after_attn, state.topk_indices_after_attn = result
+        else:
+            state.hidden_states_after_attn = result
+            state.topk_indices_after_attn = None
+
     def forward(
         self,
         positions: torch.Tensor,

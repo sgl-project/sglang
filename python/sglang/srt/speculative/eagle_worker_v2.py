@@ -331,6 +331,51 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_backend_factory.create_draft_extend_backend()
         )
 
+        # Draft-extend TBO (#7892): split fixed-width draft-extend batches into
+        # two micro-batches so each deepep dispatch stays under the per-rank
+        # token cap. Gated on the draft-extend cuda graph being disabled (the
+        # graph runner cannot consume tbo_children yet), so default-config
+        # behavior is unchanged. The wrapped backend type is what opens
+        # TboForwardBatchPreparer's draft gate.
+        from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+        from sglang.srt.layers.moe.utils import (
+            get_speculative_moe_a2a_backend,
+            is_tbo_enabled,
+        )
+        from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
+        from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+
+        self.enable_draft_extend_tbo = (
+            is_tbo_enabled()
+            and envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+            and self.draft_extend_attn_backend is not None
+            and isinstance(self.draft_runner.model, DeepseekV3ForCausalLMNextN)
+            # The decode op list runs op_dispatch_a/b; the draft MoE must own
+            # a segmented-A2A dispatcher. speculative_moe_a2a_backend may
+            # resolve to "none" (StandardDispatcher) even when the target
+            # runs deepep — TBO cannot drive that draft MoE.
+            and not get_speculative_moe_a2a_backend().is_none()
+            # Prefill-CP flips model_input_output() to SCATTERED, which would
+            # route the TBO splitter's residual=None through an unproven
+            # gather path; the split assumes the TP_ATTN_FULL regime.
+            and not is_dsa_enable_prefill_cp()
+            and not is_mla_prefill_cp_enabled()
+        )
+        if self.enable_draft_extend_tbo:
+            self.draft_extend_attn_backend = TboAttnBackend(
+                primary=self.draft_extend_attn_backend,
+                children=[
+                    draft_backend_factory.create_draft_extend_backend()
+                    for _ in range(2)
+                ],
+            )
+            log_info_on_rank0(
+                logger,
+                "Draft-extend TBO enabled: draft-extend attn backend wrapped in "
+                "TboAttnBackend",
+            )
+
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
