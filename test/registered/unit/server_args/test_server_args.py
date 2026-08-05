@@ -1707,6 +1707,50 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
 
+class TestBreakableCudaGraphKDACompatibility(CustomTestCase):
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        text_config = SimpleNamespace(
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            linear_num_heads=64,
+            linear_head_dim=128,
+        )
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiLinearForCausalLM"],
+                get_text_config=lambda: text_config,
+            ),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_default_breakable_prefill_graph_is_disabled(self):
+        args = self._handled_args()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertNotEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+
+    def test_explicit_breakable_prefill_graph_is_preserved(self):
+        args = self._handled_args(cuda_graph_backend_prefill=Backend.BREAKABLE)
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_legacy_kda_layer_list_is_detected(self):
+        from sglang.srt.configs.model_config import uses_kda_attention
+
+        config = SimpleNamespace(linear_attn_config={"kda_layers": [0, 2]})
+
+        self.assertTrue(uses_kda_attention(config))
+
+
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
     """The BCG "multimodal model" rule exempts archs on the BCG multimodal
     opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""
