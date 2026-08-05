@@ -66,6 +66,8 @@ _MPS_MLP_TOKEN_CHUNK_SIZE = 256
 # its fused full-sequence projection
 _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 256
 _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
+# bound outstanding MPS releases while avoiding one command-buffer fence per chunk
+_MPS_RELEASE_INTERVAL = 8
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -657,7 +659,9 @@ class MiniMaxH3Attention(nn.Module):
 
         # Do not retain Q while producing the K/V cache.  Dropping the chunk
         # before the next transfer keeps only two full-width attention tensors.
-        for start in range(0, total, _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE):
+        for chunk_index, start in enumerate(
+            range(0, total, _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE)
+        ):
             stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, total)
             qkv, _ = self.qkv_proj(x[start:stop])
             q_chunk, k_chunk, v_chunk = qkv.split(self.local_inner_dim, dim=-1)
@@ -668,8 +672,11 @@ class MiniMaxH3Attention(nn.Module):
             key[start:stop].copy_(k_chunk)
             value[start:stop].copy_(v_chunk.view(-1, self.num_heads, self.head_dim))
             del qkv, k_chunk, v_chunk
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
+            if (chunk_index + 1) % _MPS_RELEASE_INTERVAL == 0:
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
 
         if self._attention_impl is None:
             self._set_attention_backend(
@@ -690,10 +697,12 @@ class MiniMaxH3Attention(nn.Module):
                 continue
             keys = key[sequence_start:sequence_stop].unsqueeze(0)
             values = value[sequence_start:sequence_stop].unsqueeze(0)
-            for start in range(
-                sequence_start,
-                sequence_stop,
-                _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE,
+            for chunk_index, start in enumerate(
+                range(
+                    sequence_start,
+                    sequence_stop,
+                    _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE,
+                )
             ):
                 stop = min(start + _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE, sequence_stop)
                 qkv, _ = self.qkv_proj(x[start:stop])
@@ -723,8 +732,11 @@ class MiniMaxH3Attention(nn.Module):
                     out[query_start:query_stop].copy_(projected)
                     del q, attention_out, projected
                 del qkv, q_chunk
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
+                if (chunk_index + 1) % _MPS_RELEASE_INTERVAL == 0:
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
         del key, value
         torch.mps.empty_cache()
@@ -856,15 +868,20 @@ class MiniMaxH3MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type == "mps":
             out = torch.empty_like(x)
-            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+            for chunk_index, start in enumerate(
+                range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE)
+            ):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
                 hidden, _ = self.fc1(x[start:stop])
                 hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
                 chunk, _ = self.fc2(hidden)
                 out[start:stop].copy_(chunk)
                 del hidden, chunk
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
+                if (chunk_index + 1) % _MPS_RELEASE_INTERVAL == 0:
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
@@ -1144,7 +1161,9 @@ class MiniMaxH3FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(adaln_input)
         if x.device.type == "mps":
             video = audio = None
-            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+            for chunk_index, start in enumerate(
+                range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE)
+            ):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
                 h = self.norm(x[start:stop])
                 h = _modulate_scale_shift(
@@ -1170,8 +1189,11 @@ class MiniMaxH3FinalLayer(nn.Module):
                 video[start:stop].copy_(video_chunk)
                 audio[start:stop].copy_(audio_chunk)
                 del h, video_chunk, audio_chunk
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
+                if (chunk_index + 1) % _MPS_RELEASE_INTERVAL == 0:
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
             assert video is not None and audio is not None
             return video, audio
         h = self.norm(x)
