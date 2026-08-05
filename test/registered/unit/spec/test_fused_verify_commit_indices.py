@@ -3,7 +3,8 @@
 One Triton launch replaces ~13 small ops (mamba slot gather + last accepted
 step + track interval-crossing step). Pins bitwise equality against the
 original formulas across accept dtypes, a non-contiguous accept_index, and
-seq_lens sitting on/off track boundaries.
+seq_lens sitting on/off track boundaries, plus the int32 output dtype the
+downstream scatters expect.
 """
 
 import pytest
@@ -38,7 +39,7 @@ def _reference(accept_index, accept_lens, seq_lens, req_pool_indices, mamba_map,
 
 
 class TestFusedVerifyCommitIndices(CustomTestCase):
-    def _case(self, bs, draft, idx_dtype, noncontig):
+    def _case(self, bs, draft, idx_dtype, noncontig, map_dtype=torch.int32):
         gen = torch.Generator(device=DEVICE).manual_seed(bs * 100 + draft)
         accept_lens = torch.randint(
             1, draft + 1, (bs,), device=DEVICE, dtype=torch.int32, generator=gen
@@ -56,7 +57,7 @@ class TestFusedVerifyCommitIndices(CustomTestCase):
             ]
         )[:bs].to(torch.int64)
         req_pool_indices = torch.randperm(64, device=DEVICE)[:bs]
-        mamba_map = torch.randperm(64, device=DEVICE, dtype=torch.int64)
+        mamba_map = torch.randperm(64, device=DEVICE).to(map_dtype)
 
         got = fused_verify_commit_indices(
             accept_index=accept_index,
@@ -76,17 +77,18 @@ class TestFusedVerifyCommitIndices(CustomTestCase):
             draft,
         )
         for g, r, name in zip(got, ref, ("slots", "last_correct", "track_steps")):
-            self.assertTrue(
-                torch.equal(g, r.to(torch.int64)),
-                f"{name} bs={bs} draft={draft} {idx_dtype=} {noncontig=}",
+            where = (
+                f"{name} bs={bs} draft={draft} {idx_dtype=} {noncontig=} {map_dtype=}"
             )
+            self.assertEqual(g.dtype, torch.int32, where)
+            self.assertTrue(torch.equal(g.to(torch.int64), r.to(torch.int64)), where)
 
     def test_matches_reference(self):
         for bs in (1, 3, 7):
             for idx_dtype in (torch.int64, torch.int32):
                 for noncontig in (False, True):
                     self._case(bs, 4, idx_dtype, noncontig)
-        self._case(5, 6, torch.int64, False)
+        self._case(5, 6, torch.int64, False, map_dtype=torch.int64)
 
 
 if __name__ == "__main__":

@@ -160,10 +160,10 @@ def _fused_verify_commit_indices_kernel(
     n = tl.load(accept_lens + i).to(tl.int64)
     off = i.to(tl.int64) * draft_token_num
     last = tl.load(accept_index + i * accept_width + n - 1) - off
-    tl.store(last_correct_out + i, last)
+    tl.store(last_correct_out + i, last.to(tl.int32))
     req = tl.load(req_pool_indices + i).to(tl.int64)
     slot = tl.load(mamba_map + req).to(tl.int64)
-    tl.store(state_batch_indices_out + i, slot)
+    tl.store(state_batch_indices_out + i, slot.to(tl.int32))
 
     pre = tl.load(seq_lens + i).to(tl.int64)
     post = pre + n
@@ -172,7 +172,7 @@ def _fused_verify_commit_indices_kernel(
     ith = tl.maximum(point - pre - 1, 0)
     cand = tl.load(accept_index + i * accept_width + ith) - off
     step = tl.where(crossed, cand, -1)
-    tl.store(track_steps_out + i, step)
+    tl.store(track_steps_out + i, step.to(tl.int32))
 
 
 def fused_verify_commit_indices(
@@ -189,12 +189,13 @@ def fused_verify_commit_indices(
     slot (mamba_map gather), the last accepted step (conv rollback / fold
     target), and the mamba-track interval-crossing step (-1 = no crossing).
     Bit-equivalent to spec_utils._verify_commit_step_indices +
-    get_mamba_indices."""
+    get_mamba_indices, int32 outputs included, so the int32 casts in the
+    downstream scatters stay no-ops instead of extra launches."""
     bs = accept_lens.shape[0]
     device = accept_lens.device
-    state_batch_indices = torch.empty(bs, dtype=torch.int64, device=device)
-    last_correct = torch.empty(bs, dtype=torch.int64, device=device)
-    track_steps = torch.empty(bs, dtype=torch.int64, device=device)
+    state_batch_indices = torch.empty(bs, dtype=torch.int32, device=device)
+    last_correct = torch.empty(bs, dtype=torch.int32, device=device)
+    track_steps = torch.empty(bs, dtype=torch.int32, device=device)
     _fused_verify_commit_indices_kernel[(bs,)](
         accept_index,
         accept_lens,
