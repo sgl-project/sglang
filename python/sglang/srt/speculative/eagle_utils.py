@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -55,62 +55,6 @@ elif _is_cpu:
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
-
-
-def _get_npu_mtp_sampling_ops(
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    accept_index: torch.Tensor,
-    tree_topk: int,
-    use_rejection_sampling: bool,
-) -> Tuple[Callable, Callable]:
-    """Validate the NPU topology and return backend-specific sampling ops."""
-    if tree_topk < 1 or candidates.ndim != 2:
-        is_supported = False
-    else:
-        batch_size, num_draft_tokens = candidates.shape
-        is_supported = (
-            retrieve_index.shape == candidates.shape
-            and retrieve_next_token.shape == candidates.shape
-            and retrieve_next_sibling.shape == candidates.shape
-            and accept_index.ndim == 2
-            and accept_index.shape[0] == batch_size
-            and 1 <= accept_index.shape[1] <= num_draft_tokens
-            and (
-                not use_rejection_sampling
-                or (tree_topk == 1 and accept_index.shape == candidates.shape)
-            )
-        )
-
-    if not is_supported:
-        raise ValueError(
-            "NPU non-greedy speculative sampling cannot consume this draft "
-            "topology. "
-            "Target-only sampling supports regular EAGLE trees with "
-            "tree_topk >= 1, while classic rejection sampling requires a "
-            "tree_topk=1 linear chain."
-        )
-
-    try:
-        from sgl_kernel_npu.sample import (
-            chain_speculative_sampling_rejection,
-            top_k_top_p_renorm_probs,
-            tree_speculative_sampling_target_only,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "NPU non-greedy speculative sampling requires the matching "
-            "sgl-kernel-npu sampling kernels."
-        ) from exc
-
-    sampling_fn = (
-        chain_speculative_sampling_rejection
-        if use_rejection_sampling
-        else tree_speculative_sampling_target_only
-    )
-    return top_k_top_p_renorm_probs, sampling_fn
 
 
 def per_step_draft_out_cache_loc(
@@ -797,14 +741,16 @@ def eagle_sample(
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
         if _is_npu:
-            top_k_top_p_renorm_probs, sampling_fn = _get_npu_mtp_sampling_ops(
-                candidates=candidates,
-                retrieve_index=verify_input.retrieve_index,
-                retrieve_next_token=verify_input.retrieve_next_token,
-                retrieve_next_sibling=verify_input.retrieve_next_sibling,
-                accept_index=accept_index,
-                tree_topk=verify_input.tree_topk,
-                use_rejection_sampling=use_rejection_sampling,
+            from sgl_kernel_npu.sample import (
+                chain_speculative_sampling_rejection,
+                top_k_top_p_renorm_probs,
+                tree_speculative_sampling_target_only,
+            )
+
+            sampling_fn = (
+                chain_speculative_sampling_rejection
+                if use_rejection_sampling
+                else tree_speculative_sampling_target_only
             )
         else:
             from sgl_kernel import (
