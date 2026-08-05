@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 import torch
 
@@ -627,7 +627,11 @@ class HiCacheNixl(HiCacheStorage):
         return 1
 
     def _get_hybrid_zero_copy_buffers(
-        self, transfer: PoolTransfer, ctx: _HybridPoolContext
+        self,
+        pool_name: PoolName,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        ctx: _HybridPoolContext,
     ) -> tuple[List[str], List[tuple], int]:
         """Build NIXL keys and memory descriptors for zero-copy hybrid transfers.
 
@@ -638,27 +642,27 @@ class HiCacheNixl(HiCacheStorage):
         match the host-pool metadata, and returns `(key_strs, host_buffers,
         key_multiplier)`.
         """
-        ptr_list, size_list = ctx.host_pool.get_page_buffer_meta(transfer.host_indices)
-        page_num = len(transfer.keys or [])
+        ptr_list, size_list = ctx.host_pool.get_page_buffer_meta(host_indices)
+        page_num = len(keys)
         if page_num == 0 or len(ptr_list) % page_num != 0:
             logger.error(
                 "HiCacheNixl: hybrid pool %s metadata mismatch: pages=%s ptrs=%s",
-                transfer.name,
+                pool_name,
                 page_num,
                 len(ptr_list),
             )
             return [], [], 0
         key_multiplier = len(ptr_list) // page_num
         key_strs = self._get_hybrid_component_keys(
-            transfer.keys or [],
-            transfer.name,
+            keys,
+            pool_name,
             key_multiplier,
             ctx.host_pool,
         )
         if len(key_strs) != len(ptr_list):
             logger.error(
                 "HiCacheNixl: hybrid pool %s key/meta mismatch: keys=%s ptrs=%s",
-                transfer.name,
+                pool_name,
                 len(key_strs),
                 len(ptr_list),
             )
@@ -666,7 +670,11 @@ class HiCacheNixl(HiCacheStorage):
         return key_strs, list(zip(ptr_list, size_list)), key_multiplier
 
     def _prepare_pool_transfer(
-        self, transfer: PoolTransfer, for_write: bool
+        self,
+        transfer: PoolTransfer,
+        keys: List[str],
+        host_indices: Optional[torch.Tensor],
+        for_write: bool,
     ) -> tuple[Optional[HostKVCache], List[str], List[tuple], List[int], int]:
         ctx = self._hybrid_pool_ctx.get(transfer.name)
         if ctx is None:
@@ -674,8 +682,6 @@ class HiCacheNixl(HiCacheStorage):
             return None, [], [], [], 0
 
         host_pool = ctx.host_pool
-        keys = transfer.keys or []
-        host_indices = transfer.host_indices
         page_size = getattr(host_pool, "page_size", 1) or 1
         expected = len(keys) * page_size
         if host_indices is None or host_indices.numel() != expected:
@@ -689,7 +695,7 @@ class HiCacheNixl(HiCacheStorage):
 
         if ctx.is_zero_copy:
             key_strs, host_buffers, key_multiplier = self._get_hybrid_zero_copy_buffers(
-                transfer, ctx
+                transfer.name, keys, host_indices, ctx
             )
             page_offsets = [
                 host_indices[i * page_size].item() for i in range(len(keys))
@@ -723,6 +729,24 @@ class HiCacheNixl(HiCacheStorage):
         )
         key_strs = self._get_component_keys(keys, transfer.name)
         return host_pool, key_strs, host_buffers, page_offsets, 1
+
+    def _iter_storage_pool_transfer_chunks(
+        self, transfer: PoolTransfer
+    ) -> Iterator[tuple[List[str], Optional[torch.Tensor]]]:
+        """Yield storage-only ``(keys, host_indices)`` chunks."""
+        keys = transfer.keys or []
+        host_indices = transfer.host_indices
+        ctx = self._hybrid_pool_ctx.get(transfer.name)
+        if ctx is None or len(keys) <= STORAGE_BATCH_SIZE:
+            yield keys, host_indices
+            return
+
+        page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+        for start in range(0, len(keys), STORAGE_BATCH_SIZE):
+            end = min(start + STORAGE_BATCH_SIZE, len(keys))
+            index_start = start * page_size
+            index_end = end * page_size
+            yield keys[start:end], host_indices[index_start:index_end]
 
     def _alloc_registered(
         self,
@@ -1112,38 +1136,55 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
-            host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
-                self._prepare_pool_transfer(transfer, for_write=False)
-            )
-            if host_pool is None or not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
-                continue
-
-            start_time = time.perf_counter()
-            transfer_results = self._batch_xfer(
-                key_strs, key_strs, host_buffers, "READ"
-            )
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_xfer_stats(
-                f"batch_get_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
-            )
-            ctx = self._hybrid_pool_ctx[transfer.name]
-            page_results = self._page_results(transfer_results, key_multiplier)
-            if not ctx.is_zero_copy:
-                for ok, page_offset, data_page in zip(
-                    page_results, page_offsets, ctx.bounce_get
-                ):
-                    if not ok:
-                        break
-                    host_pool.set_from_flat_data_page(
-                        page_offset,
-                        data_page.reshape(-1)[: ctx.bounce_payload_numel],
+            pool_results: List[bool] = []
+            for (
+                chunk_keys,
+                chunk_host_indices,
+            ) in self._iter_storage_pool_transfer_chunks(transfer):
+                host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
+                    self._prepare_pool_transfer(
+                        transfer,
+                        chunk_keys,
+                        chunk_host_indices,
+                        for_write=False,
                     )
-            results[transfer.name] = page_results
+                )
+                if host_pool is None or not key_strs:
+                    pool_results.extend([False] * len(chunk_keys))
+                    break
+
+                start_time = time.perf_counter()
+                transfer_results = self._batch_xfer(
+                    key_strs, key_strs, host_buffers, "READ"
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_xfer_stats(
+                    f"batch_get_v2[{transfer.name}]",
+                    len(chunk_keys),
+                    chunk_host_indices,
+                    [size for _, size in host_buffers],
+                    elapsed_ms,
+                )
+                ctx = self._hybrid_pool_ctx[transfer.name]
+                page_results = self._page_results(transfer_results, key_multiplier)
+                if not ctx.is_zero_copy:
+                    for ok, page_offset, data_page in zip(
+                        page_results, page_offsets, ctx.bounce_get
+                    ):
+                        if not ok:
+                            break
+                        host_pool.set_from_flat_data_page(
+                            page_offset,
+                            data_page.reshape(-1)[: ctx.bounce_payload_numel],
+                        )
+                pool_results.extend(page_results)
+                if not all(page_results):
+                    break
+            if len(pool_results) < len(transfer.keys or []):
+                pool_results.extend(
+                    [False] * (len(transfer.keys or []) - len(pool_results))
+                )
+            results[transfer.name] = pool_results
         return results
 
     def batch_set_v2(
@@ -1153,26 +1194,42 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
-            _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
-                transfer, for_write=True
-            )
-            if not key_strs:
-                results[transfer.name] = [False] * len(transfer.keys or [])
-                continue
+            pool_results: List[bool] = []
+            for (
+                chunk_keys,
+                chunk_host_indices,
+            ) in self._iter_storage_pool_transfer_chunks(transfer):
+                _, key_strs, host_buffers, _, key_multiplier = (
+                    self._prepare_pool_transfer(
+                        transfer,
+                        chunk_keys,
+                        chunk_host_indices,
+                        for_write=True,
+                    )
+                )
+                if not key_strs:
+                    pool_results.extend([False] * len(chunk_keys))
+                    break
 
-            start_time = time.perf_counter()
-            transfer_results = self._batch_xfer(
-                key_strs, key_strs, host_buffers, "WRITE"
-            )
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            self._log_xfer_stats(
-                f"batch_set_v2[{transfer.name}]",
-                len(transfer.keys or []),
-                transfer.host_indices,
-                [size for _, size in host_buffers],
-                elapsed_ms,
-            )
-            results[transfer.name] = self._page_results(
-                transfer_results, key_multiplier
-            )
+                start_time = time.perf_counter()
+                transfer_results = self._batch_xfer(
+                    key_strs, key_strs, host_buffers, "WRITE"
+                )
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                self._log_xfer_stats(
+                    f"batch_set_v2[{transfer.name}]",
+                    len(chunk_keys),
+                    chunk_host_indices,
+                    [size for _, size in host_buffers],
+                    elapsed_ms,
+                )
+                page_results = self._page_results(transfer_results, key_multiplier)
+                pool_results.extend(page_results)
+                if not all(page_results):
+                    break
+            if len(pool_results) < len(transfer.keys or []):
+                pool_results.extend(
+                    [False] * (len(transfer.keys or []) - len(pool_results))
+                )
+            results[transfer.name] = pool_results
         return results
