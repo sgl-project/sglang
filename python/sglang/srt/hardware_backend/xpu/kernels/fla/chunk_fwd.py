@@ -7,9 +7,9 @@ from sglang.kernels.ops.attention.fla.op import safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
 )
-from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.hardware_backend.xpu.kernels.fla.wy_fast import recompute_w_u_fwd
 
-_MERGE_DOT_PRECISION = tl.constexpr("ieee")
+_MERGE_DOT_PRECISION = tl.constexpr("tf32")
 
 
 @triton.heuristics(
