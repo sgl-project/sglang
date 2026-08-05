@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -758,11 +759,15 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
+        self.act_fn = SiluAndMul()
         self.reuse_fc1_activation = quant_config is None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if hidden.device.type == "npu":
+            hidden = self.act_fn(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
