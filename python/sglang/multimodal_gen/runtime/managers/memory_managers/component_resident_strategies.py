@@ -504,6 +504,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
         for manager in module.layerwise_offload_managers:
             manager.release_all()
         if current_platform.is_mps():
+            torch.mps.synchronize()
             module.restore_mps_cpu_non_layer_weights()
             torch.mps.empty_cache()
 
