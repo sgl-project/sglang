@@ -1443,7 +1443,9 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+    def _check_token_based_finish(
+        self, new_accepted_tokens: List[int], skip_user_stop: bool = False
+    ) -> bool:
         if self.sampling_params.ignore_eos:
             return False
 
@@ -1451,7 +1453,12 @@ class Req(ReqDllmMixin):
         matched_eos = False
 
         for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
+            # User-specified stop_token_ids are skipped during the reasoning
+            # phase — they are an explicit stop intent meant for the final
+            # answer, not the thinking content. System eos / think_end /
+            # chat-stop tokens below are always checked so reasoning can end
+            # normally.
+            if not skip_user_stop and self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
@@ -1587,13 +1594,22 @@ class Req(ReqDllmMixin):
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
+        # When reasoning is enabled, skip user-provided stop checks (stop
+        # strings/regex and user stop_token_ids) during the reasoning phase —
+        # they are meant to delimit the final answer, not the thinking content.
+        # System eos / think_end detection still runs so reasoning can end
+        # normally.
+        in_reasoning = self.require_reasoning and not self._is_reasoning_over
+
         # Stop string beats EOS/stop-token matched in the same step (speculative
         # decoding can accept >1 token): token-based would trim only the last
         # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
+        if not in_reasoning and self._check_str_based_finish(new_accepted_len):
             return
 
-        if self._check_token_based_finish(new_accepted_tokens):
+        if self._check_token_based_finish(
+            new_accepted_tokens, skip_user_stop=in_reasoning
+        ):
             return
 
         if self.grammar is not None and self.grammar.is_terminated():
