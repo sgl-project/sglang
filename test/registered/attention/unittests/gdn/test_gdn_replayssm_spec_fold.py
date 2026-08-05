@@ -136,6 +136,63 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
             )
             self.assertTrue(torch.equal(out_plain, out_ring), f"{dtype=}")
 
+    def test_ring_write_accepts_strided_qkv_views(self):
+        state = self._state(torch.float32)
+        inputs = _make_window(12)
+        packed_qkv = torch.cat(
+            [
+                inputs["q"].reshape(B * T, -1),
+                inputs["k"].reshape(B * T, -1),
+                inputs["v"].reshape(B * T, -1),
+            ],
+            dim=-1,
+        )
+        q, k, v = packed_qkv.split([H * K, H * K, HV * V], dim=-1)
+        strided_inputs = {
+            **inputs,
+            "q": q.view(1, B * T, H, K),
+            "k": k.view(1, B * T, H, K),
+            "v": v.view(1, B * T, HV, V),
+        }
+        contiguous_inputs = {
+            **inputs,
+            "q": strided_inputs["q"].contiguous(),
+            "k": strided_inputs["k"].contiguous(),
+            "v": strided_inputs["v"].contiguous(),
+        }
+        self.assertEqual(strided_inputs["q"].stride(1), packed_qkv.shape[-1])
+        self.assertFalse(strided_inputs["q"].is_contiguous())
+
+        contiguous_rings = _make_rings()
+        strided_rings = _make_rings()
+        contiguous_state = state.clone().unsqueeze(0).contiguous()
+        strided_state = state.clone().unsqueeze(0).contiguous()
+        contiguous_out = _run_verify(
+            contiguous_inputs,
+            self.gating,
+            contiguous_state[0],
+            self.slots,
+            rings=contiguous_rings,
+        )
+        strided_out = _run_verify(
+            strided_inputs,
+            self.gating,
+            strided_state[0],
+            self.slots,
+            rings=strided_rings,
+        )
+
+        self.assertTrue(torch.equal(contiguous_out, strided_out))
+        for name in contiguous_rings:
+            self.assertTrue(
+                torch.equal(contiguous_rings[name], strided_rings[name]),
+                name,
+            )
+
+        _fold(contiguous_state, contiguous_rings, self.slots, self.accept_lens)
+        _fold(strided_state, strided_rings, self.slots, self.accept_lens)
+        self.assertTrue(torch.equal(contiguous_state, strided_state))
+
     def test_fold_matches_snapshot_baseline_bitwise(self):
         for dtype in (torch.float32, torch.bfloat16):
             state = self._state(dtype)
