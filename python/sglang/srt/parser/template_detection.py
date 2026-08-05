@@ -677,8 +677,11 @@ def _resolve_architecture_auto_parsers(server_args) -> None:
     )
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
+    model_type = getattr(config, "model_type", "")
 
-    if "DeepseekV4" in arch:
+    if "KimiK3" in arch or model_type == "kimi_k3":
+        reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"

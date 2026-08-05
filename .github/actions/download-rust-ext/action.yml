@@ -1,0 +1,70 @@
+name: 'Download prebuilt Rust extensions'
+description: >
+  Put rust-ext-build's PyO3 extension modules in the checkout and set
+  SGLANG_BUILD_RUST_EXTS=none for the job, so install skips the cargo build.
+  Sets nothing when neither source has them, leaving install to compile.
+
+inputs:
+  artifact_name:
+    description: "rust-ext-build's artifact in this run; empty uses only the cache."
+    required: false
+    default: ''
+  cache_key_prefix:
+    description: 'Must match what _pr-test-rust-ext-build.yml saves under.'
+    required: false
+    default: rust-ext-x86_64-cp310-cp312
+
+outputs:
+  hit:
+    description: "'true' when the modules are in place, for callers that install a Rust toolchain only to build them."
+    value: ${{ steps.decide.outputs.hit }}
+
+runs:
+  using: composite
+  steps:
+    # continue-on-error: the artifact expires in a day, so a re-run falls through
+    # to the cache below.
+    - name: Download prebuilt Rust extensions
+      id: artifact
+      if: inputs.artifact_name != ''
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: python/sglang/srt/
+
+    # Gated with the restore below, not run unconditionally: a job whose artifact
+    # arrived never reads the cache, so it should not pay an apt-get for it. The
+    # self-hosted images ship without zstd, and the entries were saved with it.
+    - name: Ensure zstd so the cache entry is readable
+      if: steps.artifact.outcome != 'success'
+      shell: bash
+      run: bash scripts/ci/utils/ensure_zstd.sh
+
+    # Second, not first: the cache is evictable and this repo sits at its 10 GB
+    # limit. A run reads its own branch's entries plus the default branch's, so
+    # seed-rust-ext-cache.yml and the branch's own rust-ext-build both land here.
+    - name: Restore prebuilt Rust extensions from cache
+      id: cache
+      if: steps.artifact.outcome != 'success'
+      uses: actions/cache/restore@v4
+      with:
+        path: python/sglang/srt/*/_core*.so
+        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+
+    # Job-wide, but only setup.py reads it, and only while building.
+    # Whether the modules suit this interpreter is not decided here:
+    # require_prebuilt_rust_exts checks them against the local EXT_SUFFIX and
+    # clears this back to a source build on a mismatch.
+    - name: Decide whether to skip the cargo build
+      id: decide
+      shell: bash
+      run: |
+        set -uo pipefail
+        if [ "${{ steps.artifact.outcome }}" = "success" ] \
+           || [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
+        else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+        fi
