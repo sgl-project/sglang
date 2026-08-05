@@ -28,17 +28,11 @@ from torch.nn.parameter import Parameter
 # cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.environ import envs
-from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
@@ -60,7 +54,6 @@ from sglang.srt.utils import (
     is_sm120_supported,
     is_triton_kernels_available,
     mxfp_supported,
-    next_power_of_2,
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -74,7 +67,6 @@ has_triton_kernels = is_triton_kernels_available()
 if is_flashinfer_available():
     from flashinfer import (
         nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
     )
     from flashinfer.fused_moe.core import (
         get_w2_permute_indices_with_cache,
@@ -239,7 +231,6 @@ def quant_dequant_mxfp4(
 
 
 class Mxfp4Config(QuantizationConfig):
-
     def __init__(
         self,
         ignored_layers: Optional[list[str]] = None,
@@ -261,7 +252,6 @@ class Mxfp4Config(QuantizationConfig):
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
-
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
@@ -320,7 +310,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-
     def __init__(
         self,
         prefix: str,
@@ -921,7 +910,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_kernels:
-
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
@@ -1352,6 +1340,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmGenMxfp4MoeQuantInfo,
         )
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        routing_bias = getattr(layer, "_situ_routing_bias_bf16", None)
+        topk_output = dispatch_output.topk_output
+        if (
+            self.moe_runner_config.activation == "situ"
+            and routing_bias is None
+            and TopKOutputChecker.format_is_bypassed(topk_output)
+        ):
+            correction_bias = topk_output.topk_config.correction_bias
+            if correction_bias is not None:
+                routing_bias = correction_bias.to(torch.bfloat16)
+                layer._situ_routing_bias_bf16 = routing_bias
 
         quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -1369,6 +1370,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
+            routing_bias=routing_bias,
         )
         return self.runner.run(dispatch_output, quant_info)
 

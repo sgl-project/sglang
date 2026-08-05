@@ -895,6 +895,7 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
 
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
+    routing_bias: Optional[torch.Tensor] = None
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -902,23 +903,15 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    """SM100 (Blackwell) trtllm-gen MXFP4 fused experts.
-
-    Consumes BYPASSED topk directly: the kernel routes from ``router_logits``
-    internally. Quantizes the input itself (bf16 passthrough or mxfp8).
-    """
-    from flashinfer import trtllm_fp4_block_scale_moe
-
+    """SM100 (Blackwell) trtllm-gen MXFP4 fused experts."""
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    # When bf16 mode is enabled we skip input quant; TRT-LLM quantizes inside the
-    # kernel and pipelines it with the GEMMs.
     origin_hidden_states_dim = x.shape[-1]
+    prepared_packed_topk = None
     if quant_info.flashinfer_mxfp4_moe_precision == "bf16":
         assert x.dtype == torch.bfloat16
         x_quant = x
@@ -931,10 +924,34 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 value=0.0,
             )
     elif quant_info.flashinfer_mxfp4_moe_precision == "default":
-        x_quant, x_scale = flashinfer_mxfp8_quantize(
-            x, False, alignment=quant_info.hidden_size
-        )
-        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+        if x.shape[-1] == quant_info.hidden_size:
+            if x.dim() > 2:
+                x = x.view(-1, x.shape[-1])
+
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            prepared = route_quant_handoff.take(x)
+            if prepared is not None:
+                prepared_packed_topk, x_quant, x_scale = prepared
+                x_scale = x_scale.view(torch.float8_e4m3fn)
+            else:
+                from sglang.kernels.ops.quantization.per_token_group_quant import (
+                    per_token_group_quant,
+                )
+
+                x_quant, x_scale = per_token_group_quant(
+                    x, group_size=32, scale_ue8m0=True
+                )
+                x_scale = x_scale.view(torch.float8_e4m3fn)
+        else:
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
+
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                x, False, alignment=quant_info.hidden_size
+            )
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         raise NotImplementedError(
             f"Unsupported flashinfer_mxfp4_moe_precision: "
@@ -942,19 +959,123 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         )
 
     assert x_quant.shape[-1] == quant_info.hidden_size
-    assert TopKOutputChecker.format_is_bypassed(topk_output)
+    is_standard = TopKOutputChecker.format_is_standard(topk_output)
+    assert is_standard or TopKOutputChecker.format_is_bypassed(
+        topk_output
+    ), f"unsupported topk format: {topk_output.format}"
+    if is_standard:
+        assert (
+            runner_config.activation == "situ"
+        ), "standard topk output only wired for the situ path"
+        top_k = topk_output.topk_ids.shape[1]
+        router_logits = None
+    else:
+        top_k = topk_output.topk_config.top_k
+        router_logits = topk_output.router_logits
 
-    top_k = topk_output.topk_config.top_k
-    router_logits = topk_output.router_logits
+    num_tokens = x_quant.shape[0]
+    from sglang.srt.layers import zero_copy_context
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        num_tokens = x_quant.shape[0]
-        symm_output = torch.empty(
-            num_tokens,
-            origin_hidden_states_dim,
-            dtype=torch.bfloat16,
-            device=x_quant.device,
+    symm_output = zero_copy_context.get_moe_output_spec(
+        torch.Size((num_tokens, origin_hidden_states_dim)),
+        torch.bfloat16,
+        x_quant.device,
+    )
+    if symm_output is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty(
+                num_tokens,
+                origin_hidden_states_dim,
+                dtype=torch.bfloat16,
+                device=x_quant.device,
+            )
+
+    if runner_config.activation == "situ":
+        from sglang.kernels.ops.moe import trtllm_gen_moe as situ_moe
+
+        if not situ_moe.available():
+            raise RuntimeError(
+                "activation='situ' with the flashinfer_mxfp4 runner needs the "
+                "SiTU cubin pool: set SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL (see "
+                "sglang/kernels/ops/moe/trtllm_gen_moe.py)."
+            )
+
+        if is_standard:
+            if prepared_packed_topk is not None:
+                packed_topk = prepared_packed_topk
+            else:
+                packed_topk = PackTopkIds.execute(
+                    topk_output.topk_ids, topk_output.topk_weights
+                )
+
+            defer_finalize = _deferred_finalize_enabled.get()
+            result = situ_moe.trtllm_fp4_block_scale_routed_moe(
+                packed_topk_ids=packed_topk,
+                hidden_states=x_quant,
+                hidden_states_scale=x_scale,
+                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights_scale=quant_info.w13_weight_scale,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_clamp_limit,
+                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights_scale=quant_info.w2_weight_scale,
+                output1_scale_scalar=None,
+                output1_scale_gate_scalar=None,
+                output2_scale_scalar=None,
+                num_experts=quant_info.global_num_experts,
+                top_k=packed_topk.shape[1],
+                intermediate_size=quant_info.intermediate_size_per_partition,
+                activation_type=situ_moe.ACTIVATION_SITU,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+                output=symm_output,
+                do_finalize=not defer_finalize,
+            )
+            if defer_finalize:
+                gemm2_out, topk_weights, expanded_idx = result
+                result = FlashInferTrtllmDeferredFinalizeOutput(
+                    gemm2_out=gemm2_out,
+                    expert_weights=topk_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx,
+                    top_k=packed_topk.shape[1],
+                )
+            return StandardCombineInput(hidden_states=result)
+
+        situ_moe.trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.bfloat16).contiguous(),
+            routing_bias=quant_info.routing_bias,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_clamp_limit,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=quant_info.global_num_experts,
+            top_k=top_k,
+            n_group=topk_output.topk_config.num_expert_group,
+            topk_group=topk_output.topk_config.topk_group,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            routed_scaling_factor=(
+                topk_output.topk_config.routed_scaling_factor or 1.0
+            ),
+            routing_method_type=situ_moe.ROUTING_DEEPSEEK_V3,
+            activation_type=situ_moe.ACTIVATION_SITU,
+            norm_topk_prob=topk_output.topk_config.renormalize,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            output=symm_output,
         )
+        return StandardCombineInput(hidden_states=symm_output)
+
+    from flashinfer import trtllm_fp4_block_scale_moe
+
     trtllm_gen_output = trtllm_fp4_block_scale_moe(
         router_logits.to(torch.bfloat16),
         None,  # routing_bias
