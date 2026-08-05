@@ -166,6 +166,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -374,6 +375,10 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Graph runners record this persistent event after shared-state reads.
+        self.war_read_done_event = make_war_read_done_event(
+            torch.get_device_module(self.device)
+        )
 
         # CPU offload
         set_offloader(
