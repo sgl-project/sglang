@@ -402,6 +402,7 @@ def test_kda_decode_cake_indexed_state_cuda_graph_replay():
         state_ref = initial_state.clone()
         output_ref = _decode(tri, active, state_ref, lower_bound=-5.0).float()
 
+        capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             graph_state.copy_(initial_state)
             graph_indices.copy_(indices)
