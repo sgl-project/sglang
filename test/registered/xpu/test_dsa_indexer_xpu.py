@@ -222,6 +222,7 @@ class MockModelRunner:
                 "dsa_topk_backend": "torch",  # XPU uses torch.topk fallback
                 "dsa_paged_mqa_logits_backend": "auto",
                 "disaggregation_mode": "null",
+                "enable_two_batch_overlap": False,
             },
         )()
         self.hisparse_coordinator = None

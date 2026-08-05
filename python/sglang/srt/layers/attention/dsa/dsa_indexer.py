@@ -1531,6 +1531,19 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             index_k_scale=k_scale,
         )
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        return self.forward_cuda(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
