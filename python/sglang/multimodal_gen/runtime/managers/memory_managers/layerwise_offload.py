@@ -54,7 +54,13 @@ class LayerwiseOffloadManager:
         # mps shares physical memory with the CPU and has no pinned host memory
         # or CUDA-style copy streams
         self.pin_cpu_memory = bool(pin_cpu_memory and not self._synchronous_mps)
-        self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
+        # an explicit MPS zero avoids staging the next layer alongside the
+        # active one; MPS has no transfer overlap to recover from that cost
+        self.prefetch_size = (
+            0
+            if current_platform.is_mps() and prefetch_size == 0
+            else min(max(1, prefetch_size), self.num_layers)
+        )
         # Leading layers held on GPU across denoise steps, instead of being
         # re-streamed every step like the tail.
         self.resident_layers = min(max(0, int(resident_layers)), self.num_layers)
@@ -685,7 +691,7 @@ class LayerwiseOffloadManager:
                     )
 
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                if i % self.prefetch_size == 0:
+                if self.prefetch_size and i % self.prefetch_size == 0:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
@@ -770,7 +776,9 @@ class LayerwiseOffloadableModuleMixin:
             prefetch_value = (
                 server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
             )
-            if prefetch_value < 1.0:
+            if current_platform.is_mps() and prefetch_value == 0.0:
+                prefetch_size = 0
+            elif prefetch_value < 1.0:
                 prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))
             else:
                 prefetch_size = int(prefetch_value)
