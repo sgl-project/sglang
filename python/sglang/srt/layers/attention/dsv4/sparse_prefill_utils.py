@@ -195,6 +195,7 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    num_qo_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -216,9 +217,19 @@ def build_swa_token_ids(
         full_to_swa: (full_pool_size + extra,) int64. Maps full kv id to
             SWA-cache id.
         swa_window: int. SWA window size.
+        num_qo_tokens: int. Total query tokens in the chunk (``== sum(
+            extend_seq_lens)``). Known on the host, so it lets us size the
+            output from a host-computable upper bound and skip the per-chunk
+            device sync.
 
     Returns:
-        swa_token_ids: (total_swa,) int32, flat physical SWA-cache token IDs.
+        swa_token_ids: (padded_total_swa,) int32, flat physical SWA-cache
+            token IDs. Length is a host-computed upper bound
+            (``num_qo_tokens + num_reqs * (swa_window - 1)``); only the first
+            ``swa_offsets[-1]`` entries are meaningful, the rest stay 0.
+            Consumers bound the valid region via ``swa_offsets`` (dequant of
+            the zero-padded tail reads SWA slot 0 and is never referenced by
+            the combined indices).
         swa_first_pos: (num_reqs,) int32, first seq position covered per req.
         swa_gather_lens: (num_reqs,) int32, gather length per request.
         swa_offsets: (num_reqs+1,) int32, exclusive cumsum of swa_gather_lens.
@@ -238,10 +249,16 @@ def build_swa_token_ids(
     swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
     swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
-    total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
 
-    swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
-    if total_swa == 0:
+    # Host-computable upper bound on total_swa, so we never sync the device to
+    # size the output. Per request swa_gather_lens = min(seq_len, extend + W -
+    # 1) <= extend + (W - 1), and sum(extend) == num_qo_tokens; hence the sum
+    # is bounded by num_qo_tokens + num_reqs * (W - 1). Zero-init so the
+    # unwritten tail (positions >= swa_offsets[-1]) dequants SWA slot 0 rather
+    # than uninitialized garbage; the combined indices never reference it.
+    max_total_swa = num_qo_tokens + num_reqs * (swa_window - 1)
+    swa_token_ids = torch.zeros(max_total_swa, dtype=torch.int32, device=device)
+    if max_total_swa == 0:
         return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
 
     NUM_WORKERS = 128
@@ -337,6 +354,7 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                num_qo_tokens=num_qo_tokens,
             )
         )
 
