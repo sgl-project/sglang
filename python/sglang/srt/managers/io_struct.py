@@ -204,6 +204,13 @@ class GenerateReqInput:
     ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Request-scoped dots.note.omni video preprocessing configuration.
+    seq: int = 131072
+    output_reserve: Optional[int] = None
+    audio_cap: float = 1.0
+    audio_sr: int = 16000
+    k_mode: str = "eval_ek"
+    video_question: Optional[str] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.

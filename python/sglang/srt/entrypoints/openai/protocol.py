@@ -867,6 +867,15 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
 
+    # dots.note.omni train-consistent video preprocessing controls.  These are
+    # intentionally request-scoped because different evaluation jobs can share
+    # one server while using different context budgets.
+    seq: int = Field(default=131072, gt=0)
+    output_reserve: Optional[int] = Field(default=None, ge=0)
+    audio_cap: float = Field(default=1.0, ge=0)
+    audio_sr: int = Field(default=16000, gt=0)
+    k_mode: str = "eval_ek"
+
     images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
@@ -931,6 +940,14 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
+
+    @model_validator(mode="after")
+    def validate_dots_video_preprocess_config(self):
+        if self.output_reserve is not None and self.output_reserve >= self.seq:
+            raise ValueError("output_reserve must be smaller than seq")
+        if not self.k_mode:
+            raise ValueError("k_mode must not be empty")
+        return self
 
     @model_validator(mode="before")
     @classmethod

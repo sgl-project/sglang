@@ -203,6 +203,29 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
+    """Return the text paired with a native video in the last user turn.
+
+    dots.note.omni's train-consistent video adapter needs the unrendered
+    question both for its deterministic sampling seed and its preheat-cache
+    key.  The rendered chat prompt is not sufficient because it also contains
+    role and system tokens.
+    """
+    for message in reversed(request.messages or []):
+        if getattr(message, "role", None) != "user":
+            continue
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        has_video = any(getattr(part, "type", None) == "video_url" for part in content)
+        if not has_video:
+            continue
+        return "".join(
+            getattr(part, "text", "") or ""
+            for part in content
+            if getattr(part, "type", None) == "text"
+        )
+    return None
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -1049,6 +1072,12 @@ class OpenAIServingChat(OpenAIServingBase):
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            seq=request.seq,
+            output_reserve=request.output_reserve,
+            audio_cap=request.audio_cap,
+            audio_sr=request.audio_sr,
+            k_mode=request.k_mode,
+            video_question=_extract_video_question(request),
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )
