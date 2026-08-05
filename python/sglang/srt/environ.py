@@ -1016,6 +1016,14 @@ class Envs:
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
 
     # HTTP Server
+    # 5s default is conservative; operators fronting clients with longer
+    # idle keep-alive (Go net/http 90s, reqwest 90s, Node 60s) typically
+    # want to raise this to avoid pool-reuse races (server-initiated FIN
+    # racing the next reused request → 1 RTT + TLS handshake on the
+    # critical path). Override via SGLANG_TIMEOUT_KEEP_ALIVE or
+    # --timeout-keep-alive. Only applies to entrypoints that run an HTTP
+    # listener (e.g. `sglang serve`, HttpServerEngineAdapter) -- the plain
+    # Engine class never starts one, so this has no effect there.
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
