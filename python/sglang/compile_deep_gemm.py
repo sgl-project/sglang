@@ -29,6 +29,14 @@ from sglang.srt.utils import kill_process_tree
 
 multiprocessing.set_start_method("spawn", force=True)
 
+# Prevent resource_tracker warnings on shutdown when child processes are forcefully terminated
+try:
+    import multiprocessing.resource_tracker
+
+    multiprocessing.resource_tracker.register = lambda *args, **kwargs: None
+except (ImportError, AttributeError):
+    pass
+
 # Reduce warning
 envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.set(True)
 # Force enable deep gemm
