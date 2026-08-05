@@ -1,9 +1,8 @@
-"""``RustServer._partition_cores`` (managers/rust_server.py): the rust
-server's pool cores must be a *bounded* slice of this rank's allowed cores,
-not the whole remainder — sibling TP ranks share the NUMA node, and an
-unbounded mask lets MM preprocessing bursts preempt a sibling's CUDA-launch
-thread (measured: ~20 ms of ViT wall time per image request on TP4). Pure
-computation, so this runs without the Rust extension."""
+"""``RustServer._partition_cores`` (managers/rust_server.py): the pool cores must
+be a *bounded* slice of this rank's allowed cores, not the whole remainder —
+sibling TP ranks share the NUMA node, so an unbounded mask lets MM preprocessing
+bursts preempt a sibling's CUDA-launch thread (measured: ~20 ms of ViT wall time
+per image request on TP4). Pure computation, so no Rust extension needed."""
 
 import unittest
 from unittest.mock import patch

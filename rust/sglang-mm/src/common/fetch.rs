@@ -15,12 +15,12 @@ use base64::Engine;
 /// payloads reject the request here).
 pub const MAX_FETCH_BYTES: u64 = 64 << 20;
 
-/// Charge granularity of a streaming read: one chunk is what an in-flight
-/// source may over-charge a shared [`ByteBudget`] by.
+/// Charge granularity of a streaming read: the most an in-flight source can
+/// over-charge a shared [`ByteBudget`] by.
 const CHUNK_BYTES: u64 = 256 << 10;
 
 /// A byte allowance shared by every source of one request, charged *as they
-/// stream* — so concurrent fetches stop at their combined size instead of each
+/// stream*, so concurrent fetches stop at their combined size rather than each
 /// stopping at [`MAX_FETCH_BYTES`].
 #[derive(Debug)]
 pub struct ByteBudget(std::sync::atomic::AtomicU64);
@@ -53,8 +53,7 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
 }
 
 /// [`fetch_bytes`] against a caller-owned allowance, for resolving several
-/// sources under one whole-request bound (`api_server::prefetch`).
-/// [`MAX_FETCH_BYTES`] still caps each payload.
+/// sources under one whole-request bound. [`MAX_FETCH_BYTES`] still caps each.
 pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     if src.starts_with("http://") || src.starts_with("https://") {
         return http_get(src, budget);
@@ -77,8 +76,7 @@ pub fn fetch_bytes_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, S
 }
 
 /// Base64 payloads are already resident in the request body — they cannot
-/// amplify the way a download can, so they charge the budget once decoded
-/// instead of chunk by chunk.
+/// amplify the way a download can, so they charge once decoded, not per chunk.
 fn charge_decoded(decoded: Vec<u8>, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     budget
         .claim(decoded.len() as u64)
@@ -98,7 +96,7 @@ fn read_file(path: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
 }
 
 /// Read to EOF, charging `budget` per chunk, so an oversized source stops
-/// mid-stream instead of becoming resident in full.
+/// mid-stream instead of going fully resident first.
 fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     let too_big = || format!("media fetch: {what}: exceeds {MAX_FETCH_BYTES} bytes");
     let mut buf = Vec::new();

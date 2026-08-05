@@ -158,8 +158,9 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
-    /// Whether the model accepts multimodal inputs. Gates the MM Encoding
-    /// branch in tm-ingress (`false` → mm fields silently ignored).
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
+    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// `TokenizerManager` does with `mm_processor is None`.
     #[serde(default)]
     pub is_multimodal: bool,
     /// Resolved default sampling parameters, stamped by
@@ -263,10 +264,8 @@ impl ServerArgs {
         self.disaggregation_mode == "prefill"
     }
 
-    /// Whether the served model is multimodal (`model_config.is_multimodal`
-    /// from the scheduler's dump). Gates the MM Encoding branch: when false,
-    /// mm fields on a request are silently ignored, mirroring the Python
-    /// `TokenizerManager` (`mm_processor is None`).
+    /// Whether the served model is multimodal, from the scheduler's dump. See
+    /// [`ModelConfig::is_multimodal`].
     pub fn model_is_multimodal(&self) -> bool {
         self.model_config.is_multimodal
     }

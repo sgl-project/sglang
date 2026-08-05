@@ -42,8 +42,8 @@ def import_processors(package_name: str, overwrite: bool = False):
 
 
 def get_mm_processor_cls(hf_config, server_args: ServerArgs, model_config=None):
-    """The processor class :func:`get_mm_processor` would instantiate, or
-    ``None`` when no processor is registered for the architecture."""
+    """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
+    architecture has no registered processor."""
     model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
     uses_transformers_backend = model_impl == "transformers"
     if model_impl == "auto" and model_config is not None:

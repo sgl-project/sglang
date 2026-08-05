@@ -47,12 +47,10 @@ flume = "0.12.0"
 bytemuck = "1"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
-# POSIX shm for the MM feature fan-out (`mm::ShmSegment`): the worker writes
-# feature buffers into named segments so the TP broadcast carries a pointer,
-# not the tensor. Linux-only crate usage; no default features needed.
+# POSIX shm for the MM feature fan-out (`mm::ShmSegment`).
 libc = "0.2"
-# Same major as the workspace pyo3: the zero-copy MM drain
-# (`take_mm`) moves Rust vectors into numpy arrays.
+# Same major as the workspace pyo3: the zero-copy MM drain (`take_mm`) moves
+# Rust vectors into numpy arrays.
 numpy = "0.29.0"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
@@ -60,10 +58,9 @@ rmpv = { version = "1", features = ["with-serde"] }
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
-# The pure-Rust core of the MM pipeline. `default-features = false`
-# drops the pyo3 bindings so the crate links as a plain rlib; the dependency
-# is renamed so `use sglang_mm::…` reads naturally while the crate keeps its
-# unique `sglang_mm_core` artifact name in the shared workspace target/.
+# The pure-Rust core of the MM pipeline. `default-features = false` drops the
+# pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
+# naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 
 [dev-dependencies]

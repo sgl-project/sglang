@@ -1,9 +1,9 @@
 //! Convert a parked request's [`MmWorkItem`] into the typed [`MmInput`] the
 //! `sglang-mm` driver consumes — an in-process handoff, nothing serialized.
 //!
-//! Every `Err` rejects the request back to the client (there is no Python
-//! fallback path); the message says whether the input is malformed or merely
-//! outside the pipeline's scope (video/audio, precomputed features, ...).
+//! Every `Err` rejects the request back to the client; the message says whether
+//! the input is malformed or merely outside the pipeline's scope (video/audio,
+//! precomputed features, …).
 
 use bytes::Bytes;
 use rmpv::Value;
@@ -11,11 +11,11 @@ use sglang_mm::driver::{ImageSource, MmInput};
 
 use super::request::MmWorkItem;
 
-/// True for source forms the API layer must resolve before MM dispatch: I/O —
-/// network *or* disk (a network mount can hang past any HTTP timeout) — never
-/// runs on the fixed MM worker pool (see `api_server::prefetch`). `data:` and
-/// bare base64 are pure CPU and stay on the worker. Owned here, next to
-/// `collect_images`, so the prefetch walk and the parse walk can never drift.
+/// True for sources the API layer must resolve before MM dispatch: I/O — network
+/// *or* disk, since a network mount can hang past any HTTP timeout — never runs
+/// on the fixed MM worker pool (see `api_server::prefetch`). `data:` and bare
+/// base64 are pure CPU and stay on the worker. Lives next to `collect_images` so
+/// the prefetch walk and the parse walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {
     src.starts_with("http://")
         || src.starts_with("https://")
@@ -39,8 +39,8 @@ pub fn io_sources(value: &Value) -> Vec<String> {
     out
 }
 
-/// How many media items an `image_data` value contributes, in the same walk
-/// [`collect_images`] uses — so the item budget can reject before fetching.
+/// How many media items an `image_data` value contributes, walked the way
+/// [`collect_images`] walks it, so the item budget can reject before fetching.
 pub fn item_count(value: &Value) -> usize {
     match value {
         Value::Nil => 0,
@@ -49,9 +49,9 @@ pub fn item_count(value: &Value) -> usize {
     }
 }
 
-/// `work.prefetched` holds the already-resolved bytes of the I/O-backed
-/// sources (in [`io_sources`] order); those sources are swapped for their
-/// bytes, and one left without an entry is an internal error, not a fetch.
+/// I/O-backed sources are swapped for their `work.prefetched` bytes (in
+/// [`io_sources`] order); one left without an entry is an internal error here,
+/// never a fetch.
 pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
     let present = |v: &Option<Value>| v.as_ref().is_some_and(value_present);
     if present(&work.video_data) || present(&work.audio_data) {
@@ -113,9 +113,9 @@ fn collect_images(
     }
 }
 
-/// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty /
+/// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty or
 /// all-nil lists don't count as multimodal input. Shared with the ingress
-/// `has_multimodal` routing check so routing and parsing can never drift.
+/// `has_multimodal` check so routing and parsing cannot drift.
 pub fn value_present(value: &Value) -> bool {
     match value {
         Value::Nil => false,
@@ -178,9 +178,8 @@ mod tests {
         assert_eq!(to_mm_input(work).unwrap().images.len(), 1);
     }
 
-    /// I/O-backed sources (URLs and file paths) are swapped for their
-    /// prefetched bytes in walk order; one left unfetched is an error, so
-    /// neither network nor disk I/O can ever reach an MM worker.
+    /// I/O-backed sources (URLs, file paths) take their prefetched bytes in walk
+    /// order; one left unfetched errors, so no I/O can reach an MM worker.
     #[test]
     fn io_sources_use_prefetched_bytes() {
         let image = Value::Array(vec![

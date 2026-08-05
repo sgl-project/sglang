@@ -1,9 +1,8 @@
 """E2E: Rust tokenizer-manager native multimodal path (``SGLANG_RUST_SERVER=1``).
 
-Covers what the CPU parity units structurally cannot: the sidecar handoff
-(``take_mm`` wrapping Rust-owned buffers), the drain ordering, the
-Rust-side text tokenization of multimodal prompts, and the rejection of
-inputs outside the native pipeline's scope (there is no Python fallback).
+Covers what the CPU parity units structurally cannot: the sidecar handoff, the
+drain ordering, Rust-side tokenization of multimodal prompts, and the rejection
+of inputs outside the native pipeline's scope (there is no Python fallback).
 """
 
 import base64
@@ -98,13 +97,11 @@ class TestRustServerNativeMm(CustomTestCase):
         self.assertIn("red", text)
 
     def test_unsupported_format_is_rejected(self):
-        # A real image in a format the native pipeline cannot decode must be
-        # rejected (4xx/500) — never silently answered — and must not crash
-        # the server. PCX is the probe: sglang-mm enables only
-        # jpeg/png/webp/gif/bmp, and in the server binary feature unification
-        # (dynamo-parsers → openai-harmony → image default features) widens
-        # that to every image-crate default format, so the probe has to be a
-        # format the image crate does not know at all.
+        # An undecodable format must be rejected, never silently answered, and
+        # must not crash the server. PCX is the probe because feature unification
+        # in the server binary (dynamo-parsers → openai-harmony) widens
+        # sglang-mm's jpeg/png/webp/gif/bmp set to every image-crate default, so
+        # the probe has to be a format the image crate does not know at all.
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -124,8 +121,7 @@ class TestRustServerNativeMm(CustomTestCase):
                 "sampling_params": {"max_new_tokens": 8},
             },
         )
-        # The rust server surfaces mm-processor failures as Error::Encode
-        # (500); the request must be rejected without killing the server.
+        # Surfaced as Error::Encode (500); rejected without killing the server.
         self.assertIn(response.status_code, (400, 500), response.text)
 
 

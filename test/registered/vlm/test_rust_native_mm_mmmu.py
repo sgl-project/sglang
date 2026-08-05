@@ -1,15 +1,13 @@
 """MMMU accuracy gate for the Rust tokenizer manager's native multimodal path.
 
-``test_rust_native_mm_e2e.py`` checks that the rust server (``SGLANG_RUST_SERVER=1``)
-produces *valid* multimodal output; this test checks that native Rust image
-preprocessing produces *equally good* model inputs. A systematic preprocessing
-skew (wrong resample filter, channel order, normalization, patch layout) still
-yields fluent text and passes a keyword smoke check, but drops MMMU accuracy
-below the gate.
+``test_rust_native_mm_e2e.py`` checks that the output is *valid*; this checks that
+native Rust preprocessing yields *equally good* model inputs. A systematic skew
+(wrong resample filter, channel order, normalization, patch layout) still reads as
+fluent text and passes a keyword smoke check, but drops MMMU below the gate.
 
-The rust server does not serve ``/v1/chat/completions`` yet, so the eval drives
-the native ``/generate`` endpoint with hand-rendered Qwen chat prompts instead
-of lmms-eval's OpenAI client (``MMMUMixin``).
+The rust server has no ``/v1/chat/completions`` route yet, so the eval drives
+``/generate`` with hand-rendered Qwen chat prompts instead of lmms-eval's OpenAI
+client (``MMMUMixin``).
 """
 
 import importlib.util
@@ -38,21 +36,19 @@ MODEL = "Qwen/Qwen3.5-0.8B"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 
 NUM_EXAMPLES = 100
-# Calibrated 2026-07-24 on H200: the native rust MM path scores 0.37 on this
-# fixed 100-sample subset at temperature 0 (two runs), matching the Python
-# tokenizer-manager reference (0.37, same sampler and samples); gate leaves
-# headroom for batching nondeterminism.
+# Calibrated 2026-07-24 on H200: the native path scores 0.37 on this fixed subset
+# at temperature 0 (two runs), matching the Python reference (0.37, same sampler
+# and samples). The gate leaves headroom for batching nondeterminism.
 MMMU_ACCURACY_THRESHOLD = 0.30
 
 
 class QwenGenerateVisionSampler(SamplerBase):
     """Drive ``/generate`` with Qwen chat prompts and ``image_data``.
 
-    ``MMMUVLMEval`` emits OpenAI-style messages whose content mixes ``text``
-    and ``image_url`` parts. The rust server has no chat-completions route, so
-    this sampler renders the Qwen chat format by hand — each image part becomes
-    a ``<|vision_start|><|image_pad|><|vision_end|>`` block at its original
-    position — and ships the images through ``image_data``.
+    ``MMMUVLMEval`` emits OpenAI-style messages mixing ``text`` and ``image_url``
+    parts. This sampler renders the Qwen chat format by hand — each image part
+    becomes a ``VISION_BLOCK`` at its original position — and ships the images
+    through ``image_data``.
     """
 
     def __init__(self, base_url: str, max_tokens: int = 1024):
@@ -88,8 +84,8 @@ class QwenGenerateVisionSampler(SamplerBase):
                 "max_new_tokens": self.max_tokens,
             },
         }
-        # Retry transient failures, but fail loudly when they persist: silently
-        # returning "" would degrade the score and blur the accuracy gate.
+        # Retry transient failures but fail loudly when they persist: returning ""
+        # would silently degrade the score and blur the gate.
         for attempt in range(3):
             try:
                 response = requests.post(self.generate_url, json=payload, timeout=600)
@@ -142,9 +138,8 @@ class TestRustNativeMmMMMU(CustomTestCase):
         return "\n".join(text)
 
     def test_mmmu_accuracy(self):
-        # Guard the path under test: if the model family ever drops off the
-        # native registry (NativeMmHost.NATIVE_QWEN_MODEL_TYPES), launch fails
-        # and this assertion names the missing log line explicitly.
+        # Guard the path under test: if the family ever drops off
+        # NativeMmHost.NATIVE_QWEN_MODEL_TYPES, launch fails and this names why.
         self.assertIn(
             "native MM pipeline enabled",
             self._read_server_log(),

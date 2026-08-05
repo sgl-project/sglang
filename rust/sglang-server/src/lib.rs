@@ -32,12 +32,10 @@ use pyo3::types::PyBytes;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
-/// One drained MM result (see [`Server::take_mm`]), named fields instead of
-/// a positional tuple so the Rust/Python schema is explicit. Exactly one of
+/// One drained MM result (see [`Server::take_mm`]). Exactly one of
 /// `features`/`shm_names` is `Some`: inline features for single-rank serving
-/// (zero-copy into numpy), or one POSIX shm segment name per item when the
-/// scheduler broadcasts across TP ranks (the Python side wraps each name in
-/// a `ShmPointerMMData` stub).
+/// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
+/// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
 #[pyclass(frozen, get_all)]
 struct MmHandoff {
     features: Option<Py<numpy::PyArray1<f32>>>,
@@ -217,13 +215,11 @@ impl Server {
         self.push_frame(py, crate::message::frame_egress_error(rid, message))
     }
 
-    /// Spawn the MM worker pool for the pipeline described by `spec_json`
-    /// (built by the Python side from the resolved processor config; see
-    /// `NativeMmHost.resolve_native_spec`). Image-only requests are processed
-    /// entirely in Rust and their results parked for [`Server::take_mm`];
-    /// requests the pipeline cannot serve (video/audio, precomputed inputs,
-    /// undecodable images) are rejected back to the client — there is no
-    /// Python fallback.
+    /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the
+    /// resolved processor config; see `NativeMmHost.resolve_native_spec`).
+    /// Image-only requests are processed entirely in Rust and parked for
+    /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
+    /// the client — there is no Python fallback.
     fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
         let ctx = mm::Context::new(
             spec_json,
@@ -241,25 +237,22 @@ impl Server {
         Ok(())
     }
 
-    /// Pop the MM result for `rid` (stored strictly before the request was
-    /// pushed to the ingress ring). Returns
-    /// `(features_f32, grids, hashes, offsets, mrope_i64, mrope_delta)` or
-    /// `None` when no result is parked for `rid`. The two numeric
-    /// buffers are 1-D numpy arrays that take **ownership** of the Rust
-    /// vectors — no copy — and `hashes` are the worker-precomputed per-image
-    /// feature hashes. This runs on the scheduler loop (`RustServer.drain`,
-    /// under the GIL) between decode steps, so any per-byte work here (memcpy,
-    /// hashing — tens of MB per image-heavy request) would stall every running
-    /// request's inter-token latency.
+    /// Pop the MM result for `rid` — parked strictly before the request reached
+    /// the ingress ring — or `None` if there is none. The numeric buffers become
+    /// 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
+    ///
+    /// Runs on the scheduler loop (`RustServer.drain`, under the GIL) between
+    /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB
+    /// per image-heavy request — would stall every running request's ITL. Hence
+    /// the worker-precomputed `hashes`.
     fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmHandoff> {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_sidecar.take(rid)?;
         let (features, shm_names) = match res.features {
             mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py).unbind()), None),
-            // Ownership of the segments (and the duty to unlink) moves to
-            // Python here: `materialize()` unlinks after the post-broadcast
-            // clone on every rank.
+            // The segments — and the duty to unlink — move to Python here;
+            // `materialize()` unlinks after the post-broadcast clone on each rank.
             mm::FeatureStore::Shm(segments) => (
                 None,
                 Some(segments.into_iter().map(|s| s.into_name()).collect()),

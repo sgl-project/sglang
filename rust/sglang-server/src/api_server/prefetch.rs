@@ -1,13 +1,12 @@
 //! Resolve I/O-backed media sources on the API runtime, before MM dispatch.
 //!
-//! The MM worker pool is fixed and core-pinned CPU capacity: a slow image
-//! host — or a file on a hanging network mount — must never occupy it, and
-//! images within a request must download concurrently (not
-//! `n * REQUEST_TIMEOUT`). URLs and file paths resolve here — bounded globally
-//! and per request, via `sglang-mm`'s `fetch_bytes_budgeted` so
-//! proxy/timeout/cap semantics have one owner — and ride out-of-band as
-//! [`crate::message::MmData::prefetched`];
-//! [`crate::message::mm_payload::parse`] swaps them back in.
+//! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
+//! a file on a hanging network mount — must never occupy it, and a request's
+//! images must download concurrently, not in `n * REQUEST_TIMEOUT`. URLs and
+//! file paths resolve here through `sglang-mm`'s `fetch_bytes_budgeted` (one
+//! owner for proxy/timeout/cap semantics) and ride out-of-band as
+//! [`crate::message::MmData::prefetched`], which
+//! [`crate::message::mm_payload::to_mm_input`] swaps back in.
 
 use std::sync::Arc;
 
@@ -23,15 +22,13 @@ use crate::message::{GenerateRequest, MmData};
 /// excess acquisitions queue on the semaphore without holding a thread.
 static PERMITS: Semaphore = Semaphore::const_new(32);
 
-/// Fill [`MmData::prefetched`] for every request; every fetch across the
-/// batch runs concurrently. Any failure rejects the call (fetch errors are
-/// per-request 400s, as on the Python path).
+/// Fill [`MmData::prefetched`] for every request, all fetches across the batch
+/// concurrent. Any failure rejects the call (a 400, as on the Python path).
 ///
-/// The driver's per-request budgets ([`MAX_ITEMS_PER_REQUEST`],
-/// [`MAX_REQUEST_BYTES`]) are enforced *here*, not left to
-/// `sglang_mm::driver::process` — by then 64 sources of 64 MiB would already be
-/// resident. The driver keeps its checks as the backstop for callers without a
-/// prefetch layer, and because base64 sources are counted only there.
+/// The driver's budgets ([`MAX_ITEMS_PER_REQUEST`], [`MAX_REQUEST_BYTES`]) are
+/// enforced *here* rather than in `sglang_mm::driver::process`, where 64 sources
+/// of 64 MiB would already be resident. The driver keeps its own checks as the
+/// backstop for callers without a prefetch layer.
 pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String> {
     // The item budget rejects before a single byte is fetched.
     let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
@@ -61,19 +58,17 @@ pub async fn prefetch_all(requests: &mut [GenerateRequest]) -> Result<(), String
     Ok(())
 }
 
-/// Resolve every source of one request concurrently (globally bounded),
-/// preserving order, against one shared `total_bytes` allowance. Overflow
-/// rejects mid-download and `try_join_all` drops the remaining futures, so
-/// queued sources never acquire a permit and never start.
+/// Resolve one request's sources concurrently (globally bounded), in order,
+/// against one shared `total_bytes` allowance. Overflow rejects mid-download and
+/// `try_join_all` drops the rest, so queued sources never start.
 async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Bytes>, String> {
     let budget = Arc::new(ByteBudget::new(total_bytes));
     futures::future::try_join_all(sources.into_iter().map(|src| {
         let budget = Arc::clone(&budget);
         async move {
             let _permit = PERMITS.acquire().await.expect("semaphore never closed");
-            // `fetch_bytes_budgeted` is blocking I/O; tokio's blocking pool
-            // threads are unpinned and lazily spawned, so they never contend
-            // with CPU stages.
+            // Blocking I/O: tokio's blocking threads are unpinned and lazily
+            // spawned, so they never contend with the CPU stages.
             tokio::task::spawn_blocking(move || fetch_bytes_budgeted(&src, &budget))
                 .await
                 .map_err(|e| format!("media prefetch: {e}"))?
@@ -124,8 +119,8 @@ mod tests {
         }
     }
 
-    /// URLs and file paths resolve concurrently and land in `prefetched` in
-    /// source order; CPU-only sources and mm-free requests are untouched.
+    /// URLs and file paths resolve concurrently into `prefetched` in source
+    /// order; CPU-only sources and mm-free requests are untouched.
     #[tokio::test]
     async fn resolves_io_sources() {
         let addr = serve(vec![b"one".to_vec(), b"two".to_vec()]);
@@ -158,8 +153,8 @@ mod tests {
         assert!(err.contains("media fetch"), "{err}");
     }
 
-    /// The item budget rejects before any source is touched: these sources
-    /// would all fail to fetch, so a fetch error would mean fetching started.
+    /// The item budget rejects before any source is touched: all of these would
+    /// fail to fetch, so a fetch error would prove fetching started.
     #[tokio::test]
     async fn item_budget_rejects_before_fetching() {
         let sources: Vec<Value> = (0..=MAX_ITEMS_PER_REQUEST)
@@ -174,8 +169,8 @@ mod tests {
         assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
     }
 
-    /// Sources that are legal alone but collectively over the limit are
-    /// rejected while downloading, not once every body is resident.
+    /// Sources legal alone but collectively over the limit are rejected while
+    /// downloading, not once every body is resident.
     #[tokio::test]
     async fn byte_budget_is_shared_across_sources() {
         let addr = serve(vec![vec![b'a'; 4096], vec![b'b'; 4096]]);

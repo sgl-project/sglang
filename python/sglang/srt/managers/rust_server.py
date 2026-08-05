@@ -58,10 +58,12 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     max_pixels: int
     image_mean: Tuple[float, ...]
     image_std: Tuple[float, ...]
-    # Drain-side only; never sent to Rust.
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
+
+    # Used by the drain adapter only; every other field goes to Rust.
+    DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
 
     @property
     def feature_dim(self) -> int:
@@ -69,43 +71,26 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
 
     def rust_json(self) -> str:
         """The subset `sglang_mm::registry::pipeline_from_spec` parses."""
-        import json
-
-        return json.dumps(
-            {
-                "family": self.family,
-                "feature_shm": self.feature_shm,
-                "image_token_id": self.image_token_id,
-                "patch_size": self.patch_size,
-                "merge_size": self.merge_size,
-                "temporal_patch_size": self.temporal_patch_size,
-                "min_pixels": self.min_pixels,
-                "max_pixels": self.max_pixels,
-                "image_mean": list(self.image_mean),
-                "image_std": list(self.image_std),
-            }
-        )
+        fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
+        return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
 class NativeMmHost:
     """Builds and validates the native Rust MM pipeline for one model.
 
-    Construction registers the same model-specific ``mm_processor`` mapping
-    the Python TokenizerManager would build — not to process requests (the
-    Rust worker pool does that natively, GIL-free), but as the source of truth
-    :meth:`resolve_native_spec` validates and resolves the pipeline parameters
-    from. At drain time :meth:`build_native_mm` wraps the Rust-produced
-    buffers into the scheduler's ``MultimodalProcessorOutput``.
+    Construction registers the same ``mm_processor`` mapping the Python
+    TokenizerManager would build — not to process requests (the Rust worker pool
+    does that, GIL-free) but as the source of truth
+    :meth:`resolve_native_spec` resolves the pipeline parameters from. At drain
+    time :meth:`build_native_mm` wraps the Rust-produced buffers into the
+    scheduler's ``MultimodalProcessorOutput``.
 
-    There is no Python fallback: a model without a native spec fails at
-    launch, and per-request inputs outside the pipeline's scope (video/audio,
-    precomputed features, undecodable images) are rejected by the Rust worker
-    as a 400.
+    There is no Python fallback: a model without a native spec fails at launch,
+    and inputs outside the pipeline's scope are rejected per request.
     """
 
-    # Rust mm-worker threads when --mm-processor-worker-num is 0 ("model-
-    # specific default"). The workers are GIL-free, so unlike the Python
-    # processor pool more than one is always usable.
+    # Rust mm-worker threads when --mm-processor-worker-num is 0. They are
+    # GIL-free, so unlike the Python processor pool more than one always helps.
     AUTO_MM_WORKERS = 8
 
     # Model types whose image-only M-RoPE matches the native fast path.
@@ -120,32 +105,32 @@ class NativeMmHost:
         model_config: ModelConfig,
         processor: Any = None,
     ):
-        # Lazy imports: this class is only instantiated for multimodal models
-        # under SGLANG_RUST_SERVER.
+        # Lazy: this class exists only for multimodal models under
+        # SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import import_processors
         from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
 
         self.server_args = server_args
         self.model_config = model_config
-        # Rust mm-worker threads == max concurrently-processed mm requests.
+        # Worker threads == max concurrently-processed mm requests.
         self.mm_workers = server_args.mm_processor_worker_num or self.AUTO_MM_WORKERS
 
-        # Same processor mapping the Python TokenizerManager builds
-        # (init_tokenizer_and_processor, multimodal branch). The HF
-        # AutoProcessor is reused from the caller's init_tokenizer (already
-        # loaded, identical construction args) when available.
+        # The mapping the Python TokenizerManager builds in
+        # init_tokenizer_and_processor. The caller's already-loaded HF
+        # AutoProcessor is reused when available (identical construction args).
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper(self.server_args)
 
     def resolve_native_spec(self) -> Optional[NativeMmSpec]:
-        """The [`NativeMmSpec`] for the Rust-native MM pipeline, or ``None``
-        when the model has no native pipeline (the launch gate turns that into
-        a hard error). Only resolved settings are carried (patch geometry,
-        pixel limits, normalization, token ids) — never the HF config.
-        Conservative by design: any unrecognized knob disables the native path
-        rather than approximating it."""
+        """The :class:`NativeMmSpec` for this model, or ``None`` when it has no
+        native pipeline (the launch gate turns that into a hard error).
+
+        Carries only resolved settings — patch geometry, pixel limits,
+        normalization, token ids — never the HF config, and is conservative by
+        design: an unrecognized knob disables the native path rather than being
+        approximated."""
         from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
         from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
@@ -166,8 +151,8 @@ class NativeMmHost:
         ):
             return None
 
-        # `--mm-process-config {"image": {...}}`: only pixel-limit overrides
-        # are mirrored natively; anything else disables the native pipeline.
+        # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
+        # mirrored natively, anything else disables the pipeline.
         image_overrides = dict(
             (self.server_args.mm_process_config or {}).get("image", {})
         )
@@ -203,19 +188,18 @@ class NativeMmHost:
         return spec
 
     def _use_feature_shm(self) -> bool:
-        """Park native feature buffers in POSIX shm instead of the sidecar.
+        """Whether to park feature buffers in POSIX shm rather than inline.
 
-        On when — and only when — the drained request is broadcast across TP
-        ranks AND the receiver's ``unwrap_shm_features`` will materialize the
-        stubs (its gates: non-default tensor transport, no
-        ``skip_tokenizer_init``). With inline tensors the whole feature buffer
-        (~20 MB/image) rides ``broadcast_pyobj`` serially on the scheduler
-        loop; ranks 1..n then start the TP-sharded ViT ~30 ms after rank 0 and
-        every rank stalls at the first collective for exactly that skew. With
-        shm the broadcast carries a ~100-byte stub and all ranks map +
-        materialize in parallel behind the receiver's barrier — the same
-        transport the Python TokenizerManager uses. Single-rank serving keeps
-        the zero-copy inline path (shm would only add a copy per image).
+        On exactly when the drained request is broadcast across TP ranks *and*
+        the receiver's ``unwrap_shm_features`` will materialize the stubs (its
+        gates: non-default tensor transport, no ``skip_tokenizer_init``).
+
+        Inline, the whole ~20 MB/image buffer rides ``broadcast_pyobj`` serially
+        on the scheduler loop, so ranks 1..n start the TP-sharded ViT ~30 ms
+        after rank 0 and every rank then stalls that long at the first
+        collective. With shm the broadcast carries a ~100-byte stub and all ranks
+        map in parallel — the transport the Python TokenizerManager already uses.
+        Single-rank serving stays inline, where shm would only add a copy.
         """
         from sglang.srt.managers.tokenizer_manager import (
             determine_tensor_transport_mode,
@@ -229,16 +213,16 @@ class NativeMmHost:
 
     @staticmethod
     def build_native_mm(spec: NativeMmSpec, entry):
-        """Drain-time adapter: wrap the Rust-produced buffers into the
-        scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
-        here — all processing (load, resize, patchify, token expansion, M-RoPE)
-        already ran in Rust. This runs on the scheduler loop, so it must stay
-        copy-free AND hash-free: the numpy arrays from ``take_mm`` own the Rust
-        buffers (zero copy), ``torch.from_numpy`` only wraps them, and each
-        item's ``hash`` is the worker-precomputed feature hash so the
-        scheduler's ``set_pad_value`` skips ``hash_feature``. Any per-byte work
-        here (memcpy, sha256 — tens of MB per image-heavy request) measurably
-        stalls every running request's inter-token latency."""
+        """Drain-time adapter: wrap the Rust-produced buffers of one ``MmHandoff``
+        into the scheduler's ``MultimodalProcessorOutput``. Wrapping only — load,
+        resize, patchify, token expansion and M-RoPE all ran in Rust.
+
+        Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
+        ``take_mm``'s numpy arrays own the Rust buffers, ``torch.from_numpy`` just
+        views them, and each item's ``hash`` is worker-precomputed so
+        ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
+        sha256, tens of MB per image-heavy request — measurably inflates every
+        running request's inter-token latency."""
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
@@ -248,17 +232,13 @@ class NativeMmHost:
             MultimodalProcessorOutput,
         )
 
-        # `entry` is the Rust `MmHandoff` (named fields; tests pass a
-        # SimpleNamespace of the same shape).
-        features_arr, shm_names = entry.features, entry.shm_names
-        grids, hashes, offsets = entry.grids, entry.hashes, entry.offsets
-        mrope_arr, mrope_delta = entry.mrope, entry.mrope_delta
+        shm_names = entry.shm_names
         if shm_names is None:
-            features = torch.from_numpy(features_arr.reshape(-1, spec.feature_dim))
+            features = torch.from_numpy(entry.features.reshape(-1, spec.feature_dim))
         items = []
         row = 0
         for index, ((t, h, w), item_hash, offset) in enumerate(
-            zip(grids, hashes, offsets)
+            zip(entry.grids, entry.hashes, entry.offsets)
         ):
             n = t * h * w
             if shm_names is None:
@@ -293,15 +273,14 @@ class NativeMmHost:
         if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
             for item in items:
                 item.set_pad_value()
-        mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
         return MultimodalProcessorOutput(
             mm_items=items,
             im_token_id=spec.image_token_id,
             im_start_id=spec.vision_start_token_id,
             im_end_id=spec.vision_end_token_id,
             video_token_id=spec.video_token_id,
-            mrope_positions=mrope_positions,
-            mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
+            mrope_positions=torch.from_numpy(entry.mrope.reshape(3, -1)),
+            mrope_position_delta=torch.tensor([[entry.mrope_delta]], dtype=torch.long),
         )
 
 
@@ -371,19 +350,15 @@ class RustServer:
             server_args_json=cls._build_server_args(scheduler),
         )
 
-        # Multimodal models must have a native Rust pipeline — there is no
-        # Python fallback. The host resolves/validates the spec from the same
-        # processor stack the Python TokenizerManager would build; the Rust
-        # worker pool then processes every mm request natively.
+        # Multimodal models must have a native Rust pipeline — there is no Python
+        # fallback.
         mm_spec = None
         if scheduler.model_config.is_multimodal:
-            # New threads inherit the spawning thread's CPU affinity, and this
-            # launch thread still has the full mask here. Narrow it to the
-            # server cores first so every MM thread created below — the
-            # processor's executors and the Rust MM workers — stays off the
-            # scheduler's reserved launch cores: MM preprocessing scheduled
-            # onto those cores preempts the scheduler loop and inflates
-            # inter-token latency.
+            # New threads inherit the spawning thread's affinity, and this launch
+            # thread still holds the full mask. Narrow it first so every MM thread
+            # created below (the processor's executors, the Rust MM workers) stays
+            # off the scheduler's reserved cores, where MM preprocessing would
+            # preempt the scheduler loop and inflate inter-token latency.
             if server_cores is not None:
                 try:
                     os.sched_setaffinity(0, set(server_cores))
@@ -477,10 +452,9 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
-                # Natively processed: the buffers rode a Rust sidecar (stored
-                # strictly before the ring push); wrap them into tensors here —
-                # the only Python step of the native path. `None` for text-only
-                # requests on a multimodal model.
+                # The buffers rode the Rust sidecar, parked before the ring push;
+                # wrapping them into tensors is the only Python step of the native
+                # path. `None` for a text-only request on a multimodal model.
                 native = self.server.take_mm(obj.rid)
                 if native is not None:
                     obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
@@ -693,9 +667,9 @@ class RustServer:
         )
         server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
 
-        # The Rust server only reads local files (hub-blind, so it can never
-        # disagree with huggingface_hub about cache layout): resolve a repo-id
-        # tokenizer_path to the cached tokenizer.json here. No network — the
+        # The Rust server reads only local files — hub-blind, so it can never
+        # disagree with huggingface_hub about cache layout. Resolve a repo-id
+        # tokenizer_path to the cached tokenizer.json here; no network, since the
         # scheduler's init_tokenizer already downloaded it.
         if not scheduler.server_args.skip_tokenizer_init:
             path = server_args["tokenizer_path"] or server_args["model_path"]
@@ -738,17 +712,15 @@ class RustServer:
         # effectively serial) and never take more than a quarter of the cores.
         reserve = min(2, len(allowed) // 4)
         launch_cores = allowed[:reserve]
-        # Bound the pool set instead of taking the whole remainder: this
-        # rank's "allowed" cores are usually the entire NUMA node, which the
-        # *sibling* TP ranks' processes share — an unbounded mask lets MM
-        # preprocessing bursts land on (and preempt) a sibling's CUDA-launch
-        # thread, inflating every rank's forward via the TP collectives.
-        # Measured on Qwen3.5-35B TP4 with one 720p image per request: the
-        # unbounded mask cost the worst sibling ~20 ms of ViT wall time;
-        # bounding the pools removed it. The budget covers the CPU-hot
-        # threads (MM workers + tokenizer/ingress/egress/api, which are
-        # I/O-shaped and rarely all hot at once); everything else on the node
-        # is left to the scheduler ranks.
+        # Bound the pool instead of taking the whole remainder: this rank's
+        # allowed cores are usually the entire NUMA node, shared with the sibling
+        # TP ranks' processes, so an unbounded mask lets MM preprocessing bursts
+        # preempt a sibling's CUDA-launch thread and inflate every rank's forward
+        # through the TP collectives. Measured on Qwen3.5-35B TP4 at one 720p
+        # image per request: ~20 ms of ViT wall time on the worst sibling, gone
+        # once bounded. The budget covers the CPU-hot threads (MM workers, plus
+        # the I/O-shaped tokenizer/ingress/egress/api ones that are rarely all hot
+        # at once) and leaves the rest of the node to the scheduler ranks.
         pool_budget = max(8, mm_workers + 4)
         server_cores = allowed[reserve : reserve + pool_budget]
         logger.info(

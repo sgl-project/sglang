@@ -1,8 +1,7 @@
 """``NativeMmHost.build_native_mm`` (managers/rust_server.py): the drain-time
-wrapping contracts — tensors are zero-copy views over the Rust-owned buffers,
-and pad values come from worker-precomputed hashes (the scheduler loop must
-never hash features). Synthetic buffers only, so this runs without the Rust
-extension (unlike the qwen parity suite)."""
+wrapping contracts — tensors are zero-copy views over the Rust-owned buffers, and
+pad values come from worker-precomputed hashes, since the scheduler loop must
+never hash features. Synthetic buffers, so this needs no Rust extension."""
 
 import os
 import unittest
@@ -44,18 +43,21 @@ class TestBuildNativeMm(CustomTestCase):
     HASHES = [101, 202]
     OFFSETS = [(2, 5), (8, 8)]
 
-    def build(self, shm_names=None):
+    def transport(self, features):
+        """Inline: the features ride the numpy array itself."""
+        return dict(features=features, shm_names=None)
+
+    def build(self):
         features = np.arange(30, dtype=np.float32)
         output = NativeMmHost.build_native_mm(
             self.spec,
             SimpleNamespace(  # the shape of Rust's MmHandoff
-                features=None if shm_names else features,
-                shm_names=shm_names,
                 grids=self.GRIDS,
                 hashes=self.HASHES,
                 offsets=self.OFFSETS,
                 mrope=np.arange(30, dtype=np.int64),
                 mrope_delta=-3,
+                **self.transport(features),
             ),
         )
         return output, features
@@ -97,10 +99,9 @@ class TestBuildNativeMm(CustomTestCase):
 
 
 class TestBuildNativeMmShm(TestBuildNativeMm):
-    """The shm entry shape (TP>1): features arrive as named POSIX segments the
-    Rust worker wrote; each item becomes a ``ShmPointerMMData`` stub whose
-    ``materialize()`` yields the item's slice — and unlinks, transferring the
-    cleanup duty exactly once."""
+    """The shm entry shape (TP>1): features arrive as named POSIX segments, and
+    each item becomes a ``ShmPointerMMData`` stub whose ``materialize()`` yields
+    that item's slice — and unlinks, taking the cleanup duty exactly once."""
 
     def setUp(self):
         super().setUp()
@@ -129,22 +130,9 @@ class TestBuildNativeMmShm(TestBuildNativeMm):
             row += n
         return names
 
-    def build(self, shm_names=None):
-        features = np.arange(30, dtype=np.float32)
-        names = self._park(features)
-        output = NativeMmHost.build_native_mm(
-            self.spec,
-            SimpleNamespace(  # the shape of Rust's MmHandoff
-                features=None,
-                shm_names=names,
-                grids=self.GRIDS,
-                hashes=self.HASHES,
-                offsets=self.OFFSETS,
-                mrope=np.arange(30, dtype=np.int64),
-                mrope_delta=-3,
-            ),
-        )
-        return output, features
+    def transport(self, features):
+        """Shm: the worker parked each item's slice in its own segment."""
+        return dict(features=None, shm_names=self._park(features))
 
     def test_wraps_and_slices_native_buffers(self):
         import torch
@@ -171,9 +159,6 @@ class TestBuildNativeMmShm(TestBuildNativeMm):
         for item in output.mm_items:
             with self.assertRaises(FileNotFoundError):
                 shared_memory.SharedMemory(name=item.feature.shm_name)
-
-    def test_optional_pad_values_use_precomputed_hashes(self):
-        super().test_optional_pad_values_use_precomputed_hashes()
 
 
 if __name__ == "__main__":

@@ -1,14 +1,11 @@
 //! Multimodal worker pool.
 //!
-//! Rust-owned threads drain requests parked in the `Encoding` stage and run
-//! the `sglang-mm` pipeline for the model family whose spec was registered
-//! via `Server.start_mm_workers`: fetch → decode → preprocess → placeholder
-//! expansion → M-RoPE, entirely in Rust (GIL-free). The worker stores the
-//! result in the rid-keyed [`Sidecar`] and returns the expanded ids; the
-//! Python side attaches the buffers at drain time (`Server.take_mm`).
-//! Requests the pipeline cannot serve (video/audio, precomputed inputs,
-//! undecodable images) are rejected back to the client — there is no Python
-//! fallback path.
+//! Rust threads drain requests parked in `Encoding` and run the `sglang-mm`
+//! pipeline registered by `Server.start_mm_workers` (decode → preprocess →
+//! placeholder expansion → M-RoPE, GIL-free). Each worker parks the result
+//! buffers in the rid-keyed [`Sidecar`] and returns only the expanded ids;
+//! Python attaches the buffers at drain time (`Server.take_mm`). Inputs the
+//! pipeline cannot serve are rejected to the client — no Python fallback.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,21 +17,18 @@ use crate::tokenizer_manager::TmEvent;
 
 /// A named POSIX shared-memory segment owning its name: dropped → unlinked.
 ///
-/// Written by an MM worker (off the scheduler loop) so the TP broadcast can
-/// carry a pointer instead of the feature tensor: the scheduler wraps the
-/// name in a `ShmPointerMMData` stub, `broadcast_pyobj` moves ~100 bytes
-/// instead of ~20 MB, and every TP rank maps + materializes the segment in
-/// parallel. Python's `materialize()` unlinks after cloning; this `Drop`
-/// covers the paths where the buffers never reach Python (request aborted
+/// Written by an MM worker so the TP broadcast carries a ~100-byte
+/// `ShmPointerMMData` stub instead of the ~20 MB feature tensor, and every
+/// rank maps it in parallel. Python's `materialize()` unlinks after cloning;
+/// this `Drop` covers the paths where the buffers never reach Python (aborted
 /// while parked, late result purged).
 pub struct ShmSegment {
     name: String,
 }
 
 impl ShmSegment {
-    /// Create `/dev/shm/{name}` holding exactly `bytes`. The name must be
-    /// usable by Python's `multiprocessing.shared_memory.SharedMemory(name=…)`,
-    /// i.e. no leading slash here (shm_open gets one added).
+    /// Create `/dev/shm/{name}` holding exactly `bytes`. No leading slash —
+    /// the name must suit Python's `SharedMemory(name=…)` (shm_open adds one).
     pub fn create(name: String, bytes: &[u8]) -> Result<Self, String> {
         let c_name = std::ffi::CString::new(format!("/{name}"))
             .map_err(|_| "shm name contains NUL".to_string())?;
@@ -80,8 +74,8 @@ impl ShmSegment {
         }
     }
 
-    /// Hand the segment (and the duty to unlink) to the caller — used when
-    /// Python takes ownership at drain time.
+    /// Hand the segment — and the duty to unlink — to the caller (Python, at
+    /// drain time).
     pub fn into_name(self) -> String {
         std::mem::take(&mut std::mem::ManuallyDrop::new(self).name)
     }
@@ -97,18 +91,17 @@ impl Drop for ShmSegment {
     }
 }
 
-/// Unique-enough segment names: pid guards across server restarts (a crashed
-/// process may leak segments with its old pid), the counter within one.
+/// Unique segment names: the pid separates server restarts (a crash can leak
+/// segments under the old pid), the counter separates results within one.
 fn shm_name(item: usize) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("sglmm-{}-{n}-{item}", std::process::id())
 }
 
-/// Python parity (`TokenizerManager`'s `mm_hashes` handling): caller hashes
-/// override the computed ones so an external router's keys align with the
-/// prefix cache; a length mismatch or malformed entry warns and falls back —
-/// it never blocks the request.
+/// Python parity: caller hashes override the computed ones so an external
+/// router's keys align with the prefix cache. A length mismatch or malformed
+/// entry warns and keeps the computed hash — never blocks the request.
 fn apply_caller_hashes(hashes: &mut [u64], caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -130,8 +123,8 @@ fn apply_caller_hashes(hashes: &mut [u64], caller: &[String]) {
 }
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// is the common case), keeping the low 64 bits: only the low 30 are observable,
-/// via `_compute_pad_value` (`MM_PAD_SHIFT_VALUE + hash % (1 << 30)`).
+/// being the common case), keeping the low 64 bits — only the low 30 are
+/// observable, through `_compute_pad_value`.
 fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -140,11 +133,10 @@ fn parse_caller_hash(entry: &str) -> Option<u64> {
     u64::from_str_radix(&hex[hex.len().saturating_sub(16)..], 16).ok()
 }
 
-/// One parked sidecar entry: the feature/aux buffers the drain-time Python
-/// adapter needs (the expanded `input_ids` travel separately, via
-/// `TmEvent::MmEncoded`). This is the qwen scheduler-drain shape
-/// (`sglang_mm::qwen_vl::pack_drain`); it generalizes to a named-tensor
-/// handoff when a family needs a different shape.
+/// One parked result: the buffers the drain-time Python adapter needs (the
+/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
+/// drain shape (`sglang_mm::qwen_vl::pack_drain`); generalizes to a
+/// named-tensor handoff once a family needs a different one.
 pub struct MmSidecarEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,
@@ -156,20 +148,18 @@ pub struct MmSidecarEntry {
 
 /// Where a result's feature buffers live between worker and drain.
 pub enum FeatureStore {
-    /// In this process; the drain wraps them zero-copy (single-rank serving,
-    /// or the shm fallback). Cheap for rank 0, but under TP the whole buffer
-    /// would ride the scheduler's `broadcast_pyobj` to the other ranks.
+    /// In-process; the drain wraps them zero-copy. Single-rank serving, or the
+    /// shm fallback. Under TP the whole buffer would ride `broadcast_pyobj`.
     Inline(Vec<f32>),
-    /// One POSIX segment per item; the drain sends only the names across
-    /// ranks. Written by the worker, off the scheduler loop.
+    /// One POSIX segment per item, written by the worker; only the names cross
+    /// ranks. See [`ShmSegment`].
     Shm(Vec<ShmSegment>),
 }
 
-/// Entries parked between a worker's `MmEncoded` and the scheduler's drain,
-/// keyed by rid. Owns the lifecycle: [`park`](Self::park) strictly before
-/// `MmEncoded` is emitted, [`take`](Self::take) at the scheduler drain, and
-/// [`purge`](Self::purge) for requests that die while parked (rejected or
-/// aborted), so entries never leak.
+/// Results parked between a worker's `MmEncoded` and the scheduler drain, keyed
+/// by rid. Owns the lifecycle so entries never leak: [`park`](Self::park)
+/// strictly before `MmEncoded`, [`take`](Self::take) at the drain,
+/// [`purge`](Self::purge) for requests that die while parked.
 #[derive(Clone, Default)]
 pub struct Sidecar(Arc<Mutex<HashMap<String, MmSidecarEntry>>>);
 
@@ -191,9 +181,9 @@ pub struct Context {
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub sidecar: Sidecar,
-    /// Park feature buffers in POSIX shm (`"feature_shm": true` in the spec —
-    /// set by the Python launcher exactly when the scheduler broadcasts
-    /// requests across TP ranks and `ShmPointerMMData` will be unwrapped).
+    /// Park feature buffers in POSIX shm. Set by the Python launcher
+    /// (`NativeMmHost._use_feature_shm`) exactly when the scheduler broadcasts
+    /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
 }
 
@@ -216,9 +206,8 @@ impl Context {
     }
 }
 
-/// Run the pipeline for one request. `Ok` returns the final
-/// placeholder-expanded ids (the mm buffers are parked in the sidecar
-/// strictly before returning); `Err` rejects the request back to the client.
+/// Run the pipeline for one request. `Ok` returns the final expanded ids, the
+/// buffers already parked; `Err` rejects the request back to the client.
 fn process(
     ctx: &Context,
     rid: &crate::ids::Rid,
@@ -253,18 +242,16 @@ fn process(
     Ok(drain.input_ids)
 }
 
-/// Split the flat feature buffer per item (rows = `t*h*w` per grid) and park
-/// each slice in its own segment. Any shm failure (e.g. `/dev/shm` full)
-/// falls back to inline transport — same policy as Python's
-/// `_wrap_shm_or_inline` — so requests degrade to the slow path instead of
-/// erroring.
+/// Split the flat feature buffer per item (`t*h*w` rows per grid) and park each
+/// slice in its own segment. Any shm failure (`/dev/shm` full, odd shape) falls
+/// back to inline, as Python's `_wrap_shm_or_inline` does: degrade to the slow
+/// path, never fail the request.
 fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> FeatureStore {
     let total_rows: usize = grids
         .iter()
         .map(|g| g[0] as usize * g[1] as usize * g[2] as usize)
         .sum();
     if total_rows == 0 || !features.len().is_multiple_of(total_rows) {
-        // Shape surprise: keep the request alive on the inline path.
         return FeatureStore::Inline(features.to_vec());
     }
     let dim = features.len() / total_rows;
@@ -285,11 +272,10 @@ fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> FeatureStore {
     FeatureStore::Shm(segments)
 }
 
-/// Spawn `workers` `mm-worker-{i}` threads and return their join handles for
-/// the runtime's shutdown join. Not pinned here: they inherit the launch
-/// thread's affinity, which `RustServer.launch` narrows to the server cores
-/// before calling `start_mm_workers` so MM work never preempts the scheduler
-/// thread on its reserved cores.
+/// Spawn `workers` `mm-worker-{i}` threads; the handles go to the runtime's
+/// shutdown join. Not pinned here — they inherit the launch thread's affinity,
+/// which `RustServer.launch` has already narrowed to the server cores so MM
+/// work never preempts the scheduler on its reserved ones.
 pub fn spawn_workers(
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
@@ -319,10 +305,8 @@ struct MmWorker {
 
 impl MmWorker {
     /// Drain until the mm channel closes (tm-ingress drops its sender on
-    /// shutdown). Pool size bounds MM concurrency: each worker processes one
-    /// request at a time. The sidecar entry is stored strictly *before*
-    /// `MmEncoded` is emitted, so the scheduler drain that follows always
-    /// finds it; an error rejects the request back to the client as a 400.
+    /// shutdown). One request at a time, so the pool size bounds MM
+    /// concurrency; an error rejects the request back to the client.
     fn run(self) {
         while let Ok(req) = self.rx.recv() {
             let rid = req.rid;
@@ -347,8 +331,8 @@ impl MmWorker {
 mod tests {
     use super::*;
 
-    /// Caller hashes override computed ones; length mismatches and malformed
-    /// entries fall back per item — never a rejection (Python parity).
+    /// Caller hashes override computed ones; mismatched lengths and malformed
+    /// entries fall back per item, never reject (Python parity).
     #[test]
     fn caller_hashes_override_with_fallback() {
         let mut hashes = vec![1, 2, 3];
@@ -362,8 +346,8 @@ mod tests {
         assert_eq!(hashes, [0xff, 2, 0x10]);
     }
 
-    /// A full SHA-256 (what routers send) keeps its low 64 bits instead of
-    /// falling back, so the pad value still matches Python's wide `int`.
+    /// A full SHA-256 (what routers send) keeps its low 64 bits rather than
+    /// falling back, so the pad value matches Python's wide `int`.
     #[test]
     fn caller_hashes_accept_arbitrary_width() {
         let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -382,8 +366,8 @@ mod tests {
         std::path::Path::new("/dev/shm").join(name)
     }
 
-    /// The segment holds exactly the written bytes, and dropping it unlinks —
-    /// the leak guard for results purged before Python ever takes them.
+    /// The segment holds exactly the written bytes and dropping it unlinks —
+    /// the leak guard for results purged before Python takes them.
     #[test]
     fn segment_roundtrip_and_drop_unlinks() {
         let name = shm_name(0);
@@ -406,8 +390,8 @@ mod tests {
         unsafe { libc::shm_unlink(c.as_ptr()) };
     }
 
-    /// Per-item slicing matches the grid row counts, so Python's
-    /// `(rows, feature_dim)` reshape of each segment sees its own item only.
+    /// Per-item slicing follows the grid row counts, so Python's
+    /// `(rows, feature_dim)` reshape of a segment sees only its own item.
     #[test]
     fn park_splits_features_by_grid() {
         // Two items: grids (1,2,2)=4 rows and (1,1,2)=2 rows, dim=3.
