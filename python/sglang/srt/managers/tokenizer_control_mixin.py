@@ -33,6 +33,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
+    KVFlowUpdateReqInput,
+    KVFlowUpdateReqOutput,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("kvflow_update", KVFlowUpdateReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -299,6 +302,17 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
+
+    async def kvflow_update(
+        self: TokenizerManager, agent_updates: Dict[str, int]
+    ) -> KVFlowUpdateReqOutput:
+        """Push per-agent steps_to_execution to the KVFlow eviction manager."""
+        self.auto_create_handle_loop()
+        return (
+            await self.kvflow_update_communicator(
+                KVFlowUpdateReqInput(agent_updates=agent_updates)
+            )
         )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:

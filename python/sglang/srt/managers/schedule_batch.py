@@ -823,6 +823,8 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
+        kvflow_agent_id: Optional[str] = None,
+        kvflow_fixed_prefix_len: Optional[int] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -944,6 +946,8 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.kvflow_agent_id: Optional[str] = kvflow_agent_id
+        self.kvflow_fixed_prefix_len: Optional[int] = kvflow_fixed_prefix_len
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

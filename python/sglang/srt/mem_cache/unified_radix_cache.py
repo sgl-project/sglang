@@ -221,6 +221,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
 
+        # KVFlow workflow-aware eviction (arXiv:2507.07400).
+        if params.enable_kvflow_eviction:
+            from sglang.srt.mem_cache.kvflow_agent_manager import KVFlowAgentManager
+
+            self.kvflow_manager: Optional[KVFlowAgentManager] = KVFlowAgentManager(
+                hold_step=params.kvflow_hold_step
+            )
+        else:
+            self.kvflow_manager = None
+
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
@@ -711,6 +721,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
+            if (
+                self.kvflow_manager is not None
+                and req.kvflow_agent_id is not None
+            ):
+                self.kvflow_manager.register_leaf(
+                    req.kvflow_agent_id, result.last_device_node
+                )
 
         # cleanup
         for comp in self._components_tuple:

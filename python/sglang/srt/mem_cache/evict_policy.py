@@ -46,6 +46,17 @@ class PriorityStrategy(EvictionStrategy):
         return (node.priority, node.last_access_time)
 
 
+class KVFlowEvictionStrategy(EvictionStrategy):
+    """Workflow-aware eviction: higher kvflow_priority nodes evicted last.
+
+    kvflow_priority is set by KVFlowAgentManager based on steps_to_execution.
+    Nodes with kvflow_priority=0 (no workflow info) are evicted LRU first.
+    """
+
+    def get_priority(self, node: TreeNode) -> Tuple[int, float]:
+        return (node.kvflow_priority, node.last_access_time)
+
+
 class SLRUStrategy(EvictionStrategy):
     def __init__(self, protected_threshold: int = 2):
         self.protected_threshold = protected_threshold

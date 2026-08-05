@@ -114,6 +114,7 @@ class UnifiedTreeNode:
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
+        self.kvflow_priority: int = 0  # updated by KVFlowAgentManager
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             _NUM_COMPONENT_TYPES * 2
         )

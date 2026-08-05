@@ -131,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    KVFlowUpdateReqInput,
+    KVFlowUpdateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -1508,6 +1510,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (KVFlowUpdateReqInput, self._handle_kvflow_update),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2374,6 +2377,8 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                kvflow_agent_id=recv_req.kvflow_agent_id,
+                kvflow_fixed_prefix_len=recv_req.kvflow_fixed_prefix_len,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -4157,6 +4162,22 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def _handle_kvflow_update(
+        self, recv_req: KVFlowUpdateReqInput
+    ) -> KVFlowUpdateReqOutput:
+        """Update per-agent steps_to_execution for KVFlow eviction prioritization."""
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        if (
+            isinstance(self.tree_cache, UnifiedRadixCache)
+            and self.tree_cache.kvflow_manager is not None
+        ):
+            self.tree_cache.kvflow_manager.update(recv_req.agent_updates)
+            return KVFlowUpdateReqOutput(success=True)
+        return KVFlowUpdateReqOutput(
+            success=False, message="KVFlow eviction not enabled on this server"
+        )
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

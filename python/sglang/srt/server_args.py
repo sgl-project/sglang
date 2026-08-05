@@ -914,6 +914,22 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "lru"
+    enable_kvflow_eviction: A[
+        bool,
+        "Enable KVFlow workflow-aware prefix-cache eviction (arXiv:2507.07400). "
+        "Requires --radix-eviction-policy=kvflow (set automatically when enabled). "
+        "Use POST /v1/kvflow/update with {agent_updates: {agent_id: steps}} to "
+        "push workflow step counts from the external scheduler.",
+        NS("memory"),
+    ] = False
+    kvflow_hold_step: A[
+        int,
+        "Number of future agent steps for which fixed-prefix KV is protected from "
+        "eviction. Agents at steps >= kvflow_hold_step get minimal protection "
+        "(priority=1); agents at steps=1 (next to run) get maximum protection "
+        "(priority=kvflow_hold_step). Only used when --enable-kvflow-eviction.",
+        NS("memory"),
+    ] = 4
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",

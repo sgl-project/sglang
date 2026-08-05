@@ -286,6 +286,13 @@ class GenerateReqInput:
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # KVFlow workflow-aware eviction metadata (arXiv:2507.07400).
+    # kvflow_agent_id: identifies which agent this request belongs to.
+    # kvflow_fixed_prefix_len: token count of the fixed prefix (tokens 0..N
+    #   are workflow-invariant across agent invocations; tokens after N are dynamic).
+    kvflow_agent_id: Optional[str] = None
+    kvflow_fixed_prefix_len: Optional[int] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
     # For custom metric labels
@@ -827,6 +834,8 @@ class GenerateReqInput:
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            kvflow_agent_id=self.kvflow_agent_id,
+            kvflow_fixed_prefix_len=self.kvflow_fixed_prefix_len,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -917,6 +926,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # KVFlow workflow-aware eviction metadata
+    kvflow_agent_id: Optional[str] = None
+    kvflow_fixed_prefix_len: Optional[int] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -1531,6 +1544,17 @@ class FlushCacheReqInput(BaseReq, kw_only=True):
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
+class KVFlowUpdateReqInput(BaseReq, kw_only=True):
+    """Update per-agent steps_to_execution for KVFlow eviction prioritization."""
+
+    agent_updates: Dict[str, int]  # agent_id → steps_to_execution
+
+
+class KVFlowUpdateReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 

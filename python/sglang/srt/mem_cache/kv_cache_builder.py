@@ -224,7 +224,11 @@ def build_kv_cache(
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
-        eviction_policy=server_args.radix_eviction_policy,
+        eviction_policy=(
+            "kvflow"
+            if server_args.enable_kvflow_eviction
+            else server_args.radix_eviction_policy
+        ),
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=server_args.enable_session_radix_cache,
@@ -234,6 +238,8 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        enable_kvflow_eviction=server_args.enable_kvflow_eviction,
+        kvflow_hold_step=server_args.kvflow_hold_step,
     )
 
     tree_cache = create_tree_cache(
