@@ -3,6 +3,47 @@
 > 本文基于当前主线源码（本仓库）与线上配置（SGLang 0.5.17.dev459）分析。个别参数在 0.5.17 分支上可能不同，落地前用
 > `python3.12 -m sglang.launch_server --help | grep <参数名>` 复核。
 
+## 0. 快速导航（先读这里）
+
+**当前生产配置（2026-08 定版）**
+
+```bash
+bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 --proxy-port 8080
+```
+
+6 卡 TP2 DP3 + MTP（NEXTN steps=3 draft=4）+ 代理（tool_call=16 / thinking=12）+ priority + round_robin + mem=0.85 / context=98304 / max-running=12/worker（均为脚本默认值）。
+
+**当前生产基线（2026-08 线上）**
+
+| 指标 | 值 | 评估 |
+|------|-----|------|
+| 单日总请求 | 16,454 | 稳定 |
+| Aborted | 310（1.88%） | 健康（<2%，各版本最低） |
+| AVG TTFT | 8.37s | MTP 高并发正常水位 |
+| AVG E2E | 33.6s | decode ~25.2s（长输出占比上升） |
+
+**后续观察点速查（详见 11.11）**
+
+| 指标 | 阈值 | 行动 |
+|------|------|------|
+| abort 率 | >2% 且持续 | 降 tool_call / 查 KV 紧张 |
+| token_usage | ≥0.92 持续 5m | 降并发或 mem 调回 0.85 |
+| TTFT p90 | >10s 持续 | 查排队占比，调 priority/限流 |
+| queue | >10 持续 | 容量瓶颈，考虑扩副本 |
+
+**文档结构导览**
+
+| 章节 | 性质 | 说明 |
+|------|------|------|
+| 1~8 | 过程分析（已定稿） | 早期 0.78/8 慢的归因与验证，结论已固化进脚本默认值 |
+| 9 | 请求参数建议 | 代码检视 / tool call 的 max_tokens 与 sampling 配置 |
+| 10 | MTP 落地记录 | 可行性→试点→上线→冷启动→全版对比（10.9 两实例方案**已废弃**，见 11.7） |
+| 11.1~11.8 | 双架构教训与定版 | 路由热点 → 回退 6 卡统一 + round_robin |
+| 11.9 | 当前机制 | 优先调度 + 代理限流 + 自适应 + 监控（附录 G 详述监控平台） |
+| 11.10 | 扩展分析 | 96K → 256K 可行性 |
+| 11.11 | **后续观察点** | 监控阈值与行动矩阵 |
+
 ## 1. 问题现象
 
 线上环境：6x L40S（SM89，46GB），TP=2 DP=3，Qwen3.6-35B-A3B-FP8，fp8_e5m2 KV cache，96K 上下文，mamba triton + flashinfer，关闭 CUDA graph，跳过预热。
@@ -553,7 +594,7 @@ curl -sf "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 | Abort 3.3% | 查原因分布（客户端超时 vs 服务端错误） |
 | 冷启动 | 10.6 定位 + 10.7 预热方案仍未回填，先落地再测稳态 TTFT |
 
-### 10.9 K8s 部署方案（两实例，无请求路由控制）
+### 10.9 K8s 部署方案（两实例，无请求路由控制）【历史过程，已被 11.7 取代】
 
 > **状态：已搁置（2026-08）**。双架构在无请求路由控制 + thinking 容量不足下实测更差（利用率 ~25% vs 统一 ~90%；thinking TTFT 随队列单调恶化至 ~100s）。当前生产方案回到 6 卡统一 + round_robin（见 11.7）；双架构仅在具备按类型分流能力和 thinking 容量 ≥4 卡后重启。
 
@@ -664,7 +705,7 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 
 > 6 卡 pod 由 K8s 分配；若脚本自动推断不是 TP2 DP3（如检测到 7 卡），显式传 `--tp-size 2 --dp-size 3` 或用 `--gpu-ids`（裸机）限定 6 卡。
 
-### 11.6 两实例最终启动命令（round_robin 修复后）
+### 11.6 两实例最终启动命令（round_robin 修复后）【历史过程，已被 11.7 取代】
 
 > **状态：已搁置（2026-08）**，保留作为"具备分流能力后的备选方案"。
 
@@ -738,7 +779,7 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 代理默认 `tool_call=16`、`thinking=12`，是**代理层全局并发上限**（不是 per-worker/per-GPU）；后端 6 卡 TP2 DP3 时 `max-running-requests=12/worker` 对应 **36 并发容量**。两层数字关系如下：
 
 ```
-            ┌─ tool_call 闸门（8 个位置）──┐
+            ┌─ tool_call 闸门（16 个位置）─┐
 客户端 ──► 代理                           ├──► SGLang（36 并发容量上限）
             └─ thinking  闸门（12 个位置）─┘
 ```
@@ -916,20 +957,9 @@ curl -s localhost:8000/metrics | grep num_queue_reqs
 - 需要单条请求元数据时可开 `--log-requests`；
 - 注：未设 `--default-priority-value` 时，未带 priority 的请求会显示为 `priority="None"`；脚本已默认设为 0。
 
-### 11.10 上下文窗口扩展分析（96K → 256K）与当前生产基线
+### 11.10 上下文窗口扩展分析（96K → 256K）
 
-**当前生产基线（2026-08 线上，供后续对比）**
-
-| 指标 | 值 |
-|------|-----|
-| 单日总请求 | 16,454 |
-| Aborted | 310（1.88%） |
-| AVG TTFT | 8.37s |
-| AVG E2E | 33.6s |
-| 配置 | 6卡 TP2 DP3 + MTP + 代理（tool_call=16 / thinking=12） |
-
-> 对照：无 MTP 基线 abort 2.2%（2294 req）；MTP 高并发 3.3%（2162 req）。1.88% 为各版本最低，可接受（<2%）。
-> 对照：无 MTP 基线 TTFT 4.37s / E2E 89.2s（2294 req）；MTP 高并发实测 TTFT 8.76s（2162 req）。8.37s 属 MTP 高并发正常水位，E2E 33.6s 中 decode 约 25.2s（长输出占比上升所致）。
+> 当前生产基线见 0 章速查（2026-08：16454 req / abort 1.88% / TTFT 8.37s / E2E 33.6s）。
 
 **Qwen3.6-27B 上下文 262144 可行性**
 
@@ -965,3 +995,34 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 
 - 盯三个数：启动日志有无 "reduced from the requested"（池子被钳）、TTFT（长 prefill 底线）、`nvidia-smi` 显存；OOM 则退回 mem=0.85；
 - 生产若真上 256K，建议 PD 分离（长 prefill 单独处理）而非单实例硬扛。
+
+### 11.11 后续观察点与行动阈值
+
+基于 2026-08 基线（16454 req / abort 1.88% / TTFT 8.37s / E2E 33.6s），持续盯以下指标。监控平台接入见附录 G。
+
+**观察矩阵（按优先级）**
+
+| 优先级 | 指标 | 阈值 | 判定 | 行动 |
+|--------|------|------|------|------|
+| P0 | abort 率 | 单日 >2% 且趋势上升 | KV 紧张 / TTFT 超时 | 降 tool_call（`--proxy-tool-call-limit`）或 thinking；查 `token_usage` |
+| P0 | `token_usage` | ≥0.92 持续 5m | KV 池吃紧，驱逐风暴前兆 | 降并发 / 收紧 context / 若 mem<0.85 可回 0.85 |
+| P1 | TTFT p90（stream） | >10s 持续 10m | 排队或 prefill 争抢 | 看 `num_queue_reqs{priority="10"}` 占比；调 priority / 限流 / 扩副本 |
+| P1 | `num_queue_reqs` | >10 持续 5m | 容量瓶颈 | 后端容量已到顶 → 考虑 HPA 扩副本（见附录 G 第 6 节） |
+| P2 | `spec_accept_rate` | <65% 持续 15m | MTP 收益下降 | 检查 batch 干扰 / 降 steps |
+| P2 | `kv_available_tokens` | 贴 0 且 evict 激增 | 缓存被挤爆 | 缓存命中率下滑 → 降并发或加池子 |
+
+**每天看一遍的例行检查**
+
+1. abort 率（目标 <2%）与 TTFT p90（目标 <10s）是否在阈值内；
+2. 高峰时段 `token_usage` 峰值（记录当天的最高值，观察趋势是否逐日抬升——抬升说明 KV 需求在涨，需提前降并发）；
+3. 代理日志 `[adaptive-limits]` 调整次数（若开启）：一天内调整过于频繁 = 参数震荡，调大 `--adaptive-interval`；
+4. `nvidia-smi` GPU-Util 与温度（长期 90%+ 正常，100% 满负荷注意温度）。
+
+**触发升级的动作清单**
+
+| 现象 | 第一步 | 第二步 |
+|------|--------|--------|
+| abort 率连续两天 >2% | 热调 `tool_call` 降 4（`POST /admin/limits`） | 观察 1 天；未好转查 KV 与 TTFT |
+| TTFT p90 >10s 且 queue 高 | 确认 priority 生效（`num_queue_reqs` 有 `priority="10"` label） | 降 thinking 并发（保 tool call） |
+| token_usage 持续 >0.92 | 降 `max-running-requests` 或 mem 回 0.85 | 评估是否真需要 96K（见 11.10） |
+| 一切正常但想压 TTFT | 确认 `--adaptive-limit` 开启且无震荡 | 按附录 G 6 节流程评估固化默认值 |
