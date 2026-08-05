@@ -46,7 +46,7 @@ except ImportError:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -242,26 +242,36 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     )[0]
 
 
-def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
+def check_moe_marlin_supports_layer(
+    layer: FusedMoE, group_size: int, allow_tile_padding: bool = False
+) -> bool:
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
     if layer.moe_runner_config.is_gated:
-        supports_activation = layer.moe_runner_config.activation == "silu"
+        supports_activation = layer.moe_runner_config.activation in {"silu", "situ"}
     else:
         supports_activation = layer.moe_runner_config.activation in {
             "silu",
             "relu2",
         }
 
-    # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
-    # down: (n, k) = (hidden_size, intermediate_size_per_partition)
-    # moe marlin requires n % 128 == 0 and k % 64 == 0
-    supports_shape = (
-        hidden_size % 128 == 0
-        and intermediate_size_per_partition % max(64, group_size) == 0
-    )
+    if allow_tile_padding:
+        # Thread-tile misalignment can be fixed by zero-padding the expert
+        # intermediate dimension before Marlin repack. The original K still
+        # needs to fit a Marlin tile family, and quant groups must stay whole.
+        supports_shape = (
+            hidden_size % 64 == 0 and intermediate_size_per_partition % group_size == 0
+        )
+    else:
+        # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
+        # down: (n, k) = (hidden_size, intermediate_size_per_partition)
+        # moe marlin requires n % 128 == 0 and k % 64 == 0
+        supports_shape = (
+            hidden_size % 128 == 0
+            and intermediate_size_per_partition % max(64, group_size) == 0
+        )
     supports_group_size = group_size in [-1, 32, 64, 128]
     return (
         supports_shape

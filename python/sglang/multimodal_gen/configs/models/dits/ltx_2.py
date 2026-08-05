@@ -162,6 +162,7 @@ class LTX2ArchConfig(DiTArchConfig):
     # SGLang-specific parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_len: int = 512
+    enable_packed_qkv_input_a2a: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -186,3 +187,4 @@ class LTX2Config(DiTConfig):
     arch_config: LTX2ArchConfig = field(default_factory=LTX2ArchConfig)
 
     prefix: str = "ltx2"
+    torch_compile_mode: str = "default"

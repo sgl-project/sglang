@@ -74,10 +74,14 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+
+class _MediaInputValidationError(ValueError):
+    pass
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -137,6 +141,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    @staticmethod
+    def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
+        return any(tool.type in tool_types for tool in (request.tools or []))
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -194,6 +202,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                 'type="function"; other built-in tool types cannot be forced.'
             )
 
+        if (
+            self.use_harmony
+            and self._has_response_tool(request, "web_search", "web_search_preview")
+            and not self.supports_browsing
+        ):
+            return self.create_error_response(
+                "web_search requires a browser backend. Set EXA_API_KEY on the "
+                "SGLang server to enable native Exa-backed web search, or "
+                "configure a browser MCP tool server. Create an Exa API key at "
+                "https://dashboard.exa.ai/api-keys."
+            )
+
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
@@ -215,6 +235,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages, request_prompts, engine_prompts = (
                     self._make_request_with_harmony(request, prev_response)
                 )
+                require_reasoning = self._is_thinking_enabled_for_request(request)
             else:
                 (
                     messages,
@@ -222,7 +243,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     engine_prompts,
                     processed_messages,
                 ) = await self._make_request(request, prev_response, tokenizer)
+                require_reasoning = processed_messages.require_reasoning
 
+        except _MediaInputValidationError as e:
+            return self.create_error_response(str(e))
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
@@ -344,8 +368,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=require_reasoning,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -393,6 +419,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        require_reasoning=require_reasoning,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -414,6 +441,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        require_reasoning=require_reasoning,
                     )
                 return self.responses_stream_generator_non_harmony(
                     request,
@@ -422,6 +450,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     model_name,
                     tokenizer,
                     request_metadata,
+                    require_reasoning=require_reasoning,
                 )
             try:
                 result: Union[ORJSONResponse, ResponsesResponse] = (
@@ -433,6 +462,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        require_reasoning=require_reasoning,
                     )
                 )
                 return result
@@ -461,7 +491,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            reasoning_effort=(request.reasoning.effort if request.reasoning else None),
         )
+
+        media_error = self._validate_media_content(chat_request)
+        if media_error:
+            raise _MediaInputValidationError(media_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
@@ -499,6 +534,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> Union[ResponsesResponse, ORJSONResponse]:
         if created_time is None:
             created_time = int(time.time())
@@ -525,7 +562,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             assert final_res is not None
 
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request,
+                final_res["text"],
+                tokenizer,
+                require_reasoning=require_reasoning,
             )
 
             # Calculate usage from actual output
@@ -608,7 +648,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         return request.reasoning is not None and request.reasoning.summary is not None
 
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
-        """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
         effort = request.reasoning.effort if request.reasoning is not None else None
@@ -646,15 +685,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         final_output: Any,
         tokenizer: Any,
+        *,
+        require_reasoning: bool,
     ):
         if self.reasoning_parser:
-            # Templates that prefill ``<think>`` only emit the close tag, so
-            # start the detector in thinking mode.
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
-                force_reasoning=self._is_thinking_enabled_for_request(request),
+                force_reasoning=require_reasoning,
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -697,7 +737,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             and self.tool_call_parser
             and request.tool_choice != "none"
         ):
-            parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+            parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
             should_try_native = (
                 not is_required or parser.detector.supports_structural_tag()
             )
@@ -1168,8 +1212,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
-        *args,
-        **kwargs,
+        *,
+        require_reasoning: bool,
     ):
         try:
             # Update the status to "in_progress"
@@ -1187,8 +1231,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 request_metadata,
                 created_time,
-                *args,
-                **kwargs,
+                require_reasoning=require_reasoning,
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
@@ -1278,6 +1321,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
         # TODO:
         # 1. Handle disconnect
@@ -1672,7 +1717,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
 
         async def empty_async_generator():
-            if False:
+            for _ in ():
                 yield
 
         final_response = await self.responses_full_generator(
@@ -1684,6 +1729,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             tokenizer,
             request_metadata,
             created_time=created_time,
+            require_reasoning=require_reasoning,
         )
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
@@ -1722,6 +1768,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        *,
+        require_reasoning: bool,
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -1782,21 +1830,30 @@ class OpenAIServingResponses(OpenAIServingChat):
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
             if self.tool_call_parser:
-                probe = FunctionCallParser(chat_tools, self.tool_call_parser)
+                probe = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
                 native_supports_structural_tag = (
                     probe.detector.supports_structural_tag()
                 )
             if is_required and not native_supports_structural_tag:
                 tool_parser = JsonArrayParser()
             elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(chat_tools, self.tool_call_parser)
+                tool_parser = FunctionCallParser(
+                    chat_tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
-                force_reasoning=self._is_thinking_enabled_for_request(request),
+                force_reasoning=require_reasoning,
                 request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
             )
 
         current_output_index = -1
@@ -2346,6 +2403,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
@@ -2353,6 +2411,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                require_reasoning=adapted_request.require_reasoning,
             )
 
             # Update sampling params with reduced max_tokens

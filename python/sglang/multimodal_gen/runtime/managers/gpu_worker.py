@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+    IPC_A2A,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
@@ -40,6 +43,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -75,6 +81,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -98,6 +105,21 @@ class _ExpandedOutputParts:
     output_file_paths: list[str] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
+
+
+def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
+    """CPU intra-op thread budget for one of `num_gpus` co-located workers.
+
+    torch defaults the intra-op pool to every host core in every worker, so
+    co-located workers oversubscribe the host num_gpus-fold and any CPU op
+    past the ~32k-element parallel grain pays pool wakeup contention instead
+    of microseconds (measured 500x on request-static packed layouts). An
+    explicit OMP_NUM_THREADS keeps deployer intent (returns None).
+    """
+    if "OMP_NUM_THREADS" in os.environ:
+        return None
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -128,6 +150,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        self.memory_occupation: MemoryOccupationController | None = None
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -175,9 +198,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             os.environ.get("TRITON_CACHE_DIR"),
         )
 
+    def is_sleeping(self) -> bool:
+        return self.memory_occupation.is_sleeping() if self.memory_occupation else False
+
+    def _get_memory_occupation(self) -> MemoryOccupationController:
+        if self.memory_occupation is None:
+            self.memory_occupation = MemoryOccupationController(
+                pipeline=self.pipeline,
+                rank=self.rank,
+                use_fsdp_inference=self.server_args.use_fsdp_inference,
+            )
+        return self.memory_occupation
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         torch.get_device_module().set_device(self.local_rank)
+        intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
+        if intra_op_threads is not None:
+            torch.set_num_threads(intra_op_threads)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -309,6 +347,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        # request boundary: the IPC watchdog flag is a device read, illegal
+        # inside a graph capture and too costly per exchange
+        IPC_A2A.check_timeout()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -329,6 +370,54 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             error_context=f"request {req.request_id}",
         )
+
+    def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        group_start_time = time.monotonic()
+
+        try:
+            for req in batch:
+                output_count = (
+                    max(1, int(req.num_outputs_per_prompt or 1))
+                    if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                    else 1
+                )
+                output_batch = self._execute_forward_common(
+                    req,
+                    forward_fn=lambda results=results, output_count=output_count: (
+                        self._collect_sequential_outputs(results, output_count)
+                    ),
+                    log_reqs=[req],
+                    return_req=False,
+                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                        req, output_batch
+                    ),
+                    error_context=f"grouped request {req.request_id}",
+                    execution_start_time=group_start_time,
+                    propagate_forward_errors=True,
+                )
+                assert isinstance(output_batch, OutputBatch)
+                yield output_batch
+                del output_batch
+        finally:
+            close = getattr(results, "close", None)
+            if close is not None:
+                close()
+
+    def _collect_sequential_outputs(
+        self,
+        results: Iterator[OutputBatch | Req],
+        output_count: int,
+    ) -> OutputBatch | Req:
+        if output_count == 1:
+            return next(results)
+
+        output_batches = [
+            self._to_output_batch(next(results)) for _ in range(output_count)
+        ]
+        return self._merge_expanded_output_batches(output_batches)
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""
@@ -355,17 +444,24 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return_req: bool,
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
+        execution_start_time: float | None = None,
+        propagate_forward_errors: bool = False,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        forward_failed = False
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
-            start_time = time.monotonic()
+            start_time = (
+                execution_start_time
+                if execution_start_time is not None
+                else time.monotonic()
+            )
             self._realtime_sessions.attach(req)
 
             # capture memory baseline for each req in grouped forward on rank-0
@@ -384,7 +480,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                except Exception:
+                    forward_failed = True
+                    raise
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -415,11 +515,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_output_transport(output_batch, req, save_output_paths)
 
             if (
-                torch.cuda.is_initialized()
+                not current_platform.is_cpu()
                 and output_batch.output is None
                 and not req.return_raw_frames
             ):
-                torch.cuda.empty_cache()
+                torch.get_device_module().empty_cache()
 
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 if not req.is_warmup:
@@ -438,6 +538,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     tag="server_perf_dump",
                 )
         except Exception as e:
+            if propagate_forward_errors and forward_failed:
+                if isinstance(e, StopIteration):
+                    raise RuntimeError(
+                        "Grouped pipeline returned fewer outputs than requests."
+                    ) from e
+                raise
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
@@ -449,8 +555,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if not current_platform.is_cpu():
+                torch.get_device_module().empty_cache()
         return output_batch
 
     def _materialize_output_transport(
@@ -463,7 +569,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -501,7 +607,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -675,7 +785,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(
@@ -707,6 +817,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
+            usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
             trajectory_latents=getattr(result, "trajectory_latents", None),
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
@@ -741,6 +852,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if output_batch.usage is not None:
+            if merged.usage is None:
+                merged.usage = {}
+            for key, value in output_batch.usage.items():
+                if isinstance(value, int):
+                    merged.usage[key] = int(merged.usage.get(key, 0)) + value
+                else:
+                    merged.usage[key] = value
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None
@@ -922,6 +1041,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
+    def release_memory_occupation(self) -> dict:
+        return self._get_memory_occupation().release_memory_occupation()
+
+    def resume_memory_occupation(self) -> dict:
+        if self.memory_occupation is None:
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "already awake",
+            }
+        return self.memory_occupation.resume_memory_occupation()
+
 
 OOM_MSG = """
 OOM detected. Possible solutions:
@@ -971,6 +1102,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

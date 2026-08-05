@@ -100,6 +100,13 @@ def maybe_overlap_staged_shared_add(output: torch.Tensor) -> Optional[torch.cuda
         # Single-stream caller: nothing to overlap. Leave the staging in place
         # so the model layer reclaims it and does the add as before.
         return None
+    if torch.cuda.is_current_stream_capturing():
+        # The cross-stream producer-stream add_ (ordered via base_ready/add_done
+        # events) is NOT cuda-graph-capture-safe: it corrupts `output` on replay.
+        # Fall back to the serial caller-side add -- leave the staging so the model
+        # layer reclaims it via unstage_shared_expert_add and adds shared_output
+        # after current_stream.wait_stream(alt_stream).
+        return None
     _PENDING = None
 
     base_ready = torch.cuda.Event()

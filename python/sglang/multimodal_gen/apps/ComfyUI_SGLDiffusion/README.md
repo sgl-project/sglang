@@ -4,7 +4,7 @@ A ComfyUI plugin for integrating with SGLang Diffusion server, supporting image 
 
 ## Installation
 
-1. **Install SGLang**: Follow the [Installation Guide](../../../../../docs/diffusion/installation.md) to install `sglang[diffusion]`.
+1. **Install SGLang**: Follow the [Installation Guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to install `sglang[diffusion]`.
 2. **Install Plugin**: Copy this entire directory (`ComfyUI_SGLDiffusion`) to your ComfyUI `custom_nodes/` folder.
 3. **Restart ComfyUI**: Restart ComfyUI to load the plugin.
 

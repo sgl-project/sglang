@@ -1,6 +1,6 @@
 ---
 name: cookbook-migrate-model
-description: Migrate a legacy-template SGLang cookbook page (monolithic per-model generator under docs_new/src/snippets/autoregressive/) onto the config-driven template (shared _deployment.jsx / _playground.jsx engines + per-model config). Use when asked to migrate, convert, or port an existing cookbook page — NOT for brand-new models (use cookbook-add-model for those). Run with /cookbook-migrate-model <Model page name, e.g. GLM-5.1>.
+description: Migrate a legacy-template SGLang cookbook page (monolithic per-model generator under docs/src/snippets/autoregressive/) onto the config-driven template (shared _deployment.jsx / _playground.jsx engines + per-model config). Use when asked to migrate, convert, or port an existing cookbook page — NOT for brand-new models (use cookbook-add-model for those). Run with /cookbook-migrate-model <Model page name, e.g. GLM-5.1>.
 ---
 
 # Cookbook Migrate Model
@@ -26,7 +26,7 @@ your dispatch prompt, or ask for it.
 
 1. **Never modernize.** Env vars, flags, TP values, docker tags, version strings
    are copied verbatim from the legacy page — even when today's defaults differ
-   (e.g. `SGLANG_ENABLE_SPEC_V2=1` is now default; keep it anyway). The recipe
+   (e.g. a flag whose behavior has since become the default; keep it anyway). The recipe
    that was verified is the recipe as written. Allowed normalizations are ONLY
    the five alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated
@@ -42,15 +42,22 @@ your dispatch prompt, or ask for it.
    (the recipe was measured with it, and fp8 KV halves KV memory —
    stripping could OOM it). See dimension-mapping.md §2 caveats.
 2. **Never invent versions or numbers.** Benchmark numbers only from the
-   legacy page's measured blocks. **Speed measurements migrate ONLY when the
-   legacy page pins an exact, reproducible build** (a release tag or a commit
-   hash) — drifting strings like "main branch" are no version anchor: drop the
-   speed numbers AND the entry's `sglang_version`, keep accuracy (far less
-   build-sensitive) and `benchmarkCommands` so ⚡Reproduce guides
-   re-measurement against a pinned release; confirm ambiguous strings (e.g.
-   "0.5.8+") with the maintainer. When kept, `sglang_version` is the legacy
-   page's string verbatim. Docker tags only the ones the legacy page pinned
-   (unmapped hw falls back to `:dev`).
+   legacy page's measured blocks, and a result migrates ONLY when its
+   `sglang_version` is a **reproducible anchor** — the bar is reproducibility,
+   not "must be a release":
+   - ✅ release tag/version (`v0.5.9` / `0.5.9`), commit hash, OR — for
+     **Day-0 support** (the enabling PR isn't merged and no release is cut
+     yet) — a specific **PR (`PR #27944`) or commit** you can `gh pr checkout`
+     / `git checkout <sha>`. Commit is most precise; a PR pin is fine for day-0.
+   - ❌ a moving ref — `"main branch"`, `"main (2026-06-11)"`, open-ended
+     `"0.5.8+"` — is NOT reproducible: **drop the WHOLE result (speed AND
+     accuracy)**, not just speed. Keep `benchmarkCommands` so ⚡Reproduce still
+     guides re-measurement against a pinned build.
+   **Never inherit cross-model numbers** — measurements the legacy page
+   attributes to a *different model* (e.g. a K2.6 page carrying K2.5-measured
+   speed) are dropped regardless of version. When kept, `sglang_version` is the
+   legacy page's string verbatim. Docker tags only the ones the legacy page
+   pinned (unmapped hw falls back to `:dev`).
 3. **Verified policy (strictest tier).** `verified: true` ONLY when (a) the
    legacy page has concrete measured data for that exact 5-dim combo AND
    (b) the cell's flags equal the deployment command used for that measurement
@@ -64,11 +71,14 @@ your dispatch prompt, or ask for it.
    them in the PR body for the re-verification track.
 4. **Engines are read-only.** `_deployment.jsx` / `_playground.jsx` must not
    change in a migration PR. Model-specific features are config DATA consumed
-   by generic axis handlers (MegaMoE precedent), so they need NO engine
-   change — only a genuinely new control *shape* does, and then as a one-time
-   generic primitive (never a model-named handler) on a separate prior PR
-   (engine-axis.md). KV Cache DType / mamba-cache select trigger this once for
-   the whole round; afterwards both are config.
+   by generic axis handlers (MegaMoE precedent), so they need NO engine change.
+   A **titled single-select that strips a flag family** — KV Cache DType
+   (`--kv-cache-dtype`), mamba (`--mamba-scheduler-strategy`), … — is already
+   covered by the merged generic **`flagSelects`** axis: declare it in the
+   config (a list of `{ id, title, stripPrefixes, options }`; see the Qwen3.5
+   mamba example), **no engine PR**. Only a genuinely new control *shape* that
+   `flagSelects` can't express would need a one-time generic primitive (never a
+   model-named handler) on a separate prior PR (engine-axis.md).
 5. **`github.cookbookModel` must be set** (`<hf-org>/<page-slug>`, e.g.
    `qwen/qwen3.5`) and the block never pruned — without it Submit ↗ mislabels
    as deepseek-v4. The issue template itself needs NO edits (free-form input).
@@ -83,7 +93,7 @@ your dispatch prompt, or ask for it.
 ## Workflow (one model = one PR)
 
 ### 1. Inventory the legacy assets
-- Read the legacy generator (`docs_new/src/snippets/autoregressive/<slug>-deployment.jsx`)
+- Read the legacy generator (`docs/src/snippets/autoregressive/<slug>-deployment.jsx`)
   end-to-end: every option dimension (radio vs checkbox vs dynamic), every
   gate/SUPPORT matrix, the full emitted command per reachable combo (env
   prefixes, `# Error` pseudo-commands included).
@@ -91,8 +101,8 @@ your dispatch prompt, or ask for it.
   upgraded); §3.2 tips → new §2; §4 invocation examples → new §3 (keep real
   Output Examples verbatim); §5 benchmark blocks → transcribe each measured
   block: deploy command used, bench command (dataset/isl/osl/num-prompts/
-  concurrency), Mean TTFT/TPOT, output tok/s, hardware, version string.
-- Inbound-anchor sweep: `grep -rn "<PageName>" docs_new/ --include='*.mdx'` —
+  concurrency), P50 (median) TTFT/TPOT, output tok/s, hardware, version string.
+- Inbound-anchor sweep: `grep -rn "<PageName>" docs/ --include='*.mdx'` —
   find links/`#fragments` into this page (`mint broken-links` does NOT check
   fragments). Fix referrers or add `<a id="old-anchor" />` shims in the same PR.
 - Check the maintainer-provided inventory notes for this model's known quirks —
@@ -117,12 +127,13 @@ Playground-only (DSv4 convention). **Every legacy control survives as an
 interactive control** — a dimension or a Playground axis, never a tips-only
 mention — and a model-specific control is **config data, not engine code**
 (MegaMoE W4A4 is all DSv4 config on the existing `moe` axis). It's pure
-config whenever it fits an existing axis's data schema. Only a genuinely new
-*shape* (Nemotron3's "KV Cache DType" — a titled single-select stripping a
-flag family no axis manages) needs the engine, and then as a ONE-TIME
-generic config-parameterized primitive (never a model-named handler) on a
-separate PRIOR engine PR, keeping the migration PR data-only (hard rule 4,
-engine-axis.md). The strategy count follows the page's
+config whenever it fits an existing axis's data schema. A **titled
+single-select that strips a flag family** (Nemotron3's "KV Cache DType",
+mamba `--mamba-scheduler-strategy`, …) fits the merged generic **`flagSelects`**
+axis — so it too is config-only (declare a `flagSelects` list). Only a control
+whose *shape* `flagSelects` still can't express would need a ONE-TIME generic
+primitive (never a model-named handler) on a separate PRIOR engine PR, keeping
+the migration PR data-only (hard rule 4, engine-axis.md). The strategy count follows the page's
 operating points: **one recipe → a single `balanced`; two → `low-latency` +
 `high-throughput`; three → the full trio (the ideal)**. The tiers apply per
 (hw × variant × quant) combination — a single-recipe combination on a
@@ -163,7 +174,12 @@ hardware owners sign off on at review.
 ### 4. Benchmarks file
 One entry per measured block only (cells without entries already render
 "pending" — bare `{match}` stubs are unnecessary). `tokens_per_sec_per_gpu` =
-output tok/s ÷ (tp × nnodes); TTFT/TPOT take the Mean rows; put the workload's
+total (in+out) tok/s/GPU = `output tok/s ÷ (tp × nnodes) ×
+(isl+osl)/osl` — stored directly (the card shows it as-is). TTFT/TPOT
+take the P50 (median) rows; set `config.latencyPercentile` (default `"P50"`; use
+`"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50; an
+entry-level `latencyPercentile` overrides the page value per cell).
+Put the workload's
 `num_prompts` into `workload`. **`config.accuracyLabels` is required whenever
 the benchmarks carry accuracy data** — the engine ships no default eval set
 (#27842), so missing labels means the accuracy rows silently don't render;
@@ -189,14 +205,14 @@ collapsible (required, DeepSeek-V4 pattern): code in an
 `<Accordion title="Example Output">`; legacy pages kept them inline.
 
 ### 6. Delete the legacy generator
-Remove `docs_new/src/snippets/autoregressive/<slug>-deployment.jsx` and its
-import. `grep -rn "<slug>-deployment" docs_new/` must return nothing (config
+Remove `docs/src/snippets/autoregressive/<slug>-deployment.jsx` and its
+import. `grep -rn "<slug>-deployment" docs/` must return nothing (config
 provenance comments must not name the deleted path). Site wiring needs **no
 changes**: docs.json path/title unchanged, vendor card + logo already exist.
 
 ### 7. Validate
 - `grep -rn '__[A-Z_]*__'` on the new files (no template tokens).
-- `cd docs_new && mint validate && mint broken-links` (pre-existing breaks on
+- `cd docs && mint validate && mint broken-links` (pre-existing breaks on
   main are not yours — say so in the PR).
 - `mint dev` browser smoke: initial selection = the verified cell (first in
   `cells[]`) with green badge; multi-node cells show the injected trio +
