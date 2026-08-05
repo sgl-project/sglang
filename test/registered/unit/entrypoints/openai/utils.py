@@ -51,7 +51,9 @@ class MockTokenizerManager:
             tokenizer_metrics_allowed_custom_labels=None,
             tool_call_parser=None,
             incremental_streaming_output=False,
+            enable_lora=False,
         )
+        self.served_model_name = "x"
         self.tokenizer = Mock()
         self.tokenizer.encode.return_value = [1, 2, 3]
         self.tokenizer.chat_template = None
