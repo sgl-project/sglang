@@ -1606,7 +1606,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             expanded_idx_to_permuted_idx=expanded_idx,
                             top_k=packed_topk.shape[1],
                         )
-                    return StandardCombineInput(hidden_states=result)
+                        return StandardCombineInput(hidden_states=result)
+                    # The finalized kernel writes to its explicit output
+                    # argument. Do not propagate the FFI return tensor: some
+                    # SiTU runner versions return a distinct wrapper/allocation
+                    # even though symm_output contains the published result.
+                    # Returning the destination makes the pointer contract
+                    # explicit for K3's zero-copy latent buffer.
+                    return StandardCombineInput(hidden_states=symm_output)
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
