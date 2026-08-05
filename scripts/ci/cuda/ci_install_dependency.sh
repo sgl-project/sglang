@@ -155,8 +155,20 @@ install_apt_packages() {
 }
 
 clean_site_packages() {
-    # Clear torch compilation cache
-    python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+    # Clear torch compilation cache from every location it can be in; sglang
+    # is not installed yet, so it cannot be asked which one is in use.
+    python3 -c '
+import getpass, os, shutil, tempfile
+
+sglang_cache_dir = os.environ.get("SGLANG_CACHE_DIR") or "~/.cache/sglang"
+for cache_dir in (
+    os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+    os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()),
+    os.path.join(os.path.expanduser(sglang_cache_dir), "inductor"),
+):
+    if cache_dir:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+'
 
     # Remove broken dist-info directories (missing METADATA per PEP 376)
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
