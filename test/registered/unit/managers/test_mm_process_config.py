@@ -8,10 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestMmProcessConfigValidation(CustomTestCase):

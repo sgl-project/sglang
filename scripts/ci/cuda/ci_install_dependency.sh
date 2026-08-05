@@ -238,7 +238,8 @@ setup_pip_toolchain() {
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
-    $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
+    # sglang-kernel stays: install_sglang_kernel version-gates and reinstalls it.
+    $PIP_UNINSTALL_CMD sgl-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -384,6 +385,40 @@ install_sglang() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+# Trust an installed wheel only if the version matches and every RECORD file is
+# on disk (dist-info can survive a partial install - cf. the cusparselt guard).
+# reject-local refuses wheels installed from a local file: a kernel-PR job
+# installs its own build under the SAME +cuXXX version string, and only file://
+# provenance (PEP 610; index installs record none) tells them apart.
+installed_wheel_ok() {
+    WHEEL_DIST="$1" WHEEL_WANTED="$2" WHEEL_REJECT_LOCAL="${3:-}" python3 - <<'EOF'
+import importlib.metadata as md
+import os
+import sys
+
+name = os.environ["WHEEL_DIST"]
+wanted = os.environ["WHEEL_WANTED"]
+try:
+    dist = md.distribution(name)
+except md.PackageNotFoundError:
+    print(f"{name} not installed (required: {wanted}); installing")
+    sys.exit(1)
+if dist.version != wanted:
+    print(f"{name} mismatch (installed: {dist.version}, required: {wanted}); reinstalling")
+    sys.exit(1)
+if os.environ["WHEEL_REJECT_LOCAL"] and "file://" in (dist.read_text("direct_url.json") or ""):
+    print(f"{name} came from a locally built wheel; reinstalling from the index")
+    sys.exit(1)
+if dist.files is None:
+    print(f"{name} has no RECORD to verify; reinstalling")
+    sys.exit(1)
+missing = [str(f) for f in dist.files if not dist.locate_file(f).exists()]
+if missing:
+    print(f"{name} is missing {len(missing)} installed files (e.g. {missing[0]}); reinstalling")
+    sys.exit(1)
+EOF
+}
+
 install_sglang_kernel() {
     SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' python/sglang/kernels/aot/pyproject.toml)
     SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
@@ -451,16 +486,28 @@ install_sglang_kernel() {
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
-        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
-        # tracks one CUDA version (currently cu130). Force-reinstall from the
-        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
-        # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
-        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        # The PyPI default wheel tracks one CUDA version (currently cu130); other
+        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
+        # sglang index, linked against the right libnvrtc.
+        SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
+        if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
+            echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
+        else
+            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+        fi
     else
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
     if [ "$CU_MAJOR" = "13" ]; then
+        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}"
+    else
+        SGL_DEEP_GEMM_WANTED="${SGL_DEEP_GEMM_VERSION}+cu129"
+    fi
+    # No reject-local: nothing builds sgl-deep-gemm locally.
+    if installed_wheel_ok sgl-deep-gemm "${SGL_DEEP_GEMM_WANTED}"; then
+        echo "sgl-deep-gemm==${SGL_DEEP_GEMM_WANTED} already installed, keeping it"
+    elif [ "$CU_MAJOR" = "13" ]; then
         $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
     else
         $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
