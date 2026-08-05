@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_lora
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -529,7 +529,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             # hooks appear is a per-call property, so gate on the server flag
             # here -- this is the load-time decision point and the interleaving
             # is permanent.
-            and not get_server_args().enable_lora
+            and not get_lora().enable_lora
         ):
             w13 = layer.w13_weight.data
             inter = w13.shape[1] // 2
