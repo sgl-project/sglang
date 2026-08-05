@@ -442,6 +442,36 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             server_args._handle_mamba_backend()
 
 
+class TestCakeLinearAttnBackend(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_shared_backend_selects_cake_for_prefill_and_decode(
+        self, _mock_sm100, _mock_is_cuda
+    ):
+        server_args = ServerArgs(model_path="dummy", linear_attn_backend="cake")
+
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "cake")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    def test_per_phase_override_wins_over_shared_cake_backend(
+        self, _mock_sm100, _mock_is_cuda
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            linear_attn_backend="cake",
+            linear_attn_decode_backend="triton",
+        )
+
+        server_args._handle_linear_attn_backend()
+
+        self.assertEqual(server_args.linear_attn_decode_backend, "triton")
+        self.assertEqual(server_args.linear_attn_prefill_backend, "cake")
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
