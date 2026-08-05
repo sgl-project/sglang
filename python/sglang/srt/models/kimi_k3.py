@@ -71,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.gguf_moe_loader import plan_k3_a_log_tp_shard
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -118,6 +119,50 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+
+
+def _prepare_k3_a_log_tp_shard(
+    loaded_weight: torch.Tensor,
+    *,
+    parameter_shape: torch.Size,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Return one validated, finite, owned zero-offset A_log TP shard."""
+
+    start_idx, shard_size = plan_k3_a_log_tp_shard(
+        checkpoint_shape=loaded_weight.shape,
+        parameter_shape=parameter_shape,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    owned_shard = (
+        loaded_weight.reshape(-1)
+        .narrow(0, start_idx, shard_size)
+        .reshape(parameter_shape)
+        .clone(memory_format=torch.contiguous_format)
+    )
+    if not torch.isfinite(owned_shard).all():
+        raise ValueError("K3 A_log TP shard contains non-finite values")
+    return owned_shard
+
+
+def _copy_k3_a_log_tp_shard(
+    parameter: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    tp_rank: int,
+    tp_size: int,
+) -> None:
+    owned_shard = _prepare_k3_a_log_tp_shard(
+        loaded_weight,
+        parameter_shape=parameter.shape,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    parameter.copy_(owned_shard, non_blocking=False)
+
+
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -1441,17 +1486,12 @@ class KimiK3DeltaAttention(nn.Module):
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
             tp_rank = get_parallel().attn_tp_rank
-            shard_size = param.data.shape[2]  # local_num_heads
-            start_idx = tp_rank * shard_size
-
-            # Handle old 4-D checkpoint format: [1, 1, H, 1] -> [H]
-            if loaded_weight.dim() == 4:
-                loaded_weight = loaded_weight.view(loaded_weight.shape[2])
-            # Now loaded_weight is 1-D (either [num_heads] or [head_dim]).
-            # Narrow to the TP shard along the head dimension.
-            loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-            # Reshape to match param shape [1, 1, local_num_heads, 1]
-            param.data.copy_(loaded_weight.view(param.data.shape))
+            _copy_k3_a_log_tp_shard(
+                param.data,
+                loaded_weight,
+                tp_rank=tp_rank,
+                tp_size=self.attn_tp_size,
+            )
 
         set_weight_attrs(self.A_log, {"weight_loader": _a_log_weight_loader})
 

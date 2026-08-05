@@ -378,23 +378,37 @@ def test_kv_transform_defers_both_source_ranges_until_combined_value_is_consumed
     ]
 
 
-def test_fadvise_rejection_uses_proven_madvise_fallback(tmp_path, monkeypatch):
+def test_shared_inode_releasers_never_use_global_fadvise(tmp_path, monkeypatch):
     path = tmp_path / "mapped.gguf"
     path.write_bytes(b"x" * (2 * mmap.PAGESIZE))
-    mapped = _MappedFile(path.stat().st_size)
-    reader = types.SimpleNamespace(data=types.SimpleNamespace(_mmap=mapped))
+    first_mapping = _MappedFile(path.stat().st_size)
+    second_mapping = _MappedFile(path.stat().st_size)
 
-    def reject_fadvise(*_args):
-        raise OSError("FUSE does not implement fadvise")
+    def reject_global_fadvise(*_args):
+        raise AssertionError("shared-inode fadvise must never be called")
 
-    monkeypatch.setattr("os.posix_fadvise", reject_fadvise, raising=False)
+    monkeypatch.setattr("os.posix_fadvise", reject_global_fadvise, raising=False)
     monkeypatch.setattr("os.POSIX_FADV_DONTNEED", 4, raising=False)
-    releaser = _MMapRangeReleaser(str(path), reader)
-    releaser.release(17, 23)
+    first = _MMapRangeReleaser(
+        str(path),
+        types.SimpleNamespace(data=types.SimpleNamespace(_mmap=first_mapping)),
+    )
+    second = _MMapRangeReleaser(
+        str(path),
+        types.SimpleNamespace(data=types.SimpleNamespace(_mmap=second_mapping)),
+    )
 
-    assert mapped.advice == [_aligned_release(mapped, 17, 23)]
-    assert releaser._fadvise_enabled is False
-    assert releaser._fd is None
+    # Model two ranks at different offsets in the same inode. Each release is
+    # confined to its own mapping, regardless of the other rank's progress.
+    first.release(17, 23)
+    second.release(mmap.PAGESIZE + 31, 29)
+    first.close()
+    second.close()
+
+    assert first_mapping.advice == [_aligned_release(first_mapping, 17, 23)]
+    assert second_mapping.advice == [
+        _aligned_release(second_mapping, mmap.PAGESIZE + 31, 29)
+    ]
 
 
 def test_adapter_fails_closed_without_madvise_support(tmp_path):

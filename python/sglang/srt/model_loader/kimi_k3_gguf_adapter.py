@@ -110,9 +110,12 @@ class _MMapRangeReleaser:
     the source pages: all retained expert data already belongs to the CUDA
     parameter device.
 
-    ``MADV_DONTNEED`` is mandatory.  ``POSIX_FADV_DONTNEED`` is an additional
-    best-effort page-cache hint; failure of that optional hint falls back to
-    the successful mmap advice rather than silently disabling eviction.
+    ``MADV_DONTNEED`` is mandatory and deliberately the only eviction hint.
+    Kimi K3 tensor-parallel ranks independently consume the same local GGUF
+    inode. ``POSIX_FADV_DONTNEED`` acts on that shared inode's page cache, so a
+    faster rank could evict pages that a slower rank has not consumed yet.
+    Mapping-local ``madvise`` bounds each process's resident working set
+    without introducing that cross-rank race.
     """
 
     def __init__(self, path: str, reader) -> None:
@@ -134,14 +137,9 @@ class _MMapRangeReleaser:
         if mapped_size <= 0:
             raise RuntimeError("Kimi K3 GGUF mmap is empty")
 
-        self._path = path
         self._mapped = mapped
         self._mapped_size = mapped_size
         self._page_size = int(mmap.PAGESIZE)
-        self._fd: int | None = None
-        self._fadvise_enabled = hasattr(os, "posix_fadvise") and hasattr(
-            os, "POSIX_FADV_DONTNEED"
-        )
 
     def _aligned_range(self, offset: int, length: int) -> tuple[int, int]:
         offset = int(offset)
@@ -168,23 +166,10 @@ class _MMapRangeReleaser:
                 "Kimi K3 GGUF could not evict a consumed mmap range"
             ) from error
 
-        if not self._fadvise_enabled:
-            return
-        try:
-            if self._fd is None:
-                self._fd = os.open(self._path, os.O_RDONLY)
-            os.posix_fadvise(self._fd, start, aligned_length, os.POSIX_FADV_DONTNEED)
-        except OSError:
-            # The mmap advice above already discarded this process's pages.
-            # Some FUSE filesystems reject fadvise; remember that proven
-            # fallback instead of retrying a rejected hint for every tensor.
-            self._fadvise_enabled = False
-            self.close()
-
     def close(self) -> None:
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        # Kept for the adapter's generator-finalization contract. Mapping-local
+        # madvise owns no auxiliary descriptor or other closeable resource.
+        return None
 
 
 def _strip_language_prefix(name: str) -> str:

@@ -7,10 +7,60 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 import unittest
 
 from sglang.srt.layers.quantization.gguf_moe_loader import (
+    plan_k3_a_log_tp_shard,
     plan_gguf_moe_stream_destination,
     plan_gguf_moe_tp_shard,
     record_gguf_moe_qtype,
 )
+
+
+class TestK3ALogTPShardingContract(unittest.TestCase):
+    def test_tp4_ranks_receive_exact_32_element_ranges(self):
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.assertEqual(
+                    plan_k3_a_log_tp_shard(
+                        checkpoint_shape=(128,),
+                        parameter_shape=(1, 1, 32, 1),
+                        tp_rank=rank,
+                        tp_size=4,
+                    ),
+                    (rank * 32, 32),
+                )
+
+    def test_legacy_4d_checkpoint_uses_same_range(self):
+        self.assertEqual(
+            plan_k3_a_log_tp_shard(
+                checkpoint_shape=(1, 1, 128, 1),
+                parameter_shape=(1, 1, 32, 1),
+                tp_rank=2,
+                tp_size=4,
+            ),
+            (64, 32),
+        )
+
+    def test_invalid_shapes_and_rank_fail_closed(self):
+        cases = (
+            ((2, 2), (1, 1, 1, 1), 0, 2, "1-D or legacy 4-D"),
+            ((129,), (1, 1, 32, 1), 0, 4, "extent differs"),
+            ((160,), (1, 1, 32, 1), 0, 4, "extent differs"),
+            ((128,), (1, 1, 32, 1), -1, 4, "topology is invalid"),
+            ((128,), (1, 1, 32, 1), 4, 4, "topology is invalid"),
+            ((32,), (1, 32), 0, 1, "parameter shape is invalid"),
+        )
+        for checkpoint_shape, parameter_shape, rank, size, message in cases:
+            with self.subTest(
+                checkpoint_shape=checkpoint_shape,
+                parameter_shape=parameter_shape,
+                rank=rank,
+                size=size,
+            ), self.assertRaisesRegex(ValueError, message):
+                plan_k3_a_log_tp_shard(
+                    checkpoint_shape=checkpoint_shape,
+                    parameter_shape=parameter_shape,
+                    tp_rank=rank,
+                    tp_size=size,
+                )
 
 
 class TestGGUFMoEQTypeContract(unittest.TestCase):

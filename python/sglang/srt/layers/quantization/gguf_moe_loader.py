@@ -11,6 +11,53 @@ from collections.abc import MutableMapping, Sequence
 GGUF_MOE_SHARDS = frozenset({"w1", "w2", "w3"})
 
 
+def plan_k3_a_log_tp_shard(
+    *,
+    checkpoint_shape: Sequence[int],
+    parameter_shape: Sequence[int],
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[int, int]:
+    """Return the flat start/length for one validated K3 A_log TP shard."""
+
+    checkpoint_shape = tuple(int(value) for value in checkpoint_shape)
+    parameter_shape = tuple(int(value) for value in parameter_shape)
+    if len(checkpoint_shape) == 4:
+        if checkpoint_shape[0:2] != (1, 1) or checkpoint_shape[3] != 1:
+            raise ValueError(
+                f"K3 A_log checkpoint shape is invalid: {checkpoint_shape}"
+            )
+        checkpoint_elements = checkpoint_shape[2]
+    elif len(checkpoint_shape) == 1:
+        checkpoint_elements = checkpoint_shape[0]
+    else:
+        raise ValueError(
+            f"K3 A_log checkpoint must be 1-D or legacy 4-D: {checkpoint_shape}"
+        )
+    if (
+        len(parameter_shape) != 4
+        or parameter_shape[0:2] != (1, 1)
+        or parameter_shape[3] != 1
+        or parameter_shape[2] <= 0
+    ):
+        raise ValueError(f"K3 A_log parameter shape is invalid: {parameter_shape}")
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(
+            f"K3 A_log TP topology is invalid: rank={tp_rank}, size={tp_size}"
+        )
+
+    shard_size = parameter_shape[2]
+    start_idx = tp_rank * shard_size
+    expected_checkpoint_elements = tp_size * shard_size
+    if checkpoint_elements != expected_checkpoint_elements:
+        raise ValueError(
+            "K3 A_log checkpoint extent differs from the exact TP topology: "
+            f"elements={checkpoint_elements}, expected={expected_checkpoint_elements}, "
+            f"rank={tp_rank}, size={tp_size}, shard_size={shard_size}"
+        )
+    return start_idx, shard_size
+
+
 def record_gguf_moe_qtype(
     shard_weight_types: MutableMapping[str, int],
     shard_id: str,
