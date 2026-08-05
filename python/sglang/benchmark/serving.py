@@ -35,6 +35,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -710,12 +711,18 @@ async def async_request_sglang_generate(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        # Cumulative chunks make parsing O(n^2) per request on this
+                        # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
+                        sse_data = (
+                            chunk_bytes[6:]
+                            if chunk_bytes.startswith(b"data: ")
+                            else chunk_bytes
+                        )
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
+                        if sse_data == b"[DONE]":
                             pass
                         else:
-                            data = json.loads(chunk)
+                            data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:

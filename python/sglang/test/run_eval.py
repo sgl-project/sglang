@@ -16,6 +16,7 @@ from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
     CompletionSampler,
     Eval,
+    GenerateSampler,
     make_report,
     set_ulimit,
 )
@@ -78,6 +79,13 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
         stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
         sampler = CompletionSampler(
+            **common_kwargs,
+            stop=stop,
+        )
+    elif api_mode == "generate":
+        # SGLang-native `/generate` (raw text + sampling_params), same stop defaults.
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = GenerateSampler(
             **common_kwargs,
             stop=stop,
         )
@@ -454,8 +462,8 @@ if __name__ == "__main__":
         "--api",
         type=str,
         default="chat",
-        choices=["chat", "completion"],
-        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions",
+        choices=["chat", "completion", "generate"],
+        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)

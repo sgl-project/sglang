@@ -596,7 +596,13 @@ class DSparkDraftMixin:
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
 
-    pass
+    def prune_to_ctx_kv_injection(self) -> None:
+        self.markov_head = None
+        self.confidence_head = None
+        for layer in self.layers:
+            layer.mlp = None
+            layer.self_attn.o_proj = None
+        torch.cuda.empty_cache()
 
 
 class Qwen3DSparkModel(DSparkDraftModel):
@@ -616,4 +622,4 @@ class ExaoneMoeDSparkModel(DSparkDraftModel):
         super().load_weights(remap_mtp_weights())
 
 
-EntryClass = [Qwen3DSparkModel, ExaoneMoeDSparkModel]
+EntryClass = [Qwen3DSparkModel, ExaoneMoeDSparkModel, DSparkDraftModel]
