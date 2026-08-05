@@ -31,7 +31,6 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
-from sglang.srt.utils.hf_transformers.common import resolve_local_or_cached_file
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -729,17 +728,6 @@ class RustServer:
             scheduler.server_args
         )
         server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
-
-        # The Rust server reads only local files — hub-blind, so it can never
-        # disagree with huggingface_hub about cache layout. Resolve a repo-id
-        # tokenizer_path to the cached tokenizer.json here; no network, since the
-        # scheduler's init_tokenizer already downloaded it.
-        if not scheduler.server_args.skip_tokenizer_init:
-            path = server_args["tokenizer_path"] or server_args["model_path"]
-            if not os.path.exists(path):
-                server_args["tokenizer_path"] = resolve_local_or_cached_file(
-                    path, "tokenizer.json", server_args["revision"]
-                )
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
