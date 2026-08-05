@@ -1,13 +1,19 @@
 import logging
+from dataclasses import replace
 from typing import Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
+)
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    EagleDraftWorkerBase,
 )
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
@@ -29,24 +35,18 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: int,
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        EagleDraftWorkerBase.__init__(self)
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -57,9 +57,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
-        self._topk1_parents_prealloc = None
-        self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
         # Set constant
@@ -74,12 +71,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # spec workers don't support pipeline parallelism
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
             )
@@ -122,15 +115,17 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_lm_head()
 
     def init_attention_backends(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_attention_backends()
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_cuda_graphs()
 
     def init_lm_head(self):
@@ -146,14 +141,12 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        BaseSpecWorker.__init__(self)
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
@@ -167,21 +160,11 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
-        server_args.override(
-            "spec_worker.match_target_context_length",
-            context_length=target_worker.model_runner.model_config.context_len,
-        )
-
         # Create our custom draft worker that doesn't share embeddings/lm_head
         self._draft_worker = StandaloneDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )

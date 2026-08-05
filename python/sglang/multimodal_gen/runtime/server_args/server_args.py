@@ -129,12 +129,18 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "fal/ideogram-v4-fast",
+        "fal/ideogram-v4-instant",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
+        "ideogram-v4-fast",
+        "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "minimax-h3",
+        "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen-image",
@@ -151,6 +157,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
         "ZImagePipelineConfig",
     }
@@ -175,6 +182,8 @@ def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
+    model_subfolder: str | None = None
+    model_variant: str | None = None
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
@@ -218,6 +227,11 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_cfg_parallel: Optional[bool] = None
     # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
     cfg_parallel_degree: Optional[int] = None
+
+    # encoder layout across a multi-rank replica: auto | fold | dp | replicate
+    # (see --encoder-parallel); fold shards the weights at load time, so it is
+    # mutually exclusive with dp/replicate for the lifetime of the model
+    encoder_parallel: str = "auto"
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -264,6 +278,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    # If set, keep this many leading DiT layers resident on GPU
+    dit_layerwise_resident_layers: float = 0.0
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -278,6 +294,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -412,6 +429,7 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+    enable_cache_report: bool = False
 
     # Tracing
     enable_trace: bool = False
@@ -421,6 +439,9 @@ class ServerArgs(DisaggServerArgsMixin):
     srt_encoder_url: str | None = None
     srt_encoder_connect_timeout: int = 3.05
     srt_encoder_timeout: int = 100
+
+    # SGLang server for PE model inference
+    pe_server_url: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -488,6 +509,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self.pipeline_config.validate_server_args(self)
 
     def resolved_bcg_text_buckets(self) -> tuple[int, ...]:
         """Sorted, de-duplicated, positive BCG text buckets.
@@ -535,9 +557,10 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, Qwen/Qwen-Image, "
-            "Qwen/Qwen-Image-2512, Tongyi-MAI/Z-Image/Z-Image-Turbo, "
-            "and zai-org/GLM-Image are currently supported.",
+            "[Diffusion BCG] disabled for %s: only Ideogram-4, MiniMax-H3, "
+            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
+            "currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
@@ -571,12 +594,12 @@ class ServerArgs(DisaggServerArgsMixin):
         self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
-        # 1. adjust for encoder parallel folding
         tp_size = self.tp_size or 1
         dp_size = self.dp_size or 1
         sp_degree = self.sp_degree or 1
         # one replica = all its GPUs
         replica_size = (self.num_gpus or tp_size) // dp_size
+
         fold_world = dp_size == 1 and not self.disagg_mode and replica_size > tp_size
 
         if fold_world:
@@ -587,11 +610,9 @@ class ServerArgs(DisaggServerArgsMixin):
         else:
             return
 
-        # Propose the fold group from the parallelism for every encoder. The
-        # loader keeps it only for encoders wide enough to benefit at their real
-        # (post-load) size and whose dims divide the group -- see
-        # finalize_encoder_folding. Deciding on real size (not architecture)
-        # handles the same encoder family at different parameter counts.
+        # propose the fold group from the parallelism alone; the loader keeps it
+        # only for encoders worth folding at their real post-load size
+        # (finalize_encoder_folding)
         encoder_configs = list(self.pipeline_config.text_encoder_configs) + list(
             getattr(self.pipeline_config, "image_encoder_configs", ()) or ()
         )
@@ -795,6 +816,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
@@ -1124,8 +1147,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False
@@ -1272,6 +1295,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
@@ -1295,6 +1319,26 @@ class ServerArgs(DisaggServerArgsMixin):
             "--model-path",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--model-subfolder",
+            type=str,
+            default=ServerArgs.model_subfolder,
+            help=(
+                "Advanced override for a Diffusers pipeline subfolder inside the "
+                "model repository. Prefer --model-variant when a model exposes "
+                "semantic variant-to-weights routing."
+            ),
+        )
+        parser.add_argument(
+            "--model-variant",
+            type=str,
+            default=ServerArgs.model_variant,
+            help=(
+                "Semantic checkpoint variant to serve. Models with partitioned "
+                "checkpoints use this value to select the compatible weights "
+                "without exposing repository subfolder layout."
+            ),
         )
         parser.add_argument(
             "--model-id",
@@ -1382,7 +1426,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Explicit offload/FSDP/parallelism flags take precedence."
             ),
         )
-
         # Parallelism
         parser.add_argument(
             "--num-gpus",
@@ -1430,6 +1473,21 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.ring_degree,
             help="Ring sequence parallel degree. Used in attention layer.",
+        )
+        parser.add_argument(
+            "--encoder-parallel",
+            type=str,
+            choices=["auto", "fold", "dp", "replicate"],
+            default=ServerArgs.encoder_parallel,
+            help=(
+                "Text/image encoder parallelism across a multi-rank replica. "
+                "`auto` folds encoders wide enough to benefit (best "
+                "single-request latency) and data-parallels eligible native "
+                "text encoders at batch>1; `fold` always tensor-parallels the "
+                "encoder weights; `dp` never folds and splits the batch across "
+                "ranks (best batched throughput; requires TP=1 and DP=1); "
+                "`replicate` disables both. The default is `auto`."
+            ),
         )
         parser.add_argument(
             "--enable-cfg-parallel",
@@ -1501,6 +1559,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help=(
+                "Compile repeated DiT submodules selected by the model's "
+                "_compile_conditions instead of compiling the whole transformer. "
+                "Requires --enable-torch-compile."
+            ),
         )
         parser.add_argument(
             "--offload-during-compile",
@@ -1628,6 +1696,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-resident-layers",
+            type=float,
+            default=ServerArgs.dit_layerwise_resident_layers,
+            help="With --dit-layerwise-offload, keep this many leading DiT layers "
+            "permanently resident on GPU (retained across denoise steps) and stream "
+            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
+            "count. Unlike raising the prefetch size, resident layers are transferred "
+            "once (not re-streamed every step), so this trades VRAM for lower denoise "
+            "latency when memory is available.",
         )
 
         # offload flags
@@ -1904,6 +1984,12 @@ class ServerArgs(DisaggServerArgsMixin):
             "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            default=ServerArgs.enable_cache_report,
+            help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
+        )
+        parser.add_argument(
             "--backend",
             type=str,
             choices=Backend.choices(),
@@ -1932,6 +2018,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.srt_encoder_timeout,
             help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
             "Increase value if connection between diffusion server and AR model server is slow.",
+        )
+
+        # SGLang server for PE model inference
+        parser.add_argument(
+            "--pe-server-url",
+            type=str,
+            default=ServerArgs.pe_server_url,
+            help="URL of SGLang server for PE model",
         )
 
         return parser
@@ -2231,6 +2325,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        self._validate_disagg_capability()
+
+    def _validate_disagg_capability(self) -> None:
+        if self.pipeline_config is None:
+            return
+        if (
+            self.disagg_role != RoleType.MONOLITHIC
+            and not self.pipeline_config.supports_disaggregation()
+        ):
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} only supports monolithic "
+                f"deployment; disaggregation role {self.disagg_role.value!r} "
+                "is not supported"
+            )
 
     def _validate_offload(self):
         # validate dit_offload_prefetch_size
@@ -2248,6 +2356,30 @@ class ServerArgs(DisaggServerArgsMixin):
         if 0.5 <= self.dit_offload_prefetch_size < 1.0:
             logger.info(
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        # validate dit_layerwise_resident_layers (same ratio/absolute convention)
+        if self.dit_layerwise_resident_layers < 0.0:
+            raise ValueError("dit_layerwise_resident_layers must be non-negative")
+        if self.dit_layerwise_resident_layers >= 1 and (
+            isinstance(self.dit_layerwise_resident_layers, float)
+            and not self.dit_layerwise_resident_layers.is_integer()
+        ):
+            self.dit_layerwise_resident_layers = int(
+                math.floor(self.dit_layerwise_resident_layers)
+            )
+            logger.info(
+                "Invalid --dit-layerwise-resident-layers value passed, truncated to: "
+                f"{self.dit_layerwise_resident_layers}"
+            )
+        if (
+            self.dit_layerwise_resident_layers > 0
+            and not self.is_dit_layerwise_offload_selected
+        ):
+            logger.warning(
+                "--dit-layerwise-resident-layers has no effect because the DiT is not "
+                "layerwise-offloaded. It only applies together with "
+                "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
 
         # validate layerwise offload conflicts
@@ -2357,7 +2489,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _validate_cfg_parallel(self):
-        if self.enable_cfg_parallel and self.num_gpus == 1:
+        if not self.enable_cfg_parallel:
+            return
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if not deployment_config.supports_cfg_parallel:
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} does not support CFG parallelism"
+            )
+        if self.num_gpus == 1:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
@@ -2369,6 +2508,10 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.encoder_parallel == "dp" and (
+            (self.tp_size or 1) != 1 or (self.dp_size or 1) != 1
+        ):
+            raise ValueError("encoder_parallel=dp requires tp_size=1 and dp_size=1")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

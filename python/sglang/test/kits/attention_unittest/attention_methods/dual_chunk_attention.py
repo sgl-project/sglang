@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention import (
     dual_chunk_flashattention_backend as _dual_chunk_backend,
 )
@@ -286,11 +287,16 @@ class TinyDualChunkModelConfig:
                 dual_chunk_attention_config or DUAL_CHUNK_CONFIG
             ),
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
+
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -315,6 +321,7 @@ class DualChunkMockModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -323,6 +330,7 @@ class DualChunkMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -133,6 +133,14 @@ class SpeculativeAlgorithm(Enum):
         graphs in the decode cuda graph runner."""
         return self.is_dspark()
 
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
+        # from a host corpus lookup, so it stays synchronous by design.
+        # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
+        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
@@ -174,6 +182,14 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
         return None
@@ -314,6 +330,12 @@ class SpecInput(ABC):
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
@@ -344,19 +366,22 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
 
-    def get_spec_adjusted_global_num_tokens(
-        self, batch: ScheduleBatch
-    ) -> Tuple[List[int], List[int]]:
-        c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
-        global_num_tokens_for_logprob = [
-            x * c2 for x in batch.global_num_tokens_for_logprob
-        ]
-        return global_num_tokens, global_num_tokens_for_logprob
+def spec_scale_global_num_tokens(
+    spec_info: SpecInput,
+    global_num_tokens: List[int],
+    global_num_tokens_for_logprob: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Scale the raw per-rank sync values (request counts on decode-family
+    rounds) into this forward's token units using the spec input's uniform
+    per-request widths."""
+    return (
+        [x * spec_info.num_tokens_per_req for x in global_num_tokens],
+        [
+            x * spec_info.num_tokens_for_logprob_per_req
+            for x in global_num_tokens_for_logprob
+        ],
+    )
 
 
 def create_dummy_verify_input(

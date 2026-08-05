@@ -18,6 +18,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.fused_linear_gelu import (
+    can_fuse_linear_gelu,
+    fused_linear_gelu_tanh,
+    mark_fused_gelu_site,
+)
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
@@ -201,10 +206,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 
@@ -330,8 +335,17 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
+        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # epilogue. Off by default; mounted per batch by the denoising stage.
+        mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
+            self.proj, hidden_states
+        ):
+            return fused_linear_gelu_tanh(
+                hidden_states, self.proj.weight, self.proj.bias
+            )
         hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
@@ -908,10 +922,49 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         batch_size, num_channels, height, width = hidden_states.shape
 
-        timestep = timestep - 1.0
-
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
+        if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+
+            def slice_batch(value, index):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape[0] == batch_size
+                ):
+                    return value[index : index + 1]
+                return value
+
+            outputs = []
+            for index in range(batch_size):
+                sample_encoder_hidden_states = encoder_hidden_states[index : index + 1]
+                sample_attention_mask = slice_batch(attention_mask, index)
+                if isinstance(sample_attention_mask, torch.Tensor):
+                    valid_text_length = int(sample_attention_mask.sum().item())
+                    sample_encoder_hidden_states = sample_encoder_hidden_states[
+                        :, :valid_text_length
+                    ]
+                    sample_attention_mask = None
+
+                outputs.append(
+                    self.forward(
+                        hidden_states=hidden_states[index : index + 1],
+                        encoder_hidden_states=sample_encoder_hidden_states,
+                        prior_token_id=prior_token_id[index : index + 1],
+                        prior_token_drop=prior_token_drop[index : index + 1],
+                        timestep=slice_batch(timestep, index),
+                        target_size=slice_batch(target_size, index),
+                        crop_coords=slice_batch(crop_coords, index),
+                        attention_kwargs=attention_kwargs,
+                        attention_mask=sample_attention_mask,
+                        freqs_cis=freqs_cis,
+                        guidance=slice_batch(guidance, index),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        timestep = timestep - 1.0
 
         # 1. RoPE
         image_rotary_emb = freqs_cis

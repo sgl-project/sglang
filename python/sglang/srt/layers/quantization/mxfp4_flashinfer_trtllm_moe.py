@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
@@ -25,7 +25,7 @@ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
@@ -51,7 +51,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self._fp8 = fp8_method
         self.prefix = prefix
         self.flashinfer_mxfp4_moe_precision = (
-            get_server_args().flashinfer_mxfp4_moe_precision
+            get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -303,7 +303,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
+
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
                 hidden_states,
                 False,
                 alignment=hidden_size,

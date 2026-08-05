@@ -401,7 +401,7 @@ class RayEngine(Engine):
                 actor.run_event_loop.remote() for actor in scheduler_actors
             ]
 
-            def wait_for_completion():
+            def block_until_scheduler_exits():
                 try:
                     ray.get(event_loop_refs)
                 except Exception as e:
@@ -410,7 +410,7 @@ class RayEngine(Engine):
             return (
                 RaySchedulerInitResult(
                     scheduler_infos=scheduler_infos,
-                    wait_for_completion=wait_for_completion,
+                    block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
                 ),
                 None,
@@ -484,12 +484,13 @@ class RayEngine(Engine):
             {
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
             }
         ]
 
         event_loop_refs = controller.event_loop_refs
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             try:
                 ray.get(event_loop_refs)
             except Exception as e:
@@ -497,6 +498,6 @@ class RayEngine(Engine):
 
         return RaySchedulerInitResult(
             scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
+            block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
         )
