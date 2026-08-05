@@ -352,9 +352,17 @@ class LRUFileEvictor:
                 self._on_evict(evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
+            # Re-pin at MRU and skip, exactly like an in-flight write, instead of
+            # stopping the whole eviction loop. A single un-removable file
+            # (EPERM/EACCES/EBUSY/EROFS/EIO on some backends) must not block the
+            # removable newer entries behind it: returning "stop" here -- and
+            # re-pinning the victim at the LRU *front* -- makes every later evict
+            # pass hit it first, reclaim nothing, and leave the cap permanently
+            # exceeded, so reserve() refuses all new writes forever. Skipping lets
+            # the loop reclaim what it can; the bounded skip budget in
+            # _evict_while still terminates when every entry is un-evictable.
             self._lru[evict_stem] = evict_size
-            self._lru.move_to_end(evict_stem, last=False)
-            return "stop", 0
+            return "skipped", 0
         self._total_bytes -= evict_size
         return "evicted", freed
 
