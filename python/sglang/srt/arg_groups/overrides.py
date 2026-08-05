@@ -939,25 +939,6 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-def _has_modelopt_w4a16_moe_layers(hf_config: Any) -> bool:
-    quantization_config = getattr(hf_config, "quantization_config", {}) or {}
-    if hasattr(quantization_config, "to_dict"):
-        quantization_config = quantization_config.to_dict()
-    if not isinstance(quantization_config, dict):
-        return False
-
-    quantized_layers = quantization_config.get("quantized_layers", {}) or {}
-    if not isinstance(quantized_layers, dict):
-        return False
-
-    return any(
-        isinstance(info, dict)
-        and str(info.get("quant_algo", "")).upper() == "W4A16_NVFP4"
-        and (".experts." in name or name.endswith(".experts"))
-        for name, info in quantized_layers.items()
-    )
-
-
 @_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
@@ -974,6 +955,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         "modelopt_mixed",
     ]
     quantization = server_args.quantization
+    has_w4a16_moe_layers = is_modelopt and any(
+        info.get("quant_algo") == "W4A16_NVFP4" and ".experts." in name
+        for name, info in hf_config.quantization_config.get(
+            "quantized_layers", {}
+        ).items()
+    )
     if is_modelopt:
         assert model_config.hf_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
@@ -988,21 +975,29 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
-    if (is_modelopt or model_config.quantization is None) and (
+    if has_w4a16_moe_layers:
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "W4A16_NVFP4 MoE layers require --moe-a2a-backend=none."
+            )
+        if server_args.moe_runner_backend not in ("auto", "marlin"):
+            raise ValueError(
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+            )
+        if server_args.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend for "
+                f"{model_arch} with W4A16_NVFP4 MoE layers"
+            )
+    elif (is_modelopt or model_config.quantization is None) and (
         server_args.moe_runner_backend == "auto"
     ):
         if is_sm100_supported() and server_args.moe_a2a_backend == "none":
-            if _has_modelopt_w4a16_moe_layers(model_config.hf_config):
-                overrides["moe_runner_backend"] = "marlin"
-                logger.info(
-                    "Use marlin as MoE runner backend on sm100 for "
-                    f"{model_arch} with W4A16_NVFP4 MoE layers"
-                )
-            else:
-                overrides["moe_runner_backend"] = "flashinfer_trtllm"
-                logger.info(
-                    f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
-                )
+            overrides["moe_runner_backend"] = "flashinfer_trtllm"
+            logger.info(
+                f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
+            )
         elif (
             (
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")

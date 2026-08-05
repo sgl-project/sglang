@@ -481,6 +481,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_a2a_backend = "deepep"
+
+        with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
+            _nemotron_h_overrides(server_args, hf_config)
+
+    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_trtllm"
+
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
+            _nemotron_h_overrides(server_args, hf_config)
+
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
         config_extra = {

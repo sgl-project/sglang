@@ -161,11 +161,6 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
 
     if (padded_size_n, padded_size_k) != (part_size_n, part_size_k):
-        logger.warning_once(
-            "Marlin requires thread-tile padding for some weight shapes in "
-            "this model. Activations and/or outputs of the padded layers are "
-            "padded/sliced on every forward; performance may be degraded."
-        )
         pad_rows = padded_size_n - part_size_n
         pad_cols = (padded_size_k - part_size_k) // 2
         scale_pad_cols = (padded_size_k - part_size_k) // 16
@@ -179,11 +174,6 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             ),
             requires_grad=False,
         )
-        if hasattr(layer, "bias") and layer.bias is not None:
-            layer.bias = torch.nn.Parameter(
-                torch.nn.functional.pad(layer.bias, (0, pad_rows)),
-                requires_grad=False,
-            )
 
     device = layer.weight.device
     layer.workspace = marlin_make_workspace(device)
@@ -216,8 +206,11 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
 
     if hasattr(layer, "bias") and layer.bias is not None:
-        assert layer.bias.shape == (padded_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        assert layer.bias.shape == (part_size_n,)
+        bias = torch.nn.functional.pad(
+            layer.bias, (0, padded_size_n - part_size_n)
+        )
+        bias = marlin_permute_bias(bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 
