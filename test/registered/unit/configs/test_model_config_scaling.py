@@ -9,6 +9,15 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestMlaMscaleScaling(CustomTestCase):
+    def test_ignores_transformers_v5_default_rope_parameters(self):
+        base_scaling = 1 / math.sqrt(72)
+        rope_scaling = {"rope_theta": 10000.0, "rope_type": "default"}
+
+        with self.assertNoLogs("sglang.srt.configs.model_config", level="WARNING"):
+            scaling = compute_mla_mscale_scaling(rope_scaling, base_scaling)
+
+        self.assertEqual(scaling, base_scaling)
+
     def test_respects_disabled_yarn_scaling(self):
         base_scaling = 1 / math.sqrt(128)
         rope_scaling = {
@@ -29,6 +38,14 @@ class TestMlaMscaleScaling(CustomTestCase):
             "factor": 128,
             "mscale_all_dim": 1,
         }
+
+        self.assertGreater(
+            compute_mla_mscale_scaling(rope_scaling, base_scaling), base_scaling
+        )
+
+    def test_applies_legacy_scaling_without_rope_type(self):
+        base_scaling = 1 / math.sqrt(128)
+        rope_scaling = {"factor": 128, "mscale_all_dim": 1}
 
         self.assertGreater(
             compute_mla_mscale_scaling(rope_scaling, base_scaling), base_scaling
