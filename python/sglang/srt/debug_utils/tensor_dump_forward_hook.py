@@ -10,6 +10,7 @@ The file contains a series of key-value pairs, where the keys correspond to oper
 (similar to those in model.safetensors.index.json), and the values are the outputs produced by the respective operators.
 """
 
+import functools
 import logging
 import os
 from pathlib import Path
@@ -119,10 +120,24 @@ class TensorDumper:
                     # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
                     # Therefore, we do not need to add output hooks for self_attn,
                     # since the output of self_attn should be the same to self_attn.o_proj.
-                    module.register_forward_hook(
-                        self._dump_hook(cur_name, top_level_model)
-                    )
+                    #
+                    # Use replace_fn mode so the hook fires even when callers
+                    # invoke .forward() directly (as model_runner and some models do).
+                    self._register_hook(module, cur_name, top_level_model)
         return model_top_level_module_matched, len(model._modules.items())
+
+    def _register_hook(self, module, tensor_name, do_dump):
+        """Register a dump hook that fires on both __call__ and .forward()."""
+        hook_fn = self._dump_hook(tensor_name, do_dump)
+        original_forward = module.forward
+
+        @functools.wraps(original_forward)
+        def _wrapped_forward(*args, **kwargs):
+            output = original_forward(*args, **kwargs)
+            hook_fn(module, args, output)
+            return output
+
+        module.forward = _wrapped_forward
 
     def _dump_hook(self, tensor_name, do_dump):
         def inner_dump_hook(module, input, output):
