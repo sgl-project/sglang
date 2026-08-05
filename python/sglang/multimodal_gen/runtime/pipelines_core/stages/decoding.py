@@ -250,7 +250,22 @@ class DecodingStage(PipelineStage):
             with temporary_module_dtype(
                 self.vae, vae_dtype, enabled=should_cast_vae
             ) as vae:
-                decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                try:
+                    decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
+                except Exception as error:
+                    if "out of memory" in str(error).lower():
+                        if not server_args.pipeline_config.vae_tiling:
+                            logger.warning(
+                                "OOM detected during VAE decoding. Please enable "
+                                "--vae-tiling to reduce peak memory usage."
+                            )
+                        else:
+                            logger.warning(
+                                "OOM detected during VAE decoding with tiling enabled. "
+                                "Please reduce the resolution or enable "
+                                "--vae-cpu-offload."
+                            )
+                    raise
                 image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
