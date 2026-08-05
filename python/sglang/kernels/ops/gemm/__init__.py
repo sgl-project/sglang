@@ -93,7 +93,7 @@ def fp8_scaled_mm(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 scaled matmul: ``(mat_a @ mat_b) * scales_a * scales_b (+ bias)``."""
-    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.AOT)(
+    return get_kernel("gemm.fp8_scaled_mm", KernelBackend.JIT)(
         mat_a, mat_b, scales_a, scales_b, out_dtype, bias
     )
 
