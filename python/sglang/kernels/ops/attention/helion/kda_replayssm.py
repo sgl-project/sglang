@@ -167,8 +167,10 @@ _KDA_REPLAYSSM_BF16_CONFIG = helion.Config(
     range_warp_specializes=[None, False],
 )
 
-# Bounded small-head BF16 ReplaySSM shares the FP32 schedule.
-_KDA_REPLAYSSM_BF16_SMALL_HEAD_CONFIG = _KDA_REPLAYSSM_FP32_CONFIG
+# Small-head BF16 ReplaySSM uses the FP32 tile schedule with direct PID order.
+_KDA_REPLAYSSM_BF16_SMALL_HEAD_CONFIG = helion.Config.from_dict(
+    {**_KDA_REPLAYSSM_FP32_CONFIG, "l2_groupings": [1]}
+)
 
 
 def _log_decay(
@@ -660,13 +662,8 @@ def _select_replayssm_decode_kernel(
     *,
     is_bf16_state: bool,
     num_v_heads: int,
-    use_lower_bound: bool,
 ) -> helion.Kernel:
-    if (
-        is_bf16_state
-        and use_lower_bound
-        and num_v_heads <= KDA_SMALL_VALUE_HEAD_THRESHOLD
-    ):
+    if is_bf16_state and num_v_heads <= KDA_SMALL_VALUE_HEAD_THRESHOLD:
         return _helion_fused_recurrent_kda_replayssm_decode_bf16_small_head
     if is_bf16_state:
         return _helion_fused_recurrent_kda_replayssm_decode_bf16
@@ -746,7 +743,6 @@ def helion_fused_recurrent_kda_replayssm_decode(
     kernel = _select_replayssm_decode_kernel(
         is_bf16_state=initial_state.dtype is torch.bfloat16,
         num_v_heads=num_v_heads,
-        use_lower_bound=use_lower_bound,
     )
     result = kernel(
         mixed_qkv,
