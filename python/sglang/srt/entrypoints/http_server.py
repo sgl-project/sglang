@@ -895,7 +895,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -2048,7 +2048,8 @@ async def vertex_generate(
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
