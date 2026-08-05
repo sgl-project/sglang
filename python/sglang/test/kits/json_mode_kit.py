@@ -1,21 +1,9 @@
+"""JSON mode (response_format json_object) test mixin.
+
+Host class must provide ``self.client`` (openai.Client) and ``self.model``.
+"""
+
 import json
-import unittest
-
-import openai
-
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    is_in_amd_ci,
-    popen_launch_server,
-)
-
-register_cuda_ci(est_time=118, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
 
 
 class JSONModeMixin:
@@ -88,52 +76,3 @@ class JSONModeMixin:
             )
 
         self.assertIsInstance(js_obj, dict)
-
-
-class ServerWithGrammarBackend(CustomTestCase):
-    """Base class for tests requiring a grammar backend server"""
-
-    backend = "xgrammar"
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        other_args = [
-            "--max-running-requests",
-            "10",
-            "--grammar-backend",
-            cls.backend,
-        ]
-
-        if is_in_amd_ci():
-            other_args.append("--constrained-json-disable-any-whitespace")
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-        cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestJSONModeXGrammar(ServerWithGrammarBackend, JSONModeMixin):
-    backend = "xgrammar"
-
-
-class TestJSONModeOutlines(ServerWithGrammarBackend, JSONModeMixin):
-    backend = "outlines"
-
-
-class TestJSONModeLLGuidance(ServerWithGrammarBackend, JSONModeMixin):
-    backend = "llguidance"
-
-
-if __name__ == "__main__":
-    unittest.main()
