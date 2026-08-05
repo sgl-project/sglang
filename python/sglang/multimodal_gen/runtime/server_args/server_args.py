@@ -429,6 +429,7 @@ class ServerArgs(DisaggServerArgsMixin):
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+    enable_cache_report: bool = False
 
     # Tracing
     enable_trace: bool = False
@@ -1981,6 +1982,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
             "Defaults to empty (disabled). "
             "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            default=ServerArgs.enable_cache_report,
+            help="Return number of cached tokens in usage.prompt_tokens_details for each OpenAI-compatible request.",
         )
         parser.add_argument(
             "--backend",

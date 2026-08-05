@@ -112,13 +112,17 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
 
             flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
             post.assert_called_once_with(
-                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+                "http://127.0.0.1:8000/reset_prefix_cache",
+                headers={},
+                params={},
             )
             post.reset_mock()
 
             flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
             post.assert_called_once_with(
-                "http://127.0.0.1:30000/flush_cache", headers={}
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 10.0},
             )
 
 
