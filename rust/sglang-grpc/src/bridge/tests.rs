@@ -7,3 +7,47 @@ fn terminal_error_messages_include_request_id() {
     };
     assert!(error.message().contains("rid"));
 }
+
+#[tokio::test]
+async fn stale_request_key_cannot_abort_reused_request_id() {
+    Python::initialize();
+    let runtime_handle = Python::attach(|py| PyDict::new(py).clone().unbind().into_any());
+    let bridge = PyBridge::new(
+        runtime_handle,
+        None,
+        1,
+        1,
+        tokio::runtime::Handle::current(),
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let old_key = RequestKey {
+        rid: "reused".to_string(),
+        incarnation: 1,
+    };
+    let current_key = RequestKey {
+        rid: "reused".to_string(),
+        incarnation: 2,
+    };
+    {
+        let mut state = lock_or_recover(bridge.state.as_ref(), "state");
+        state.channels.insert(
+            current_key.rid.clone(),
+            ActiveChannel {
+                incarnation: current_key.incarnation,
+                sender,
+            },
+        );
+        state.pending_sends.insert(old_key.clone());
+    }
+
+    // The dict has no `abort` method, so this also proves the stale path never
+    // invokes the Python abort callback for the new incarnation.
+    bridge.abort_request(&old_key).unwrap();
+
+    let state = lock_or_recover(bridge.state.as_ref(), "state");
+    assert_eq!(
+        state.channels.get(current_key.rid()).unwrap().incarnation,
+        current_key.incarnation
+    );
+    assert!(!state.pending_sends.contains(&old_key));
+}

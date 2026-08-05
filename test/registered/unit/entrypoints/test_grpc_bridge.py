@@ -1,6 +1,8 @@
 import asyncio
 import enum
+import threading
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
@@ -109,6 +111,23 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+
+
+class TestNativeGrpcRequestLifecycle(CustomTestCase):
+    def test_reused_request_id_keeps_current_generation_future(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle._active_generation_futures = {}
+        handle._generation_futures_lock = threading.Lock()
+        old_future = Future()
+        current_future = Future()
+
+        handle._track_generation_future("reused", old_future)
+        handle._track_generation_future("reused", current_future)
+        old_future.set_result(None)
+
+        self.assertIs(handle._active_generation_futures["reused"], current_future)
+        handle._cancel_generation_futures("reused", abort_all=False)
+        self.assertTrue(current_future.cancelled())
 
 
 if __name__ == "__main__":
