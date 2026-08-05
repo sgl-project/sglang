@@ -474,10 +474,30 @@ class MambaComponent(TreeComponent):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict(self._mamba_slot_eviction_params())
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                allocator = self.cache.req_to_token_pool.mamba_allocator
+                raise AssertionError(
+                    "Can not alloc mamba cache after eviction fallback: "
+                    f"available={allocator.available_size()}, "
+                    f"schedulable={allocator.schedulable_available_size()}, "
+                    f"mamba_evictable={self.cache.mamba_evictable_size()}, "
+                    f"mamba_protected={self.cache.mamba_protected_size()}, "
+                    f"allocator={allocator.allocator_state_str()}, "
+                    f"cache={self.cache.available_and_evictable_str()}"
+                )
         return slot
+
+    def _mamba_slot_eviction_params(self) -> EvictParams:
+        """Evict from the side that can actually supply one shared Mamba row."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        full_token_cost_fn = getattr(allocator, "mamba_slot_full_token_cost", None)
+        if full_token_cost_fn is None:
+            return EvictParams(mamba_num=1)
+        if self.cache.mamba_evictable_size() > 0:
+            return EvictParams(mamba_num=1)
+        return EvictParams(num_tokens=full_token_cost_fn())
 
     @property
     def int8_ckpt_pool(self):
