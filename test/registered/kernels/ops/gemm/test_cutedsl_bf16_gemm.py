@@ -23,19 +23,17 @@ from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
     use_cutedsl_bf16_gemm,
 )
 
-N_VALUES = [1024, 2624, 6144]
-K_VALUES = [2048, 6144]
+SHAPES = [(n, k) for n in [1024, 2624, 6144] for k in [2048, 6144]] + [(2048, 4096)]
 NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("n", N_VALUES)
-@pytest.mark.parametrize("k", K_VALUES)
+@pytest.mark.parametrize("n,k", SHAPES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     if is_hip_runtime() or get_jit_cuda_arch().major != 10:
-        pytest.skip("SM100/SM103 required")
+        pytest.skip("SM10x required")
 
     torch.manual_seed(num_tokens)
     x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
@@ -65,7 +63,7 @@ def test_cutedsl_bf16_gemm_empty_batch(has_bias):
     """Empty input must yield the empty [0, N] output, mirroring F.linear —
     launching TGV with a 0-CTA grid fails with CUDA_ERROR_INVALID_VALUE."""
     if is_hip_runtime() or get_jit_cuda_arch().major != 10:
-        pytest.skip("SM100/SM103 required")
+        pytest.skip("SM10x required")
 
     n, k = 6144, 2048
     x = torch.empty(0, k, dtype=torch.bfloat16, device="cuda")
