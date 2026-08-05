@@ -43,6 +43,9 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    get_cp_cache_layer_shard_info,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -1171,12 +1174,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
-        ) = get_glm_dsa_cp_layer_shard_info(self)
+        ) = get_cp_cache_layer_shard_info(self)
         pool_kwargs = {}
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
@@ -1187,7 +1188,7 @@ class KVCacheConfigurator:
             ).host_to_device_ratio
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
-            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            from sglang.srt.mem_cache.cp_cache_layer_split.dsa import (
                 LayerSplitDSATokenToKVPool,
             )
 
