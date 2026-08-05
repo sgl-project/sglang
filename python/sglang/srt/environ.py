@@ -5,7 +5,7 @@ import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -23,6 +23,15 @@ def _default_hip() -> bool:
         return torch.version.hip is not None
     except Exception:
         return False
+
+
+def _default_cache_subdir(name: str) -> str:
+    """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
+
+    Pass as a callable default: SGLANG_CACHE_DIR is declared further down the
+    Envs body, and resolving late also lets tests override it.
+    """
+    return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
 class EnvField:
@@ -735,7 +744,8 @@ class Envs:
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
-    SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
+    SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
@@ -1364,6 +1374,33 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
     """
     if env_name in os.environ:
         warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
+def third_party_cache_defaults() -> Dict[str, str]:
+    base = os.path.expanduser(envs.SGLANG_CACHE_DIR.get())
+    return {
+        "TRITON_CACHE_DIR": os.path.join(base, "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(base, "inductor"),
+        "CUDA_CACHE_PATH": os.path.join(base, "nv"),
+        # FlashInfer appends ".cache/flashinfer" to this base itself, so this
+        # is the base dir rather than the final cache dir.
+        "FLASHINFER_WORKSPACE_BASE": base,
+    }
+
+
+def redirect_third_party_caches():
+    """Point third-party JIT caches at SGLANG_CACHE_DIR, so a run's compiled
+    kernels can be cleaned, warmed or volume-mounted as one directory.
+
+    Must be called early. The redirect silently does nothing if either of
+    these has already happened:
+
+    - FlashInfer was imported. It resolves its workspace at import time.
+    - Inductor made its first ``cache_dir()`` call. That call setdefaults
+      TORCHINDUCTOR_CACHE_DIR itself.
+    """
+    for key, value in third_party_cache_defaults().items():
+        os.environ.setdefault(key, value)
 
 
 def _convert_SGL_to_SGLANG():
