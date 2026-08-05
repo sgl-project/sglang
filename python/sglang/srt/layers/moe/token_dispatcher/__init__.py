@@ -1,3 +1,8 @@
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPCombineInput,
+    AscendTPDispatcher,
+    AscendTPDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -37,6 +42,11 @@ from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPDispatcher,
     NixlEPDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.pplx import (
+    PplxCombineInput,
+    PplxDispatcher,
+    PplxDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatcher,
@@ -65,6 +75,9 @@ __all__ = [
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",
+    "PplxCombineInput",
+    "PplxDispatchOutput",
+    "PplxDispatcher",
     "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
@@ -74,4 +87,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "AscendTPDispatcher",
+    "AscendTPDispatchOutput",
+    "AscendTPCombineInput",
 ]

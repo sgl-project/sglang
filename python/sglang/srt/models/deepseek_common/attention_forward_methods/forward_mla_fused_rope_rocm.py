@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -21,10 +21,10 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 if _is_hip:
-    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+    from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
 

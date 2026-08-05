@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
 
 if TYPE_CHECKING:
@@ -58,7 +58,7 @@ class WaveAttnBackend(AttentionBackend):
         import wave_lang.kernel.wave.cache as cache
 
         base_cache_dir = cache.CACHE_BASE_DIR
-        new_dir = base_cache_dir / f"worker_{model_runner.tp_rank}"
+        new_dir = base_cache_dir / f"worker_{model_runner.ps.tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
         cache.CACHE_BASE_DIR = new_dir
 
@@ -92,7 +92,7 @@ class WaveAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size

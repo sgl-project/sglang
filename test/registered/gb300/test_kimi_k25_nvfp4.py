@@ -6,9 +6,12 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(
+    est_time=7200, suite="nightly-4-gpu-gb300-kimi-k25-nvfp4", nightly=True
+)
 
 MODEL_PATH = "nvidia/Kimi-K2.5-NVFP4"
+DRAFT_MODEL_PATH = "lightseekorg/kimi-k2.5-eagle3-mla"
 
 COMMON_ARGS = [
     "--trust-remote-code",
@@ -19,30 +22,43 @@ COMMON_ARGS = [
     "--kv-cache-dtype=fp8_e4m3",
     "--moe-runner-backend=flashinfer_trtllm",
     "--mem-fraction-static=0.8",
-    "--enable-multimodal",
     "--enable-metrics",
+    "--speculative-algorithm=EAGLE3",
+    f"--speculative-draft-model-path={DRAFT_MODEL_PATH}",
+    "--speculative-draft-model-quantization=unquant",
+]
+
+TP_EAGLE_ARGS = [
+    "--speculative-num-steps=3",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=4",
+]
+
+DP_EAGLE_ARGS = [
+    "--speculative-num-steps=1",
+    "--speculative-eagle-topk=1",
+    "--speculative-num-draft-tokens=2",
 ]
 
 
 class TestKimiK25Nvfp4(unittest.TestCase):
-    """Kimi-K2.5 NVFP4 on GB300 (4x GB300 NVL4, tp=4).
-
-    No EAGLE/MTP support for Kimi-K2.5 — only TP and TP+DP+DPA variants.
-    """
+    """Kimi-K2.5 NVFP4 + EAGLE3 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_kimi_k25_nvfp4(self):
         variants = [
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS,
-                variant="TP4",
+                extra_args=COMMON_ARGS + TP_EAGLE_ARGS,
+                variant="TP4+EAGLE3",
             ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                extra_args=COMMON_ARGS
+                + ["--dp-size=4", "--enable-dp-attention"]
+                + DP_EAGLE_ARGS,
+                variant="TP4+DP4+DPA+EAGLE3",
             ),
         ]
 

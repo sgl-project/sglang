@@ -46,13 +46,21 @@ def _extract_model_type_override(extra_argv):
     return model_type, filtered_argv
 
 
+def _normalize_positional_model_path(extra_argv):
+    """Allow `sglang serve <model>` while preserving existing flag parsing."""
+    if extra_argv and not extra_argv[0].startswith("-"):
+        return ["--model-path", extra_argv[0], *extra_argv[1:]], True
+    return extra_argv, False
+
+
 def serve(args, extra_argv):
     if any(h in extra_argv for h in ("-h", "--help")):
         # Since the server type is determined by the model, and we don't have a model path,
         # we can't show the exact help. Instead, we show a general help message and then
         # the help for both possible server types.
         print(
-            "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
+            "Usage: sglang serve <model-name-or-path> [additional-arguments]\n"
+            "   or: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
             "This command can launch either a standard language model server or a diffusion model server.\n"
             "The server type is determined by the --model-path.\n"
             "Optional override: --model-type {auto,llm,diffusion} "
@@ -91,6 +99,9 @@ def serve(args, extra_argv):
     load_plugins()
 
     model_type, dispatch_argv = _extract_model_type_override(extra_argv)
+    dispatch_argv, positional_model_path = _normalize_positional_model_path(
+        dispatch_argv
+    )
     model_path = get_model_path(dispatch_argv)
     try:
         if model_type == "auto":
@@ -116,6 +127,8 @@ def serve(args, extra_argv):
             )
             add_multimodal_gen_serve_args(parser)
             parsed_args, remaining_argv = parser.parse_known_args(dispatch_argv)
+            if positional_model_path:
+                parsed_args._sglang_explicit_arg_names = {"model_path"}
 
             execute_serve_cmd(parsed_args, remaining_argv)
         else:

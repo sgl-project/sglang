@@ -69,6 +69,7 @@ _DP: GroupCoordinator | None = None
 _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
+_VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -199,6 +200,14 @@ def init_parallel_group_coordinator(
                 )
             ),
         )
+
+
+def _get_vae_decode_group_ranks(
+    rank_generator: RankGenerator,
+) -> list[list[int]]:
+    # VAE decode happens after each DP replica owns a different request result.
+    # Decode can shard one request across TP/SP/PP/CFG ranks, but must not cross DP.
+    return rank_generator.get_ranks(_VAE_DECODE_PARALLEL_AXES)
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -461,7 +470,7 @@ def initialize_model_parallel(
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
     _VAE_DECODE = init_parallel_group_coordinator(
-        group_ranks=rank_generator.get_ranks("tp-sp-pp-cfg"),
+        group_ranks=_get_vae_decode_group_ranks(rank_generator),
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="vae_decode",
@@ -892,9 +901,32 @@ def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
 
+    # The IPC transport keeps CUDA mappings associated with the current
+    # Ulysses group. Drop them before tearing down the process groups.
+    from .device_communicators.ipc_a2a import IPC_A2A
+    from .parallel_groups import PROCESS_GROUP
+
+    IPC_A2A.reset()
+
     for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
         if group is not None:
             group.destroy()
+
+    # Ulysses and Ring groups are created separately from the SP coordinator,
+    # so GroupCoordinator.destroy() does not own or release them. Explicitly
+    # destroy them here; otherwise repeated Ulysses/Ring topology switches leak
+    # NCCL communicators and their CUDA memory.
+    destroyed_sequence_groups = []
+    for group in (PROCESS_GROUP.ULYSSES_PG, PROCESS_GROUP.RING_PG):
+        if (
+            group is not None
+            and group is not torch.distributed.group.WORLD
+            and all(group is not destroyed for destroyed in destroyed_sequence_groups)
+        ):
+            torch.distributed.destroy_process_group(group)
+            destroyed_sequence_groups.append(group)
+    PROCESS_GROUP.ULYSSES_PG = None
+    PROCESS_GROUP.RING_PG = None
 
     for group in (_DIT, _VAE):
         if group is not None:

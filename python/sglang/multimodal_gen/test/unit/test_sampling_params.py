@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan import (
+    FastWanT2V480PConfig,
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
@@ -39,6 +40,18 @@ class TestSamplingParamsValidate(unittest.TestCase):
     def test_num_outputs_per_prompt_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
+
+    def test_quality_defaults_to_lossless(self):
+        self.assertEqual(SamplingParams().quality, "lossless")
+
+    def test_quality_accepts_the_two_validated_levels(self):
+        self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
+        self.assertEqual(SamplingParams(quality="high").quality, "high")
+
+    def test_quality_rejects_invalid_values(self):
+        for bad in ("ultra", "draft", "fast", "", True, 1):
+            with self.assertRaisesRegex(ValueError, r"quality must be one of"):
+                SamplingParams(quality=bad)  # type: ignore[arg-type]
 
     def test_seed_accepts_int_or_non_empty_int_list(self):
         self.assertEqual(SamplingParams(seed=7).seed, 7)
@@ -101,6 +114,12 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+    def test_fastwan_480p_default_resolution_is_supported(self):
+        params = FastWanT2V480PConfig()
+
+        self.assertEqual((params.width, params.height), (832, 480))
+        self.assertIn((params.width, params.height), params.supported_resolutions)
 
     def test_output_file_name_supports_callable_teacache_params(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
@@ -216,6 +235,12 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(
             self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
             [7, 8],
+        )
+
+    def test_quality_is_request_scoped_cli_arg(self):
+        self.assertNotIn("quality", self._parse_cli_kwargs([]))
+        self.assertEqual(
+            self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
         )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):

@@ -176,7 +176,7 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--enable-two-batch-overlap",
             "--moe-a2a-backend",
             "deepep",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
