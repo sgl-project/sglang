@@ -444,6 +444,7 @@ def _fwd_kernel(
             # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
             # On all other platforms keep the original q.to(k.dtype) downcast.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
             if IS_GFX1250:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
@@ -525,6 +526,7 @@ def _fwd_kernel(
             )
             # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
             # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
             else:
@@ -651,6 +653,7 @@ def _fwd_kernel(
             )
             # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
             # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
             else:
@@ -1097,6 +1100,7 @@ def _fwd_kernel_unified(
             # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
             # On all other platforms keep the original q.to(k.dtype) downcast.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
             if IS_GFX1250:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
@@ -1179,6 +1183,7 @@ def _fwd_kernel_unified(
             )
             # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
             # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
             else:
