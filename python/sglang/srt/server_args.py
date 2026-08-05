@@ -7158,6 +7158,10 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
+        # Step 0: L3 key-scheme validation. Runs before the early return so
+        # canonical-grid flags are never silently inert.
+        self._resolve_hicache_key_scheme()
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -7174,9 +7178,6 @@ class ServerArgs:
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
 
-        # Step 4: L3 key-scheme validation (canonical-grid v1 scope).
-        self._resolve_hicache_key_scheme()
-
     def _resolve_hicache_key_scheme(self):
         if self.hicache_storage_key_scheme == "rank-suffix":
             if self.hicache_storage_namespace_descriptor is not None:
@@ -7185,6 +7186,15 @@ class ServerArgs:
                     "--hicache-storage-key-scheme canonical-grid."
                 )
             return
+        if not (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ):
+            raise ValueError(
+                "--hicache-storage-key-scheme canonical-grid has no effect "
+                "without --enable-hierarchical-cache (or decode KV offload); "
+                "refusing a silently inert flag."
+            )
         if self.hicache_storage_backend is None:
             raise ValueError(
                 "--hicache-storage-key-scheme canonical-grid requires an L3 "
@@ -7200,6 +7210,28 @@ class ServerArgs:
             raise NotImplementedError(
                 "canonical-grid does not cover speculative-decoding draft "
                 "pools yet; use --hicache-storage-key-scheme rank-suffix."
+            )
+        # Topologies whose at-rest KV is not a dense per-rank rectangle of
+        # whole pages cannot be named by canonical cells yet. Checked here
+        # (not only at attach) because the decode-offload attach path has no
+        # CP/DCP group wired into its controller.
+        if self.dcp_size > 1:
+            raise NotImplementedError(
+                "canonical-grid with --dcp-size > 1 is not supported: each "
+                "DCP rank holds an interleaved token shard (needs the "
+                "token-granule extension)."
+            )
+        if self.attn_cp_size > 1:
+            raise NotImplementedError(
+                "canonical-grid with --attn-cp-size > 1 is not supported: "
+                "CP ranks hold sub-page slices or replicated pages (needs "
+                "token-granule cells / writer election)."
+            )
+        descriptor = self.hicache_storage_namespace_descriptor
+        if descriptor is not None and not os.path.isfile(descriptor):
+            raise ValueError(
+                f"--hicache-storage-namespace-descriptor {descriptor!r} is "
+                "not a readable file."
             )
 
     def _resolve_hicache_dcp_compatibility(self):

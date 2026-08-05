@@ -458,20 +458,23 @@ class HiCacheController:
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
-        )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
+            # Inside the rollback try-block: canonical-grid attach validation
+            # raises here, and a failed runtime re-attach must leave the
+            # controller consistent (storage_backend_type reset in except).
+            self.storage_config = self._generate_storage_config(
+                model_name, storage_backend_extra_config
+            )
+            # for MLA models, only one rank needs to backup the KV cache
+            self.backup_skip = (
+                self.storage_config.is_mla_model
+                # todo: load balancing
+                and self.storage_config.tp_rank != 0
+            )
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.mem_pool_host
             )
@@ -632,7 +635,9 @@ class HiCacheController:
                     "(multi-cell head fan-out is the follow-up)."
                 )
             canonical_suffix = self._build_canonical_suffix(
-                model_name=model_name, is_rank_replicated=is_rank_replicated
+                model_name=model_name,
+                is_rank_replicated=is_rank_replicated,
+                attn_cp_size=attn_cp_size,
             )
 
         return HiCacheStorageConfig(
@@ -654,7 +659,7 @@ class HiCacheController:
         )
 
     def _build_canonical_suffix(
-        self, model_name: Optional[str], is_rank_replicated: bool
+        self, model_name: Optional[str], is_rank_replicated: bool, attn_cp_size: int
     ) -> str:
         """Attach-time construction of the canonical-grid cell suffix.
 
@@ -687,7 +692,9 @@ class HiCacheController:
                 "pools yet (the draft model needs its own namespace identity)."
             )
 
-        dtype = normalize_dtype(self.mem_pool_host.dtype)
+        # Logical KV dtype, not the storage view: fp8 variants all store as
+        # uint8, and e4m3/e5m2 deployments must land in distinct keyspaces.
+        dtype = normalize_dtype(self.mem_pool_device.dtype)
         start_layer = self.mem_pool_host.start_layer
         end_layer = self.mem_pool_host.end_layer
         local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
@@ -697,17 +704,31 @@ class HiCacheController:
         if descriptor_path is not None:
             namespace = load_namespace_descriptor(descriptor_path)
         else:
+            if not is_rank_replicated and local_kv_heads == 1 and self.tp_size > 1:
+                # One kv head per rank is ambiguous without model-level info:
+                # the model may have exactly tp_size kv heads (sharded, safe)
+                # or fewer (heads REPLICATED across ranks — several ranks hold
+                # the same head, and per-rank H indices would mislabel it).
+                # The derived namespace fabricates total_kv_heads = local*tp,
+                # so it cannot tell these apart; require an explicit
+                # descriptor carrying the model's true total_kv_heads.
+                raise NotImplementedError(
+                    "canonical-grid cannot derive a namespace at 1 kv head "
+                    "per rank (possible kv-head replication when tp_size "
+                    "exceeds the model's kv heads); provide "
+                    "--hicache-storage-namespace-descriptor with the model's "
+                    "true total_kv_heads, or use "
+                    "--hicache-storage-key-scheme rank-suffix."
+                )
             namespace = derive_namespace(
                 model_id=model_id,
                 dtype=dtype,
                 page_size=self.page_size,
                 rank_replicated=is_rank_replicated,
                 total_kv_heads=local_kv_heads * self.tp_size,
-                stage_layer_count=end_layer - start_layer,
                 local_kv_heads=local_kv_heads,
             )
 
-        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         suffix = build_canonical_cell_suffix(
             namespace,
             attn_tp_rank=self.tp_rank,

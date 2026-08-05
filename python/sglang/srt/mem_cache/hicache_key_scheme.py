@@ -18,7 +18,7 @@ Replaces the per-backend rank/topology key suffixes (``_{tp_rank}_{tp_size}``,
 ``_{pp_size}_{pp_rank}``, ``_cp{r}_{s}``, ...) with a topology-free canonical
 cell coordinate::
 
-    {page_hash}_{namespace_digest}_L{layer_group_index}[_H{head_group_index}]
+    {page_hash}_{namespace_digest}_L{start_layer}-{end_layer}[_H{head_group_index}]
 
 The coordinate names *what data the object holds* (a model-global layer-range x
 kv-head-range rectangle of one page), never *who wrote it*. Any deployment
@@ -27,13 +27,16 @@ data, which makes cross-topology reuse a pure key-selection problem. Design:
 ``DESIGN_l3_canonical_shard_grid.md``.
 
 v1 scope (enforced in :func:`build_canonical_cell_suffix`): exactly one cell
-per rank per page — the namespace grid must equal this deployment's shard
-shape (``layer_group`` == the rank's layer count, ``head_group`` == the rank's
-local kv-head count). Objects are therefore byte-identical to the rank-suffix
-scheme's; only the names change. Grids finer than the deployment (multi-cell
-fan-out, subsuming the mooncake ``tp_lcm_size`` split-heads mechanism) are the
-follow-up and are rejected with an explicit error here. Rank-replicated pools
-(MLA-family) have no head axis, so cross-TP-size reuse works immediately.
+per rank per page. The layer coordinate is the rank's absolute layer range —
+any pipeline partition works, uneven stages included (61-layer models at any
+pp_size); partitions that differ simply derive disjoint keys and miss instead
+of colliding. The head axis requires ``head_group`` == the rank's local
+kv-head count. Objects are therefore byte-identical to the rank-suffix
+scheme's; only the names change. Uniform layer grids with multi-cell fan-out
+(and head fan-out subsuming the mooncake ``tp_lcm_size`` split-heads
+mechanism) are the follow-up and are rejected with explicit errors here.
+Rank-replicated pools (MLA-family) have no head axis, so cross-TP-size reuse
+works immediately.
 
 The namespace descriptor is *configuration*, distributed out-of-band (a JSON
 file passed to every deployment that should share cache). Two deployments
@@ -57,26 +60,34 @@ logger = logging.getLogger(__name__)
 _SCHEMA_VERSION = 1
 
 
-class KVCacheNamespace(msgspec.Struct, frozen=True, kw_only=True):
+class KVCacheNamespace(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
     """Immutable identity of one shared L3 KV keyspace.
 
     Everything that must be equal for two deployments' KV bytes to be
     interchangeable, plus the canonical grid that fixes cell boundaries.
     Field order is part of the canonical encoding — append new fields only,
-    and bump ``schema_version`` when doing so.
+    and bump ``schema_version`` when doing so. ``forbid_unknown_fields``
+    makes descriptor-file typos a decode error instead of a silently
+    different keyspace.
     """
 
     schema_version: int = _SCHEMA_VERSION
     model_id: str
-    # torch dtype of the *stored* KV bytes, normalized (e.g. "bfloat16").
+    # Logical torch dtype of the KV cache, normalized (e.g. "bfloat16",
+    # "float8_e4m3fn") — NOT the storage view dtype (fp8 variants all store
+    # as uint8 and must not share a keyspace).
     dtype: str
     page_size: int
     # True for MLA-family pools whose KV is replicated across attn-TP ranks;
     # such namespaces have no head axis (total_kv_heads/head_group are 0).
     rank_replicated: bool
     total_kv_heads: int
-    # Grid: contiguous layers per cell / kv heads per cell.
-    layer_group: int
+    # Head grid: kv heads per cell. Layer cells are absolute per-stage layer
+    # ranges in v1; layer_group must stay 0 (uniform layer grids with
+    # fan-out are the follow-up).
+    layer_group: int = 0
     head_group: int
     # Optional kernel/build ABI digest; deployments whose numerics must not
     # mix set distinct values and thereby get distinct namespaces.
@@ -115,15 +126,15 @@ def derive_namespace(
     page_size: int,
     rank_replicated: bool,
     total_kv_heads: int,
-    stage_layer_count: int,
     local_kv_heads: int,
 ) -> KVCacheNamespace:
-    """Default descriptor when no file is given: grid == this deployment.
+    """Default descriptor when no file is given: head grid == this deployment.
 
     Deployments with different topologies then derive different digests and
     land in disjoint keyspaces — safe (never a geometry collision) but with no
     cross-topology sharing. Fleets that want sharing distribute one descriptor
-    file instead.
+    file instead. Layer cells are per-stage ranges, so the derived namespace
+    is PP-partition-independent: only the head grid enters the identity.
     """
     namespace = KVCacheNamespace(
         model_id=model_id,
@@ -131,7 +142,6 @@ def derive_namespace(
         page_size=page_size,
         rank_replicated=rank_replicated,
         total_kv_heads=0 if rank_replicated else total_kv_heads,
-        layer_group=stage_layer_count,
         head_group=0 if rank_replicated else local_kv_heads,
     )
     _validate_grid(namespace)
@@ -139,8 +149,12 @@ def derive_namespace(
 
 
 def _validate_grid(namespace: KVCacheNamespace) -> None:
-    if namespace.layer_group <= 0:
-        raise ValueError(f"layer_group must be positive: {namespace}")
+    if namespace.layer_group != 0:
+        raise NotImplementedError(
+            f"layer_group={namespace.layer_group}: uniform layer grids with "
+            f"multi-cell fan-out are not implemented; v1 uses per-stage layer "
+            f"ranges (layer_group=0)."
+        )
     if namespace.page_size <= 0:
         raise ValueError(f"page_size must be positive: {namespace}")
     if not namespace.model_id:
@@ -203,36 +217,25 @@ def build_canonical_cell_suffix(
             "--hicache-storage-key-scheme rank-suffix with the file backend."
         )
 
-    stage_layers = end_layer - start_layer
-    if stage_layers <= 0:
+    if not 0 <= start_layer < end_layer:
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
-    if start_layer % namespace.layer_group != 0 or (
-        stage_layers % namespace.layer_group != 0
-    ):
-        raise ValueError(
-            f"this rank's layer range [{start_layer}, {end_layer}) does not "
-            f"tile layer_group={namespace.layer_group}; pick a descriptor "
-            f"whose layer_group divides every deployed stage."
-        )
-    if stage_layers != namespace.layer_group:
-        raise NotImplementedError(
-            f"layer fan-out is not implemented: this rank holds "
-            f"{stage_layers} layers but the namespace layer_group is "
-            f"{namespace.layer_group} ({stage_layers // namespace.layer_group} "
-            f"cells per page). v1 requires layer_group == the rank's layer "
-            f"count."
-        )
-    layer_index = start_layer // namespace.layer_group
+    # Absolute per-stage range: any PP partition (uneven stages included)
+    # yields valid, collision-free names; differing partitions miss instead
+    # of colliding.
+    layer_coord = f"L{start_layer}-{end_layer}"
 
     digest = namespace_digest(namespace)
     if namespace.rank_replicated:
-        return f"{digest}_L{layer_index}"
+        return f"{digest}_{layer_coord}"
 
     if namespace.total_kv_heads != local_kv_heads * attn_tp_size:
         raise ValueError(
             f"namespace total_kv_heads={namespace.total_kv_heads} != "
-            f"local_kv_heads({local_kv_heads}) x attn_tp_size({attn_tp_size}); "
-            f"wrong descriptor for this model/parallelism."
+            f"local_kv_heads({local_kv_heads}) x attn_tp_size({attn_tp_size}): "
+            f"either the descriptor does not match this model/parallelism, or "
+            f"kv heads are replicated across ranks (tp_size > model kv heads),"
+            f" which needs writer election (follow-up). Use "
+            f"--hicache-storage-key-scheme rank-suffix meanwhile."
         )
     if local_kv_heads % namespace.head_group != 0:
         raise ValueError(
@@ -249,7 +252,7 @@ def build_canonical_cell_suffix(
             f"with tp_lcm_size split-heads."
         )
     head_index = (attn_tp_rank * local_kv_heads) // namespace.head_group
-    return f"{digest}_L{layer_index}_H{head_index}"
+    return f"{digest}_{layer_coord}_H{head_index}"
 
 
 def _check_identity(
