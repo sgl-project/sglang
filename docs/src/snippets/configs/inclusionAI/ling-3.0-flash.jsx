@@ -4,11 +4,6 @@ export const config = {
   supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300"],
   groupHardware: false,
 
-  hardware: [
-    { id: "h20-3e", label: "H20-3e", vram: "141GB", vendor: "hopper" },
-    { id: "h800", label: "H800", vram: "80GB", vendor: "hopper" },
-  ],
-
   variants: [
     { id: "default", label: "Ling-3.0-flash" },
   ],

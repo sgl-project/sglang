@@ -100,6 +100,8 @@ export const Deployment = ({ config, benchmarks }) => {
     hopper: [
       { id: "h200",  label: "H200",  vram: "141GB" },
       { id: "h100",  label: "H100",  vram: "80GB"  },
+      { id: "h20-3e", label: "H20-3e", vram: "141GB" },
+      { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
     amd: [
       { id: "mi300x", label: "MI300X", vram: "192GB" },
