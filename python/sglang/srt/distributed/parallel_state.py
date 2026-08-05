@@ -2567,7 +2567,12 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Use the CPU-backed world group explicitly so object exchange does not
+    # depend on the backend-selection fallback in torch.distributed.
+    world_cpu_group = get_world_group().cpu_group
+    torch.distributed.all_gather_object(
+        gathered_configs, local_config, group=world_cpu_group
+    )
 
     unique_groups = []
     seen_signatures = set()
