@@ -99,6 +99,9 @@ jobs:
     env:
       FRAMEWORK: sglang
       HW: mi355x
+      # The runtime image predates this checkout's MORI pin. Reinstall MORI
+      # inside each prefill/decode container before launching the server.
+      SGLANG_REINSTALL_MORI: "1"
       MODEL: ${{ matrix.config.model }}
       MODEL_PREFIX: ${{ matrix.config.model_prefix }}
       PRECISION: ${{ matrix.config.precision }}

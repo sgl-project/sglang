@@ -30,6 +30,10 @@
 #                        checkout sglang-router package inside the bench
 #                        container, before launching servers/bench. Set 0 to
 #                        use the image's baked-in packages.
+#   SGLANG_REINSTALL_MORI
+#                      - default 0. Reinstall the MORI revision pinned by this
+#                        checkout's docker/rocm.Dockerfile in each server
+#                        container before launch.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -63,6 +67,15 @@ case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
     0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
     *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
 esac
+SGLANG_REINSTALL_MORI="${SGLANG_REINSTALL_MORI:-0}"
+case "${SGLANG_REINSTALL_MORI,,}" in
+    1|true|yes|on) SGLANG_REINSTALL_MORI=1 ;;
+    *) SGLANG_REINSTALL_MORI=0 ;;
+esac
+if [[ "$SGLANG_REINSTALL_MORI" == "1" && "$SGLANG_USE_CHECKOUT_RUNTIME" != "1" ]]; then
+    echo "ERROR: SGLANG_REINSTALL_MORI=1 requires SGLANG_USE_CHECKOUT_RUNTIME=1" >&2
+    exit 1
+fi
 
 if [[ -z "$MODEL_PATH" ]]; then
     echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
@@ -239,7 +252,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
 # reinstall the same code SHA the workflow checked out. The container gets a
 # read-only mount and copies it to /tmp before mutating pyproject.toml.
-CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"
+CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME -e SGLANG_REINSTALL_MORI=$SGLANG_REINSTALL_MORI"
 if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
     CHECKOUT_STAGE="$WORKDIR/checkout"
     CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
@@ -251,6 +264,40 @@ if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
     CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
 else
     echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
+fi
+
+# Compute nodes are not assumed to have Internet access. Fetch the pinned MORI
+# source once on the login node, including submodules, and stage it on shared
+# NFS. Each server container copies this source locally before building.
+if [[ "$SGLANG_REINSTALL_MORI" == "1" ]]; then
+    MORI_DOCKERFILE="$GITHUB_WORKSPACE/docker/rocm.Dockerfile"
+    MORI_REPO="$(
+        sed -nE 's|^[[:space:]]*ARG[[:space:]]+MORI_REPO="?([^"[:space:]]+)"?.*$|\1|p' \
+            "$MORI_DOCKERFILE" | head -n1
+    )"
+    MORI_COMMIT="$(
+        sed -nE 's|^[[:space:]]*ARG[[:space:]]+MORI_COMMIT="?([^"[:space:]]+)"?.*$|\1|p' \
+            "$MORI_DOCKERFILE" | head -n1
+    )"
+    if [[ -z "$MORI_REPO" || -z "$MORI_COMMIT" ]]; then
+        echo "ERROR: failed to resolve MORI pin from $MORI_DOCKERFILE" >&2
+        exit 1
+    fi
+
+    MORI_STAGE="$WORKDIR/mori-src"
+    echo "Staging MORI source: repo=$MORI_REPO commit=$MORI_COMMIT"
+    rm -rf "$MORI_STAGE"
+    git clone "$MORI_REPO" "$MORI_STAGE"
+    git -C "$MORI_STAGE" checkout "$MORI_COMMIT"
+    git -C "$MORI_STAGE" submodule update --init --recursive
+    EXPECTED_MORI_COMMIT="$(
+        git -C "$MORI_STAGE" rev-parse "${MORI_COMMIT}^{commit}"
+    )"
+    ACTUAL_MORI_COMMIT="$(git -C "$MORI_STAGE" rev-parse HEAD)"
+    if [[ "$ACTUAL_MORI_COMMIT" != "$EXPECTED_MORI_COMMIT" ]]; then
+        echo "ERROR: staged MORI expected=$EXPECTED_MORI_COMMIT actual=$ACTUAL_MORI_COMMIT" >&2
+        exit 1
+    fi
 fi
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
@@ -556,6 +603,79 @@ if not actual.startswith(expected):
 PY
 EOF
 
+cat > "$WORKDIR/install_checkout_mori.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_REINSTALL_MORI:-0}" in
+  1|true|True|TRUE|yes|Yes|YES|on|On|ON) ;;
+  *)
+    echo "[checkout-mori] disabled; using image-baked MORI"
+    exit 0
+    ;;
+esac
+
+STAGED_MORI_SRC="${1:-}"
+CHECKOUT_SRC="${CHECKOUT_SRC:-/sglang-checkout}"
+DOCKERFILE="$CHECKOUT_SRC/docker/rocm.Dockerfile"
+if [[ ! -f "$DOCKERFILE" ]]; then
+  echo "[checkout-mori] ERROR: Dockerfile not found: $DOCKERFILE" >&2
+  exit 1
+fi
+if [[ ! -d /sgl-workspace/mori ]]; then
+  echo "[checkout-mori] ERROR: image was not built with ENABLE_MORI=1" >&2
+  exit 1
+fi
+if [[ ! -d "$STAGED_MORI_SRC/.git" ]]; then
+  echo "[checkout-mori] ERROR: staged MORI source not found: $STAGED_MORI_SRC" >&2
+  exit 1
+fi
+git config --global --add safe.directory "$STAGED_MORI_SRC" || true
+
+extract_arg() {
+  local name="$1"
+  sed -nE \
+    "s|^[[:space:]]*ARG[[:space:]]+${name}=\"?([^\"[:space:]]+)\"?.*$|\1|p" \
+    "$DOCKERFILE" | head -n1
+}
+
+MORI_COMMIT="$(extract_arg MORI_COMMIT)"
+if [[ -z "$MORI_COMMIT" ]]; then
+  echo "[checkout-mori] ERROR: failed to resolve MORI pin from $DOCKERFILE" >&2
+  exit 1
+fi
+
+EXPECTED_COMMIT="$(
+  git -C "$STAGED_MORI_SRC" rev-parse "${MORI_COMMIT}^{commit}"
+)"
+STAGED_COMMIT="$(git -C "$STAGED_MORI_SRC" rev-parse HEAD)"
+if [[ "$STAGED_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+  echo "[checkout-mori] ERROR: staged=$STAGED_COMMIT expected=$EXPECTED_COMMIT" >&2
+  exit 1
+fi
+
+echo "[checkout-mori] reinstalling $MORI_COMMIT for gfx950"
+rm -rf /sgl-workspace/mori
+cp -a "$STAGED_MORI_SRC" /sgl-workspace/mori
+chown -R root:root /sgl-workspace/mori
+(
+  cd /sgl-workspace/mori
+  unset SETUPTOOLS_SCM_PRETEND_VERSION
+  MORI_GPU_ARCHS=gfx950 python3 setup.py develop
+)
+
+ACTUAL_COMMIT="$(git -C /sgl-workspace/mori rev-parse HEAD)"
+if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+  echo "[checkout-mori] ERROR: expected=$EXPECTED_COMMIT actual=$ACTUAL_COMMIT" >&2
+  exit 1
+fi
+
+python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))' \
+  > /etc/ld.so.conf.d/torch.conf
+ldconfig
+echo "[checkout-mori] installed commit $ACTUAL_COMMIT"
+EOF
+
 cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -641,6 +761,7 @@ set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
+bash "\$CIDIR/install_checkout_mori.sh" "\$CIDIR/mori-src"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
@@ -660,6 +781,7 @@ set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
+bash "\$CIDIR/install_checkout_mori.sh" "\$CIDIR/mori-src"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
@@ -710,6 +832,7 @@ set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
+bash "\$CIDIR/install_checkout_mori.sh" "\$CIDIR/mori-src"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
@@ -725,6 +848,7 @@ set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
+bash "\$CIDIR/install_checkout_mori.sh" "\$CIDIR/mori-src"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
