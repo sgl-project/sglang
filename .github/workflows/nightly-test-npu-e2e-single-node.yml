@@ -17,9 +17,15 @@ on:
         type: string
         description: test config name
       test_case:
-        required: true
+        required: false
         type: string
-        description: path of test case file
+        default: ''
+        description: path of test case file (mutually exclusive with test_suite)
+      test_suite:
+        required: false
+        type: string
+        default: ''
+        description: name of test suite to run via run_suite.py (mutually exclusive with test_case)
       image:
         required: false
         type: string
@@ -96,18 +102,26 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
 
-          test_case=${{ inputs.test_case }}
-          if [ ! -f "${sglang_source_path}/${test_case}" ]; then
-            echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
-            exit 1
+          # Determine test mode: suite (run_suite.py --suite) or single case file.
+          test_suite="${{ inputs.test_suite }}"
+          test_case="${{ inputs.test_case }}"
+          if [ -n "${test_suite}" ]; then
+            echo "Test mode: suite (${test_suite})"
+            tc_name="${test_suite}"
+          else
+            echo "Test mode: single case (${test_case})"
+            if [ ! -f "${sglang_source_path}/${test_case}" ]; then
+              echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
+              exit 1
+            fi
+            tc_name=${test_case##*/}
+            tc_name=${tc_name%.*}
           fi
 
           # prepare for output data
           current_date=$(date +%Y%m%d)
           test_data_output_path=/root/.cache/tests/output/${{ inputs.test_type }}/${current_date}
           mkdir -p ${test_data_output_path}
-          tc_name=${test_case##*/}
-          tc_name=${tc_name%.*}
           export METRICS_DATA_FILE=${test_data_output_path}/${tc_name}
           mkdir -p ${METRICS_DATA_FILE}
           echo "Metrics file path: ${METRICS_DATA_FILE}"
@@ -173,10 +187,15 @@ jobs:
           mkdir -p ${log_path}
           echo "Log path: ${log_path}"
 
-          echo "Running test case ${test_case}"
+          echo "Running test: ${tc_name}"
           test_exit_code=0
-          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
-          echo "Finished test case ${test_case}"
+          if [ -n "${test_suite}" ]; then
+            cd test
+            ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          else
+            ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          fi
+          echo "Finished test: ${tc_name}"
 
           if [ "${test_exit_code}" = "0" ]; then
             test_status="pass"
@@ -206,29 +225,34 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "import json, re, os" > /tmp/dump_metrics.py
-          echo "tc = os.environ.get('tc_name', 'unknown')" >> /tmp/dump_metrics.py
-          echo "st = os.environ.get('test_status', 'unknown')" >> /tmp/dump_metrics.py
-          echo "tp = '${{ inputs.test_type }}'" >> /tmp/dump_metrics.py
-          echo "metrics = {}" >> /tmp/dump_metrics.py
-          echo "with open('/tmp/test_output.log') as f:" >> /tmp/dump_metrics.py
-          echo "    for line in f:" >> /tmp/dump_metrics.py
-          echo "        m = re.match(r'\[METRIC\] (\S+)=(\S+)', line)" >> /tmp/dump_metrics.py
-          echo "        if m:" >> /tmp/dump_metrics.py
-          echo "            v = m.group(2)" >> /tmp/dump_metrics.py
-          echo "            try:" >> /tmp/dump_metrics.py
-          echo "                v = float(v)" >> /tmp/dump_metrics.py
-          echo "            except ValueError:" >> /tmp/dump_metrics.py
-          echo "                pass" >> /tmp/dump_metrics.py
-          echo "            metrics[m.group(1)] = v" >> /tmp/dump_metrics.py
-          echo "baselines = {}" >> /tmp/dump_metrics.py
-          echo "for k, v in list(metrics.items()):" >> /tmp/dump_metrics.py
-          echo "    if k.endswith('_baseline'):" >> /tmp/dump_metrics.py
-          echo "        baselines[k[:-9]] = v" >> /tmp/dump_metrics.py
-          echo "        del metrics[k]" >> /tmp/dump_metrics.py
-          echo "with open('/tmp/metrics.json', 'w') as f:" >> /tmp/dump_metrics.py
-          echo "    json.dump({'test_case': tc, 'test_type': tp, 'status': st, 'metrics': metrics, 'baselines': baselines}, f)" >> /tmp/dump_metrics.py
-          python3 /tmp/dump_metrics.py
+          # In suite mode the test base class writes per-case metrics.json
+          # files under /root/.cache/tests/output/, so skip the suite-level
+          # /tmp/metrics.json generation here.
+          if [ -z "${test_suite}" ]; then
+            echo "import json, re, os" > /tmp/dump_metrics.py
+            echo "tc = os.environ.get('tc_name', 'unknown')" >> /tmp/dump_metrics.py
+            echo "st = os.environ.get('test_status', 'unknown')" >> /tmp/dump_metrics.py
+            echo "tp = '${{ inputs.test_type }}'" >> /tmp/dump_metrics.py
+            echo "metrics = {}" >> /tmp/dump_metrics.py
+            echo "with open('/tmp/test_output.log') as f:" >> /tmp/dump_metrics.py
+            echo "    for line in f:" >> /tmp/dump_metrics.py
+            echo "        m = re.match(r'\[METRIC\] (\S+)=(\S+)', line)" >> /tmp/dump_metrics.py
+            echo "        if m:" >> /tmp/dump_metrics.py
+            echo "            v = m.group(2)" >> /tmp/dump_metrics.py
+            echo "            try:" >> /tmp/dump_metrics.py
+            echo "                v = float(v)" >> /tmp/dump_metrics.py
+            echo "            except ValueError:" >> /tmp/dump_metrics.py
+            echo "                pass" >> /tmp/dump_metrics.py
+            echo "            metrics[m.group(1)] = v" >> /tmp/dump_metrics.py
+            echo "baselines = {}" >> /tmp/dump_metrics.py
+            echo "for k, v in list(metrics.items()):" >> /tmp/dump_metrics.py
+            echo "    if k.endswith('_baseline'):" >> /tmp/dump_metrics.py
+            echo "        baselines[k[:-9]] = v" >> /tmp/dump_metrics.py
+            echo "        del metrics[k]" >> /tmp/dump_metrics.py
+            echo "with open('/tmp/metrics.json', 'w') as f:" >> /tmp/dump_metrics.py
+            echo "    json.dump({'test_case': tc, 'test_type': tp, 'status': st, 'metrics': metrics, 'baselines': baselines}, f)" >> /tmp/dump_metrics.py
+            python3 /tmp/dump_metrics.py
+          fi
           exit ${test_exit_code}
 
       - name: Upload metrics
@@ -236,19 +260,33 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: metrics-${{ inputs.test_config_name }}
-          path: /tmp/metrics.json
+          path: |
+            /tmp/metrics.json
+            /root/.cache/tests/output/
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Backup plog
         if: always()
         shell: bash
         run: |
+          # In suite mode the test base class backs up plog per case under
+          # /root/.cache/tests/logs/plog/<tc_name>/<hostname>/, so skip the
+          # suite-level backup here to avoid a shared suite-name directory.
+          test_suite="${{ inputs.test_suite }}"
+          if [ -n "${test_suite}" ]; then
+            echo "Suite mode: per-case plog backup handled by test base class."
+            exit 0
+          fi
           plog_path="/root/ascend/log/debug/plog"
           if [ -d "$plog_path" ];then
             echo "Plog files found. Begin to backup them."
-            tc_name=${{ inputs.test_case }}
-            tc_name=${tc_name##*/}
-            tc_name=${tc_name%.*}
+            tc_name="${{ inputs.test_suite }}"
+            if [ -z "${tc_name}" ]; then
+              tc_name=${{ inputs.test_case }}
+              tc_name=${tc_name##*/}
+              tc_name=${tc_name%.*}
+            fi
             target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
             echo "Save path: ${target_plog_path}"
             rm -rf ${target_plog_path}

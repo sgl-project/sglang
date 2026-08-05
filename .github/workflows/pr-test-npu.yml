@@ -90,7 +90,7 @@ jobs:
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
 
-  stage-a-unit-test-npu:
+  base-a-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
@@ -128,9 +128,9 @@ jobs:
           SGLANG_IS_IN_CI: true
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite stage-a-unit-test-npu
+          python3 run_suite.py --hw npu --suite base-a-test-1-npu-a2
 
-  stage-b-test-1-npu-a3:
+  base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-2-
@@ -177,10 +177,10 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-1-npu-a3 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite base-b-test-1-npu-a3 --timeout-per-file 3600
 
 
-  stage-b-test-2-npu-a3:
+  base-b-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-2-
@@ -227,10 +227,10 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a3 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite base-b-test-2-npu-a3 --timeout-per-file 3600
 
 
-  stage-b-test-4-npu-a3:
+  base-b-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4-
@@ -282,9 +282,9 @@ jobs:
         run: |
           pip install sglang_router
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite base-b-test-4-npu-a3 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
-  stage-b-test-8-npu-a3:
+  base-b-test-8-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-8-
@@ -331,9 +331,9 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-8-npu-a3 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite base-b-test-8-npu-a3 --timeout-per-file 3600
 
-  stage-b-test-16-npu-a3:
+  base-b-test-16-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16-
@@ -382,7 +382,7 @@ jobs:
           apt-get install -y libssl-dev
           pip install sglang_router
           cd test
-          python3 run_suite.py --hw npu --suite stage-b-test-16-npu-a3 --timeout-per-file 3600
+          python3 run_suite.py --hw npu --suite base-b-test-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config]
@@ -506,116 +506,28 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        test_config:
-          # qwen3_6_27b performance tests
-          - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
-            runner: linux-aarch64-a3-800t-2
-            test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
-            test_type: 'perf'
-
-          # - name: qwen3_6_27b_1p_in1024x1024_30_out1024_50ms
-          #   runner: linux-aarch64-a3-800t-2
-          #   test_case: test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_1p_in1024x1024_30_out1024_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_8b performance tests
-          # - name: qwen3_8b_w8a8_1p_in3k5_out1k5_50ms
-          #   runner: linux-aarch64-a3-800t-2
-          #   test_case: test/registered/npu/performance/qwen3-8b/test_npu_qwen3_8b_w8a8_1p_in3k5_out1k5_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_30b_a3b performance tests
-          # - name: qwen3_30b_w8a8_1p_in3k5_out1k5_50ms
-          #   runner: linux-aarch64-a3-800t-2
-          #   test_case: test/registered/npu/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in3k5_out1k5_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_6_35b_a3b performance tests
-          # - name: qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms
-          #   runner: linux-aarch64-a3-800t-2
-          #   test_case: test/registered/npu/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in64k_out1k_prefix90_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_vl_8b_thinking accuracy tests
-          # - name: qwen3_vl_8b_thinking_1p_mmmu
-          #   runner: linux-aarch64-a3-2-
-          #   test_case: test/registered/npu/accuracy/qwen3_vl_8b_thinking/test_npu_qwen3_vl_8b_thinking_1p_mmmu.py
-          #   test_type: 'accuracy'
-
-          # # qwen3_32b performance tests
-          # - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms
-          #   runner: linux-aarch64-a3-800t-4
-          #   test_case: test/registered/npu/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_next_80b_a3b performance tests
-          # - name: qwen3_next_80b_w8a8_2p_in6k_out1k5_bs16
-          #   runner: linux-aarch64-a3-800t-4
-          #   test_case: test/registered/npu/performance/qwen3_next_80b_a3b_instruct/test_npu_qwen3_next_80b_w8a8_2p_in6k_out1k5_bs16.py
-          #   test_type: 'perf'
-
-          # # minimax_m2_5 performance tests
-          # - name: minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms
-          #   runner: linux-aarch64-a3-800t-8
-          #   test_case: test/registered/npu/performance/minimax_m2_5/test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms.py
-          #   test_type: 'perf'
-
-          # # deepseek_v4_flash performance tests
-          # - name: deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms
-          #   runner: linux-aarch64-a3-800t-16
-          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms.py
-          #   test_type: 'perf'
-
-          # # kimi_k2_6 performance tests
-          # - name: kimi_k2_6_w4a8_8p_in3k5_out1k5_20ms
-          #   runner: linux-aarch64-a3-800t-16
-          #   test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_8p_in3k5_out1k5_20ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_235b performance tests
-          # - name: qwen3_235b_w8a8_8p_in3k5_out1k5_50ms
-          #   runner: linux-aarch64-a3-800t-16
-          #   test_case: test/registered/npu/performance/qwen3_235b_a22b/test_npu_qwen3_235b_w8a8_8p_in3k5_out1k5_50ms.py
-          #   test_type: 'perf'
-
-          # # qwen3_5_397b performance tests
-          # - name: qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms
-          #   runner: linux-aarch64-a3-800t-16
-          #   test_case: test/registered/npu/performance/qwen3_5_397b/test_npu_qwen3_5_397b_w4a8_8p_in3k5_out1k5_50ms.py
-          #   test_type: 'perf'
-
-          # NPU accuracy tests
-          # - name: glm4_7_flash_1p_gsm8k
-          #   runner: linux-aarch64-a3-2-
-          #   test_case: test/registered/npu/accuracy/glm4_7_flash/test_npu_glm4_7_flash_1p_gsm8k.py
-          #   test_type: 'accuracy'
-          # - name: qwen3_vl_30b_a3b_bf16_2p_gsm8k
-          #   runner: linux-aarch64-a3-4-
-          #   test_case: test/registered/npu/accuracy/qwen3_vl_30b_a3b/test_npu_qwen3_vl_30b_a3b_bf16_2p_gsm8k.py
-          #   test_type: 'accuracy'
-          - name: glm5_top64_pruned_bf16_8p_gsm8k
-            runner: linux-aarch64-a3-16-
-            test_case: test/registered/npu/accuracy/glm5_top64_pruned/test_npu_glm5_top64_pruned_bf16_8p_gsm8k.py
+        # Test suites group cases that occupy the same number of NPU cards.
+        # Each suite is run as a single job via run_suite.py --suite.
+        test_suite:
+          - name: base-c-test-acc-2-npu-a3
+            runner: linux-aarch64-a3-2-
             test_type: 'accuracy'
-          # - name: moonshotai_moonlight_16b_a3b_bf16_1p_gsm8k
-          #   runner: linux-aarch64-a3-2-
-          #   test_case: test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
-          #   test_type: 'accuracy'
-          # - name: qwen3_5_9b_bf16_1p_gsm8k
-          #   runner: linux-aarch64-a3-2-
-          #   test_case: test/registered/npu/accuracy/qwen3_5_9b/test_npu_qwen3_5_9b_bf16_1p_gsm8k.py
-          #   test_type: 'accuracy'
-          # - name: qwen3_vl_8b_bf16_2p_gsm8k
-          #   runner: linux-aarch64-a3-4-
-          #   test_case: test/registered/npu/accuracy/qwen3_vl_8b/test_npu_qwen3_vl_8b_bf16_2p_gsm8k.py
-          #   test_type: 'accuracy'
+          - name: base-c-test-acc-4-npu-a3
+            runner: linux-aarch64-a3-4-
+            test_type: 'accuracy'
+          - name: base-c-test-acc-8-npu-a3
+            runner: linux-aarch64-a3-8-
+            test_type: 'accuracy'
+          - name: base-c-test-acc-16-npu-a3
+            runner: linux-aarch64-a3-16-
+            test_type: 'accuracy'
 
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
-      runner: ${{ matrix.test_config.runner }}
-      test_type: ${{ matrix.test_config.test_type }}
-      test_config_name: ${{ matrix.test_config.name }}
-      test_case: ${{ matrix.test_config.test_case }}
+      runner: ${{ matrix.test_suite.runner }}
+      test_type: ${{ matrix.test_suite.test_type }}
+      test_config_name: ${{ matrix.test_suite.name }}
+      test_suite: ${{ matrix.test_suite.name }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_from_source: false
       install_sglang_deps: true
@@ -627,12 +539,12 @@ jobs:
       [
         check-changes,
 
-        stage-a-unit-test-npu,
-        stage-b-test-1-npu-a3,
-        stage-b-test-2-npu-a3,
-        stage-b-test-4-npu-a3,
-        stage-b-test-8-npu-a3,
-        stage-b-test-16-npu-a3,
+        base-a-test-1-npu-a2,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
 
         multimodal-gen-test-1-npu-a3,
         multimodal-gen-test-2-npu-a3,
