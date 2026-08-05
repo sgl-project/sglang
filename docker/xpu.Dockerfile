@@ -78,7 +78,4 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
-RUN echo "Cloning ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO}" && \
-    git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} sgl-kernel-xpu
-
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
