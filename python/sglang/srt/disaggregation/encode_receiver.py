@@ -2123,9 +2123,14 @@ class MMReceiverBase(ABC):
             if mm_items:
                 mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
+                    if mm_item is None:
+                        continue
+                    raw_url = to_raw_url(mm_item)
+                    if raw_url is None:
+                        continue
                     mm_data.append(
                         {
-                            "url": to_raw_url(mm_item),
+                            "url": raw_url,
                             "modality": modality,
                         }
                     )
@@ -2286,7 +2291,9 @@ class MMReceiverHTTP(MMReceiverBase):
             # zmq_to_tokenizer is pushed to our PULL socket during /encode,
             # zmq_to_scheduler to the ports its ranks registered, and mooncake
             # by RDMA once those ranks have pulled sizes and driven /send.
-            await self._check_encoder_responses(responses, encode_requests, req_id)
+            return await self._check_encoder_responses(
+                responses, encode_requests, req_id
+            )
 
 
 class MMReceiverGrpc(MMReceiverBase):
