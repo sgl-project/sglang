@@ -722,8 +722,6 @@ class MiniMaxH3Attention(nn.Module):
                     )
                     out[query_start:query_stop].copy_(projected)
                     del q, attention_out, projected
-                    torch.mps.synchronize()
-                    torch.mps.empty_cache()
                 del qkv, q_chunk
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
