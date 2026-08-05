@@ -31,7 +31,9 @@ from sglang.srt.runtime_context import get_device, get_parallel
 
 def prepare_decode_context_parallel_metadata(
     seq_lens: torch.Tensor,
-    extend_prefix_lens: torch.Tensor,
+    # Optional: extend-class forwards without chunked-prefix metadata (eager
+    # target-verify) pass None; the attention backend plans instead.
+    extend_prefix_lens: Optional[torch.Tensor],
     extend_prefix_lens_cpu: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -44,6 +46,10 @@ def prepare_decode_context_parallel_metadata(
 ) -> Optional[DecodeContextParallelMetadata]:
     parallel = get_parallel()
     if not parallel.dcp_enabled:
+        return None
+    if extend_prefix_lens is None:
+        # Extend-class forwards without chunked-prefix metadata (e.g. eager
+        # target-verify) build their DCP metadata in the attention backend.
         return None
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
