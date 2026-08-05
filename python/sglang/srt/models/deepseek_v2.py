@@ -915,6 +915,8 @@ class DeepseekV2MoE(nn.Module):
                     <= get_exec().graph.torch_compile_max_bs
                     * (get_spec().speculative_num_draft_tokens or 1)
                 )
+                # Dual-stream MoE is non-deterministic under CUDA graph replay.
+                and not get_global_server_args().enable_deterministic_inference
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
