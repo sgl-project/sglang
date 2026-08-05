@@ -749,6 +749,52 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - **36 − 20 = 16 不是浪费**：槽位是容量上限不是工作岗位，GPU 打没打满看算力和显存带宽，不是请求数。20 个并发（含 12 个长输出）很可能已接近 L40S 饱和；硬塞满 36 会让每个请求变慢（实测高并发下 TTFT 1.35s→8.76s、abort 0.3%→3.3%）；
 - **判断是否调大**：看 `nvidia-smi` GPU-Util。经常 90%+ → 现状合理；经常 30~40% → 请求量不足或配置过保守，可上调 tool_call（tool call 是主力场景时优先调它，thinking 保持 12 保护 tool call 延迟）。
 
+**6 卡生产完整启动命令（含代理 + 限并发 + MTP）**
+
+```bash
+export LD_PRELOAD=/usr/local/lib/python3.12/site-packages/sgl_kernel/sgl_stubs.so
+export TORCH_CUDA_ARCH_LIST="8.9"
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
+bash sglang_start.sh \
+    --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
+    --port 8000 \
+    --max-running-requests 12 \
+    --enable-speculative \
+    --speculative-num-steps 3 \
+    --speculative-num-draft-tokens 4 \
+    --proxy-port 8080 \
+    --proxy-tool-call-limit 16 \
+    --proxy-thinking-limit 12 \
+    --keep-alive \
+    --warmup
+```
+
+| 参数 | 作用 |
+|------|------|
+| `--max-running-requests 12` | per-worker 并发（TP2 DP3 → 后端容量 36） |
+| `--enable-speculative` + `--speculative-num-steps 3` + `--speculative-num-draft-tokens 4` | MTP 投机解码（NEXTN） |
+| `--proxy-port 8080` | 拉起前置代理（限并发 + 给 tool call 注入 priority=10） |
+| `--proxy-tool-call-limit 16` | tool call 并发上限（默认 8，实施时建议直接提到 16，重启后保留） |
+| `--proxy-thinking-limit 12` | thinking 并发上限（默认 12，保持，保护 tool call 延迟） |
+| `--keep-alive` | 常驻轻量请求防内核/autotune 缓存回收 |
+| `--warmup` | 启动前预热（等价去掉 `--skip-server-warmup`） |
+
+> tool call 上限**建议直接通过启动参数固化**（`--proxy-tool-call-limit 16`），而不是启动后热调：热调不持久化，pod 重启会恢复默认 8。
+
+启动后从 pod 外验证：
+
+```bash
+# 代理就绪
+curl -s http://<service-ip>:8080/health
+# 查询当前 limits（确认 16/12 生效）
+curl -s http://<service-ip>:8080/admin/limits
+# 运行中想再调（不持久化，重启恢复启动参数）
+curl -X POST http://<service-ip>:8080/admin/limits \
+  -H 'Content-Type: application/json' \
+  -d '{"tool_call": 16, "thinking": 12}'
+```
+
 **服务端配置**（先 `--help | grep -iE "priority|schedule-policy"` 确认 0.5.17 支持）：
 
 ```bash
