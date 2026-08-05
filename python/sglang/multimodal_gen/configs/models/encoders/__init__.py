@@ -21,6 +21,10 @@ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.llama import LlamaConfig
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLArchConfig,
+    MiniMaxH3Qwen3VLConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
@@ -36,6 +40,8 @@ __all__ = [
     "Flux2MistralTextConfig",
     "build_flux2_text_messages",
     "LlamaConfig",
+    "MiniMaxH3Qwen3VLArchConfig",
+    "MiniMaxH3Qwen3VLConfig",
     "Qwen3TextConfig",
     "Qwen3VLConfig",
     "T5Config",
