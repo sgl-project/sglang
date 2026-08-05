@@ -267,6 +267,16 @@ def record_action_latency(
         action_sent_at.pop(event_id, None)
 
 
+def record_frame_batch(
+    message: dict, *, frame_counts: dict[int, int]
+) -> None:
+    chunk_index = int(message.get("chunk_index") or 0)
+    num_frames = int(message.get("num_frames") or 0)
+    if chunk_index < 0 or num_frames <= 0:
+        return
+    frame_counts[chunk_index] = frame_counts.get(chunk_index, 0) + num_frames
+
+
 def server_action_latencies(
     trace_events: list[dict], *, min_chunk_index: int = 0
 ) -> dict[str, list[float]]:
@@ -376,6 +386,7 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
     )
     stats: dict[int, dict] = {}
     first_frame_at: dict[int, float] = {}
+    frame_counts: dict[int, int] = {}
     trace_events: list[dict] = []
     action_sent_at: dict[int, float] = {}
     action_latencies: list[float] = []
@@ -431,6 +442,7 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
                 if message_type in {"frame_batch", "frame_batch_header"}:
                     chunk = int(message.get("chunk_index") or 0)
                     observed_at = time.perf_counter()
+                    record_frame_batch(message, frame_counts=frame_counts)
                     first_frame_at.setdefault(chunk, observed_at)
                     if chunk >= args.warmup_chunks and measured_started_at is None:
                         measured_started_at = observed_at
@@ -477,7 +489,10 @@ async def run_session(args: argparse.Namespace, concurrency: int, index: int) ->
 
     measured = [stats[index] for index in range(args.warmup_chunks, total_chunks)]
     chunk_total = [float(item["chunk_total_ms"]) for item in measured]
-    frame_count = sum(int(item.get("num_frames") or 0) for item in measured)
+    frame_count = sum(
+        frame_counts.get(index, 0)
+        for index in range(args.warmup_chunks, total_chunks)
+    )
     measured_seconds = (
         max(0.0, measured_completed_at - measured_started_at)
         if measured_started_at is not None and measured_completed_at is not None

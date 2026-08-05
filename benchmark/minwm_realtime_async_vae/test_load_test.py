@@ -7,6 +7,7 @@ from load_test import (
     collect_trace_events,
     derive_trace_http_url,
     init_request,
+    record_frame_batch,
     record_action_latency,
     server_action_latencies,
     stage_values,
@@ -26,6 +27,19 @@ def test_init_request_keeps_t2v_frame_count_aligned_with_chunk_count():
 
     assert request["num_frames"] == 65
     assert request["max_chunks"] == 5
+
+
+def test_record_frame_batch_counts_all_batches_in_the_same_chunk():
+    frame_counts = {}
+
+    record_frame_batch(
+        {"chunk_index": 3, "num_frames": 8}, frame_counts=frame_counts
+    )
+    record_frame_batch(
+        {"chunk_index": 3, "num_frames": 8}, frame_counts=frame_counts
+    )
+
+    assert frame_counts == {3: 16}
 
 
 def test_stage_values_excludes_warmup_and_records_local_vae():
