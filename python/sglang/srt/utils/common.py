@@ -309,6 +309,13 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
 try:
     import sgl_kernel  # noqa: F401
 
