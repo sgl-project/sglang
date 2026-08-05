@@ -5,6 +5,9 @@ pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
+
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/sglang_descriptor.bin"));
 }
 
 use pyo3::prelude::*;
