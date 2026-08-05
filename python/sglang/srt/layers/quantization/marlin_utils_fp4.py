@@ -207,9 +207,7 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = torch.nn.functional.pad(
-            layer.bias, (0, padded_size_n - part_size_n)
-        )
+        bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
         bias = marlin_permute_bias(bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 

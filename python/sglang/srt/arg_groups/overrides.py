@@ -977,9 +977,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if has_w4a16_moe_layers:
         if server_args.moe_a2a_backend != "none":
-            raise ValueError(
-                "W4A16_NVFP4 MoE layers require --moe-a2a-backend=none."
-            )
+            raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
         if server_args.moe_runner_backend not in ("auto", "marlin"):
             raise ValueError(
                 "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
