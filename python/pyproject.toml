@@ -215,6 +215,7 @@ exclude = [
   "scripts*",
   "sglang.kernels.aot*",
   "tests*",
+  "build*",
 ]
 
 [tool.wheel]
