@@ -224,8 +224,7 @@ setup_cargo_cache() {
 
 setup_pip_toolchain() {
     if [ "$USE_VENV" = "1" ]; then
-        # configure_environment upgraded system pip before the venv existed;
-        # this upgrades the venv's own. Without a venv they are the same pip.
+        # The bootstrap upgrade hit system pip; this upgrades the venv's own.
         python3 -m pip install --upgrade pip
     fi
 
@@ -635,9 +634,7 @@ prepare_runner() {
 
 setup_ld_library_path() {
     # NVIDIA pip packages and torch ship .so files under site-packages that are
-    # not on the default LD_LIBRARY_PATH. The wheels nest lib/ at varying depths
-    # (nvidia/cudnn/lib, nvidia/cu13/cccl/lib) but always under nvidia/, so
-    # scope the find there instead of walking all of site-packages.
+    # not on the default LD_LIBRARY_PATH; lib/ always nests under nvidia/.
     SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
     NVIDIA_LIBS=$( (find "$SITE_PACKAGES/nvidia" -type d -name lib 2>/dev/null || true) | tr '\n' ':')
     TORCH_LIB="$SITE_PACKAGES/torch/lib"
@@ -658,9 +655,8 @@ setup_ld_library_path() {
 verify_imports() {
     $PIP_CMD list
 
-    # One process for every probe so the interpreter and torch load once.
-    # torch and cutlass do not import sglang, so the find_spec check below
-    # still resolves before any sglang import in this process.
+    # One process; torch/cutlass do not import sglang, so the find_spec check
+    # still runs ahead of any sglang import.
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import torch
 print(torch.version.cuda)

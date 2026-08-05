@@ -8,8 +8,7 @@ echo "Preparing CI runner..."
 echo ""
 
 # Clean up stale HuggingFace cache artifacts from previous failed downloads.
-# No prevalidation pass here: launch/load-time validation covers (and repairs)
-# each model's cache; a boot-time sweep only duplicates it.
+# No prevalidation: launch/load-time validation covers and repairs each cache.
 python3 "${SCRIPT_DIR}/../utils/cleanup_hf_cache.py"
 echo ""
 

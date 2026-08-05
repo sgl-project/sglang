@@ -47,20 +47,14 @@ def find_stale_artifacts(cache_dir: str) -> List[Path]:
     if not cache_path.exists():
         return []
 
-    # Deliberately NOT "**/*.lock": download locks live inside the shared cache
-    # (.sglang_locks/, huggingface_hub's .locks/) so NFS-co-mounted containers
-    # coordinate, and may be held 30+ minutes while another container downloads
-    # a large model. Unlinking a held lock hands the next acquirer a fresh inode
-    # and both proceed - the cross-container race the locks exist to prevent.
-    # Leftover locks from dead processes are inert: flock dies with its holder.
+    # Not "**/*.lock": another container may hold a download lock for 30+ min;
+    # unlinking it gives the next acquirer a fresh inode and both proceed.
     patterns = [
         "**/*.incomplete",  # Incomplete download markers
         "**/*.tmp",  # Temporary files
     ]
 
-    # A match is only stale once it has been quiet for a while: another
-    # co-mounted container may still be appending to its blobs/*.incomplete,
-    # and unlinking that breaks the download's final os.replace into the blob.
+    # Another container may still be appending to its blobs/*.incomplete.
     min_stale_age_seconds = 2 * 60 * 60
 
     stale_files = []
@@ -71,7 +65,7 @@ def find_stale_artifacts(cache_dir: str) -> List[Path]:
                 if now - path.stat().st_mtime < min_stale_age_seconds:
                     continue
             except OSError:
-                continue  # vanished mid-scan - nothing left to clean
+                continue  # vanished mid-scan
             stale_files.append(path)
 
     return stale_files
