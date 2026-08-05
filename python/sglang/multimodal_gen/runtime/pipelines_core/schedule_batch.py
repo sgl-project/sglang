@@ -50,12 +50,13 @@ SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 class BatchMetricsWindow:
     """Counters accumulated between dynamic batching metric logs.
 
-    `total_capacity` uses each dispatch's effective admission cap, so
-    utilization reflects model/config limits instead of only the user max.
+    `total_outputs` and `total_capacity` use output slots, so utilization
+    reflects model/config limits even when one request asks for many outputs.
     """
 
     dispatches: int = 0
     total_requests: int = 0
+    total_outputs: int = 0
     total_capacity: int = 0
     merged_dispatches: int = 0
     full_dispatches: int = 0
