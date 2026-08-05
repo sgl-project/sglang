@@ -3233,6 +3233,30 @@ class FlashAttentionBackend(AttentionBackend):
             output = output[..., : layer.v_head_dim]
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def forward_swa_mla_absorbed(self, q, layer, forward_batch):
+        """Page64 fallback for SWA-shaped MLA decode and speculative steps."""
+        from sglang.srt.layers.attention.flashmla_ops.flashmla_fallback import (
+            forward_dense_kvlora_swa_torch_fallback,
+        )
+
+        metadata = self.forward_metadata
+        if metadata.swa_page_table is None:
+            raise RuntimeError("SWA latent attention requires an SWA page table.")
+        bs = forward_batch.batch_size
+        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        output = forward_dense_kvlora_swa_torch_fallback(
+            reshape_q=reshape_q,
+            k_cache=k_cache,
+            block_table=metadata.swa_page_table[:bs],
+            cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+            layer=layer,
+            kv_cache_dim=layer.head_dim,
+            head_dim_v=layer.v_head_dim,
+            window_size=layer.sliding_window_size + 1,
+        )
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _maybe_init_local_attn_metadata(
         self,
         forwardbatch: ForwardBatch,

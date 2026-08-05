@@ -953,9 +953,16 @@ class Dots3AttentionMLA(nn.Module):
         # NOTE(xiaozhi): Currently only fa3, nsa, triton and flashmla are supported.
         if attention_backend == "fa3":
             if self.use_swa:
+                # Target verification already has a paged SWA view prepared by
+                # the speculative attention backend. It must use the absorbed
+                # MLA path; the expanded SWA-MHA path is a prefill-only path
+                # and its logical-tail metadata is intentionally not built for
+                # target-verify CUDA graphs.
                 return (
                     Dots3AttnForwardMethod.MLA
                     if forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
                     else Dots3AttnForwardMethod.SWA_MHA
                 )
             if forward_batch.forward_mode.is_extend_without_speculative():
@@ -1244,7 +1251,16 @@ class Dots3AttentionMLA(nn.Module):
         if topk_indices is not None:
             attn_kwargs["topk_indices"] = topk_indices
 
-        if self.use_swa and forward_batch.forward_mode.is_decode_or_idle():
+        backend = get_attn_backend()
+        if (
+            self.use_swa
+            and hasattr(backend, "forward_swa_mla_absorbed")
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        ):
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
@@ -1252,8 +1268,6 @@ class Dots3AttentionMLA(nn.Module):
                 k_pe,
             )
             q_input = torch.cat([q_nope_out, q_pe], dim=-1)
-            backend = get_attn_backend()
-            assert hasattr(backend, "forward_swa_mla_absorbed")
             attn_output = backend.forward_swa_mla_absorbed(
                 q_input, self.attn_mqa, forward_batch
             )

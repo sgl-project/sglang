@@ -117,6 +117,7 @@ def is_deepseek_dsa(config) -> bool:
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
             "Dot3NoteForCausalLM",
+            "Dot3NoteForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -615,6 +616,32 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        if is_draft_model and self.hf_config.architectures[0] == "Dot3NoteForCausalLM":
+            # Dots3 uses one SWA-shaped MTP layer recursively for all NEXTN
+            # proposal steps (full sharing). Rewrite the draft config before
+            # model shapes and hybrid KV-cache geometry are derived.
+            self.hf_config.architectures[0] = "Dot3NoteForCausalLMNextN"
+            self.hf_text_config.num_nextn_predict_layers = 1
+            self.hf_text_config.layer_types = ["sliding_attention"]
+            self.hf_text_config.attention_gate_type = (
+                self.hf_text_config.swa_attention_gate_type
+            )
+            self.hf_text_config.kv_lora_rank = self.hf_text_config.swa_kv_lora_rank
+            self.hf_text_config.q_lora_rank = self.hf_text_config.swa_q_lora_rank
+            self.hf_text_config.qk_nope_head_dim = (
+                self.hf_text_config.swa_qk_nope_head_dim
+            )
+            self.hf_text_config.qk_rope_head_dim = (
+                self.hf_text_config.swa_qk_rope_head_dim
+            )
+            self.hf_text_config.num_attention_heads = (
+                self.hf_text_config.swa_num_attention_heads
+            )
+            self.hf_text_config.num_key_value_heads = (
+                self.hf_text_config.swa_num_key_value_heads
+            )
+            self.hf_text_config.v_head_dim = self.hf_text_config.swa_v_head_dim
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -889,6 +916,7 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dot3NoteForCausalLM" in self.hf_config.architectures
+            or "Dot3NoteForCausalLMNextN" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
             or (
                 "PixtralForConditionalGeneration" in self.hf_config.architectures
@@ -2117,6 +2145,7 @@ def get_hybrid_layer_ids(
     elif (
         "GptOssForCausalLM" in model_architectures
         or "Dot3NoteForCausalLM" in model_architectures
+        or "Dot3NoteForCausalLMNextN" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
