@@ -16,6 +16,7 @@ bugs in tensor shape handling (e.g., 2D tensors [num_delimiters, num_label_token
 import asyncio
 import os
 import unittest
+from collections import OrderedDict
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -27,7 +28,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=175, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
@@ -35,6 +36,36 @@ TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(
     "tomaarsen/Qwen3-Reranker-0.6B-seq-cls",
 )
 _CLS_NUM_LABELS = AutoConfig.from_pretrained(TEST_CLASSIFICATION_BASE_MODEL).num_labels
+
+# Engines are shared across classes by config: score() is stateless and the
+# radix cache is off everywhere here, so booting the same config once per class
+# only cost wall time.
+#
+# The bound must stay strictly above the most engines any single class holds at
+# once (two, for the MIS vs non-MIS comparisons) -- otherwise eviction could
+# shut down an engine a live class still references through cls.engine.
+_MAX_LIVE_ENGINES = 3
+_ENGINE_CACHE = OrderedDict()
+
+
+def get_engine(**kwargs) -> Engine:
+    key = tuple(sorted(kwargs.items()))
+    engine = _ENGINE_CACHE.pop(key, None)
+    if engine is None:
+        while len(_ENGINE_CACHE) >= _MAX_LIVE_ENGINES:
+            _, evicted = _ENGINE_CACHE.popitem(last=False)
+            evicted.shutdown()
+            torch.cuda.empty_cache()
+        engine = Engine(**kwargs)
+    _ENGINE_CACHE[key] = engine
+    return engine
+
+
+def tearDownModule():
+    while _ENGINE_CACHE:
+        _, engine = _ENGINE_CACHE.popitem()
+        engine.shutdown()
+    torch.cuda.empty_cache()
 
 
 class TestMISServerArgsValidation(unittest.TestCase):
@@ -52,7 +83,7 @@ class TestMultiItemScoringOptimization(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.engine = Engine(
+        cls.engine = get_engine(
             model_path=TEST_MODEL_NAME,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -60,20 +91,12 @@ class TestMultiItemScoringOptimization(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-        cls.non_mis_engine = Engine(
+        cls.non_mis_engine = get_engine(
             model_path=TEST_MODEL_NAME,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.engine is not None:
-            cls.engine.shutdown()
-        if cls.non_mis_engine is not None:
-            cls.non_mis_engine.shutdown()
-        torch.cuda.empty_cache()
 
     def test_mis_basic(self):
         """Test basic MIS: correct shapes, valid probabilities."""
@@ -157,7 +180,7 @@ class TestMultiItemScoringClassification(CustomTestCase):
     def setUpClass(cls):
         # One engine for the whole class: score() is stateless and the radix
         # cache is off, so the per-method boot this used to do bought nothing.
-        cls.engine = Engine(
+        cls.engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -165,12 +188,6 @@ class TestMultiItemScoringClassification(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.engine is not None:
-            cls.engine.shutdown()
-            torch.cuda.empty_cache()
 
     def test_classification_mis_basic(self):
         """Classification MIS: correct shapes, valid softmax probabilities."""
@@ -207,23 +224,19 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     def test_classification_non_mis_fallback(self):
         """Classification model works correctly without --enable-mis."""
-        non_mis_engine = Engine(
+        non_mis_engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             mem_fraction_static=0.15,
         )
-        try:
-            scores = non_mis_engine.score(
-                query="Test:", items=["A", "B"], apply_softmax=True
-            ).scores
+        scores = non_mis_engine.score(
+            query="Test:", items=["A", "B"], apply_softmax=True
+        ).scores
 
-            self.assertEqual(len(scores), 2)
-            for score_list in scores:
-                self.assertEqual(len(score_list), self.NUM_LABELS)
-                self.assertAlmostEqual(sum(score_list), 1.0, places=5)
-        finally:
-            non_mis_engine.shutdown()
-            torch.cuda.empty_cache()
+        self.assertEqual(len(scores), 2)
+        for score_list in scores:
+            self.assertEqual(len(score_list), self.NUM_LABELS)
+            self.assertAlmostEqual(sum(score_list), 1.0, places=5)
 
 
 class TestMultiItemScoringParity(CustomTestCase):
@@ -231,29 +244,19 @@ class TestMultiItemScoringParity(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.engine_single = Engine(
+        cls.engine_single = get_engine(
             model_path=TEST_MODEL_NAME,
             disable_radix_cache=True,
-            log_level="error",
             mem_fraction_static=0.15,
         )
-        cls.engine_mis = Engine(
+        cls.engine_mis = get_engine(
             model_path=TEST_MODEL_NAME,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            log_level="error",
             enable_mis=True,
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.engine_single is not None:
-            cls.engine_single.shutdown()
-        if cls.engine_mis is not None:
-            cls.engine_mis.shutdown()
-        torch.cuda.empty_cache()
 
     def _compare_scores(
         self, query, items, label_token_ids=None, apply_softmax=True, test_name=""
@@ -336,7 +339,7 @@ class TestMultiItemScoringClassificationParity(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.engine = Engine(
+        cls.engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -344,12 +347,6 @@ class TestMultiItemScoringClassificationParity(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.engine is not None:
-            cls.engine.shutdown()
-        torch.cuda.empty_cache()
 
     def _compare_scores(self, query, items, apply_softmax=True, test_name=""):
         """Compare MIS batched vs MIS single-item scoring results."""
@@ -420,24 +417,20 @@ class TestMultiItemScoringClassificationMISvsNonMIS(CustomTestCase):
     """
 
     def test_mis_single_vs_non_mis(self):
-        non_mis_engine = Engine(
+        non_mis_engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             mem_fraction_static=0.15,
         )
-        try:
-            query = "Rate this option:"
-            items = [" Option A", " Option B", " Option C"]
-            non_mis_scores = non_mis_engine.score(
-                query=query,
-                items=items,
-                apply_softmax=True,
-            ).scores
-        finally:
-            non_mis_engine.shutdown()
-            torch.cuda.empty_cache()
+        query = "Rate this option:"
+        items = [" Option A", " Option B", " Option C"]
+        non_mis_scores = non_mis_engine.score(
+            query=query,
+            items=items,
+            apply_softmax=True,
+        ).scores
 
-        mis_engine = Engine(
+        mis_engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -445,15 +438,11 @@ class TestMultiItemScoringClassificationMISvsNonMIS(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-        try:
-            mis_scores = mis_engine.score(
-                query=query,
-                items=items,
-                apply_softmax=True,
-            ).scores
-        finally:
-            mis_engine.shutdown()
-            torch.cuda.empty_cache()
+        mis_scores = mis_engine.score(
+            query=query,
+            items=items,
+            apply_softmax=True,
+        ).scores
 
         self.assertEqual(len(mis_scores), len(non_mis_scores))
         for i, (ms, ns) in enumerate(zip(mis_scores, non_mis_scores)):
@@ -475,7 +464,7 @@ class TestMultiItemScoringClassificationAdvanced(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.engine = Engine(
+        cls.engine = get_engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
@@ -483,12 +472,6 @@ class TestMultiItemScoringClassificationAdvanced(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.engine is not None:
-            cls.engine.shutdown()
-        torch.cuda.empty_cache()
 
     def test_items_produce_distinct_scores(self):
         """Different items must produce different score vectors.
