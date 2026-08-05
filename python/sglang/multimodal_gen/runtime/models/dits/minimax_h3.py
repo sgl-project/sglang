@@ -8,7 +8,6 @@ contract accepts packed inference keyword arguments and returns packed logits.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import torch
@@ -37,7 +36,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -63,19 +61,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_NPU_KERNEL_CHOICES = frozenset({"none", "rope", "swiglu", "gate", "all"})
-_NPU_KERNEL_MODE = (
-    os.getenv("SGLANG_MINIMAX_H3_USE_NPU_KERNELS", "all").strip().lower()
-)
-if _NPU_KERNEL_MODE not in _NPU_KERNEL_CHOICES:
-    raise ValueError(
-        "SGLANG_MINIMAX_H3_USE_NPU_KERNELS must be one of: "
-        + ", ".join(sorted(_NPU_KERNEL_CHOICES))
-    )
-
-
-def _npu_kernel_enabled(name: str) -> bool:
-    return _NPU_KERNEL_MODE == "all" or _NPU_KERNEL_MODE == name
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -287,10 +272,7 @@ def _modulate_gate(
         and other.is_contiguous()
     ):
         return indexed_gate_bf16_(x, gate, other, indices)
-    selected_gate = gate.index_select(0, indices)
-    if current_platform.is_npu() and not _npu_kernel_enabled("gate"):
-        return (x + selected_gate * other).to(dtype)
-    return torch.addcmul(x, selected_gate, other).to(dtype)
+    return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
@@ -394,21 +376,6 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if current_platform.is_npu() and _npu_kernel_enabled("rope"):
-        from sglang.kernels.ops.diffusion.triton.npu_fallback import (
-            apply_rotary_embedding_native,
-        )
-
-        half = cos_sin_cache.shape[-1] // 2
-        cos, sin = cos_sin_cache.split(half, dim=-1)
-        rot_dim = half * 2
-        q_rot = apply_rotary_embedding_native(q[..., :rot_dim].contiguous(), cos, sin)
-        k_rot = apply_rotary_embedding_native(k[..., :rot_dim].contiguous(), cos, sin)
-        return (
-            torch.cat((q_rot, q[..., rot_dim:]), dim=-1),
-            torch.cat((k_rot, k[..., rot_dim:]), dim=-1),
-        )
-
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
         cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
@@ -772,15 +739,11 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
-        self.act_fn = SiluAndMul()
         self.reuse_fc1_activation = quant_config is None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        if current_platform.is_npu() and _npu_kernel_enabled("swiglu"):
-            hidden = self.act_fn(hidden)
-        else:
-            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
