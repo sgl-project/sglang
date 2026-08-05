@@ -142,6 +142,40 @@ spec:
       securityContext:
         seLinuxOptions:
           type: spc_t
+      initContainers:
+        - name: model-stager
+          image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [/bin/bash, -lc]
+          env:
+            - name: SOURCE_MODEL
+              value: /checkpoint-archive/world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+            - name: CACHED_MODEL
+              value: /model-cache/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+          args:
+            - |
+              set -euo pipefail
+              exec 9>/var/run/minwm-startup-lock/model-cache.lock
+              flock -x 9
+              if [[ ! -f "${CACHED_MODEL}/_READY" ]]; then
+                staging="${CACHED_MODEL}.staging.$$"
+                rm -rf "${staging}"
+                mkdir -p "$(dirname "${CACHED_MODEL}")"
+                cp -av "${SOURCE_MODEL}" "${staging}"
+                test -f "${staging}/_READY"
+                test -f "${staging}/model_index.json"
+                test -d "${staging}/transformer"
+                rm -rf "${CACHED_MODEL}"
+                mv "${staging}" "${CACHED_MODEL}"
+              fi
+              flock -u 9
+          resources:
+            requests: {cpu: "2", memory: 2Gi, ephemeral-storage: 1Gi}
+            limits: {cpu: "4", memory: 4Gi, ephemeral-storage: 2Gi}
+          volumeMounts:
+            - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}
+            - {name: model-cache, mountPath: /model-cache}
+            - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
       containers:
         - name: denoiser
           image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
@@ -154,7 +188,7 @@ spec:
             - name: REALTIME_UI_CONFIG_JSON
               value: '{"generationModes":["i2v","t2v"],"defaultGenerationMode":"i2v","t2vFrameStep":4,"t2vDefaultNumFrames":121}'
             - name: MINWM_MODEL
-              value: /checkpoint-archive/world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
+              value: /model-cache/wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model
             - {name: TAEHV_CHECKPOINT_PATH, value: /opt/taehv/taew2_2.pth}
             - {name: MINWM_ATTENTION_IMPL, value: packed}
             - {name: MINWM_PACKED_ATTENTION_DETERMINISTIC, value: "false"}
@@ -243,7 +277,7 @@ spec:
               ephemeral-storage: 32Gi
               nvidia.com/gpu: "1"
           volumeMounts:
-            - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}
+            - {name: model-cache, mountPath: /model-cache, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
             - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
         - name: denoiser-heartbeat
@@ -284,4 +318,8 @@ spec:
         - name: startup-lock
           hostPath:
             path: /var/run/minwm-startup-lock
+            type: DirectoryOrCreate
+        - name: model-cache
+          hostPath:
+            path: /var/lib/minwm-model-cache
             type: DirectoryOrCreate

@@ -145,15 +145,20 @@ def test_west_model_artifact_uses_a_matching_read_only_s3_mount():
     deployment = find(documents, "StatefulSet", "minwm-async-denoiser")
     pod_spec = deployment["spec"]["template"]["spec"]
     container = pod_spec["containers"][0]
+    stager = pod_spec["initContainers"][0]
     model = next(
         entry["value"]
         for entry in container["env"]
         if entry["name"] == "MINWM_MODEL"
     )
-    assert model.startswith("/checkpoint-archive/")
+    assert model.startswith("/model-cache/")
+    assert any(
+        mount["name"] == "model-cache" and mount["readOnly"]
+        for mount in container["volumeMounts"]
+    )
     assert any(
         mount["name"] == "checkpoint-archive" and mount["readOnly"]
-        for mount in container["volumeMounts"]
+        for mount in stager["volumeMounts"]
     )
     assert any(
         item["name"] == "checkpoint-archive"
@@ -172,7 +177,7 @@ def test_runtime_uses_one_owned_read_only_s3_claim_and_preconverted_model():
     command = " ".join(container["args"])
 
     assert env["MINWM_MODEL"] == (
-        "/checkpoint-archive/world-model/minwm/serving-artifacts/"
+        "/model-cache/"
         "wan22-5b-stage3-dmd-30-gs1800/REPLACE_WITH_MODEL_ARTIFACT_REVISION/model"
     )
     assert "MINWM_CHECKPOINT" not in env
@@ -189,6 +194,31 @@ def test_runtime_uses_one_owned_read_only_s3_claim_and_preconverted_model():
     }
     assert claims == {"minwm-async-west-s3"}
     assert all(mount["name"] != "s3" for mount in container["volumeMounts"])
+
+
+def test_model_is_staged_once_per_spot_node_before_workers_mmap_it():
+    workload = find(
+        load_documents(("h100-denoiser.yaml",)),
+        "StatefulSet",
+        "minwm-async-denoiser",
+    )
+    pod_spec = workload["spec"]["template"]["spec"]
+    stager = pod_spec["initContainers"][0]
+    command = " ".join(stager["args"])
+    env = {item["name"]: item["value"] for item in stager["env"]}
+
+    assert stager["name"] == "model-stager"
+    assert env["SOURCE_MODEL"].startswith("/checkpoint-archive/")
+    assert env["CACHED_MODEL"].startswith("/model-cache/")
+    assert "flock -x 9" in command
+    assert "cp -av" in command
+    assert ".staging.$$" in command
+    assert 'mv "${staging}" "${CACHED_MODEL}"' in command
+    cache = next(volume for volume in pod_spec["volumes"] if volume["name"] == "model-cache")
+    assert cache["hostPath"] == {
+        "path": "/var/lib/minwm-model-cache",
+        "type": "DirectoryOrCreate",
+    }
 
 
 def test_production_resources_are_isolated_in_a_dedicated_namespace():
