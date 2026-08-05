@@ -11,6 +11,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
 )
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    EagleDraftWorkerBase,
+)
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -35,6 +39,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        EagleDraftWorkerBase.__init__(self)
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -109,15 +115,17 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_lm_head()
 
     def init_attention_backends(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_attention_backends()
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_cuda_graphs()
 
     def init_lm_head(self):
@@ -137,6 +145,8 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        BaseSpecWorker.__init__(self)
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk

@@ -22,14 +22,15 @@ from torch import nn
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=5,
+    stage="base-b",
+    runner_config="1-gpu-small",
+    disabled="refactor-fragile source-parsing unit test; skipped on CI",
+)
 
 # Skipped on CI: these hermetic checks AST-extract LoRAManager methods and re-run
 # them in a stubbed namespace, so they break whenever the manager's internal
-# call graph changes. Skip until they are rebuilt against a stable seam.
-pytestmark = pytest.mark.skip(
-    reason="refactor-fragile source-parsing unit test; skipped on CI"
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LORA_LAYERS_PATH = REPO_ROOT / "python/sglang/srt/lora/layers.py"

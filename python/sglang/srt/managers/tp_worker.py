@@ -46,6 +46,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.graph_memory_usage import (
+    merge_graph_memory_usage,
+    merge_graph_time_usage,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import get_exec, get_model, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
@@ -96,6 +100,23 @@ class BaseTpWorker(ABC):
             self.model_runner.full_max_total_num_tokens,
             self.model_runner.swa_max_total_num_tokens,
         )
+
+    @property
+    def graph_memory_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_memory_usage(
+            *(runner.graph_memory_usage for runner in runners)
+        )
+
+    @property
+    def graph_time_usage(self) -> dict[str, float]:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
+
+    @property
+    def weight_load_time(self) -> float:
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.weight_load_time for runner in runners)
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
