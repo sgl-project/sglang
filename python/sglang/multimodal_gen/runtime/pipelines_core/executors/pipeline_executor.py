@@ -205,8 +205,7 @@ class PipelineExecutor(ABC):
         if server_args.use_fsdp_inference:
             return True
 
-        stage_name = stage._component_stage_name()
-        for use in stage.component_uses(server_args, stage_name):
+        for use in stage.component_uses(server_args):
             component_name = use.component_name
             if server_args.dit_cpu_offload and component_name in (
                 "transformer",
