@@ -817,7 +817,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--dcp-size 8",
-        "--disable-custom-all-reduce",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",

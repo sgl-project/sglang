@@ -523,6 +523,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         cap_layout.verify_lens.copy_(live.verify_lens)
         cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
 
+    @staticmethod
+    def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
+        request_counts = forward_batch.original_global_num_tokens_cpu
+        if request_counts is None:
+            raise RuntimeError(
+                "DP CUDA graph replay requires raw per-rank request counts"
+            )
+        return max(request_counts)
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -550,9 +559,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         if self.require_mlp_tp_gather:
-            # Raw sync values are per-rank request counts on decode-family
-            # rounds -- no width division, no per-algorithm enumeration.
-            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
+            cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
 
@@ -1103,15 +1110,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
-                max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-                max_batch_size = (
-                    max_num_tokens / self.captured_req_width
-                    if self.model_runner.spec_algorithm.is_eagle()
-                    or self.model_runner.spec_algorithm.is_standalone()
-                    or self.model_runner.spec_algorithm.is_dflash_family()
-                    else max_num_tokens
-                )
-                bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+                max_batch_size = self._max_dp_batch_size(forward_batch)
+                bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
                 bs = self._pad_to_bucket(raw_bs, self.capture_bs)
             padded_num_tokens = bs * self.captured_req_width
