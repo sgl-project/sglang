@@ -289,6 +289,7 @@ class ServerArgs(DisaggServerArgsMixin):
     realtime_admission_wait_s: float = 10.0
     realtime_session_lease_table: str | None = None
     realtime_require_authenticated_user: bool = False
+    realtime_remote_vae_enabled: bool = False
     realtime_vae_worker_url: str | None = None
     realtime_vae_timeout_s: float = 10.0
     realtime_vae_max_message_mb: int = 64
@@ -1633,6 +1634,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Require an authenticated ASGI principal for realtime admission; "
                 "query/header user IDs are ignored in this mode."
+            ),
+        )
+        parser.add_argument(
+            "--realtime-remote-vae-enabled",
+            action="store_true",
+            default=ServerArgs.realtime_remote_vae_enabled,
+            help=(
+                "Build the realtime pipeline with a latent handoff stage. The "
+                "Gateway may still supply the remote VAE endpoint per session."
             ),
         )
         parser.add_argument(

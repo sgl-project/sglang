@@ -76,8 +76,20 @@ def test_handoff_prepends_i2v_reference_only_for_first_chunk():
 
 def test_minwm_pipeline_remote_vae_is_feature_flagged():
     assert not _use_remote_realtime_vae(
-        SimpleNamespace(realtime_vae_worker_url=None)
+        SimpleNamespace(
+            realtime_vae_worker_url=None,
+            realtime_remote_vae_enabled=False,
+        )
     )
     assert _use_remote_realtime_vae(
-        SimpleNamespace(realtime_vae_worker_url="ws://vae:18081/v1/realtime_vae/decode")
+        SimpleNamespace(
+            realtime_vae_worker_url="ws://vae:18081/v1/realtime_vae/decode",
+            realtime_remote_vae_enabled=False,
+        )
+    )
+    assert _use_remote_realtime_vae(
+        SimpleNamespace(
+            realtime_vae_worker_url=None,
+            realtime_remote_vae_enabled=True,
+        )
     )

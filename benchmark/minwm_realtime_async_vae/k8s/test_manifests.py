@@ -121,6 +121,18 @@ def test_vae_pipeline_keeps_one_waiting_latent_and_streams_single_frames():
     assert "--encoded-frames-per-batch=1" in args
 
 
+def test_denoiser_enables_dynamic_remote_vae_handoff_without_a_static_worker_url():
+    workload = find(
+        load_documents(("h100-denoiser.yaml",)),
+        "StatefulSet",
+        "minwm-async-denoiser",
+    )
+    command = " ".join(_container(workload, "denoiser")["args"])
+
+    assert "--realtime-remote-vae-enabled" in command
+    assert "--realtime-vae-worker-url" not in command
+
+
 def test_wan22_5b_uses_the_matching_taehv_checkpoint():
     for filename in ("h100-denoiser.yaml", "l4-vae.yaml"):
         manifest = (Path(__file__).parent / filename).read_text()
