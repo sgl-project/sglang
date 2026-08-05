@@ -190,7 +190,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank and not getattr(config, "language_only", False):
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -421,6 +421,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 ):
                     all_embeds.append(pv.to(self.language_model.device))
                     continue
+                if isinstance(vt, PPMissingLayer):
+                    raise ValueError(
+                        "Gemma 4 language-only mode requires precomputed image "
+                        "embeddings; local multimodal fallback is unavailable."
+                    )
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
                     raise ValueError(
@@ -484,6 +489,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 ):
                     all_embeds.append(pv.to(self.language_model.device))
                     continue
+                if isinstance(vt, PPMissingLayer):
+                    raise ValueError(
+                        "Gemma 4 language-only mode requires precomputed video "
+                        "embeddings; local multimodal fallback is unavailable."
+                    )
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
                     raise ValueError(
