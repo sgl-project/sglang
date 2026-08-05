@@ -511,7 +511,7 @@ jobs:
       timeout_per_file: '1800'
       # aarch64 has no prebuild, so this stage compiles during install - which also
       # makes it the only stage still covering that path. Keep it that way.
-      rust_ext_artifact: ''
+      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   base-c-test-8-gpu-b300:
