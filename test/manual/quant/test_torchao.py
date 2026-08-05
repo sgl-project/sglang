@@ -1,9 +1,9 @@
 import unittest
 
 import requests
+from transformers import AutoProcessor
 
 from sglang import Engine
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    build_vlm_image_prompt,
     is_in_amd_ci,
     popen_launch_server,
 )
@@ -72,8 +73,9 @@ class TestTorchAO(CustomTestCase, MMLUMixin):
 class TestTorchAOForVLM(CustomTestCase):
     def test_vlm_generate(self):
         model_path = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
-        chat_template = get_chat_template_by_model_path(model_path)
-        text = f"{chat_template.image_token}What is in this picture? Answer: "
+        text = build_vlm_image_prompt(
+            AutoProcessor.from_pretrained(model_path), "What is in this picture?"
+        )
 
         engine = Engine(
             model_path=model_path,

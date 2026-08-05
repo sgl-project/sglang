@@ -337,6 +337,10 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def set_hash(self, hash_value: int) -> None:
+        self.hash = hash_value
+        self.pad_value = _compute_pad_value(hash_value)
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -1975,6 +1979,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
+    after_idle_gap: bool = False
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
@@ -3197,6 +3202,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
+            after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
         )
 

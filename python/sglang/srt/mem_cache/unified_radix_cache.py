@@ -213,7 +213,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
-        logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+        logger.info(
+            f"Init Unified Radix Cache. Components: {self.tree_components}. "
+            f"Tree Core: {type(self.tree_core).__name__}"
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -310,17 +313,6 @@ class UnifiedRadixCache(BasePrefixCache):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
-
-        # Direct IO layout fixup (must happen before pool creation)
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
 
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
@@ -2202,4 +2194,4 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
-        return self.tree_core.root_node.id
+        return self.tree_core.root_node_handle(extra_key)
