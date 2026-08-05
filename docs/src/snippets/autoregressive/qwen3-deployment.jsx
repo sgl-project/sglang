@@ -120,7 +120,6 @@ export const Qwen3Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        
         { id: 'xeon', label: 'XEON', default: false },
         { id: 'Arc B', label: 'BMG', default: false },
       ]
