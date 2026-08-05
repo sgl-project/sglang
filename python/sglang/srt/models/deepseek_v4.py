@@ -92,6 +92,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_finish,
+    cp_all_gather_rerange_launch,
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
@@ -994,6 +996,15 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        # kv_score depends only on x, so its CP all-gather can start before the
+        # projections and be collected inside forward_core_compressor below --
+        # the projections are what hides it. No-op unless the CP+TBO path armed
+        # _cp_prefetch_comm_stream.
+        if self.compressor is not None:
+            self.compressor.prelaunch_kv_score(x, forward_batch)
+            if self.indexer is not None:
+                self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
+
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1003,6 +1014,8 @@ class MQALayer(MqaAttentionBase):
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
+        kv_handle = None
+        sub_index = getattr(forward_batch, "tbo_subbatch_index", 0)
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1126,12 +1139,26 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
-                        kv.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
+                    comm_stream = getattr(
+                        forward_batch, "_cp_prefetch_comm_stream", None
                     )
+                    if comm_stream is not None:
+                        # kv is not read again until this function returns, so the
+                        # indexer + compressor below can run while it gathers.
+                        kv_handle = cp_all_gather_rerange_launch(
+                            kv,
+                            self.cp_size,
+                            comm_stream,
+                            ("kv", self.layer_id, sub_index),
+                        )
+                        kv = None
+                    else:
+                        kv = cp_all_gather_rerange_output(
+                            kv.contiguous(),
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -1169,6 +1196,17 @@ class MQALayer(MqaAttentionBase):
                 self.layer_id,
                 self.compressor,
             )
+
+        if kv_handle is not None:
+            kv = cp_all_gather_rerange_finish(kv_handle)
+
+        # A prelaunched gather whose consumer was skipped still has to be waited:
+        # dropping the handle would let the allocator recycle buffers the comm
+        # stream is still reading.
+        pending = getattr(forward_batch, "_cp_pending_gathers", None)
+        if pending:
+            for key in [k for k in pending if k[1] == self.layer_id]:
+                cp_all_gather_rerange_finish(pending.pop(key))
 
         return q, kv
 
@@ -2470,13 +2508,12 @@ class DeepseekV4Model(nn.Module):
 
         attn_backend = get_attn_backend()
         children = forward_batch.tbo_children
-        # A/B knob: route the compressor kv_score all-gather to the comm stream
-        # (the MoE collectives already live there) instead of the compute stream.
-        kv_score_comm_stream = (
-            get_dp_tbo_comm_stream()
-            if envs.SGLANG_OPT_CP_TBO_KV_SCORE_COMM_STREAM.get()
-            else None
-        )
+        # Attention-side CP gathers run two-phase (launch early on the comm
+        # stream / collect right before their consumer). Only the MoE
+        # collectives are splittable across a YieldOperation, so without this the
+        # ~2.5 attention-side collectives per layer would stay on the compute
+        # stream and defeat most of TBO's overlap.
+        prefetch_comm_stream = get_dp_tbo_comm_stream()
 
         inputs_arr = []
         for idx, child in enumerate(children):
@@ -2496,7 +2533,7 @@ class DeepseekV4Model(nn.Module):
                 child, child_inputs["positions"]
             )
             child._cp_moe_input_ids = cp_round_robin_input_ids(child.input_ids)
-            child._cp_kv_score_comm_stream = kv_score_comm_stream
+            child._cp_prefetch_comm_stream = prefetch_comm_stream
             inputs_arr.append(child_inputs)
 
         outputs_arr = execute_overlapped_operations(

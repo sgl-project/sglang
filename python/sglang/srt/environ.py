@@ -1034,11 +1034,12 @@ class Envs:
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
-    # DSA prefill CP + TBO (HIP only): run the compressor kv_score all-gather on
-    # the TBO comm stream instead of the compute stream. A/B knob -- it trades
-    # exposed compute-stream time for queueing behind the MoE collectives that
-    # already own that stream, so it is not a clear win; measure before enabling.
-    SGLANG_OPT_CP_TBO_KV_SCORE_COMM_STREAM = EnvBool(False)
+    # DSA prefill CP + TBO (HIP only): issue the attention-side CP all-gathers
+    # (kv_score, unified_kv KV) early and collect them right before their
+    # consumer, so the q/kv projections and the indexer/compressor hide them.
+    # Unlike the flag above this actually creates overlap -- there is real
+    # compute between the launch and the wait.
+    SGLANG_OPT_CP_TBO_ATTN_GATHER_PREFETCH = EnvBool(False)
     # ====================================================================
 
     # ====================================================================
