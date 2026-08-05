@@ -67,6 +67,14 @@ _MPS_MLP_TOKEN_CHUNK_SIZE = 256
 _MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 256
 _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 192
 
+_MPS_EMBED_WEIGHT_PREFIXES = (
+    "condition_proj",
+    "video_patch_proj",
+    "audio_patch_proj",
+    "time_embedder",
+    "token_refiner.final_norm",
+)
+
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
     "video_patch_proj.bias",
@@ -1188,6 +1196,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # parameters mix fp32 (patch projections, timestep embedder, and output
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
+    mps_stream_non_layer_weights = True
     _compile_conditions = _ARCH_DEFAULTS._compile_conditions
     _supported_attention_backends = _ARCH_DEFAULTS._supported_attention_backends
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
@@ -1411,6 +1420,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         device: torch.device,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
+        self.materialize_mps_non_layer_weights(
+            "condition_proj", "token_refiner.final_norm"
+        )
         text_len = int(refiner_cu_seqlens[1].item())
         if text_len <= 0 or text_len > int(prompt_embeds.shape[0]):
             raise ValueError(
@@ -1426,12 +1438,14 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         )
         text_embed, _ = self.condition_proj(text_rows)
-        return self.token_refiner(
+        refined = self.token_refiner(
             text_embed,
             cu_seqlens=true_refiner_cu,
             cu_seqlens_host=(0, text_len, text_len),
             max_seqlen=text_len,
         )
+        self.release_mps_non_layer_weights("condition_proj", "token_refiner.final_norm")
+        return refined
 
     def build_rope_cache(
         self,
@@ -1440,6 +1454,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build request-static RoPE inputs for this Ulysses rank."""
+        self.materialize_mps_non_layer_weights("rope")
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(
                 "img_position_ids must be [1, S, 3], got "
@@ -1456,7 +1471,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope_freqs = self.rope(
             img_position_ids[:, row_start : row_start + local_seq_len]
         ).to(device)
-        return (
+        result = (
             _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
             torch.arange(
                 local_seq_len,
@@ -1464,6 +1479,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 dtype=torch.long,
             ),
         )
+        self.release_mps_non_layer_weights("rope")
+        return result
 
     @eager_on_graph(True)
     def _embed(
@@ -1731,6 +1748,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # request-static cache once; direct model callers use this fallback.
         rope_cache = kwargs.get("rope_cache")
         if rope_cache is None:
+            self.materialize_mps_non_layer_weights("rope")
             rope_freqs = self.rope(img_position_ids[:, row_start:row_stop]).to(device)
             rope_cache = (
                 _rope_cos_sin_cache(rope_freqs, dtype=_BF16_DTYPE),
@@ -1740,6 +1758,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     dtype=torch.long,
                 ),
             )
+            self.release_mps_non_layer_weights("rope")
+        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -1760,6 +1780,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
+        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks
         adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
         inverse_indices = inverse_indices.to(device)
@@ -1812,11 +1833,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),
             )
+        self.materialize_mps_non_layer_weights("final_layer")
         video_logits, audio_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,
             inverse_indices=block_inverse,
         )
+        self.release_mps_non_layer_weights("final_layer")
         if sp_ws > 1:
             from sglang.multimodal_gen.runtime.distributed.parallel_state import (
                 get_sp_group,

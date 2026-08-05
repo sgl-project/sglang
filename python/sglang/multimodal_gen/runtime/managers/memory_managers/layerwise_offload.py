@@ -725,6 +725,9 @@ class LayerwiseOffloadableModuleMixin:
 
     # whether the current module is selected by the `dit` group
     layerwise_offload_dit_group_enabled: bool = True
+    # H3 has a large packed-sequence working set on MPS, so its non-block
+    # weights are materialized only for the subphase that consumes them
+    mps_stream_non_layer_weights: bool = False
 
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
@@ -745,6 +748,71 @@ class LayerwiseOffloadableModuleMixin:
         self._mps_cpu_buffers = {
             name: buffer.detach() for name, buffer in self.named_buffers()
         }
+        if not self.mps_stream_non_layer_weights:
+            return
+
+        parameters = dict(self.named_parameters())
+        for name, tensor in self._mps_cpu_non_layer_parameters.items():
+            parameters[name].data = torch.empty(
+                (1,),
+                dtype=tensor.dtype,
+                device=current_platform.get_local_torch_device(),
+            )
+        buffers = dict(self.named_buffers())
+        for name, tensor in self._mps_cpu_buffers.items():
+            buffers[name].data = torch.empty(
+                (1,),
+                dtype=tensor.dtype,
+                device=current_platform.get_local_torch_device(),
+            )
+
+    @staticmethod
+    def _matches_mps_weight_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+        return any(
+            name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes
+        )
+
+    def materialize_mps_non_layer_weights(self, *prefixes: str) -> None:
+        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+            return
+        selected_prefixes = tuple(prefixes)
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    parameters[name].data = tensor.to(
+                        current_platform.get_local_torch_device()
+                    )
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    buffers[name].data = tensor.to(
+                        current_platform.get_local_torch_device()
+                    )
+
+    def release_mps_non_layer_weights(self, *prefixes: str) -> None:
+        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+            return
+        selected_prefixes = tuple(prefixes)
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    parameters[name].data = torch.empty(
+                        (1,),
+                        dtype=tensor.dtype,
+                        device=current_platform.get_local_torch_device(),
+                    )
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    buffers[name].data = torch.empty(
+                        (1,),
+                        dtype=tensor.dtype,
+                        device=current_platform.get_local_torch_device(),
+                    )
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
 
     def restore_mps_cpu_non_layer_weights(self) -> None:
         if not current_platform.is_mps():

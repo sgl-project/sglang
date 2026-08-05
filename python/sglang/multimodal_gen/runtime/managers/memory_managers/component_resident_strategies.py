@@ -492,6 +492,8 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     def enter(self, module: nn.Module) -> None:
         if isinstance(module, LayerwiseOffloadableModuleMixin):
             if current_platform.is_mps():
+                if module.mps_stream_non_layer_weights:
+                    return
                 module.to(get_local_torch_device())
                 return
             module.prepare_for_next_req()
