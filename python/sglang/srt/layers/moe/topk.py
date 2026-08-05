@@ -503,15 +503,10 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        self.topk_config.torch_native = True
         output_format = self._get_output_format()
-        if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
-                router_logits,
-                self.topk_config.top_k,
-                sm_first=not self.topk_config.renormalize,
-            )
-            return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+        # Quantized runners consume the bypass carrier directly; the native
+        # unquantized fallback materializes it before using routing tensors.
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -520,7 +515,6 @@ class TopK(MultiPlatformOp):
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
-        self.topk_config.torch_native = True
         topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
