@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,62 @@ elif _is_cpu:
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+
+
+def _get_npu_mtp_sampling_ops(
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    accept_index: torch.Tensor,
+    tree_topk: int,
+    use_rejection_sampling: bool,
+) -> Tuple[Callable, Callable]:
+    """Validate the NPU topology and return backend-specific sampling ops."""
+    if tree_topk < 1 or candidates.ndim != 2:
+        is_supported = False
+    else:
+        batch_size, num_draft_tokens = candidates.shape
+        is_supported = (
+            retrieve_index.shape == candidates.shape
+            and retrieve_next_token.shape == candidates.shape
+            and retrieve_next_sibling.shape == candidates.shape
+            and accept_index.ndim == 2
+            and accept_index.shape[0] == batch_size
+            and 1 <= accept_index.shape[1] <= num_draft_tokens
+            and (
+                not use_rejection_sampling
+                or (tree_topk == 1 and accept_index.shape == candidates.shape)
+            )
+        )
+
+    if not is_supported:
+        raise ValueError(
+            "NPU non-greedy speculative sampling cannot consume this draft "
+            "topology. "
+            "Target-only sampling supports regular EAGLE trees with "
+            "tree_topk >= 1, while classic rejection sampling requires a "
+            "tree_topk=1 linear chain."
+        )
+
+    try:
+        from sgl_kernel_npu.sample import (
+            chain_speculative_sampling_rejection,
+            top_k_top_p_renorm_probs,
+            tree_speculative_sampling_target_only,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "NPU non-greedy speculative sampling requires the matching "
+            "sgl-kernel-npu sampling kernels."
+        ) from exc
+
+    sampling_fn = (
+        chain_speculative_sampling_rejection
+        if use_rejection_sampling
+        else tree_speculative_sampling_target_only
+    )
+    return top_k_top_p_renorm_probs, sampling_fn
 
 
 def per_step_draft_out_cache_loc(
@@ -737,58 +793,81 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
-    elif _is_npu:
-        from sglang.srt.hardware_backend.npu.speculative.mtp_sampling import (
-            npu_mtp_non_greedy_sample,
-        )
-
-        predict, accept_index, num_correct_drafts = npu_mtp_non_greedy_sample(
-            next_token_logits=next_token_logits,
-            sampling_info=sampling_info,
-            verify_input=verify_input,
-            candidates=candidates,
-            predict=predict,
-            accept_index=accept_index,
-            accept_token_num=num_correct_drafts,
-        )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        from sglang.kernels.ops.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
-
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+
+        if _is_npu:
+            top_k_top_p_renorm_probs, sampling_fn = _get_npu_mtp_sampling_ops(
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                accept_index=accept_index,
+                tree_topk=verify_input.tree_topk,
+                use_rejection_sampling=use_rejection_sampling,
+            )
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
+
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
+
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if use_rejection_sampling
+                else tree_speculative_sampling_target_only
+            )
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
+        sampling_logits = next_token_logits.float() if _is_npu else next_token_logits
         target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+            sampling_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
+
+        if _is_npu:
+            target_probs = top_k_top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, verify_input.draft_token_num, dim=0
                 ),
+                sampling_info.need_top_k_sampling,
+                sampling_info.need_top_p_sampling,
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after renorm")
+        else:
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -807,6 +886,10 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
+        if _is_npu:
+            target_probs = target_probs.contiguous()
+            draft_probs = draft_probs.float().contiguous()
+
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
             seq_lens=batch.seq_lens,
@@ -815,11 +898,6 @@ def eagle_sample(
             device=device,
         )
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
