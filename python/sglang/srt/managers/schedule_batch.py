@@ -1580,6 +1580,18 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _cap_finished_len_at_max_new_tokens(self) -> None:
+        """Demote a stop matched beyond the length budget to a length finish.
+
+        Speculative decoding can accept a run that both crosses
+        ``max_new_tokens`` and contains a stop; a stop located past the cap
+        must not extend the emitted output beyond the cap.
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if self.finished_len is not None and self.finished_len > max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -1589,26 +1601,33 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
-        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
-            self.finished_len = self.sampling_params.max_new_tokens
-            return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
         if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
             return
 
         # Stop string beats EOS/stop-token matched in the same step (speculative
         # decoding can accept >1 token): token-based would trim only the last
         # token and leak the stop string.
         if self._check_str_based_finish(new_accepted_len):
+            self._cap_finished_len_at_max_new_tokens()
             return
 
+        # Stop token/EOS beats the length cap for the same reason: a spec accept
+        # run can cross max_new_tokens in the very step the EOS lands, and a
+        # length-first finish would keep the over-accepted tokens after the EOS
+        # (up to the cap) in the emitted output.
         if self._check_token_based_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         if self.grammar is not None and self.grammar.is_terminated():
