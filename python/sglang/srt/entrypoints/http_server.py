@@ -961,6 +961,33 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.post("/v1/kvflow/update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def kvflow_update(request: Request):
+    """Update per-agent steps_to_execution for KVFlow workflow-aware eviction.
+
+    Body: {"agent_updates": {"agent_id": steps_to_execution, ...}}
+    """
+    try:
+        body = await request.json()
+        agent_updates = body.get("agent_updates", {})
+        if not isinstance(agent_updates, dict):
+            return ORJSONResponse(
+                {"success": False, "message": "agent_updates must be a dict"},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+    except Exception as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    ret = await _global_state.tokenizer_manager.kvflow_update(agent_updates)
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.post("/add_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def add_external_corpus(request: Request):

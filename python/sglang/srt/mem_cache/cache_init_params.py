@@ -49,6 +49,10 @@ class CacheInitParams:
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
 
+    # KVFlow workflow-aware eviction (arXiv:2507.07400)
+    enable_kvflow_eviction: bool = False
+    kvflow_hold_step: int = 4
+
     tree_components: Optional[tuple[ComponentType, ...]] = None
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
