@@ -484,7 +484,7 @@ jobs:
             /bin/bash -lc '
               set -exo pipefail
               source /opt/intel/oneapi/setvars.sh --force
-              python scripts/build_wheel.py
+              python scripts/build_rel_wheel.py
               ls -lh dist
             '
           mkdir -p python/sglang/kernels/aot/dist
