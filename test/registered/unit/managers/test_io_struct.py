@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -702,6 +702,33 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
+
+
+class TestEmbeddingReqInputNormalization(CustomTestCase):
+    """Test the normalization of EmbeddingReqInput for batch processing."""
+
+    def test_getitem_preserves_priority(self):
+        """Batch embedding subrequests must keep request priority."""
+        req = EmbeddingReqInput(
+            text=["Hello", "World"],
+            priority=7,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].priority, 7)
+        self.assertEqual(req[1].priority, 7)
+
+    def test_getitem_preserves_priority_for_cross_encoder(self):
+        """Cross-encoder embedding subrequests must keep request priority."""
+        req = EmbeddingReqInput(
+            text=[["query 1", "document 1"], ["query 2", "document 2"]],
+            priority=7,
+            is_cross_encoder_request=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].priority, 7)
+        self.assertEqual(req[1].priority, 7)
 
 
 if __name__ == "__main__":
