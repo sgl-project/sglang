@@ -45,6 +45,7 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
         prefetch_size: int = 1,
         resident_layers: int = 0,
+        initialize: bool = True,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -111,6 +112,10 @@ class LayerwiseOffloadManager:
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
+        if initialize:
+            self._initialize()
+
+    def initialize(self) -> None:
         self._initialize()
 
     def _match_layer_idx(self, name: str) -> int | None:
@@ -305,14 +310,9 @@ class LayerwiseOffloadManager:
                 tensor, cpu_tensor.dtype
             )
 
-        torch.get_device_module().empty_cache()
-        self.model.to(self.device)
-        self.prepare_for_next_req(non_blocking=False)
+        torch.mps.empty_cache()
         self.register_forward_hooks()
         self._configured = True
-        self.release_all()
-        self.model.to("cpu")
-        torch.mps.empty_cache()
         logger.info(
             f"Initialized synchronous MPS layerwise offload with {self.num_layers} layers"
         )
@@ -722,6 +722,33 @@ class LayerwiseOffloadableModuleMixin:
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
+    def _capture_mps_cpu_non_layer_weights(self) -> None:
+        managed_names = {
+            name
+            for manager in self.layerwise_offload_managers
+            for weights in manager._mps_cpu_weights.values()
+            for name in weights
+        }
+        self._mps_cpu_non_layer_parameters = {
+            name: parameter.detach()
+            for name, parameter in self.named_parameters()
+            if name not in managed_names
+        }
+        self._mps_cpu_buffers = {
+            name: buffer.detach() for name, buffer in self.named_buffers()
+        }
+
+    def restore_mps_cpu_non_layer_weights(self) -> None:
+        if not current_platform.is_mps():
+            return
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                parameters[name].data = tensor
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                buffers[name].data = tensor
+
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
         named_modules = dict(self.named_modules())
@@ -764,9 +791,15 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
+                initialize=not current_platform.is_mps(),
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
+
+        if current_platform.is_mps():
+            for manager in self.layerwise_offload_managers:
+                manager.initialize()
+            self._capture_mps_cpu_non_layer_weights()
 
         if configured_layer_names:
             logger.info(
