@@ -69,10 +69,11 @@ def _make_inputs(seq_lens, num_heads):
         g=torch.randn(
             1, total_tokens, num_heads, K, device="cuda", dtype=torch.bfloat16
         ).contiguous(),
-        # SGLang ordinary extend passes post-sigmoid beta to its kernel backend.
-        beta=(torch.rand(1, total_tokens, num_heads, device="cuda") * 0.8 + 0.1)
-        .to(torch.bfloat16)
-        .contiguous(),
+        # SGLang ordinary extend passes post-sigmoid FP32 beta to its kernel
+        # backend (Kimi K3 computes sigmoid before dispatch).
+        beta=(
+            torch.rand(1, total_tokens, num_heads, device="cuda") * 0.8 + 0.1
+        ).contiguous(),
         A_log=(
             torch.randn(1, 1, num_heads, 1, device="cuda", dtype=torch.float32) * 0.2
         ).contiguous(),
