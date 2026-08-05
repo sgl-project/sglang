@@ -35,17 +35,11 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
   return idx;
 }
 
-// 4 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
-constexpr uint32_t kFusedQBlockSize = 128;
+// 8 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
+// 256 threads lifts scheduler occupancy (~38% -> ~86%) on the fp8-quant path;
+// math is unchanged, output is bitwise-identical.
+constexpr uint32_t kFusedQBlockSize = 256;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / device::kWarpThreads;
-
-// 8 warps per block: occupancy-tuned dispatch for the fp8-quant Q kernel. The
-// 4-warp (128-thread) block ran the schedulers at ~38% occupancy on the top
-// long_scoreboard stall; doubling warps/block lifts occupancy to ~86% and is
-// where the win comes from (see FusedQIndexerRopeHadamardQuantKernel).
-constexpr uint32_t kFusedQuantBlockSize = 256;
-constexpr uint32_t kFusedQuantNumWarps = kFusedQuantBlockSize / device::kWarpThreads;
-constexpr uint32_t kFusedQuantMinBlocksPerSM = 16;
 
 // 8 warps per block: block-per-token work-item dispatch (K kernel).
 constexpr uint32_t kFusedKBlockSize = 256;
@@ -462,16 +456,8 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <
-    typename DType,
-    typename PosT,
-    bool kUsePDL,
-    bool kRopeFirst = false,
-    bool kHadamard = true,
-    uint32_t kNumWarps = kFusedQuantNumWarps,
-    uint32_t kMinBlocksPerSM = kFusedQuantMinBlocksPerSM>
-__global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) void fused_q_indexer_rope_hadamard_quant(
-    const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
+template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -488,7 +474,7 @@ __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) v
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto work_id = blockIdx.x * kNumWarps + warp_id;
+  const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
   // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
   // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
   const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
@@ -597,23 +583,14 @@ __global__ __launch_bounds__(kNumWarps* device::kWarpThreads, kMinBlocksPerSM) v
     // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     result.store(out_row, lane_id);
-    // scale/weight are uniform across lanes; one lane writes the scalar, the
-    // other 31 same-address stores were waste. Bitwise identical.
-    if (lane_id == 0) params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    params.weights_out[work_id] = weight_val * params.weight_scale * scale;
   }
 }
 
 template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
-  // 8 warps/block + resident-block cap 16 (see kFusedQuantBlockSize): the win is
-  // occupancy, ~38% -> ~86%. Math path is unchanged.
-  static constexpr uint32_t kNumWarps = kFusedQuantNumWarps;
-  static constexpr uint32_t kBlocksPerSM = kFusedQuantMinBlocksPerSM;
-  static constexpr uint32_t kBlockSize = kFusedQuantBlockSize;
-
   template <typename PosT>
-  static constexpr auto kernel =
-      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kNumWarps, kBlocksPerSM>;
+  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -693,11 +670,11 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    const auto num_blocks = div_ceil(total_works, kNumWarps);
+    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
     const auto k_int32 = kernel<int32_t>;
     const auto k_int64 = kernel<int64_t>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
-    LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
+    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
 };
