@@ -38,12 +38,16 @@ mechanism) are the follow-up and are rejected with explicit errors here.
 Rank-replicated pools (MLA-family) have no head axis, so cross-TP-size reuse
 works immediately.
 
-The namespace descriptor is *configuration*, distributed out-of-band (a JSON
-file passed to every deployment that should share cache). Two deployments
-share objects iff their descriptors are byte-equivalent: the digest of the
-canonical encoding prefixes every key, so mismatched descriptors partition
-into disjoint keyspaces instead of colliding (fail-safe, and observable via
-the digest logged at attach).
+The namespace is derived from deployment facts (model, logical KV dtype,
+page size, head grid) and its digest prefixes every key: deployments share
+objects iff every identity field matches, so configuration differences
+partition into disjoint keyspaces instead of colliding (fail-safe, and
+observable via the digest logged at attach). Notably the *logical* dtype is
+an identity field — fp8_e4m3 and fp8_e5m2 caches never share a keyspace even
+though both store as uint8. :func:`load_namespace_descriptor` is the
+out-of-band fleet-descriptor API (a JSON file shared by deployments that
+must agree on a head grid finer than their own shards); it becomes reachable
+from the CLI together with head fan-out.
 """
 
 from __future__ import annotations
@@ -106,7 +110,13 @@ def namespace_digest(namespace: KVCacheNamespace) -> str:
 
 
 def load_namespace_descriptor(path: str) -> KVCacheNamespace:
-    """Load and strictly decode an out-of-band descriptor file (JSON)."""
+    """Load and strictly decode an out-of-band descriptor file (JSON).
+
+    Not wired to a CLI flag yet: fleet descriptor files ship together with
+    head fan-out, where deployments must agree on a head grid finer than
+    their own shards. Kept (and tested) now so the schema, strictness, and
+    digest semantics are pinned from the first release of the key format.
+    """
     with open(path, "rb") as f:
         raw = f.read()
     namespace = msgspec.json.decode(raw, type=KVCacheNamespace)

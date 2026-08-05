@@ -670,7 +670,6 @@ class HiCacheController:
         from sglang.srt.mem_cache.hicache_key_scheme import (
             build_canonical_cell_suffix,
             derive_namespace,
-            load_namespace_descriptor,
             namespace_digest,
             normalize_dtype,
         )
@@ -700,34 +699,32 @@ class HiCacheController:
         local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
         model_id = model_name or ""
 
-        descriptor_path = get_memory().hicache_storage_namespace_descriptor
-        if descriptor_path is not None:
-            namespace = load_namespace_descriptor(descriptor_path)
-        else:
-            if not is_rank_replicated and local_kv_heads == 1 and self.tp_size > 1:
-                # One kv head per rank is ambiguous without model-level info:
-                # the model may have exactly tp_size kv heads (sharded, safe)
-                # or fewer (heads REPLICATED across ranks — several ranks hold
-                # the same head, and per-rank H indices would mislabel it).
-                # The derived namespace fabricates total_kv_heads = local*tp,
-                # so it cannot tell these apart; require an explicit
-                # descriptor carrying the model's true total_kv_heads.
-                raise NotImplementedError(
-                    "canonical-grid cannot derive a namespace at 1 kv head "
-                    "per rank (possible kv-head replication when tp_size "
-                    "exceeds the model's kv heads); provide "
-                    "--hicache-storage-namespace-descriptor with the model's "
-                    "true total_kv_heads, or use "
-                    "--hicache-storage-key-scheme rank-suffix."
-                )
-            namespace = derive_namespace(
-                model_id=model_id,
-                dtype=dtype,
-                page_size=self.page_size,
-                rank_replicated=is_rank_replicated,
-                total_kv_heads=local_kv_heads * self.tp_size,
-                local_kv_heads=local_kv_heads,
+        if not is_rank_replicated and local_kv_heads == 1 and self.tp_size > 1:
+            # One kv head per rank is ambiguous without model-level info: the
+            # model may have exactly tp_size kv heads (sharded, safe) or
+            # fewer (heads REPLICATED across ranks — several ranks hold the
+            # same head, and per-rank H indices would mislabel it). The
+            # derived namespace fabricates total_kv_heads = local*tp, so it
+            # cannot tell these apart; the fleet-descriptor mechanism of the
+            # head fan-out follow-up carries the model's true head count.
+            raise NotImplementedError(
+                "canonical-grid cannot derive a namespace at 1 kv head per "
+                "rank (possible kv-head replication when tp_size exceeds the "
+                "model's kv heads); use --hicache-storage-key-scheme "
+                "rank-suffix for this deployment."
             )
+        # The namespace is derived from deployment facts; its digest prefixes
+        # every key, so deployments agree on a keyspace iff model, logical KV
+        # dtype (fp8 variants stay distinct), page size, and head grid all
+        # match. Fleet-level descriptor files arrive with head fan-out.
+        namespace = derive_namespace(
+            model_id=model_id,
+            dtype=dtype,
+            page_size=self.page_size,
+            rank_replicated=is_rank_replicated,
+            total_kv_heads=local_kv_heads * self.tp_size,
+            local_kv_heads=local_kv_heads,
+        )
 
         suffix = build_canonical_cell_suffix(
             namespace,
@@ -743,10 +740,9 @@ class HiCacheController:
             rank_replicated=is_rank_replicated,
         )
         logger.info(
-            "HiCache canonical-grid L3 keys: namespace=%s cell=%s " "(descriptor=%s)",
+            "HiCache canonical-grid L3 keys: namespace=%s cell=%s",
             namespace_digest(namespace),
             suffix,
-            descriptor_path or "derived-from-deployment",
         )
         return suffix
 

@@ -2684,14 +2684,6 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "rank-suffix"
-    hicache_storage_namespace_descriptor: A[
-        Optional[str],
-        "Path to a JSON KV-namespace descriptor for the canonical-grid key "
-        "scheme. Deployments sharing one descriptor file share one L3 "
-        "keyspace; if omitted, a single-topology namespace is derived from "
-        "this deployment.",
-        NS("memory"),
-    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -7180,11 +7172,6 @@ class ServerArgs:
 
     def _resolve_hicache_key_scheme(self):
         if self.hicache_storage_key_scheme == "rank-suffix":
-            if self.hicache_storage_namespace_descriptor is not None:
-                raise ValueError(
-                    "--hicache-storage-namespace-descriptor requires "
-                    "--hicache-storage-key-scheme canonical-grid."
-                )
             return
         if not (
             self.enable_hierarchical_cache
@@ -7226,12 +7213,6 @@ class ServerArgs:
                 "canonical-grid with --attn-cp-size > 1 is not supported: "
                 "CP ranks hold sub-page slices or replicated pages (needs "
                 "token-granule cells / writer election)."
-            )
-        descriptor = self.hicache_storage_namespace_descriptor
-        if descriptor is not None and not os.path.isfile(descriptor):
-            raise ValueError(
-                f"--hicache-storage-namespace-descriptor {descriptor!r} is "
-                "not a readable file."
             )
 
     def _resolve_hicache_dcp_compatibility(self):
