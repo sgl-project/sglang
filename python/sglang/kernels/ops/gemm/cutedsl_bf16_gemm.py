@@ -122,8 +122,6 @@ class TgvGemmCuteExtKernel:
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         self.acc_dtype = acc_dtype
-        # Traced from the output tensor, not read here; carried so the kernel's
-        # identity (and the cubin name) distinguishes the two epilogues.
         self.out_dtype = out_dtype
         self.cta_m = cta_m
         self.cta_n = cta_n
@@ -1000,9 +998,6 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
 }
 
-# Output dtypes the epilogue can emit. The accumulator is fp32 and the store is
-# a plain RMEM->GMEM st.global (no TMA descriptor), so fp32 output is just the
-# `acc.to(c_dtype)` cast turning into a no-op; the operands stay bf16.
 _TORCH_TO_CUTLASS_OUT_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
@@ -1411,8 +1406,6 @@ def _tgv_bf16_gemm_out_run(
     if get_device_sm() not in (100, 103):
         raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    # fp32 out keeps a consumer that needs exact values (the K3 merged front's
-    # router-logit slice) off a bf16 round-trip; the accumulator is fp32 either way.
     assert out.dtype in (torch.bfloat16, torch.float32) and out.device == x.device
     assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
     assert x.stride(-1) == 1, "x must be K-major [M, K]"

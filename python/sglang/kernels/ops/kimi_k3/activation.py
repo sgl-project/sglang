@@ -58,19 +58,14 @@ def situ_and_mul(
 
     Parameters
     ----------
-    input       : bf16 or fp32 CUDA tensor [*, 2*D]. fp32 lets a caller feed the
-                  K3 fused MoE front's gate_up slice straight in, with no cast
-                  pass: the activation math is fp32 internally either way.
+    input       : bf16 or fp32 CUDA tensor [*, 2*D]
     out         : optional pre-allocated CUDA tensor [*, D]; its dtype selects
-                  the output dtype (defaults to the input's)
+                  the output dtype (bf16 for an fp32 input)
     beta        : gate softcap scalar (e.g. 4.0)
     linear_beta : up softcap scalar (e.g. 25.0), or None to skip
     """
     hidden_size = input.shape[-1] // 2
     if out is None:
-        # An fp32 input is a wider view of a bf16 activation (the K3 fused MoE
-        # front emits fp32 so its router slice stays exact), so the activation
-        # rejoins the bf16 chain rather than widening it.
         out_dtype = torch.bfloat16 if input.dtype == torch.float32 else input.dtype
         out = input.new_empty(*input.shape[:-1], hidden_size, dtype=out_dtype)
 

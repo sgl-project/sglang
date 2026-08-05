@@ -229,15 +229,8 @@ struct QuantTrait {
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
   static constexpr uint32_t kBlockSize = 256;
-  // Elements per lane, deliberately independent of the input width: consumers
-  // derive their CTA geometry from kNumLanes (see RouteQuantTrait's
-  // kQuantHidden_), so a wider input must cost more loads per lane, not more
-  // lanes per group. bf16 -> one 32B load, fp32 -> two.
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
-  // 16-bit inputs take the packed path below; fp32 exists so a producer that
-  // must emit fp32 for another consumer (the K3 fused MoE front, whose router
-  // slice shares the GEMM output) can be quantized without a cast pass.
   static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
   static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
@@ -257,7 +250,6 @@ struct QuantTrait {
     }
   }
 
-  /// 16-bit (bf16/fp16) input: loads and reduces in the packed domain.
   SGL_DEVICE static void run_packed16(
       const QuantKernelParams& params,
       const uint32_t expert_idx,
@@ -339,11 +331,6 @@ struct QuantTrait {
     params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
   }
 
-  /// fp32 input. Same scale derivation and the same rounding as the 16-bit
-  /// path -- only the load width and the amax reduction differ, since there is
-  /// no packed fp32 type to reduce in. Quantizing an fp32 source is strictly
-  /// more faithful: the 16-bit path's amax and product are taken after the
-  /// input has already been rounded to bf16.
   SGL_DEVICE static void run_fp32(
       const QuantKernelParams& params,
       const uint32_t expert_idx,
@@ -356,7 +343,6 @@ struct QuantTrait {
     using Q = QuantType;
     using WTrait = details::WeightTrait<Q>;
     using Q2 = typename WTrait::packed2_t;
-    // 32B is the widest load, so kVecSize fp32 elements take kNumSubVecs of them.
     constexpr uint32_t kSubVec = kMaxVecBytes / sizeof(fp32_t);
     constexpr uint32_t kNumSubVecs = kVecSize / kSubVec;
     using in_vec_t = AlignedVector<fp32_t, kSubVec>;
@@ -397,8 +383,6 @@ struct QuantTrait {
     const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      // 2^exp >= amax/kMaxValue keeps the ue8m0 product inside the fp8 range;
-      // the SATFINITE cast in WTrait::quant handles NaN / +-inf either way.
       out[i] = WTrait::quant(details::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
     }
 

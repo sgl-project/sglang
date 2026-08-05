@@ -36,8 +36,6 @@ using RouteQuantTraitT = QuantTrait<
     /*kAligned=*/true,
     /*kFuseSiluAndMul=*/false>;
 
-// Lane geometry is input-width independent (QuantTrait::kVecSize is fixed), so
-// these constants hold for every activation dtype.
 using RouteQuantTrait = RouteQuantTraitT<bf16_t>;
 
 inline constexpr uint32_t kQuantGroupsPerRow_ = LargeRouterRadixTrait::kBlockSize / RouteQuantTrait::kNumLanes;
@@ -108,8 +106,6 @@ struct RouteQuantFusedKernel {
     // with the standalone flat kernel.
     auto x_dtype = SymbolicDType{};
     TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
-    // Only `.params` is needed downstream and it is trait-independent, so the
-    // two instantiations converge on one value.
     const auto quant_params =
         x_dtype.is_type<fp32_t>()
             ? build_quant_context<sglang::RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
@@ -143,23 +139,23 @@ struct RouteQuantFusedKernel {
         .quant = quant_params,
     };
 
-#define SGL_RQF_LAUNCH(TS, TX)                                                    \
+#define SGL_ROUTE_QUANT_LAUNCH(TS, TX)                                            \
   LaunchKernel(2 * M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
       .enable_pdl(kUsePDL)(sglang::route_quant_fused_kernel<kUsePDL, TS, TX>, params)
 
     if (score_dtype.is_type<fp32_t>()) {
       if (x_dtype.is_type<fp32_t>()) {
-        SGL_RQF_LAUNCH(fp32_t, fp32_t);
+        SGL_ROUTE_QUANT_LAUNCH(fp32_t, fp32_t);
       } else {
-        SGL_RQF_LAUNCH(fp32_t, bf16_t);
+        SGL_ROUTE_QUANT_LAUNCH(fp32_t, bf16_t);
       }
     } else {
       if (x_dtype.is_type<fp32_t>()) {
-        SGL_RQF_LAUNCH(bf16_t, fp32_t);
+        SGL_ROUTE_QUANT_LAUNCH(bf16_t, fp32_t);
       } else {
-        SGL_RQF_LAUNCH(bf16_t, bf16_t);
+        SGL_ROUTE_QUANT_LAUNCH(bf16_t, bf16_t);
       }
     }
-#undef SGL_RQF_LAUNCH
+#undef SGL_ROUTE_QUANT_LAUNCH
   }
 };

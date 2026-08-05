@@ -142,12 +142,7 @@ def _k3_bf16_gemm(
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them.
-
-    ``out_dtype`` (fp32) keeps a consumer that needs the unrounded result -- the
-    merged front's router-logit slice -- off a bf16 round-trip. Both backends
-    accumulate in fp32, so it only removes the epilogue's cast; measured free
-    on the merged-front shape (CUPTI, B300)."""
+    --bf16-gemm-backend cutedsl selection would silently skip them."""
     if out is None and out_dtype is not None and out_dtype != x.dtype:
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
@@ -166,21 +161,10 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 if out.is_contiguous():
-                    # TGV stores straight into caller memory (same entry the
-                    # UnquantizedLinearMethod out-buffer path uses); no
-                    # staging tensor + copy.
                     return cutedsl_bf16_gemm_out(x, weight, out)
-                if out.dtype == x.dtype:
-                    out.copy_(cutedsl_bf16_gemm(x, weight))
-                    return out
-                # A wider destination cannot be reached through a bf16 staging
-                # tensor without throwing away the precision it was asked for;
-                # let cuBLAS write the accumulator below instead.
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
-        # cuBLAS emits the fp32 accumulator directly; out= alone rejects a
-        # differently-typed destination.
         return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
     return torch.mm(x, weight.t(), out=out)
 
@@ -675,12 +659,10 @@ class KimiK3MoE(nn.Module):
 
     @cached_property
     def _front_fp32(self) -> bool:
-        """Whether the merged front emits fp32 so the router reads exact logits.
+        """Emit the merged front in fp32 so the router reads exact logits.
 
-        Every consumer of that one buffer must accept fp32: situ for the
-        shared-expert half, and the mxfp8 quantizers for the latent half. Only
-        the flashinfer_mxfp4 chain does, so other runners keep the bf16 front.
-        """
+        Every consumer of that buffer must accept fp32; only the
+        flashinfer_mxfp4 chain does."""
         return (
             self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
@@ -1084,10 +1066,6 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        # fp32 keeps the router's slice unrounded (the HF reference, vLLM and the
-        # EP front all route in fp32; a bf16 merged GEMM moves the selected
-        # expert set on a few percent of rows). The other two slices are read as
-        # fp32 by their consumers, so nothing casts.
         fused = _k3_bf16_gemm(
             hidden_states,
             self._front_w,

@@ -68,10 +68,6 @@ struct SituAndMulParams {
   uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
 };
 
-// TIn may be wider than TOut: the K3 fused MoE front emits fp32 so the router
-// reads unrounded logits, and this activation consumes its gate_up slice
-// directly rather than paying a separate cast pass. The activation math was
-// always fp32 internally, so a wider input only changes the load width.
 template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
 __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams params) {
   using namespace device;
