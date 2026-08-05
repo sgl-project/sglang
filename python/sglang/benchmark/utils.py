@@ -2,7 +2,7 @@ import json
 import os
 import resource
 from json import JSONDecodeError
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import requests
 from tqdm.asyncio import tqdm
@@ -131,14 +131,17 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+def load_json_file(path) -> Any:
+    with open(path) as f:
+        return json.load(f)
+
+
 def is_file_valid_json(path):
     if not os.path.isfile(path):
         return False
 
-    # TODO can fuse into the real file open later
     try:
-        with open(path) as f:
-            json.load(f)
+        load_json_file(path)
         return True
     except JSONDecodeError as e:
         print(
