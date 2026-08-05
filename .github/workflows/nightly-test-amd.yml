@@ -79,6 +79,8 @@ on:
           # 8-GPU GLM-5.1 (MI30x + MI35x)
           - nightly-8-gpu-glm51
           - nightly-8-gpu-mi35x-glm51
+          # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+          - nightly-8-gpu-mi35x-glm52-fp8
           # 8-GPU GLM-5-MXFP4 (MI35x only)
           - nightly-8-gpu-mi35x-glm5-mxfp4
           # 4-GPU MiniMax-M2.5 (MI35x)
@@ -1658,6 +1660,47 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-glm52-fp8:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm52-fp8,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # The ~700 GB FP8 checkpoint means weight download and load dominate wall
+      # time well before the eval itself starts.
+      - name: Accuracy Test MI35x (8-GPU GLM-5.2-FP8 DSA)
+        timeout-minutes: 180
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm52-fp8 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU GLM-5-MXFP4 (MI35x only)
   # ==============================================================================
 
@@ -1932,6 +1975,8 @@ jobs:
       # 8-GPU GLM-5.1 (MI30x + MI35x)
       - nightly-8-gpu-glm51
       - nightly-8-gpu-mi35x-glm51
+      # 8-GPU GLM-5.2-FP8 (MI35x only - guards the gfx950 block-FP8 path)
+      - nightly-8-gpu-mi35x-glm52-fp8
       # 8-GPU GLM-5-MXFP4 (MI35x only)
       - nightly-8-gpu-mi35x-glm5-mxfp4
       # 4-GPU MiniMax-M2.5 (MI35x)
