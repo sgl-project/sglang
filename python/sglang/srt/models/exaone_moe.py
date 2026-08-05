@@ -26,6 +26,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32, silu_and_mul_clamp
+from sglang.kernels.ops.attention.fused_qknorm_rope import (
+    can_use_fused_qk_norm_rope,
+    fused_qk_norm_rope,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -379,6 +383,7 @@ class ExaoneMoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
 
         qkv_quant_config = quant_config
         o_quant_config = quant_config
@@ -441,6 +446,23 @@ class ExaoneMoeAttention(nn.Module):
             is_neox_style=rope_is_neox_style,
         )
 
+        rope_type = (
+            (rope_scaling or {}).get("rope_type")
+            or (rope_scaling or {}).get("type")
+            or "default"
+        )
+        self.use_fused_qk_norm_rope = (
+            get_exec().kernel.enable_fused_qk_norm_rope
+            and _is_cuda
+            and rope_type == "default"
+            and (self.sliding_window or self.apply_rope_all_layers)
+            and can_use_fused_qk_norm_rope(
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+            )
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -460,18 +482,40 @@ class ExaoneMoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rope_theta,
+                self.rotary_emb.is_neox_style,
+                positions.view(-1)
+                .to(dtype=torch.int32, device=qkv.device)
+                .contiguous(),
+                1.0,
+                0,
+                0,
+                1.0,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.reshape(-1, self.head_dim)
-        q = self.q_norm(q)
-        q = q.reshape(-1, self.num_heads * self.head_dim)
+            q = q.reshape(-1, self.head_dim)
+            q = self.q_norm(q)
+            q = q.reshape(-1, self.num_heads * self.head_dim)
 
-        k = k.reshape(-1, self.head_dim)
-        k = self.k_norm(k)
-        k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+            k = k.reshape(-1, self.head_dim)
+            k = self.k_norm(k)
+            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
 
-        if self.sliding_window or self.apply_rope_all_layers:
-            q, k = self.rotary_emb(positions, q, k)
+            if self.sliding_window or self.apply_rope_all_layers:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
