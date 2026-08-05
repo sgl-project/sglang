@@ -141,18 +141,16 @@ def capture_cuda_graphs(
         moe_a2a_backend = model_runner.server_args.moe_a2a_backend
 
     uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
-    if (
-        moe_runner_backend == "auto"
-        and model_runner.model_config.quantization in ("fp8", "mxfp8")
+    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+        "fp8",
+        "mxfp8",
     ):
         from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        uses_deep_gemm_moe_runner = (
-            Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
-                MoeRunnerBackend(moe_runner_backend),
-                MoeA2ABackend(moe_a2a_backend),
-            )
+        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+            MoeRunnerBackend(moe_runner_backend),
+            MoeA2ABackend(moe_a2a_backend),
         )
 
     if (
