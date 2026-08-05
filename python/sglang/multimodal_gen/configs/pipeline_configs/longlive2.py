@@ -18,6 +18,7 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
     is_causal: bool = True
     task_type: ModelTaskType = ModelTaskType.TI2V
     vae_precision: str = "bf16"
+    vae_decode_precision: str = "bf16"
 
     flow_shift: float | None = 5.0
     dmd_denoising_steps: list[int] | None = field(
