@@ -50,7 +50,6 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
       'Arc B': { tp: 1, ep: 0, bf16: true, fp8: true },
     },
@@ -64,7 +63,6 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
       'Arc B': { tp: 1, ep: 0, bf16: true, fp8: true },
     },
@@ -78,7 +76,6 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
       'Arc B': { tp: 2, ep: 0, bf16: true, fp8: true },
     },
@@ -92,7 +89,6 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
       'Arc B': { tp: 2, ep: 0, bf16: true, fp8: true },
     },
@@ -106,7 +102,6 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
       'Arc B': { tp: 3, ep: 0, bf16: true, fp8: true },
     }
@@ -183,9 +178,8 @@ export const Qwen3Deployment = () => {
   const getDisplayOptions = (values) => {
     const options = { ...baseOptions };
     const currentModelConfig = modelConfigs[values.modelsize];
-    const isArcB = values.hardware === 'Arc B';
 
-    if (isArcB) {
+    if (values.hardware === 'Arc B') {
       options.quantization = {
         ...baseOptions.quantization,
         items: baseOptions.quantization.items.map(item => ({
@@ -204,7 +198,7 @@ export const Qwen3Deployment = () => {
     }
 
     // If model doesn't have thinking variants, disable non-base category options
-    if (isArcB || (currentModelConfig && !currentModelConfig.hasThinkingVariants)) {
+    if (values.hardware === 'Arc B' || (currentModelConfig && !currentModelConfig.hasThinkingVariants)) {
       options.category = {
         ...baseOptions.category,
         items: baseOptions.category.items.map(item => ({
@@ -324,6 +318,7 @@ export const Qwen3Deployment = () => {
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (hardware === 'Arc B') {
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }
 
