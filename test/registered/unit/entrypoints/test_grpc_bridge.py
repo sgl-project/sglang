@@ -1,11 +1,10 @@
 import asyncio
 import enum
-import threading
 import unittest
-from concurrent.futures import Future
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -156,6 +155,11 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                     "finish_reason": {"type": "stop"},
                 },
             },
+            {
+                "index": 1,
+                "output_ids": [7],
+                "meta_info": {"id": "choice-1", "finish_reason": None},
+            },
             RuntimeError("scheduler failed"),
         ]
         handle = _make_runtime_handle(responses)
@@ -171,13 +175,14 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             )
         )
 
-        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1])
+        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1, 1])
         self.assertEqual(
-            callback.calls[1][0]["meta_info"]["finish_reason"]["type"], "error"
+            callback.calls[2][0]["meta_info"]["finish_reason"]["type"], "error"
         )
-        self.assertEqual([call[1] for call in callback.calls], [False, True])
+        self.assertEqual(callback.calls[2][0]["output_ids"], [7])
+        self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
-    def test_incremental_streaming_retains_legacy_cumulative_output(self):
+    def test_incremental_streaming_preserves_legacy_segments(self):
         callback = _RecordingCallback()
         responses = [
             {
@@ -204,29 +209,25 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             )
         )
 
-        self.assertEqual(
-            [call[0]["output_ids"] for call in callback.calls], [[1], [1, 2]]
-        )
+        self.assertEqual([call[0]["output_ids"] for call in callback.calls], [[1], [2]])
         self.assertEqual(
             [call[0]["delta_output_ids"] for call in callback.calls], [[1], [2]]
         )
 
 
 class TestNativeGrpcRequestLifecycle(CustomTestCase):
-    def test_reused_request_id_keeps_current_generation_future(self):
-        handle = RuntimeHandle.__new__(RuntimeHandle)
-        handle._active_generation_futures = {}
-        handle._generation_futures_lock = threading.Lock()
-        old_future = Future()
-        current_future = Future()
+    def test_stale_lifecycle_cannot_abort_reused_request_id(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.rid_to_state = {
+            "reused": SimpleNamespace(lifecycle_id=2, abort_requested=False)
+        }
+        manager.child_rid_to_logical_rid = {}
+        manager.logical_rid_to_child_rids = {}
 
-        handle._track_generation_future("reused", old_future)
-        handle._track_generation_future("reused", current_future)
-        old_future.set_result(None)
+        aborted = manager.abort_request("reused", lifecycle_id=1)
 
-        self.assertIs(handle._active_generation_futures["reused"], current_future)
-        handle._cancel_generation_futures("reused", abort_all=False)
-        self.assertTrue(current_future.cancelled())
+        self.assertFalse(aborted)
+        self.assertFalse(manager.rid_to_state["reused"].abort_requested)
 
 
 if __name__ == "__main__":

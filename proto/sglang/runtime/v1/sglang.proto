@@ -133,8 +133,9 @@ message GenerateRequest {
 }
 
 message GenerateResponse {
-  // Legacy cumulative response fields. New clients should use the request,
-  // choice, delta, and terminal fields below for multi-choice generation.
+  // Legacy response fields. output_ids preserves the configured server streaming
+  // mode: cumulative by default, or disjoint segments with incremental streaming.
+  // New clients should use the request, choice, delta, and terminal fields below.
   repeated int32 output_ids = 1;
   map<string, string> meta_info = 2;
   bool finished = 3;

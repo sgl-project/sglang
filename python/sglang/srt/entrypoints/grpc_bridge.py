@@ -10,46 +10,16 @@ import asyncio
 import dataclasses
 import json
 import logging
-import threading
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.entrypoints.grpc_native_generation import NativeGenerationAdapter
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass
-class _ChoiceOutputState:
-    """Per-choice state used to normalize both SGLang streaming modes."""
-
-    cumulative_output_ids: List[int] = dataclasses.field(default_factory=list)
-
-
-def _normalize_choice_output(
-    chunk: dict,
-    state: _ChoiceOutputState,
-    *,
-    incremental: bool,
-) -> dict:
-    """Return legacy cumulative IDs and new delta IDs for one choice."""
-    normalized = dict(chunk)
-    current_output_ids = list(chunk.get("output_ids") or [])
-    if incremental:
-        delta_output_ids = current_output_ids
-        state.cumulative_output_ids.extend(current_output_ids)
-    else:
-        previous_count = len(state.cumulative_output_ids)
-        delta_start = previous_count if previous_count <= len(current_output_ids) else 0
-        delta_output_ids = current_output_ids[delta_start:]
-        state.cumulative_output_ids = current_output_ids
-
-    normalized["output_ids"] = list(state.cumulative_output_ids)
-    normalized["delta_output_ids"] = delta_output_ids
-    return normalized
 
 
 class _BadOpenAIRequest(ValueError):
@@ -84,7 +54,7 @@ class _GrpcRequest:
         return bool(self._is_disconnected_fn())
 
 
-class RuntimeHandle:
+class RuntimeHandle(NativeGenerationAdapter):
     """Thin Python handle that the Rust gRPC server calls into.
 
     Provides synchronous ``submit_*``, ``abort``, and info methods.
@@ -106,9 +76,6 @@ class RuntimeHandle:
         self.scheduler_info = scheduler_info or {}
 
         self._openai_serving_classes = None
-        self._active_generation_futures = {}
-        self._generation_futures_lock = threading.Lock()
-
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
 
@@ -139,12 +106,18 @@ class RuntimeHandle:
     def _is_closed_status(status) -> bool:
         return status is not None and status == type(status).Closed
 
-    def _abort_request_id(self, rid) -> None:
+    def _abort_request_id(self, rid, lifecycle_id=None) -> None:
         if isinstance(rid, list):
             for single_rid in rid:
-                self.tokenizer_manager.abort_request(rid=single_rid)
+                self.tokenizer_manager.abort_request(
+                    rid=single_rid,
+                    lifecycle_id=lifecycle_id,
+                )
         else:
-            self.tokenizer_manager.abort_request(rid=rid)
+            self.tokenizer_manager.abort_request(
+                rid=rid,
+                lifecycle_id=lifecycle_id,
+            )
 
     async def _send_with_backpressure(
         self,
@@ -153,6 +126,7 @@ class RuntimeHandle:
         payload,
         *,
         timeout_abort_rid=None,
+        timeout_abort_lifecycle_id=None,
         **kwargs,
     ) -> bool:
         status = self._safe_callback(chunk_callback, payload, **kwargs)
@@ -172,7 +146,10 @@ class RuntimeHandle:
             )
         except asyncio.TimeoutError:
             if timeout_abort_rid is not None:
-                self._abort_request_id(timeout_abort_rid)
+                self._abort_request_id(
+                    timeout_abort_rid,
+                    timeout_abort_lifecycle_id,
+                )
                 logger.warning(
                     "gRPC chunk backpressure wait timed out after %ss; aborted request",
                     self._BACKPRESSURE_TIMEOUT_S,
@@ -217,27 +194,6 @@ class RuntimeHandle:
         future = asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
         future.add_done_callback(self._log_unhandled_future_exception)
         return future
-
-    def _track_generation_future(self, rid: str, future) -> None:
-        with self._generation_futures_lock:
-            self._active_generation_futures[rid] = future
-
-        def _remove_finished(completed) -> None:
-            with self._generation_futures_lock:
-                if self._active_generation_futures.get(rid) is completed:
-                    self._active_generation_futures.pop(rid, None)
-
-        future.add_done_callback(_remove_finished)
-
-    def _cancel_generation_futures(self, rid: str, abort_all: bool) -> None:
-        with self._generation_futures_lock:
-            if abort_all:
-                futures = list(self._active_generation_futures.values())
-            else:
-                future = self._active_generation_futures.get(rid)
-                futures = [] if future is None else [future]
-        for future in futures:
-            future.cancel()
 
     @staticmethod
     def _log_unhandled_future_exception(future) -> None:
@@ -324,6 +280,7 @@ class RuntimeHandle:
         req_dict: dict,
         chunk_callback,
         choice_aware: bool = False,
+        lifecycle_id=None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         mock_request = (
@@ -336,267 +293,45 @@ class RuntimeHandle:
 
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
-            future = self._submit_on_tm_loop(
+            self._submit_on_tm_loop(
                 self._run_generate(
                     obj,
                     chunk_callback,
                     stream,
                     mock_request,
                     choice_aware=choice_aware,
+                    lifecycle_id=lifecycle_id,
                 )
             )
-            rid = req_dict.get("rid")
-            if isinstance(rid, str):
-                self._track_generation_future(rid, future)
         elif req_type == "embed":
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
             obj = EmbeddingReqInput(**req_dict)
-            self._submit_on_tm_loop(self._run_embed(obj, chunk_callback, mock_request))
+            self._submit_on_tm_loop(
+                self._run_embed(
+                    obj,
+                    chunk_callback,
+                    mock_request,
+                    lifecycle_id=lifecycle_id,
+                )
+            )
         else:
             raise ValueError(
                 f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
             )
 
-    @staticmethod
-    def _generation_error_meta(error: Exception) -> dict:
-        status_code = getattr(error, "status_code", None)
-        if status_code is None:
-            status_code = (
-                400 if isinstance(error, (ValidationError, ValueError)) else 500
-            )
-        detail = getattr(error, "detail", None)
-        return {
-            "finish_reason": {
-                "type": "error",
-                "status_code": int(status_code),
-                "message": str(detail if detail is not None else error),
-            }
-        }
-
-    async def _send_generation_errors(
-        self,
-        chunk_callback,
-        ready_event: Optional[asyncio.Event],
-        *,
-        error: Exception,
-        expected_choices: int,
-        terminal_choices: set,
-        timeout_abort_rid,
-    ) -> None:
-        unfinished = [
-            index for index in range(expected_choices) if index not in terminal_choices
-        ]
-        for position, index in enumerate(unfinished):
-            keep_going = await self._send_with_backpressure(
-                chunk_callback,
-                ready_event,
-                {
-                    "index": index,
-                    "output_ids": [],
-                    "delta_output_ids": [],
-                    "meta_info": self._generation_error_meta(error),
-                },
-                finished=position == len(unfinished) - 1,
-                timeout_abort_rid=timeout_abort_rid,
-            )
-            if not keep_going:
-                self._abort_request_id(timeout_abort_rid)
-                return
-
-    async def _run_generate(
-        self,
-        obj,
-        chunk_callback,
-        stream: bool,
-        request,
-        *,
-        choice_aware: bool = False,
-    ):
-        ready_event = None
-        gen = None
-        sampling_params = getattr(obj, "sampling_params", None)
-        if isinstance(sampling_params, dict):
-            parallel_sample_num = sampling_params.get("n", 1)
-        elif isinstance(sampling_params, list) and sampling_params:
-            parallel_sample_num = sampling_params[0].get("n", 1)
-        else:
-            parallel_sample_num = getattr(obj, "parallel_sample_num", 1)
-        expected_choices = max(1, int(parallel_sample_num))
-        terminal_choices = set()
-        try:
-            ready_event = self._install_on_ready(chunk_callback)
-            generate_kwargs = {"request": request}
-            if choice_aware:
-                generate_kwargs["yield_scheduler_errors"] = True
-            gen = self.tokenizer_manager.generate_request(obj, **generate_kwargs)
-            if stream:
-                incremental = bool(
-                    getattr(
-                        getattr(self.tokenizer_manager, "server_args", None),
-                        "incremental_streaming_output",
-                        False,
-                    )
-                )
-                output_states = {
-                    index: _ChoiceOutputState() for index in range(expected_choices)
-                }
-                async for chunk in gen:
-                    choice_index = int(chunk.get("index") or 0)
-                    if not 0 <= choice_index < expected_choices:
-                        self._abort_request_id(obj.rid)
-                        self._send_native_error(
-                            chunk_callback,
-                            f"choice index {choice_index} is outside 0..{expected_choices}",
-                        )
-                        return
-                    if choice_index in terminal_choices:
-                        self._abort_request_id(obj.rid)
-                        self._send_native_error(
-                            chunk_callback,
-                            f"data after terminal for choice {choice_index}",
-                        )
-                        return
-                    choice_finished = (
-                        chunk.get("meta_info", {}).get("finish_reason") is not None
-                    )
-                    if choice_finished:
-                        terminal_choices.add(choice_index)
-                    finished = len(terminal_choices) == expected_choices
-                    callback_chunk = (
-                        _normalize_choice_output(
-                            chunk,
-                            output_states[choice_index],
-                            incremental=incremental,
-                        )
-                        if choice_aware
-                        else chunk
-                    )
-                    keep_going = await self._send_with_backpressure(
-                        chunk_callback,
-                        ready_event,
-                        callback_chunk,
-                        finished=finished,
-                        timeout_abort_rid=obj.rid,
-                    )
-                    if finished or not keep_going:
-                        return
-                # Defensive: generator exited without a finish_reason chunk.
-                missing = sorted(set(range(expected_choices)) - terminal_choices)
-                error = RuntimeError(
-                    f"SGLang stream ended without terminal choices: {missing}"
-                )
-                if choice_aware:
-                    await self._send_generation_errors(
-                        chunk_callback,
-                        ready_event,
-                        error=error,
-                        expected_choices=expected_choices,
-                        terminal_choices=terminal_choices,
-                        timeout_abort_rid=obj.rid,
-                    )
-                else:
-                    self._send_native_error(chunk_callback, str(error))
-            else:
-                result = await gen.__anext__()
-                chunks = result if isinstance(result, list) else [result]
-                if len(chunks) != expected_choices:
-                    error = RuntimeError(
-                        f"SGLang returned {len(chunks)} choices; expected {expected_choices}"
-                    )
-                    if choice_aware:
-                        await self._send_generation_errors(
-                            chunk_callback,
-                            ready_event,
-                            error=error,
-                            expected_choices=expected_choices,
-                            terminal_choices=terminal_choices,
-                            timeout_abort_rid=obj.rid,
-                        )
-                    else:
-                        self._send_native_error(chunk_callback, str(error))
-                    return
-                for index, chunk in enumerate(chunks):
-                    callback_chunk = dict(chunk)
-                    callback_chunk.setdefault("index", index)
-                    if choice_aware:
-                        output_ids = list(chunk.get("output_ids") or [])
-                        callback_chunk["output_ids"] = output_ids
-                        callback_chunk["delta_output_ids"] = output_ids
-                    terminal_choices.add(index)
-                    keep_going = await self._send_with_backpressure(
-                        chunk_callback,
-                        ready_event,
-                        callback_chunk,
-                        finished=index == len(chunks) - 1,
-                        timeout_abort_rid=obj.rid,
-                    )
-                    if not keep_going:
-                        return
-        except StopAsyncIteration:
-            error = RuntimeError("SGLang returned no generation result")
-            if choice_aware:
-                await self._send_generation_errors(
-                    chunk_callback,
-                    ready_event,
-                    error=error,
-                    expected_choices=expected_choices,
-                    terminal_choices=terminal_choices,
-                    timeout_abort_rid=obj.rid,
-                )
-            else:
-                self._send_native_error(chunk_callback, str(error))
-        except asyncio.CancelledError:
-            if not choice_aware:
-                raise
-            error = RuntimeError(f"Request aborted: {obj.rid}")
-            error.status_code = 499
-            await self._send_generation_errors(
-                chunk_callback,
-                ready_event,
-                error=error,
-                expected_choices=expected_choices,
-                terminal_choices=terminal_choices,
-                timeout_abort_rid=obj.rid,
-            )
-        except Exception as e:
-            logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            if choice_aware:
-                await self._send_generation_errors(
-                    chunk_callback,
-                    ready_event,
-                    error=e,
-                    expected_choices=expected_choices,
-                    terminal_choices=terminal_choices,
-                    timeout_abort_rid=obj.rid,
-                )
-            else:
-                self._send_native_error(chunk_callback, str(e))
-        finally:
-            if gen is not None:
-                await gen.aclose()
-            self._uninstall_on_ready(chunk_callback)
-
-    async def _run_embed(self, obj, chunk_callback, request):
-        try:
-            gen = self.tokenizer_manager.generate_request(obj, request=request)
-            result = await gen.__anext__()
-            self._safe_callback(chunk_callback, result, finished=True)
-        except StopAsyncIteration:
-            self._safe_callback(chunk_callback, {}, finished=True)
-        except Exception as e:
-            logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
-
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
-    # called abort. abort_request only enqueues a message on the ZMQ socket,
-    # so a few seconds is generous; if we time out, log and drop — the client
-    # will retry or give up.
+    # called abort. A timeout is propagated so the gRPC Abort RPC cannot report
+    # success without knowing whether the scheduler saw the request.
     _ABORT_TIMEOUT_S = 5.0
 
-    def abort(self, rid: str = "", abort_all: bool = False):
+    def abort(
+        self,
+        rid: str = "",
+        lifecycle_id=None,
+        abort_all: bool = False,
+    ):
         """Abort a request by request ID or abort all active requests."""
-        self._cancel_generation_futures(rid, abort_all)
         loop = self._tm_loop
 
         try:
@@ -605,17 +340,19 @@ class RuntimeHandle:
             running_loop = None
 
         if running_loop is loop:
-            self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
-            return
+            return self.tokenizer_manager.abort_request(
+                rid=rid,
+                abort_all=abort_all,
+                lifecycle_id=lifecycle_id,
+            )
 
         future = asyncio.run_coroutine_threadsafe(
-            self._abort_async(rid, abort_all),
+            self._abort_async(rid, lifecycle_id, abort_all),
             loop,
         )
         try:
-            future.result(timeout=self._ABORT_TIMEOUT_S)
+            return future.result(timeout=self._ABORT_TIMEOUT_S)
         except TimeoutError:
-            future.cancel()
             logger.error(
                 "gRPC abort timed out after %ss (rid=%r, abort_all=%s); "
                 "tokenizer_manager loop appears stuck",
@@ -623,9 +360,14 @@ class RuntimeHandle:
                 rid,
                 abort_all,
             )
+            raise
 
-    async def _abort_async(self, rid: str, abort_all: bool) -> None:
-        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+    async def _abort_async(self, rid: str, lifecycle_id, abort_all: bool) -> bool:
+        return self.tokenizer_manager.abort_request(
+            rid=rid,
+            abort_all=abort_all,
+            lifecycle_id=lifecycle_id,
+        )
 
     def get_model_info(self) -> str:
         model_config = self.tokenizer_manager.model_config
@@ -769,9 +511,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

@@ -34,8 +34,11 @@ async fn stale_request_key_cannot_abort_reused_request_id() {
             current_key.rid.clone(),
             ActiveChannel {
                 incarnation: current_key.incarnation,
-                sender,
+                sender: Some(sender),
                 preserve_on_explicit_abort: false,
+                scheduler_backed: true,
+                submitting: false,
+                abort_requested: false,
             },
         );
         state.pending_sends.insert(old_key.clone());
@@ -65,8 +68,11 @@ fn explicit_abort_keeps_choice_aware_channel_for_terminal_errors() {
         key.rid.clone(),
         ActiveChannel {
             incarnation: key.incarnation,
-            sender,
+            sender: Some(sender),
             preserve_on_explicit_abort: true,
+            scheduler_backed: true,
+            submitting: false,
+            abort_requested: true,
         },
     );
 
@@ -74,4 +80,31 @@ fn explicit_abort_keeps_choice_aware_channel_for_terminal_errors() {
 
     assert!(state.channels.contains_key(key.rid()));
     assert!(!state.terminal_errors.contains_key(&key));
+}
+
+#[test]
+fn explicit_abort_closes_legacy_consumer_but_reserves_request_id() {
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let key = RequestKey {
+        rid: "legacy".to_string(),
+        incarnation: 1,
+    };
+    let mut state = BridgeState::default();
+    state.channels.insert(
+        key.rid.clone(),
+        ActiveChannel {
+            incarnation: key.incarnation,
+            sender: Some(sender),
+            preserve_on_explicit_abort: false,
+            scheduler_backed: true,
+            submitting: false,
+            abort_requested: true,
+        },
+    );
+
+    finalize_explicit_abort_locked(&mut state, &key);
+
+    let channel = state.channels.get(key.rid()).unwrap();
+    assert!(channel.sender.is_none());
+    assert!(state.terminal_errors.contains_key(&key));
 }
