@@ -4,6 +4,10 @@
 export const config = {
   modelName: "GLM-5.2",
 
+  // TTFT/TPOT in the benchmarks file are P50 (median_ttft_ms / median_tpot_ms
+  // from bench_serving), not means. Engine renders the "(P50)" label from this.
+  latencyPercentile: "P50",
+
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
     "mi355x", "mi325x", "mi300x",
