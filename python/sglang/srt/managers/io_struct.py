@@ -285,6 +285,11 @@ class GenerateReqInput:
     data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For KVCC P2P G2 reuse — opaque router hint from the dynamo router telling
+    # this worker which peer holds a reusable prefix. Passed through untouched to
+    # the HiCache storage backend via HiCacheStorageExtraInfo.extra_info. Shape:
+    # {"source_control_endpoint": str, "block_hashes": list[str]}.
+    kv_router_hint: Optional[dict] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -939,6 +944,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            kv_router_hint=self.kv_router_hint,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
@@ -1025,6 +1031,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For KVCC P2P G2 reuse — opaque router hint, passed through to the HiCache
+    # storage backend. See GenerateReqInput.kv_router_hint.
+    kv_router_hint: Optional[dict] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

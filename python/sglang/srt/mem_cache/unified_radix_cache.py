@@ -1650,6 +1650,7 @@ class UnifiedRadixCache(BasePrefixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
         matched_prefix_tokens: Optional[list[int]] = None,
+        router_hint: Optional[dict] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1741,6 +1742,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            router_hint=router_hint,
             extra_pools=aux_xfers or None,
         )
         stats["issued"] += 1
