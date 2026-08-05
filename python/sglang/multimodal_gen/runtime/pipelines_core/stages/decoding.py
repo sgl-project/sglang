@@ -161,13 +161,23 @@ class DecodingStage(PipelineStage):
     def scale_and_shift(self, latents: torch.Tensor, server_args):
         return scale_and_shift_latents(latents, server_args, self.vae)
 
-    def _get_vae_decode_fn(self, vae, server_args: ServerArgs):
+    def _get_vae_decode_fn(
+        self,
+        vae,
+        server_args: ServerArgs,
+        *,
+        decode_fn=None,
+        compiled_callable: ActiveTargetCompiledCallable | None = None,
+    ):
+        decode_fn = decode_fn or vae.decode
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
-            return vae.decode
+            return decode_fn
+
+        compiled_callable = compiled_callable or self._compiled_vae_decode
 
         will_compile = (
-            self._compiled_vae_decode.target_id != id(vae)
-            or self._compiled_vae_decode.compiled_module is None
+            compiled_callable.target_id != id(vae)
+            or compiled_callable.compiled_module is None
         )
         if current_platform.is_npu():
             compile_kwargs = build_torch_compile_kwargs(mode=None)
@@ -183,8 +193,8 @@ class DecodingStage(PipelineStage):
             if will_compile:
                 logger.info("Compiling VAE decode with mode: %s", mode)
 
-        return self._compiled_vae_decode.get_or_compile(
-            vae, vae.decode, compile_kwargs=compile_kwargs
+        return compiled_callable.get_or_compile(
+            vae, decode_fn, compile_kwargs=compile_kwargs
         )
 
     @torch.no_grad()
@@ -287,34 +297,45 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+            # Request-scoped VAE fast-path gate (see flux2_vae_cuda_opt):
+            # quality == "high" opts this decode into the near-lossless fast
+            # paths; the "lossless" default keeps the bit-exact original
+            # module path. VAEs without installed wrappers have no gate.
+            gate = getattr(vae, "_sgl_vae_fast_path_gate", None)
+            if gate is not None:
+                gate.enabled = getattr(batch.sampling_params, "quality", None) == "high"
+            try:
+                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
-            # decode trajectory latents if needed
-            if batch.return_trajectory_decoded:
-                assert (
-                    batch.trajectory_latents is not None
-                ), "batch should have trajectory latents"
+                # decode trajectory latents if needed
+                if batch.return_trajectory_decoded:
+                    assert (
+                        batch.trajectory_latents is not None
+                    ), "batch should have trajectory latents"
 
-                # 1. Batch trajectory decoding to improve GPU utilization
-                # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
-                B, T, C, F, H, W = batch.trajectory_latents.shape
-                flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+                    # 1. Batch trajectory decoding to improve GPU utilization
+                    # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
+                    B, T, C, F, H, W = batch.trajectory_latents.shape
+                    flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
 
-                logger.info("decoding %s trajectory latents in batch", B * T)
-                # Use the optimized batch decode
-                all_decoded = self.decode(
-                    flat_latents, server_args, vae_dtype=vae_dtype
-                )
+                    logger.info("decoding %s trajectory latents in batch", B * T)
+                    # Use the optimized batch decode
+                    all_decoded = self.decode(
+                        flat_latents, server_args, vae_dtype=vae_dtype
+                    )
 
-                # 2. Reshape back
-                # Keep on GPU to allow faster vectorized post-processing
-                decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+                    # 2. Reshape back
+                    # Keep on GPU to allow faster vectorized post-processing
+                    decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
 
-                # Convert to list of tensors (per timestep) as expected by OutputBatch
-                # Each element in list is [B, channels, frames, H_out, W_out]
-                trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
-            else:
-                trajectory_decoded = None
+                    # Convert to list of tensors (per timestep) as expected by OutputBatch
+                    # Each element in list is [B, channels, frames, H_out, W_out]
+                    trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
+                else:
+                    trajectory_decoded = None
+            finally:
+                if gate is not None:
+                    gate.enabled = False
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 

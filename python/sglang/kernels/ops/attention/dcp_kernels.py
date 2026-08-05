@@ -202,6 +202,7 @@ def _correct_attn_cp_out_kernel(
     lse_idx,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    IS_LSE_BASE_ON_E: tl.constexpr,
 ):
     """
     Apply the all-gathered lses to correct each local rank's attention
@@ -242,9 +243,9 @@ def _correct_attn_cp_out_kernel(
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == neg_inf, 0.0, lse_max)
     lse = lse - lse_max
-    lse_exp = tl.exp2(lse)
+    lse_exp = tl.exp(lse) if IS_LSE_BASE_ON_E else tl.exp2(lse)
     lse_acc = tl.sum(lse_exp, axis=0)
-    final_lse = tl.log2(lse_acc) + lse_max
+    final_lse = (tl.log(lse_acc) if IS_LSE_BASE_ON_E else tl.log2(lse_acc)) + lse_max
 
     # Compute correction factor
     lse_offset = lse_idx * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
@@ -255,7 +256,7 @@ def _correct_attn_cp_out_kernel(
         neg_inf,
         lse_diff,
     )
-    factor = tl.exp2(lse_diff)
+    factor = tl.exp(lse_diff) if IS_LSE_BASE_ON_E else tl.exp2(lse_diff)
 
     # Store final LSE
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
@@ -298,6 +299,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: Optional[CPTritonContext],
     new_output: torch.Tensor = None,
+    is_lse_base_on_e: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -361,7 +363,11 @@ def correct_attn_out(
         no_sD,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N}
+    const_args = {
+        "HEAD_DIM": D,
+        "N_ROUNDED": N,
+        "IS_LSE_BASE_ON_E": is_lse_base_on_e,
+    }
 
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return new_output, lse
