@@ -330,9 +330,6 @@ class LongcatFlashMoE(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
-            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
-
         # LONGCAT_MOE_A2A_SKIP_ALLREDUCE: skip the post-experts TP all-reduce when a
         # real EP a2a backend is active -- self.experts (DeepEPMoE) already combined
         # expert outputs across EP ranks, so an extra all-reduce double-counts.
@@ -340,6 +337,9 @@ class LongcatFlashMoE(nn.Module):
 
         if self.tp_size > 1 and _lc_gab().is_none():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+            final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
