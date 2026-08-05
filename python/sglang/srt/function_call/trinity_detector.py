@@ -18,6 +18,15 @@ class TrinityDetector(Qwen25Detector):
     Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
     """
 
+    _think_tokens = ("<think>", "</think>")
+
+    def __init__(self):
+        super().__init__()
+        # Carries a trailing partial `<think>`/`</think>` tag that split across
+        # a streaming chunk boundary, so it can be completed and stripped on the
+        # next increment instead of leaking into normal_text.
+        self._think_tag_carry = ""
+
     def _strip_think_tags(self, text: str) -> str:
         """Remove <think> and </think> tags, keeping the content inside."""
         return text.replace("<think>", "").replace("</think>", "")
@@ -37,7 +46,22 @@ class TrinityDetector(Qwen25Detector):
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for tool calls.
+
+        Stripping per-increment is unsafe: a `<think>`/`</think>` tag can split
+        across chunk boundaries (`"<thi"` + `"nk>"`), and neither half contains
+        the full tag, so it leaks through raw. Strip on the carried buffer and
+        hold back a trailing partial tag until the next increment completes it —
+        matching the one-shot `detect_and_parse` behavior.
         """
-        return super().parse_streaming_increment(
-            self._strip_think_tags(new_text), tools
+        stripped = self._strip_think_tags(self._think_tag_carry + new_text)
+        holdback = max(
+            (self._ends_with_partial_token(stripped, tok) or 0)
+            for tok in self._think_tokens
         )
+        if holdback:
+            self._think_tag_carry = stripped[-holdback:]
+            forward = stripped[:-holdback]
+        else:
+            self._think_tag_carry = ""
+            forward = stripped
+        return super().parse_streaming_increment(forward, tools)
