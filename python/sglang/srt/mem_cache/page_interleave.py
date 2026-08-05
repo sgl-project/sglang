@@ -19,7 +19,6 @@ pages — one per rank of the shard group. Everything above the memory pool
 (radix tree, allocator free list, ``req_to_token``, scheduler budgets) sees
 only logical token slots, identical on every rank (SPMD); everything below
 sees only its own physical pages; the boundary is the pure bijection below.
-See ``DESIGN_kv_sharding_logical_page.md``.
 
 The shard group is the group across which KV storage is replicated today and
 therefore can be striped without extra compute-time communication:
@@ -56,8 +55,8 @@ class PageShardSpec(msgspec.Struct, frozen=True):
 
     @property
     def logical_page_size(self) -> int:
-        """The allocation granule. (The radix-tree match quantum stays at the
-        physical ``page_size`` — see DESIGN_kv_shard_subgranule_reuse.md.)"""
+        """The allocation granule. The radix-tree match quantum stays at the
+        physical ``page_size``, so a prefix can be reused sub-granule."""
         return self.shard_size * self.page_size
 
 
@@ -92,7 +91,9 @@ class PageInterleavePlacement:
 
 
 def is_kv_cache_sharding_enabled(kvc: KVCacheConfigurator) -> bool:
-    return not kvc.is_draft_worker and kvc.server_args.enable_kv_cache_sharding
+    from sglang.srt.runtime_context import get_parallel
+
+    return not kvc.is_draft_worker and get_parallel().enable_kv_cache_sharding
 
 
 def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
@@ -139,19 +140,18 @@ def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
     if shard_rank is None:
         return 0
 
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_parallel, get_schedule
     from sglang.srt.utils.common import ceil_align
 
     model_config = kvc.model_config
     granule = shard_size * kvc.page_size
-    # Rotated owner-classed allocation: a K-page prefix gathers as
-    # N * ceil(K / N) pages <= ceil_align(context_len, granule), exactly —
-    # rotation keeps per-rank owned counts within 1, so there is no per-turn
-    # seam term. The chunk region is per-page (chunk boundaries are
-    # ps-floored).
+    # Rotated owner-classed allocation keeps per-rank owned counts within 1, so
+    # a K-page prefix gathers as exactly N * ceil(K / N) pages, bounded by
+    # ceil_align(context_len, granule). The chunk region is sized per-page
+    # because chunk boundaries are page-size floored.
     rows = (
         ceil_align(model_config.context_len, granule)
-        + ceil_align(kvc.server_args.chunked_prefill_size, kvc.page_size)
+        + ceil_align(get_schedule().chunked_prefill_size, kvc.page_size)
         + kvc.page_size
     )
     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)

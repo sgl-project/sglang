@@ -14,7 +14,7 @@
 
 """Allocator for logical-page KV sharding (see mem_cache/page_interleave.py).
 
-Rotated owner-classed page allocation (DESIGN_kv_shard_classed_page_alloc.md):
+Rotated owner-classed page allocation:
 physical pages are handed out one at a time from N mirrored per-rank class
 free lists. Logical page ``l = loc // ps`` is owned by rank ``l % N`` and is
 that rank's local physical page ``l // N``, so class ``r``'s free list IS
@@ -32,15 +32,14 @@ class choice correct; balance is pure policy:
 Every list, cursor decision, and pop is a pure function of the mirrored
 alloc/free stream, so the state is byte-identical across shard-group ranks
 by construction (SPMD, no consensus protocol). A freed page is immediately
-reusable — the whole-group design's per-turn granule stranding (adoption,
-liveness counting, dead-at-birth padding) is gone.
+reusable: nothing strands a page until its whole logical group is free.
 
 ``available_size`` reports the MIN-CLASS capacity floor
 (``N * min_r free_pages(r) * ps``): in-flight P/D transfers lock tree nodes,
 so an aggregate gate could admit a request whose tight class has nothing
 evictable — fail-loud where min-class admission defers. Rotation plus
 least-full seeding keeps the classes near-balanced, so the floor tracks the
-aggregate within the bounded skew (design §4.1).
+aggregate within the bounded skew.
 """
 
 from __future__ import annotations
@@ -115,6 +114,9 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         ]
         self.is_not_in_free_group = True
         self.free_group = []
+        # free_segment() routes back to free(), so this stays empty; the paged
+        # base's free_group_end() reads it unconditionally.
+        self.free_page_reps_group = []
         # Neutralize the base single-list attributes: every consumer of this
         # allocator must go through the classed API (or fail loud on None),
         # never a stale flat free list.
@@ -150,7 +152,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         class fills (SPMD-safe). Least-full seeding is required, not
         cosmetic: oblivious round-robin drifts unboundedly under adversarial
         traffic, least-full self-corrects the per-chain <= 1-page remainders
-        to multinomial noise (design §4.1)."""
+        to multinomial noise."""
         counts = self.class_free_page_counts()
         return max(range(self.shard_size), key=lambda r: (counts[r], -r))
 
@@ -347,15 +349,26 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             self.debug_check_classes()
 
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        # Back to the base contract (plain free): the paged override derives
+        # page representatives by striding and hands them to _release_page_ids,
+        # which writes the stock free_pages list this allocator does not use.
+        # start_pos buys nothing here — free() keys pages by owner class, which
+        # needs the page ids anyway.
+        self.free(free_index)
+
+    def _release_page_ids(self, *page_ids: torch.Tensor):
+        raise NotImplementedError(
+            "PageInterleavePoolAllocator keeps free pages in per-owner class "
+            "lists; a caller reaching the stock free_pages list would leak them"
+        )
+
+    def _debug_check_no_duplicate_pages(self):
+        # The base sweep concatenates the neutralized flat lists; the classed
+        # census is the equivalent check here.
+        self.debug_check_classes()
+
     # ---- state / debug ----------------------------------------------------------
-
-    def backup_state(self):
-        return (list(self.class_free_pages), list(self.class_release_pages))
-
-    def restore_state(self, state):
-        class_free_pages, class_release_pages = state
-        self.class_free_pages = list(class_free_pages)
-        self.class_release_pages = list(class_release_pages)
 
     def resize(self, config) -> None:
         raise NotImplementedError(

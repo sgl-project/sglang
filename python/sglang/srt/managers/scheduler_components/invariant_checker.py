@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
@@ -110,7 +111,7 @@ class SchedulerInvariantChecker:
         class_watermark_msg = ""
         widened_page_alloc = (
             getattr(self.server_args, "dcp_size", 1) > 1
-            or self.server_args.enable_kv_cache_sharding
+            or get_parallel().enable_kv_cache_sharding
         ) and allocator.page_size > 1
         if widened_page_alloc:
             from sglang.srt.mem_cache.allocator.page_interleave import (
@@ -122,8 +123,8 @@ class SchedulerInvariantChecker:
                 # needs the AGGREGATE free size — the admission-facing
                 # available_size() is the min-class capacity floor and
                 # under-reports the aggregate by the (bounded) class skew.
-                # Export the per-class free-page watermarks here: they gate
-                # the deferred rebalancing knobs (design §4.1).
+                # The per-class free-page watermarks are exported alongside so
+                # a skewed class shows up in the log.
                 round_to = allocator.physical_page_size
                 full_available_size = allocator.aggregate_free_size()
                 class_watermark_msg = (
@@ -180,11 +181,14 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba
-            free_full_pages = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
-                + self.token_to_kv_pool_allocator.release_pages.tolist()
-            )
+            # Page-level leak diagnosis for mamba. Allocator flavors without
+            # page free-lists (free_pages is None) skip the page census — the
+            # dump must never crash the watchdog thread that calls it.
+            free_pages = self.token_to_kv_pool_allocator.free_pages
+            release_pages = self.token_to_kv_pool_allocator.release_pages
+            if free_pages is None or release_pages is None:
+                return leak, msg
+            free_full_pages = set(free_pages.tolist() + release_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             expected_full_pages = set(
                 range(1, self.token_to_kv_pool_allocator.size + 1)

@@ -13,8 +13,7 @@
 # ==============================================================================
 """Unit tests for logical-page KV cache sharding (CPU only).
 
-Pins the pure arithmetic the design hangs on
-(DESIGN_kv_shard_classed_page_alloc.md — rotated owner-classed allocation):
+Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 
 1. The placement bijection ``loc = Q*(N*ps) + r*ps + o`` — owner / local-row
    round-trip, disjoint equal partition across ranks.
@@ -155,11 +154,10 @@ class TestClassedAllocator(CustomTestCase):
             self.assertTrue(torch.equal(pages // N, torch.arange(1, 33)))
 
     def test_rotation_worked_example_zero_stranding(self):
-        """Appendix A of DESIGN_kv_shard_classed_page_alloc.md, scaled to
-        ps=16: turn 1 allocates cyclic owners from the root base; the
-        turn-boundary free returns its page whole (immediately reusable —
-        the whole-group design stranded one granule here); turn 2 continues
-        the rotation and reuses the freed page first."""
+        """Two-turn worked example at ps=16: turn 1 allocates cyclic owners
+        from the root base; the turn-boundary free returns its page whole and
+        immediately reusable; turn 2 continues the rotation and reuses the
+        freed page before any fresh one."""
         alloc = _make_allocator()
         total = alloc.available_size()
 
@@ -193,7 +191,7 @@ class TestClassedAllocator(CustomTestCase):
         """available_size is the MIN-CLASS floor: draining one class must
         zero the admission budget even while the aggregate stays large —
         an aggregate gate would over-admit into the alloc path's fail-loud
-        RuntimeError when the tight class is protected (design §4)."""
+        RuntimeError when the tight class is protected."""
         alloc = _make_allocator(pages_per_rank=4)
         outs = [_alloc_extend(alloc, 0, PS, rotation_base=3) for _ in range(4)]
         self.assertEqual(alloc.class_free_page_counts(), [4, 4, 4, 0])
@@ -264,15 +262,26 @@ class TestClassedAllocator(CustomTestCase):
         deltas = [a - b for a, b in zip(after, before)]
         self.assertEqual(deltas, [1, 0, 0, 1])  # classes (1+2)%4=3 and (1+3)%4=0
 
-    def test_backup_restore_roundtrip(self):
+    def test_free_segment_returns_pages_to_their_classes(self):
+        # The radix cache frees through free_segment/free_segments. The paged
+        # base routes those to the stock free_pages list, which this allocator
+        # never reads, so the override must land them in the class lists.
         alloc = _make_allocator()
+        total = alloc.available_size()
         out = _alloc_extend(alloc, 0, 3 * PS, rotation_base=2)
-        state = alloc.backup_state()
-        counts = alloc.class_free_page_counts()
-        alloc.free(out)
-        self.assertNotEqual(alloc.class_free_page_counts(), counts)
-        alloc.restore_state(state)
-        self.assertEqual(alloc.class_free_page_counts(), counts)
+        self.assertLess(alloc.available_size(), total)
+        alloc.free_segment(out, start_pos=0)
+        self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.class_free_page_counts(), [32] * N)
+
+    def test_free_segments_splits_at_a_page_boundary(self):
+        alloc = _make_allocator()
+        total = alloc.available_size()
+        out = _alloc_extend(alloc, 0, 4 * PS, rotation_base=0)
+        # Two disjoint ascending segments of one request's kv row.
+        alloc.free_segments([(out[: 2 * PS], 0), (out[2 * PS :], 2 * PS)])
+        self.assertEqual(alloc.available_size(), total)
+        self.assertEqual(alloc.class_free_page_counts(), [32] * N)
 
     def test_need_sort_merges_per_class(self):
         alloc = _make_allocator(pages_per_rank=4, need_sort=True)
@@ -511,9 +520,7 @@ class TestRotationGraftDecline(CustomTestCase):
         pool = MagicMock()
         pool.req_to_token = req_to_token
         pool.write = lambda idx, values: req_to_token.__setitem__(idx, values)
-        tree = RadixCache.create_simulated(
-            mock_allocator=allocator, page_size=self.PS
-        )
+        tree = RadixCache.create_simulated(mock_allocator=allocator, page_size=self.PS)
         tree.req_to_token_pool = pool
         return tree, allocator, req_to_token
 
@@ -590,15 +597,17 @@ class TestRotationGraftDecline(CustomTestCase):
         req_to_token[0, :12] = own_locs
         tree.cache_finished_req(req, kv_len_to_handle=12)
         freed = torch.cat(
-            [torch.as_tensor(c.args[0]) for c in allocator.free.call_args_list]
+            [
+                torch.as_tensor(seg)
+                for call in allocator.free_segments.call_args_list
+                for seg, _start_pos in call.args[0]
+            ]
         )
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
         # grafted).
         self.assertEqual(set(freed.tolist()), set(own_locs.tolist()))
-        m = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", req.fill_ids)))
-        )
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", req.fill_ids))))
         self.assertEqual(len(m.device_indices), 8)
 
 
@@ -644,8 +653,7 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
 def _run_begin(stub, prefix_lens, seq_lens, rows):
     width = max(r.numel() for r in rows)
     padded = [
-        torch.cat([r, torch.zeros(width - r.numel(), dtype=torch.int32)])
-        for r in rows
+        torch.cat([r, torch.zeros(width - r.numel(), dtype=torch.int32)]) for r in rows
     ]
     PageInterleaveKVPoolMixin.begin_shard_extend(
         stub,
@@ -695,9 +703,7 @@ class TestBeginShardExtendPlan(CustomTestCase):
                 self.assertEqual(int(stub._page_pos[page]), slot)
             for j, page in enumerate(pages[7:]):
                 self.assertEqual(int(stub._page_pos[page]), N * block + j)
-            own = sorted(
-                (p for p in pages[:7] if p % N == rank), key=lambda p: p // N
-            )
+            own = sorted((p for p in pages[:7] if p % N == rank), key=lambda p: p // N)
             expect = torch.cat(
                 [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
             )
@@ -729,9 +735,7 @@ class TestBeginShardExtendPlan(CustomTestCase):
             [4 * PS, 7 * PS, 4 * PS - 3],
             rows,
         )
-        slots, block = _reference_prefix_slots(
-            [chain_a[:3], chain_a[:5], chain_c[:2]]
-        )
+        slots, block = _reference_prefix_slots([chain_a[:3], chain_a[:5], chain_c[:2]])
         self.assertEqual(block, 1 + 2 + 1)
         self.assertEqual(stub._block_pages, block)
         for page, slot in slots.items():
@@ -754,9 +758,7 @@ class TestBeginShardExtendPlan(CustomTestCase):
                 [4 * PS, 7 * PS, 4 * PS - 3],
                 rows,
             )
-            own = sorted(
-                (p for p in all_prefix if p % N == rank), key=lambda p: p // N
-            )
+            own = sorted((p for p in all_prefix if p % N == rank), key=lambda p: p // N)
             self.assertLessEqual(len(own), block)
             self.assertEqual(stub_r._send_rows.numel(), block * PS)
             expect_head = torch.cat(
@@ -775,7 +777,9 @@ class TestBeginShardExtendPlan(CustomTestCase):
         pages = [9 * N + 0, 5 * N + 1, 5 * N + 2, 5 * N + 3, 3 * N + 0]
         row = _chain_row(pages, 5 * PS)
         stub = _run_begin(
-            _make_pool_stub(_make_spec(), shard_rank=0), [5 * PS], [5 * PS + PS],
+            _make_pool_stub(_make_spec(), shard_rank=0),
+            [5 * PS],
+            [5 * PS + PS],
             [torch.cat([row, _chain_row([7 * N + 1], PS)])],
         )
         slots, block = _reference_prefix_slots([pages])
@@ -783,7 +787,9 @@ class TestBeginShardExtendPlan(CustomTestCase):
         # local 3 gets owner-0's first slot although it sits at position 4.
         self.assertEqual(int(stub._page_pos[3 * N + 0]), 0)
         self.assertEqual(int(stub._page_pos[9 * N + 0]), 1)
-        expect = torch.cat([torch.arange(3 * PS, 4 * PS), torch.arange(9 * PS, 10 * PS)])
+        expect = torch.cat(
+            [torch.arange(3 * PS, 4 * PS), torch.arange(9 * PS, 10 * PS)]
+        )
         self.assertTrue(torch.equal(stub._send_rows, expect))
 
     def test_plan_without_prefix(self):

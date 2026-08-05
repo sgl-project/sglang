@@ -36,7 +36,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import ActivationType
 
 # ---- SGLang Marlin ----
-from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -29,6 +29,8 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
+        # Publishes the config bags the configurator reads at construction.
+        get_context().override_server_args(model_path="dummy"),
         get_parallel().override(attn_tp_size=tp_size),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
@@ -63,6 +65,8 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -81,6 +85,8 @@ def _make_model_runner(
     mc = SimpleNamespace()
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
+    mc.kv_lora_rank = kv_lora_rank
+    mc.qk_rope_head_dim = qk_rope_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
         full_attention_layer_ids
@@ -97,11 +103,12 @@ def _make_model_runner(
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
+    mc.context_len = 8192
     mr.model_config = mc
-
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.max_total_tokens = None
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
@@ -117,10 +124,9 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
-    # Read by the logical-page KV sharding scratch charge
-    # (compute_page_shard_scratch_bytes) during configurator construction.
-    sa.enable_kv_cache_sharding = False
+    sa.kv_cache_dtype = "auto"
     mr.server_args = sa
 
     spec = MagicMock()
@@ -216,6 +222,44 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.get_dsa_index_head_dim",
+        return_value=128,
+    )
+    @patch(
+        "sglang.srt.model_executor.pool_configurator.is_deepseek_dsa",
+        return_value=True,
+    )
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        side_effect=(576, 656),
+    )
+    def test_dsa_mla_cell_size_uses_backend_kv_layout(
+        self, mock_calculate_mla_kv_cache_dim, _mock_is_dsa, _mock_index_head_dim
+    ):
+        num_layers = 2
+        raw = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+        )
+        packed = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+        )
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            raw_configurator = DefaultPoolConfigurator(raw)
+            packed_configurator = DefaultPoolConfigurator(packed)
+
+        # The DSA indexer adds 128 FP8 values and one FP32 scale (4 bytes).
+        self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
+        self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
+        self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):

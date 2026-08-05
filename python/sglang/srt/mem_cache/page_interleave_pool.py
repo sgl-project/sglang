@@ -14,11 +14,9 @@
 
 """KV pools striped at logical-page granularity across a shard group.
 
-Companion to ``DESIGN_kv_sharding_logical_page.md`` /
-``PLAN_kv_shard_logical_page_impl.md``. Per-layer pool tensors keep the stock
-shape and size — identical rows on every rank; only the written rows differ:
-each rank persists the rows it owns under the pure placement bijection
-(``mem_cache/page_interleave.py``).
+Per-layer pool tensors keep the stock shape and size — identical rows on every
+rank; only the written rows differ: each rank persists the rows it owns under
+the pure placement bijection (``mem_cache/page_interleave.py``).
 
 Central consequence for the forward pass: during a sharded prefill, extend
 attention never reads the KV pool — a rank's pool holds only its stripe of
@@ -28,12 +26,11 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
 - The prefix is NCCL-allgathered from the shard group into the slot one layer
   ahead, on a dedicated side stream with a dedicated ``PyNcclCommunicator``
   (the ``dsa_cache_layer_split.py`` broadcast template). Under rotated
-  owner-classed allocation (DESIGN_kv_shard_classed_page_alloc.md) the
-  owners of a cached prefix's pages are exactly cyclic, so per-rank owned
-  counts differ by <= 1: each rank sends its own prefix pages in position
-  order, padded to ``ceil(prefix_pages / N)`` pages with the (never
-  referenced) trash page — a *regular* in-place allgather, owner-major
-  output, no reorder pass.
+  owner-classed allocation the owners of a cached prefix's pages are exactly
+  cyclic, so per-rank owned counts differ by <= 1: each rank sends its own
+  prefix pages in position order, padded to ``ceil(prefix_pages / N)`` pages
+  with the (never referenced) trash page — a *regular* in-place allgather,
+  owner-major output, no reorder pass.
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
   write; MLA latent is replicated across the shard group at write time).
@@ -193,6 +190,12 @@ class PageInterleaveKVPoolMixin:
             scratch_rows,
         )
 
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported under logical-page KV sharding "
+            "(it writes pool rows directly, bypassing the ownership filter)"
+        )
+
     # ---- subclass hooks -------------------------------------------------------
 
     def _scratch_tensor_specs(self, rows: int) -> Dict[str, torch.Tensor]:
@@ -269,9 +272,7 @@ class PageInterleaveKVPoolMixin:
         # A prefix page shared by several requests gathers into ONE scratch
         # slot (torch.unique sorts — deterministic, mirrored); chunk pages
         # are per-request fresh allocations, disjoint by construction.
-        prefix_pages = (
-            torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
-        )
+        prefix_pages = torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
         chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
         n_prefix = prefix_pages.numel()
         n_chunk = chunk_pages.numel()
@@ -304,9 +305,9 @@ class PageInterleaveKVPoolMixin:
                 torch.arange(n_prefix, dtype=torch.int64, device=self.device)
                 - starts[sorted_owners]
             )
-            self._page_pos[sorted_pages] = (
-                sorted_owners * block_pages + within
-            ).to(torch.int32)
+            self._page_pos[sorted_pages] = (sorted_owners * block_pages + within).to(
+                torch.int32
+            )
         if n_chunk:
             self._page_pos[chunk_pages] = torch.arange(
                 n_prefix_slots,
