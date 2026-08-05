@@ -310,6 +310,9 @@ class LayerwiseOffloadManager:
         self.prepare_for_next_req(non_blocking=False)
         self.register_forward_hooks()
         self._configured = True
+        self.release_all()
+        self.model.to("cpu")
+        torch.mps.empty_cache()
         logger.info(
             f"Initialized synchronous MPS layerwise offload with {self.num_layers} layers"
         )

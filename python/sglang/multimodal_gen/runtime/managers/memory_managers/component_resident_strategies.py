@@ -491,6 +491,8 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
 
     def enter(self, module: nn.Module) -> None:
         if isinstance(module, LayerwiseOffloadableModuleMixin):
+            if current_platform.is_mps():
+                _module_to_local_device(module)
             module.prepare_for_next_req()
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
@@ -498,6 +500,9 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
             return
         for manager in module.layerwise_offload_managers:
             manager.release_all()
+        if current_platform.is_mps():
+            module.to("cpu")
+            torch.mps.empty_cache()
 
     def prepare_after_request(
         self,
