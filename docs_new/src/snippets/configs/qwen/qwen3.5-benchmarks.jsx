@@ -5,6 +5,15 @@
 // the ACTUAL served tp (cells that omit --tp serve tp=1). Accuracy (P50) preserved from the
 // prior fill. Cells without an entry render "pending" (in-progress re-bench, or non-NVIDIA
 // hardware we can't re-measure: xeon/AMD — their old conc-100 speed was dropped).
+//
+// NOTE on a few cells where the high-throughput peak tok/s/GPU sits at or below the
+// low-latency peak (e.g. b200/b300 122b & 397b, dense h200 27b): on these memory-bound
+// large models the HT sweep (conc 1024/4096 at isl 8192) is KV-bound and saturates —
+// requests queue (TTFT runs to hundreds of seconds) with no throughput headroom, so the
+// HT figure reflects an overloaded operating point, not a higher-throughput one. Numbers
+// are cache-cold run1 as measured; small b300-vs-b200 / fp8-vs-bf16 inversions are run1
+// variance. The genuinely higher-throughput operating point for these cells is nearer the
+// low-latency concurrency.
 
 export const benchmarks = [
   {
