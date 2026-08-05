@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -28,7 +29,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     partition_for_task,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args.server_args import Backend
 
 TARGET = {
@@ -302,6 +306,18 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
     assert stage.forward(batch, server_args) is batch
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend",
+        side_effect=ValueError("does not implement packed varlen attention"),
+    ) as get_attn_backend:
+        with pytest.raises(ValueError, match="does not implement packed varlen"):
+            stage.forward(batch, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SAGE_ATTN,
+        requires_packed_varlen=True,
+    )
 
     batch.sampling_params.quality = "ultra"
     server_args.attention_backend = None

@@ -34,6 +34,10 @@ class AttentionBackend(ABC):
     def get_impl_cls() -> type["AttentionImpl"]:
         raise NotImplementedError
 
+    @classmethod
+    def supports_packed_varlen(cls) -> bool:
+        return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
+
     @staticmethod
     @abstractmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:

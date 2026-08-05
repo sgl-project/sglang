@@ -151,6 +151,7 @@ def get_attn_backend(
     dtype: torch.dtype,
     supported_attention_backends: set[AttentionBackendEnum] | None = None,
     selected_attention_backend: AttentionBackendEnum | None = None,
+    requires_packed_varlen: bool = False,
 ) -> type[AttentionBackend]:
     if supported_attention_backends is None:
         be_tuple = tuple()
@@ -188,6 +189,10 @@ def get_attn_backend(
     )
 
     backend_name = attention_backend_cls.get_enum().name.lower()
+    if requires_packed_varlen and not attention_backend_cls.supports_packed_varlen():
+        raise ValueError(
+            f"Attention backend '{backend_name}' does not implement packed varlen attention"
+        )
     reason = "component constraint" if backend_name == constraint_backend else None
     if not _record_component_attn_backend(backend_name, reason):
         logger.info_once(f"Using {backend_name} attention backend")
