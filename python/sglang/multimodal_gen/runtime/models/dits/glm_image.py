@@ -969,7 +969,9 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         prior_embedding = self.prior_token_embedding(prior_token_id)
         if is_in_breakable_cuda_graph():
-            prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
+            prior_embedding = prior_embedding.masked_fill(
+                prior_token_drop.unsqueeze(-1), 0
+            )
         else:
             prior_embedding[prior_token_drop] *= 0.0
 
