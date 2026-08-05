@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import threading
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -75,6 +76,8 @@ class RuntimeHandle:
         self.scheduler_info = scheduler_info or {}
 
         self._openai_serving_classes = None
+        self._active_generation_futures = {}
+        self._generation_futures_lock = threading.Lock()
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
@@ -180,12 +183,36 @@ class RuntimeHandle:
         except Exception as e:
             logger.warning("gRPC clear_on_ready failed: %s", e)
 
-    def _submit_on_tm_loop(self, coro: Awaitable) -> None:
+    def _submit_on_tm_loop(self, coro: Awaitable):
         future = asyncio.run_coroutine_threadsafe(coro, self._tm_loop)
         future.add_done_callback(self._log_unhandled_future_exception)
+        return future
+
+    def _track_generation_future(self, rid: str, future) -> None:
+        with self._generation_futures_lock:
+            self._active_generation_futures[rid] = future
+
+        def _remove_finished(completed) -> None:
+            with self._generation_futures_lock:
+                if self._active_generation_futures.get(rid) is completed:
+                    self._active_generation_futures.pop(rid, None)
+
+        future.add_done_callback(_remove_finished)
+
+    def _cancel_generation_futures(self, rid: str, abort_all: bool) -> None:
+        with self._generation_futures_lock:
+            if abort_all:
+                futures = list(self._active_generation_futures.values())
+            else:
+                future = self._active_generation_futures.get(rid)
+                futures = [] if future is None else [future]
+        for future in futures:
+            future.cancel()
 
     @staticmethod
     def _log_unhandled_future_exception(future) -> None:
+        if future.cancelled():
+            return
         try:
             future.result()
         except Exception as e:
@@ -278,9 +305,12 @@ class RuntimeHandle:
 
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
-            self._submit_on_tm_loop(
+            future = self._submit_on_tm_loop(
                 self._run_generate(obj, chunk_callback, stream, mock_request)
             )
+            rid = req_dict.get("rid")
+            if isinstance(rid, str):
+                self._track_generation_future(rid, future)
         elif req_type == "embed":
             from sglang.srt.managers.io_struct import EmbeddingReqInput
 
@@ -363,6 +393,7 @@ class RuntimeHandle:
 
     def abort(self, rid: str = "", abort_all: bool = False):
         """Abort a request by request ID or abort all active requests."""
+        self._cancel_generation_futures(rid, abort_all)
         loop = self._tm_loop
 
         try:
