@@ -19,6 +19,7 @@ from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
+from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
@@ -71,6 +72,7 @@ __all__ = [
     "Step3VisionEncoderConfig",
     "Olmo3Config",
     "KimiLinearConfig",
+    "KimiK3Config",
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
