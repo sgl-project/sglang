@@ -182,8 +182,8 @@ bash sglang_start.sh \
 
 # 注: 最终实测仍存在 Worker 1 热点（10 排队）；追加 round_robin 是 7.4 已列出的缓解措施，
 #     本轮数据为加参数前的记录，加上后 TTFT 6.18s 可能进一步下降。
-#     注: 脚本默认已内置 mem=0.85 / max-running=12 / MTP / round_robin / 预热 / keep-alive / 代理 8080，
-#     仅当需要覆盖默认值时才显式传参。
+#     注: 脚本默认已内置 mem=0.85 / max-running=12 / MTP / round_robin / 预热 / keep-alive；
+#     代理默认关，需要限并发/priority 时加 --proxy-port 8080（tool_call=16 / thinking=12 为默认）。
 
 # 网关侧
 # Thinking:  enable_thinking=true,  max_tokens=8192, temperature=0.1

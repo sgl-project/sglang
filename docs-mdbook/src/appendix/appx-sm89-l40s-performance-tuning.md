@@ -749,9 +749,9 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 - **36 − 28 = 8 不是浪费**：槽位是容量上限不是工作岗位，GPU 打没打满看算力和显存带宽，不是请求数。28 个并发（含 12 个长输出）很可能已接近 L40S 饱和；硬塞满 36 会让每个请求变慢（实测高并发下 TTFT 1.35s→8.76s、abort 0.3%→3.3%）；
 - **判断是否调大**：看 `nvidia-smi` GPU-Util。经常 90%+ → 现状合理；经常 30~40% → 请求量不足或配置过保守，可上调 tool_call（tool call 是主力场景时优先调它，thinking 保持 12 保护 tool call 延迟）。
 
-**6 卡生产完整启动命令（默认值即生产配置，无需额外参数）**
+**6 卡生产完整启动命令（默认值即生产配置，代理按需开启）**
 
-`sglang_start.sh` 默认已内置生产配置：MTP 开 / 代理 8080 / tool_call=16 / thinking=12 / keep-alive 开 / 预热开 / priority 开 / round_robin / mem=0.85 / context=98304 / max-running=12。因此启动命令最短形式：
+`sglang_start.sh` 默认已内置生产配置：MTP 开 / keep-alive 开 / 预热开 / priority 开 / round_robin / mem=0.85 / context=98304 / max-running=12；**代理默认关**，`--proxy-port 8080` 开启后 tool_call=16 / thinking=12 为默认（传 `--proxy-tool-call-limit` / `--proxy-thinking-limit` 则用传入值）。生产推荐命令：
 
 ```bash
 export LD_PRELOAD=/usr/local/lib/python3.12/site-packages/sgl_kernel/sgl_stubs.so
@@ -760,7 +760,8 @@ export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
 bash sglang_start.sh \
     --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
-    --port 8000
+    --port 8000 \
+    --proxy-port 8080
 ```
 
 默认值清单与覆盖开关：
@@ -768,9 +769,9 @@ bash sglang_start.sh \
 | 配置项 | 默认值 | 覆盖开关 |
 |--------|--------|----------|
 | MTP 投机解码（NEXTN steps=3 draft=4） | 开 | `--no-speculative`（单卡验证不需要 MTP） |
-| 前置代理 | 开（8080） | `--no-proxy` 或 `--proxy-port 0` |
-| tool call 并发上限 | 16 | `--proxy-tool-call-limit N` |
-| thinking 并发上限 | 12 | `--proxy-thinking-limit N` |
+| 前置代理 | 关 | `--proxy-port 8080` 开启；`--no-proxy` / `--proxy-port 0` 关闭 |
+| tool call 并发上限（代理开启时） | 16 | `--proxy-tool-call-limit N` |
+| thinking 并发上限（代理开启时） | 12 | `--proxy-thinking-limit N` |
 | keep-alive | 开（45s） | `--no-keep-alive` |
 | 启动预热 | 开 | `--skip-warmup` |
 | priority 调度 | 开 | `--priority-scheduling` 仍可显式传 |
@@ -780,7 +781,7 @@ bash sglang_start.sh \
 
 > tool call 上限由启动参数固化（默认 16），运行中热调不持久化，pod 重启恢复启动默认值。
 >
-> 注意：**多实例拆分**（如 7 卡 4+2+1）时各实例默认都会起代理占用 8080，必须用 `--no-proxy` 或分别指定 `--proxy-port`，避免端口冲突。
+> 注意：**多实例拆分**（如 7 卡 4+2+1）时，只有显式开了代理的实例才占端口；若多实例都要代理，必须分别指定不同 `--proxy-port`，避免端口冲突。
 
 **自适应限流（可选，替代人工盯曲线手调）**
 
@@ -831,7 +832,7 @@ curl -X POST http://<service-ip>:8080/admin/limits \
 - 语义：priority 值越高越先调度（默认）；可选 `--disable-priority-preemption` 控制是否抢占；
 - 注意：priority **只改队列顺序，不改 GPU 计算份额**，网关限并发不能省。
 - 落地：`sglang_start.sh` 内置 `--priority-scheduling`，且**默认已开启**（自动切 `--schedule-policy priority` 并加 `--enable-priority-scheduling --default-priority-value 0`）；未传 priority 的请求默认 0，全 0 时等价 fcfs，无副作用。
-- **只改启动脚本层的完整方案**：`sglang_start.sh` 默认（`--proxy-port 8080`）会在脚本内同时拉起 [sglang_proxy.py](appendix/sglang_proxy.py) 前置代理——客户端连代理端口，代理按类型限并发（tool call 16 / thinking 12，超时 429）、给 tool call 注入 `priority=10` 后转发到本机 SGLang；流式响应期间持续占用槽位。代理代码与脚本同目录，随镜像持久化。
+- **只改启动脚本层的完整方案**：`sglang_start.sh` 加 `--proxy-port 8080` 会在脚本内同时拉起 [sglang_proxy.py](appendix/sglang_proxy.py) 前置代理（代理默认关）——客户端连代理端口，代理按类型限并发（tool call 16 / thinking 12，超时 429）、给 tool call 注入 `priority=10` 后转发到本机 SGLang；流式响应期间持续占用槽位。代理代码与脚本同目录，随镜像持久化。
 - **限并发运行时可调（不用重启）**：`curl -X POST http://127.0.0.1:8080/admin/limits -H 'Content-Type: application/json' -d '{"tool_call": 12, "thinking": 16}'` 即时生效（重建信号量，在途请求不受影响）；**查询当前值**：`curl -s http://127.0.0.1:8080/admin/limits` → `{"limits": {"tool_call": ..., "thinking": ...}}`；启动默认值用脚本 `--proxy-tool-call-limit` / `--proxy-thinking-limit` 设置。调大后盯 TTFT 趋势，`num_queue_reqs` 上涨即回落。
 - **K8s pod 场景（无法 exec 进 pod）**：代理监听 `0.0.0.0`，只要 K8s Service 暴露了 8080 端口，pod 外任意能访问 Service IP 的机器都能查/调：
   - 查询：`curl -s http://<service-ip>:8080/admin/limits`

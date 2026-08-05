@@ -310,7 +310,7 @@ bash /usr1/sglang_scripts/sglang_start.sh --model-path /usr1/project/models/Qwen
 bash /usr1/sglang_scripts/sglang_start.sh --model-path /usr1/project/models/Qwen3.6-35B-A3B-FP8
 ```
 
-> 脚本默认值即生产配置（MTP 开 / 代理 8080 / tool_call=16 / thinking=12 / keep-alive / 预热 / priority / round_robin / mem=0.85 / context=98304 / max-running=12）。单卡验证如不需要 MTP 与代理，可加 `--no-speculative --no-proxy --skip-warmup`；多实例拆分时各实例必须 `--no-proxy` 或指定不同 `--proxy-port`，避免都占 8080。
+> 脚本默认值即生产配置（MTP 开 / keep-alive / 预热 / priority / round_robin / mem=0.85 / context=98304 / max-running=12）；**代理默认关**，`--proxy-port 8080` 开启后 tool_call=16 / thinking=12 为默认。单卡验证如不需要 MTP，可加 `--no-speculative --skip-warmup`；多实例拆分时各实例可自由决定是否开代理，若多实例都要代理则分别指定不同 `--proxy-port`。
 
 | GPU数 | 自动推断 | 上下文 | mem | 并发(总) |
 |--------|---------|--------|-----|------|

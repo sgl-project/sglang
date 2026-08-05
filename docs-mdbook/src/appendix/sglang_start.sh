@@ -15,12 +15,14 @@
 #   bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-35B-A3B-FP8
 #   bash sglang_start.sh --model-path /path/to/model --port 8001 --gpu-ids 0,1
 #
-# 默认值即生产配置（无需额外参数）: MTP 开 / 代理 8080 / tool_call=16 / thinking=12 /
-#   keep-alive 开 / 预热开 / priority 开 / round_robin / mem=0.85 / context=98304 / max-running=12
+# 默认值即生产配置（无需额外参数）: MTP 开 / keep-alive 开 / 预热开 / priority 开 /
+#   round_robin / mem=0.85 / context=98304 / max-running=12
+# 代理默认关: --proxy-port 8080 开启；开启后 tool_call=16 / thinking=12 为默认，
+#   传 --proxy-tool-call-limit / --proxy-thinking-limit 则用传入值
 # 覆盖开关: --no-speculative / --no-proxy / --proxy-port 0 / --no-keep-alive / --skip-warmup
-# 自适应限流: --adaptive-limit 开启（控制器自动调代理 limits，默认关）
+# 自适应限流: --adaptive-limit 开启（需同时开代理；控制器自动调代理 limits，默认关）
 # 注意: 多实例拆分（如 7 卡 4+2+1）时各实例必须用 --no-proxy 或不同 --proxy-port，
-#        避免都占用默认 8080。
+#        避免端口冲突。
 
 set -e
 source ~/.bashrc 2>/dev/null || true
@@ -40,7 +42,7 @@ CHUNKED_PREFILL_SIZE=4096
 KV_CACHE_DTYPE=fp8_e5m2
 MAMBA_RADIX_CACHE_STRATEGY=extra_buffer
 MAMBA_BACKEND=triton
-ENABLE_SPECULATIVE=false
+ENABLE_SPECULATIVE=true
 SPECULATIVE_NUM_STEPS=3
 SPECULATIVE_EAGLE_TOPK=1
 SPECULATIVE_NUM_DRAFT_TOKENS=4
@@ -51,7 +53,7 @@ KEEP_ALIVE=true
 KEEP_ALIVE_INTERVAL=45
 LOAD_BALANCE_METHOD=round_robin
 ENABLE_PRIORITY=true
-PROXY_PORT=8080
+PROXY_PORT=0
 PROXY_TOOL_CALL_LIMIT=16
 PROXY_THINKING_LIMIT=12
 ADAPTIVE_LIMIT=false
