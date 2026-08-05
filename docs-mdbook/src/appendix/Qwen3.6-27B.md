@@ -178,14 +178,12 @@ Per-Worker Cache (最终混合数据):
 bash sglang_start.sh \
     --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
     --context-length 98304 \
-    --mem-fraction-static 0.85 \
-    --max-running-requests 12 \
-    --enable-speculative \
-    --load-balance-method round_robin \
-    --warmup --keep-alive
+    --port 8000
 
 # 注: 最终实测仍存在 Worker 1 热点（10 排队）；追加 round_robin 是 7.4 已列出的缓解措施，
 #     本轮数据为加参数前的记录，加上后 TTFT 6.18s 可能进一步下降。
+#     注: 脚本默认已内置 mem=0.85 / max-running=12 / MTP / round_robin / 预热 / keep-alive / 代理 8080，
+#     仅当需要覆盖默认值时才显式传参。
 
 # 网关侧
 # Thinking:  enable_thinking=true,  max_tokens=8192, temperature=0.1

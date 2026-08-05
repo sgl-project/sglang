@@ -14,6 +14,12 @@
 #   bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8
 #   bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-35B-A3B-FP8
 #   bash sglang_start.sh --model-path /path/to/model --port 8001 --gpu-ids 0,1
+#
+# 默认值即生产配置（无需额外参数）: MTP 开 / 代理 8080 / tool_call=16 / thinking=12 /
+#   keep-alive 开 / 预热开 / priority 开 / round_robin / mem=0.85 / context=98304 / max-running=12
+# 覆盖开关: --no-speculative / --no-proxy / --proxy-port 0 / --no-keep-alive / --skip-warmup
+# 注意: 多实例拆分（如 7 卡 4+2+1）时各实例必须用 --no-proxy 或不同 --proxy-port，
+#        避免都占用默认 8080。
 
 set -e
 source ~/.bashrc 2>/dev/null || true
@@ -38,14 +44,14 @@ SPECULATIVE_NUM_STEPS=3
 SPECULATIVE_EAGLE_TOPK=1
 SPECULATIVE_NUM_DRAFT_TOKENS=4
 KILL_EXISTING=false
-SKIP_WARMUP=true
+SKIP_WARMUP=false
 SCHEDULE_POLICY=lpm
-KEEP_ALIVE=false
+KEEP_ALIVE=true
 KEEP_ALIVE_INTERVAL=45
 LOAD_BALANCE_METHOD=round_robin
 ENABLE_PRIORITY=true
-PROXY_PORT=0
-PROXY_TOOL_CALL_LIMIT=8
+PROXY_PORT=8080
+PROXY_TOOL_CALL_LIMIT=16
 PROXY_THINKING_LIMIT=12
 
 while [[ $# -gt 0 ]]; do
@@ -59,17 +65,21 @@ while [[ $# -gt 0 ]]; do
         --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2 ;;
         --max-running-requests) MAX_RUNNING_REQUESTS="$2"; shift 2 ;;
         --enable-speculative) ENABLE_SPECULATIVE=true; shift ;;
+        --no-speculative) ENABLE_SPECULATIVE=false; shift ;;
         --speculative-num-steps) SPECULATIVE_NUM_STEPS="$2"; shift 2 ;;
         --speculative-eagle-topk) SPECULATIVE_EAGLE_TOPK="$2"; shift 2 ;;
         --speculative-num-draft-tokens) SPECULATIVE_NUM_DRAFT_TOKENS="$2"; shift 2 ;;
         --kill-existing) KILL_EXISTING=true; shift ;;
         --warmup) SKIP_WARMUP=false; shift ;;
+        --skip-warmup) SKIP_WARMUP=true; shift ;;
         --schedule-policy) SCHEDULE_POLICY="$2"; shift 2 ;;
         --keep-alive) KEEP_ALIVE=true; shift ;;
+        --no-keep-alive) KEEP_ALIVE=false; shift ;;
         --keep-alive-interval) KEEP_ALIVE_INTERVAL="$2"; shift 2 ;;
         --load-balance-method) LOAD_BALANCE_METHOD="$2"; shift 2 ;;
         --priority-scheduling) ENABLE_PRIORITY=true; shift ;;
         --proxy-port) PROXY_PORT="$2"; shift 2 ;;
+        --no-proxy) PROXY_PORT=0; shift ;;
         --proxy-tool-call-limit) PROXY_TOOL_CALL_LIMIT="$2"; shift 2 ;;
         --proxy-thinking-limit) PROXY_THINKING_LIMIT="$2"; shift 2 ;;
         *) shift ;;
