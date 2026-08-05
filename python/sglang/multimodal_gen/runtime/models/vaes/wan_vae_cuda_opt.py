@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
+    GATE_ATTR,
+    VaeFastPathGate,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -26,42 +30,31 @@ except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
 
-class VaeFastPathGate:
-    """Mutable fast-path flag shared by every wrapper of one VAE; enabled by
-    ``DecodingStage`` while decoding a ``quality == "high"`` request."""
-
-    __slots__ = ("enabled",)
-
-    def __init__(self) -> None:
-        self.enabled = False
-
-
-GATE_ATTR = "_sgl_vae_fast_path_gate"
-
-
 class FusedWanRMSNormSiLU(nn.Module):
     """``WanRMS_norm`` + SiLU fused via the channels_last_3d Triton kernel;
-    falls back to the original chain (bit-identical to norm + ``nn.SiLU``)
+    falls back to the original op chain (bit-identical to norm + ``nn.SiLU``)
     for unsupported inputs and whenever the gate is off. Steps aside under
     ``torch.compile``, where Inductor already fuses this chain."""
 
     def __init__(self, norm: nn.Module, gate: VaeFastPathGate) -> None:
         super().__init__()
-        self.norm = norm
+        # Keep the norm's parameters registered directly on the wrapper so
+        # parameter names stay `...norm1.gamma` (weight transfer and
+        # state_dict load match by name).
+        self.gamma = norm.gamma
+        self.bias = norm.bias
+        self.scale = float(norm.scale)
         self._sgl_gate = gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._sgl_gate.enabled and not torch.compiler.is_compiling():
-            bias = self.norm.bias
-            y = wan_rmsnorm_silu(
-                x,
-                self.norm.gamma,
-                bias if isinstance(bias, torch.Tensor) else None,
-                rms_scale=float(self.norm.scale),
-            )
+            bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+            y = wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
             if y is not None:
                 return y
-        return F.silu(self.norm(x))
+        # WanRMS_norm.forward (channel-first) + SiLU, same ops in the same
+        # order, so the off-path stays bit-identical.
+        return F.silu(F.normalize(x, dim=1) * self.scale * self.gamma + self.bias)
 
 
 def _is_plain_silu(act: object) -> bool:

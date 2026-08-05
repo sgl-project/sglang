@@ -57,6 +57,8 @@ def test_fused_module_gate_dispatch() -> None:
     norm.gamma.add_(torch.randn_like(norm.gamma))
     gate = VaeFastPathGate()
     fused = FusedWanRMSNormSiLU(norm, gate)
+    # Parameter names must not change (weight transfer matches by name).
+    assert [n for n, _ in fused.named_parameters()] == ["gamma"]
     x = _cl3d((1, 96, 3, 10, 14), torch.bfloat16)
     assert torch.equal(fused(x), nn.SiLU()(norm(x)))
     gate.enabled = True
