@@ -150,6 +150,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ttl-s", type=float, default=30.0)
     parser.add_argument("--worker-ttl-s", type=float, default=15.0)
     parser.add_argument("--wait-timeout-s", type=float, default=10.0)
+    parser.add_argument("--candidate-limit", type=int, default=64)
     return parser.parse_args()
 
 
@@ -163,6 +164,7 @@ def main() -> None:
             ttl_s=args.ttl_s,
             worker_ttl_s=args.worker_ttl_s,
             region_name=args.region,
+            candidate_limit=args.candidate_limit,
         )
     else:
         store = InMemoryCoordinatorStore(

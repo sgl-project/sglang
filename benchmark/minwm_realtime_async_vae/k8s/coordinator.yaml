@@ -72,6 +72,7 @@ spec:
               --ttl-s=30
               --worker-ttl-s=15
               --wait-timeout-s=10
+              --candidate-limit=64
           env:
             - name: COORDINATOR_TABLE
               value: REPLACE_WITH_COORDINATOR_TABLE

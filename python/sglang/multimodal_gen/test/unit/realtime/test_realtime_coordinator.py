@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.realtime.coordinator import (
     InMemoryCoordinatorStore,
     RealtimeCoordinator,
     WorkerHeartbeat,
+    WorkerSlot,
 )
 
 
@@ -361,3 +362,80 @@ def test_dynamodb_slot_query_paginates_past_filtered_stale_slots():
         "allocation_key": {"S": "DENOISER#minwm-r1"},
         "allocation_sort": {"S": "stale-worker#0001"},
     }
+
+
+def test_dynamodb_candidate_pairing_spreads_bursts_across_workers():
+    denoisers = [
+        WorkerSlot(
+            worker_id=f"denoiser-{index}",
+            role="denoiser",
+            endpoint=f"ws://denoiser-{index}/generate",
+            az="us-east-2a",
+            slot_index=0,
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+        for index in range(8)
+    ]
+    vaes = [
+        WorkerSlot(
+            worker_id=f"vae-{index}",
+            role="vae",
+            endpoint=f"ws://vae-{index}/decode",
+            az="us-east-2a",
+            slot_index=0,
+            model_revision="all",
+            vae_fingerprint="taew2_2",
+        )
+        for index in range(8)
+    ]
+
+    first_denoisers = set()
+    for index in range(32):
+        pairs = DynamoDBCoordinatorStore._candidate_pairs(
+            denoisers,
+            vaes,
+            identity=f"user-{index}:session-{index}:generation-{index}",
+        )
+        assert len(pairs) == 8
+        assert len({pair[0].worker_id for pair in pairs}) == 8
+        assert len({pair[1].worker_id for pair in pairs}) == 8
+        first_denoisers.add(pairs[0][0].worker_id)
+
+    assert first_denoisers == {slot.worker_id for slot in denoisers}
+
+
+def test_dynamodb_heartbeat_retries_a_transient_transaction_conflict():
+    class TransactionConflictException(Exception):
+        pass
+
+    class FakeExceptions:
+        pass
+
+    FakeExceptions.TransactionConflictException = TransactionConflictException
+
+    class FakeClient:
+        exceptions = FakeExceptions()
+
+        def __init__(self):
+            self.slot_updates = 0
+
+        def put_item(self, **kwargs):
+            return None
+
+        def update_item(self, **kwargs):
+            self.slot_updates += 1
+            if self.slot_updates == 1:
+                raise TransactionConflictException("transaction in progress")
+
+    client = FakeClient()
+    store = DynamoDBCoordinatorStore(
+        "minwm-realtime-coordinator",
+        ttl_s=60,
+        worker_ttl_s=30,
+        client=client,
+    )
+
+    store._heartbeat_sync(_heartbeat("denoiser-a", "denoiser"))
+
+    assert client.slot_updates == 2

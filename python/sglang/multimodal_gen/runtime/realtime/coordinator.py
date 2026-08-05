@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal, Protocol
@@ -374,6 +375,37 @@ class DynamoDBCoordinatorStore:
             vae_fingerprint=self._read_s(item, "vae_fingerprint"),
         )
 
+    @staticmethod
+    def _candidate_pairs(
+        denoisers: list[WorkerSlot],
+        vaes: list[WorkerSlot],
+        *,
+        identity: str,
+    ) -> list[tuple[WorkerSlot, WorkerSlot]]:
+        if not denoisers or not vaes:
+            return []
+        digest = hashlib.sha256(identity.encode("utf-8")).digest()
+        denoiser_offset = int.from_bytes(digest[:8], "big") % len(denoisers)
+        vae_offset = int.from_bytes(digest[8:16], "big") % len(vaes)
+        ordered_denoisers = (
+            denoisers[denoiser_offset:] + denoisers[:denoiser_offset]
+        )
+        available_vaes = vaes[vae_offset:] + vaes[:vae_offset]
+        pairs: list[tuple[WorkerSlot, WorkerSlot]] = []
+        for denoiser in ordered_denoisers:
+            if not available_vaes:
+                break
+            vae_index = next(
+                (
+                    index
+                    for index, vae in enumerate(available_vaes)
+                    if vae.az == denoiser.az
+                ),
+                0,
+            )
+            pairs.append((denoiser, available_vaes.pop(vae_index)))
+        return pairs
+
     async def heartbeat(self, heartbeat: WorkerHeartbeat) -> None:
         InMemoryCoordinatorStore._validate_heartbeat(heartbeat)
         await asyncio.to_thread(self._heartbeat_sync, heartbeat)
@@ -404,9 +436,9 @@ class DynamoDBCoordinatorStore:
             vae_fingerprint=heartbeat.vae_fingerprint,
         )
         for slot_index in range(heartbeat.capacity):
-            client.update_item(
-                TableName=self.table_name,
-                Key={
+            update = {
+                "TableName": self.table_name,
+                "Key": {
                     "pk": {
                         "S": self._slot_pk(
                             heartbeat.role, heartbeat.worker_id, slot_index
@@ -414,7 +446,7 @@ class DynamoDBCoordinatorStore:
                     },
                     "sk": {"S": "LEASE"},
                 },
-                UpdateExpression=(
+                "UpdateExpression": (
                     "SET item_type = :item_type, #role = :role, "
                     "worker_id = :worker_id, endpoint = :endpoint, az = :az, "
                     "slot_index = :slot_index, model_revision = :model_revision, "
@@ -423,8 +455,11 @@ class DynamoDBCoordinatorStore:
                     "allocation_key = :allocation_key, "
                     "allocation_sort = :allocation_sort, #ttl = :ttl"
                 ),
-                ExpressionAttributeNames={"#role": "role", "#ttl": "ttl"},
-                ExpressionAttributeValues={
+                "ExpressionAttributeNames": {
+                    "#role": "role",
+                    "#ttl": "ttl",
+                },
+                "ExpressionAttributeValues": {
                     ":item_type": {"S": "worker_slot"},
                     ":role": {"S": heartbeat.role},
                     ":worker_id": {"S": heartbeat.worker_id},
@@ -440,7 +475,15 @@ class DynamoDBCoordinatorStore:
                     },
                     ":ttl": {"N": str(heartbeat_expires + 86400)},
                 },
-            )
+            }
+            for attempt in range(3):
+                try:
+                    client.update_item(**update)
+                    break
+                except client.exceptions.TransactionConflictException:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.01 * (2**attempt))
 
     def _query_slots_sync(
         self,
@@ -529,18 +572,11 @@ class DynamoDBCoordinatorStore:
             vae_fingerprint=vae_fingerprint,
             now_epoch=now_epoch,
         )
-        pairs = [
-            (denoiser, vae)
-            for denoiser in denoisers
-            for vae in sorted(
-                vaes,
-                key=lambda slot: (
-                    slot.az != denoiser.az,
-                    slot.worker_id,
-                    slot.slot_index,
-                ),
-            )
-        ]
+        pairs = self._candidate_pairs(
+            denoisers,
+            vaes,
+            identity=f"{user_id}:{session_id}:{generation_id}",
+        )
         if not pairs:
             raise CoordinatorRejected("CAPACITY_EXHAUSTED", retry_after_s=0.25)
 

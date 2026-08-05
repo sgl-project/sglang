@@ -591,6 +591,16 @@ def test_gateway_output_queue_absorbs_one_complete_frame_burst():
     assert "--output-queue-depth=32" in gateway
 
 
+def test_coordinator_candidate_window_covers_the_full_gpu_session_pool():
+    documents = load_documents(("coordinator.yaml",))
+    coordinator = find(
+        documents, "Deployment", "minwm-realtime-coordinator"
+    )
+    command = " ".join(_container(coordinator, "coordinator")["args"])
+
+    assert "--candidate-limit=64" in command
+
+
 def test_trace_uses_otlp_and_cloudwatch_with_five_day_retention():
     documents = load_documents(
         ("gateway.yaml", "coordinator.yaml", "h100-denoiser.yaml", "l4-vae.yaml", "observability.yaml")
