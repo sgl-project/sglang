@@ -26,6 +26,10 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
+from sglang.srt.utils.hf_transformers.config import (
+    _remap_gemma4_local_global_head_dims,
+    get_config,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -634,6 +638,99 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.assertEqual(result, ["mamba", "moe", "attention"])
         except ImportError:
             self.skipTest("NemotronHConfig not available in this transformers version")
+
+
+# ---------------------------------------------------------------------------
+# config: _remap_gemma4_local_global_head_dims
+# ---------------------------------------------------------------------------
+
+
+class TestRemapGemma4LocalGlobalHeadDims(unittest.TestCase):
+    def test_swaps_local_and_global_values(self):
+        # Shape of a Gemma4 `text_config`: base attrs hold the local
+        # (sliding-window) values, `global_*` holds the full-attention
+        # override -- the inverse of what SGLang's Gemma4 model code reads.
+        cfg = SimpleNamespace(
+            head_dim=256,
+            num_key_value_heads=16,
+            global_head_dim=512,
+            num_global_key_value_heads=4,
+        )
+        _remap_gemma4_local_global_head_dims(cfg)
+
+        self.assertEqual(cfg.head_dim, 512)
+        self.assertEqual(cfg.num_key_value_heads, 4)
+        self.assertEqual(cfg.swa_head_dim, 256)
+        self.assertEqual(cfg.swa_num_key_value_heads, 16)
+        self.assertEqual(cfg.v_head_dim, 512)
+        self.assertEqual(cfg.swa_v_head_dim, 256)
+
+    def test_no_op_for_global_fields_when_absent(self):
+        # A config with no `global_*` override (e.g. a uniform-attention
+        # variant) keeps its base head_dim/num_key_value_heads unchanged --
+        # only the swa_* mirror is populated.
+        cfg = SimpleNamespace(head_dim=128, num_key_value_heads=8)
+        _remap_gemma4_local_global_head_dims(cfg)
+
+        self.assertEqual(cfg.head_dim, 128)
+        self.assertEqual(cfg.num_key_value_heads, 8)
+        self.assertEqual(cfg.swa_head_dim, 128)
+        self.assertEqual(cfg.swa_num_key_value_heads, 8)
+        self.assertEqual(cfg.v_head_dim, 128)
+        self.assertEqual(cfg.swa_v_head_dim, 128)
+
+    def test_preserves_existing_v_head_dim(self):
+        cfg = SimpleNamespace(
+            head_dim=256,
+            num_key_value_heads=16,
+            global_head_dim=512,
+            num_global_key_value_heads=4,
+            v_head_dim=999,
+        )
+        _remap_gemma4_local_global_head_dims(cfg)
+
+        self.assertEqual(cfg.v_head_dim, 999)
+
+
+class TestGetConfigGemma4TextIntegration(unittest.TestCase):
+    """End-to-end check through the real `get_config()` entrypoint (the one
+    the model loader actually calls), not just the helper in isolation --
+    this exercises the `model_type == "gemma4_text"` dispatch branch itself,
+    `AutoConfig.from_pretrained` round-tripping through a saved config.json,
+    and the `HfModelConfigParser.parse()` glue in between.
+    """
+
+    def test_standalone_text_config_remapped_on_load(self):
+        try:
+            from transformers.models.gemma4.configuration_gemma4 import (
+                Gemma4TextConfig,
+            )
+        except ImportError:
+            self.skipTest("Gemma4TextConfig not available in this transformers version")
+
+        cfg = Gemma4TextConfig(
+            num_hidden_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            global_head_dim=32,
+            num_global_key_value_heads=2,
+            layer_types=["sliding_attention", "full_attention"],
+            architectures=["Gemma4ForCausalLM"],
+        )
+        self.assertEqual(cfg.model_type, "gemma4_text")
+
+        with tempfile.TemporaryDirectory() as d:
+            cfg.save_pretrained(d)
+            loaded = get_config(d, trust_remote_code=False)
+
+        self.assertEqual(loaded.head_dim, 32)
+        self.assertEqual(loaded.num_key_value_heads, 2)
+        self.assertEqual(loaded.swa_head_dim, 16)
+        self.assertEqual(loaded.swa_num_key_value_heads, 4)
+        self.assertEqual(loaded.v_head_dim, 32)
+        self.assertEqual(loaded.swa_v_head_dim, 16)
 
 
 if __name__ == "__main__":
