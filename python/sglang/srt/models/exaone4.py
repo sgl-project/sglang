@@ -515,9 +515,7 @@ class Exaone4ForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
+            hidden_states = self.model.norm(forward_batch.hidden_states)
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
