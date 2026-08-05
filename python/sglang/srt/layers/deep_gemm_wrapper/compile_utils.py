@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.startup_phase_registry import startup_phase
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -176,7 +177,12 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        with _local_rank_compile_lock(kernel_type, n, k, num_groups):
+        # Outside the lock on purpose: a rank waiting for a peer to populate
+        # the shared cache is still stalled in startup, and attributing that
+        # wait to deepgemm_jit is what surfaces the serialization cost.
+        with startup_phase("deepgemm_jit"), _local_rank_compile_lock(
+            kernel_type, n, k, num_groups
+        ):
             _compile_deep_gemm_one_type_all(
                 kernel_type=kernel_type,
                 n=n,

@@ -16,8 +16,16 @@ def build_scheduler_startup_time(
     scheduler_e2e: float,
     target_cuda_graph: Mapping[str, float] | None,
     draft_cuda_graph: Mapping[str, float] | None,
+    phases: Mapping[str, float],
 ) -> dict:
+    """Build one scheduler rank's startup-time dict.
+
+    ``phases`` carries the frozen startup-phase registry (see
+    sglang.srt.observability.startup_phase_registry) as additional flat entries;
+    the explicitly plumbed durations take precedence on name collision.
+    """
     return {
+        **phases,
         "load_weight": target_load_weight + draft_load_weight,
         "kv_cache_allocation": kv_cache_allocation,
         "scheduler_e2e": scheduler_e2e,
@@ -31,7 +39,7 @@ def build_scheduler_startup_time(
 def aggregate_scheduler_startup_times(
     startup_times: Iterable[Mapping | None],
 ) -> dict:
-    """Return critical-path startup durations across scheduler ranks."""
+    """Return critical-path (max across ranks) startup durations."""
     result = {
         "load_weight": 0.0,
         "kv_cache_allocation": 0.0,
@@ -41,21 +49,15 @@ def aggregate_scheduler_startup_times(
     for startup_time in startup_times:
         if not startup_time:
             continue
-        result["load_weight"] = max(
-            result["load_weight"], float(startup_time.get("load_weight", 0.0))
-        )
-        result["kv_cache_allocation"] = max(
-            result["kv_cache_allocation"],
-            float(startup_time.get("kv_cache_allocation", 0.0)),
-        )
-        result["scheduler_e2e"] = max(
-            result["scheduler_e2e"],
-            float(startup_time.get("scheduler_e2e", 0.0)),
-        )
-        for phase, duration in startup_time.get("cuda_graph", {}).items():
-            result["cuda_graph"][phase] = max(
-                result["cuda_graph"].get(phase, 0.0), float(duration)
-            )
+        for phase, duration in startup_time.items():
+            if phase == "cuda_graph":
+                for graph_phase, graph_duration in duration.items():
+                    result["cuda_graph"][graph_phase] = max(
+                        result["cuda_graph"].get(graph_phase, 0.0),
+                        float(graph_duration),
+                    )
+            else:
+                result[phase] = max(result.get(phase, 0.0), float(duration))
     return result
 
 
