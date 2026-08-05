@@ -37,11 +37,8 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _ensure_dist_initialized() -> None:
-    """The CCA module reads ``get_tensor_model_parallel_rank()`` /
-    ``get_tensor_model_parallel_world_size()`` inside ``__init__`` to size its
-    head-parallel projections, so the world group and model parallel groups
-    must both be initialized before any CCA construction.
-    """
+    """CCA reads the TP rank / world size inside ``__init__`` to size its
+    head-parallel projections, so the groups must exist before construction."""
     init_single_process_dist()
 
 
