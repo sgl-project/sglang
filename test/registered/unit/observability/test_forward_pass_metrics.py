@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import math
 import types
 import unittest
 from unittest.mock import patch
@@ -329,6 +330,73 @@ class TestForwardPassMetrics(unittest.TestCase):
             reporter = _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
+
+
+class TestIdleMetrics(unittest.TestCase):
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace(
+            running_batch=types.SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            grammar_manager=[],
+            enable_priority_scheduling=False,
+            disaggregation_mode=DisaggregationMode.NULL,
+            pool_stats_observer=types.SimpleNamespace(
+                get_pool_stats=lambda: types.SimpleNamespace(
+                    update_scheduler_stats=lambda _: None
+                ),
+                streaming_session_count=lambda: 0,
+                session_held_tokens=lambda: 0,
+            ),
+        )
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.published_occupancies = []
+        self.reporter.metrics_collector = types.SimpleNamespace(
+            last_log_time=100.0,
+            log_stats=lambda stats: self.published_occupancies.append(
+                stats.fwd_occupancy
+            ),
+        )
+
+    def test_idle_clears_cached_forward_occupancy_immediately(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.reporter.fwd_occupancy = 72.0
+        self.reporter.stats.fwd_occupancy = 72.0
+        self.reporter._device_timer_window_batch_count = 7
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=101.0,
+            ),
+        ):
+            self.reporter._maybe_log_idle_metrics()
+            self.reporter._maybe_log_idle_metrics()
+
+        self.assertEqual(len(self.published_occupancies), 1)
+        self.assertTrue(math.isnan(self.published_occupancies[0]))
+        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+
+    def test_idle_resets_forward_timing_when_metrics_are_disabled(self):
+        self.reporter.fwd_occupancy = 72.0
+        self.reporter.stats.fwd_occupancy = 72.0
+        self.reporter._device_timer_window_batch_count = 7
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+            True,
+        ):
+            self.reporter._maybe_log_idle_metrics()
+
+        self.assertTrue(math.isnan(self.reporter.fwd_occupancy))
+        self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertEqual(self.published_occupancies, [])
 
 
 if __name__ == "__main__":
