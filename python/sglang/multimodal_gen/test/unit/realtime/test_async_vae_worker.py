@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import replace
 
 import pytest
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.runtime.realtime.async_vae_protocol import (
 from sglang.multimodal_gen.runtime.realtime.async_vae_worker import (
     AsyncVAEWorker,
     SessionOpen,
+    TAEHVEngine,
     VAEBackpressureError,
 )
 
@@ -73,6 +75,64 @@ class _StreamingEngine(_FakeEngine):
         yield torch.zeros((1, 3, 1, 8, 8), dtype=torch.float32)
         await self.release_second.wait()
         yield torch.ones((1, 3, 1, 8, 8), dtype=torch.float32)
+
+
+def test_taehv_engine_warmup_runs_a_production_shape_decode(monkeypatch):
+    engine = TAEHVEngine.__new__(TAEHVEngine)
+    engine.device = torch.device("cpu")
+    engine.dtype = torch.bfloat16
+    decoder = object()
+    calls = []
+
+    monkeypatch.setattr(engine, "create_decoder", lambda identity: decoder)
+
+    def iter_decode(actual_decoder, latents, *, first_chunk):
+        calls.append((actual_decoder, tuple(latents.shape), latents.dtype, first_chunk))
+        yield torch.zeros(1, 3, 1, 480, 832)
+
+    monkeypatch.setattr(engine, "iter_decode", iter_decode)
+
+    engine.warmup()
+
+    assert calls == [(decoder, (1, 48, 1, 30, 52), torch.bfloat16, True)]
+
+
+def test_realtime_vae_server_warms_engine_before_serving(monkeypatch):
+    events = []
+
+    class Engine:
+        def __init__(self, *_args, **_kwargs):
+            events.append("engine_created")
+
+        def warmup(self):
+            events.append("engine_warmed")
+
+    class Worker:
+        def __init__(self, *_args, **_kwargs):
+            events.append("worker_created")
+
+    monkeypatch.setattr(realtime_vae_server, "TAEHVEngine", Engine)
+    monkeypatch.setattr(realtime_vae_server, "AsyncVAEWorker", Worker)
+    monkeypatch.setattr(realtime_vae_server, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        realtime_vae_server.uvicorn,
+        "run",
+        lambda *_args, **_kwargs: events.append("server_started"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["realtime-vae", "--checkpoint-path", "/tmp/taehv.pth"],
+    )
+
+    realtime_vae_server.main()
+
+    assert events == [
+        "engine_created",
+        "engine_warmed",
+        "worker_created",
+        "server_started",
+    ]
 
 
 def test_worker_keeps_decoder_state_per_generation():

@@ -309,6 +309,7 @@ def create_app(worker: AsyncVAEWorker, *, max_message_bytes: int) -> FastAPI:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="SGLang realtime TAEHV worker")
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--host", default="0.0.0.0")
@@ -323,6 +324,12 @@ def main() -> None:
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     engine = TAEHVEngine(args.checkpoint_path, device=args.device, dtype=dtype)
+    warmup_started = time.perf_counter()
+    engine.warmup()
+    logger.info(
+        "TAEHV startup warmup completed in %.1f ms",
+        (time.perf_counter() - warmup_started) * 1000,
+    )
     worker = AsyncVAEWorker(
         engine,
         max_sessions=args.max_sessions,
