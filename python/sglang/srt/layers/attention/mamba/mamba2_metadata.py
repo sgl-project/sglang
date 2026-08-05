@@ -235,13 +235,9 @@ class Mamba2Metadata(ForwardMetadata):
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
         if forward_batch._original_forward_mode is not None:
-            # prepare_mlp_sync_batch converted this rank's whole batch to EXTEND
-            # (idle -> one fabricated row, or decode rows -> 1-token extends), so
-            # there are no decode rows. Subtracting from _original_batch_size does
-            # not work here: on an idle rank it is the pre-conversion 0, which
-            # excludes the fabricated row on purpose (the backend poisons its
-            # mamba-cache index so the dummy never writes state) and would make
-            # num_decodes negative.
+            # mlp-sync converted the whole batch to EXTEND, so there are no decode
+            # rows; on an idle rank _original_batch_size is 0 and subtracting here
+            # would go negative.
             num_decodes = 0
         else:
             batch_size = forward_batch._original_batch_size
