@@ -86,7 +86,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
-        lower_bound=0.0,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,
         v=v,
