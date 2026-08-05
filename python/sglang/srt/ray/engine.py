@@ -484,6 +484,7 @@ class RayEngine(Engine):
             {
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
             }
         ]
 
