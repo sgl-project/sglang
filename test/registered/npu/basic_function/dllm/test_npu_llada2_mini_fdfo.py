@@ -10,7 +10,7 @@ register_npu_ci(est_time=400, suite="stage-b-test-2-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
-class TestNpuHierarchicalCacheTTFT(CustomTestCase):
+class TestLLaDA2MiniFDFO(CustomTestCase):
     """The test used the LLaDA2.0-mini model, with --dllm-fdfo, and throughputs improved.
 
     [Test Category] Diffusion LLM
