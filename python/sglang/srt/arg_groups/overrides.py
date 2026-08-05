@@ -1408,6 +1408,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -1436,6 +1437,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
@@ -1452,7 +1454,11 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        return view.linear_attn_backend == "triton"
+        prefill_backend = (
+            getattr(view, "linear_attn_prefill_backend", None)
+            or view.linear_attn_backend
+        )
+        return prefill_backend == "triton"
     return False
 
 

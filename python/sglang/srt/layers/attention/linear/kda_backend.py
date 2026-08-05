@@ -48,6 +48,7 @@ class KDAKernelDispatcher:
     ):
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
+        self.triton_kernel = triton_kernel
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
@@ -230,7 +231,12 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self.decode_kernel.decode(
+        kernel = self.decode_kernel
+        if kwargs.get("lower_bound") is not None and not getattr(
+            kernel, "supports_safe_gate", True
+        ):
+            kernel = self.triton_kernel
+        return kernel.decode(
             q,
             k,
             v,
@@ -299,8 +305,13 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
-        return self.extend_kernel.extend(
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        kernel = self.extend_kernel
+        if kwargs.get("lower_bound") is not None and not getattr(
+            kernel, "supports_safe_gate", True
+        ):
+            kernel = self.triton_kernel
+        return kernel.extend(
             q,
             k,
             v,

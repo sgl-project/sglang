@@ -30,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -119,10 +120,10 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
-        USE_LOWER_BOUND=False,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
