@@ -48,3 +48,4 @@
 - [附录 D：SM89/L40S 生产性能分析与优化建议](appendix/appx-sm89-l40s-performance-tuning.md)
 - [附录 E：Qwen3.6-27B 生产部署数据分析报告](appendix/Qwen3.6-27B.md)
 - [附录 F：Qwen3.6-27B 在旧版 SGLang（0.5.1）上乱码的根因分析](appendix/appx-qwen36-garbled-version-analysis.md)
+- [附录 G：SGLang 生产监控（Prometheus + Grafana）设计文档](appendix/appx-sglang-prometheus-monitoring.md)
