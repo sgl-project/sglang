@@ -1,18 +1,26 @@
 mod common;
 
 use std::{
+    convert::Infallible,
+    fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
-use axum::{body::Body, extract::Request, http::StatusCode};
+use axum::{body::Body, extract::Request, http::StatusCode, response::Response as AxumResponse};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
+use opentelemetry_sdk::{
+    export::trace::{ExportResult, SpanData, SpanExporter},
+    propagation::TraceContextPropagator,
+    trace::{SimpleSpanProcessor, TracerProvider as SdkTracerProvider},
 };
 use portpicker::pick_unused_port;
 use serde_json::json;
@@ -20,15 +28,46 @@ use serial_test::serial;
 use smg::{
     config::{RouterConfig, TraceConfig},
     core::Job,
+    middleware,
     observability::{logging, otel_trace},
     routers::RouterFactory,
 };
 use tokio::sync::oneshot;
 use tonic::metadata::MetadataMap;
-use tonic_v12::{transport::Server, Request as TonicRequest, Response, Status};
-use tower::ServiceExt;
+use tonic_v12::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+use tower::{service_fn, ServiceExt};
 use tracing::info_span;
 use tracing_subscriber::prelude::*;
+
+#[derive(Clone, Default)]
+struct TestSpanExporter {
+    spans: Arc<Mutex<Vec<SpanData>>>,
+}
+
+impl TestSpanExporter {
+    fn get_finished_spans(&self) -> Vec<SpanData> {
+        self.spans.lock().expect("spans mutex poisoned").clone()
+    }
+}
+
+impl fmt::Debug for TestSpanExporter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestSpanExporter").finish_non_exhaustive()
+    }
+}
+
+impl SpanExporter for TestSpanExporter {
+    fn export(
+        &mut self,
+        mut batch: Vec<SpanData>,
+    ) -> futures_util::future::BoxFuture<'static, ExportResult> {
+        self.spans
+            .lock()
+            .expect("spans mutex poisoned")
+            .append(&mut batch);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
 
 #[derive(Clone)]
 struct TestOtelCollector {
@@ -52,7 +91,7 @@ impl TraceService for TestOtelCollector {
     async fn export(
         &self,
         request: TonicRequest<ExportTraceServiceRequest>,
-    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+    ) -> Result<TonicResponse<ExportTraceServiceResponse>, Status> {
         let req = request.into_inner();
 
         let mut total_spans = 0;
@@ -65,7 +104,7 @@ impl TraceService for TestOtelCollector {
 
         self.span_count.fetch_add(total_spans, Ordering::SeqCst);
 
-        Ok(Response::new(ExportTraceServiceResponse {
+        Ok(TonicResponse::new(ExportTraceServiceResponse {
             partial_success: None,
         }))
     }
@@ -91,6 +130,53 @@ async fn start_collector(
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     Ok(collector)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_000_http_request_span_extracts_inbound_traceparent() {
+    const INBOUND_TRACE_ID: &str = "3dac15ca145787138ee68247fda9258b";
+    const INBOUND_PARENT_SPAN_ID: &str = "892bf5320fe1ac06";
+
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let exporter = TestSpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(SimpleSpanProcessor::new(Box::new(exporter.clone())))
+        .build();
+    let tracer = provider.tracer("smg-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let app = tower::ServiceBuilder::new()
+        .layer(middleware::create_logging_layer())
+        .service(service_fn(|_request: Request<Body>| async {
+            Ok::<AxumResponse, Infallible>(AxumResponse::new(Body::empty()))
+        }));
+
+    let traceparent = format!("00-{}-{}-01", INBOUND_TRACE_ID, INBOUND_PARENT_SPAN_ID);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("traceparent", traceparent)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
+    drop(response);
+
+    let spans = exporter.get_finished_spans();
+    let http_span = spans
+        .iter()
+        .find(|span| span.name == "http_request")
+        .expect("expected exported http_request span");
+
+    assert_eq!(
+        http_span.span_context.trace_id().to_string(),
+        INBOUND_TRACE_ID
+    );
+    assert_eq!(http_span.parent_span_id.to_string(), INBOUND_PARENT_SPAN_ID);
 }
 
 #[tokio::test]
