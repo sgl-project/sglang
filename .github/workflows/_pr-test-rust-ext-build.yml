@@ -139,14 +139,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No crate sets abi3, so the ABI tag is minor-version specific. Build one
-      # module set per interpreter minor the test pools run - the images are not
-      # on one version (h100 ships 3.10, h20 ships 3.12) - so every pool skips
-      # the install-time compile, not only the 3.10 ones. The EXT_SUFFIX in the
-      # filename keeps the sets apart in one cache entry, and
-      # require_prebuilt_rust_exts picks whichever matches the local
-      # interpreter. Pinned rather than left to the image so the tags are at
-      # least predictable.
+      # No crate sets abi3, so each module is minor-version specific, and the
+      # pools are not on one version (h100 ships 3.10, h20 ships 3.12). Build
+      # one set per interpreter: EXT_SUFFIX keeps them apart in one cache entry
+      # and require_prebuilt_rust_exts picks the matching one at install time.
+      # Pinned rather than left to the image so the tags are predictable.
       - name: Set up Python 3.10
         id: py310
         uses: actions/setup-python@v5
@@ -186,8 +183,6 @@ jobs:
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
           trap 'rm -rf "${venv_root}" || true' EXIT
-          # One venv and one inplace build per interpreter; the EXT_SUFFIX names
-          # keep the module sets from clobbering each other.
           for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               venv="${venv_root}/py${minor}"

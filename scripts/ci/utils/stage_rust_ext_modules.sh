@@ -12,10 +12,9 @@ shopt -s nullglob
 # module would silently shift the archive layout.
 rm -rf rust-ext-staging
 built=()
-# The build job compiles one module set per interpreter minor, so each pkg
-# holds one _core<EXT_SUFFIX>.so per interpreter. Require the same suffix set
-# across pkgs: a pkg missing one ABI would otherwise surface only as
-# silently-skipped Rust-server tests on the pools running that interpreter.
+# Each pkg holds one _core<EXT_SUFFIX>.so per interpreter the build targets.
+# Require the same suffix set across pkgs: a pkg missing one ABI would only
+# surface as silently-skipped Rust-server tests on that interpreter's pools.
 expected_suffixes=""
 for pkg in server grpc multimodal; do
     found=(python/sglang/srt/"${pkg}"/_core*.so)
