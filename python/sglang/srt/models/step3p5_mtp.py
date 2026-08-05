@@ -93,6 +93,9 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
+            # The speculative path can contain a multimodal pad sentinel
+            # before target hidden states overwrite that placeholder position.
+            input_ids = input_ids.clamp(min=0, max=self.config.vocab_size - 1)
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
@@ -127,6 +130,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         return hidden_states, hidden_states_before_norm
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        input_ids = input_ids.clamp(min=0, max=self.config.vocab_size - 1)
         return self.embed_tokens(input_ids)
 
 
