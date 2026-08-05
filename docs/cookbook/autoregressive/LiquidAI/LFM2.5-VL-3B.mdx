@@ -1,0 +1,139 @@
+---
+title: LFM2.5-VL-3B
+description: "Deploy Liquid AI's LFM2.5-VL-3B with SGLang in BF16 on NVIDIA H100, H200, or B200."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all installation methods, see the [SGLang installation guide](../../../docs/get-started/install).
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+</Tab>
+
+<Tab title="Docker">
+
+Use the platform image selected by the command panel:
+
+```bash Command
+docker pull lmsysorg/sglang:nightly-dev-20260729-16a52bff
+```
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+The verified cells are BF16 and TP=1.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/LiquidAI/lfm2.5-vl-3b.jsx";
+import { benchmarks } from "/src/snippets/configs/LiquidAI/lfm2.5-vl-3b-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The model fits on one GPU. TP=1 is the validated launch setting; the
+Playground exposes no unverified multi-GPU recipe.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+LFM2.5-VL-3B combines an LFM2 hybrid language model with a SigLIP2 So400M
+NaFlex vision encoder. It supports OCR, document and chart understanding,
+visual reasoning, and Pythonic tool calls.
+
+**Key features:**
+
+- **Hybrid language backbone:** gated short-convolution and full-attention
+  layers keep the language KV cache compact.
+- **Packed vision input:** SigLIP2 handles multiple image sizes without a
+  fixed square resize.
+- **Single-GPU serving:** the BF16 checkpoint fits on every verified GPU.
+- **OpenAI-compatible API:** image input, streaming, text-only requests, and
+  image-plus-tool calls passed the launch checks.
+
+## 2. Configuration Tips
+
+- **BF16 and TP=1:** all published cells use BF16 on one GPU.
+- **Feature transport:** the cells set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` and
+  `SGLANG_USE_IPC_POOL_HANDLE_CACHE=1` to move image feature tensors over
+  CUDA IPC instead of CPU shared memory. Do not combine them with multimodal
+  splitting.
+- **Blackwell:** SM100 defaults resolve FlashInfer language attention at
+  page size 1, unchunked multimodal prefill, and native FA4 vision
+  attention. For byte-identical reproducible evaluations, add
+  `--enable-deterministic-inference`.
+- **Sampling:** for the LFM2.5 cookbook MMMU run, use temperature `0.1`,
+  `min_p=0.15`, and `max_tokens=2048`. Downstream launch gates use their
+  evaluation-specific settings.
+
+The Benchmark card uses the same commands as the existing LFM2.5 entry:
+random input/output caps of 1024/1024, 10 prompts at concurrency 1, and
+1,000 prompts at concurrency 100.
+
+## 3. Advanced Usage
+
+### 3.1 Vision Input
+
+LFM2.5-VL-3B accepts standard OpenAI multimodal content blocks:
+
+<Accordion title="Image chat over the OpenAI-compatible API">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="LiquidAI/LFM2.5-VL-3B",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {
+                "url": "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }],
+    temperature=0,
+    max_tokens=64,
+)
+print(response.choices[0].message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+Base64 data URLs and multiple images use the same content-block format.
+
+### 3.2 Tool Calling
+
+Enable tool calling from the Playground's parser toggle
+(`--tool-call-parser lfm2`). SGLang returns the model's Pythonic calls as
+standard `message.tool_calls`. Image-plus-tool calling passed the launch
+conformance suite.
