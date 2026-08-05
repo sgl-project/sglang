@@ -15,12 +15,26 @@ class ImageResponseData(BaseModel):
     file_path: Optional[str] = None
 
 
+class ImagePromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ImageUsage(BaseModel):
+    prompt_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    image_count: Optional[int] = None
+
+
 class ImageResponse(BaseModel):
     id: str
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageResponseData]
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
+    usage: Optional[ImageUsage] = None
 
 
 class ImageGenerationsRequest(BaseModel):
