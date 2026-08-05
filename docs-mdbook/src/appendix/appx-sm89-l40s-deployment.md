@@ -26,7 +26,7 @@
 | CUDA Driver | 535.x (CUDA 12.2) |
 | CUDA Toolkit | 12.1 (nvcc) |
 | Python | 3.12 |
-| SGLang | 0.5.17.dev459 (源码复制到site-packages) |
+| SGLang | 0.5.17 (源码复制到site-packages) |
 | sglang-kernel | 0.4.5 (源码编译, sm_89 only) |
 | PyTorch | 2.7.0+cu121 |
 | flashinfer | 0.6.13 (python+cubin版本对齐) |
@@ -433,7 +433,7 @@ pkill -9 -f sglang.launch_server
 > 本节取决于镜像平台（docker commit / VM 快照 / 平台镜像固化），保存命令需按实际平台填写，例如：
 > ```bash
 > # docker 示例（按实际平台替换）
-> docker commit <container> sglang-l40s-sm89:0.5.17.dev459
+> docker commit <container> sglang-l40s-sm89:0.5.17
 > ```
 > 恢复后必须执行 4.7 的验证，不能只依赖 4.5 的保存前清单。
 
