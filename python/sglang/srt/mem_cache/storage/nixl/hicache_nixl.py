@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     MEM_BACKEND_HUGEPAGE,
@@ -69,6 +70,7 @@ class _HybridPoolContext:
     bounce_set: Optional[torch.Tensor] = None
     bounce_get: Optional[torch.Tensor] = None
     bounce_page_bytes: int = 0
+    bounce_payload_numel: int = 0
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -144,23 +146,26 @@ class HiCacheNixl(HiCacheStorage):
             self.file_manager,
         )
         # O_DIRECT requires OS-page-aligned I/O buffers on all file-based backends
-        # (POSIX, GDS, GDS_MT, 3FS). OBJ backends never open files so they are exempt
-        # (file_manager is None for OBJ).
-        self.needs_page_alignment = use_direct_io and self.file_manager is not None
+        # (POSIX, GDS, GDS_MT, 3FS).
+        # DOCA_MEMOS is an OBJ backend but has the same address/length requirement.
+        self.needs_page_alignment = (
+            use_direct_io and self.file_manager is not None
+        ) or self.backend_selector.backend_name == "DOCA_MEMOS"
         if self.needs_page_alignment:
             logger.info(
-                "HiCacheNixl: O_DIRECT is active with a file-based backend (%s). "
-                "Page-aligned host buffers are required (needs_page_alignment=True).",
+                "HiCacheNixl: %s requires 4KiB aligned host descriptor addresses "
+                "and lengths.",
                 self.backend_selector.backend_name,
             )
         # Pre-registered host regions (set by register_mem_pool_host):
-        # zero-copy: one registration covering mem_pool_host.kv_buffer
+        # zero-copy: registrations covering every mem_pool_host data buffer
         # non-zero-copy: two registrations, one bounce buffer per direction
         # (set/get) so the two storage threads never share slots.
         self._host_regs: List[Any] = []
         self._bounce_set: Optional[torch.Tensor] = None
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
+        self._bounce_payload_numel: Optional[int] = None
         self._logical_anchor = False
         self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
         self.registered_pools: dict[PoolName, HostKVCache] = {}
@@ -210,15 +215,23 @@ class HiCacheNixl(HiCacheStorage):
         return [self._get_component_key(key, pool_name) for key in keys]
 
     def _get_hybrid_component_keys(
-        self, keys: List[str], pool_name: PoolName, key_multiplier: int
+        self,
+        keys: List[str],
+        pool_name: PoolName,
+        key_multiplier: int,
+        host_pool: HostKVCache,
     ) -> List[str]:
         if key_multiplier == 1:
             return self._get_component_keys(keys, pool_name)
 
         if pool_name == PoolName.MAMBA:
-            suffixes = [f"_{pool_name}_temporal"] + [
-                f"_{pool_name}_conv_{i}" for i in range(key_multiplier - 1)
-            ]
+            mamba_has_temporal = host_pool.temporal_state_elem_size > 0
+            if mamba_has_temporal:
+                suffixes = [f"_{pool_name}_temporal"] + [
+                    f"_{pool_name}_conv_{i}" for i in range(key_multiplier - 1)
+                ]
+            else:
+                suffixes = [f"_{pool_name}_conv_{i}" for i in range(key_multiplier)]
         elif key_multiplier == 2:
             suffixes = [f"_{pool_name}_k", f"_{pool_name}_v"]
         else:
@@ -376,11 +389,16 @@ class HiCacheNixl(HiCacheStorage):
             )
             return
 
-        self._validate_host_pool_doca_memos(
-            mem_pool_host,
-            is_zero_copy=self.is_zero_copy,
-            buffers=[kv],
-        )
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            buffers = (
+                mem_pool_host.get_hybrid_pool_buffer()
+                if hasattr(mem_pool_host, "get_hybrid_pool_buffer")
+                else kv
+            )
+            buffer_list = buffers if isinstance(buffers, (list, tuple)) else [buffers]
+            kv_buffers = [buf for buf in buffer_list if buf.numel() > 0]
+        else:
+            kv_buffers = [kv]
         super().register_mem_pool_host(mem_pool_host)
 
         if self.needs_page_alignment and self.is_zero_copy:
@@ -393,30 +411,62 @@ class HiCacheNixl(HiCacheStorage):
             # is the safe lower bound all known FSes accept, and real page-sizes meet it.
             if not mem_pool_host.is_stride_page_aligned(4096):
                 logger.warning(
-                    "HiCacheNixl: O_DIRECT is active but the host kv_buffer is "
-                    "not OS-page-aligned (base or per-page stride). Falling back "
-                    "to copy mode for this pool."
+                    "HiCacheNixl: %s requires aligned descriptors but the host "
+                    "kv_buffer is not 4KiB aligned. Falling back to copy mode.",
+                    self.backend_selector.backend_name,
+                )
+                self.is_zero_copy = False
+            elif self.backend_selector.backend_name == "DOCA_MEMOS" and any(
+                tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE for buf in kv_buffers
+            ):
+                logger.warning(
+                    "HiCacheNixl: DOCA_MEMOS zero-copy requires hugetlb-backed "
+                    "host buffers. Falling back to copy mode."
                 )
                 self.is_zero_copy = False
 
         if self.is_zero_copy:
-            self._pre_register_host(
-                kv.data_ptr(), kv.numel() * kv.element_size(), "kv_buffer"
-            )
+            for i, buf in enumerate(kv_buffers):
+                self._pre_register_host(
+                    buf.data_ptr(),
+                    buf.numel() * buf.element_size(),
+                    f"kv_buffer_{i}",
+                )
         else:
             # One bounce buffer per direction so set/get run lock-free across
-            # the prefetch and backup threads. Sized from get_dummy_flat_data_page()
-            # so each slot matches what the v1 path would otherwise allocate.
-            sample = mem_pool_host.get_dummy_flat_data_page()
-            page_numel = sample.numel()
-            self._bounce_page_bytes = page_numel * sample.element_size()
-            del sample
+            # the prefetch and backup threads. The logical payload matches one
+            # flat data page; DOCA_MEMOS pads each physical slot to 4 KiB.
+            asymmetric_pool = (
+                self._get_asymmetric_pool(mem_pool_host)
+                if self.backend_selector.backend_name == "DOCA_MEMOS"
+                else None
+            )
+            if asymmetric_pool is not None:
+                page_numel = (
+                    asymmetric_pool.layer_num
+                    * asymmetric_pool.page_size
+                    * asymmetric_pool.head_num
+                    * (asymmetric_pool.head_dim + asymmetric_pool.v_head_dim)
+                )
+                page_dtype = asymmetric_pool.dtype
+            else:
+                sample = mem_pool_host.get_dummy_flat_data_page()
+                page_numel = sample.numel()
+                page_dtype = sample.dtype
+                del sample
+            self._bounce_payload_numel = page_numel
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
+            self._bounce_page_bytes = page_numel * page_dtype.itemsize
+            if self.backend_selector.backend_name == "DOCA_MEMOS":
+                self._bounce_page_bytes = (
+                    (self._bounce_page_bytes + 4095) // 4096 * 4096
+                )
+            slot_numel = self._bounce_page_bytes // page_dtype.itemsize
             self._bounce_set = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_set"
+                slot_numel, page_dtype, pin_memory, "bounce_set"
             )
             self._bounce_get = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_get"
+                slot_numel, page_dtype, pin_memory, "bounce_get"
             )
 
         logger.info(
@@ -428,20 +478,40 @@ class HiCacheNixl(HiCacheStorage):
         if host_pool_name == PoolName.KV:
             return
 
-        is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
-        buffers = (
-            [buf for buf in host_pool.get_hybrid_pool_buffer() if buf.numel() > 0]
-            if is_zero_copy
-            else []
+        is_doca_memos = self.backend_selector.backend_name == "DOCA_MEMOS"
+        is_zero_copy = hasattr(host_pool, "get_page_buffer_meta") and hasattr(
+            host_pool, "get_hybrid_pool_buffer"
         )
-        self._validate_host_pool_doca_memos(
-            host_pool,
-            is_zero_copy=is_zero_copy,
-            buffers=buffers,
-        )
-
-        super().register_mem_host_pool_v2(host_pool, host_pool_name)
-
+        if is_doca_memos and getattr(host_pool, "layout", None) not in (
+            "page_first",
+            "page_first_direct",
+        ):
+            is_zero_copy = False
+        buffers = []
+        if is_zero_copy:
+            buffers = host_pool.get_hybrid_pool_buffer()
+            if is_doca_memos:
+                buffers = [buf for buf in buffers if buf.numel() > 0]
+            is_zero_copy = bool(buffers)
+        if is_zero_copy and self.needs_page_alignment:
+            is_zero_copy = host_pool.is_stride_page_aligned(4096)
+            if not is_zero_copy:
+                logger.warning(
+                    "HiCacheNixl: %s requires aligned descriptors but hybrid "
+                    "pool %s is not 4096-byte aligned; using bounce buffers.",
+                    self.backend_selector.backend_name,
+                    host_pool_name,
+                )
+        if is_zero_copy and is_doca_memos:
+            is_zero_copy = all(
+                tensor_mem_backend(buf) == MEM_BACKEND_HUGEPAGE for buf in buffers
+            )
+            if not is_zero_copy:
+                logger.warning(
+                    "HiCacheNixl: DOCA_MEMOS zero-copy pool %s is not "
+                    "hugetlb-backed; using bounce buffers.",
+                    host_pool_name,
+                )
         if is_zero_copy:
             for i, buf in enumerate(buffers):
                 self._pre_register_host(
@@ -455,23 +525,34 @@ class HiCacheNixl(HiCacheStorage):
         else:
             sample = host_pool.get_dummy_flat_data_page()
             page_numel = sample.numel()
-            page_bytes = page_numel * sample.element_size()
-            del sample
-
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
+            page_bytes = page_numel * sample.element_size()
+            if is_doca_memos:
+                page_bytes = (page_bytes + 4095) // 4096 * 4096
+            slot_numel = page_bytes // sample.element_size()
             bounce_set = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
+                slot_numel,
+                sample.dtype,
+                pin_memory,
+                f"{host_pool_name}_bounce_set",
             )
             bounce_get = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_get"
+                slot_numel,
+                sample.dtype,
+                pin_memory,
+                f"{host_pool_name}_bounce_get",
             )
+            del sample
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
                 is_zero_copy=False,
                 bounce_set=bounce_set,
                 bounce_get=bounce_get,
                 bounce_page_bytes=page_bytes,
+                bounce_payload_numel=page_numel,
             )
+
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
         logger.info(
             "HiCacheNixl: registered hybrid host pool %s zero_copy=%s",
@@ -479,55 +560,54 @@ class HiCacheNixl(HiCacheStorage):
             is_zero_copy,
         )
 
-    def _validate_host_pool_doca_memos(
-        self,
+    @staticmethod
+    def _get_asymmetric_pool(
         host_pool: HostKVCache,
-        is_zero_copy: bool,
-        buffers: List[torch.Tensor],
-    ) -> None:
-        if self.backend_selector.backend_name != "DOCA_MEMOS":
-            return
-        if getattr(host_pool, "layout", None) not in (
-            "page_first",
-            "page_first_direct",
-        ):
-            raise RuntimeError(
-                "HiCache NIXL DOCA_MEMOS requires host pools to use "
-                "page_first or page_first_direct layout."
-            )
-        if not is_zero_copy:
-            raise RuntimeError(
-                "HiCache NIXL DOCA_MEMOS requires host pools to support "
-                "zero-copy page buffers."
-            )
-        if not buffers or any(
-            tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE for buf in buffers
-        ):
-            raise RuntimeError(
-                "HiCache NIXL DOCA_MEMOS requires every host-pool buffer to be "
-                "hugetlb-backed. Set SGLANG_HUGEPAGE_MODE=required, "
-                "SGLANG_HUGEPAGE_SIZE=2MB, and reserve enough 2 MiB huge pages."
-            )
+    ) -> Optional[AsymmetricMHATokenToKVPoolHost]:
+        anchor_entry = getattr(host_pool, "anchor_entry", None)
+        data_pool = getattr(anchor_entry, "host_pool", host_pool)
+        if not isinstance(data_pool, AsymmetricMHATokenToKVPoolHost):
+            return None
+        return data_pool
 
-    def _hybrid_pool_supports_zero_copy(
-        self, host_pool: HostKVCache, host_pool_name: PoolName
-    ) -> bool:
-        if not (
-            hasattr(host_pool, "get_page_buffer_meta")
-            and hasattr(host_pool, "get_hybrid_pool_buffer")
-        ):
-            return False
-        buffers = host_pool.get_hybrid_pool_buffer()
-        if not buffers:
-            return False
-        if self.needs_page_alignment and not host_pool.is_stride_page_aligned(4096):
-            logger.warning(
-                "HiCacheNixl: O_DIRECT is active but hybrid pool %s is not "
-                "OS-page-aligned. Falling back to bounce buffers.",
-                host_pool_name,
-            )
-            return False
-        return True
+    def _get_asymmetric_flat_data_page(
+        self, asymmetric_pool: AsymmetricMHATokenToKVPoolHost, index: int
+    ) -> torch.Tensor:
+        if asymmetric_pool.layout == "page_first":
+            k_page = asymmetric_pool.k_buffer[index : index + asymmetric_pool.page_size]
+            v_page = asymmetric_pool.v_buffer[index : index + asymmetric_pool.page_size]
+        else:
+            page_index = index // asymmetric_pool.page_size
+            k_page = asymmetric_pool.k_buffer[page_index]
+            v_page = asymmetric_pool.v_buffer[page_index]
+        return torch.cat((k_page.reshape(-1), v_page.reshape(-1)))
+
+    def _set_asymmetric_flat_data_page(
+        self,
+        asymmetric_pool: AsymmetricMHATokenToKVPoolHost,
+        index: int,
+        data_page: torch.Tensor,
+    ) -> None:
+        if asymmetric_pool.layout == "page_first":
+            k_page = asymmetric_pool.k_buffer[index : index + asymmetric_pool.page_size]
+            v_page = asymmetric_pool.v_buffer[index : index + asymmetric_pool.page_size]
+        else:
+            page_index = index // asymmetric_pool.page_size
+            k_page = asymmetric_pool.k_buffer[page_index]
+            v_page = asymmetric_pool.v_buffer[page_index]
+        flat_data = data_page.reshape(-1)
+        k_numel = k_page.numel()
+        k_page.copy_(flat_data[:k_numel].reshape_as(k_page))
+        v_page.copy_(flat_data[k_numel:].reshape_as(v_page))
+
+    @staticmethod
+    def _copy_to_bounce_slot(
+        slot: torch.Tensor, src: torch.Tensor, payload_numel: int
+    ) -> None:
+        src = src.reshape(-1)
+        slot[:payload_numel].copy_(src)
+        if payload_numel < slot.numel():
+            slot[payload_numel:].zero_()
 
     def _get_bounce_slot_buffers(
         self, buf: torch.Tensor, page_bytes: int, page_num: int
@@ -539,7 +619,9 @@ class HiCacheNixl(HiCacheStorage):
         self, pool_name: PoolName, host_pool: HostKVCache
     ) -> int:
         if pool_name == PoolName.MAMBA:
-            return 1 + len(getattr(host_pool, "conv_buffer", []) or [])
+            return int(host_pool.temporal_state_elem_size > 0) + len(
+                host_pool.conv_buffer
+            )
         if hasattr(host_pool, "v_buffer"):
             return 2
         return 1
@@ -568,7 +650,10 @@ class HiCacheNixl(HiCacheStorage):
             return [], [], 0
         key_multiplier = len(ptr_list) // page_num
         key_strs = self._get_hybrid_component_keys(
-            transfer.keys or [], transfer.name, key_multiplier
+            transfer.keys or [],
+            transfer.name,
+            key_multiplier,
+            ctx.host_pool,
         )
         if len(key_strs) != len(ptr_list):
             logger.error(
@@ -631,7 +716,7 @@ class HiCacheNixl(HiCacheStorage):
         if for_write:
             for i, page_offset in enumerate(page_offsets):
                 src = host_pool.get_data_page(page_offset, flat=True)
-                bounce[i].copy_(src)
+                self._copy_to_bounce_slot(bounce[i], src, ctx.bounce_payload_numel)
 
         host_buffers = self._get_bounce_slot_buffers(
             bounce, ctx.bounce_page_bytes, len(page_offsets)
@@ -648,10 +733,19 @@ class HiCacheNixl(HiCacheStorage):
     ) -> torch.Tensor:
         """Allocate a ``(STORAGE_BATCH_SIZE, page_numel)`` bounce buffer and
         pre-register it as a DRAM region with NIXL. Uses alloc_mmap so the
-        buffer is page-aligned -- required when O_DIRECT is on for any
-        file-based backend (POSIX/GDS/GDS_MT/3FS). pin_memory is currently
-        unused (alloc_mmap does not support it)."""
+        buffer is page-aligned -- required by O_DIRECT file backends and
+        DOCA_MEMOS. pin_memory is currently unused (alloc_mmap does not support
+        it)."""
         buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
+        if (
+            self.backend_selector.backend_name == "DOCA_MEMOS"
+            and tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE
+        ):
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS bounce buffers must be hugetlb-backed. "
+                "Set SGLANG_HUGEPAGE_MODE=required, SGLANG_HUGEPAGE_SIZE=2MB, "
+                "and reserve enough 2 MiB huge pages."
+            )
         self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
         return buf
 
@@ -683,6 +777,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_set = None
         self._bounce_get = None
         self._bounce_page_bytes = None
+        self._bounce_payload_numel = None
         self._hybrid_pool_ctx.clear()
 
     def __del__(self):
@@ -744,16 +839,6 @@ class HiCacheNixl(HiCacheStorage):
 
         return key_list, ptr_list, element_size_list
 
-    def _bounce_slot_buffers(self, buf: torch.Tensor, page_num: int) -> List[tuple]:
-        """Return ``page_num`` ``(addr, size)`` tuples pointing at the first
-        ``page_num`` slots of ``buf``.
-        """
-        base = buf.data_ptr()
-        return [
-            (base + i * self._bounce_page_bytes, self._bounce_page_bytes)
-            for i in range(page_num)
-        ]
-
     def _batch_preprocess(self, keys: List[str], host_indices: torch.Tensor, op: str):
         """Build (key_list, host_buffers) for the v1 path.
 
@@ -792,13 +877,26 @@ class HiCacheNixl(HiCacheStorage):
             if self._logical_anchor:
                 bounce[:page_num].fill_(1)
             else:
+                asymmetric_pool = (
+                    self._get_asymmetric_pool(self.mem_pool_host)
+                    if self.backend_selector.backend_name == "DOCA_MEMOS"
+                    else None
+                )
                 for i in range(page_num):
-                    src = self.mem_pool_host.get_data_page(
-                        host_indices[i * page_size], flat=True
+                    index = host_indices[i * page_size]
+                    if asymmetric_pool is not None:
+                        src = self._get_asymmetric_flat_data_page(
+                            asymmetric_pool, index
+                        )
+                    else:
+                        src = self.mem_pool_host.get_data_page(index, flat=True)
+                    self._copy_to_bounce_slot(
+                        bounce[i], src, self._bounce_payload_numel
                     )
-                    bounce[i].copy_(src)
 
-        host_buffers = self._bounce_slot_buffers(bounce, page_num)
+        host_buffers = self._get_bounce_slot_buffers(
+            bounce, self._bounce_page_bytes, page_num
+        )
         key_list = [self._get_suffixed_key(key) for key in keys]
         return key_list, host_buffers
 
@@ -847,12 +945,20 @@ class HiCacheNixl(HiCacheStorage):
             return results
 
         # non zero copy: copy data from the get-side bounce buffer to mem_pool_host
+        asymmetric_pool = (
+            self._get_asymmetric_pool(self.mem_pool_host)
+            if self.backend_selector.backend_name == "DOCA_MEMOS"
+            else None
+        )
         for i in range(page_num):
             if not results[i]:
                 break
-            self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * page_size], self._bounce_get[i]
-            )
+            index = host_indices[i * page_size]
+            data_page = self._bounce_get[i].reshape(-1)[: self._bounce_payload_numel]
+            if asymmetric_pool is not None:
+                self._set_asymmetric_flat_data_page(asymmetric_pool, index, data_page)
+            else:
+                self.mem_pool_host.set_from_flat_data_page(index, data_page)
         return results
 
     def _log_xfer_stats(
@@ -963,7 +1069,7 @@ class HiCacheNixl(HiCacheStorage):
                 else 1
             )
             component_keys = self._get_hybrid_component_keys(
-                keys[:kv_pages], transfer.name, key_multiplier
+                keys[:kv_pages], transfer.name, key_multiplier, ctx.host_pool
             )
             exists_results = self._query_keys_exist(component_keys)
             page_exists = self._page_results(exists_results, key_multiplier)
@@ -1033,7 +1139,10 @@ class HiCacheNixl(HiCacheStorage):
                 ):
                     if not ok:
                         break
-                    host_pool.set_from_flat_data_page(page_offset, data_page)
+                    host_pool.set_from_flat_data_page(
+                        page_offset,
+                        data_page.reshape(-1)[: ctx.bounce_payload_numel],
+                    )
             results[transfer.name] = page_results
         return results
 

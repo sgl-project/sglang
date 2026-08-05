@@ -254,7 +254,7 @@ class HostKVCache(abc.ABC):
         """
         logger.warning(
             "%s does not implement is_stride_page_aligned(); assuming not aligned. "
-            "O_DIRECT with a file-based NIXL backend will fall back to copy mode for this pool.",
+            "An alignment-constrained NIXL backend will fall back to copy mode for this pool.",
             type(self).__name__,
         )
         return False
