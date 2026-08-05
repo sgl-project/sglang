@@ -102,7 +102,7 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
     return hf_tokenizer
 
 
-class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+class TestEmbeddingBenchmarkBackends(CustomTestCase):
     def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
         self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
         self.assertIs(
@@ -287,7 +287,7 @@ def make_args(**overrides):
     return SimpleNamespace(**args)
 
 
-class TestBenchmarkDatasetsAPI(unittest.TestCase):
+class TestBenchmarkDatasetsAPI(CustomTestCase):
     def setUp(self):
         self.tokenizer = create_lightweight_tokenizer()
         self.processor = DummyProcessor(self.tokenizer)
