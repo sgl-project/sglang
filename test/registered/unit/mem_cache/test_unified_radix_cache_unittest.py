@@ -3826,10 +3826,10 @@ class UnifiedRadixCacheSuite:
             leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
         cache._free_values(device_frees, host_frees)
-        full_host_available = cache.cache_controller.mem_pool_host.available_size()
-        mamba_host_available = cache.components[
-            ComponentType.MAMBA
-        ]._mamba_pool_host.available_size()
+        full_host_pool = cache.cache_controller.mem_pool_host
+        mamba_host_pool = cache.components[ComponentType.MAMBA]._mamba_pool_host
+        full_available_before = full_host_pool.available_size()
+        mamba_available_before = mamba_host_pool.available_size()
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
@@ -3848,13 +3848,14 @@ class UnifiedRadixCacheSuite:
             tokens[:branching_seqlen],
         )
         cache.writing_check(write_back=True)
+        # Full was already backed up, so only one Mamba slot is allocated.
         self.assertEqual(
-            cache.cache_controller.mem_pool_host.available_size(),
-            full_host_available,
+            full_host_pool.available_size(),
+            full_available_before,
         )
         self.assertEqual(
-            cache.components[ComponentType.MAMBA]._mamba_pool_host.available_size(),
-            mamba_host_available - 1,
+            mamba_host_pool.available_size(),
+            mamba_available_before - 1,
         )
 
         second_match = cache.match_prefix(
