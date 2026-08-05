@@ -180,7 +180,9 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
     @classmethod
     def _launch_server(cls):
         storage_config = {
-            "dram_capacity_bytes": 8 * 1024 * 1024 * 1024,
+            # This test stores four 256-token pages. Keep the UMBP DRAM-tier MR
+            # below the CI NIC's registration limit while leaving ample headroom.
+            "dram_capacity_bytes": 1 * 1024 * 1024 * 1024,
             "ssd_enabled": False,
             "master_address": f"127.0.0.1:{cls.master_port}",
             "io_engine_port": cls.io_engine_port,
