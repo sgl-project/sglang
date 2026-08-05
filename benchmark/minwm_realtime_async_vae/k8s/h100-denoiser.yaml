@@ -172,7 +172,9 @@ spec:
               test -f "${MINWM_MODEL}/_READY"
               test -f "${MINWM_MODEL}/model_index.json"
               test -d "${MINWM_MODEL}/transformer"
-              exec python3 -m sglang.multimodal_gen.runtime.launch_server \
+              exec 9>/var/run/minwm-startup-lock/denoiser.lock
+              flock -x 9
+              python3 -m sglang.multimodal_gen.runtime.launch_server \
                 --model-path "${MINWM_MODEL}" \
                 --pipeline-class-name MinWMCausalDMDPipeline \
                 --attention-backend fa \
@@ -194,7 +196,23 @@ spec:
                 --enable-trace \
                 --otlp-traces-endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT}" \
                 --host 0.0.0.0 \
-                --port 30000
+                --port 30000 &
+              child=$!
+              terminate() {
+                kill -TERM "${child}" 2>/dev/null || true
+                wait "${child}" || true
+                exit 143
+              }
+              trap terminate TERM INT
+              until curl --fail --silent --max-time 2 http://127.0.0.1:30000/health >/dev/null; do
+                if ! kill -0 "${child}" 2>/dev/null; then
+                  wait "${child}"
+                  exit $?
+                fi
+                sleep 2
+              done
+              flock -u 9
+              wait "${child}"
           ports:
             - {name: api, containerPort: 30000}
           startupProbe:
@@ -222,11 +240,12 @@ spec:
             limits:
               cpu: "7"
               memory: 220Gi
-              ephemeral-storage: 40Gi
+              ephemeral-storage: 32Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}
             - {name: shm, mountPath: /dev/shm}
+            - {name: startup-lock, mountPath: /var/run/minwm-startup-lock}
         - name: denoiser-heartbeat
           image: REPLACE_WITH_DENOISER_IMAGE_DIGEST
           imagePullPolicy: IfNotPresent
@@ -262,3 +281,7 @@ spec:
           persistentVolumeClaim: {claimName: minwm-async-west-s3, readOnly: true}
         - name: shm
           emptyDir: {medium: Memory, sizeLimit: 64Gi}
+        - name: startup-lock
+          hostPath:
+            path: /var/run/minwm-startup-lock
+            type: DirectoryOrCreate

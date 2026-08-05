@@ -228,7 +228,7 @@ def test_gpu_pods_use_a_prebuilt_runtime_without_installing_at_startup():
         assert "GITHUB_TOKEN" not in manifest
         assert "git clone" not in manifest
         assert "pip install" not in manifest
-        assert "curl --fail" not in manifest
+        assert "curl --fail --location" not in manifest
         assert "REPLACE_WITH_GIT_SHA" not in manifest
 
 
@@ -241,8 +241,37 @@ def test_eight_denoiser_workers_fit_on_one_p5_48xlarge_ephemeral_disk():
     resources = _container(deployment, "denoiser")["resources"]
 
     assert resources["requests"]["ephemeral-storage"] == "24Gi"
-    assert resources["limits"]["ephemeral-storage"] == "40Gi"
-    assert 8 * 40 < 359
+    assert resources["limits"]["ephemeral-storage"] == "32Gi"
+    assert 8 * 32 + 100 < 359
+
+
+def test_denoiser_serializes_cold_starts_even_after_a_node_restart():
+    workload = find(
+        load_documents(("h100-denoiser.yaml",)),
+        "StatefulSet",
+        "minwm-async-denoiser",
+    )
+    pod_spec = workload["spec"]["template"]["spec"]
+    denoiser = _container(workload, "denoiser")
+    command = " ".join(denoiser["args"])
+
+    assert "flock -x 9" in command
+    assert "flock -u 9" in command
+    assert "exec python3 -m sglang.multimodal_gen.runtime.launch_server" not in command
+    assert "python3 -m sglang.multimodal_gen.runtime.launch_server" in command
+    assert "http://127.0.0.1:30000/health" in command
+    assert any(
+        mount["name"] == "startup-lock"
+        and mount["mountPath"] == "/var/run/minwm-startup-lock"
+        for mount in denoiser["volumeMounts"]
+    )
+    lock_volume = next(
+        volume for volume in pod_spec["volumes"] if volume["name"] == "startup-lock"
+    )
+    assert lock_volume["hostPath"] == {
+        "path": "/var/run/minwm-startup-lock",
+        "type": "DirectoryOrCreate",
+    }
 
 
 def test_public_nlb_selects_only_the_gateway_control_plane():

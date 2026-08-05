@@ -134,10 +134,14 @@ if rg -n 'REPLACE_WITH_' "${RENDERED}"; then
   exit 1
 fi
 
+kubectl apply --server-side --dry-run=server \
+  --field-manager=minwm-production -f "${RENDERED}" >/dev/null
+
 # Kubernetes cannot change a workload's kind in place. Remove the legacy
 # Deployment before the first StatefulSet rollout so both controllers never
 # compete for the same H100s.
 if kubectl get deployment minwm-async-denoiser -n minwm-realtime >/dev/null 2>&1; then
-  kubectl delete deployment minwm-async-denoiser -n minwm-realtime --wait=true
+  kubectl delete deployment minwm-async-denoiser -n minwm-realtime \
+    --cascade=foreground --wait=true
 fi
 kubectl apply --server-side --field-manager=minwm-production -f "${RENDERED}"
