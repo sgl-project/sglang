@@ -81,7 +81,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
-            from sglang.kernels.ops.moe.swiglu_oai_quant_int8 import (
+            from sgl_kernel_npu.activation.swiglu_oai_quant import (
                 swiglu_oai_quant,
             )
 

@@ -1253,10 +1253,6 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
-    # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
-    # (`_gqa_share_sparse_prefill_blockq_kernel`).
-    SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
-
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table

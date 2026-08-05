@@ -232,18 +232,9 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
 
 class MiniMaxM3MLP(nn.Module):
     @staticmethod
-    def _swigluoai_torch(
-        x: torch.Tensor, gemm1_alpha: float, gemm1_limit: float
-    ) -> torch.Tensor:
-        gate, up = x.chunk(2, dim=-1)
-        gate = gate.clamp(min=None, max=gemm1_limit)
-        up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-        return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
-
-    @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sglang.kernels.ops.moe.swiglu_oai_quant_int8 import swiglu_oai_quant
+        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
@@ -458,6 +449,7 @@ class MiniMaxM3MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        """DeepEP MoE forward: routed experts via a2a, shared experts replicated."""
         shared_output = None
         enable_npu_dual_stream = _is_npu and (
             forward_batch.forward_mode.is_extend()
@@ -467,8 +459,7 @@ class MiniMaxM3MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             router_logits = self._compute_router_logits(hidden_states)
             if enable_npu_dual_stream:
-                # Overlap the shared-expert MLP with the router/experts on a
-                # separate stream; wait_share_stream() re-syncs before the add.
+                # Overlap shared experts with router/experts on a separate stream.
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
@@ -500,8 +491,7 @@ class MiniMaxM3MoE(nn.Module):
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
             if _is_npu:
-                # NPU has no aten::mm.dtype; bf16 mm (fp32 cube accumulation)
-                # then cast back to fp32 keeps the same topk input semantics.
+                # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
@@ -1057,11 +1047,7 @@ class MiniMaxM3Attention(nn.Module):
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
     def _can_use_npu_fused_qkv_norm_rope(self) -> bool:
-        # Reuse sgl_kernel_npu's per-head GemmaRMSNorm + partial NeoX RoPE + QKV
-        # split fusion (split_qkv_rmsnorm_rope_pos_cache_half_npu) for M3's
-        # per_head norm -- replaces the unfused _qk_norm_rope (q_norm + k_norm +
-        # rotary_emb) on both dense and sparse layers' MAIN qkv. Bit-exact vs the
-        # split path (gemma_weight = weight + 1 supplies the Gemma +1).
+        """Main qkv can use the fused per-head GemmaRMSNorm + RoPE + split op."""
         return (
             _is_npu
             and self.use_qk_norm
@@ -1071,29 +1057,17 @@ class MiniMaxM3Attention(nn.Module):
             and self.rotary_dim == 64
             and getattr(self.rotary_emb, "is_neox_style", False)
             and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            # cos_sin_cache is cast to bf16 when the model is loaded with
-            # --dtype bfloat16; the fused kernel upcasts to fp32 in-kernel
-            # (tl.load(...).to(fp32)), so bf16 is accepted -- it reads the same
-            # cos/sin values the unfused rope path already uses (no precision
-            # regression, only sub-ULP rotation-arithmetic noise vs that path).
+            # bf16 cache is accepted: the fused kernel upcasts to fp32 in-kernel.
             and self.rotary_emb.cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
         )
 
     def _can_use_npu_fused_index_qkv_norm_rope(self) -> bool:
-        # Sparse index branch reuses the SAME fusion as the main branch. It is
-        # only reached inside the main fused branch (_can_use_npu_fused_qkv_norm_rope
-        # already True), so the model-level guards (per_head / gemma / neox_style /
-        # cos_sin_cache) carry over -- index_rotary_emb IS self.rotary_emb, so the
-        # cache, is_neox_style and rotary_dim are identical. The fused kernel's
-        # q|k|v split matches idx_qkv only when the index V head is enabled (it is
-        # laid out [idx_q | idx_k | idx_v]); when the V head is disabled the input
-        # has no v slot and we fall back to _split_index_qkv + _index_qk_norm_rope.
-        # M3 DISABLES the index V on every sparse layer: sparse_disable_index_value
-        # = [0,0,0, 1x57], aligned with sparse_attention_freq, so
-        # disable_value_layer_ids = layers 3..59 -> disable_index_value=True here.
-        # This gate therefore returns False for all M3 sparse layers and they fall
-        # back to _split_index_qkv + _index_qk_norm_rope (no V slot). The fused
-        # path only fires for configs that keep the index V head (split [q|k|v]).
+        """Fused split [q|k|v] + norm + RoPE applies to idx_qkv.
+
+        Main-branch guards carry over (index_rotary_emb IS rotary_emb). M3 disables
+        the index V head, so this returns False for all M3 layers; it only fires
+        for configs that keep the index V head.
+        """
         return (
             self.is_sparse_attention_layer
             and not self.disable_index_value
@@ -1107,6 +1081,7 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        """NPU qkv projection + fused norm/RoPE/split; returns (None, fb, inner_state)."""
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -1114,11 +1089,7 @@ class MiniMaxM3Attention(nn.Module):
             return hidden_states, forward_batch, None
 
         if self._can_use_npu_fused_qkv_norm_rope():
-            # Per-head GemmaRMSNorm + partial NeoX RoPE + QKV split fused into
-            # one sgl_kernel_npu op (reused from GLM4-MoE/Qwen3). cos_sin_cache
-            # is read in-kernel by position; gemma_weight (= weight + 1) supplies
-            # the Gemma +1; cast_norm_to_bf16=True matches the split path's
-            # norm->bf16->RoPE flow (bit-exact, see test_qkv_fuse_npu.py).
+            # One fused op: per-head GemmaRMSNorm + partial NeoX RoPE + QKV split.
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
                 input_tensor=qkv,
@@ -1136,13 +1107,7 @@ class MiniMaxM3Attention(nn.Module):
             if self.is_sparse_attention_layer:
                 idx_qkv, _ = self.index_qkv_proj(hidden_states)
                 if self._can_use_npu_fused_index_qkv_norm_rope():
-                    # Same fused op as the main branch: split [q|k|v] + per-head
-                    # GemmaRMSNorm on idx_q/idx_k (shared gemma_weight buffers) +
-                    # partial NeoX RoPE in one launch. index_rotary_emb ==
-                    # rotary_emb, so cos_sin_cache / rotary_dim are identical to
-                    # the main call. Bit-exact vs _split_index_qkv +
-                    # _index_qk_norm_rope (same per-head norm, same rope, same
-                    # cast_norm_to_bf16=True).
+                    # Same fused op as the main branch (shared gemma_weight buffers).
                     idx_q, idx_k, idx_v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
                         input_tensor=idx_qkv,
                         positions=positions.reshape(-1),
@@ -1300,8 +1265,7 @@ class MiniMaxM3Attention(nn.Module):
             output, _ = self.o_proj(attn_output)
             if self.disable_index_value:
                 return output
-            # idx_replica_size ranks produce identical idx_o; pre-divide idx_o (not the
-            # o_proj weight) so the TP all-reduce sums right and stays FP8-quant-safe.
+            # Pre-divide idx_o (not the weight) so the TP all-reduce sums right.
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
@@ -1713,24 +1677,20 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return
 
         self.capture_aux_hidden_states = True
-        # The draft consumes the OUTPUT hidden state of specific target layers.
-        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
-        # output), so to capture layer L's output we must mark layer L+1. Apply
-        # the +1 offset on BOTH paths so EAGLE3 works out-of-the-box even when
-        # the draft config omits ``eagle_aux_hidden_state_layer_ids`` -- the
-        # upstream Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it, and
-        # without this the default-path layers are off by one (mark 2/30/57 ->
-        # capture 1/29/56 instead of 2/30/57) and draft accept collapses to
-        # ~0.05. The explicit path was already +1; only the default was missing.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            layer_ids = [2, num_layers // 2, num_layers - 3]
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+            if _is_npu:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
-        # attribute (not ``i in layers_to_capture``), so the per-layer flag must
-        # be set explicitly -- mirroring qwen3_next/qwen2_moe. Without this the
-        # aux list stays empty and the (hidden, aux) tuple is never returned.
+        # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id
+        # list, so set it explicitly (mirrors qwen3_next/qwen2_moe).
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
