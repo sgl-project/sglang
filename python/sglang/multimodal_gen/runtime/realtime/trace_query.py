@@ -217,11 +217,23 @@ class CloudWatchTraceQuery:
 
     @staticmethod
     def _parse_message(message: str) -> dict[str, Any] | None:
-        start = message.find("{")
-        if start < 0:
-            return None
-        try:
-            value = json.loads(message[start:])
-        except json.JSONDecodeError:
-            return None
-        return value if isinstance(value, dict) else None
+        value: dict[str, Any] | None = None
+        for _ in range(3):
+            start = message.find("{")
+            if start < 0:
+                return value
+            try:
+                parsed = json.loads(message[start:])
+            except json.JSONDecodeError:
+                return value
+            if not isinstance(parsed, dict):
+                return value
+            value = parsed
+            if parsed.get("trace_id") is not None:
+                return parsed
+
+            nested = parsed.get("log")
+            if not isinstance(nested, str):
+                return parsed
+            message = nested
+        return value

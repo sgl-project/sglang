@@ -66,6 +66,25 @@ def test_cloudwatch_trace_query_is_cached_and_returns_incremental_events():
     asyncio.run(run())
 
 
+def test_cloudwatch_trace_query_unwraps_container_insights_log_events():
+    event = {
+        "trace_id": "trace-container",
+        "event": "server.vae_decode_complete",
+        "trace_seq": 42,
+        "duration_ms": 27.2,
+    }
+    message = json.dumps(
+        {
+            "time": "2026-08-05T13:31:54Z",
+            "stream": "stdout",
+            "log": "[08-05 13:31:54] realtime_trace " + json.dumps(event),
+            "kubernetes": {"pod_name": "minwm-b300-vae"},
+        }
+    )
+
+    assert CloudWatchTraceQuery._parse_message(message) == event
+
+
 def test_cloudwatch_trace_query_rejects_unsafe_trace_ids_without_a_query():
     class FakeLogs:
         def start_query(self, **_kwargs):
