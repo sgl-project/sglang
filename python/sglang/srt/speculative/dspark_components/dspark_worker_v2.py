@@ -358,6 +358,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
+            gpu_id=self.gpu_id,
             tp_rank=self.ps.tp_rank,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
