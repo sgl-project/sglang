@@ -69,8 +69,12 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        verify_forward_batch = ForwardBatch.init_new(
+            batch,
+            target_worker.model_runner,
+            capture_hidden_mode=self.capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
@@ -101,6 +105,9 @@ class DFlashVerifyInput(SpecInput):
         bs = len(req_pool_indices)
 
         layout = self.ragged_verify_layout
+        if layout is not None and layout.bs != bs:
+            # Graph replay pads the batch to the captured slots; match it.
+            layout = layout.padded_to_bucket(padded_bs=bs)
 
         if layout is None:
             qo_indptr = torch.arange(

@@ -26,7 +26,8 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
-    allocate_token_bitmask,
+    bitmask_dtype,
+    get_bitmask_shape,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -54,6 +55,18 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+
+def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
+    # Always allocate a pinned bitmask so the later H2D to the device can be a
+    # genuine non_blocking copy (a pageable source silently downgrades it to a
+    # blocking copy).
+    return torch.full(
+        get_bitmask_shape(batch_size, vocab_size),
+        -1,
+        dtype=bitmask_dtype,
+        pin_memory=True,
+    )
 
 
 class XGrammarGrammar(BaseGrammarObject):
@@ -100,7 +113,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
@@ -228,7 +241,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return _allocate_token_bitmask(vocab_size, batch_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

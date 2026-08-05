@@ -17,6 +17,7 @@ from sglang.test.vlm_utils import (
     OmniOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
@@ -74,7 +75,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -148,7 +149,8 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
-        "--mem-fraction-static=0.40",
+        # Weights alone need ~0.39; 0.40 left <0.001 headroom and flaked at load.
+        "--mem-fraction-static=0.42",
     ]
 
     def test_video_images_chat_completion(self):

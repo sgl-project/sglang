@@ -45,7 +45,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -73,7 +77,7 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_mm
 from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
 
 _is_cuda = is_cuda()
@@ -181,6 +185,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
         output_ws=None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -194,6 +199,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
             output_ws=output_ws,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -484,6 +490,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
             cu_window_seqlens = cu_window_seqlens.to("cpu")
+
+        # pre-compute attention metadata once for all layers (two variants)
+        full_metadata = prepare_vision_attention_metadata(cu_seqlens, device=x.device)
+        window_metadata = prepare_vision_attention_metadata(
+            cu_window_seqlens, device=x.device
+        )
+
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
@@ -492,10 +505,15 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 fullatt_indexes = fullatt_indexes.tolist()
             if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
+                metadata_now = full_metadata
             else:
                 cu_seqlens_now = cu_window_seqlens
+                metadata_now = window_metadata
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                forward_metadata=metadata_now,
             )
 
         # adapter
@@ -533,8 +551,8 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         # [G, M, hidden]
         x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
-        x = x[window_index, :, :]  # [G, M, hidden]
-        x = x.reshape(seq_len, -1)  # [seq_len, hidden]
+        x = x[window_index, :, :]
+        x = x.reshape(seq_len, -1)
 
         rotary_pos_emb = rotary_pos_emb.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
@@ -544,8 +562,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
-        # After building position_embeddings, make sure both cos and sin are on
-        # the same device/dtype as the attention input
         position_embeddings = (
             position_embeddings[0].to(x.device, x.dtype),
             position_embeddings[1].to(x.device, x.dtype),
@@ -618,7 +634,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         if not self.config.encoder_only:
             self.model = Qwen2Model(

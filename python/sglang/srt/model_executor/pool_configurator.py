@@ -30,7 +30,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -78,11 +78,6 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     if dtype_name in ("float32", "fp32"):
         return 4, 4
     if dtype_name in ("bfloat16", "bf16"):
-        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            raise ValueError(
-                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
-                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
-            )
         return 2, 2
     raise ValueError(
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
@@ -124,6 +119,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -136,6 +132,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        has_kv_on_another_pp_stage = (
+            self._cell_size == 0
+            and mambaish is not None
+            and bool(mambaish.full_attention_layer_ids)
+            and kvc.ps.pp_size > 1
+        )
+        self._zero_kv_max_tokens = (
+            torch.iinfo(torch.int64).max
+            if has_kv_on_another_pp_stage
+            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+        )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -170,7 +177,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
+                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
@@ -190,8 +197,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
+
             cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
+                    server_args=kvc.server_args,
+                )
                 * effective_num_layers
                 * kv_size
             )
@@ -217,8 +232,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
+                indexer_ratio = 1
+                if kvc.server_args.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        kvc.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token
+                    * effective_num_layers
+                    * element_size
+                    * indexer_ratio
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
@@ -278,13 +303,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
+                # FP4 prefill uses one shared FP8 dequant workspace across layers.
+                cell_size += n * k * 2 * kv_size
+            elif self.kv_cache_dtype_str == "mxfp8":
+                scale_block_size = 32
+                n = model_config.get_num_kv_heads(tp_size)
+                cell_size += (
+                    n * (model_config.head_dim + model_config.v_head_dim) * num_layers
+                ) // scale_block_size
 
         return cell_size
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            available_bytes // self._cell_size
+            if self._cell_size
+            else self._zero_kv_max_tokens
+        )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -303,6 +340,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -315,6 +353,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
+        self._sliding_window_size = kvc.sliding_window_size
+        self._page_size = kvc.page_size
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -330,15 +370,43 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
+        if self.kv_cache_dtype_str == "mxfp8":
+            scale_block_size = 32
+            self._full_per_token += (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+            ) // scale_block_size
+            self._swa_per_token += (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+            ) // scale_block_size
+
         # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
-        # full-attn layers; budget into the full term.
+        # full-attn layers; budget into the full term. A banded MTP depth
+        # (Inkling mtp_local_layer_ids) instead allocates an swa-geometry ring
+        # at FULL draft capacity, so budget those depths at swa_per_token.
         self._draft_full_layers_num = 0
+        self._draft_swa_full_layers_num = 0
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
-                self._draft_full_layers_num = int(draft_layers)
+                draft_layers = int(draft_layers)
+                banded_depths = 0
+                if (
+                    model_config.hf_config.architectures[0]
+                    == "InklingForConditionalGeneration"
+                ):
+                    banded_depths = len(
+                        [
+                            i
+                            for i in model_config.hf_text_config.mtp_local_layer_ids
+                            if i < draft_layers
+                        ]
+                    )
+                self._draft_swa_full_layers_num = banded_depths
+                self._draft_full_layers_num = draft_layers - banded_depths
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -353,11 +421,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
+                + self._swa_per_token * self._draft_swa_full_layers_num
             )
         else:
             self._cell_size = (
                 self._full_per_token
                 * (self._full_layers_num + self._draft_full_layers_num)
+                + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
@@ -388,6 +458,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+
+        if (
+            self._sliding_window_size is not None
+            and self._sliding_window_size + self._page_size >= swa_tokens
+        ):
+            raise ValueError(
+                f"SWA pool ({swa_tokens} tokens) cannot hold even one request: "
+                f"the prefill admission floor is sliding_window_size "
+                f"({self._sliding_window_size}) + page_size ({self._page_size}). "
+                f"Increase --swa-full-tokens-ratio or the total KV budget."
+            )
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -422,6 +503,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
@@ -481,8 +563,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
-        full_cell_size = self._full_per_token * (
-            self._full_layers_num + self._draft_full_layers_num
+        full_cell_size = (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._swa_per_token * self._draft_swa_full_layers_num
         )
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
@@ -533,6 +616,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim

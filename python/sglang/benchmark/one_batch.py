@@ -507,7 +507,11 @@ def extend(reqs, model_runner):
         )
         batch.prefill_input_ids_cpu = None
 
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
@@ -518,7 +522,11 @@ def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        model_runner,
+        return_hidden_states_before_norm=False,
+    )
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
@@ -528,6 +536,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
     if require_mlp_sync(model_runner.server_args):
         prepare_mlp_sync_batch_raw(
             batch,
+            model_runner=model_runner,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
