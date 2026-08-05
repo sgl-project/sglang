@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+
+import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
@@ -48,3 +51,7 @@ def test_online_c128_mtp_plan() -> None:
     torch.testing.assert_close(plan.plan_c.view(torch.int32).cpu(), expected_c)
     torch.testing.assert_close(plan.plan_w.view(torch.int32).cpu(), expected_w)
     assert plan.pin_buffer is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
