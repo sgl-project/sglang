@@ -163,7 +163,7 @@ async def run_async_client_warmup(
             response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
-    except Exception as e:
+    except Exception:
         if fail_open:
             logger.warning(
                 "Synthetic server warmup failed; continuing startup", exc_info=True

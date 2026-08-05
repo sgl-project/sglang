@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
@@ -80,6 +81,8 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        allocator_type = get_allocator_type(server_args)
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
@@ -87,7 +90,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -96,13 +99,18 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            from sglang.srt.runtime_context import get_parallel
+
+            _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+                allocator_type=allocator_type,
+                dcp_size=_parallel.attn_dcp_size,
+                dcp_rank=_parallel.attn_dcp_rank,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
@@ -140,8 +148,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -156,8 +162,6 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
-                attn_cp_group=self.attn_cp_group,
-                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -203,7 +207,6 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -779,6 +782,10 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves.clear()
         super().reset()
 
+    def release_host_resources(self) -> None:
+        if self.token_to_kv_pool_host is not None:
+            self.token_to_kv_pool_host.destroy()
+
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:
@@ -978,7 +985,42 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
-    def writing_check(self, write_back=False):
+    def _count_ready_acks(self, ack_queue) -> int:
+        ready_count = 0
+        for ack in ack_queue:
+            if not ack.finish_event.query():
+                break
+            ready_count += 1
+        return ready_count
+
+    def _sync_hicache_ready_counts(self) -> tuple[int, int, tuple[int, ...]]:
+        cache_controller = self.cache_controller
+        storage_queue_sizes = (
+            (
+                cache_controller.prefetch_revoke_queue.qsize(),
+                cache_controller.prefetch_hit_queue.qsize(),
+                cache_controller.ack_backup_queue.qsize(),
+                cache_controller.host_mem_release_queue.qsize(),
+            )
+            if self.enable_storage
+            else ()
+        )
+
+        ready_counts = torch.tensor(
+            [
+                self._count_ready_acks(cache_controller.ack_write_queue),
+                self._count_ready_acks(cache_controller.ack_load_queue),
+                *storage_queue_sizes,
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+
+        count_values = list(map(int, ready_counts.tolist()))
+        return count_values[0], count_values[1], tuple(count_values[2:])
+
+    def writing_check(self, write_back=False, finish_count: Optional[int] = None):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -990,19 +1032,21 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset under
-        # host memory pressure), so a conditional skip desyncs the NCCL op
-        # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in self.cache_controller.ack_write_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_write_through can
+            # diverge across ranks (e.g. write_backup returning 0 on a subset under
+            # host memory pressure), so a conditional skip desyncs the NCCL op
+            # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(
+                    self.cache_controller.ack_write_queue
+                )
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
@@ -1013,16 +1057,18 @@ class HiRadixCache(RadixCache):
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
-    def loading_check(self):
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in self.cache_controller.ack_load_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+    def loading_check(self, finish_count: Optional[int] = None):
+        if finish_count is None:
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(
+                    self.cache_controller.ack_load_queue
+                )
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
@@ -1437,16 +1483,33 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
-
     def check_hicache_events(self):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
+
+        if self.pp_size != 1:
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+        else:
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+            ) = self._sync_hicache_ready_counts()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
+
+            if self.enable_storage and storage_queue_sizes:
+                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                self._drain_storage_control_queues_impl(
+                    n_revoke=n_revoke,
+                    n_storage_hit=n_storage_hit,
+                    n_backup=n_backup,
+                    n_release=n_release,
+                    log_metrics=True,
+                )
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1560,13 +1623,10 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
-        min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        min_completed_tokens = self._sync_and_clamp_prefetch_result(
+            operation, completed_tokens
         )
-        min_completed_tokens = completed_tokens_tensor.item()
+
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = operation.host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -1594,6 +1654,39 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
         return True
+
+    def _sync_and_clamp_prefetch_result(
+        self,
+        operation: PrefetchOperation,
+        completed_tokens: int,
+    ) -> int:
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
+
+        HiRadixCache only wires DSA-style stacks (Full attention + a KV-derived
+        ALL_PAGES sidecar such as the DSA / MiniMax indexer); For the DSA case we *clamp*
+        to the minimum fetched prefix shared by the Full KV pool and every
+        sidecar rather than discarding everything. With no sidecar (FULL-only)
+        this is just the synced Full KV completion.
+        """
+        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
+        # the minimum so every rank agrees on the same usable prefix length.
+        pool_transfers = getattr(operation, "pool_transfers", None) or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
+        )
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+
+        # Clamp to the shared minimum prefix of the Full KV completion and each
+        # KV-derived ALL_PAGES sidecar (e.g. the DSA indexer). FULL-only has no
+        # sidecar, so the usable prefix is just the Full KV completion.
+        usable_pages = min_completed_tokens // self.page_size
+        if pool_transfers:
+            usable_pages = min(usable_pages, *pool_hit_pages)
+        return usable_pages * self.page_size
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
