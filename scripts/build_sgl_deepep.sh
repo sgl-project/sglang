@@ -1,415 +1,197 @@
 #!/usr/bin/env bash
-# Build a pip-installable DeepEP wheel in the current CUDA environment.
+# Build sgl-deep-ep wheels in a CUDA-versioned manylinux container.
+#
+# Usage:
+#   build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
+#
+# Writes CUDA-tagged wheels to <deepep-source>/dist. CUDA 13 builds also write
+# PyPI-ready wheels without the local CUDA version to <deepep-source>/dist-pypi.
 
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-MAX_JOBS="${MAX_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-GDRCOPY_VERSION="2.5.1"
-GDRCOPY_HOME="/usr/src/gdrdrv-${GDRCOPY_VERSION}/"
-DEEPEP_REPO="https://github.com/sgl-project/DeepEP.git"
-DEEPEP_BUILD_ROOT=""
+usage() {
+    cat <<'EOF'
+Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> <packaging-overlay> [architecture]
 
-
-select_deepep_branch() {
-    local arch="$1"
-    local cuda_major="$2"
-
-    case "${arch}:${cuda_major}" in
-        x86_64:12|x86_64:13)
-            echo "sgl-deepep-x86"
-            ;;
-        aarch64:12)
-            echo "sgl-deepep-cu12-arm"
-            ;;
-        aarch64:13)
-            echo "sgl-deepep-arm"
-            ;;
-        *)
-            echo "Unsupported architecture/CUDA combination: ${arch} with CUDA ${cuda_major}" >&2
-            return 1
-            ;;
-    esac
+  python-version:     3.10, 3.11, 3.12, or 3.13
+  cuda-version:       12.9 or 13.0
+  deepep-source:      checkout of the selected DeepEP implementation branch
+  packaging-overlay: path to the shared DeepEP sgl_deep_ep directory
+  architecture:       x86_64 or aarch64 (defaults to the current machine)
+EOF
 }
 
-
-parse_cuda_major() {
-    local nvcc_output="$1"
-    local cuda_major
-
-    if [[ ! "${nvcc_output}" =~ release[[:space:]]+([0-9]+)\. ]]; then
-        echo "Could not parse CUDA toolkit version from nvcc output" >&2
-        return 1
-    fi
-    cuda_major="${BASH_REMATCH[1]}"
-
-    case "${cuda_major}" in
-        12|13)
-            echo "${cuda_major}"
-            ;;
-        *)
-            echo "Unsupported CUDA toolkit major version: ${cuda_major}" >&2
-            return 1
-            ;;
-    esac
-}
-
-
-resolve_cuda_home_from_nvcc() {
-    local nvcc_path="$1"
-    local real_nvcc
-    local nvcc_dir
-    local cuda_home
-
-    real_nvcc="$(readlink -f "${nvcc_path}")" || {
-        echo "Could not resolve nvcc path: ${nvcc_path}" >&2
-        return 1
-    }
-    if [[ ! -x "${real_nvcc}" ]]; then
-        echo "Resolved nvcc is not executable: ${real_nvcc}" >&2
-        return 1
-    fi
-
-    nvcc_dir="$(cd "$(dirname "${real_nvcc}")" && pwd -P)"
-    cuda_home="$(cd "${nvcc_dir}/.." && pwd -P)"
-    if [[ ! -x "${cuda_home}/bin/nvcc" ]]; then
-        echo "Could not derive a CUDA toolkit root from nvcc: ${nvcc_path}" >&2
-        return 1
-    fi
-
-    echo "${cuda_home}"
-}
-
-
-patch_cuda13_cccl() {
-    local setup_py="$1"
-    local cuda_home="$2"
-    local cccl_dir="${cuda_home}/include/cccl"
-
-    if [[ ! -d "${cccl_dir}" ]]; then
-        echo "CCCL include directory not found: ${cccl_dir}" >&2
-        return 1
-    fi
-    if [[ ! -f "${setup_py}" ]]; then
-        echo "DeepEP setup.py not found: ${setup_py}" >&2
-        return 1
-    fi
-
-    "${PYTHON_BIN}" - "${setup_py}" "${cccl_dir}" <<'PY'
-import pathlib
-import sys
-
-setup_py = pathlib.Path(sys.argv[1])
-cccl_dir = sys.argv[2]
-text = setup_py.read_text()
-anchor = "    include_dirs = ['csrc/']"
-addition = f"    include_dirs.append('{cccl_dir}')"
-
-if addition in text:
-    raise SystemExit(0)
-if anchor not in text:
-    print(
-        "Could not find DeepEP include_dirs insertion point in setup.py",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-setup_py.write_text(text.replace(anchor, f"{anchor}\n{addition}", 1))
-PY
-}
-
-
-find_single_wheel() {
-    local output_dir="$1"
-    local nullglob_state
-    local -a wheels
-
-    nullglob_state="$(shopt -p nullglob || true)"
-    shopt -s nullglob
-    wheels=("${output_dir}"/deep_ep-*.whl)
-    eval "${nullglob_state}"
-
-    if [[ "${#wheels[@]}" -ne 1 ]]; then
-        echo "Expected exactly one DeepEP wheel, found ${#wheels[@]} in ${output_dir}" >&2
-        return 1
-    fi
-
-    local wheel_dir
-    wheel_dir="$(cd "$(dirname "${wheels[0]}")" && pwd -P)"
-    echo "${wheel_dir}/$(basename "${wheels[0]}")"
-}
-
-
-build_deepep() {
-    local source_dir="$1"
-    local output_dir="$2"
-
-    if [[ ! -f "${source_dir}/setup.py" ]]; then
-        echo "DeepEP setup.py not found: ${source_dir}/setup.py" >&2
-        return 1
-    fi
-
-    mkdir -p "${output_dir}"
-    output_dir="$(cd "${output_dir}" && pwd -P)"
-    rm -f "${output_dir}"/deep_ep-*.whl
-
-    (
-        cd "${source_dir}"
-        TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
-            MAX_JOBS="${MAX_JOBS}" \
-            "${PYTHON_BIN}" setup.py bdist_wheel -d "${output_dir}"
-    )
-
-    find_single_wheel "${output_dir}" >/dev/null
-}
-
-
-build_and_report() {
-    local source_dir="$1"
-    local output_dir="$2"
-    local wheel_path
-
-    build_deepep "${source_dir}" "${output_dir}"
-    wheel_path="$(find_single_wheel "${output_dir}")"
-    echo "--- Done ---"
-    echo "DeepEP wheel: ${wheel_path}"
-}
-
-
-run_as_root() {
-    if [[ "${EUID}" -eq 0 ]]; then
-        "$@"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
-    else
-        echo "Root privileges are required, but sudo is unavailable" >&2
-        return 1
-    fi
-}
-
-
-install_apt_packages() {
-    local package
-
-    if run_as_root apt-get install -y --no-install-recommends "$@"; then
-        return 0
-    fi
-
-    echo "apt-get install failed; checking whether every package is already installed" >&2
-    for package in "$@"; do
-        if ! dpkg -l "${package}" 2>/dev/null | grep -q '^ii'; then
-            echo "Required package ${package} is not installed" >&2
-            return 1
-        fi
-    done
-    echo "All requested packages are already installed; continuing" >&2
-}
-
-
-install_system_dependencies() {
-    local -a system_deps=(
-        curl
-        wget
-        git
-        sudo
-        rdma-core
-        infiniband-diags
-        openssh-server
-        perftest
-        libibumad3
-        libibverbs-dev
-        libibverbs1
-        ibverbs-providers
-        ibverbs-utils
-        libnl-3-200
-        libnl-route-3-200
-        librdmacm1
-        build-essential
-        cmake
-    )
-
-    run_as_root apt-get update || \
-        echo "apt-get update failed; package availability checks will decide whether to continue" >&2
-    install_apt_packages "${system_deps[@]}"
-}
-
-
-install_python_dependencies() {
-    "${PYTHON_BIN}" -m pip install setuptools wheel ninja
-}
-
-
-remove_existing_deepep() {
-    "${PYTHON_BIN}" -m pip uninstall -y deep_ep
-}
-
-
-install_gdrcopy() {
-    local gdrcopy_dir="/opt/gdrcopy"
-    local arch="$1"
-    local lib_path="/usr/lib/${arch}-linux-gnu"
-    local -a gdrcopy_deps_1=(nvidia-dkms-580)
-    local -a gdrcopy_deps_2=(
-        build-essential
-        devscripts
-        debhelper
-        fakeroot
-        pkg-config
-        dkms
-    )
-    local -a gdrcopy_deps_3=(
-        check
-        libsubunit0
-        libsubunit-dev
-        python3-venv
-    )
-
-    echo "--- Installing GDRCopy v${GDRCOPY_VERSION} ---"
-    run_as_root rm -rf "${gdrcopy_dir}"
-    run_as_root mkdir -p "${gdrcopy_dir}"
-    run_as_root git clone --depth 1 --branch "v${GDRCOPY_VERSION}" \
-        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_dir}"
-
-    install_apt_packages "${gdrcopy_deps_1[@]}"
-    install_apt_packages "${gdrcopy_deps_2[@]}"
-    install_apt_packages "${gdrcopy_deps_3[@]}"
-
-    run_as_root env CUDA="${CUDA_HOME}" \
-        bash -c 'cd "$1/packages" && ./build-deb-packages.sh' bash "${gdrcopy_dir}"
-    run_as_root bash -c '
-        set -e
-        cd "$1/packages"
-        dpkg -i gdrdrv-dkms_*.deb
-        dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
-    ' bash "${gdrcopy_dir}"
-
-    if [[ ! -e "${lib_path}/libmlx5.so" ]]; then
-        if [[ ! -e "${lib_path}/libmlx5.so.1" ]]; then
-            echo "Required mlx5 library not found: ${lib_path}/libmlx5.so.1" >&2
-            return 1
-        fi
-        run_as_root ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
-    fi
-
-    run_as_root apt-get update || \
-        echo "apt-get update failed before libfabric-dev installation" >&2
-    install_apt_packages libfabric-dev
-}
-
-
-cleanup_build_root() {
-    if [[ -z "${DEEPEP_BUILD_ROOT}" || ! -d "${DEEPEP_BUILD_ROOT}" ]]; then
-        return 0
-    fi
-    if [[ "$(basename "${DEEPEP_BUILD_ROOT}")" != sgl-deepep.* ]]; then
-        echo "Refusing to remove unexpected DeepEP build path: ${DEEPEP_BUILD_ROOT}" >&2
-        return 1
-    fi
-    rm -rf -- "${DEEPEP_BUILD_ROOT}"
-}
-
-
-main() {
-    if [[ "$#" -gt 1 ]]; then
-        echo "Usage: build_sgl_deepep.sh [OUTPUT_DIR]" >&2
-        return 2
-    fi
-
-    local output_dir="${1:-${PWD}/dist}"
-    local arch
-    local nvcc_bin
-    local nvcc_output
-    local cuda_major
-    local deepep_branch
-    local deepep_dir
-
-    arch="$(uname -m)"
-    if [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
-        nvcc_bin="${CUDA_HOME}/bin/nvcc"
-    elif command -v nvcc >/dev/null 2>&1; then
-        nvcc_bin="$(command -v nvcc)"
-        CUDA_HOME="$(resolve_cuda_home_from_nvcc "${nvcc_bin}")"
-        nvcc_bin="${CUDA_HOME}/bin/nvcc"
-    else
-        echo "nvcc not found under CUDA_HOME=${CUDA_HOME} or PATH" >&2
-        return 1
-    fi
-    nvcc_output="$("${nvcc_bin}" --version)"
-    cuda_major="$(parse_cuda_major "${nvcc_output}")"
-    deepep_branch="$(select_deepep_branch "${arch}" "${cuda_major}")"
-
-    command -v git >/dev/null 2>&1 || {
-        echo "git is required to clone DeepEP" >&2
-        return 1
-    }
-    command -v apt-get >/dev/null 2>&1 || {
-        echo "apt-get is required to install DeepEP dependencies" >&2
-        return 1
-    }
-    command -v dpkg >/dev/null 2>&1 || {
-        echo "dpkg is required to install GDRCopy packages" >&2
-        return 1
-    }
-    command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
-        echo "Python interpreter not found: ${PYTHON_BIN}" >&2
-        return 1
-    }
-    "${PYTHON_BIN}" -m pip --version >/dev/null
-    "${PYTHON_BIN}" -c 'import torch' || {
-        echo "PyTorch must be installed in the selected Python environment" >&2
-        return 1
-    }
-    if [[ "${EUID}" -ne 0 ]]; then
-        if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true; then
-            echo "Run as root or configure passwordless sudo to install system dependencies" >&2
-            return 1
-        fi
-    fi
-
-    mkdir -p "${output_dir}"
-    output_dir="$(cd "${output_dir}" && pwd -P)"
-    DEEPEP_BUILD_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sgl-deepep.XXXXXX")"
-    trap cleanup_build_root EXIT
-    deepep_dir="${DEEPEP_BUILD_ROOT}/DeepEP"
-
-    echo "----------------------------------------"
-    echo "Architecture:     ${arch}"
-    echo "CUDA major:      ${cuda_major}"
-    echo "CUDA_HOME:       ${CUDA_HOME}"
-    echo "DeepEP branch:   ${deepep_branch}"
-    echo "Python:          ${PYTHON_BIN}"
-    echo "TORCH arch list: 9.0;10.0;10.3"
-    echo "Output directory: ${output_dir}"
-    echo "----------------------------------------"
-
-    echo "--- Cloning DeepEP (${deepep_branch}) ---"
-    git clone --depth 1 --branch "${deepep_branch}" \
-        "${DEEPEP_REPO}" "${deepep_dir}"
-
-    echo "--- Removing an existing DeepEP installation ---"
-    remove_existing_deepep
-
-    echo "--- Installing Python build dependencies ---"
-    install_python_dependencies
-
-    echo "--- Installing system dependencies ---"
-    install_system_dependencies
-    install_gdrcopy "${arch}"
-
-    if [[ "${cuda_major}" == "13" ]]; then
-        echo "--- Adding CUDA 13 CCCL include path ---"
-        patch_cuda13_cccl "${deepep_dir}/setup.py" "${CUDA_HOME}"
-    fi
-
-    export CUDA_HOME GDRCOPY_HOME
-    echo "--- Building DeepEP wheel ---"
-    build_and_report "${deepep_dir}" "${output_dir}"
-}
-
-
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+    usage >&2
+    exit 2
 fi
+
+PYTHON_VERSION="$1"
+CUDA_VERSION="$2"
+DEEPEP_SOURCE="$(cd "$3" && pwd)"
+PACKAGING_OVERLAY="$(cd "$4" && pwd)"
+ARCHITECTURE="${5:-$(uname -m)}"
+
+if [[ "${ARCHITECTURE}" == arm64 ]]; then
+    ARCHITECTURE=aarch64
+fi
+
+case "${PYTHON_VERSION}" in
+    3.10|3.11|3.12|3.13) ;;
+    *)
+        echo "Unsupported Python version: ${PYTHON_VERSION}" >&2
+        exit 2
+        ;;
+esac
+
+case "${CUDA_VERSION}" in
+    12.9)
+        CUDA_TAG=cu129
+        ;;
+    13.0)
+        CUDA_TAG=cu130
+        ;;
+    *)
+        echo "Unsupported CUDA version: ${CUDA_VERSION}" >&2
+        exit 2
+        ;;
+esac
+
+case "${ARCHITECTURE}" in
+    x86_64)
+        BASE_IMAGE=pytorch/manylinux2_28-builder
+        ;;
+    aarch64)
+        BASE_IMAGE=pytorch/manylinuxaarch64-builder
+        ;;
+    *)
+        echo "Unsupported architecture: ${ARCHITECTURE}" >&2
+        exit 2
+        ;;
+esac
+
+for required_file in setup.py deep_ep/__init__.py; do
+    if [[ ! -f "${DEEPEP_SOURCE}/${required_file}" ]]; then
+        echo "DeepEP source is missing ${required_file}: ${DEEPEP_SOURCE}" >&2
+        exit 1
+    fi
+done
+for required_file in build_sgl_deep_ep.sh setup.py VERSION; do
+    if [[ ! -f "${PACKAGING_OVERLAY}/${required_file}" ]]; then
+        echo "Packaging overlay is missing ${required_file}: ${PACKAGING_OVERLAY}" >&2
+        exit 1
+    fi
+done
+if ! command -v docker >/dev/null; then
+    echo "docker is required to build sgl-deep-ep" >&2
+    exit 1
+fi
+
+PYTHON_TAG="cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DOCKERFILE="${REPOSITORY_ROOT}/docker/sgl-deep-ep.Dockerfile"
+IMAGE_TAG="sgl-deep-ep-builder:cuda${CUDA_VERSION}-${PYTHON_TAG}-${ARCHITECTURE}"
+DIST_DIR="${DEEPEP_SOURCE}/dist"
+PYPI_DIST_DIR="${DEEPEP_SOURCE}/dist-pypi"
+
+mkdir -p "${DIST_DIR}" "${PYPI_DIST_DIR}"
+
+echo "----------------------------------------"
+echo "Python:            ${PYTHON_VERSION} (${PYTHON_TAG})"
+echo "CUDA:              ${CUDA_VERSION} (${CUDA_TAG})"
+echo "Architecture:      ${ARCHITECTURE}"
+echo "Base image:        ${BASE_IMAGE}:cuda${CUDA_VERSION}"
+echo "DeepEP source:     ${DEEPEP_SOURCE}"
+echo "Packaging overlay: ${PACKAGING_OVERLAY}"
+echo "Builder image:     ${IMAGE_TAG}"
+echo "----------------------------------------"
+
+docker build \
+    --file "${DOCKERFILE}" \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    --build-arg CUDA_VERSION="${CUDA_VERSION}" \
+    --build-arg CUDA_TAG="${CUDA_TAG}" \
+    --build-arg PYTHON_TAG="${PYTHON_TAG}" \
+    --build-arg ARCHITECTURE="${ARCHITECTURE}" \
+    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.11.0}" \
+    --tag "${IMAGE_TAG}" \
+    --network=host \
+    "${REPOSITORY_ROOT}/docker"
+
+docker run --rm \
+    --network=host \
+    --env ARCHITECTURE="${ARCHITECTURE}" \
+    --env CUDA_TAG="${CUDA_TAG}" \
+    --env CUDA_VERSION="${CUDA_VERSION}" \
+    --env MAX_JOBS="${MAX_JOBS:-8}" \
+    --volume "${DEEPEP_SOURCE}:/deepep:ro" \
+    --volume "${PACKAGING_OVERLAY}:/packaging:ro" \
+    --volume "${DIST_DIR}:/output/dist" \
+    --volume "${PYPI_DIST_DIR}:/output/dist-pypi" \
+    "${IMAGE_TAG}" \
+    bash -euo pipefail -c '
+find /output/dist -maxdepth 1 -type f -name "sgl_deep_ep-*.whl" -delete
+find /output/dist-pypi -maxdepth 1 -type f -name "sgl_deep_ep-*.whl" -delete
+raw_dir="$(mktemp -d -t sgl-deep-ep-raw.XXXXXX)"
+trap '\''rm -rf -- "${raw_dir}"'\'' EXIT
+
+bash /packaging/build_sgl_deep_ep.sh \
+    /deepep /packaging "${raw_dir}" "${CUDA_VERSION}" "${ARCHITECTURE}"
+
+shopt -s nullglob
+raw_wheels=("${raw_dir}"/*.whl)
+if [[ ${#raw_wheels[@]} -ne 1 ]]; then
+    echo "Expected exactly one raw wheel, found ${#raw_wheels[@]}" >&2
+    exit 1
+fi
+
+auditwheel repair \
+    --plat "manylinux_2_28_${ARCHITECTURE}" \
+    --wheel-dir /output/dist \
+    --exclude libcuda.so.1 \
+    --exclude libcudart.so.12 \
+    --exclude libcudart.so.13 \
+    --exclude libc10.so \
+    --exclude libc10_cuda.so \
+    --exclude libtorch.so \
+    --exclude libtorch_cpu.so \
+    --exclude libtorch_cuda.so \
+    --exclude libtorch_python.so \
+    --exclude libnvshmem_host.so.1 \
+    --exclude libnvshmem_host.so.2 \
+    --exclude libnvshmem_host.so.3 \
+    --exclude libnccl.so.2 \
+    --exclude libgdrapi.so.2 \
+    --exclude libnvToolsExt.so.1 \
+    "${raw_wheels[0]}"
+
+if [[ "${CUDA_TAG}" == cu130 ]]; then
+    tagged_wheels=(/output/dist/sgl_deep_ep-*+cu130-*.whl)
+    if [[ ${#tagged_wheels[@]} -ne 1 ]]; then
+        echo "Expected exactly one CUDA 13 wheel, found ${#tagged_wheels[@]}" >&2
+        exit 1
+    fi
+    unpack_root="$(mktemp -d -t sgl-deep-ep-pypi.XXXXXX)"
+    python -m wheel unpack "${tagged_wheels[0]}" --dest "${unpack_root}"
+    unpacked="$(find "${unpack_root}" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    dist_info="$(find "${unpacked}" -maxdepth 1 -type d -name "*.dist-info" | head -1)"
+    metadata="${dist_info}/METADATA"
+    original_version="$(sed -n "s/^Version:[[:space:]]*//p" "${metadata}" | head -1)"
+    public_version="${original_version%+cu130}"
+    if [[ "${original_version}" == "${public_version}" ]]; then
+        echo "CUDA 13 wheel metadata lacks the +cu130 local version" >&2
+        exit 1
+    fi
+    sed -i "s/^Version:.*/Version: ${public_version}/" "${metadata}"
+    old_dist_info="$(basename "${dist_info}")"
+    new_dist_info="${old_dist_info/${original_version}/${public_version}}"
+    mv "${dist_info}" "$(dirname "${dist_info}")/${new_dist_info}"
+    python -m wheel pack "${unpacked}" --dest-dir /output/dist-pypi
+fi
+
+ls -lh /output/dist/*.whl
+if [[ "${CUDA_TAG}" == cu130 ]]; then
+    ls -lh /output/dist-pypi/*.whl
+fi
+'
