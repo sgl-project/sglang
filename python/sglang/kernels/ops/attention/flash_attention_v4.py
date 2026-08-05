@@ -137,7 +137,9 @@ def flash_attn_varlen_func(
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
     if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
-        # The dedicated hd256 kernel assumes dense Q/K/V strides.
+        # The vendored hd256 kernel assumes dense Q/K/V strides.
+        # TODO: Remove this workaround after the FA4 in current environment includes
+        # https://github.com/Dao-AILab/flash-attention/pull/2670 (flash-attn-4 >= 4.0.0b20).
         q, k, v = [t.contiguous() for t in (q, k, v)]
     q, qv, mla_head_padding = _pad_mla_q_heads(q, qv, v, pack_gqa)
     if qv is not None and num_splits < 1:
