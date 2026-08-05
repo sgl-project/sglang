@@ -140,12 +140,10 @@ install_apt_packages() {
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
 
-    # The images bake these in, so the usual run installs nothing yet still pays
-    # apt-get update's round trips to every source. Ask dpkg first - a local
-    # status read - and reach the network only for what is missing. Nothing is
-    # lost by not running apt-get install here: it only ever considers the
-    # packages named above, so it is not what keeps the runner current (a
-    # passing run reports 100+ other packages left un-upgraded). The image is.
+    # The images bake these in, so the usual run pays apt-get update's round
+    # trips to install nothing. Skipping it costs no currency either: apt-get
+    # install only ever considers the packages named above, and a passing run
+    # leaves 100+ others un-upgraded - the image is what pins these versions.
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
