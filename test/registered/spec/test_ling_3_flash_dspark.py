@@ -4,7 +4,7 @@ os.environ.setdefault("SGLANG_RAGGED_VERIFY_MODE", "static")
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=7200, stage="base-c", runner_config="4-gpu-h20")
+register_cuda_ci(est_time=7200, stage="base-c", runner_config="4-gpu-b200")
 
 import unittest
 from types import SimpleNamespace
