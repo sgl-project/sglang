@@ -277,7 +277,7 @@ def _modulate_gate(
         and other.is_contiguous()
     ):
         return indexed_gate_bf16_(x, gate, other, indices)
-    return (x + gate.index_select(0, indices) * other).to(dtype)
+    return torch.addcmul(x, gate.index_select(0, indices), other).to(dtype)
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:

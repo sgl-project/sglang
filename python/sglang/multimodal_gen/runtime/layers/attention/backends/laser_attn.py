@@ -232,11 +232,31 @@ class LaserAttentionImpl(AttentionImpl):
         # tokens attend alignment padding in MiniMax-H3.
         if padding_start is not None and padding_start not in bounds:
             raise ValueError("padding_start must be a packed segment boundary")
-        output = (
-            torch.zeros_like(query)
-            if padding_start is not None
-            else torch.empty_like(query)
-        )
+
+        # MiniMax-H3 packs one real segment followed by alignment padding.
+        # Delay allocation until Laser releases its temporary tensors and
+        # avoid allocating/copying the result when no padding was added.
+        if (
+            padding_start is not None
+            and padding_start > 0
+            and bounds[0] == 0
+            and bounds[1] == padding_start
+        ):
+            segment = self.forward(
+                query[:padding_start].unsqueeze(0),
+                key[:padding_start].unsqueeze(0),
+                value[:padding_start].unsqueeze(0),
+                None,
+            )[0]
+            if padding_start == query.shape[0]:
+                return segment
+
+            output = torch.empty_like(query)
+            output[:padding_start].copy_(segment)
+            output[padding_start:].zero_()
+            return output
+
+        output = torch.empty_like(query)
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if padding_start is not None and start >= padding_start:
                 break
@@ -249,4 +269,6 @@ class LaserAttentionImpl(AttentionImpl):
                 None,
             )
             output[start:stop].copy_(segment[0])
+        if padding_start is not None:
+            output[padding_start:].zero_()
         return output
