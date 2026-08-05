@@ -42,9 +42,8 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba
-# state pool, so stale content is unsafe to execute. Authoritative for both
-# the capture-time reset below and the registry's ZERO padding policy, which
-# build_decode_registry checks against this set.
+# state pool, so stale content is unsafe to execute. build_decode_registry
+# asserts its ZERO-policy slots against this set.
 INDEX_SEMANTIC_BUFFERS = frozenset(
     {
         "positions",

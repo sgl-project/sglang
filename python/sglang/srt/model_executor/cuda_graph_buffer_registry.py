@@ -778,10 +778,9 @@ def build_decode_registry(
                     bind=canary,
                 )
 
-    # A ZERO slot is reset on every replay, but a mid-serving recapture relies
-    # on ForwardInputBuffers.reset_index_buffers, which keys off
-    # INDEX_SEMANTIC_BUFFERS. Over the slots this registry actually carries the
-    # two must name the same set, or one of the resets silently skips a buffer.
+    # ZERO covers replay; a mid-serving recapture is covered by
+    # ForwardInputBuffers.reset_index_buffers, which keys off
+    # INDEX_SEMANTIC_BUFFERS. Diverge and one of the two skips a buffer.
     registered = set(reg.slot_names())
     zero_slots = {
         name

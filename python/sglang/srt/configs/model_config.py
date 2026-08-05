@@ -855,8 +855,7 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
-            # Handle rope scaling. In transformers v5, rope_scaling is just
-            # rope_parameters for backward compatibility.
+            # In transformers v5, rope_scaling is just rope_parameters.
             self._init_mla_scaling(self.hf_text_config.rope_scaling)
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
@@ -925,7 +924,6 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            # Handle rope scaling with yarn
             self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
