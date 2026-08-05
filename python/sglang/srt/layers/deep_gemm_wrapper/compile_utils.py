@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.startup_phase_registry import startup_phase
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
@@ -147,13 +148,14 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+        with startup_phase("deepgemm_jit"):
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import inspect
 import logging
 import time
@@ -166,6 +167,10 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.startup_phase_registry import (
+    startup_phase,
+    startup_phase_prefix,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -252,6 +257,19 @@ def _prefill_cuda_graph_allows_context_parallel(
         bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
         and is_cp_v2_active(forward_batch)
     )
+
+
+def _with_startup_phase_scope(method):
+    """Attribute phases recorded inside ``method`` (however deeply nested)
+    to the draft model when running on a draft-model runner."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        prefix = "draft_" if self.is_draft_worker else ""
+        with startup_phase_prefix(prefix):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -985,6 +1003,7 @@ class ModelRunner:
             n_prepared,
         )
 
+    @_with_startup_phase_scope
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
@@ -1030,16 +1049,18 @@ class ModelRunner:
             moe_dp_size=self.ps.moe_dp_size,
         )
 
+    @_with_startup_phase_scope
     def init_torch_distributed(self):
-        result = bootstrap.init_torch_distributed(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            device=self.device,
-            ps=self.ps,
-            dist_port=self.dist_port,
-            is_draft_worker=self.is_draft_worker,
-            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
-        )
+        with startup_phase("distributed_init"):
+            result = bootstrap.init_torch_distributed(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                device=self.device,
+                ps=self.ps,
+                dist_port=self.dist_port,
+                is_draft_worker=self.is_draft_worker,
+                local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+            )
         self.tp_group = result.tp_group
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
@@ -1358,6 +1379,7 @@ class ModelRunner:
 
         return DecodeCudaGraphRunner
 
+    @_with_startup_phase_scope
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
@@ -1373,6 +1395,7 @@ class ModelRunner:
             phases=("decode", "target_verify", "draft_decode"),
         )
 
+    @_with_startup_phase_scope
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
         capture = capture_prefill_graph(

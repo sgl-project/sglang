@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import time
 import unittest
+from types import SimpleNamespace
 from typing import Dict, List
 
 import requests
@@ -14,6 +16,19 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_SCHEDULER,
     SchedulerMetricsCollector,
     compute_routing_key_stats,
+)
+from sglang.srt.observability.startup_phase_registry import (
+    drain_post_startup_deltas,
+    freeze_startup_phases,
+    get_startup_phases,
+    record_startup_phase,
+    reset_startup_phases,
+    startup_phase,
+    startup_phase_prefix,
+)
+from sglang.srt.observability.startup_time import (
+    aggregate_scheduler_startup_times,
+    build_scheduler_startup_time,
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -240,7 +255,10 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:startup_time_seconds", {"phase": "kv_cache_allocation"}),
             ("sglang:startup_time_seconds", {"phase": "scheduler_e2e"}),
             ("sglang:startup_time_seconds", {"phase": "tokenizer_e2e"}),
+            # Registry-collected phases flow through the same gauge.
+            ("sglang:startup_time_seconds", {"phase": "distributed_init"}),
             ("sglang:startup_cuda_graph_time_seconds", {"phase": "decode"}),
+            ("sglang:engine_startup_duration_seconds_sum", {}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 
@@ -595,6 +613,234 @@ class TestStatLoggersDIRecording(CustomTestCase):
         any_running = by_name["sglang:num_running_reqs"][0]
         self.assertIn("model_name", any_running["tags"])
         self.assertEqual(any_running["tags"]["model_name"], _MODEL_NAME)
+
+
+class _InMemoryMetric:
+    """Minimal gauge/counter double that records ``(op, value, tags)`` triples
+    in memory. Unlike ``_FileRecordingMetric`` it has no filesystem side
+    effects, so it cannot pollute the cross-process recording tests."""
+
+    def __init__(self, name="", documentation="", labelnames=(), **kwargs):
+        self.name = name
+        self.calls = []
+
+    def labels(self, **tags):
+        metric = self
+
+        class _Bound:
+            def inc(self, amount=1):
+                metric.calls.append(("inc", amount, tags))
+
+            def set(self, value):
+                metric.calls.append(("set", value, tags))
+
+            def observe(self, value):
+                metric.calls.append(("observe", value, tags))
+
+        return _Bound()
+
+
+class _InMemorySchedulerCollector(SchedulerMetricsCollector):
+    _counter_cls = _InMemoryMetric
+    _gauge_cls = _InMemoryMetric
+    _histogram_cls = _InMemoryMetric
+    _summary_cls = _InMemoryMetric
+
+
+def _make_in_memory_collector(labels):
+    # The collector only reads the prefill-delayer bucket fields from
+    # server_args in __init__, so a namespace stub keeps the test light.
+    server_args_stub = SimpleNamespace(
+        prefill_delayer_max_delay_passes=128,
+        prefill_delayer_forward_passes_buckets=None,
+        prefill_delayer_wait_seconds_buckets=None,
+    )
+    return _InMemorySchedulerCollector(labels=labels, server_args=server_args_stub)
+
+
+# Same label keys init_new() builds for a real scheduler.
+_TEST_COLLECTOR_LABELS = {
+    "model_name": "test-model",
+    "engine_type": "unified",
+    "tp_rank": 0,
+    "pp_rank": 0,
+    "moe_ep_rank": 0,
+}
+
+
+class TestStartupTimeDict(unittest.TestCase):
+    """The frozen phase registry must flow through the startup_time dict."""
+
+    def setUp(self) -> None:
+        # GaugeHistogram is not covered by the DI metric doubles and lands in
+        # the process-global prometheus registry; drop leftovers so each test
+        # can construct a fresh collector.
+        _clear_sglang_metrics_from_default_registry()
+        reset_startup_phases()
+
+    def tearDown(self) -> None:
+        reset_startup_phases()
+
+    def test_build_merges_frozen_registry_phases(self):
+        record_startup_phase("distributed_init", 4.0)
+        record_startup_phase("deepgemm_jit", 30.0)
+        with startup_phase_prefix("draft_"):
+            record_startup_phase("deepgemm_jit", 7.0)
+
+        startup_time = build_scheduler_startup_time(
+            target_load_weight=100.0,
+            draft_load_weight=20.0,
+            kv_cache_allocation=2.0,
+            scheduler_e2e=150.0,
+            target_cuda_graph={"decode": 9.0},
+            draft_cuda_graph=None,
+            phases=freeze_startup_phases(),
+        )
+
+        self.assertEqual(startup_time["load_weight"], 120.0)
+        self.assertEqual(startup_time["scheduler_e2e"], 150.0)
+        self.assertEqual(startup_time["distributed_init"], 4.0)
+        self.assertEqual(startup_time["deepgemm_jit"], 30.0)
+        self.assertEqual(startup_time["draft_deepgemm_jit"], 7.0)
+        self.assertEqual(startup_time["cuda_graph"]["decode"], 9.0)
+
+        # Work recorded after the freeze must not reach the dict.
+        record_startup_phase("deepgemm_jit", 5.0)
+        self.assertEqual(freeze_startup_phases()["deepgemm_jit"], 30.0)
+
+    def test_aggregate_maxes_arbitrary_phases(self):
+        aggregated = aggregate_scheduler_startup_times(
+            [
+                {
+                    "load_weight": 100.0,
+                    "deepgemm_jit": 30.0,
+                    "cuda_graph": {"decode": 9.0},
+                },
+                {
+                    "load_weight": 110.0,
+                    "deepgemm_jit": 25.0,
+                    "cuda_graph": {"decode": 11.0},
+                },
+                None,
+            ]
+        )
+        self.assertEqual(aggregated["load_weight"], 110.0)
+        self.assertEqual(aggregated["deepgemm_jit"], 30.0)
+        self.assertEqual(aggregated["cuda_graph"]["decode"], 11.0)
+        # Base keys stay present even when no rank reported them.
+        self.assertEqual(aggregated["kv_cache_allocation"], 0.0)
+        self.assertEqual(aggregated["scheduler_e2e"], 0.0)
+
+    def test_post_startup_phases_counted_once(self):
+        record_startup_phase("distributed_init", 100.0)
+        freeze_startup_phases()
+        collector = _make_in_memory_collector(_TEST_COLLECTOR_LABELS)
+
+        counter = collector.post_startup_time_seconds_total
+        self.assertEqual(counter.name, "sglang:post_startup_time_seconds_total")
+        collector.log_post_startup_phases()
+        self.assertEqual(counter.calls, [])
+
+        record_startup_phase("deepgemm_jit", 3.0)
+        collector.log_post_startup_phases()
+        record_startup_phase("deepgemm_jit", 2.0)
+        collector.log_post_startup_phases()
+        # A tick with no new work adds no increments.
+        collector.log_post_startup_phases()
+
+        incs = [
+            (value, tags["phase"]) for op, value, tags in counter.calls if op == "inc"
+        ]
+        self.assertEqual(incs, [(3.0, "deepgemm_jit"), (2.0, "deepgemm_jit")])
+
+
+class TestStartupPhaseRegistry(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_startup_phases()
+
+    def tearDown(self) -> None:
+        reset_startup_phases()
+
+    def test_record_accumulates(self):
+        record_startup_phase("phase_a", 1.5)
+        record_startup_phase("phase_a", 2.5)
+        record_startup_phase("phase_b", 3.0)
+        self.assertEqual(get_startup_phases(), {"phase_a": 4.0, "phase_b": 3.0})
+
+    def test_context_manager_records_elapsed(self):
+        with startup_phase("phase_timed"):
+            time.sleep(0.01)
+        self.assertGreaterEqual(get_startup_phases()["phase_timed"], 0.01)
+
+    def test_context_manager_records_on_exception(self):
+        with self.assertRaises(RuntimeError):
+            with startup_phase("phase_failed"):
+                raise RuntimeError("boom")
+        self.assertIn("phase_failed", get_startup_phases())
+
+    def test_prefix_applies_to_nested_recordings(self):
+        with startup_phase_prefix("draft_"):
+            record_startup_phase("weight_load", 2.0)
+            with startup_phase("deepgemm_jit"):
+                pass
+        record_startup_phase("weight_load", 5.0)
+
+        phases = get_startup_phases()
+        self.assertEqual(phases["draft_weight_load"], 2.0)
+        self.assertEqual(phases["weight_load"], 5.0)
+        self.assertIn("draft_deepgemm_jit", phases)
+        self.assertNotIn("deepgemm_jit", phases)
+
+    def test_prefix_restored_on_exception(self):
+        with self.assertRaises(RuntimeError):
+            with startup_phase_prefix("draft_"):
+                raise RuntimeError("boom")
+        record_startup_phase("weight_load", 1.0)
+        self.assertEqual(get_startup_phases(), {"weight_load": 1.0})
+
+    def test_freeze_is_idempotent(self):
+        record_startup_phase("weight_load", 10.0)
+        first = freeze_startup_phases()
+        record_startup_phase("deepgemm_jit", 3.0)
+        second = freeze_startup_phases()
+
+        self.assertEqual(first, {"weight_load": 10.0})
+        # A later freeze call cannot fold post-ready work into the snapshot.
+        self.assertEqual(second, first)
+        self.assertEqual(
+            get_startup_phases(), {"weight_load": 10.0, "deepgemm_jit": 3.0}
+        )
+
+    def test_drain_returns_post_freeze_deltas_exactly_once(self):
+        # Before the freeze there is no cold-start boundary.
+        record_startup_phase("deepgemm_jit", 30.0)
+        self.assertEqual(drain_post_startup_deltas(), {})
+
+        freeze_startup_phases()
+        self.assertEqual(drain_post_startup_deltas(), {})
+
+        record_startup_phase("deepgemm_jit", 12.0)
+        record_startup_phase("grammar_warmup", 1.5)  # phase first seen post-ready
+        self.assertEqual(
+            drain_post_startup_deltas(),
+            {"deepgemm_jit": 12.0, "grammar_warmup": 1.5},
+        )
+
+        self.assertEqual(drain_post_startup_deltas(), {})
+        record_startup_phase("deepgemm_jit", 2.0)
+        self.assertEqual(drain_post_startup_deltas(), {"deepgemm_jit": 2.0})
+
+    def test_inner_empty_prefix_overrides_outer(self):
+        # A target-runner scope entered during draft setup must attribute its
+        # own work to the target, not inherit the draft prefix.
+        with startup_phase_prefix("draft_"):
+            with startup_phase_prefix(""):
+                record_startup_phase("cuda_graph_capture", 3.0)
+            record_startup_phase("cuda_graph_capture", 4.0)
+        self.assertEqual(
+            get_startup_phases(),
+            {"cuda_graph_capture": 3.0, "draft_cuda_graph_capture": 4.0},
+        )
 
 
 class TestComputeRoutingKeyStats(unittest.TestCase):

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.startup_phase_registry import drain_post_startup_deltas
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -1039,6 +1040,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.post_startup_time_seconds_total = Counter(
+            name="sglang:post_startup_time_seconds_total",
+            documentation=(
+                "Cumulative seconds of startup-phase work performed after "
+                "scheduler-ready (lazy work such as DeepGEMM JIT compiles "
+                "triggered by server warmup or traffic). Separate from "
+                "the frozen cold-start breakdown in "
+                "sglang:startup_time_seconds."
+            ),
+            labelnames=list(labels.keys()) + ["phase"],
+        )
         self.page_size = Gauge(
             name="sglang:page_size",
             documentation="KV cache page size in tokens.",
@@ -1316,6 +1328,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
 
     def log_stats(self, stats: SchedulerStats) -> None:
+        self.log_post_startup_phases()
+
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
@@ -1476,6 +1490,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
 
+    def log_post_startup_phases(self) -> None:
+        """Export phase work performed after scheduler-ready as counter
+        increments."""
+        for phase, delta in drain_post_startup_deltas().items():
+            self.post_startup_time_seconds_total.labels(**self.labels, phase=phase).inc(
+                delta
+            )
+
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
@@ -1508,6 +1530,15 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="CUDA graph capture duration by phase in seconds.",
             labelnames=[*labels.keys(), "phase"],
             multiprocess_mode="mostrecent",
+        )
+        self.engine_startup_duration_seconds = Histogram(
+            name="sglang:engine_startup_duration_seconds",
+            documentation=(
+                "Histogram of end-to-end engine startup duration in seconds, "
+                "observed once at ready."
+            ),
+            labelnames=labels.keys(),
+            buckets=exponential_buckets(1, 2, 13),  # 1s .. 4096s
         )
 
         self.prompt_tokens_total = Counter(
@@ -1720,22 +1751,22 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
-        for phase in (
-            "load_weight",
-            "kv_cache_allocation",
-            "scheduler_e2e",
-            "tokenizer_e2e",
-        ):
-            self.startup_time_seconds.labels(
-                **self.labels,
-                phase=phase,
-            ).set(float(startup_time[phase]))
+        for phase, duration in startup_time.items():
+            if phase == "cuda_graph":
+                for graph_phase, graph_duration in duration.items():
+                    self.startup_cuda_graph_time_seconds.labels(
+                        **self.labels,
+                        phase=graph_phase,
+                    ).set(float(graph_duration))
+            else:
+                self.startup_time_seconds.labels(
+                    **self.labels,
+                    phase=phase,
+                ).set(float(duration))
 
-        for phase, duration in startup_time["cuda_graph"].items():
-            self.startup_cuda_graph_time_seconds.labels(
-                **self.labels,
-                phase=phase,
-            ).set(float(duration))
+        self.engine_startup_duration_seconds.labels(**self.labels).observe(
+            float(startup_time["tokenizer_e2e"])
+        )
 
     def observe_one_finished_request(
         self,
