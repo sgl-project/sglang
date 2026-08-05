@@ -2587,9 +2587,9 @@ class ServerArgs:
     # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
     # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
     # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
-    enable_gdn_replayssm_spec: A[
+    enable_linear_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM spec-verify (Part B of RFC #28511): fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
 
@@ -3476,13 +3476,6 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
-
-        if self.default_chat_template_kwargs is not None and not isinstance(
-            self.default_chat_template_kwargs, dict
-        ):
-            raise ValueError(
-                "--default-chat-template-kwargs must decode to a JSON object"
-            )
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -6171,10 +6164,10 @@ class ServerArgs:
         # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
         # --linear-replayssm-cache-len window and folds via its own fused
         # verify ring-write + commit_kda_replayssm_after_verify.
-        if self.enable_gdn_replayssm_spec:
+        if self.enable_linear_replayssm_spec:
             if self.speculative_eagle_topk not in (None, 1):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "--enable-linear-replayssm-spec requires a linear draft chain "
                     "(--speculative-eagle-topk in {None, 1}); the chunked verify "
                     "kernel uses a strictly-lower causal mask and is invalid for "
                     "EAGLE tree verify. Got "
@@ -6182,21 +6175,9 @@ class ServerArgs:
                 )
             if decode not in ("triton", "flashinfer"):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires the triton or "
+                    "--enable-linear-replayssm-spec requires the triton or "
                     "flashinfer linear-attn decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
-                )
-            # The auto->extra_buffer strategy resolution is still a declaration
-            # here, so read it through the resolved view.
-            view = self._resolved()
-            if (
-                view.disable_radix_cache is False
-                and view.mamba_radix_cache_strategy == "extra_buffer_lazy"
-            ):
-                raise ValueError(
-                    "--enable-gdn-replayssm-spec is not validated with "
-                    "--mamba-radix-cache-strategy extra_buffer_lazy yet; "
-                    "use extra_buffer."
                 )
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -6218,7 +6199,7 @@ class ServerArgs:
                     "nv_cutedsl",
                 ):
                     raise ValueError(
-                        "--enable-gdn-replayssm-spec with "
+                        "--enable-linear-replayssm-spec with "
                         f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
                         "KDA fold-every-commit family (DSPARK/DFLASH) and a "
                         "ring-writing verify kernel (--linear-attn-verify-backend "
@@ -6228,27 +6209,27 @@ class ServerArgs:
                     )
             if self.disaggregation_mode == "prefill":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not supported on a PD "
+                    "--enable-linear-replayssm-spec is not supported on a PD "
                     "prefill server: the ring is spec-verify-only scratch and "
                     "the prefill server never runs spec verify."
                 )
             if self.enable_linear_replayssm:
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec and --enable-linear-replayssm are "
+                    "--enable-linear-replayssm-spec and --enable-linear-replayssm are "
                     "mutually exclusive: they share the ring storage but drive it "
                     "with incompatible cursor protocols (per-decode-forward vs "
                     "per-verify-commit advance)."
                 )
             if self.mamba_ssm_dtype is None:
                 logger.info(
-                    "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
+                    "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
                     "float32 (the closed-loop exact fold keeps the SSM checkpoint "
                     "bit-identical to the recurrent baseline)."
                 )
                 self.mamba_ssm_dtype = "float32"
             elif self.mamba_ssm_dtype != "float32":
                 logger.warning(
-                    "--enable-gdn-replayssm-spec with --mamba-ssm-dtype=%s: the "
+                    "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
                     "closed-loop fold re-quantizes the committed state each "
                     "commit/flush (fp32 keeps it bit-exact to the fp32 recurrent "
                     "baseline), so it may drift over long sequences. Validate "
@@ -8104,6 +8085,12 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
 
         # Handle optimistic prefill validation
         if (
@@ -8113,8 +8100,14 @@ class ServerArgs:
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
                 self.optimistic_prefill_attempts = 0
-            elif self.enable_hierarchical_cache:
-                logger.warning("Optimistic prefill does not support hierarchical cache")
+            elif self.enable_hierarchical_cache and (
+                self.hicache_storage_backend is not None
+                or self.hicache_write_policy != "write_back"
+            ):
+                logger.warning(
+                    "Optimistic prefill only supports L2 hierarchical cache "
+                    "with write-back policy"
+                )
                 self.optimistic_prefill_attempts = 0
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
@@ -8410,6 +8403,13 @@ class ServerArgs:
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
+            "--enable-gdn-replayssm-spec",
+            dest="enable_linear_replayssm_spec",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-linear-replayssm-spec",
+            help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
+        )
+        parser.add_argument(
             "--enable-prefill-context-parallel",
             dest="enable_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
@@ -8533,6 +8533,11 @@ class ServerArgs:
         if hasattr(self, "model_config"):
             return self.model_config
         self.model_config = ModelConfig.from_server_args(self)
+        if self.model_config.is_hybrid_swa:
+            logger.info(
+                "Hybrid SWA model detected. architectures=%s",
+                self.model_config.hf_config.architectures,
+            )
         return self.model_config
 
     def _resolved(self):

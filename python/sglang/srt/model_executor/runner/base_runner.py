@@ -305,15 +305,6 @@ class BaseRunner(ABC):
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
-        # One dummy forward leaves the caching allocator short of a full forward's
-        # scratch: a second one still triggers fresh cudaMalloc segments (measured
-        # 6 segments / 118 MB; a third adds none). Capturing cuda graphs on that
-        # half-warmed allocator silently corrupts them -- spec verify degenerates
-        # and the accept length pins at the draft ceiling, with no error. Run once
-        # more so capture sees a settled allocator.
-        with torch.inference_mode():
-            self._dummy_run(batch_size=batch_size, buffers=buffers)
-
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_req: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_req).

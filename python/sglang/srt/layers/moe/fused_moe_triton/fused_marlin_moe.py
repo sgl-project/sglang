@@ -243,7 +243,14 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    if M == 1 and topk <= 32 and expert_map is None:
+    if (
+        M == 1
+        and topk <= 32
+        and expert_map is None
+        # The JIT kernel is int32-only; torch-native topk emits int64 -- let
+        # that (test-only) shape take the generic path instead of casting.
+        and topk_ids.dtype == torch.int32
+    ):
         # Single-token decode: top-k ids are distinct, so alignment is a
         # single-warp sort instead of the align + count_and_sort kernel pair.
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token

@@ -468,7 +468,7 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -487,13 +487,13 @@ class MambaPool:
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         # ReplaySSM: the decode ring (--enable-linear-replayssm) allocates the
         # chunked (d, k) records + write_pos; the spec-verify flag
-        # (--enable-gdn-replayssm-spec) always uses fold-every-commit and
+        # (--enable-linear-replayssm-spec) always uses fold-every-commit and
         # allocates only the raw (v, k, g, beta) window -- no chunked records,
         # no cursors (KDA additionally keeps d/k, see the allocation below).
         # The shared g allocation gates on `_replayssm_on`.
-        self.enable_gdn_replayssm_spec = enable_gdn_replayssm_spec
-        self.replayssm_spec_fold = bool(enable_gdn_replayssm_spec)
-        _replayssm_on = enable_linear_replayssm or enable_gdn_replayssm_spec
+        self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        self.replayssm_spec_fold = bool(enable_linear_replayssm_spec)
+        _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -591,7 +591,7 @@ class MambaPool:
                 # in the conv/activation dtype instead of the (fp32-enforced)
                 # SSM dtype to halve the ring traffic. g stays fp32 everywhere
                 # (exact-fold input). The two flags are mutually exclusive.
-                ring_dtype = conv_dtype if enable_gdn_replayssm_spec else ssm_dtype
+                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
                 # Fold-every-commit: one verify window, no chunked (d, k)
                 # records. KDA is the exception on both counts: its window
                 # stays L-sized (the fused verify ring-write drops
@@ -638,7 +638,7 @@ class MambaPool:
                 # flush replays these through the recurrent update sequentially
                 # (bit-identical to the recurrent baseline) instead of folding
                 # the chunked `d` records open-loop.
-                if enable_gdn_replayssm_spec:
+                if enable_linear_replayssm_spec:
                     if cache_params.is_kda:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
@@ -693,7 +693,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_gdn_replayssm_spec:
+                if enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -834,7 +834,7 @@ class MambaPool:
                         f"rawv={get_tensor_size_bytes(replayssm_rawv) / GB:.3f}GB, "
                         f"rawk={get_tensor_size_bytes(replayssm_rawk) / GB:.3f}GB, "
                         f"beta={get_tensor_size_bytes(replayssm_beta) / GB:.3f}GB "
-                        if enable_gdn_replayssm_spec
+                        if enable_linear_replayssm_spec
                         else ""
                     )
                 )
@@ -857,12 +857,12 @@ class MambaPool:
             # all GDN layers of one verify step; advanced by commit_gdn_replayssm_spec.
             self.replayssm_cache_base = (
                 torch.zeros((size + 1,), dtype=torch.int32, device=device)
-                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             self.replayssm_is_flush = (
                 torch.zeros((size + 1,), dtype=torch.int8, device=device)
-                if enable_gdn_replayssm_spec and not self.replayssm_spec_fold
+                if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
@@ -1169,7 +1169,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1196,7 +1196,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
 
     def _init_mamba_pool(
@@ -1212,7 +1212,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
-        enable_gdn_replayssm_spec: bool = False,
+        enable_linear_replayssm_spec: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1226,7 +1226,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
-            enable_gdn_replayssm_spec=enable_gdn_replayssm_spec,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1632,6 +1632,7 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        allocation_label: Optional[str] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -1645,6 +1646,7 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+        self.allocation_label = allocation_label
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -1665,19 +1667,27 @@ class KVCache(abc.ABC):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
+        cache_name = (
+            f"{self.allocation_label} KV Cache"
+            if self.allocation_label is not None
+            else "KV Cache"
+        )
         kv_size_bytes = self.get_kv_size_bytes()
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"{cache_name} {'VA upper bound' if self.post_capture_active else 'is allocated'}. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, "
+                f"V size: {v_size_GB:.2f} GB"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. dtype: {self.dtype}, #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"{cache_name} {'VA upper bound' if self.post_capture_active else 'is allocated'}. dtype: {self.dtype}, "
+                f"#tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
             )
             self.mem_usage = kv_size_GB
 
@@ -1760,6 +1770,7 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        allocation_label: Optional[str] = None,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -1776,6 +1787,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            allocation_label,
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None

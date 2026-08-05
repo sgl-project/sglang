@@ -44,9 +44,6 @@ def _use_fast(hidden_size: int) -> bool:
     return _FAST_SUPPORTED and hidden_size == 7168
 
 
-# ---- Precomputed weight cache ------------------------------------------------
-
-
 def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
@@ -101,9 +98,6 @@ def _aggregate_fast(
     return out
 
 
-# ---- Kernel 1: per-row scoring (2D grid [T, NVB+1]) -------------------------
-
-
 @triton.jit
 def _score_kernel(
     prefix_ptr,  # [T, H]
@@ -139,9 +133,6 @@ def _score_kernel(
         dotv += tl.sum(v * cw)
     rrms = 1.0 / tl.sqrt(sumsq / H + eps)
     tl.store(scores_ptr + pid_t * stride_sm + j, dotv * rrms)
-
-
-# ---- Kernel 2: softmax + weighted sum (2D grid [T, H/BLOCK_H]) --------------
 
 
 @triton.jit
@@ -194,9 +185,6 @@ def _combine_kernel(
         out_ptr + pid_t * stride_om + offs_h,
         acc.to(out_ptr.dtype.element_ty),
     )
-
-
-# ---- Fused path: score → combine → RMSNorm(standard) ------------------------
 
 
 def _mix_fused(
@@ -267,9 +255,6 @@ def _aggregate_fused(
     return out_norm(_mix_fused(prefix_sum, bank, nvb, score_proj, score_norm))
 
 
-# ---- PyTorch reference -------------------------------------------------------
-
-
 def aggregate_stream_torch(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -284,10 +269,8 @@ def aggregate_stream_torch(
     # rows = [bank[0..nvb-1], prefix_sum]  shape [T, nvb+1, H]
     rows = torch.cat([bank[:, :nvb, :], prefix_sum.unsqueeze(1)], dim=1)
     R = nvb + 1
-    # score: RMSNorm each row, project to scalar
     normed = score_norm(rows.reshape(T * R, H))
     scores = score_proj(normed)[0].reshape(T, R)
-    # softmax + weighted sum of original rows
     probs = torch.softmax(scores.float(), dim=-1)
     mixed = (probs.unsqueeze(-1) * rows.float()).sum(dim=1)
     return mixed.to(prefix_sum.dtype)
@@ -308,9 +291,6 @@ def aggregate_stream(
     if prefix_sum.shape[1] % _BLOCK_H != 0:
         return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
     return _mix_fused(prefix_sum, bank, nvb, score_proj, score_norm)
-
-
-# ---- Residual-add + aggregation ----------------------------------------------
 
 
 def _aggregate_fused_add(
@@ -339,9 +319,6 @@ def _aggregate_fused_add(
         ),
         prefix,
     )
-
-
-# ---- Capability dispatch -------------------------------------------------------
 
 
 def _aggregate(
@@ -376,9 +353,6 @@ def _aggregate(
         )
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
-
-
-# ---- Public API ---------------------------------------------------------------
 
 
 class AttnResidual:
