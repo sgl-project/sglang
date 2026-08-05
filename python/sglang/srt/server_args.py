@@ -3865,14 +3865,16 @@ class ServerArgs:
         if model_config.attention_arch != AttentionArch.MLA:
             return
 
-        # bf16 kv-cache is what the gluon DCP decode path is validated on; fp8
-        # kv-cache under DCP is not yet exercised, so reject it early.
-        if "fp8" in (self.kv_cache_dtype or ""):
+        # Keep FP8 blocked by default while allowing the validated local
+        # benchmark path to opt in explicitly.
+        if "fp8" in (self.kv_cache_dtype or "") and os.environ.get(
+            "SGLANG_EXPERIMENTAL_AITER_DCP_FP8", "0"
+        ) != "1":
             raise ValueError(
                 "aiter MLA decode context parallel (--dcp-size > 1) currently "
                 "requires bf16 kv-cache; fp8 kv-cache under DCP is not yet "
-                "validated. Use bf16 kv-cache with --dcp-size, or drop --dcp-size "
-                "for fp8 kv-cache."
+                "validated. Set SGLANG_EXPERIMENTAL_AITER_DCP_FP8=1 to opt into "
+                "an unsupported experiment."
             )
 
     def _handle_load_balance_method(self):
