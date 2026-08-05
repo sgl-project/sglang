@@ -664,6 +664,73 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(results[PoolName.MAMBA], [True])
         self.assertTrue(torch.all(pool.get_data_page(0) == 3))
 
+    def test_batch_set_get_v2_chunks_large_pool(self):
+        from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
+
+        cases = (
+            (
+                PoolName.MAMBA,
+                MockHybridPool(num_pages=STORAGE_BATCH_SIZE + 2, expose_zero_copy=True),
+                2,
+            ),
+            (
+                PoolName.SWA,
+                MockMemPoolHost(
+                    is_zero_copy_mode=False,
+                    page_size=2,
+                    num_pages=STORAGE_BATCH_SIZE + 2,
+                ),
+                1,
+            ),
+        )
+        for pool_name, pool, key_multiplier in cases:
+            with self.subTest(pool_name=pool_name, page_size=pool.page_size):
+                page_count = STORAGE_BATCH_SIZE + 2
+                self.hicache.register_mem_host_pool_v2(pool, pool_name)
+                keys = [f"p{i}" for i in range(page_count)]
+                host_indices = torch.arange(
+                    page_count * pool.page_size, dtype=torch.int64
+                )
+                transfer = PoolTransfer(
+                    name=pool_name,
+                    keys=keys,
+                    host_indices=host_indices,
+                )
+                write_batch_sizes = []
+
+                def fake_write(keys, key_strs, host_buffers, direction):
+                    write_batch_sizes.append(len(key_strs))
+                    return [True] * len(key_strs)
+
+                self.hicache._batch_xfer = fake_write
+                set_results = self.hicache.batch_set_v2([transfer])
+                self.assertEqual(set_results[pool_name], [True] * page_count)
+                self.assertEqual(
+                    write_batch_sizes,
+                    [STORAGE_BATCH_SIZE * key_multiplier, 2 * key_multiplier],
+                )
+
+                read_batch_sizes = []
+
+                def fake_read(keys, key_strs, host_buffers, direction):
+                    read_batch_sizes.append(len(key_strs))
+                    ctx = self.hicache._hybrid_pool_ctx[pool_name]
+                    if not ctx.is_zero_copy:
+                        ctx.bounce_get[: len(key_strs)].fill_(len(read_batch_sizes))
+                    return [True] * len(key_strs)
+
+                self.hicache._batch_xfer = fake_read
+                get_results = self.hicache.batch_get_v2([transfer])
+                self.assertEqual(get_results[pool_name], [True] * page_count)
+                self.assertEqual(
+                    read_batch_sizes,
+                    [STORAGE_BATCH_SIZE * key_multiplier, 2 * key_multiplier],
+                )
+                if not self.hicache._hybrid_pool_ctx[pool_name].is_zero_copy:
+                    self.assertTrue(torch.all(pool.get_data_page(0) == 1))
+                    last_page_start = (page_count - 1) * pool.page_size
+                    self.assertTrue(torch.all(pool.get_data_page(last_page_start) == 2))
+
     def test_batch_set_get_v2_distinguishes_same_key_by_pool_name(self):
         mamba_pool = MockHybridPool(expose_zero_copy=False)
         swa_pool = MockHybridPool(expose_zero_copy=False)
