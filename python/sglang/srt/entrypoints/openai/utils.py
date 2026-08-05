@@ -33,9 +33,17 @@ def to_openai_style_logprobs(
     def append_top_logprobs(top_logprobs):
         for tokens in top_logprobs:
             if tokens is not None:
-                ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
-                )
+                # tokens is ordered by descending logprob (highest first).
+                # When two distinct token ids decode to the same string
+                # (e.g. byte-fallback tokens all decoding to U+FFFD), a plain
+                # dict comprehension keyed by text silently drops all but the
+                # last -- which is the *lowest*-ranked candidate. Build the
+                # dict in reverse so the first (highest-ranked) occurrence
+                # wins, preserving the correct logprob for colliding text.
+                result = {}
+                for token in reversed(tokens):
+                    result[token[2]] = token[0]
+                ret_logprobs.top_logprobs.append(result)
             else:
                 ret_logprobs.top_logprobs.append(None)
 
