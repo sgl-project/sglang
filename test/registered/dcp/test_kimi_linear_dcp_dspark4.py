@@ -1,3 +1,5 @@
+"""Four-Blackwell Kimi Linear TokenSpeed DCP + DSpark static acceptance test."""
+
 import json
 import socket
 import tempfile
@@ -39,6 +41,7 @@ def _has_four_blackwell_gpus() -> bool:
 
 
 def _write_dummy_qwen3_dspark_draft(root: Path) -> str:
+    """Write a dummy Qwen3 DSpark config with Kimi Linear dimensions."""
     draft_dir = root / "qwen3-dspark-kimi-proxy"
     draft_dir.mkdir()
     config = {
