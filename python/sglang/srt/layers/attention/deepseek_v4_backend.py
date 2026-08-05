@@ -204,11 +204,24 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
-    # trtllm decode: preallocated combined sparse table [num_tokens, 128 + compressed_capacity]
-    # and total-lens [num_tokens], filled in place per layer. None for
-    # prefill-style metadata and when the trtllm backend is off.
-    trtllm_sparse_indices: Optional[torch.Tensor] = None
-    trtllm_sparse_topk_lens: Optional[torch.Tensor] = None
+    # trtllm decode: per-ratio combined sparse tables [num_tokens, 128 + w]
+    # and lens [num_tokens]. Layer-invariant content (SWA columns, the whole
+    # c128 table, the c0 lens) is written once per step by
+    # init_trtllm_sparse_buffers; the per-layer forward only writes the c4
+    # tail + lens (indexer top-k). c0 layers pass swa_page_indices itself as
+    # the table. None for prefill-style metadata and when trtllm is off.
+    trtllm_swa_lens: Optional[torch.Tensor] = None
+    trtllm_c4_indices: Optional[torch.Tensor] = None
+    trtllm_c4_lens: Optional[torch.Tensor] = None
+    trtllm_c128_indices: Optional[torch.Tensor] = None
+    trtllm_c128_lens: Optional[torch.Tensor] = None
+    # trtllm prefill: per-chunk caches built lazily by _forward_trtllm_prefill
+    # (prefill runs eagerly). qmeta = (cum_seq_lens_q, max_q_len, sum_q,
+    # seq_lens_int32); c128 = (table, lens).
+    trtllm_prefill_qmeta: Optional[tuple] = None
+    trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
+    trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
+    trtllm_prefill_c128: Optional[tuple] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -253,8 +266,11 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
-                "trtllm_sparse_indices",
-                "trtllm_sparse_topk_lens",
+                "trtllm_swa_lens",
+                "trtllm_c4_indices",
+                "trtllm_c4_lens",
+                "trtllm_c128_indices",
+                "trtllm_c128_lens",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -280,10 +296,14 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
-            # trtllm buffers are refilled in place by the per-layer
-            # forward; content-copy keeps the captured tensor objects alive.
-            "trtllm_sparse_indices",
-            "trtllm_sparse_topk_lens",
+            # trtllm tables: static parts are rebuilt per step by the host
+            # metadata; content-copy keeps the captured tensor objects alive
+            # (the c4 tail is refilled in place by the per-layer forward).
+            "trtllm_swa_lens",
+            "trtllm_c4_indices",
+            "trtllm_c4_lens",
+            "trtllm_c128_indices",
+            "trtllm_c128_lens",
         ]
         reference_assign_fields = [
             "page_table",
@@ -423,27 +443,43 @@ class DSV4AttnMetadata:
         self.c128_flashmla_metadata = _create_flashmla_metadata()
 
     def init_trtllm_sparse_buffers(self) -> None:
-        """Preallocate the trtllm combined sparse table.
+        """Build the trtllm per-ratio combined sparse tables (decode).
 
-        Capacity = 128 SWA slots + the widest compressed tier present in this
-        metadata (c4 top-k and/or c128 page list, both already 64-aligned).
-        The per-layer decode forward fills the buffers strictly in place.
+        Kernel contract per row: columns [0:128) SWA physical token indices,
+        [128:) compressed-tier indices, -1 invalid, capacity % 4 == 0; lens
+        include the 128 SWA slots. Everything layer-invariant is written here,
+        once per step: the SWA columns of both tables, the ENTIRE c128 table
+        and lens (its page list is metadata-level), and the constant SWA-only
+        lens (c0 layers pass swa_page_indices itself as the table). The
+        per-layer decode forward only writes the c4 tail + lens.
         """
 
         num_tokens = self.seq_lens_casual.shape[0]
-        compressed_widths = [0]
-        if self.c4_sparse_page_indices is not None:
-            compressed_widths.append(self.c4_sparse_page_indices.shape[-1])
-        if self.c128_page_indices is not None:
-            compressed_widths.append(self.c128_page_indices.shape[-1])
-        # The kernel requires capacity % 4 == 0.
-        capacity = SWA_WINDOW + ceil_align(max(compressed_widths), 4)
-        self.trtllm_sparse_indices = torch.full(
-            (num_tokens, capacity), -1, **self.cuda_int32_kwargs
-        )
-        self.trtllm_sparse_topk_lens = torch.full(
+        assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
+        self.trtllm_swa_lens = torch.full(
             (num_tokens,), SWA_WINDOW, **self.cuda_int32_kwargs
         )
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
+            assert w4 % 4 == 0, f"{w4=}"
+            self.trtllm_c4_indices = torch.empty(
+                (num_tokens, SWA_WINDOW + w4), **self.cuda_int32_kwargs
+            )
+            self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c4_lens = torch.empty(
+                (num_tokens,), **self.cuda_int32_kwargs
+            )
+        if self.c128_page_indices is not None:
+            w128 = self.c128_page_indices.shape[-1]
+            assert w128 % 4 == 0, f"{w128=}"
+            self.trtllm_c128_indices = torch.empty(
+                (num_tokens, SWA_WINDOW + w128), **self.cuda_int32_kwargs
+            )
+            self.trtllm_c128_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
+            self.trtllm_c128_indices[:, SWA_WINDOW:].copy_(self.c128_page_indices)
+            self.trtllm_c128_lens = (
+                self.c128_topk_lengths_clamp1 + SWA_WINDOW
+            ).to(torch.int32)
 
 
 @dataclass
@@ -1981,40 +2017,46 @@ class DeepseekV4AttnBackend(
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
 
-        sparse_indices = core_attn_metadata.trtllm_sparse_indices
-        sparse_topk_lens = core_attn_metadata.trtllm_sparse_topk_lens
+        # Per-ratio tables: layer-invariant content (SWA columns, the whole
+        # c128 table, the c0 lens) was written once per step by
+        # init_trtllm_sparse_buffers; only the c4 tail + lens (indexer
+        # top-k) are written here.
+        assert swa_page_indices.shape == (bs, SWA_WINDOW)
+        if compress_ratio == 0:
+            # swa_page_indices is itself a valid combined table (capacity
+            # 128, all-SWA); no fill needed.
+            sparse_indices = swa_page_indices
+            sparse_topk_lens = core_attn_metadata.trtllm_swa_lens
+        elif compress_ratio == 128:
+            sparse_indices = core_attn_metadata.trtllm_c128_indices
+            sparse_topk_lens = core_attn_metadata.trtllm_c128_lens
+        else:
+            sparse_indices = core_attn_metadata.trtllm_c4_indices
+            sparse_topk_lens = core_attn_metadata.trtllm_c4_lens
         assert sparse_indices is not None and sparse_topk_lens is not None, (
             "trtllm decode requires metadata built with "
             "init_trtllm_sparse_buffers (decode-mode DSV4AttnMetadata)"
         )
         if sparse_indices.shape[0] != bs:
             # Metadata may be built against a padded batch; slice to the live
-            # rows (views -- the fills below stay in place).
+            # rows (views -- the c4 fill below stays in place).
             assert sparse_indices.shape[0] > bs, f"{sparse_indices.shape=} {bs=}"
             sparse_indices = sparse_indices[:bs]
+        if sparse_topk_lens.shape[0] != bs:
+            assert sparse_topk_lens.shape[0] > bs, f"{sparse_topk_lens.shape=}"
             sparse_topk_lens = sparse_topk_lens[:bs]
-        capacity = sparse_indices.shape[1]
 
-        # Kernel index contract: columns [0:128) = SWA physical token
-        # indices, [128:) = compressed-tier indices, -1 = invalid.
-        assert swa_page_indices.shape == (bs, SWA_WINDOW)
-        sparse_indices[:, :SWA_WINDOW].copy_(swa_page_indices)
-        if extra_indices is not None:
-            assert extra_topk_lengths is not None
+        if compress_ratio == 4:
+            assert extra_indices is not None and extra_topk_lengths is not None
             width = extra_indices.shape[-1]
-            assert SWA_WINDOW + width <= capacity, f"{width=} {capacity=}"
-            sparse_indices[:, SWA_WINDOW : SWA_WINDOW + width].copy_(extra_indices)
-            if SWA_WINDOW + width < capacity:
-                sparse_indices[:, SWA_WINDOW + width :].fill_(-1)
+            assert SWA_WINDOW + width == sparse_indices.shape[1], (
+                f"{width=} {sparse_indices.shape=}"
+            )
+            sparse_indices[:, SWA_WINDOW:].copy_(extra_indices)
             # Lens include the fixed 128 SWA slots; SWA validity itself is
             # derived from seq_lens inside the kernel.
             sparse_topk_lens.copy_(extra_topk_lengths)
             sparse_topk_lens.add_(SWA_WINDOW)
-        else:
-            # SWA-only (compress_ratio == 0) layer.
-            if capacity > SWA_WINDOW:
-                sparse_indices[:, SWA_WINDOW:].fill_(-1)
-            sparse_topk_lens.fill_(SWA_WINDOW)
 
         swa_kv_cache, compressed_kv_cache = self._trtllm_kv_cache_views(
             layer.layer_id, compress_ratio
@@ -2080,43 +2122,75 @@ class DeepseekV4AttnBackend(
         # Varlen query structure, from the same host-side extend lens that
         # produced this metadata (init_forward_metadata_prefill /
         # expand_prefill_casually).
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
-        batch_size = len(extend_seq_lens_cpu)
-        cum_lens = [0] * (batch_size + 1)
-        for i, extend_len in enumerate(extend_seq_lens_cpu):
-            cum_lens[i + 1] = cum_lens[i] + int(extend_len)
-        sum_q = cum_lens[-1]
-        max_q_len = max(int(x) for x in extend_seq_lens_cpu)
-        # q (and the per-token metadata rows, via match_num_queries) may be
-        # padded past the real extend tokens; the pad rows sit at the end.
-        assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-        cum_seq_lens_q = self._move_to_device(cum_lens)
-
-        # Per-request TOTAL KV length (cached prefix + extend tokens).
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        assert seq_lens.shape == (batch_size,), f"{seq_lens.shape=} {batch_size=}"
+        core = self.forward_metadata.core_attn_metadata
+        if core.trtllm_prefill_qmeta is None:
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
+            batch_size = len(extend_seq_lens_cpu)
+            cum_lens = [0] * (batch_size + 1)
+            for i, extend_len in enumerate(extend_seq_lens_cpu):
+                cum_lens[i + 1] = cum_lens[i] + int(extend_len)
+            sum_q = cum_lens[-1]
+            max_q_len = max(int(x) for x in extend_seq_lens_cpu)
+            # q (and the per-token metadata rows, via match_num_queries) may
+            # be padded past the real extend tokens; the pad rows sit at the
+            # end.
+            assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
+            # Per-request TOTAL KV length (cached prefix + extend tokens).
+            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+            assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
+            core.trtllm_prefill_qmeta = (
+                self._move_to_device(cum_lens),
+                max_q_len,
+                sum_q,
+                seq_lens_i32,
+            )
+        cum_seq_lens_q, max_q_len, sum_q, seq_lens = core.trtllm_prefill_qmeta
 
         # Combined per-token sparse table (physical indices, -1 invalid).
+        # Layer-invariant parts are cached per chunk on the metadata: the c0
+        # lens, the c4 table's SWA half (per-layer: the indexer top-k tail +
+        # lens), and the whole c128 table + lens (its page list is
+        # metadata-level).
         swa_indices = swa_page_indices[:sum_q]
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
         if extra_indices is None:
             # SWA-only (compress_ratio == 0) layer. SWA_WINDOW satisfies the
             # kernel's capacity constraints (>= 128, % 4 == 0).
             sparse_indices = swa_indices.contiguous()
-            sparse_topk_lens = torch.full(
-                (sum_q,), SWA_WINDOW, **self.cuda_int32_kwargs
-            )
+            if core.trtllm_prefill_swa_lens is None:
+                core.trtllm_prefill_swa_lens = torch.full(
+                    (sum_q,), SWA_WINDOW, **self.cuda_int32_kwargs
+                )
+            sparse_topk_lens = core.trtllm_prefill_swa_lens
+        elif compress_ratio == 128:
+            if core.trtllm_prefill_c128 is None:
+                width = extra_indices.shape[-1]
+                assert width % 4 == 0, f"{width=}"
+                table = torch.empty(
+                    (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
+                )
+                table[:, :SWA_WINDOW].copy_(swa_indices)
+                table[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
+                assert extra_topk_lengths is not None
+                lens = extra_topk_lengths[:sum_q].to(torch.int32) + SWA_WINDOW
+                core.trtllm_prefill_c128 = (table, lens)
+            sparse_indices, sparse_topk_lens = core.trtllm_prefill_c128
         else:
             assert extra_topk_lengths is not None
             width = extra_indices.shape[-1]
-            # c4/c128 index tables are padded to multiples of 64 upstream
+            # c4 index tables are padded to multiples of 64 upstream
             # (_pad_last_dim), so the combined capacity satisfies % 4 == 0.
             assert width % 4 == 0, f"{width=}"
-            sparse_indices = torch.empty(
-                (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
+            if core.trtllm_prefill_c4_indices is None:
+                core.trtllm_prefill_c4_indices = torch.empty(
+                    (sum_q, SWA_WINDOW + width), **self.cuda_int32_kwargs
+                )
+                core.trtllm_prefill_c4_indices[:, :SWA_WINDOW].copy_(swa_indices)
+            sparse_indices = core.trtllm_prefill_c4_indices
+            assert sparse_indices.shape == (sum_q, SWA_WINDOW + width), (
+                f"{sparse_indices.shape=} {width=}"
             )
-            sparse_indices[:, :SWA_WINDOW].copy_(swa_indices)
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices[:sum_q])
             # Total lens include the fixed 128 SWA slots; SWA validity itself
             # is derived from seq_lens/cum_seq_lens_q inside the kernel.
