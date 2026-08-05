@@ -63,31 +63,16 @@ def build_roofline_suffix(forward_batch: ForwardBatch) -> str:
     MIXED emitting both groups. The per-phase ``sq`` (Σ N_Q) is always emitted
     so the suffix is self-contained, even where it duplicates the base label's
     ``bs`` (vanilla decode) or ``toks`` (pure extend).
-
-    Speculative decoding (EAGLE/MTP) breaks the vanilla ``N_Q == 1`` decode
-    assumption: draft-decode and target-verify process ``num_tokens_per_req``
-    query tokens per request (see :func:`_decode_query_width`). Both are
-    classified as generation (``g_``) by request phase (matching vLLM), with
-    ``g_sq = bs * num_tokens_per_req``. Target-verify's quadratic self-attention
-    among those query tokens is still captured numerically in ``g_sqsq``.
-
-    Returns an empty string when the required host mirrors are unavailable
-    (e.g. some overlap-schedule paths drop ``seq_lens_cpu``), so the base label
-    is emitted unchanged rather than risking a device sync or a crash.
     """
     mode = forward_batch.forward_mode
     seq_lens_cpu = forward_batch.seq_lens_cpu
 
     # DECODE (vanilla or spec draft-decode) and TARGET_VERIFY both key off
     # ``seq_lens_cpu`` for N_KV and a uniform per-request query width N_Q, and
-    # are both classified as generation (``g_``) by request phase (matching
-    # vLLM's convention):
+    # are both classified as generation (``g_``) by request phase
     #   * DECODE        -> N_Q is 1 (vanilla) or the spec draft-decode width.
     #   * TARGET_VERIFY -> N_Q is ``num_tokens_per_req`` (the draft-token count);
-    #                      the request is past its prompt (generation phase), so
-    #                      it is bucketed under ``g_`` even though those query
-    #                      tokens self-attend. The quadratic self-attention cost
-    #                      is still captured numerically in ``g_sqsq`` (Σ N_Q²).
+    #                      the request is past its prompt (generation phase)
     if mode == ForwardMode.DECODE or mode == ForwardMode.TARGET_VERIFY:
         if seq_lens_cpu is None:
             return ""
