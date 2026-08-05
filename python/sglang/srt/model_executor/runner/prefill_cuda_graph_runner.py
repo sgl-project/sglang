@@ -303,9 +303,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         deepstack_replay_width = (
             self.model_runner.model_config.hidden_size
             * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
-            if getattr(
-                self.model_runner.model, "supports_bcg_deepstack_replay", False
-            )
+            if getattr(self.model_runner.model, "supports_bcg_deepstack_replay", False)
             else 0
         )
 

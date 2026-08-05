@@ -100,6 +100,7 @@ class TestDeepStackReplaySlotRegistration(CustomTestCase):
         self.assertEqual(buf.shape[-1], 192)
         self.assertEqual(buf.dtype, torch.bfloat16)
 
+
 class TestPrefillInputBuffersDeepStackField(CustomTestCase):
 
     def test_buffer_none_when_width_zero(self):
