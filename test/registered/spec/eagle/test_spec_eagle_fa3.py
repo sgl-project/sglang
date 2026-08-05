@@ -22,7 +22,7 @@ register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
-    """EAGLE3 spec v2 topk=1 on fa3 (the H200 default backend)."""
+    """EAGLE3 topk=1 on fa3 (the H200 default backend), overlap on."""
 
     attention_backend = "fa3"
     disable_overlap = False
@@ -37,7 +37,7 @@ class TestEagleLlama2Fa3Page256(
     SpecPerfKit,
     SpecFeatureKit,
 ):
-    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256 (spec v1)."""
+    """EAGLE/Llama-2 topk=5 tree on fa3 + page_size=256, overlap off."""
 
     spec_topk = 5
     spec_steps = 8

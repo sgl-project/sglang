@@ -1,8 +1,7 @@
-"""topk > 1 tree drafting (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
+"""topk > 1 tree drafting at page_size=1 (EAGLE3 topk16 + EAGLE/Llama-2 topk8).
 
-topk > 1 routes to spec v1, except page_size==1 which can also stay on spec v2
-(overlap). flashinfer is pinned because this runs on the cheap (5090) runner,
-where fa3 (Hopper-only) isn't available -- functional sanity only, no perf/stress.
+flashinfer is pinned because this runs on the cheap (5090) runner, where fa3
+(Hopper-only) isn't available -- functional sanity only, no perf/stress.
 (topk > 1 on fa3 is covered on the Hopper runner in test_spec_eagle_fa3.py.)
 """
 
@@ -14,32 +13,38 @@ from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
     SpecFeatureKit,
+    SpecHiddenStatesKit,
     SpecLogprobKit,
     SpecPenaltyKit,
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=1180, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=830, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
-    """EAGLE3 topk=16 tree (spec v1): correctness + gsm8k + logprob losslessness."""
+class TestEagle3Topk16(
+    Eagle3Base,
+    SpecCorrectnessKit,
+    SpecAccuracyKit,
+    SpecLogprobKit,
+    SpecFeatureKit,
+    SpecHiddenStatesKit,
+):
+    """EAGLE3 topk=16 tree with the overlap scheduler: guards the accepted-path
+    compaction (validated by logprob_decode_match_prefill) and, via
+    SpecHiddenStatesKit, the per-request hidden-state stride slicing that the
+    same tree compaction feeds.
+    """
 
     spec_topk = 16
     spec_tokens = 64
-    disable_overlap = True  # synchronous baseline; SpecV2 subclass flips overlap on
+    disable_overlap = False
+    enable_return_hidden_states = True
     cuda_graph_max_bs_decode = 5
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
     gsm8k_accept_len_thres = 2.4  # EAGLE3 topk16 gsm8k accept ~2.48
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
-
-
-class TestEagle3Topk16SpecV2(TestEagle3Topk16, SpecFeatureKit):
-    """EAGLE3 topk=16 tree on spec v2 (overlap, page1): guards the v2 tree path's
-    accepted-path compaction, validated by logprob_spec_v2_match."""
-
-    disable_overlap = False
 
 
 class TestEagleLlama2Suite(
