@@ -41,6 +41,7 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 aster_iq2_moe_a8_vec = None
+aster_iq2_moe_fused_decode = None
 
 if _is_cuda:
     from sgl_kernel import moe_align_block_size, moe_sum
@@ -58,6 +59,7 @@ if _is_cuda:
     if os.environ.get("SGLANG_ASTER_IQ2_KERNEL"):
         from sglang.srt.layers.quantization.aster_iq2_moe import (
             aster_iq2_moe_a8_vec,
+            aster_iq2_moe_fused_decode,
         )
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
@@ -302,6 +304,21 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
+
+        if activation == "situ" and aster_iq2_moe_fused_decode is not None:
+            fused = aster_iq2_moe_fused_decode(
+                x,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                int(qweight_type),
+                int(qweight_type2),
+                situ_beta,
+                situ_linear_beta,
+            )
+            if fused is not None:
+                return fused
 
         out = _ggml_moe_a8_vec_dispatch(
             x, w1, topk_ids, top_k, qweight_type, N, num_tokens

@@ -1560,13 +1560,10 @@ class KimiK3DeltaAttention(nn.Module):
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
-            or w.dtype != torch.float32
             or layer.A_log is None
             or layer.A_log.numel() != self.local_num_heads
-            or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
-            or layer.dt_bias.dtype != torch.float32
         ):
             rank0_log(
                 "K3 fused KDA decode disabled: unexpected conv/A_log/dt_bias "
@@ -1575,21 +1572,29 @@ class KimiK3DeltaAttention(nn.Module):
                 f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
             )
             return
-        # Conv weights/bias stay fp32 (checkpoint dtype; the kernel loads
-        # them as fp32, matching the triton chain's precision exactly).
-        wt = w.t().contiguous()  # [4, 3*seg]
+        # Native checkpoints already carry these recurrence constants in
+        # fp32. GGUF may restore an exactly equivalent bf16 storage tensor.
+        # The fused CUDA ABI is fp32, so widen once during model preparation;
+        # widening bf16 is lossless and avoids silently disabling all 69 KDA
+        # layers solely because of serialized storage dtype/layout.
+        wt = w.float().t().contiguous()  # [4, 3*seg]
         bias = layer.bias
         conv_bias = (
             bias.float().contiguous()
             if bias is not None
             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
         )
+        if (
+            layer.dt_bias.dtype != torch.float32
+            or not layer.dt_bias.is_contiguous()
+        ):
+            layer.dt_bias.data = layer.dt_bias.data.float().contiguous()
         layer._k3_fused_decode_args = (
             wt[:, :seg].contiguous(),
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [local heads]
+            layer.A_log.detach().float().reshape(-1).contiguous(),
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
