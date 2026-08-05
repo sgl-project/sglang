@@ -70,13 +70,13 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
-    def _run_raw_output_dispatch(self, *, use_v2: bool):
-        query_rows = 2
-        page_table = torch.tensor([[3, 1], [5, 2]], dtype=torch.int32)
-        c4_seq_lens = torch.tensor([64, 65], dtype=torch.int32)
+    def test_raw_output_dispatch(self):
+        query_rows = 1
+        page_table = torch.zeros((query_rows, 1), dtype=torch.int32)
+        c4_seq_lens = torch.ones(query_rows, dtype=torch.int32)
         page_indices = torch.full((query_rows, 512), -1, dtype=torch.int32)
         raw_indices = torch.full_like(page_indices, -1)
-        topk_metadata = torch.tensor([[0, 0]], dtype=torch.int32)
+        topk_metadata = torch.zeros((query_rows + 1, 2), dtype=torch.int32)
 
         indexer_metadata = object.__new__(PagedIndexerMetadata)
         indexer_metadata.page_size = 256
@@ -114,63 +114,45 @@ class TestDSV4TopKDispatch(CustomTestCase):
         )
         c4_indexer = SimpleNamespace(use_fp4_indexer=False, layer_id=0)
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-        topk_v1 = MagicMock()
-        topk_v2 = MagicMock()
-        deep_gemm = SimpleNamespace(fp8_paged_mqa_logits=MagicMock())
 
         with (
-            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            envs.SGLANG_OPT_USE_TOPK_V2.override(use_v2),
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
-            patch(f"{_INDEXER}.topk_transform_512", topk_v1),
-            patch(f"{_INDEXER}.topk_transform_512_v2", topk_v2),
+            patch(f"{_INDEXER}.topk_transform_512") as topk_v1,
+            patch(f"{_INDEXER}.topk_transform_512_v2") as topk_v2,
         ):
-            C4IndexerBackendMixin.forward_c4_indexer(
-                backend,
-                x=torch.empty((query_rows, 1)),
-                q_lora=torch.empty((query_rows, 1)),
-                c4_indexer=c4_indexer,
-                forward_batch=forward_batch,
-            )
+            for use_v2, selected, skipped in (
+                (True, topk_v2, topk_v1),
+                (False, topk_v1, topk_v2),
+            ):
+                with (
+                    self.subTest(use_v2=use_v2),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(use_v2),
+                ):
+                    C4IndexerBackendMixin.forward_c4_indexer(
+                        backend,
+                        x=torch.empty((query_rows, 1)),
+                        q_lora=torch.empty((query_rows, 1)),
+                        c4_indexer=c4_indexer,
+                        forward_batch=forward_batch,
+                    )
 
-        return SimpleNamespace(
-            logits=logits,
-            c4_seq_lens=c4_seq_lens,
-            page_table=page_table,
-            page_indices=page_indices,
-            raw_indices=raw_indices,
-            topk_metadata=topk_metadata,
-            topk_v1=topk_v1,
-            topk_v2=topk_v2,
-        )
-
-    def test_raw_output_uses_v2_and_preserves_v1_fallback(self):
-        result = self._run_raw_output_dispatch(use_v2=True)
-        result.topk_v2.assert_called_once_with(
-            result.logits,
-            result.c4_seq_lens,
-            result.page_table,
-            result.page_indices,
-            64,
-            result.topk_metadata,
-            result.raw_indices,
-        )
-        result.topk_v1.assert_not_called()
-
-        result = self._run_raw_output_dispatch(use_v2=False)
-        result.topk_v1.assert_called_once_with(
-            result.logits,
-            result.c4_seq_lens,
-            result.page_table,
-            result.page_indices,
-            64,
-            result.raw_indices,
-        )
-        result.topk_v2.assert_not_called()
+                    expected_args = (
+                        logits,
+                        c4_seq_lens,
+                        page_table,
+                        page_indices,
+                        64,
+                        *((topk_metadata,) if use_v2 else ()),
+                        raw_indices,
+                    )
+                    selected.assert_called_once_with(*expected_args)
+                    skipped.assert_not_called()
+                    topk_v1.reset_mock()
+                    topk_v2.reset_mock()
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
