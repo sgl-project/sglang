@@ -22,13 +22,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
+# earlier, at arg resolution (speculative_hook.py) -- its draft path needs
+# per-layer DFlash attention -- so it never reaches this gate with it.
 _SUPPORTED_DRAFT_BACKENDS = (
     "flashinfer",
     "fa3",
     "fa4",
     "triton",
-    "trtllm_mha",
     "ascend",
+    "trtllm_mha",
 )
 
 

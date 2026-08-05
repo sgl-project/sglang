@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +38,21 @@ def publish_config_and_parallel_state():
 
 
 HIDDEN = 16
+
+
+@pytest.fixture(autouse=True)
+def single_process_runtime_context():
+    # These mm_utils unit tests exercise cache-hit paths that acknowledge
+    # deferred CUDA IPC through runtime_context. They do not start an engine, so
+    # pin the runtime topology to a single-process CPU setup.
+    server_args_override = get_context().override_server_args(tp_size=1)
+    server_args_override.install()
+    try:
+        with get_parallel().override(attn_tp_rank=0, attn_tp_size=1):
+            yield
+    finally:
+        server_args_override.restore()
+
 
 # Three items with text gaps between their placeholder runs; offsets are
 # (start, end) inclusive, mirroring processor output.
