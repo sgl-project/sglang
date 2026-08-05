@@ -30,6 +30,9 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -205,6 +208,10 @@ class FlashInferMhaChunkKVRunner:
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
+    # Verify metadata is ragged-layout aware via generate_attn_arg_prefill;
+    # graphs key their wrappers by token tier (_verify_graph_key).
+    supports_ragged_verify_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -352,7 +359,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     kv_len_arr=self.cuda_graph_kv_lens[:bs],
                     backend="auto",
                 )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrapper
+                self.prefill_cuda_graph_metadata[
+                    self._verify_graph_key(bs, spec_info)
+                ] = prefill_wrapper
                 self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
             else:
                 raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -404,8 +413,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             use_ragged = (
                 not get_exec().kernel.flashinfer_mla_disable_ragged
                 and extend_no_prefix
-                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                # Captured prefill (tc_piecewise or breakable) must use paged
+                # prefill: it stays compatible with prefix cache, and the ragged
+                # wrapper rejects the absorbed-MLA head dims (qk=576, vo=512).
                 and not is_in_tc_piecewise_cuda_graph()
+                and not is_in_breakable_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
@@ -452,6 +464,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
+    @staticmethod
+    def _verify_graph_key(bs: int, spec_info: Optional[SpecInput]):
+        """bs for uniform graphs; token tier for ragged (tiers share slot
+        counts but each graph must replay its own recorded plan buffers)."""
+        layout = spec_info.ragged_verify_layout if spec_info is not None else None
+        if layout is None:
+            return bs
+        return ("ragged", layout.graph_num_tokens)
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -496,7 +517,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
+                    self._verify_graph_key(bs, spec_info)
+                ],
                 use_ragged=False,
                 spec_info=spec_info,
             )
