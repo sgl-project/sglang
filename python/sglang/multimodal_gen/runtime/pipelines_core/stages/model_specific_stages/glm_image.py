@@ -154,6 +154,41 @@ def _repeat_to_batch(tensor: Optional[torch.Tensor], batch_size: int):
     return tensor.repeat(*repeat_shape)
 
 
+def _extract_srt_usage(meta_info: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(meta_info, dict):
+        return None
+
+    usage = {
+        "prompt_tokens": int(meta_info.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(meta_info.get("completion_tokens", 0) or 0),
+        "reasoning_tokens": int(meta_info.get("reasoning_tokens", 0) or 0),
+        "cached_tokens": int(meta_info.get("cached_tokens", 0) or 0),
+    }
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    return usage
+
+
+def _merge_srt_usage(
+    total_usage: dict[str, Any] | None, usage: dict[str, int] | None
+) -> dict[str, Any] | None:
+    if usage is None:
+        return total_usage
+    if total_usage is None:
+        total_usage = {}
+    for key, value in usage.items():
+        total_usage[key] = int(total_usage.get(key, 0)) + int(value)
+    return total_usage
+
+
+def _merge_srt_usages(
+    usages: list[dict[str, int] | None],
+) -> dict[str, Any] | None:
+    total_usage = None
+    for usage in usages:
+        total_usage = _merge_srt_usage(total_usage, usage)
+    return total_usage
+
+
 class GlmImageAR(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
@@ -304,7 +339,7 @@ class GlmImageAR(PipelineStage):
         image: Optional[List[PIL.Image.Image]] = None,
         factor: int = 32,
         seed: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, int, int]:
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[dict[str, int]]]:
         """
         Generate prior tokens using the AR (vision_language_encoder) model.
 
@@ -369,6 +404,7 @@ class GlmImageAR(PipelineStage):
             }
             data = self._request_external_ar(payload, server_args)
             generated_ids = data.get("output_ids")
+            usage = _extract_srt_usage(data.get("meta_info"))
         else:
             if image is not None:
                 source_grids = image_grid_thw[:-1]
@@ -403,6 +439,7 @@ class GlmImageAR(PipelineStage):
             )
             input_len = inputs["input_ids"].shape[-1]
             generated_ids = outputs[0][input_len:]
+            usage = None
 
         prior_token_ids = self._extract_prior_token_ids(
             generated_ids,
@@ -410,7 +447,7 @@ class GlmImageAR(PipelineStage):
             device,
         )
 
-        return prior_token_ids, prior_token_image_ids
+        return prior_token_ids, prior_token_image_ids, usage
 
     def generate_prior_tokens_batch(
         self,
@@ -420,7 +457,7 @@ class GlmImageAR(PipelineStage):
         width: int,
         server_args: ServerArgs,
         factor: int = 32,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
         device = get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
@@ -472,13 +509,15 @@ class GlmImageAR(PipelineStage):
             )
 
         prior_token_ids = []
+        usages = []
         for item, generation_shape in zip(data, generation_shapes, strict=True):
             prior_token_ids.append(
                 self._extract_prior_token_ids(
                     item.get("output_ids"), generation_shape, device
                 )
             )
-        return prior_token_ids
+            usages.append(_extract_srt_usage(item.get("meta_info")))
+        return prior_token_ids, usages
 
     def run_grouped_requests(
         self,
@@ -513,7 +552,7 @@ class GlmImageAR(PipelineStage):
             for batch, output_count in zip(batches, output_counts, strict=True)
             for output_idx in range(output_count)
         ]
-        prior_token_ids = self.generate_prior_tokens_batch(
+        prior_token_ids, usages = self.generate_prior_tokens_batch(
             prompts=prompts,
             seeds=seeds,
             height=height,
@@ -535,6 +574,11 @@ class GlmImageAR(PipelineStage):
                 prior_token_ids[output_offset : output_offset + output_count], dim=0
             )
             batch.prior_token_image_ids = None
+            output_usages = usages[output_offset : output_offset + output_count]
+            batch.extra["usage_by_output"] = output_usages
+            usage = _merge_srt_usages(output_usages)
+            if usage is not None:
+                batch.usage = usage
             if batch.metrics is not None:
                 batch.metrics.record_stage(stage_name, duration)
             output_offset += output_count
@@ -585,6 +629,9 @@ class GlmImageAR(PipelineStage):
         output_req.seeds = None
         output_req.generator = None
         output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        usage_by_output = output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
         if batch.request_id is not None:
             output_req.request_id = f"{batch.request_id}:{output_index}"
             if output_req.metrics is not None:
@@ -633,7 +680,7 @@ class GlmImageAR(PipelineStage):
             and isinstance(prompt, str)
             and ar_condition_images is None
         ):
-            prior_token_ids = self.generate_prior_tokens_batch(
+            prior_token_ids, output_usages = self.generate_prior_tokens_batch(
                 prompts=[prompt] * num_outputs,
                 seeds=[_seed_for_output(seed, i) for i in range(num_outputs)],
                 height=height,
@@ -642,10 +689,11 @@ class GlmImageAR(PipelineStage):
             )
         else:
             prior_token_ids = []
+            output_usages = []
             for output_idx in range(num_outputs):
                 output_seed = _seed_for_output(seed, output_idx)
                 if output_seed is None:
-                    prior_token_id, output_prior_token_image_ids = (
+                    prior_token_id, output_prior_token_image_ids, output_usage = (
                         self.generate_prior_tokens(
                             prompt=prompt,
                             image=ar_condition_images,
@@ -661,7 +709,7 @@ class GlmImageAR(PipelineStage):
                         device_type=rng_device_type,
                     ):
                         torch.manual_seed(output_seed)
-                        prior_token_id, output_prior_token_image_ids = (
+                        prior_token_id, output_prior_token_image_ids, output_usage = (
                             self.generate_prior_tokens(
                                 prompt=prompt,
                                 image=ar_condition_images,
@@ -672,6 +720,7 @@ class GlmImageAR(PipelineStage):
                             )
                         )
                 prior_token_ids.append(prior_token_id)
+                output_usages.append(output_usage)
                 if prior_token_image_ids is None:
                     prior_token_image_ids = output_prior_token_image_ids
 
@@ -684,6 +733,10 @@ class GlmImageAR(PipelineStage):
         batch.prior_token_image_ids = prior_token_image_ids
         batch.height = height
         batch.width = width
+        batch.extra["usage_by_output"] = output_usages
+        usage = _merge_srt_usages(output_usages)
+        if usage is not None:
+            batch.usage = usage
 
         return batch
 

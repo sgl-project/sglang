@@ -1,36 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA fast paths for the FLUX.2 VAE decoder (AutoencoderKLFlux2, diffusers
-``Decoder``) on image workloads.
+"""CUDA fast paths for the FLUX.2 VAE decoder (AutoencoderKLFlux2).
 
 All rewrites are mathematically exact re-associations of the original
-operators (weight folding is done lazily in fp32 on first fast-path use and
-written back to the model compute dtype). The wrappers are installed once at
-VAE load and stay in place; each forward dispatches on a shared
-request-scoped :class:`VaeFastPathGate`: requests with ``quality == "high"``
-run the fast paths, the ``"lossless"`` default runs the original module path
-bit-for-bit.
+operators. Wrappers are installed once at VAE load and dispatch on a
+request-scoped :class:`VaeFastPathGate` (published as
+``_sgl_vae_fast_path_gate``): ``quality == "high"`` runs the fast paths, the
+``"lossless"`` default runs the original module path bit-for-bit.
 
-- channels_last: run the decoder in channels_last so cuDNN convolutions run
-  natively in NHWC (removes the nchwToNhwc/nhwcToNchw transpose kernels
-  around every conv). The parameter layout is swapped at decode entry to
-  match the gate, so lossless decodes always run the NCHW baseline kernels
-  bit-for-bit. The mid-block attention needs a layout-safe forward because
-  diffusers' ``AttnProcessor2_0`` calls ``.view`` on the 4D activation,
-  which is illegal for channels_last tensors.
-- norm+SiLU: two-pass channels_last GroupNorm(+SiLU) Triton fusion (fp32
-  statistics) for the ResnetBlock2D norm1/norm2 + SiLU chains and the
-  decoder ``conv_norm_out``/``conv_act`` tail, which upcast to fp32 under
-  autocast and dominate the decode profile.
-- fused upsample: nearest-2x upsample + Conv2d(3x3, p1) ==
-  ConvTranspose2d(k4, s2, p1) with a lazily-summed kernel. Removes the 4x
-  upsampled intermediate materialization.
-- attention V/proj fold: fold the attention output projection into the V
-  projection of the single-head mid-block attention (softmax rows sum to 1,
-  so ``A @ (V W_v^T + b_v) W_o^T + b_o == A @ (V W_v'^T + b')``).
+- channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
+  kernels; parameter layout is swapped at decode entry to match the gate.
+- norm+SiLU: two-pass channels_last GroupNorm(+SiLU) Triton fusion.
+- fused upsample: nearest-2x + Conv2d(3x3, p1) == ConvTranspose2d(k4, s2, p1).
+- attention V/proj fold: softmax rows sum to 1, so
+  ``A @ (V W_v^T + b_v) W_o^T + b_o == A @ (V W_v'^T + b')``.
 
-Install is all-or-nothing and fail-closed: without Triton, or with any
-attention block lacking the layout-safe rewrite, no wrapper is installed and
-every request runs the unmodified decoder.
+Install is all-or-nothing and fail-closed.
 """
 
 from types import MethodType
@@ -55,12 +39,8 @@ except ImportError:  # pragma: no cover
 
 
 class VaeFastPathGate:
-    """Mutable fast-path flag shared by every wrapper of one VAE.
-
-    Published on the VAE as ``_sgl_vae_fast_path_gate``; ``DecodingStage``
-    enables it for the duration of a decode when the request's ``quality``
-    sampling param is ``"high"``.
-    """
+    """Mutable fast-path flag shared by every wrapper of one VAE; enabled by
+    ``DecodingStage`` while decoding a ``quality == "high"`` request."""
 
     __slots__ = ("enabled",)
 
@@ -77,13 +57,9 @@ GATE_ATTR = "_sgl_vae_fast_path_gate"
 
 
 class FusedGroupNormSiLU(nn.Module):
-    """GroupNorm + SiLU fused with the two-pass channels_last Triton kernel.
-
-    fp32 statistics and affine/SiLU application, output in the input dtype.
-    Falls back to the original module chain (norm + F.silu, bit-identical to
-    the original norm + nn.SiLU pair) for unsupported inputs and whenever
-    the fast-path gate is disabled.
-    """
+    """GroupNorm + SiLU fused with the two-pass channels_last Triton kernel;
+    falls back to the original op chain (bit-identical to norm + ``nn.SiLU``)
+    for unsupported inputs and whenever the gate is off."""
 
     def __init__(self, norm: nn.GroupNorm, gate: VaeFastPathGate) -> None:
         super().__init__()
@@ -181,12 +157,8 @@ def _fold_upsample2x_conv2d_weight(conv: nn.Conv2d) -> torch.Tensor:
 
 class FusedUpsample2xConv2d(nn.Module):
     """ConvTranspose2d(k4, s2, p1) equivalent of diffusers Upsample2D
-    (nearest-2x interpolate + Conv2d(3x3, p1)).
-
-    nearest 2x upsampling is pure pixel replication (no arithmetic), so the
-    fusion only re-associates the conv taps; the kernel is summed lazily in
-    fp32 on first fast-path use and written back to the conv dtype. With the
-    fast-path gate disabled the original Upsample2D runs bit-for-bit.
+    (nearest-2x interpolate + Conv2d(3x3, p1)); the kernel is summed lazily
+    in fp32 on first use. Gate off runs the original Upsample2D bit-for-bit.
     """
 
     def __init__(self, upsample: nn.Module, gate: VaeFastPathGate) -> None:
