@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import SetLoraReq, Shutdown
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
-    _is_control_req,
+    _CONTROL_REQ_TYPES,
     _merge_fanout_results,
     _select_replica,
 )
@@ -42,10 +42,10 @@ def test_session_requests_stick_to_one_replica():
 
 
 def test_control_reqs_are_recognized():
-    assert _is_control_req(SetLoraReq(lora_nickname="x", lora_path="y"))
-    assert _is_control_req(ShutdownReq())
-    assert not _is_control_req([_req()])
-    assert not _is_control_req(_req())
+    assert isinstance(SetLoraReq(lora_nickname="x", lora_path="y"), _CONTROL_REQ_TYPES)
+    assert isinstance(ShutdownReq(), _CONTROL_REQ_TYPES)
+    assert not isinstance([_req()], _CONTROL_REQ_TYPES)
+    assert not isinstance(_req(), _CONTROL_REQ_TYPES)
 
 
 def test_fanout_merge_surfaces_the_failing_replica():
