@@ -269,6 +269,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_context, get_parallel, publish
@@ -483,6 +484,8 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+        self.init_auto_parsers()
+        self.init_reasoning_parser()
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
@@ -832,6 +835,14 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
+    def init_auto_parsers(self) -> None:
+        resolve_auto_parsers(
+            self.server_args,
+            self.tokenizer,
+            config_override=get_context().override,
+        )
+
+    def init_reasoning_parser(self) -> None:
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,

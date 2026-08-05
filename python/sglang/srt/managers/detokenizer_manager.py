@@ -39,6 +39,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -101,6 +102,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Init tokenizer
         self.init_tokenizer(server_args)
+        self.init_auto_parsers(server_args)
 
         # Init running status
         self.init_running_status(server_args)
@@ -137,6 +139,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = len(self.tokenizer)
             except TypeError:
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
+
+    def init_auto_parsers(self, server_args: ServerArgs) -> None:
+        resolve_auto_parsers(server_args, self.tokenizer)
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)

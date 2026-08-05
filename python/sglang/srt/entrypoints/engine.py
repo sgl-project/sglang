@@ -162,32 +162,7 @@ def init_tokenizer_manager(
         completion_template=server_args.completion_template,
     )
 
-    # Resolve any remaining auto parsers using template manager's detection results
-    for attr, suggested, label in (
-        (
-            "reasoning_parser",
-            template_manager.suggested_reasoning_parser,
-            "reasoning parser",
-        ),
-        (
-            "tool_call_parser",
-            template_manager.suggested_tool_call_parser,
-            "tool-call parser",
-        ),
-    ):
-        if getattr(server_args, attr) != "auto":
-            continue
-        if suggested is not None:
-            server_args.override(source="template-detection", **{attr: suggested})
-            logger.info(
-                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
-            )
-        else:
-            logger.warning(
-                f"--{attr.replace('_', '-')}=auto specified but could not detect "
-                f"{label} from chat template. Disabling {label}."
-            )
-            server_args.override(source="template-detection", **{attr: None})
+    resolve_auto_parsers(server_args, tokenizer_manager.tokenizer)
 
     return tokenizer_manager, template_manager
 
@@ -1052,7 +1027,6 @@ class Engine(EngineScoreMixin, EngineBase):
         load_plugins()
 
         server_args.check_server_args()
-        resolve_auto_parsers(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -1164,6 +1138,7 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
+            resolve_auto_parsers(server_args, tokenizer_manager.tokenizer)
         else:
             # Launch multi-tokenizer router
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)

@@ -625,28 +625,6 @@ def detect_inline_system_support(chat_template: Optional[str]) -> bool:
         return False
 
 
-def _resolve_auto_parser(
-    server_args,
-    attr: str,
-    ctx: TemplateDetectionContext,
-    rules: Tuple[DetectionRule, ...],
-    label: str,
-) -> None:
-    """Resolve a single auto parser, updating server_args in place."""
-    detected = match_rules(ctx, rules, label)
-    if detected:
-        server_args.override(source="template-detection", **{attr: detected})
-        logger.info(
-            f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
-        )
-    else:
-        logger.warning(
-            f"--{attr.replace('_', '-')}=auto specified but could not detect "
-            f"{label} from chat template. Disabling {label}."
-        )
-        server_args.override(source="template-detection", **{attr: None})
-
-
 def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[str]:
     if not chat_template_arg or not isinstance(chat_template_arg, str):
         return None
@@ -658,15 +636,9 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
         return f.read().replace("\\n", "\n")
 
 
-def _disable_auto_parser(server_args, attr: str, label: str) -> None:
-    logger.warning(
-        f"--{attr.replace('_', '-')}=auto specified but could not detect "
-        f"{label} from chat template. Disabling {label}."
-    )
-    server_args.override(source="template-detection", **{attr: None})
-
-
-def _resolve_architecture_auto_parsers(server_args) -> None:
+def _detect_architecture_auto_parsers(
+    server_args,
+) -> Tuple[Optional[str], Optional[str], str]:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     config = get_config(
@@ -686,33 +658,23 @@ def _resolve_architecture_auto_parsers(server_args) -> None:
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
     else:
-        return
+        return None, None, arch
 
-    for attr, detected in (
-        ("reasoning_parser", reasoning_parser),
-        ("tool_call_parser", tool_call_parser),
-    ):
-        if getattr(server_args, attr) == "auto":
-            server_args.override(source="template-detection", **{attr: detected})
-            logger.info(
-                f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
-                f"from model architecture '{arch}'"
-            )
+    return reasoning_parser, tool_call_parser, arch
 
 
-def resolve_auto_parsers(server_args) -> None:
-    """Resolve --reasoning-parser=auto and --tool-call-parser=auto before scheduler.
-
-    This performs a lightweight tokenizer load to detect parsers from the chat
-    template. Called early in engine init before scheduler subprocesses are spawned.
-    """
+def resolve_auto_parsers(
+    server_args,
+    tokenizer,
+    *,
+    config_override: Optional[Callable[..., None]] = None,
+) -> None:
+    """Resolve auto parsers using a tokenizer already owned by the caller."""
     needs_reasoning = server_args.reasoning_parser == "auto"
     needs_tool_call = server_args.tool_call_parser == "auto"
 
     if not needs_reasoning and not needs_tool_call:
         return
-
-    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
     chat_template_arg = getattr(server_args, "chat_template", None)
     try:
@@ -724,15 +686,6 @@ def resolve_auto_parsers(server_args) -> None:
         chat_template_arg is not None and explicit_jinja_template is None
     )
 
-    tokenizer = None
-    try:
-        tokenizer = get_tokenizer(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
-
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
@@ -741,6 +694,9 @@ def resolve_auto_parsers(server_args) -> None:
     ctx = build_detection_context(
         template, tokenizer, reasoning_config, force_reasoning
     )
+    architecture = ""
+    reasoning_parser = None
+    tool_call_parser = None
     if ctx is None:
         if has_explicit_template_without_detection:
             logger.warning(
@@ -750,38 +706,49 @@ def resolve_auto_parsers(server_args) -> None:
             )
         else:
             try:
-                _resolve_architecture_auto_parsers(server_args)
+                reasoning_parser, tool_call_parser, architecture = (
+                    _detect_architecture_auto_parsers(server_args)
+                )
             except Exception as e:
                 logger.warning(
                     "Failed to load model config for architecture-based auto-detection: %s",
                     e,
                 )
+    else:
         if needs_reasoning:
-            if server_args.reasoning_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "reasoning_parser", "reasoning parser"
-                )
+            reasoning_parser = match_rules(
+                ctx, REASONING_PARSER_RULES, "reasoning parser"
+            )
         if needs_tool_call:
-            if server_args.tool_call_parser == "auto":
-                _disable_auto_parser(
-                    server_args, "tool_call_parser", "tool-call parser"
-                )
-        return
+            tool_call_parser = match_rules(
+                ctx, TOOL_CALL_PARSER_RULES, "tool-call parser"
+            )
 
-    if needs_reasoning:
-        _resolve_auto_parser(
-            server_args,
-            "reasoning_parser",
-            ctx,
-            REASONING_PARSER_RULES,
-            "reasoning parser",
-        )
+    updates = {}
+    for attr, needed, detected, label in (
+        ("reasoning_parser", needs_reasoning, reasoning_parser, "reasoning parser"),
+        ("tool_call_parser", needs_tool_call, tool_call_parser, "tool-call parser"),
+    ):
+        if not needed:
+            continue
+        updates[attr] = detected
+        if detected:
+            detection_source = (
+                f"model architecture '{architecture}'"
+                if architecture
+                else "chat template"
+            )
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{detected}' "
+                f"from {detection_source}"
+            )
+        else:
+            logger.warning(
+                f"--{attr.replace('_', '-')}=auto specified but could not detect "
+                f"{label} from chat template. Disabling {label}."
+            )
 
-    if needs_tool_call:
-        _resolve_auto_parser(
-            server_args,
-            "tool_call_parser",
-            ctx,
-            TOOL_CALL_PARSER_RULES,
-            "tool-call parser",
-        )
+    if config_override is None:
+        server_args.override(source="template-detection", **updates)
+    else:
+        config_override(source="template-detection", **updates)

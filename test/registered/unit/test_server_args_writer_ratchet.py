@@ -22,8 +22,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import re
-import unittest
+import sys
 from pathlib import Path
+
+import pytest
 
 import sglang
 from sglang.test.test_utils import CustomTestCase
@@ -49,7 +51,7 @@ _EXCLUDED = (
     "multimodal_gen",
 )
 
-_BASELINE = 18
+_BASELINE = 13
 
 
 class TestServerArgsWriterRatchet(CustomTestCase):
@@ -78,4 +80,4 @@ class TestServerArgsWriterRatchet(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
