@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
     ComponentResidencyStrategy,
     ResidentStrategy,
 )
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor import (
     ParallelExecutor,
 )
@@ -196,10 +197,22 @@ class TestExecutionLevelDerivation(unittest.TestCase):
 
 
 class TestStageCollectiveCapabilities(unittest.TestCase):
-    def test_image_vae_uses_explicit_collective_capability(self):
-        vae = SimpleNamespace(encode_uses_collectives=True)
+    def test_wan_vae_collective_capability_tracks_parallel_encode(self):
+        vae = AutoencoderKLWan.__new__(AutoencoderKLWan)
+        object.__setattr__(vae, "use_parallel_encode", True)
+        stage = ImageVAEEncodingStage(vae)
 
-        self.assertTrue(ImageVAEEncodingStage(vae).may_use_collectives)
+        with patch(
+            "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_sp_world_size",
+            return_value=2,
+        ):
+            self.assertTrue(stage.may_use_collectives)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.vaes.wanvae.get_sp_world_size",
+            return_value=1,
+        ):
+            self.assertFalse(stage.may_use_collectives)
 
 
 class TestParallelLevelExecution(unittest.TestCase):
