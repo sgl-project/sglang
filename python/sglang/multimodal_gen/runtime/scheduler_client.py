@@ -7,6 +7,21 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -17,6 +32,22 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 )
 
 logger = init_logger(__name__)
+
+# Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
+# DP they must reach every replica rather than one.
+_CONTROL_REQ_TYPES = (
+    SetLoraReq,
+    MergeLoraWeightsReq,
+    UnmergeLoraWeightsReq,
+    ListLorasReq,
+    ShutdownReq,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -50,46 +81,6 @@ async def run_zeromq_broker(server_args: ServerArgs):
                 await socket.send(pickle.dumps({"status": "error", "message": str(e)}))
             except Exception:
                 pass
-
-
-def _control_req_types() -> tuple[type, ...]:
-    # imported lazily: entrypoints.utils pulls in FastAPI-adjacent modules that
-    # the offline client should not need until a control op is actually sent
-    from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-        GetWeightsChecksumReqInput,
-        ReleaseMemoryOccupationReqInput,
-        ResumeMemoryOccupationReqInput,
-        UpdateWeightFromDiskReqInput,
-        UpdateWeightFromTensorCheckerReqInput,
-        UpdateWeightFromTensorReqInput,
-    )
-    from sglang.multimodal_gen.runtime.entrypoints.utils import (
-        ListLorasReq,
-        MergeLoraWeightsReq,
-        SetLoraReq,
-        ShutdownReq,
-        UnmergeLoraWeightsReq,
-    )
-
-    return (
-        SetLoraReq,
-        MergeLoraWeightsReq,
-        UnmergeLoraWeightsReq,
-        ListLorasReq,
-        ShutdownReq,
-        UpdateWeightFromDiskReqInput,
-        UpdateWeightFromTensorReqInput,
-        UpdateWeightFromTensorCheckerReqInput,
-        GetWeightsChecksumReqInput,
-        ReleaseMemoryOccupationReqInput,
-        ResumeMemoryOccupationReqInput,
-    )
-
-
-def _is_control_req(batch: Any) -> bool:
-    """Control ops mutate replica state (weights, LoRA, memory, shutdown), so
-    with DP they must reach every replica, not one."""
-    return isinstance(batch, _control_req_types())
 
 
 def _session_key(batch: Any) -> str | None:
@@ -128,7 +119,6 @@ class SchedulerClient:
 
     def __init__(self):
         self.context = None
-        self.scheduler_socket = None
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
@@ -141,42 +131,10 @@ class SchedulerClient:
         self.server_args = server_args
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
-        self.scheduler_socket = self.context.socket(zmq.REQ)
-
-        # Set socket options for the main communication socket
-        self.scheduler_socket.setsockopt(zmq.LINGER, 0)
-
-        # 100 minute timeout for generation
-        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
-
-        scheduler_endpoint = self.server_args.scheduler_endpoint
-        self.scheduler_socket.connect(scheduler_endpoint)
-        logger.debug(
-            f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
-        )
 
     def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
-        dp_size = self.server_args.dp_size or 1
-        if dp_size > 1:
-            return self._forward_routed(batch, timeout_ms)
-        self.request_logger.log_received_request(batch)
-        previous_timeout_ms = None
-        if timeout_ms is not None:
-            previous_timeout_ms = self.scheduler_socket.getsockopt(zmq.RCVTIMEO)
-            self.scheduler_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        try:
-            self.scheduler_socket.send_pyobj(batch)
-            output_batch = self.scheduler_socket.recv_pyobj()
-            _materialize_output_batch_file_refs(output_batch)
-            self.request_logger.log_finished_request(batch, output_batch)
-            return output_batch
-        except zmq.error.Again:
-            logger.error("Timeout waiting for response from scheduler.")
-            raise TimeoutError("Scheduler did not respond in time.")
-        finally:
-            if previous_timeout_ms is not None and self.scheduler_socket is not None:
-                self.scheduler_socket.setsockopt(zmq.RCVTIMEO, previous_timeout_ms)
+        return self._forward_routed(batch, timeout_ms)
 
     def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
         socket = self.context.socket(zmq.REQ)
@@ -197,7 +155,7 @@ class SchedulerClient:
     def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
-        if _is_control_req(batch):
+        if isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
             output_batch = _merge_fanout_results(results)
         else:
@@ -229,10 +187,7 @@ class SchedulerClient:
         return True
 
     def close(self):
-        """Closes the socket and terminates the context."""
-        if self.scheduler_socket:
-            self.scheduler_socket.close()
-            self.scheduler_socket = None
+        """Terminates the context."""
         if self.context:
             self.context.term()
             self.context = None
@@ -274,7 +229,7 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if _is_control_req(batch):
+        if isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
             results = [await self._forward_one(ep, batch) for ep in endpoints]
             output_batch = _merge_fanout_results(results)

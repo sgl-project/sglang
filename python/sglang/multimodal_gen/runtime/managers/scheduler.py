@@ -104,14 +104,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         set_global_server_args(server_args=server_args)
 
-        # Inter-process Communication. Every DP replica is a contiguous rank
-        # block (dp is the outermost axis of the group layout), and its first
-        # rank is the driver: it owns the replica's ingress socket, and the
-        # existing sp/cfg/tp broadcast relay in recv_reqs -- whose groups are
-        # replica-internal by construction -- distributes each request to the
-        # rest of the replica and never across replicas.
-        dp_size = server_args.dp_size or 1
-        gpus_per_replica = max(1, server_args.num_gpus // dp_size)
+        # Each DP replica is a contiguous rank block (dp is the outermost
+        # layout axis); its first rank binds the replica's ingress, and the
+        # sp/cfg/tp broadcast relay in recv_reqs -- replica-internal by
+        # construction -- fans requests out within the replica only.
+        gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
         self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
         if gpu_id % gpus_per_replica == 0:
