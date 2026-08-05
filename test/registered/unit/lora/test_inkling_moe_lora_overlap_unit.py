@@ -21,10 +21,6 @@ register_cuda_ci(
 
 # Skipped on CI: this hermetic check re-parses the InklingMoE forward source and
 # pins its exact stream-order, so it breaks on unrelated refactors of that
-# method. Skip until it is rebuilt against a stable seam.
-pytestmark = pytest.mark.skip(
-    reason="refactor-fragile source-parsing unit test; skipped on CI"
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 MOE_PATH = REPO_ROOT / "python/sglang/srt/models/inkling_common/moe.py"

@@ -21,9 +21,6 @@ register_cuda_ci(
     disabled="new inkling LoRA test; disabled on CI",
 )
 
-# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
-pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
-
 
 def _config(**overrides):
     values = dict(

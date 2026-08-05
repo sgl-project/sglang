@@ -31,10 +31,6 @@ register_cuda_ci(
 
 # Skipped on CI: these hermetic checks AST-extract LoRAManager methods and re-run
 # them in a stubbed namespace, so they break whenever the manager's internal
-# call graph changes. Skip until they are rebuilt against a stable seam.
-pytestmark = pytest.mark.skip(
-    reason="refactor-fragile source-parsing unit test; skipped on CI"
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LORA_LAYERS_PATH = REPO_ROOT / "python/sglang/srt/lora/layers.py"

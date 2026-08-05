@@ -14,9 +14,6 @@ register_cuda_ci(
     disabled="new inkling LoRA test; disabled on CI",
 )
 
-# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
-pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
-
 
 _CUDA_BF16_AVAILABLE = bool(
     torch.cuda.is_available()

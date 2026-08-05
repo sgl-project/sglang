@@ -18,10 +18,6 @@ register_cuda_ci(
 # ceiling of the small-GPU CI runner (~99 KiB on L4) at rank=128, so the
 # generic-fallback parity case OOMs there. Skip this file on CI rather than
 # shrink the production kernel to a small-GPU block config.
-pytestmark = pytest.mark.skip(
-    reason="fused MoE LoRA-add kernel needs more opt-in shared memory than the "
-    "small-GPU CI runner provides"
-)
 
 
 _CUDA_BF16_AVAILABLE = bool(
