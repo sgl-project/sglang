@@ -237,12 +237,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                 let choiced_url = buc.find_boundary(char_count);
                 (choiced_url, chars_per_url_snapshot)
             };
-            let max_load = chars_per_url_snapshot.values().copied().max().unwrap_or(0);
-            let min_load = chars_per_url_snapshot.values().copied().min().unwrap_or(0);
-            let abs_diff = max_load.saturating_sub(min_load);
-            let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
-            let is_imbalanced =
-                abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
+            let is_imbalanced = false; // Disable load-balancing fallback for fixed short/long separation
             debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
@@ -393,14 +388,13 @@ impl Bucket {
             Vec::new()
         } else {
             let gap = self.l_max / worker_cnt;
-            self.l_max = usize::MAX;
             prefill_worker_urls
                 .iter()
                 .enumerate()
                 .map(|(i, url)| {
                     let min = i * gap;
                     let max = if i == worker_cnt - 1 {
-                        self.l_max
+                        usize::MAX
                     } else {
                         (i + 1) * gap - 1
                     };
@@ -505,6 +499,8 @@ impl Bucket {
     }
 
     pub fn adjust_boundary(&mut self) {
+        return; // Disable auto-adjustment for fixed short/long separation
+
         if self.t_req_loads.is_empty() {
             return;
         }
