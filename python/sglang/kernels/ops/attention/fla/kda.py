@@ -638,26 +638,13 @@ def _recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
-def _recompute_w_u_configs():
-    configs = [
-        triton.Config(
-            {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
-        )
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ]
-    # The original Kimi K3 NPU path used this kernel without autotuning and
-    # fixed BK/BV to 64. Ascend Triton otherwise benchmarks all 36 GPU-tuned
-    # configs independently on every TP rank, which can hit the device's
-    # 600-second execution timeout during the first prefill.
-    return configs if torch.cuda.is_available() else [
-        triton.Config({"BK": 64, "BV": 64})
-    ]
-
-
-_RECOMPUTE_W_U_CONFIGS = _recompute_w_u_configs()
+_RECOMPUTE_W_U_CONFIGS = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [64, 128]
+    for BV in [64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
 
 recompute_w_u_fwd_kernel = triton.autotune(
     configs=_RECOMPUTE_W_U_CONFIGS,
@@ -702,11 +689,6 @@ def _get_k3_recompute_w_u_config(
     V: int,
     BT: int,
 ) -> dict | None:
-    # The former NPU-local KDA implementation launched the raw JIT kernel with
-    # this fixed tile.  Returning it here also selects _recompute_w_u_fwd_kernel
-    # below, bypassing Triton's benchmark loop entirely.
-    if not torch.cuda.is_available():
-        return {"BK": 64, "BV": 64}
     if (
         not is_nvidia
         or gk is None
@@ -766,23 +748,18 @@ def recompute_w_u_fwd(
     return w, u, kg
 
 
-def _chunk_gla_fwd_o_configs():
-    configs = [
-        triton.Config(
-            {"BK": 64, "BV": 64}, num_warps=num_warps, num_stages=num_stages
-        )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [64]
+        for BV in [64]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
-    ]
-    # Match the fixed-size configuration supported by the former NPU-local
-    # implementation while leaving CUDA/ROCm autotuning unchanged.
-    return configs if torch.cuda.is_available() else [
-        triton.Config({"BK": 64, "BV": 64})
-    ]
-
-
+    ],
+    key=["BT", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
-def _chunk_gla_fwd_kernel_o(
+def chunk_gla_fwd_kernel_o(
     q,
     v,
     g,
@@ -800,7 +777,6 @@ def _chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    H_LAYOUT_VK: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -841,6 +817,15 @@ def _chunk_gla_fwd_kernel_o(
             (BT, BK),
             (1, 0),
         )
+        p_h = tl.make_block_ptr(
+            h + (i_tg * H + i_h) * V * K,
+            (V, K),
+            (K, 1),
+            (i_v * BV, i_k * BK),
+            (BV, BK),
+            (1, 0),
+        )
+
         # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_q.dtype)
@@ -848,30 +833,12 @@ def _chunk_gla_fwd_kernel_o(
         b_g = tl.load(p_g, boundary_check=(0, 1))
         # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
-        if H_LAYOUT_VK:
-            p_h = tl.make_block_ptr(
-                h + (i_tg * H + i_h) * V * K,
-                (V, K),
-                (K, 1),
-                (i_v * BV, i_k * BK),
-                (BV, BK),
-                (1, 0),
-            )
-            # CUDA keeps h as [V, K].
-            b_h = tl.load(p_h, boundary_check=(0, 1))
+        # [BK, BV]
+        b_h = tl.load(p_h, boundary_check=(0, 1))
+        # works but dkw, owing to divine benevolence
+        # [BT, BV]
+        if i_k >= 0:
             b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
-        else:
-            p_h = tl.make_block_ptr(
-                h + (i_tg * H + i_h) * K * V,
-                (K, V),
-                (V, 1),
-                (i_k * BK, i_v * BV),
-                (BK, BV),
-                (1, 0),
-            )
-            # The 0728 NPU producer stores h directly as [K, V].
-            b_h = tl.load(p_h, boundary_check=(0, 1))
-            b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),
@@ -900,12 +867,6 @@ def _chunk_gla_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
-chunk_gla_fwd_kernel_o = triton.autotune(
-    configs=_chunk_gla_fwd_o_configs(),
-    key=["BT", "IS_VARLEN"],
-)(_chunk_gla_fwd_kernel_o)
-
-
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -925,21 +886,10 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    if torch.cuda.is_available():
-        kernel = chunk_gla_fwd_kernel_o
+    def grid(meta):
+        return (cdiv(V, meta["BV"]), NT, B * H)
 
-        def grid(meta):
-            return (cdiv(V, meta["BV"]), NT, B * H)
-
-        static_config = {"H_LAYOUT_VK": True}
-    else:
-        # One-config autotuners still benchmark their kernel on Ascend. Launch
-        # the raw JIT function exactly as the original NPU implementation did.
-        kernel = _chunk_gla_fwd_kernel_o
-        grid = (cdiv(V, 64), NT, B * H)
-        static_config = {"BK": 64, "BV": 64, "H_LAYOUT_VK": False}
-
-    kernel[grid](
+    chunk_gla_fwd_kernel_o[grid](
         q=q,
         v=v,
         g=g,
@@ -955,7 +905,6 @@ def chunk_gla_fwd_o_gk(
         V=V,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
-        **static_config,
     )
     return o
 
@@ -1132,88 +1081,6 @@ def kda_gate_chunk_cumsum(
     return g
 
 
-def _use_small_grid_fusions(total_ctas: int) -> bool:
-    """Return whether the GPU-tuned fused KDA prefill kernels are supported."""
-    return torch.cuda.is_available() and total_ctas <= 256
-
-
-def _chunk_kda_fwd_npu_split(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor],
-    chunk_indices: Optional[torch.LongTensor],
-    output_intermediate_states: bool,
-):
-    """Run the established 0728 KDA prefill decomposition on Ascend.
-
-    The GPU PR's fused inter/solve kernel does not complete on A3.  Keep that
-    CUDA path intact and reuse the original NPU split: KKT, triangular solve,
-    w/u recompute, recurrent state, then output.
-    """
-    from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-
-    A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
-        q=q,
-        k=k,
-        gk=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        output_dtype=torch.float32,
-    )
-    A = solve_tril_npu(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u, kg = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        gk=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    del A
-
-    h, v_new = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-    )
-    del w, u, kg
-
-    o = chunk_gla_fwd_o_gk(
-        q=q,
-        v=v_new,
-        g=g,
-        A=Aqk,
-        h=h,
-        o=v,
-        scale=scale,
-        chunk_size=64,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    del Aqk, v_new
-
-    if output_intermediate_states:
-        # The public cache contract is VxK; the 0728 NPU prefill kernel keeps
-        # its internal chunk-state tiles in KxV to avoid unsupported transposes.
-        return o, h.transpose(-1, -2).contiguous()
-    del h
-    return o
-
-
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1261,21 +1128,6 @@ def chunk_kda_fwd(
             chunk_indices=chunk_indices,
         )
 
-    if not torch.cuda.is_available():
-        return _chunk_kda_fwd_npu_split(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            initial_state_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            output_intermediate_states=output_intermediate_states,
-        )
-
     # FUSE_DIAGONAL (fold diagonal-block compute into inter+solve) and
     # FUSE_RECOMPUTE (also fold w/u/kg recompute) save kernel launches and HBM
     # round-trips, but cost register footprint per CTA. Wins at small grid
@@ -1292,11 +1144,7 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    # These two fusions were tuned for CUDA.  Their combined register footprint
-    # makes some non-CUDA Triton runtimes spend minutes autotuning and can trip
-    # the device kernel timeout.  Keep the established split-kernel path on
-    # those platforms; verify/decode backend selection is unaffected.
-    _small_grid = _use_small_grid_fusions(_B * _NT_pr * _H_pr)
+    _small_grid = _B * _NT_pr * _H_pr <= 256
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,

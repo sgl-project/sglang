@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -205,30 +204,17 @@ def forward_mla_prepare_npu(
             else:
                 # Kimi-K3 precision baseline (0728): the fused split+RMSNorm
                 # kernel is not numerically equivalent on Ascend.  Keep the
-                # proven unfused NPU path until that kernel is corrected.
-                if False and qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
-                    forward_batch
-                ):
-                    q, k_nope, k_pe = fused_split_qk_norm(
-                        qkv_latent,
-                        m.q_a_layernorm,
-                        m.kv_a_layernorm,
-                        m.q_lora_rank,
-                        m.kv_lora_rank,
-                        m.qk_rope_head_dim,
-                        eps=m.q_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    q, latent_cache = qkv_latent.split(
-                        [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
-                        dim=-1,
-                    )
-                    k_nope = latent_cache[..., : m.kv_lora_rank]
+                # proven unfused path until the fused kernel is corrected.
+                q, latent_cache = qkv_latent.split(
+                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
+                    dim=-1,
+                )
+                k_nope = latent_cache[..., : m.kv_lora_rank]
 
-                    q = m.q_a_layernorm(q)
+                q = m.q_a_layernorm(q)
 
-                    k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
-                    k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
+                k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
+                k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
             # q_lora needed by indexer
             if m.use_dsa:
@@ -392,30 +378,18 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if False and fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
-                forward_batch
-            ):
-                q_lora, k_nope, k_pe = fused_split_qk_norm(
-                    fused_qkv_a_proj_out,
-                    m.q_a_layernorm,
-                    m.kv_a_layernorm,
-                    m.q_lora_rank,
-                    m.kv_lora_rank,
-                    m.qk_rope_head_dim,
-                    eps=m.q_a_layernorm.variance_epsilon,
-                )
-            else:
-                q, latent_cache = fused_qkv_a_proj_out.split(
-                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
-                )
-                # overlap qk norm
-                q = m.q_a_layernorm(q)
+            # Keep the numerically validated unfused Ascend split and RMSNorm.
+            q, latent_cache = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            # overlap qk norm
+            q = m.q_a_layernorm(q)
 
-                q_lora = q.clone()  # required for topk_indices
-                k_nope, k_pe = latent_cache.unsqueeze(1).split(
-                    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
-                )
-                k_nope = m.kv_a_layernorm(k_nope)
+            q_lora = q.clone()  # required for topk_indices
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+            )
+            k_nope = m.kv_a_layernorm(k_nope)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)

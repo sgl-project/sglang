@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import is_npu
 
 
 class RaggedVerifyWindow(msgspec.Struct, frozen=True):
@@ -766,11 +767,9 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        # The 0728 Ascend path intentionally used the torch implementation.
         # BiShengIR cannot compile the nested tl.where below because its mask
-        # lowering mixes i1 and i8. Keep CUDA on the Triton kernel without
-        # introducing a platform-name check.
-        if not torch.cuda.is_available():
+        # lowering mixes i1 and i8. Ascend therefore uses the torch path.
+        if is_npu():
             return cls.torch(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)

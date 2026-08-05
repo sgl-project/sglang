@@ -1,17 +1,14 @@
 from typing import Optional, Union
 
 import torch
-
 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
     conv_state_rollback,
-)
-
-from sglang.srt.hardware_backend.npu.kernels.mamba_state_move import (
     move_intermediate_cache,
 )
-from sglang.srt.hardware_backend.npu.kernels.speculative_state_scatter import (
+from sgl_kernel_npu.mamba.speculative_state_scatter import (
     speculative_state_scatter_npu,
 )
+
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -284,9 +281,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             False,
         )
         if has_conv_snapshots:
-            intermediate_conv_window_cache = (
-                mamba_caches.intermediate_conv_window[0]
-            )
+            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
             speculative_state_scatter_npu(
                 conv_states,
                 intermediate_conv_window_cache,

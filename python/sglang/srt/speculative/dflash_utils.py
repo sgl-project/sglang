@@ -16,7 +16,7 @@ from sglang.srt.layers.sampler import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -74,7 +74,7 @@ def _dflash_ascend_top_k_top_p_renorm_prob(
     top_ks: Optional[torch.Tensor] = None,
     top_ps: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    if probs.device.type != "npu":
+    if not is_npu() or probs.device.type != "npu":
         return None
     try:
         import torch_npu

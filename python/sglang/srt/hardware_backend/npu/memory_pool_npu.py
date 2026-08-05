@@ -1,12 +1,12 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel_npu.mem_cache.kv_cache_store import (
+    store_kv_cache_prefix_valid_npu_triton,
+)
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.kernels.kv_cache_store import (
-    store_kv_cache_prefix_valid_npu_triton,
-)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -239,16 +239,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             torch_npu.npu_scatter_nd_update_(
                 k_buffer_layer.view(-1, self.head_num, self.head_dim),
                 loc_indices,
-                cache_k.contiguous().view(
-                    num_rows, self.head_num, self.head_dim
-                ),
+                cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
             )
             torch_npu.npu_scatter_nd_update_(
                 v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
                 loc_indices,
-                cache_v.contiguous().view(
-                    num_rows, self.head_num, self.v_head_dim
-                ),
+                cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
             )
         else:
             loc = loc.to(torch.int32)

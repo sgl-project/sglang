@@ -24,20 +24,6 @@ else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
-def _inter_solve_configs():
-    configs = [
-        triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ]
-    # Ascend Triton does not persist autotune results in the runtime shipped by
-    # the A3 image.  Benchmarking all six configs concurrently on every TP rank
-    # makes the first KDA prefill take minutes and can hit the device timeout.
-    # Keep CUDA/ROCm autotuning unchanged and use the first known-good config on
-    # backends that do not expose the CUDA runtime.
-    return configs if torch.cuda.is_available() else configs[:1]
-
-
 ################################################################################
 # Fused inter + solve_tril kernel: compute off-diagonal Akk and solve in one pass
 ################################################################################
@@ -49,7 +35,11 @@ def _inter_solve_configs():
     }
 )
 @triton.autotune(
-    configs=_inter_solve_configs(),
+    configs=[
+        triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
+        for BK in [32, 64]
+        for num_warps in [1, 2, 4]
+    ],
     key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
     **autotune_cache_kwargs,
 )

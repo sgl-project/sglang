@@ -1,21 +1,116 @@
 from typing import Optional
 
 import torch
+from sgl_kernel_npu.fla.kda_chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h_npu,
+)
+from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
+from sgl_kernel_npu.fla.kda_prefill import (
+    chunk_gla_fwd_o_gk_npu,
+    recompute_w_u_fwd_npu,
+)
+from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+from sgl_kernel_npu.fla.l2norm import l2norm_fwd
+from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
+from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
-
-from sglang.srt.hardware_backend.npu.kernels.causal_conv1d_verify import (
+from sgl_kernel_npu.mamba.causal_conv1d_verify import (
     causal_conv1d_linear_verify_npu,
 )
-from sglang.srt.hardware_backend.npu.kernels.kda_target_verify import (
-    kda_target_verify_npu,
-)
-from sglang.srt.hardware_backend.npu.kernels.kda_gate import fused_kda_gate_npu
+
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class _AscendKDAExtendKernel:
+    """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        return_intermediate_states: bool = False,
+        **kwargs,
+    ):
+        chunk_size = 64
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        v = v.contiguous()
+        beta = beta.contiguous()
+        chunk_indices = prepare_chunk_indices(query_start_loc, chunk_size)
+        g = chunk_local_cumsum(
+            g.contiguous(),
+            chunk_size=chunk_size,
+            scale=1.4426950408889634,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+        )
+
+        triangular, query_key = chunk_kda_scaled_dot_kkt_fwd(
+            q=q,
+            k=k,
+            gk=g,
+            beta=beta,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=query_start_loc,
+            output_dtype=torch.float32,
+        )
+        triangular = solve_tril_npu(
+            A=triangular,
+            cu_seqlens=query_start_loc,
+            output_dtype=k.dtype,
+        )
+        w, u, gated_k = recompute_w_u_fwd_npu(
+            k=k,
+            v=v,
+            beta=beta,
+            A=triangular,
+            gk=g,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+        )
+        del triangular
+        chunk_states, new_values = chunk_gated_delta_rule_fwd_h_npu(
+            k=gated_k,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+        del w, u, gated_k
+        out = chunk_gla_fwd_o_gk_npu(
+            q=q,
+            v=new_values,
+            g=g,
+            A=query_key,
+            h=chunk_states,
+            out=v,
+            scale=k.shape[-1] ** -0.5,
+            cu_seqlens=query_start_loc,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+        del query_key, new_values
+        if return_intermediate_states:
+            return out, chunk_states.transpose(-1, -2).contiguous()
+        return out
 
 
 class AscendKDAAttnBackend(KDAAttnBackend):
@@ -30,6 +125,10 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     def _channel_first_conv_states(conv_states: torch.Tensor) -> torch.Tensor:
         # The NPU pool is allocated directly as [pool, channels, window].
         return conv_states
+
+    def __init__(self, model_runner):
+        super().__init__(model_runner)
+        self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
 
     def _causal_conv1d_extend(
         self,
@@ -151,12 +250,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             activation="silu",
             update_persistent_state=False,
         )
-        processed_qkv = processed_qkv.transpose(1, 2).reshape(
-            num_dense_tokens, -1
-        )
-        q, k, v = processed_qkv.split(
-            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
+        processed_qkv = processed_qkv.transpose(1, 2).reshape(num_dense_tokens, -1)
+        q, k, v = processed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
@@ -190,9 +285,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         if dense_token_indices is None:
             return out
-        padded_out = out.new_zeros(
-            1, num_dense_tokens + 1, *out.shape[2:]
-        )
+        padded_out = out.new_zeros(1, num_dense_tokens + 1, *out.shape[2:])
         padded_out[:, :num_dense_tokens] = out
         return padded_out[:, dense_token_indices]
 

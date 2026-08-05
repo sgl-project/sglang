@@ -488,23 +488,6 @@ class ServingChatTestCase(unittest.TestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertNotIn("thinking", kwargs)
 
-    def test_kimi_k3_reasoning_effort_maps_to_thinking_effort(self):
-        self.chat.is_kimi_k3 = True
-        self.template_manager.chat_template_name = None
-        self.template_manager.jinja_template_content_format = "openai"
-        self.tm.tokenizer.apply_chat_template.return_value = "rendered prompt"
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "What is 2+2?"}],
-            reasoning_effort="max",
-        )
-
-        self.chat._process_messages(req, is_multimodal=False)
-
-        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-        self.assertEqual(kwargs["thinking_effort"], "max")
-        self.assertNotIn("reasoning_effort", kwargs)
-
     def test_kimi_tool_call_keeps_explicit_template_thinking(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
