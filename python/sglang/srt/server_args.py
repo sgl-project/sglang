@@ -3093,6 +3093,7 @@ class ServerArgs:
             "checkpoint files while CUDA graphs are captured and commits the "
             "real weights afterward."
         ),
+        NS("model"),
     ] = "serial"
     custom_weight_loader: A[
         Optional[List[str]],
