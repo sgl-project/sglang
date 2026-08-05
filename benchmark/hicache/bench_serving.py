@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -32,7 +34,7 @@ from data_processing import MsgContent, SampleOutput, get_dataset
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import get_tokenizer, remove_prefix, set_ulimit
+from sglang.benchmark.utils import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 

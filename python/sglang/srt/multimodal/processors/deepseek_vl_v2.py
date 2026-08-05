@@ -18,6 +18,7 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -41,9 +42,9 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         request_obj,
         max_req_input_len,
         *args,
-        **kwargs
+        **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -55,8 +56,8 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
             conversations=base_output.input_text,
         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "im_token_id": self._processor.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self._processor.image_token_id,
+        )

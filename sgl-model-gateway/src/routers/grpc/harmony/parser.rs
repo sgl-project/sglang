@@ -20,7 +20,7 @@ fn get_harmony_encoding() -> &'static HarmonyEncoding {
 ///
 /// Wraps openai_harmony::StreamableParser and provides methods for parsing
 /// complete responses and streaming chunks.
-pub struct HarmonyParserAdapter {
+pub(crate) struct HarmonyParserAdapter {
     parser: StreamableParser,
     prev_recipient: Option<String>,
     reasoning_token_count: u32,
@@ -517,6 +517,7 @@ impl HarmonyParserAdapter {
     /// Reset parser state
     ///
     /// Resets the parser to initial state for reuse
+    #[allow(dead_code)]
     pub fn reset(&mut self) -> Result<(), String> {
         // Create a new parser instance (StreamableParser doesn't have a reset method)
         let encoding = get_harmony_encoding();

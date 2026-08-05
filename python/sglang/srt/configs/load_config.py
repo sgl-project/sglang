@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import orjson
 
@@ -19,6 +21,7 @@ class LoadFormat(str, enum.Enum):
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
+    PRESHARDED = "presharded"
     GGUF = "gguf"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
@@ -29,7 +32,10 @@ class LoadFormat(str, enum.Enum):
     REMOTE_INSTANCE = "remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
+    FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
+    RUNAI_STREAMER = "runai_streamer"
+    IPC_CACHE = "ipc_cache"
 
 
 @dataclass
@@ -74,7 +80,10 @@ class LoadConfig:
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Optional[str] = None
-    remote_instance_weight_loader_transfer_engine: Optional[any] = None
+    remote_instance_weight_loader_transfer_engine: Optional[Any] = None
+    remote_instance_weight_loader_transfer_engine_session_id: Optional[str] = None
+    modelexpress_url: Optional[str] = None
+    modelexpress_transport: str = "nixl"
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -84,10 +93,23 @@ class LoadConfig:
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
 
+    # Inc-related loading options
+    inc_save_path: Optional[str] = None
+    inc_tuning_iters: Optional[int] = 0
+    inc_disable_opt_rtn: Optional[bool] = None
+
     # QuantizedRL-specific options (for FlashRL-style quantization)
     rl_quant_profile: Optional[str] = (
         None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
     )
+
+    # For multi-layer MTP
+    draft_model_idx: Optional[int] = None
+
+    # Weight cache daemon options
+    weight_cache_mode: str = "off"  # "off", "daemon", "client"
+    weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

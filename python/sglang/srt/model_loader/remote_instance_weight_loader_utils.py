@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import importlib
+import importlib.util
 import logging
 import time
 from typing import List
 
 import requests
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
+    MODELEXPRESS = "modelexpress"
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
@@ -104,8 +106,14 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-# DEPRECATED. Use register_memory_region_v2 instead.
 def register_memory_region(model, transfer_engine):
+    if importlib.util.find_spec("torch") is None:
+        return register_memory_region_v1(model, transfer_engine)
+    else:
+        return register_memory_region_v2(model, transfer_engine)
+
+
+def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
@@ -140,6 +148,8 @@ def register_memory_region_v2(model, transfer_engine):
             weight.element_size(),
         )
         weight_addr_set.add(weight.data_ptr())
+
+    import torch
 
     memory_snapshot = torch.cuda.memory.memory_snapshot()
     weight_blocks_for_reg_mr = []

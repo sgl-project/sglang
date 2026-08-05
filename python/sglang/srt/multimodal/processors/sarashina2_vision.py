@@ -1,5 +1,6 @@
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.sarashina2_vision import Sarashina2VisionForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -61,7 +62,7 @@ class Sarashina2VisionProcessor(BaseMultimodalProcessor):
         **kwargs,
     ):
         """Process image data for Sarashina2Vision model using standard SGLang pattern."""
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -72,10 +73,10 @@ class Sarashina2VisionProcessor(BaseMultimodalProcessor):
             mm_tokens=self.mm_tokens,
         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "im_token_id": self.mm_tokens.image_token_id,
-            "im_start_id": self.IM_START_ID,
-            "im_end_id": self.IM_END_ID,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self.IM_START_ID,
+            im_end_id=self.IM_END_ID,
+        )

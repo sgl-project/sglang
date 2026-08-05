@@ -5,11 +5,11 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerType,
+        parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
+        RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
     },
 };
-use crate::routers::grpc::client::GrpcClient;
+use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -131,30 +131,9 @@ impl BasicWorkerBuilder {
             Arc, RwLock as StdRwLock,
         };
 
-        use tokio::sync::RwLock;
+        use tokio::sync::OnceCell;
 
-        let bootstrap_host = match url::Url::parse(&self.url) {
-            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) if !self.url.contains("://") => {
-                match url::Url::parse(&format!("http://{}", self.url)) {
-                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-                    Err(_) => {
-                        tracing::warn!(
-                            "Failed to parse URL '{}', defaulting to localhost",
-                            self.url
-                        );
-                        "localhost".to_string()
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Failed to parse URL '{}', defaulting to localhost",
-                    self.url
-                );
-                "localhost".to_string()
-            }
-        };
+        let bootstrap_host = parse_bootstrap_host_from_url(&self.url);
 
         let bootstrap_port = match self.worker_type {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,
@@ -176,16 +155,32 @@ impl BasicWorkerBuilder {
             default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
 
-        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
+        // Use OnceCell for lock-free gRPC client access after initialization
+        let grpc_client = Arc::new(match self.grpc_client {
+            Some(client) => {
+                let cell = OnceCell::new();
+                // Pre-set the client if provided (blocking set is fine during construction)
+                cell.set(Arc::new(client)).ok();
+                cell
+            }
+            None => OnceCell::new(),
+        });
+
+        let healthy = true;
+        Metrics::set_worker_health(&self.url, healthy);
 
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(true)),
+            healthy: Arc::new(AtomicBool::new(healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            circuit_breaker: CircuitBreaker::with_config_and_label(
+                self.circuit_breaker_config,
+                self.url.clone(),
+            ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
@@ -381,6 +376,7 @@ mod tests {
             check_interval_secs: 60,
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -473,6 +469,7 @@ mod tests {
             check_interval_secs: 45,
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: false,
         };
 
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 3, 16)

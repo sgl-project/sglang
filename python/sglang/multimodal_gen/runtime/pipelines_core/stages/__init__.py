@@ -12,8 +12,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
-    ConditioningStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.comfyui_latent_preparation import (
+    ComfyUILatentPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
+    AuxiliaryConditionEncodingStage,
+    ConditionEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -31,29 +35,39 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.stepvideo_encoding import (
-    StepvideoPromptEncodingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
+    DMDTimestepPreparationStage,
     TimestepPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
+    VLAActionDenoisingStage,
+    VLAActionPostprocessStage,
+    VLAObservationPreprocessStage,
+    VLAPrefixEncodingStage,
 )
 
 __all__ = [
     "PipelineStage",
     "InputValidationStage",
     "TimestepPreparationStage",
+    "DMDTimestepPreparationStage",
     "LatentPreparationStage",
-    "ConditioningStage",
+    "ComfyUILatentPreparationStage",
     "DenoisingStage",
     "DmdDenoisingStage",
     "CausalDMDDenoisingStage",
     "EncodingStage",
+    "ConditionEncodingStage",
+    "AuxiliaryConditionEncodingStage",
     "DecodingStage",
     "ImageEncodingStage",
     "ImageVAEEncodingStage",
     "TextEncodingStage",
-    "StepvideoPromptEncodingStage",
+    "VLAObservationPreprocessStage",
+    "VLAPrefixEncodingStage",
+    "VLAActionDenoisingStage",
+    "VLAActionPostprocessStage",
 ]

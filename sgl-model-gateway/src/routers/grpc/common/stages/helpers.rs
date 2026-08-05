@@ -3,18 +3,16 @@
 use std::sync::Arc;
 
 use rand::Rng;
+use smg_grpc_client::sglang_proto::DisaggregatedParams;
 use tracing::debug;
 
-use crate::{
-    core::Worker, grpc_client::sglang_proto::DisaggregatedParams,
-    routers::grpc::proto_wrapper::ProtoGenerateRequest,
-};
+use crate::{core::Worker, routers::grpc::proto_wrapper::ProtoGenerateRequest};
 
 /// Inject PD bootstrap metadata into a gRPC request
 ///
 /// Used by both chat and generate request building stages when in PD mode.
 /// Only SGLang supports PD (prefill/decode) disaggregated mode.
-pub fn inject_bootstrap_metadata(
+pub(crate) fn inject_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
 ) {

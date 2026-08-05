@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
+
 import logging
 import re
 from functools import partial
@@ -41,12 +42,14 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.environ import envs
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -70,10 +73,14 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import RotaryPosMixin, permute_inv
+from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
+
+_is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +97,8 @@ class Qwen2_5_VLMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -112,12 +117,21 @@ class Qwen2_5_VLMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act = ACT2FN[hidden_act]
+        self.hidden_act = hidden_act
+        if self.hidden_act == "silu":
+            self.act = SiluAndMul()
+        else:
+            base_act = ACT2FN[self.hidden_act]
+
+            def _act_fn(x: torch.Tensor) -> torch.Tensor:
+                gate, up = x.chunk(2, dim=-1)
+                return base_act(gate) * up
+
+            self.act = _act_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
+        x = self.act(gate_up)
         x_down, _ = self.down_proj(x)
         return x_down
 
@@ -129,6 +143,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         dim: int,
         intermediate_dim: int,
         num_heads: int,
+        head_size: int,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -144,7 +159,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            head_size=head_size,
+            projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -167,6 +183,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws=None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -179,6 +197,8 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws=output_ws,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -200,6 +220,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        padded_context_dim: int,
         spatial_merge_size: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -207,14 +228,15 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
                     self.hidden_size,
-                    self.hidden_size,
+                    self.padded_context_dim,
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
@@ -223,7 +245,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                 ),
                 nn.GELU(),
                 RowParallelLinear(
-                    self.hidden_size,
+                    self.padded_context_dim,
                     dim,
                     bias=True,
                     quant_config=quant_config,
@@ -256,6 +278,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        max_context_len: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -282,7 +305,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = hidden_size // num_heads
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = hidden_size // num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
             [
@@ -290,6 +316,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -302,11 +329,21 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            padded_context_dim=num_heads * head_dim,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
         )
+
+        # Resource prepared for vit cuda graph
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.max_context_len = max_context_len
+        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = None
+        if self.enable_cg:
+            self.cuda_graph_runner = ViTCudaGraphRunner(self)
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -368,8 +405,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        max_grid_size = int(grid_thw[:, 1:].max())
+        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        rotary_pos_emb_full = self.rotary_pos_emb(
+            torch.arange(max_grid_size, device=self.device)
+        )
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -378,6 +418,9 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if self.enable_cg:
+            return self.forward_with_cuda_graph(x, grid_thw)
+
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -428,16 +471,34 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
+            cu_window_seqlens = cu_window_seqlens.to("cpu")
+
+        # pre-compute attention metadata once for all layers (two variants)
+        full_metadata = prepare_vision_attention_metadata(cu_seqlens, device=x.device)
+        window_metadata = prepare_vision_attention_metadata(
+            cu_window_seqlens, device=x.device
+        )
 
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
+            fullatt_indexes = self.fullatt_block_indexes
+            if isinstance(fullatt_indexes, torch.Tensor):
+                fullatt_indexes = fullatt_indexes.tolist()
+            if layer_num in fullatt_indexes:
                 cu_seqlens_now = cu_seqlens
+                metadata_now = full_metadata
             else:
                 cu_seqlens_now = cu_window_seqlens
+                metadata_now = window_metadata
             x = blk(
-                x, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings
+                x,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+                forward_metadata=metadata_now,
             )
 
         # adapter
@@ -445,6 +506,70 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x = x[reverse_indices, :]
 
         return x
+
+    def forward_with_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=x.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        window_index = window_index.to(device=x.device)
+        reverse_indices = permute_inv(window_index)
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
+        # patch token num
+        seq_len, _ = x.size()
+
+        # [G, M, hidden]
+        x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        x = x[window_index, :, :]
+        x = x.reshape(seq_len, -1)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
+
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
+            ]
+        )
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=position_embeddings,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=cu_window_seqlens,
+            output_indices=reverse_indices,
+        )
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
@@ -466,6 +591,24 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn.qkv": "attn.qkv_proj",
+        },
+        orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+            # mapping for original checkpoint
+            "lm_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
+        },
+    )
+
     def __init__(
         self,
         config: Qwen2_5_VLConfig,
@@ -476,7 +619,32 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+
+        if not self.config.encoder_only:
+            self.model = Qwen2Model(
+                config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -485,27 +653,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
+            max_context_len=self.config.max_position_embeddings,
         )
-
-        self.model = Qwen2Model(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -525,6 +674,25 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+
+        expected_dim = getattr(self.visual, "embed_dim", -1)
+
+        if expected_dim == -1:
+            vision_conf = self.config.vision_config
+            expected_dim = getattr(
+                vision_conf, "embed_dim", getattr(vision_conf, "hidden_size", -1)
+            )
+
+        raw_patch_dim = 1176
+
+        if pixel_values.dim() == 2:
+            current_dim = pixel_values.shape[-1]
+            if current_dim == expected_dim:
+                return pixel_values
+            if current_dim != raw_patch_dim:
+
+                return pixel_values
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
@@ -656,6 +824,18 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -669,6 +849,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
+                    and hasattr(self, "model")
                     and hasattr(self.model, "start_layer")
                     and (
                         layer_id < self.model.start_layer
@@ -679,6 +860,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -696,7 +882,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                     else:
-                        raise ValueError(f"Weight {name} not found in params_dict")
+                        continue
+
                 except KeyError:
                     print(params_dict.keys())
                     raise

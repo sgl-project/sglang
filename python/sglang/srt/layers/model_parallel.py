@@ -2,11 +2,14 @@
 Common utilities for torch model parallelism.
 """
 
+import logging
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+
+logger = logging.getLogger(__name__)
 
 try:
     import torch.distributed.tensor as dt
@@ -88,7 +91,7 @@ class RowwiseParallelMaybeWait(RowwiseParallel):
     A version of RowwiseParallel that waits for the output (establish dependency
     between comm stream and compute stream in CUDA sense) before going into the
     next op. This is needed to workaround the current interaction between
-    AsyncCollectiveTensor and custom ops, such as `class RMSNorm(CustomOp)`.
+    AsyncCollectiveTensor and multi-platform ops, such as `RMSNorm`.
     """
 
     def _partition_linear_fn(self, name, module, device_mesh):
@@ -153,3 +156,14 @@ def tensor_parallel(
     # `apply` is a native method of `nn.Module` that recursively applies a
     # function to every submodule.
     module.apply(tplize)
+
+
+def apply_torch_tp(
+    *,
+    model: nn.Module,
+    device: str,
+    tp_size: int,
+):
+    logger.info(f"Enabling torch tensor parallelism on {tp_size} devices.")
+    device_mesh = torch.distributed.init_device_mesh(device, (tp_size,))
+    tensor_parallel(model, device_mesh)
