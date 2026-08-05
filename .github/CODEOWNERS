@@ -82,6 +82,8 @@
 /test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/registered/npu @ping1jing2 @ssshinigami  @e-martirosian
+/test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py @zianglih
+/test/registered/rl/test_update_weights_from_disk_blackwell.py @zianglih
 /test/srt/test_modelopt* @Edwardf0t1
 /python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl @pyc96
 /python/sglang/srt/models/gemma4_*.py @kpham-sgl @pyc96
