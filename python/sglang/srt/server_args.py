@@ -7227,18 +7227,22 @@ class ServerArgs:
             except (ValueError, AttributeError):
                 tp_lcm_size = None
                 layer_partition = None
-            if tp_lcm_size and tp_lcm_size > self.tp_size:
+            # Rank-replicated (MLA-family) pools ignore tp_lcm_size at
+            # attach (no head axis), so a shared fleet extra-config must not
+            # be rejected for them here.
+            if tp_lcm_size and not self.use_mla_backend():
                 if self.hicache_storage_backend != "mooncake":
                     raise NotImplementedError(
-                        "canonical-grid head fan-out (tp_lcm_size > tp_size) "
-                        "needs a multi-key-per-page backend; only mooncake "
-                        "supports it."
+                        "canonical-grid with tp_lcm_size needs a "
+                        "multi-key-per-page backend; only mooncake supports "
+                        "it."
                     )
                 if self.hicache_mem_layout != "page_head":
                     raise ValueError(
-                        "canonical-grid head fan-out requires "
-                        "--hicache-mem-layout page_head (per-head-group "
-                        "contiguous buffer metas)."
+                        "canonical-grid with tp_lcm_size requires "
+                        "--hicache-mem-layout page_head on every "
+                        "participating deployment (single-cell members "
+                        "included: object byte order must match fleet-wide)."
                     )
             if layer_partition is not None:
                 # Layer fan-out (PP read-back) prerequisites. layer_partition
@@ -7254,7 +7258,7 @@ class ServerArgs:
                 # The page_first_direct layout requirement only binds when a
                 # stage actually spans >1 canonical range, which depends on
                 # the PP split — validated at attach.
-                if tp_lcm_size and tp_lcm_size > self.tp_size:
+                if tp_lcm_size and not self.use_mla_backend():
                     raise NotImplementedError(
                         "canonical-grid layer fan-out and head fan-out "
                         "cannot combine yet (they require different host "

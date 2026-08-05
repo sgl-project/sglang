@@ -99,6 +99,12 @@ class KVCacheNamespace(
     # Optional kernel/build ABI digest; deployments whose numerics must not
     # mix set distinct values and thereby get distinct namespaces.
     numerics_id: str = ""
+    # Host memory-pool layout of the stored object bytes (page_first,
+    # page_head, page_first_direct, ...). Different layouts serialize a page
+    # in different byte orders with EQUAL sizes, so without this field two
+    # deployments could exchange byte-permuted KV under identical keys.
+    # Identity field: mismatched layouts miss instead of corrupting.
+    object_layout: str
     # Canonical layer partition (the fleet agreement for PP read-back):
     # strictly increasing boundaries starting at 0 and ending at the model's
     # layer count, e.g. [0, 30, 61]. Every deployment's stage must start and
@@ -147,6 +153,7 @@ def derive_namespace(
     rank_replicated: bool,
     total_kv_heads: int,
     head_group: int,
+    object_layout: str,
     layer_boundaries: Optional[list[int]] = None,
 ) -> KVCacheNamespace:
     """Derive the namespace from deployment facts plus the fleet agreements.
@@ -168,6 +175,7 @@ def derive_namespace(
         rank_replicated=rank_replicated,
         total_kv_heads=0 if rank_replicated else total_kv_heads,
         head_group=0 if rank_replicated else head_group,
+        object_layout=object_layout,
         layer_boundaries=list(layer_boundaries) if layer_boundaries else [],
     )
     _validate_grid(namespace)
@@ -231,6 +239,7 @@ def build_canonical_cell_suffixes(
     page_size: int,
     model_id: str,
     rank_replicated: bool,
+    object_layout: str,
 ) -> list[str]:
     """Validate this rank against the namespace; return its owned cell suffixes.
 
@@ -252,6 +261,7 @@ def build_canonical_cell_suffixes(
         page_size=page_size,
         model_id=model_id,
         rank_replicated=rank_replicated,
+        object_layout=object_layout,
     )
     if attn_cp_size > 1:
         raise NotImplementedError(
@@ -328,7 +338,14 @@ def _check_identity(
     page_size: int,
     model_id: str,
     rank_replicated: bool,
+    object_layout: str,
 ) -> None:
+    if namespace.object_layout != object_layout:
+        raise ValueError(
+            f"namespace object_layout={namespace.object_layout!r} != this "
+            f"deployment's --hicache-mem-layout {object_layout!r}; object "
+            f"bytes would be permuted, not just misplaced."
+        )
     if namespace.model_id != model_id:
         raise ValueError(
             f"namespace model_id={namespace.model_id!r} != served model "

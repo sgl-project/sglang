@@ -720,20 +720,25 @@ class HiCacheController:
         # prerequisite checks run before any pool access so misconfiguration
         # fails on config alone.
         split_factor = 1
-        if tp_lcm_size and not is_rank_replicated and tp_lcm_size > self.tp_size:
+        if tp_lcm_size and not is_rank_replicated:
+            # tp_lcm_size pins the whole fleet, split_factor == 1 members
+            # included: every participant must produce page_head-ordered
+            # object bytes, or a fan-out writer and a whole-page reader
+            # would exchange size-equal but byte-permuted objects. (The
+            # object_layout namespace field backstops this by digest, but
+            # the shared fleet keyspace only forms when everyone complies.)
             if self.storage_backend_type != "mooncake":
                 raise NotImplementedError(
-                    "canonical-grid head fan-out needs a multi-key-per-page "
-                    "backend; only mooncake supports it (the file backend "
-                    "stores one object per page)."
+                    "canonical-grid with tp_lcm_size needs a "
+                    "multi-key-per-page backend; only mooncake supports it "
+                    "(the file backend stores one object per page)."
                 )
-            if not should_split_heads:
-                # should_split_heads additionally requires the page_head host
-                # layout (per-head-group contiguity for the multi-key metas).
+            if self.mem_pool_host.layout != "page_head":
                 raise ValueError(
-                    "canonical-grid with tp_lcm_size head fan-out requires "
-                    "--hicache-mem-layout page_head (per-head-group "
-                    "contiguous buffer metas)."
+                    "canonical-grid with tp_lcm_size requires "
+                    "--hicache-mem-layout page_head on every participating "
+                    "deployment (fan-out and single-cell members alike must "
+                    "serialize objects in the same byte order)."
                 )
             split_factor = tp_lcm_size // self.tp_size
 
@@ -753,7 +758,16 @@ class HiCacheController:
                 f"kv heads."
             )
 
-        if not is_rank_replicated and local_kv_heads == 1 and self.tp_size > 1:
+        if (
+            not is_rank_replicated
+            and local_kv_heads == 1
+            and self.tp_size > 1
+            and not tp_lcm_size
+        ):
+            # tp_lcm_size, when set, attests total_kv_heads >= tp_lcm_size >=
+            # tp_size (enforced by the divisibility asserts), which rules out
+            # kv-head replication — so the max-TP member of a head_group=1
+            # fleet attaches with H index == tp_rank.
             # One kv head per rank is ambiguous without model-level info: the
             # model may have exactly tp_size kv heads (sharded, safe) or
             # fewer (heads REPLICATED across ranks — several ranks hold the
@@ -778,6 +792,7 @@ class HiCacheController:
             rank_replicated=is_rank_replicated,
             total_kv_heads=local_kv_heads * self.tp_size,
             head_group=0 if is_rank_replicated else local_kv_heads // split_factor,
+            object_layout=self.mem_pool_host.layout,
             layer_boundaries=layer_partition,
         )
 
@@ -793,6 +808,7 @@ class HiCacheController:
             page_size=self.page_size,
             model_id=model_id,
             rank_replicated=is_rank_replicated,
+            object_layout=self.mem_pool_host.layout,
         )
 
         canonical_layer_ranges = None

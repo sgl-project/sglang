@@ -32,6 +32,7 @@ def _gqa_namespace(**overrides) -> KVCacheNamespace:
         rank_replicated=False,
         total_kv_heads=8,
         head_group=2,
+        object_layout="page_head",
     )
     fields.update(overrides)
     return KVCacheNamespace(**fields)
@@ -45,6 +46,7 @@ def _mla_namespace(**overrides) -> KVCacheNamespace:
         rank_replicated=True,
         total_kv_heads=0,
         head_group=0,
+        object_layout="page_first_direct",
     )
     fields.update(overrides)
     return KVCacheNamespace(**fields)
@@ -69,6 +71,7 @@ def _gqa_suffixes(
         page_size=64,
         model_id="meta-llama/Llama-3-70B",
         rank_replicated=False,
+        object_layout="page_head",
     )
     kwargs.update(overrides)
     return build_canonical_cell_suffixes(_gqa_namespace(), **kwargs)
@@ -89,6 +92,7 @@ def _mla_suffixes(
         page_size=64,
         model_id="deepseek-ai/DeepSeek-V3",
         rank_replicated=True,
+        object_layout="page_first_direct",
     )
 
 
@@ -103,6 +107,7 @@ class TestNamespaceDigest(CustomTestCase):
             {"total_kv_heads": 16},
             {"model_id": "other/model"},
             {"numerics_id": "buildX"},
+            {"object_layout": "page_first"},
         ):
             self.assertNotEqual(
                 namespace_digest(base),
@@ -126,6 +131,7 @@ class TestNamespaceDigest(CustomTestCase):
                     "rank_replicated": False,
                     "total_kv_heads": 8,
                     "head_group": 2,
+                    "object_layout": "page_head",
                 },
                 f,
             )
@@ -144,6 +150,7 @@ class TestNamespaceDigest(CustomTestCase):
                     "rank_replicated": True,
                     "total_kv_heads": 0,
                     "head_group": 0,
+                    "object_layout": "page_first",
                 },
                 f,
             )
@@ -164,6 +171,7 @@ class TestNamespaceDigest(CustomTestCase):
                     "rank_replicated": True,
                     "total_kv_heads": 0,
                     "head_group": 0,
+                    "object_layout": "page_first",
                     "numeric_id": "buildX",
                 },
                 f,
@@ -185,6 +193,7 @@ class TestNamespaceDigest(CustomTestCase):
                     "total_kv_heads": 0,
                     "layer_group": 40,
                     "head_group": 0,
+                    "object_layout": "page_first",
                 },
                 f,
             )
@@ -201,6 +210,7 @@ class TestNamespaceDigest(CustomTestCase):
                 rank_replicated=True,
                 total_kv_heads=0,
                 head_group=0,
+                object_layout="page_first",
             )
         with self.assertRaisesRegex(ValueError, "divide"):
             build_canonical_cell_suffixes(
@@ -215,6 +225,7 @@ class TestNamespaceDigest(CustomTestCase):
                 page_size=64,
                 model_id="meta-llama/Llama-3-70B",
                 rank_replicated=False,
+                object_layout="page_head",
             )
 
 
@@ -315,6 +326,7 @@ class TestDeriveNamespace(CustomTestCase):
             rank_replicated=False,
             total_kv_heads=8,
             head_group=4,
+            object_layout="page_head",
         )
         suffixes = build_canonical_cell_suffixes(
             namespace,
@@ -328,6 +340,7 @@ class TestDeriveNamespace(CustomTestCase):
             page_size=64,
             model_id="m/1B",
             rank_replicated=False,
+            object_layout="page_head",
         )
         self.assertEqual(len(suffixes), 1)
         self.assertTrue(suffixes[0].endswith("_L0-16_H1"))
@@ -343,8 +356,8 @@ class TestDeriveNamespace(CustomTestCase):
             rank_replicated=False,
             total_kv_heads=8,
         )
-        tp2 = derive_namespace(head_group=2, **common)
-        tp4 = derive_namespace(head_group=2, **common)
+        tp2 = derive_namespace(head_group=2, object_layout="page_head", **common)
+        tp4 = derive_namespace(head_group=2, object_layout="page_head", **common)
         self.assertEqual(namespace_digest(tp2), namespace_digest(tp4))
 
     def test_different_head_grids_derive_disjoint_namespaces(self):
@@ -356,8 +369,12 @@ class TestDeriveNamespace(CustomTestCase):
             total_kv_heads=8,
         )
         self.assertNotEqual(
-            namespace_digest(derive_namespace(head_group=4, **common)),
-            namespace_digest(derive_namespace(head_group=2, **common)),
+            namespace_digest(
+                derive_namespace(head_group=4, object_layout="page_head", **common)
+            ),
+            namespace_digest(
+                derive_namespace(head_group=2, object_layout="page_head", **common)
+            ),
         )
 
     def test_normalize_dtype(self):
@@ -372,10 +389,15 @@ class TestControllerGuards(CustomTestCase):
     """Attach-time guards of HiCacheController._build_canonical_suffix that
     fire before any storage or runtime-context access."""
 
+    class _StubHostPool:
+        def __init__(self, layout: str):
+            self.layout = layout
+
     def _stub_controller(self, controller_cls, backend_type: str, has_draft: bool):
         controller = controller_cls.__new__(controller_cls)
         controller.storage_backend_type = backend_type
         controller.has_draft = has_draft
+        controller.mem_pool_host = self._StubHostPool("page_first")
         return controller
 
     def _build(self, controller, **overrides):
@@ -507,6 +529,7 @@ class TestLayerPartition(CustomTestCase):
             page_size=64,
             model_id="deepseek-ai/DeepSeek-V3",
             rank_replicated=True,
+            object_layout="page_first_direct",
         )
 
     def test_pp_read_back_coverage(self):
@@ -540,6 +563,7 @@ class TestLayerPartition(CustomTestCase):
                 page_size=64,
                 model_id="meta-llama/Llama-3-70B",
                 rank_replicated=False,
+                object_layout="page_head",
             )
         # A single-range MHA stage under the same partition is fine.
         single = build_canonical_cell_suffixes(
@@ -554,6 +578,7 @@ class TestLayerPartition(CustomTestCase):
             page_size=64,
             model_id="meta-llama/Llama-3-70B",
             rank_replicated=False,
+            object_layout="page_head",
         )
         self.assertEqual(len(single), 1)
 
@@ -577,6 +602,7 @@ class TestLayerPartition(CustomTestCase):
                     rank_replicated=True,
                     total_kv_heads=0,
                     head_group=0,
+                    object_layout="page_first",
                     layer_boundaries=bad,
                 )
 
