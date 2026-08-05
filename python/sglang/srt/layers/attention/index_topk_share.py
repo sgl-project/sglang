@@ -10,8 +10,6 @@ if TYPE_CHECKING:
 
 
 class IndexTopKShareState:
-    """Carries DSA indexer top-k across layers and MTP draft steps."""
-
     def __init__(
         self,
         forward_batch: ForwardBatch,

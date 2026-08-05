@@ -12,17 +12,6 @@ if TYPE_CHECKING:
 
 
 class IndexKeyCache:
-    """Owns the DSA indexer's per-layer fp8+scale index-K buffer and the read /
-    store / move / transfer / offload of it.
-
-    The buffer is page-co-located with the latent KV (same loc / page indices),
-    so page allocation stays with the owning ``DSATokenToKVPool``. This object
-    holds only the index-K tensors and reads layout/context attributes back from
-    the pool (``page_size``, ``index_head_dim``, ``quant_block_size``, the layer
-    transfer counter, ...), so the existing ``index_buf_accessor`` codec keeps
-    seeing the pool object unchanged.
-    """
-
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
@@ -33,12 +22,6 @@ class IndexKeyCache:
         ):
             self.buffer = [
                 torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
                     self._buffer_shape(self._layer_num_pages(i, num_pages)),
                     dtype=pool.index_k_with_scale_buffer_dtype,
                     device=pool.device,
@@ -100,8 +83,6 @@ class IndexKeyCache:
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        """Fused read of both index K and scale in one Triton call. Returns
-        (k_fp8: (seq_len, index_head_dim) uint8, k_scale: (seq_len, 4) uint8)."""
         buf = self.get_buffer(layer_id)
         return index_buf_accessor.GetKAndS.execute(
             self.pool,
@@ -129,10 +110,7 @@ class IndexKeyCache:
         )
 
     def cpu_copy(self, indices):
-        # Retract frees the slots/pages and they get reused by other reqs'
-        # store_quantized, so we must offload index-K too -- otherwise resume
-        # restores kv_buffer but leaves foreign index/scale in place and DSA
-        # attention reads garbage at those token positions.
+        # Retracted pages may be reused before resume, so offload index-K with KV.
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         index_k_cpu = []

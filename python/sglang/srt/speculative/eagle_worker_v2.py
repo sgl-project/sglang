@@ -592,11 +592,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     token_list.append(tree_info[1])
                     parents_list.append(tree_info[2])
 
-                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
                 if i == self.speculative_num_steps - 1:
                     break
 
-                # Set inputs
                 forward_batch.input_ids = input_ids
                 # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
                 # argument must be contiguous.
@@ -608,9 +606,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
 
-                # Run forward under a per-step ForwardContext so the model layer
-                # reads attn_backends[i] for the i-th draft step, plus a canary
-                # index context so canary tracks which draft step is active.
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
                     if (c := self.draft_runner.canary_manager) is not None
@@ -642,7 +637,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 elif self.topk == 1 and not _is_hip:
                     if _is_cuda:
-                        # The positions advance is fused into the kernel.
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,

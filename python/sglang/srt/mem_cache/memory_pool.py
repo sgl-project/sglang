@@ -4346,8 +4346,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     @property
     def index_k_with_scale_buffer(self):
-        # Back-compat alias: external readers (e.g. the HiCache host pool) index
-        # this attribute directly. The buffer now lives on self.index_key_cache.
+        # Preserve direct HiCache access while storage lives behind the facade.
         return self.index_key_cache.buffer
 
     def _clear_buffers(self):
