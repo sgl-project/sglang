@@ -61,11 +61,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_MPS_MLP_TOKEN_CHUNK_SIZE = 512
+_MPS_MLP_TOKEN_CHUNK_SIZE = 256
 # keep MPS activation chunks below the allocator high-watermark; CUDA keeps
 # its fused full-sequence projection
-_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 512
-_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 256
+_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 256
+_MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
 # bound outstanding MPS releases while avoiding one command-buffer fence per chunk
 _MPS_RELEASE_INTERVAL = 8
 
