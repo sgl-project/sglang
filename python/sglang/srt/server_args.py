@@ -7121,6 +7121,29 @@ class ServerArgs:
             )
         if scaling_active:
             resolved = self._resolved()
+            from sglang.srt.elastic_ep.topology import (
+                derive_attn_tp_size,
+                physical_ep_size_to_dp_size,
+            )
+
+            try:
+                attn_tp_size = derive_attn_tp_size(
+                    tp_size=self.tp_size,
+                    dp_size=self.dp_size,
+                    attn_cp_size=resolved.attn_cp_size,
+                )
+                attn_replica_size = attn_tp_size * resolved.attn_cp_size
+                physical_ep_size_to_dp_size(self.max_ep_size, attn_replica_size)
+                physical_ep_size_to_dp_size(
+                    self.elastic_ep_initial_size or self.tp_size, attn_replica_size
+                )
+                if self.ep_join_mode == "scale":
+                    physical_ep_size_to_dp_size(
+                        self.ep_join_rank_offset, attn_replica_size
+                    )
+            except ValueError as exc:
+                raise AssertionError(str(exc)) from exc
+
             assert (
                 self.elastic_ep_scale_timeout > 0
             ), "--elastic-ep-scale-timeout must be greater than zero."
@@ -7178,6 +7201,11 @@ class ServerArgs:
                 "Elastic EP scale-up requires --pp-size 1 "
                 f"(got pp_size={self.pp_size}); WORLD must not span PP stages."
             )
+            assert attn_tp_size % self.dcp_size == 0, (
+                "Elastic EP scale-up requires --dcp-size to divide the fixed "
+                "attention TP width "
+                f"(got dcp_size={self.dcp_size}, attn_tp_size={attn_tp_size})."
+            )
 
             assert resolved.enable_dp_attention, (
                 "Elastic EP scale-up requires --enable-dp-attention; without it "
@@ -7198,12 +7226,8 @@ class ServerArgs:
             )
             assert resolved.ep_size == self.tp_size, (
                 "Elastic EP scale-up requires ep_size == tp_size "
-                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); EP, TP "
-                "and the attention DP group must all coincide with WORLD."
-            )
-            assert self.dp_size == self.tp_size, (
-                "Elastic EP scale-up requires dp_size == tp_size "
-                f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
+                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); "
+                "physical EP membership must coincide with the launch-time TP span."
             )
             assert resolved.moe_a2a_backend == "nixl", (
                 "Elastic EP scale-up requires --moe-a2a-backend nixl "
