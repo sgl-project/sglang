@@ -565,8 +565,8 @@ def attention_ref(
 # @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
-@pytest.mark.parametrize("has_qv", [False, True])
-# @pytest.mark.parametrize("has_qv", [False])
+# @pytest.mark.parametrize("has_qv", [False, True])
+@pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
@@ -1515,7 +1515,14 @@ def _generate_block_kvcache(
     not is_sm100_or_sm110_supported(),
     reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
 )
-@pytest.mark.parametrize("mha_type", ["mqa", "gqa"])
+@pytest.mark.parametrize(
+    "nheads,nheads_k,num_splits",
+    [
+        (8, 1, 1),  # DeepSeek-style MQA, tile-compatible head ratio
+        (8, 4, 1),  # GQA
+        (20, 1, 0),  # GLM-4.7-Flash TP1: padded head ratio, auto split selection
+    ],
+)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1525,19 +1532,26 @@ def _generate_block_kvcache(
         (16, 20000),  # long context
     ],
 )
-def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
-    """DeepSeek absorbed-MLA FA4 shape: rope q/k head_dim 64, latent v/qv
-    head_dim 512, varlen q over a paged KV cache, num_splits=1. Mirrors the
-    production calls in flashattention_backend.py, where extend
-    (flash_attn_varlen_func) and decode (flash_attn_with_kvcache) share this
-    qv-threaded path.
+def test_flash_attn_varlen_qv_deepseek_absorbed(
+    seqlen_q, seqlen_k, nheads, nheads_k, num_splits
+):
+    """Absorbed-MLA FA4 shape: rope q/k head_dim 64, latent v/qv head_dim 512,
+    varlen q over a paged KV cache. Mirrors the production calls in
+    flashattention_backend.py, where extend (flash_attn_varlen_func) and decode
+    (flash_attn_with_kvcache) share this qv-threaded path.
+
+    The (20, 1, 0) case is the GLM-4.7-Flash TP1 shape: a 20:1 head ratio is
+    incompatible with the MLA kernel's 128-row cluster tile, so the SGLang
+    wrapper must pad each KV group to 32 q heads and crop the output, and must
+    coerce num_splits=0 (the production non-deterministic decode default) to 1
+    because FA4 MLA has no split-KV. Without the wrapper fix this case dies on
+    "split kv not supported with qv" (num_splits=0) or the cluster_tile_m ratio
+    assert in flash_fwd_mla_sm100.py (num_splits=1).
     """
     device = "cuda"
     dtype = torch.bfloat16
     torch.random.manual_seed(seqlen_q + seqlen_k)
     batch_size = 5
-    nheads = 8
-    nheads_k = 1 if mha_type == "mqa" else 4
     d, dv = 64, 512
     page_size = 128
 
@@ -1566,7 +1580,7 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
         seqused_k=cache_seqlens,
         page_table=page_table,
         causal=True,
-        num_splits=1,
+        num_splits=num_splits,
         ver=4,
     )
     out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
@@ -1583,7 +1597,7 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=seqlen_q,
         causal=True,
-        num_splits=1,
+        num_splits=num_splits,
         ver=4,
     )
     assert torch.equal(out_kvcache, out_unpad)
