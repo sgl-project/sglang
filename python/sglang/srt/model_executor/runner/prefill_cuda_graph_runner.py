@@ -337,6 +337,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
+        # Archs on the MLA-BCG allowlist pin the absorbed MLA path inside
+        # capture/replay (attention_backend_handler), so the MHA companion is
+        # never captured and the MHA-prefix restrictions below don't apply.
+        self.mla_pinned_under_bcg = (
+            self.model_runner.model_config.is_mla_breakable_cuda_graph_supported
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -1052,11 +1058,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         # A prefix forces the MHA companion path, whose captured state is
         # frozen prefix-free; DSA models are exempt (capture/replay force
-        # the sparse path, which takes any prefix via device metadata).
+        # the sparse path, which takes any prefix via device metadata), as
+        # are archs on the MLA-BCG allowlist (they pin the absorbed MLA path
+        # inside capture/replay, so the MHA companion is never captured).
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not self.dsa_sparse_prefill_forced
+            and not self.mla_pinned_under_bcg
             and prefix_lens is not None
             and any(prefix_lens)
         ):
@@ -1392,7 +1401,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             run_once,
             # DP padding can install capture-only tensors on this dummy batch;
             # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=forward_batch,
+            capture_inputs=(
+                forward_batch
+                if forward_batch.global_num_tokens_gpu is not None
+                else None
+            ),
             post_warmup_hook=post_warmup_hook,
         )
 
@@ -1532,6 +1545,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
+            and not self.mla_pinned_under_bcg
         ):
             self._restore_mha_capture_state(static_forward_batch)
 
