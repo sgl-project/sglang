@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32, silu_and_mul_clamp
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -255,7 +255,7 @@ class ExaoneMoeSparseMoEBlock(nn.Module):
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         shared_output = None
         if hidden_states.shape[0] > 0:
-            router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
+            router_logits = self._router_logits(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -278,9 +278,14 @@ class ExaoneMoeSparseMoEBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        router_logits = self._router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
+
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if _is_cuda:
+            return linear_bf16_fp32(hidden_states, self.gate.weight)
+        return F.linear(hidden_states.float(), self.gate.weight.float())
 
     def forward_normal_dual_stream(
         self,
