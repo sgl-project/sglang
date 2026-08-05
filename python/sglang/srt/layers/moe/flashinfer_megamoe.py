@@ -161,6 +161,15 @@ def _keep_topk_ids_int32() -> bool:
     )
 
 
+def _use_output_workspace_view() -> bool:
+    """Whether to request the opt-in workspace output view."""
+    return os.environ.get("SGLANG_FLASHINFER_MEGA_OUTPUT_VIEW", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+
+
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
     combine_dtype = (
         envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
@@ -588,6 +597,11 @@ def run_flashinfer_megamoe(
         fc1_norm_const=quant_info.fc1_norm_const,
     )
     with torch.inference_mode():
-        y = mega.forward(t)
+        if _use_output_workspace_view() and getattr(mega, "supports_output_view", False):
+            y = mega.forward(t, return_workspace_view=True)
+        else:
+            # Keep compatibility with older MegaMoE implementations that do
+            # not expose the workspace-view capability.
+            y = mega.forward(t)
 
     return StandardCombineInput(hidden_states=y)
