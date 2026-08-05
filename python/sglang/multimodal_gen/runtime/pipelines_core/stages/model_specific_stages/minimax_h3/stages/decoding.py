@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
@@ -45,9 +46,15 @@ def _required_tensor(value, path: str) -> torch.Tensor:
 def _autocast_enabled_for_device(
     tensor: torch.Tensor, dtype: torch.dtype, disable_autocast: bool
 ) -> bool:
-    return tensor.device.type in ("cuda", "npu") and autocast_enabled(
-        dtype, disable_autocast
+    supported_backend = (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_npu()
     )
+    supported_device = (
+        supported_backend and tensor.device.type == current_platform.device_type
+    )
+    return supported_device and autocast_enabled(dtype, disable_autocast)
 
 
 @functools.lru_cache(maxsize=None)

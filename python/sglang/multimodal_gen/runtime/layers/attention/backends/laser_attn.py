@@ -105,23 +105,35 @@ class LaserAttentionImpl(AttentionImpl):
         return torch.nn.functional.pad(input_tensor, pad_list)
 
     def _la_preprocess_input(
-        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        preserve_bf16_range: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
         # Currently BSND input layout is not supported
         q = query.transpose(1, 2)
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
 
-        q_scale = _BF16_LASER_SCALE if q.dtype == torch.bfloat16 else 1.0
-        k_scale = _BF16_LASER_SCALE if k.dtype == torch.bfloat16 else 1.0
-        value_scale = _BF16_LASER_SCALE if v.dtype == torch.bfloat16 else 1.0
-
-        if q.dtype != torch.float16:
-            q = q.mul(1.0 / q_scale).to(torch.float16)
-        if k.dtype != torch.float16:
-            k = k.mul(1.0 / k_scale).to(torch.float16)
-        if v.dtype != torch.float16:
-            v = v.mul(1.0 / value_scale).to(torch.float16)
+        q_scale = 1.0
+        k_scale = 1.0
+        value_scale = 1.0
+        if preserve_bf16_range:
+            q_scale = _BF16_LASER_SCALE if q.dtype == torch.bfloat16 else 1.0
+            k_scale = _BF16_LASER_SCALE if k.dtype == torch.bfloat16 else 1.0
+            value_scale = _BF16_LASER_SCALE if v.dtype == torch.bfloat16 else 1.0
+            if q.dtype != torch.float16:
+                q = q.mul(1.0 / q_scale).to(torch.float16)
+            if k.dtype != torch.float16:
+                k = k.mul(1.0 / k_scale).to(torch.float16)
+            if v.dtype != torch.float16:
+                v = v.mul(1.0 / value_scale).to(torch.float16)
+        elif q.dtype != torch.float16:
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
 
         q = self._pad(q)
         k = self._pad(k)
@@ -175,6 +187,17 @@ class LaserAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        return self._forward_dense(query, key, value, attn_metadata)
+
+    def _forward_dense(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        *,
+        preserve_bf16_range: bool = False,
+    ) -> torch.Tensor:
         q_seqlen, head_dim = query.shape[1], query.shape[3]
         kv_seqlen = key.shape[1]
 
@@ -193,7 +216,10 @@ class LaserAttentionImpl(AttentionImpl):
                 ) * self.seq_len_pad_base - kv_seqlen
 
             q, k, v, qk_scale, value_scale = self._la_preprocess_input(
-                query, key, value
+                query,
+                key,
+                value,
+                preserve_bf16_range=preserve_bf16_range,
             )
             _, la_output = self._laser_attention(
                 q,
@@ -242,11 +268,12 @@ class LaserAttentionImpl(AttentionImpl):
             and bounds[0] == 0
             and bounds[1] == padding_start
         ):
-            segment = self.forward(
+            segment = self._forward_dense(
                 query[:padding_start].unsqueeze(0),
                 key[:padding_start].unsqueeze(0),
                 value[:padding_start].unsqueeze(0),
                 None,
+                preserve_bf16_range=True,
             )[0]
             if padding_start == query.shape[0]:
                 return segment
@@ -262,11 +289,12 @@ class LaserAttentionImpl(AttentionImpl):
                 break
             if start == stop:
                 continue
-            segment = self.forward(
+            segment = self._forward_dense(
                 query[start:stop].unsqueeze(0),
                 key[start:stop].unsqueeze(0),
                 value[start:stop].unsqueeze(0),
                 None,
+                preserve_bf16_range=padding_start is not None,
             )
             output[start:stop].copy_(segment[0])
         if padding_start is not None:

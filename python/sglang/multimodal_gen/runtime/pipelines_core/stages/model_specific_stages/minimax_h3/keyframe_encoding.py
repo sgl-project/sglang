@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
     minimax_h3_patchify_video_latent,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_KEYFRAME_PATCH_SIZE = (1, 2, 2)
@@ -37,16 +38,26 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
 
     The encode recipes seed the default torch generators right before a
     posterior-sampled VAE encode. Forking restores the process-global CPU and
-    accelerator generators after the encode while preserving the exact sampled result.
+    accelerator generators after the encode while preserving the exact sampled
+    result.
     """
     devices: list[torch.device] = []
     device_module = None
     device_type = None
-    if device is not None and device.type in {"cuda", "npu"}:
+    is_supported_backend = (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_npu()
+    )
+    if (
+        device is not None
+        and is_supported_backend
+        and device.type == current_platform.device_type
+    ):
         device_module = torch.get_device_module(device)
         if device_module.is_available():
             devices = [device]
-            device_type = device.type
+            device_type = current_platform.device_type
     with torch.random.fork_rng(devices=devices, device_type=device_type):
         torch.default_generator.manual_seed(int(seed))
         for forked_device in devices:

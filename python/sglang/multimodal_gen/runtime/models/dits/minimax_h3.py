@@ -490,9 +490,7 @@ def _minimax_h3_attention_core_impl(
         )
     if attention._attention_backend == AttentionBackendEnum.LASER_ATTN:
         padding_start = (
-            int(cu_seqlens[1].item())
-            if cu_seqlens_host is None
-            else cu_seqlens_host[1]
+            int(cu_seqlens[1].item()) if cu_seqlens_host is None else cu_seqlens_host[1]
         )
         out = attention._attention_impl.forward_varlen(
             q,
