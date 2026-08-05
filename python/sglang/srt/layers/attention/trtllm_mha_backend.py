@@ -25,6 +25,9 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    make_persistent_multi_ctas_kv_counter_buffer,
+)
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -232,6 +235,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     f"(got {config.head_dim}/{config.v_head_dim}) and a "
                     f"power-of-2 page size. Use --page-size 64 instead."
                 )
+
+        # Owned here, and sized for the widest batch this backend can see, so
+        # FlashInfer does not allocate and zero a fresh counter buffer per
+        # attention layer inside the captured decode graph.
+        self._multi_ctas_kv_counter_buffer = (
+            make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                num_q_heads=config.num_attention_heads,
+                max_batch_size=(model_runner.max_running_requests + 1)
+                * max(1, self.speculative_num_draft_tokens or 1),
+            )
+        )
+        # Same reason for the fused FP8 KV-cache write's fallback scales: it
+        # needs float32 [1] tensors, and layers without checkpoint kv scales
+        # would otherwise have torch.ones() build them on every call.
+        self._default_kv_scale = get_buffer(
+            "trtllm_mha_default_kv_scale",
+            lambda: torch.ones(1, dtype=torch.float32, device=self.device),
+        )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -775,6 +797,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # Layers without checkpoint KV scales fall back to the backend-owned
+        # float32 ones tensor; letting the op synthesize one costs a fill
+        # kernel per layer per forward, baked into the captured graph.
         return fused_fp8_qkv_kv_cache(
             q=q,
             k=k,
@@ -782,8 +807,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_cache=k_cache,
             v_cache=v_cache,
             cache_loc=cache_loc,
-            k_scale=layer.k_scale,
-            v_scale=layer.v_scale,
+            k_scale=(
+                layer.k_scale if layer.k_scale is not None else self._default_kv_scale
+            ),
+            v_scale=(
+                layer.v_scale if layer.v_scale is not None else self._default_kv_scale
+            ),
         )
 
     def init_forward_metadata_out_graph(
@@ -1128,6 +1157,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1257,6 +1287,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             elif self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1275,6 +1306,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=None,
                     max_q_len=self.forward_metadata.max_seq_len_q,
                     cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
@@ -1291,6 +1323,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
         else:
 
@@ -1302,6 +1335,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 *,
                 cu_seqlens_kv,
                 use_zigzag_page_table=False,
+                out=None,
             ):
                 block_tables = page_table
                 if use_zigzag_page_table:
@@ -1327,6 +1361,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    out=out,
                     out_dtype=self.q_data_type,
                 )
 
@@ -1341,12 +1376,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
                 )
             else:
+                out = forward_batch._attn_output
+                if out is not None:
+                    out = out.view_as(q)
                 o = _trtllm_context_attn(
                     q,
                     self.forward_metadata.cu_seqlens_q,
                     self.forward_metadata.cache_seqlens_int32,
                     self.forward_metadata.max_seq_len_q,
                     cu_seqlens_kv=self.forward_metadata.cu_seqlens_k,
+                    out=out,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

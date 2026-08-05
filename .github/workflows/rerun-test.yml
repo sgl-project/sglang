@@ -104,6 +104,9 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
         env:
@@ -195,6 +198,8 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - uses: ./.github/actions/download-rust-ext
+
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -240,7 +245,12 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # The image ships ~65G free and the suite peaks around 30G; deleting
+          # these trees is ~1M unlinks (~80s), so only pay it when actually low.
+          avail_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          if [ "${avail_gb}" -lt 40 ]; then
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
           df -h
 
       - name: Checkout code
@@ -270,9 +280,16 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Worth the most of the three jobs: this runner is hosted, so it has no
+      # persistent cargo target dir and every dispatch compiled cold. Its
+      # setup-python pins the same 3.10 the modules were built against.
+      - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
+
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
       - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 

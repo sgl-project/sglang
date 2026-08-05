@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
@@ -165,7 +167,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 class DeepGemmRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        assert self.config.activation == "silu"
+        # SiTU (Kimi K3) is applied outside the GEMMs in python, so it only
+        # needs the masked-gemm activation site to branch (see _run_masked_gemm).
+        assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = False
@@ -256,7 +260,61 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if self.config.activation == "situ":
+            situ_beta = self.config.gemm1_alpha
+            situ_linear_beta = self.config.gemm1_clamp_limit
+            assert situ_beta is not None and situ_linear_beta is not None
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                # Fused SiTU + per-group fp8 quant over the compacted rows,
+                # then the proven round-up e8m0 cast (mn-major packed layout).
+                rows = gateup_output.shape[0]
+                half_n = N // 2
+                kg = half_n // scale_block_size
+                down_input_fp8 = torch.empty(
+                    (rows, half_n),
+                    device=gateup_output.device,
+                    dtype=torch.float8_e4m3fn,
+                )
+                s = torch.empty(
+                    (rows, kg), device=gateup_output.device, dtype=torch.float32
+                )
+                _situ_mul_quant_contig_kernel[(rows,)](
+                    gateup_output,
+                    down_input_fp8,
+                    s,
+                    half_n,
+                    kg,
+                    situ_beta,
+                    situ_linear_beta,
+                    GROUP=scale_block_size,
+                    KG_POW2=triton.next_power_of_2(kg),
+                    num_warps=8,
+                )
+                del gateup_output
+                down_input_scale = _cast_to_e8m0_with_rounding_up(
+                    s.unsqueeze(0)
+                ).squeeze(0)
+            else:
+                from sglang.kernels.ops.quantization.fp8_kernel import (
+                    sglang_per_token_group_quant_fp8,
+                )
+
+                gate = gateup_output[:, : N // 2].float()
+                up = gateup_output[:, N // 2 :].float()
+                gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                down_input = (gate * up).to(torch.bfloat16)
+                del gateup_output
+
+                down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                    down_input,
+                    scale_block_size,
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                )
+                del down_input
+        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -519,28 +577,38 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
 
         # Act.
-        topk_ids_rs = running_state.get("topk_ids")
-        num_real_tokens = (
-            topk_ids_rs.shape[0]
-            if (
-                use_mxfp8
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and topk_ids_rs is not None
-                and "src2dst" in running_state
+        if self.config.activation == "situ":
+            down_input, down_input_scale = _varlen_deep_gemm_situ_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=128,
+                topk=self.config.top_k,
+                beta=self.config.gemm1_alpha,
+                linear_beta=self.config.gemm1_clamp_limit,
             )
-            else None
-        )
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
-            gateup_output,
-            masked_m,
-            group_size=scale_block_size,
-            topk=self.config.top_k,
-            swiglu_limit=swiglu_limit_arg,
-            swizzle=self.use_swizzle,
-            gemm1_alpha=self.config.gemm1_alpha,
-            gemm1_clamp_limit=self.config.gemm1_clamp_limit,
-            num_real_tokens=num_real_tokens,
-        )
+        else:
+            topk_ids_rs = running_state.get("topk_ids")
+            num_real_tokens = (
+                topk_ids_rs.shape[0]
+                if (
+                    use_mxfp8
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    and topk_ids_rs is not None
+                    and "src2dst" in running_state
+                )
+                else None
+            )
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=scale_block_size,
+                topk=self.config.top_k,
+                swiglu_limit=swiglu_limit_arg,
+                swizzle=self.use_swizzle,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                num_real_tokens=num_real_tokens,
+            )
         del gateup_output
 
         # Down activation is quantised locally at scale_block_size (never DeepEP-LL),
@@ -885,9 +953,10 @@ def post_permute_deep_gemm_to_standard(
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
     hidden_states_device = running_state["hidden_states_device"]
-    src2dst = running_state["src2dst"]
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
+
+    src2dst = running_state["src2dst"]
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         output = torch.empty(
@@ -975,7 +1044,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "situ")
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
@@ -1090,6 +1159,53 @@ def post_permute_deep_gemm_to_deepep_normal(
     )
 
 
+def _varlen_deep_gemm_situ_mul_quant(
+    gateup_output: torch.Tensor,
+    masked_m: torch.Tensor,
+    group_size: int,
+    topk: int,
+    beta: float,
+    linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
+    from sglang.kernels.ops.kimi_k3 import situ_and_mul_masked_post_quant
+
+    E, N, D_2 = gateup_output.shape
+    D = D_2 // 2
+    G = D // group_size
+    packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+
+    down_input = torch.empty(
+        (E, N, D), device=gateup_output.device, dtype=torch.float8_e4m3fn
+    )
+    if packed_ue8m0:
+        down_input_scale = torch.empty(
+            (E, G // 4, N), device=gateup_output.device, dtype=torch.int32
+        )
+    else:
+        down_input_scale = torch.empty(
+            (E, N, G), device=gateup_output.device, dtype=torch.float32
+        )
+
+    situ_and_mul_masked_post_quant(
+        gateup_output,
+        down_input,
+        down_input_scale,
+        group_size,
+        masked_m,
+        beta=beta,
+        linear_beta=linear_beta,
+        scale_ue8m0=packed_ue8m0,
+        topk=topk,
+        transposed=packed_ue8m0,
+    )
+
+    if packed_ue8m0:
+        down_input_scale = down_input_scale.transpose(-1, -2)
+
+    return down_input, down_input_scale
+
+
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
@@ -1200,6 +1316,37 @@ def _varlen_deep_gemm_silu_mul_quant(
         expected_m=expected_m,
         column_major_scales=True,
     )
+
+
+@triton.jit
+def _situ_mul_quant_contig_kernel(
+    g_ptr,  # [rows, 2N] bf16, non-interleaved [gate; up] halves
+    q_ptr,  # [rows, N] fp8 out
+    s_ptr,  # [rows, KG] fp32 scales out
+    N,
+    KG,
+    situ_beta,
+    situ_linear_beta,
+    GROUP: tl.constexpr,
+    KG_POW2: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rows2d = tl.arange(0, KG_POW2)[:, None]
+    cols = tl.arange(0, GROUP)[None, :]
+    offs = rows2d * GROUP + cols
+    mask = rows2d < KG
+    gate = tl.load(g_ptr + row * 2 * N + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(g_ptr + row * 2 * N + N + offs, mask=mask, other=0.0).to(tl.float32)
+    # tanh(x) == 2*sigmoid(2x) - 1 (avoids a libdevice dependency)
+    gate_t = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+    gate = situ_beta * gate_t * tl.sigmoid(gate)
+    up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+    y = gate * situ_linear_beta * up_t
+    amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
+    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    tl.store(q_ptr + row * N + offs, q, mask=mask)
+    srow = tl.arange(0, KG_POW2)
+    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
 
 
 def _apply_swiglu_limit(

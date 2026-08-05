@@ -218,6 +218,10 @@ from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoad
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.memory_usage import (
+    build_memory_usage,
+    combine_graph_memory_usage,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -262,6 +266,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -330,7 +335,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
-DECODE_STEP_MAX_US = 2_000_000
+STEP_MAX_US = 2_000_000
 
 
 def _accumulate_decode_moment(
@@ -378,6 +383,11 @@ class Scheduler(
         moe_dp_rank: int,
         dp_rank: Optional[int],
     ):
+        # NOTE: KEEP THE FOLLOWING CODE STYLE for this function:
+        # Keep __init__ as an orchestrator: sequence init_* and maybe_init_* calls
+        # with minimal glue. Move substantial component-specific logic into
+        # dedicated methods instead of adding inline blocks here.
+        self.init_startup_timing_begin()
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
@@ -521,22 +531,8 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-
-        if _is_npu and is_deepseek_v4(
-            self.tp_worker.model_runner.model_config.hf_config
-        ):
-            rank = (
-                self.ps.dp_rank
-                if self.ps.dp_rank is not None
-                else self.tp_group.rank_in_group
-            )
-            logger.info("HCCL DP prewarm start: rank=%s", rank)
-            _prewarm_hccl_group(
-                device=self.tp_group.device,
-                group=self.tp_group.device_group,
-                device_module=self.tp_group.device_module,
-            )
-            logger.info("HCCL DP prewarm done: rank=%s", rank)
+        self.emit_metrics_constants()
+        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -645,6 +641,46 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+        self.init_startup_timing_summary()
+
+    def init_startup_timing_begin(self) -> None:
+        self.scheduler_startup_begin = time.perf_counter()
+
+    def init_startup_timing_summary(self) -> None:
+        self.startup_time = build_scheduler_startup_time(
+            target_load_weight=self.tp_worker.weight_load_time,
+            draft_load_weight=(
+                0.0 if self.draft_worker is None else self.draft_worker.weight_load_time
+            ),
+            kv_cache_allocation=self.kv_cache_allocation_time,
+            scheduler_e2e=time.perf_counter() - self.scheduler_startup_begin,
+            target_cuda_graph=self.tp_worker.graph_time_usage,
+            draft_cuda_graph=(
+                None
+                if self.draft_worker is None
+                else self.draft_worker.graph_time_usage
+            ),
+        )
+
+    def maybe_init_hccl_dp_prewarm(self) -> None:
+        if not (
+            _is_npu
+            and is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config)
+        ):
+            return
+
+        rank = (
+            self.ps.dp_rank
+            if self.ps.dp_rank is not None
+            else self.tp_group.rank_in_group
+        )
+        logger.info("HCCL DP prewarm start: rank=%s", rank)
+        _prewarm_hccl_group(
+            device=self.tp_group.device,
+            group=self.tp_group.device_group,
+            device_module=self.tp_group.device_module,
+        )
+        logger.info("HCCL DP prewarm done: rank=%s", rank)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -941,14 +977,18 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
+        tic = time.perf_counter()
         self.init_memory_pools()
+        self.kv_cache_allocation_time = time.perf_counter() - tic
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
+            tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
+            self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if (
             get_exec().moe.elastic_ep_backend is not None
@@ -1021,7 +1061,7 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
-        avail_mem = get_available_gpu_memory(
+        self.startup_available_gpu_memory_gb = get_available_gpu_memory(
             self.device, self.ps.gpu_id, empty_cache=False
         )
         if self.ps.tp_rank == 0:
@@ -1031,23 +1071,36 @@ class Scheduler(
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
-                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
+                f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
 
-        if get_observability().enable_metrics:
-            self.metrics_collector.emit_constants(
-                max_total_num_tokens=self.max_total_num_tokens,
-                # TODO: max_running_requests_under_SLO has no setter — dead chain.
-                max_running_requests_under_SLO=getattr(
-                    self, "max_running_requests_under_SLO", None
+    def emit_metrics_constants(self) -> None:
+        if not get_observability().enable_metrics:
+            return
+
+        self.metrics_collector.emit_constants(
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens_swa=self.swa_tokens_per_layer,
+            weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            kv_cache_memory_usage_gb=(
+                self.token_to_kv_pool_allocator.get_kvcache().mem_usage
+            ),
+            graph_memory_usage_gb=combine_graph_memory_usage(
+                self.tp_worker.graph_memory_usage,
+                (
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.graph_memory_usage
                 ),
-                engine_startup_time=0.0,
-                engine_load_weights_time=0.0,
-                page_size=self.page_size,
-                num_pages=self.max_total_num_tokens // self.page_size,
-                context_len=self.model_config.context_len,
-                startup_available_gpu_memory_gb=avail_mem,
-            )
+            ),
+            # TODO: max_running_requests_under_SLO has no setter — dead chain.
+            max_running_requests_under_SLO=None,
+            page_size=self.page_size,
+            num_pages=self.max_total_num_tokens // self.page_size,
+            context_len=self.model_config.context_len,
+            startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
+        )
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -1561,6 +1614,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "startup_time": self.startup_time,
         }
 
         return result_dict
@@ -1651,6 +1705,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
+                self._sched_idled = True
                 self.on_idle()
 
             # Update last_batch
@@ -1712,6 +1767,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self._sched_idled = True
 
             # Process the last batch
             if self.last_batch:
@@ -1990,7 +2046,8 @@ class Scheduler(
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
-        self._prev_decode_launch_ts: Optional[float] = None
+        self._prev_step: Optional[Tuple[int, float, bool]] = None
+        self._sched_idled = False
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -3484,6 +3541,8 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3803,23 +3862,28 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
+        prev = self._prev_step
+        self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
+        # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
+        if prev is None or batch.after_idle_gap:
+            return
+        prev_iter, prev_ts, prev_is_prefill = prev
+        if prev_iter + 1 != batch.forward_iter or prev_is_prefill != is_prefill:
+            return
+        step_us = int((batch.launch_ts - prev_ts) * 1e6)
+        if not 0 < step_us < STEP_MAX_US:
+            return
         if is_prefill:
-            # Busy span = run_batch entry -> result processed.
-            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
-            self.total_prefill_busy_us += span_us
+            self.total_prefill_busy_us += step_us
             self.total_prefill_uncached_tokens += batch.extend_num_tokens
         else:
             batch_size = len(batch.reqs)
-            if self._prev_decode_launch_ts is not None:
-                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
-                if 0 < step_us < DECODE_STEP_MAX_US:
-                    _accumulate_decode_moment(
-                        self.decode_moment_totals,
-                        batch_size,
-                        step_us,
-                        batch_size + result.num_correct_drafts,
-                    )
-            self._prev_decode_launch_ts = batch.launch_ts
+            _accumulate_decode_moment(
+                self.decode_moment_totals,
+                batch_size,
+                step_us,
+                batch_size + result.num_correct_drafts,
+            )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -3907,9 +3971,6 @@ class Scheduler(
 
         # reset token ratio
         self.new_token_ratio_tracker.reset()
-
-        # reset device timer window so idle time isn't counted
-        self.metrics_reporter.reset_device_timer_window()
 
         # Publish the idle state so /get_loads and DP balancing do not see stale load.
         self.publish_load_snapshot(force=True)
@@ -4120,14 +4181,19 @@ class Scheduler(
         # readback reflects values changed via /set_internal_state, not startup.
         ret = get_context().resolved_server_args_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
-        ret["memory_usage"] = {
-            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
-            "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
-        }
+        draft_graph_memory_usage = (
+            None if self.draft_worker is None else self.draft_worker.graph_memory_usage
+        )
+        ret["memory_usage"] = build_memory_usage(
+            weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
+            kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
+            startup_available_gb=self.startup_available_gpu_memory_gb,
+            token_capacity=self.max_total_num_tokens,
+            token_capacity_swa=self.swa_tokens_per_layer,
+            target_graph_memory_usage=self.tp_worker.graph_memory_usage,
+            draft_graph_memory_usage=draft_graph_memory_usage,
+        )
+        ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if get_exec().moe.elastic_ep_backend is not None:
