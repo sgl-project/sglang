@@ -577,6 +577,16 @@ def _get_chunked_embedding_full(
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
     embedding_per_req = embedding_cache.get(item_hashes)
 
+    if embedding_per_req is not None and not isinstance(
+        embedding_per_req, EVSEmbeddingResult
+    ):
+        expected_token_counts = sum(end - start + 1 for start, end in items_offset)
+        cached_embedding = embedding_per_req.embedding.reshape(
+            -1, embedding_per_req.embedding.shape[-1]
+        )
+        if cached_embedding.shape[0] != expected_token_counts:
+            embedding_per_req = None
+
     if embedding_per_req is None:
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
@@ -660,12 +670,19 @@ def _batch_encode_per_image_misses(
         for _idx, item, start, end in overlapping:
             if item.hash in hash_to_embedding:
                 continue
+
+            expected_token_count = end - start + 1
             cached = embedding_cache.get_single(item.hash)
             if cached is not None:
-                hash_to_embedding[item.hash] = cached.embedding
+                cached_embedding = cached.embedding.reshape(
+                    -1, cached.embedding.shape[-1]
+                )
+                if cached_embedding.shape[0] == expected_token_count:
+                    hash_to_embedding[item.hash] = cached.embedding
+                else:
+                    unique_misses[item.hash] = (item, expected_token_count)
             elif item.hash not in unique_misses:
-                token_count = end - start + 1
-                unique_misses[item.hash] = (item, token_count)
+                unique_misses[item.hash] = (item, expected_token_count)
 
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
@@ -733,10 +750,17 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
+        expected_token_count = end - start + 1
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
-            cached_embeddings[idx] = cached.embedding
-            _acknowledge_deferred_cuda_ipc_cache_hits([item])
+            cached_embedding = cached.embedding.reshape(
+                -1, cached.embedding.shape[-1]
+            )
+            if cached_embedding.shape[0] == expected_token_count:
+                cached_embeddings[idx] = cached.embedding
+                _acknowledge_deferred_cuda_ipc_cache_hits([item])
+            else:
+                miss_items.append((idx, item, start, end))
         else:
             miss_items.append((idx, item, start, end))
 
