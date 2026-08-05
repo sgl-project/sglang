@@ -129,6 +129,7 @@ def inplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_scale_ue8m0: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -162,6 +163,7 @@ def inplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_scale_ue8m0=use_scale_ue8m0,
     )
 
 
@@ -197,6 +199,7 @@ def outplace_fused_experts(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_scale_ue8m0: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -230,6 +233,7 @@ def outplace_fused_experts(
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
+        use_scale_ue8m0=use_scale_ue8m0,
     )
 
 
@@ -254,6 +258,7 @@ def fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
+    use_scale_ue8m0: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -292,6 +297,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_scale_ue8m0=use_scale_ue8m0,
         )
         return hidden_states
     else:
@@ -326,6 +332,7 @@ def fused_experts(
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
+            use_scale_ue8m0=use_scale_ue8m0,
         )
 
 
@@ -456,6 +463,7 @@ def _fused_moe_kernel_sequence(
     a1_scale: Optional[torch.Tensor],
     a2_scale: Optional[torch.Tensor],
     block_shape: Optional[List[int]],
+    use_scale_ue8m0: bool,
     activation: str,
     is_gated: bool,
     no_combine: bool,
@@ -567,6 +575,7 @@ def _fused_moe_kernel_sequence(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        scale_ue8m0=use_scale_ue8m0,
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
     )
@@ -777,6 +786,7 @@ def _fused_moe_kernel_sequence(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        scale_ue8m0=use_scale_ue8m0,
         a_use_tma=down_moe_use_tma,
         b_use_tma=down_moe_use_tma,
         filter_expert=filter_expert,
@@ -903,6 +913,7 @@ def fused_experts_impl(
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    use_scale_ue8m0: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -967,6 +978,7 @@ def fused_experts_impl(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        use_scale_ue8m0=use_scale_ue8m0,
         activation=activation,
         is_gated=is_gated,
         no_combine=no_combine,
