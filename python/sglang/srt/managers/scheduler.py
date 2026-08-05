@@ -2442,7 +2442,11 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = (
+                "DSpark speculative decoding does not support return_logprob yet."
+                if self.spec_algorithm.is_dspark() and req.return_logprob
+                else validate_dflash_request(req, self.enable_overlap)
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
