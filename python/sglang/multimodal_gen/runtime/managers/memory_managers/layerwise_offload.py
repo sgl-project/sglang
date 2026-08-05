@@ -463,6 +463,9 @@ class LayerwiseOffloadManager:
                 )
 
         self._gpu_layers.discard(layer_idx)
+        if self._synchronous_mps:
+            # release cached unified-memory allocations before streaming the next layer
+            torch.mps.empty_cache()
 
     @torch.compiler.disable
     def release_all(self) -> None:
