@@ -14,10 +14,12 @@ DenoisingStage instead of this stage.
 Supported progressive_mode values
   "dct"         : DCT-II embed, IDCT upsample, no scheduler rewind
   "dct_rewind"  : DCT upsample + gamma scaling + scheduler sigma rewind (paper §3)
+  "selflift"    : SelfLift clean-sample latent + pixel transition
 
 Extension hooks for model-specific subclasses
   _unpack_latent(latent, h_lat, w_lat)               → spatial [B, C, H, W]
   _repack_latent(x_spatial, h_lat, w_lat, batch)     → model-native latent
+  _transition_resolution(...)                        → next model-native latent
   _on_resolution_change(ctx, batch, srv, h_px, w_px) → update resolution-dep. state
 """
 
@@ -47,6 +49,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.selflift import (
+    apply_selflift_transition,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.upsample import (
     apply_upsample,
 )
@@ -58,7 +63,8 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 
 logger = init_logger(__name__)
 
-PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+SPECTRAL_PROGRESSIVE_MODES = frozenset({"dct", "dct_rewind"})
+PROGRESSIVE_MODES = SPECTRAL_PROGRESSIVE_MODES | {"selflift"}
 
 
 def is_progressive_resolution_mode(mode: str | None) -> bool:
@@ -260,6 +266,10 @@ class ProgressiveDenoisingStage(DenoisingStage):
         """
         return server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        """Modes implemented by this model-specific progressive stage."""
+        return SPECTRAL_PROGRESSIVE_MODES
+
     def _spectrum_latent_dims(
         self, batch: Req, server_args: ServerArgs, H_lat: int, W_lat: int
     ) -> tuple[int, int]:
@@ -299,6 +309,56 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> None:
         """Called after each stage transition. Update resolution-dependent state."""
         pass
+
+    def _transition_resolution(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        mode: str,
+        sigma_t: float,
+        seeds: Sequence[int],
+        current_h_lat: int,
+        current_w_lat: int,
+        target_h_lat: int,
+        target_w_lat: int,
+    ) -> tuple[torch.Tensor, float | None]:
+        """Grow one resolution level and return (native_latent, rewind_sigma)."""
+        if mode == "selflift":
+            return apply_selflift_transition(
+                stage=self,
+                ctx=ctx,
+                batch=batch,
+                server_args=server_args,
+                sigma_t=sigma_t,
+                seeds=seeds,
+                current_h_lat=current_h_lat,
+                current_w_lat=current_w_lat,
+                target_h_lat=target_h_lat,
+                target_w_lat=target_w_lat,
+            )
+        if mode not in SPECTRAL_PROGRESSIVE_MODES:
+            raise ValueError(
+                f"{self.__class__.__name__} does not implement progressive_mode={mode!r}"
+            )
+
+        x_spatial = self._unpack_latent(ctx.latents, current_h_lat, current_w_lat)
+        result = apply_upsample(x_spatial, sigma_t, seeds, mode)
+        if mode == "dct_rewind":
+            x_spatial_up, effective_sigma = result
+        else:
+            x_spatial_up = result
+            effective_sigma = None
+        return (
+            self._repack_latent(
+                x_spatial_up,
+                target_h_lat,
+                target_w_lat,
+                batch,
+                server_args,
+            ),
+            effective_sigma,
+        )
 
     def _refresh_cache_dit_context(
         self, n_remaining: int, scm_preset: str | None
@@ -443,7 +503,14 @@ class ProgressiveDenoisingStage(DenoisingStage):
             step = self._prepare_step_state(
                 ctx, batch, server_args, step_index, t_host, timesteps_cpu
             )
-            self._run_denoising_step(ctx, step, batch, server_args)
+            previous_sample = ctx.latents
+            noise_pred = self._run_denoising_step(ctx, step, batch, server_args)
+            if getattr(batch, "progressive_mode", None) == "selflift":
+                ctx.extra["progressive_last_prediction"] = (
+                    previous_sample,
+                    noise_pred,
+                    step.t_device,
+                )
 
     # ------------------------------------------------------------------
     # Progressive forward
@@ -453,10 +520,11 @@ class ProgressiveDenoisingStage(DenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         mode = getattr(batch, "progressive_mode", "fullres") or "fullres"
 
-        if mode not in PROGRESSIVE_MODES:
+        supported_modes = self._supported_progressive_modes()
+        if mode not in supported_modes:
             raise ValueError(
-                "ProgressiveDenoisingStage requires progressive_mode to be "
-                "'dct' or 'dct_rewind'. Route fullres requests to DenoisingStage."
+                f"{self.__class__.__name__} supports progressive_mode values "
+                f"{sorted(supported_modes)}, got {mode!r}."
             )
 
         if get_sp_world_size() > 1:
@@ -519,7 +587,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
         transition_steps = find_transition_steps(
             scheduler.sigmas, stage_sigmas, n_steps
         )
-        rewind = mode.endswith("_rewind")
+        rewind = mode.endswith("_rewind") or mode == "selflift"
 
         # For rewind mode we patch scheduler.sigmas/timesteps and ctx.timesteps
         # in-place at transition points.  The scheduler tensors may be inference
@@ -567,33 +635,36 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 # ── Resolution transition ──────────────────────────────────────
                 sigma_t = float(scheduler.sigmas[stage_end])
                 upsample_seed = [item + stage * 10_000 for item in seeds]
-
-                # Unpack → spatial, upsample, repack
-                x_spatial = self._unpack_latent(ctx.latents, cur_h_lat, cur_w_lat)
-
-                result = apply_upsample(x_spatial, sigma_t, upsample_seed, mode)
-
-                if rewind:
-                    x_spatial_up, t_eff = result
-                    # Patch scheduler sigma/timestep at transition point for rewind
-                    scheduler.sigmas[stage_end] = t_eff
-                    scheduler.timesteps[stage_end] = t_eff * 1000
-                    ctx.timesteps[stage_end] = t_eff * 1000
-                    timesteps_cpu[stage_end] = t_eff * 1000
-                    logger.info(
-                        "  rewind: sigma=%.4f → t_eff=%.4f at step %d",
-                        sigma_t,
-                        t_eff,
-                        stage_end,
-                    )
-                else:
-                    x_spatial_up = result
-
                 new_h_lat = cur_h_lat * 2
                 new_w_lat = cur_w_lat * 2
-                ctx.latents = self._repack_latent(
-                    x_spatial_up, new_h_lat, new_w_lat, batch, server_args
+                ctx.latents, effective_sigma = self._transition_resolution(
+                    ctx=ctx,
+                    batch=batch,
+                    server_args=server_args,
+                    mode=mode,
+                    sigma_t=sigma_t,
+                    seeds=upsample_seed,
+                    current_h_lat=cur_h_lat,
+                    current_w_lat=cur_w_lat,
+                    target_h_lat=new_h_lat,
+                    target_w_lat=new_w_lat,
                 )
+
+                if effective_sigma is not None:
+                    # Patch scheduler sigma/timestep at transition points whose
+                    # upsample operation changes the effective noise level.
+                    scheduler.sigmas[stage_end] = effective_sigma
+                    scheduler.timesteps[stage_end] = effective_sigma * 1000
+                    ctx.timesteps[stage_end] = effective_sigma * 1000
+                    timesteps_cpu[stage_end] = effective_sigma * 1000
+                    patch_label = "rewind" if mode == "dct_rewind" else "transition"
+                    logger.info(
+                        "  %s: sigma=%.4f → t_eff=%.4f at step %d",
+                        patch_label,
+                        sigma_t,
+                        effective_sigma,
+                        stage_end,
+                    )
 
                 # Update batch dimensions and model-specific state
                 new_h_pixel = new_h_lat * latent_scale
@@ -624,6 +695,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 cur_w_lat = new_w_lat
                 stage_start = stage_end
 
+        ctx.extra.pop("progressive_last_prediction", None)
         denoising_end = time.time()
         if not ctx.is_warmup:
             logger.info(

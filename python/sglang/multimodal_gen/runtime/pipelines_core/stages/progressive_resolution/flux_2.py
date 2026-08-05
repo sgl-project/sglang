@@ -19,7 +19,11 @@ from __future__ import annotations
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.configs.pipeline_configs.flux import _prepare_latent_ids
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    _patchify_latents,
+    _prepare_latent_ids,
+    _unpatchify_latents,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -27,6 +31,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.selflift import (
+    denormalize_vae_latent,
+    normalize_vae_latent,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -83,6 +91,9 @@ class Flux2ProgressiveDenoisingStage(ProgressiveDenoisingStage):
         # pixel resolution due to the extra patchification step.
         return server_args.pipeline_config.vae_config.arch_config.vae_scale_factor * 2
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        return super()._supported_progressive_modes() | {"selflift"}
+
     # ------------------------------------------------------------------
     # Pack / Unpack overrides
     # ------------------------------------------------------------------
@@ -101,6 +112,52 @@ class Flux2ProgressiveDenoisingStage(ProgressiveDenoisingStage):
         server_args: ServerArgs,
     ) -> torch.Tensor:
         return _flux2_pack(x_spatial)
+
+    # ------------------------------------------------------------------
+    # SelfLift VAE adapters
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_standard_selflift_vae(vae) -> None:
+        if getattr(vae, "bn", None) is None:
+            raise RuntimeError(
+                "FLUX.2 SelfLift requires the standard encoder-decoder VAE with "
+                "BatchNorm statistics; a decoder-only/distilled VAE is not supported."
+            )
+
+    def _selflift_vae_latent_size(self, h_lat: int, w_lat: int) -> tuple[int, int]:
+        return h_lat * 2, w_lat * 2
+
+    def _selflift_spatial_to_vae_latent(
+        self, x_spatial: torch.Tensor, batch: Req, server_args: ServerArgs, vae
+    ) -> torch.Tensor:
+        del batch
+        self._require_standard_selflift_vae(vae)
+        return _unpatchify_latents(
+            denormalize_vae_latent(x_spatial, server_args.pipeline_config, vae)
+        )
+
+    def _selflift_vae_latent_to_spatial(
+        self, x_vae: torch.Tensor, batch: Req, server_args: ServerArgs, vae
+    ) -> torch.Tensor:
+        del batch
+        self._require_standard_selflift_vae(vae)
+        x_spatial = _patchify_latents(x_vae)
+        return normalize_vae_latent(x_spatial, server_args.pipeline_config, vae)
+
+    @staticmethod
+    def _selflift_denormalize_vae_latent(
+        latents: torch.Tensor, pipeline_config, vae
+    ) -> torch.Tensor:
+        del pipeline_config, vae
+        return latents
+
+    @staticmethod
+    def _selflift_normalize_vae_latent(
+        latents: torch.Tensor, pipeline_config, vae
+    ) -> torch.Tensor:
+        del pipeline_config, vae
+        return latents
 
     # ------------------------------------------------------------------
     # Initial noise generation

@@ -60,6 +60,9 @@ class ZImageProgressiveDenoisingStage(ProgressiveDenoisingStage):
             spectrum_beta=ZIMAGE_SPECTRUM_BETA,
         )
 
+    def _supported_progressive_modes(self) -> frozenset[str]:
+        return super()._supported_progressive_modes() | {"selflift"}
+
     # ------------------------------------------------------------------
     # Initial noise
     # ------------------------------------------------------------------
