@@ -1,7 +1,12 @@
-"""``NativeMmHost`` (managers/rust_server.py) parity for the Qwen family: the
-spec built by ``resolve_native_spec()`` drives the real native Rust driver and
-``build_native_mm()`` wraps its buffers; the result must be indistinguishable
-from the Python ``mm_processor`` output at the scheduler-input boundary."""
+"""The mm-item hash contract of the native Qwen path.
+
+The two paths hash different things, deliberately. Native hashes are `content_hash`
+over the raw encoded source bytes, computed on an MM worker; the Python path hashes
+the decoded feature tensor. Both feed `set_pad_value`, so the native drain can skip
+`hash_feature` on the scheduler loop — the point of precomputing them.
+
+Field-by-field parity of everything else is `test_e2e_parity.py`.
+"""
 
 import asyncio
 import base64
@@ -10,8 +15,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-
-import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -23,116 +26,79 @@ from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _fixtures import make_processor, snapshot  # noqa: E402
-from _mm_rust_utils import (  # noqa: E402
-    PROCESSOR_CONFIGS,
-    image_bytes,
-    load_core,
-)
+from _fixtures import make_processor  # noqa: E402
+from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 CORE = load_core()
 DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)
 
 
+def raw_bytes(source):
+    """The encoded bytes behind any accepted source form."""
+    if isinstance(source, bytes):
+        return source
+    if source.startswith("data:"):
+        return base64.b64decode(source.split(",", 1)[1])
+    return Path(source.removeprefix("file://")).read_bytes()
+
+
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
-class TestQwenNativeMmHost(CustomTestCase):
+class TestQwenNativeMmHashes(CustomTestCase):
     def setUp(self):
-        self.config = PROCESSOR_CONFIGS["qwen2_5_vl"]
-        self.processor = make_processor(self.config)
+        from sglang.srt.managers.multimodal_processor import import_processors
+
+        import_processors("sglang.srt.multimodal.processors")
+        self.processor = make_processor(PROCESSOR_CONFIGS["qwen2_5_vl"])
 
     def tearDown(self):
         self.processor.io_executor.shutdown()
         self.processor.cpu_executor.shutdown()
 
-    def make_host(self):
-        """A host whose spec comes from ``resolve_native_spec()`` — the production
-        extraction path — rather than a hand-built dict."""
-        # Populate the processor mapping the gate resolves from, as __init__ does.
-        from sglang.srt.managers.multimodal_processor import import_processors
-
-        import_processors("sglang.srt.multimodal.processors")
+    def native_hashes(self, sources):
+        """Per-item hashes the Rust driver returns, via the production gate."""
         host = NativeMmHost.__new__(NativeMmHost)
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
-        return host, host.resolve_native_spec()
+        spec = host.resolve_native_spec()
+        self.assertIsNotNone(spec, "gate rejected the fixture processor")
+        input_ids = [t for _ in sources for t in (1, 2, 3, 4)]
+        return DRIVER(input_ids, sources, spec.rust_json())[3]
 
-    def compare(self, sources):
-        _host, spec = self.make_host()
-        self.assertIsNotNone(
-            spec, "resolve_native_spec() rejected the fixture processor"
-        )
-
-        input_ids = []
-        for _ in sources:
-            input_ids.extend((1, 2, 3, 4))
-        raw = DRIVER(input_ids, sources, spec.rust_json())
-        ids, features, grids, hashes, offsets, mrope, delta = raw
-
-        rust_output = NativeMmHost.build_native_mm(
-            spec,
-            # Inline entry shape (single-rank; `shm_names=None`). The shm
-            # shape's wrapping contract is pinned by test_build_native_mm.
-            SimpleNamespace(
-                features=features,
-                shm_names=None,
-                grids=grids,
-                hashes=hashes,
-                offsets=offsets,
-                mrope=mrope,
-                mrope_delta=delta,
-            ),
-        )
-        request = SimpleNamespace(video_data=None, audio_data=None, rid="parity")
-        python_output = asyncio.run(
-            self.processor.process_mm_data_async(
-                image_data=sources,
-                input_text=input_ids,
-                request_obj=request,
-            )
-        )
-
-        rust = snapshot(ids, rust_output)
-        python = snapshot(python_output.input_ids, python_output)
-        for key in ("input_ids", "grids", "offsets", "mrope", "delta", "tokens"):
-            with self.subTest(field=key):
-                if isinstance(rust[key], np.ndarray):
-                    np.testing.assert_array_equal(rust[key], python[key])
-                else:
-                    self.assertEqual(rust[key], python[key])
-        diff = np.abs(rust["features"] - python["features"])
-        self.assertLess(diff.max(), 0.06)
-        self.assertLess(diff.mean(), 1e-3)
-
-        # Native item hashes are of the raw encoded source bytes, not the feature.
-        def raw_bytes(source):
-            if isinstance(source, bytes):
-                return source
-            if source.startswith("data:"):
-                return base64.b64decode(source.split(",", 1)[1])
-            return Path(source.removeprefix("file://")).read_bytes()
-
-        for source, expected_hash in zip(sources, hashes):
-            self.assertEqual(expected_hash, CORE.common.content_hash(raw_bytes(source)))
-        for python_item in python_output.mm_items:
-            expected_python_hash = hash_feature(python_item.feature)
-            python_item.set_pad_value()
-            self.assertEqual(python_item.hash, expected_python_hash)
-
-    def test_bytes_data_url_file_and_multiple_images(self):
+    def test_native_hashes_the_raw_source_bytes(self):
+        """Same image in any source form hashes identically, because the hash is
+        over the bytes and not over anything the transport changes."""
         first, second = image_bytes(96, 80), image_bytes(112, 88, 1)
         data_url = "data:image/png;base64," + base64.b64encode(first).decode()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "image.png"
             path.write_bytes(first)
-            cases = ([first], [data_url], [path.as_uri()], [first, second])
-            for sources in cases:
-                with self.subTest(
-                    source_count=len(sources), type=type(sources[0]).__name__
-                ):
-                    self.compare(sources)
+            for sources in ([first], [data_url], [path.as_uri()], [first, second]):
+                with self.subTest(n=len(sources), form=type(sources[0]).__name__):
+                    hashes = self.native_hashes(sources)
+                    self.assertEqual(
+                        list(hashes),
+                        [CORE.common.content_hash(raw_bytes(s)) for s in sources],
+                    )
+
+    def test_python_hashes_the_feature(self):
+        """The contrast: `set_pad_value` on the Python path derives its hash from
+        the feature tensor, which is why the native path must precompute one."""
+        output = asyncio.run(
+            self.processor.process_mm_data_async(
+                image_data=[image_bytes(96, 80)],
+                input_text=[1, 2, 3, 4],
+                request_obj=SimpleNamespace(
+                    video_data=None, audio_data=None, rid="hash"
+                ),
+            )
+        )
+        for item in output.mm_items:
+            expected = hash_feature(item.feature)
+            item.set_pad_value()
+            self.assertEqual(item.hash, expected)
 
 
 if __name__ == "__main__":

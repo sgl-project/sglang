@@ -34,6 +34,7 @@ class TestBuildNativeMm(CustomTestCase):
             max_pixels=1 << 30,
             image_mean=(0.0, 0.0, 0.0),
             image_std=(1.0, 1.0, 1.0),
+            resample="aten_u8",
             vision_start_token_id=11,
             vision_end_token_id=12,
             video_token_id=13,

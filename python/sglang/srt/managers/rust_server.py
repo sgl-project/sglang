@@ -58,6 +58,9 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     max_pixels: int
     image_mean: Tuple[float, ...]
     image_std: Tuple[float, ...]
+    # Which HF processor the Rust resize must reproduce bit-exactly, from
+    # `NativeMmHost.NATIVE_IMAGE_PROCESSORS`.
+    resample: str
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
@@ -97,6 +100,14 @@ class NativeMmHost:
     NATIVE_QWEN_MODEL_TYPES = frozenset(
         ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
     )
+
+    # HF image processors the native resize reproduces bit-exactly, each mapped
+    # to the `resample` the Rust pipeline must use (see `NativeMmSpec.resample`).
+    NATIVE_IMAGE_PROCESSORS = {
+        "Qwen2VLImageProcessor": "aten_u8",
+        "Qwen2VLImageProcessorFast": "aten_u8",
+        "Qwen2VLImageProcessorPil": "pil",
+    }
 
     def __init__(
         self,
@@ -145,10 +156,16 @@ class NativeMmHost:
         ):
             return None
         ip = getattr(self._processor, "image_processor", None)
-        if type(ip).__name__ not in (
-            "Qwen2VLImageProcessor",
-            "Qwen2VLImageProcessorFast",
-        ):
+        resample = self.NATIVE_IMAGE_PROCESSORS.get(type(ip).__name__)
+        if resample is None:
+            return None
+        # The native pipeline always resizes, rescales by 1/255 and normalizes;
+        # Rust's fused normalize constants assume that factor. Anything else
+        # would silently produce different features.
+        stages = ("do_resize", "do_rescale", "do_normalize")
+        if not all(getattr(ip, stage, True) for stage in stages):
+            return None
+        if getattr(ip, "rescale_factor", None) != 1 / 255:
             return None
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
@@ -178,6 +195,7 @@ class NativeMmHost:
                 max_pixels=int(max_pixels),
                 image_mean=tuple(float(x) for x in ip.image_mean),
                 image_std=tuple(float(x) for x in ip.image_std),
+                resample=resample,
                 vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
                 vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
                 video_token_id=getattr(hf_config, "video_token_id", None),

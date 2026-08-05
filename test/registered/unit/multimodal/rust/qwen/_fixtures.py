@@ -25,7 +25,10 @@ from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
 register_cpu_ci(est_time=0, suite="base-a-test-cpu", disabled="Qwen test fixtures")
 
 
-def make_processor(config):
+def make_processor(config, image_processor_cls=None):
+    """A ``QwenVLImageProcessor`` over a tiny hand-built tokenizer.
+    ``image_processor_cls`` picks the HF backend; they resample differently."""
+    image_processor_cls = image_processor_cls or HfQwenImageProcessor
     vocab = [
         "<unk>",
         "<|vision_start|>",
@@ -48,7 +51,7 @@ def make_processor(config):
         additional_special_tokens=vocab[1:4] + [vocab[5]],
     )
     processor = Qwen2VLProcessor(
-        image_processor=HfQwenImageProcessor(**config),
+        image_processor=image_processor_cls(**config),
         video_processor=Qwen2VLVideoProcessor(),
         tokenizer=tokenizer,
     )
