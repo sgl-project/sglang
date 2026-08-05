@@ -158,8 +158,8 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        # One engine for the whole class: score() is stateless and the radix
-        # cache is off, so the per-method boot this used to do bought nothing.
+        # Two engines for the whole class: score() is stateless and the radix
+        # cache is off, so booting either config per test bought nothing.
         cls.engine = Engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
@@ -168,12 +168,18 @@ class TestMultiItemScoringClassification(CustomTestCase):
             attention_backend="flashinfer",
             mem_fraction_static=0.15,
         )
+        cls.non_mis_engine = Engine(
+            model_path=TEST_CLASSIFICATION_BASE_MODEL,
+            disable_radix_cache=True,
+            mem_fraction_static=0.15,
+        )
 
     @classmethod
     def tearDownClass(cls):
-        if cls.engine is not None:
-            cls.engine.shutdown()
-            torch.cuda.empty_cache()
+        for engine in (cls.engine, cls.non_mis_engine):
+            if engine is not None:
+                engine.shutdown()
+        torch.cuda.empty_cache()
 
     def test_classification_mis_basic(self):
         """Classification MIS: correct shapes, valid softmax probabilities."""
@@ -210,23 +216,14 @@ class TestMultiItemScoringClassification(CustomTestCase):
 
     def test_classification_non_mis_fallback(self):
         """Classification model works correctly without --enable-mis."""
-        non_mis_engine = Engine(
-            model_path=TEST_CLASSIFICATION_BASE_MODEL,
-            disable_radix_cache=True,
-            mem_fraction_static=0.15,
-        )
-        try:
-            scores = non_mis_engine.score(
-                query="Test:", items=["A", "B"], apply_softmax=True
-            ).scores
+        scores = self.non_mis_engine.score(
+            query="Test:", items=["A", "B"], apply_softmax=True
+        ).scores
 
-            self.assertEqual(len(scores), 2)
-            for score_list in scores:
-                self.assertEqual(len(score_list), self.NUM_LABELS)
-                self.assertAlmostEqual(sum(score_list), 1.0, places=5)
-        finally:
-            non_mis_engine.shutdown()
-            torch.cuda.empty_cache()
+        self.assertEqual(len(scores), 2)
+        for score_list in scores:
+            self.assertEqual(len(score_list), self.NUM_LABELS)
+            self.assertAlmostEqual(sum(score_list), 1.0, places=5)
 
     def _compare_scores(self, query, items, apply_softmax=True, test_name=""):
         """Compare MIS batched vs MIS single-item scoring results."""
@@ -392,6 +389,33 @@ class TestMultiItemScoringClassification(CustomTestCase):
                         f"concurrent={c} vs sequential={s}",
                     )
 
+    def test_mis_single_vs_non_mis(self):
+        """MIS single-item must approximate non-MIS single-item.
+
+        MIS inserts delimiter tokens into the attention context, which
+        perturbs hidden states; after softmax the scores should still land
+        within places=1 (+-0.05).
+        """
+        query = "Rate this option:"
+        items = [" Option A", " Option B", " Option C"]
+        non_mis_scores = self.non_mis_engine.score(
+            query=query, items=items, apply_softmax=True
+        ).scores
+        mis_scores = self.engine.score(
+            query=query, items=items, apply_softmax=True
+        ).scores
+
+        self.assertEqual(len(mis_scores), len(non_mis_scores))
+        for i, (ms, ns) in enumerate(zip(mis_scores, non_mis_scores)):
+            self.assertEqual(len(ms), len(ns))
+            for j, (m, n) in enumerate(zip(ms, ns)):
+                self.assertAlmostEqual(
+                    m,
+                    n,
+                    places=1,
+                    msg=f"item {i} label {j}: MIS={m} vs non-MIS={n}",
+                )
+
 
 class TestMultiItemScoringParity(CustomTestCase):
     """Test that MIS produces the same results as single-item scoring."""
@@ -488,65 +512,6 @@ class TestMultiItemScoringParity(CustomTestCase):
         labels = [" 1", " 2", " 3", " 4", " 5"]
         label_ids = [tokenizer.encode(lb, add_special_tokens=False)[0] for lb in labels]
         self._compare_scores(query, items, label_ids, test_name="many_items")
-
-
-class TestMultiItemScoringClassificationMISvsNonMIS(CustomTestCase):
-    """Test that MIS single-item approximates non-MIS single-item.
-
-    The MIS path inserts delimiter tokens into the attention context,
-    which slightly perturbs hidden states.  After softmax the scores
-    should still be close.  Uses places=1 (±0.05) tolerance.
-
-    Runs as a separate class so each engine is created and destroyed
-    independently to avoid GPU OOM.
-    """
-
-    def test_mis_single_vs_non_mis(self):
-        non_mis_engine = Engine(
-            model_path=TEST_CLASSIFICATION_BASE_MODEL,
-            disable_radix_cache=True,
-            mem_fraction_static=0.15,
-        )
-        try:
-            query = "Rate this option:"
-            items = [" Option A", " Option B", " Option C"]
-            non_mis_scores = non_mis_engine.score(
-                query=query,
-                items=items,
-                apply_softmax=True,
-            ).scores
-        finally:
-            non_mis_engine.shutdown()
-            torch.cuda.empty_cache()
-
-        mis_engine = Engine(
-            model_path=TEST_CLASSIFICATION_BASE_MODEL,
-            disable_radix_cache=True,
-            chunked_prefill_size=-1,
-            enable_mis=True,
-            attention_backend="flashinfer",
-            mem_fraction_static=0.15,
-        )
-        try:
-            mis_scores = mis_engine.score(
-                query=query,
-                items=items,
-                apply_softmax=True,
-            ).scores
-        finally:
-            mis_engine.shutdown()
-            torch.cuda.empty_cache()
-
-        self.assertEqual(len(mis_scores), len(non_mis_scores))
-        for i, (ms, ns) in enumerate(zip(mis_scores, non_mis_scores)):
-            self.assertEqual(len(ms), len(ns))
-            for j, (m, n) in enumerate(zip(ms, ns)):
-                self.assertAlmostEqual(
-                    m,
-                    n,
-                    places=1,
-                    msg=f"item {i} label {j}: MIS={m} vs non-MIS={n}",
-                )
 
 
 if __name__ == "__main__":
