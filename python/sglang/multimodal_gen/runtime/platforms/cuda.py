@@ -537,6 +537,28 @@ class CudaPlatformBase(Platform):
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
 
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Install the quality-gated FLUX.2 VAE decoder fast paths.
+
+        Requests with quality == "high" run the fast paths; the "lossless"
+        default runs the original module path bit-for-bit. See
+        flux2_vae_cuda_opt for details.
+        """
+        try:
+            from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
+                maybe_optimize_flux2_vae,
+            )
+
+            vae = maybe_optimize_flux2_vae(vae)
+        except Exception:
+            logger.warning(
+                "Failed to apply CUDA FLUX.2 VAE optimizations; "
+                "using the unmodified VAE.",
+                exc_info=True,
+            )
+        return vae
+
 
 # NVML utils
 # Note that NVML is not affected by `CUDA_VISIBLE_DEVICES`,
