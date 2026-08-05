@@ -90,6 +90,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
+                    "enable_symm_mem",
+                    "speculative_attention_mode",
                 }
             ),
         )
@@ -1737,6 +1739,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 decode_attention_backend=None,
                 prefill_attention_backend=None,
+                speculative_draft_attention_backend=None,
                 page_size=1,
             )
             defaults.update(kw)
@@ -2009,7 +2012,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="deepep", ep_size=1, tp_size=8)
+                )
             ),
             {"ep_size": 8},
         )

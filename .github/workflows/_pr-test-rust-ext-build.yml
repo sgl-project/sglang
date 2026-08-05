@@ -1,0 +1,242 @@
+name: PR Test - Build Rust Extensions
+
+# Builds the rust/ workspace's PyO3 extension modules once so the CUDA test
+# stages install with SGLANG_BUILD_RUST_EXTS=none instead of each rebuilding them.
+#
+# Why: uv holds the editable sdist lock in the shared ~/.cache/uv for the whole
+# build, cargo included, so CUDA jobs on one host serialize on it - and once the
+# Rust build passed a few minutes, the queue's tail hit uv's lock timeout.
+#
+# The win is compiling once per run instead of in all ~25 install steps; the two
+# layers below only decide who pays for it.
+# - The cache, keyed by a source hash, carries a build across runs - no version to
+#   bump, unlike sgl-kernel, which publishes one because it ships to users.
+# - The artifact hands it to the stages, which the cache cannot: it is best-effort,
+#   evictable, and this repo is at its 10 GB limit. Artifacts are durable per run.
+#
+# Two jobs, because only compiling needs the build node: exactly one runner carries
+# that label and it also serves the sgl-kernel and docker builds, so queueing there
+# on a cache hit would put its wait in front of every stage. Republishing bytes
+# needs no particular host - the glibc a module requires is recorded in the module,
+# not decided by whoever uploads it.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label for the compile job. Must be self-hosted: its glibc has to satisfy max_glibc, and the cargo build cache needs a persistent ~/.cache.'
+        type: string
+        required: true
+      restore_runs_on:
+        description: 'Runner label for the cache-hit path. Wants free capacity and nothing else, since it neither compiles nor imports the modules.'
+        type: string
+        default: ubuntu-latest
+      artifact_name:
+        description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
+        type: string
+        default: rust-ext-x86_64
+      cache_key_prefix:
+        description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
+        type: string
+        default: rust-ext-x86_64-cp310-cp312
+      max_glibc:
+        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
+        type: string
+        default: '2.35'
+      git_ref:
+        type: string
+        default: ''
+      skip_pr_test_health_check:
+        description: 'Forwarded from the caller for the check-maintenance action.'
+        type: boolean
+        default: false
+    outputs:
+      artifact_name:
+        description: 'Artifact holding the built modules. Empty when neither job published one, whether skipped or failed; consumers that still run compile them during install.'
+        value: ${{ jobs.restore.outputs.artifact_name || jobs.compile.outputs.artifact_name }}
+
+# Reusable workflows do not inherit the caller's env; mirror what
+# check-maintenance reads.
+env:
+  SGLANG_IS_IN_CI: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  restore:
+    runs-on: ${{ inputs.restore_runs_on }}
+    timeout-minutes: 15
+    name: Restore Rust Ext
+    outputs:
+      hit: ${{ steps.cache.outputs.cache-hit }}
+      # From the last step, so a failed job publishes no name for always() consumers.
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+          # Just what the cache key hashes, plus the action and script this job
+          # runs: the workspace is cold here and the rest of the tree is mostly
+          # docs. Both jobs must hash the same rust/** set, which this preserves.
+          # Cone mode off is what allows naming a single file.
+          sparse-checkout: |
+            rust
+            python/setup.py
+            .github
+            scripts/ci/utils
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/check-maintenance
+
+      # A no-op on the hosted default, which ships zstd; here for whatever
+      # restore_runs_on is pointed at, since a reader without it sees no entry.
+      - name: Ensure zstd so the saved entry is readable
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      # setup.py counts because it selects which crates get built. pyproject.toml
+      # is left out - it churns on bumps that cannot affect these modules.
+      - name: Restore built modules
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: python/sglang/srt/*/_core*.so
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+
+      # On a miss: different hash = rust/setup.py moved; no entries = evicted.
+      - name: Report cache lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          KEY_PREFIX: ${{ inputs.cache_key_prefix }}
+        run: |
+          if [ -n "${MATCHED_KEY}" ]; then
+              echo "hit: ${MATCHED_KEY}"
+              ls -l python/sglang/srt/*/_core*.so
+          else
+              echo "miss: ${PRIMARY_KEY}"
+              echo "entries under ${KEY_PREFIX}- (created / ref / size / key):"
+              gh cache list --repo "${GITHUB_REPOSITORY}" --key "${KEY_PREFIX}-" \
+                  --limit 15 --json createdAt,ref,sizeInBytes,key \
+                  --jq '.[] | [.createdAt, .ref, ((.sizeInBytes / 1048576 | floor | tostring) + " MiB"), .key] | @tsv' \
+                  || echo "(gh cache list unavailable: token lacks actions:read)"
+          fi
+
+      # No MAX_GLIBC: these are the bytes the compile job already checked before
+      # saving them under this key. The module count is still worth re-checking,
+      # so a truncated entry fails here rather than as a test import error.
+      - name: Stage modules for upload
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+
+      - name: Upload extension modules
+        if: steps.cache.outputs.cache-hit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          # Archive holds <pkg>/_core*.so, so it unpacks into python/sglang/srt/.
+          path: rust-ext-staging/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"
+
+  compile:
+    needs: restore
+    if: needs.restore.outputs.hit != 'true'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 60
+    name: Build Rust Ext
+    outputs:
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      # No crate sets abi3, so build one module set per interpreter the pools
+      # run (h100 ships 3.10, h20 ships 3.12); EXT_SUFFIX keeps them apart.
+      - name: Set up Python 3.10
+        id: py310
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Python 3.12
+        id: py312
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protoc and Rust toolchain
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Build extension modules
+        run: |
+          set -euxo pipefail
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+          # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
+          # the interpreter, so a shared dir rebuilds on every ABI switch.
+          cargo_target_root="${HOME}/.cache/sglang-cargo-target"
+          mkdir -p "${cargo_target_root}"
+          used="$(df --output=pcent "${cargo_target_root}" 2>/dev/null | tr -dc '0-9')"
+          if [ "${used:-0}" -ge 85 ]; then
+              echo "cargo target dir filesystem at ${used}%; dropping ${cargo_target_root}"
+              rm -rf "${cargo_target_root}"
+              mkdir -p "${cargo_target_root}"
+          fi
+          python3 -m pip install --upgrade pip
+          command -v uv >/dev/null 2>&1 || pip install uv
+          # build_rust needs only the build backend, not sglang's ~294 runtime deps.
+          # Per-job path: these runners are persistent and shared, so a fixed one
+          # both inherits the previous job's venv and races a concurrent build.
+          venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
+          # would fail the step, and nothing here is worth keeping for a postmortem.
+          trap 'rm -rf "${venv_root}" || true' EXIT
+          for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
+              minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+              export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
+              venv="${venv_root}/py${minor}"
+              uv venv "${venv}" --python "${python_bin}" --seed
+              # shellcheck disable=SC1091
+              source "${venv}/bin/activate"
+              uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
+              (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+              deactivate
+          done
+
+      - name: Verify modules and stage for upload
+        env:
+          MAX_GLIBC: ${{ inputs.max_glibc }}
+        run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+
+      # Without it the entry saved below lands under a version no reader with zstd
+      # can find. This runner's image ships without it.
+      - name: Ensure zstd so the restore job can read what this job saves
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      # After the verify step, so a rejected build cannot poison this key for every
+      # later run.
+      - name: Save built modules
+        uses: actions/cache/save@v4
+        with:
+          path: python/sglang/srt/*/_core*.so
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+
+      - name: Upload extension modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: rust-ext-staging/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"
