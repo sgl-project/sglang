@@ -46,11 +46,18 @@ def find_stale_artifacts(cache_dir: str) -> List[Path]:
     if not cache_path.exists():
         return []
 
-    # Patterns for stale files to clean up
+    # Patterns for stale files to clean up.
+    #
+    # Deliberately NOT "**/*.lock": download locks live inside the shared cache
+    # ({HF_HUB_CACHE}/.sglang_locks/ and huggingface_hub's .locks/) precisely so
+    # NFS-co-mounted containers coordinate, and may be held for 30+ minutes
+    # while another container downloads a large model. Unlinking a held lock
+    # file hands the next acquirer a fresh inode and both proceed - the exact
+    # cross-container .incomplete race the locks exist to prevent. A leftover
+    # lock file from a dead process is inert: flock releases with its holder.
     patterns = [
         "**/*.incomplete",  # Incomplete download markers
         "**/*.tmp",  # Temporary files
-        "**/*.lock",  # Lock files from interrupted downloads
     ]
 
     stale_files = []
