@@ -2029,8 +2029,8 @@ class DSAIndexerPoolHost(HostKVCache):
                 )
             else:
                 raise ValueError(
-                    "Layer-sharded direct DSA indexer backup only supports "
-                    f"layer_first layout, got {self.layout}"
+                    "Layer-sharded direct DSA indexer per-layer backup only "
+                    f"supports layer_first layout, got {self.layout}"
                 )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
@@ -2039,7 +2039,25 @@ class DSAIndexerPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
+            owned_layer_ids = self._owned_device_layer_ids(device_pool)
+            if not owned_layer_ids:
+                return
+            if io_backend == "direct" and self.layout == "page_first_direct":
+                host_page_indices, device_page_indices = self._get_indexer_page_indices(
+                    host_indices, device_indices
+                )
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[
+                        device_pool.index_k_with_scale_buffer[i]
+                        for i in owned_layer_ids
+                    ],
+                    dst_ptrs=[self.index_k_with_scale_buffer],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+                return
+            for layer_id in owned_layer_ids:
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
