@@ -34,7 +34,6 @@ export const DeepSeekOCR2Deployment = () => {
 
   const generateCommand = (values) => {
     const { hardware, strategy } = values;
-    const isArcB = hardware === 'Arc B';
 
     const strategyArray = Array.isArray(strategy) ? strategy : [];
 
@@ -44,7 +43,7 @@ export const DeepSeekOCR2Deployment = () => {
     cmd += `  --model-path ${modelPath}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule \\\n  --trust-remote-code`;
-    } else if (isArcB) {
+    } else if (hardware === 'Arc B') {
       cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += ` \\\n  --device xpu`;
     }
