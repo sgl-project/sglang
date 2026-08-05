@@ -472,6 +472,29 @@ class TopK(MultiPlatformOp):
         assert TopKOutputChecker.format_is_standard(topk_output)
         return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
+    def _get_output_format(self) -> TopKOutputFormat:
+        if self.topk_config.output_format is not None:
+            return self.topk_config.output_format
+        if get_moe_runner_backend().is_triton_kernels():
+            return TopKOutputFormat.TRITON_KERNEL
+        # ===== TO BE REFACTORED ====
+        if get_moe_runner_backend().is_experimental_sgl_trtllm():
+            try:
+                use_standard_for_lora = bool(get_lora().enable_lora)
+            except ValueError:
+                use_standard_for_lora = False
+            return (
+                TopKOutputFormat.STANDARD
+                if use_standard_for_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        # ===== END TO BE REFACTORED ====
+        if get_moe_runner_backend().is_flashinfer_trtllm() or (
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
+        ):
+            return TopKOutputFormat.BYPASSED
+        return TopKOutputFormat.STANDARD
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -481,6 +504,17 @@ class TopK(MultiPlatformOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
+        output_format = self._get_output_format()
+        # Quantized runners consume the bypass carrier directly; the native
+        # unquantized fallback materializes it before using routing tensors.
+        if output_format == TopKOutputFormat.BYPASSED:
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
         topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
@@ -499,29 +533,7 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        if self.topk_config.output_format is not None:
-            output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
-            output_format = TopKOutputFormat.TRITON_KERNEL
-        # ===== TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_experimental_sgl_trtllm():
-            try:
-
-                use_standard_for_lora = bool(get_lora().enable_lora)
-            except ValueError:
-                use_standard_for_lora = False
-            output_format = (
-                TopKOutputFormat.STANDARD
-                if use_standard_for_lora
-                else TopKOutputFormat.BYPASSED
-            )
-        # ===== END TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
-        ):
-            output_format = TopKOutputFormat.BYPASSED
-        else:
-            output_format = TopKOutputFormat.STANDARD
+        output_format = self._get_output_format()
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False

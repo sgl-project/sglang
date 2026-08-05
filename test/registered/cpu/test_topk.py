@@ -1,14 +1,19 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -172,6 +177,65 @@ class TestBiasedTopK(CustomTestCase):
 
 
 class TestTopK(CustomTestCase):
+    def test_compile_mode_bypassed_topk_is_consumed_by_native_moe(self):
+        """A bypass-routing backend must interoperate with native compiled MoE."""
+
+        class CompileMoe(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.topk = TopK(top_k=2)
+                self.method = UnquantizedFusedMoEMethod()
+                self.layer_id = 3
+                self.moe_runner_config = MoeRunnerConfig(activation="silu")
+                self.w13_weight = torch.nn.Parameter(
+                    torch.tensor(
+                        [
+                            [[1.0, 0.0], [0.0, 1.0]],
+                            [[0.0, 1.0], [1.0, 0.0]],
+                        ]
+                    ),
+                    requires_grad=False,
+                )
+                self.w2_weight = torch.nn.Parameter(
+                    torch.tensor(
+                        [
+                            [[1.0], [0.0]],
+                            [[0.0], [1.0]],
+                        ]
+                    ),
+                    requires_grad=False,
+                )
+                self.topk.enter_torch_compile(num_tokens=1)
+                self.method.enter_torch_compile(num_tokens=1)
+
+            def forward(self, hidden_states, router_logits):
+                topk_output = self.topk(hidden_states, router_logits)
+                dispatch_output = StandardDispatchOutput(
+                    hidden_states, None, topk_output
+                )
+                return self.method.apply(self, dispatch_output).hidden_states
+
+        hidden_states = torch.tensor([[1.0, 2.0]])
+        router_logits = torch.tensor([[0.25, 0.75]])
+        torch._dynamo.reset()
+        model = CompileMoe()
+        self.addCleanup(model.topk.leave_torch_compile)
+        self.addCleanup(model.method.leave_torch_compile)
+        self.addCleanup(torch._dynamo.reset)
+
+        with patch(
+            "sglang.srt.layers.moe.topk.get_moe_runner_backend",
+            new=lambda: MoeRunnerBackend.FLASHINFER_TRTLLM,
+        ):
+            topk_output = model.topk(hidden_states, router_logits)
+            expected = model(hidden_states, router_logits)
+            compiled = torch.compile(model, backend="eager", fullgraph=True)
+            actual = compiled(hidden_states, router_logits)
+
+        self.assertIsInstance(topk_output, BypassedTopKOutput)
+        self.assertTrue(topk_output.topk_config.torch_native)
+        torch.testing.assert_close(actual, expected)
+
     def _run_single_test(self, M, E, topk, renormalize, dtype):
         torch.manual_seed(1998)
 

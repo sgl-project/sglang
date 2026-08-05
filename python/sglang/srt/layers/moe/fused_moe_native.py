@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     StandardCombineInput,
     StandardDispatchOutput,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 
 
 def fused_moe_forward_native(
@@ -26,6 +26,10 @@ def fused_moe_forward_native(
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     moe_runner_config = layer.moe_runner_config
+
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        topk_output = topk_output.to_standard(layer_id=layer.layer_id)
+    assert TopKOutputChecker.format_is_standard(topk_output)
 
     if moe_runner_config.apply_router_weight_on_input:
         raise NotImplementedError()
