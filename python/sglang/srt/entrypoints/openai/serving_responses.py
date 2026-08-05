@@ -53,6 +53,9 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai.utils import (
+    to_responses_style_logprobs,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -372,6 +375,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                         require_reasoning=require_reasoning,
+                        return_logprob=bool(
+                            (request.top_logprobs and request.top_logprobs > 0)
+                            or (
+                                request.include is not None
+                                and "message.output_text.logprobs"
+                                in request.include
+                            )
+                        ),
+                        top_logprobs_num=request.top_logprobs or 0,
+                        return_text_in_logprobs=True,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -561,16 +574,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._make_response_output_items(
-                request,
-                final_res["text"],
-                tokenizer,
-                require_reasoning=require_reasoning,
-            )
-
             # Calculate usage from actual output
             num_reasoning_tokens = 0
             meta_info = None
+            output_token_logprobs = None
+            output_top_logprobs = None
             if isinstance(final_res, dict) and isinstance(
                 final_res.get("meta_info"), dict
             ):
@@ -583,6 +591,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+                output_token_logprobs = meta_info.get("output_token_logprobs")
+                output_top_logprobs = meta_info.get("output_top_logprobs")
             elif isinstance(final_res, dict) and (
                 final_res.get("prompt_token_ids") is not None
                 or final_res.get("output_ids") is not None
@@ -611,6 +621,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_generated_tokens = 0
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
+
+            output = self._make_response_output_items(
+                request,
+                final_res["text"],
+                tokenizer,
+                require_reasoning=require_reasoning,
+                output_token_logprobs=output_token_logprobs,
+                output_top_logprobs=output_top_logprobs,
+            )
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
@@ -687,6 +706,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         *,
         require_reasoning: bool,
+        output_token_logprobs: Optional[list] = None,
+        output_top_logprobs: Optional[list] = None,
     ):
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
@@ -790,11 +811,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logger.error("Required tool JSON parse error: %s", e)
 
         if content:
+            logprobs = None
+            wants_logprobs = (
+                request.top_logprobs is not None and request.top_logprobs > 0
+            ) or (
+                request.include is not None
+                and "message.output_text.logprobs" in request.include
+            )
+            if wants_logprobs:
+                logprobs = to_responses_style_logprobs(
+                    output_token_logprobs=output_token_logprobs,
+                    output_top_logprobs=output_top_logprobs,
+                )
             output_text = ResponseOutputText(
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=logprobs,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",

@@ -640,6 +640,89 @@ class OutputItemsTestCase(unittest.TestCase):
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
 
+class LogprobsTestCase(unittest.TestCase):
+    def test_logprobs_populated_when_top_logprobs_set(self):
+        """Non-streaming: top_logprobs > 0 produces logprobs in output text."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", input="hi", top_logprobs=3, store=False
+        )
+
+        token_logprobs = [
+            (-0.5, 313, "Hello"),
+            (-0.2, 1234, "world"),
+        ]
+        top_logprobs = [
+            [(-0.5, 313, "Hello"), (-1.2, 999, "Hi")],
+            [(-0.2, 1234, "world"), (-1.5, 777, "earth")],
+        ]
+
+        output_items = serving._make_response_output_items(
+            request,
+            "Hello world",
+            serving.tokenizer_manager.tokenizer,
+            require_reasoning=False,
+            output_token_logprobs=token_logprobs,
+            output_top_logprobs=top_logprobs,
+        )
+
+        msg = output_items[0]
+        self.assertIsInstance(msg, ResponseOutputMessage)
+        text_part = msg.content[0]
+        self.assertIsNotNone(text_part.logprobs)
+        self.assertEqual(len(text_part.logprobs), 2)
+        self.assertEqual(text_part.logprobs[0].token, "Hello")
+        self.assertEqual(text_part.logprobs[0].logprob, -0.5)
+        self.assertEqual(len(text_part.logprobs[0].top_logprobs), 2)
+        self.assertEqual(text_part.logprobs[1].token, "world")
+
+    def test_logprobs_populated_when_include_set(self):
+        """Non-streaming: include list triggers logprobs even with top_logprobs=0."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            top_logprobs=0,
+            include=["message.output_text.logprobs"],
+            store=False,
+        )
+
+        token_logprobs = [(-0.1, 42, "yes")]
+
+        output_items = serving._make_response_output_items(
+            request,
+            "yes",
+            serving.tokenizer_manager.tokenizer,
+            require_reasoning=False,
+            output_token_logprobs=token_logprobs,
+            output_top_logprobs=None,
+        )
+
+        text_part = output_items[0].content[0]
+        self.assertIsNotNone(text_part.logprobs)
+        self.assertEqual(text_part.logprobs[0].token, "yes")
+        self.assertEqual(len(text_part.logprobs[0].top_logprobs), 0)
+
+    def test_logprobs_none_when_not_requested(self):
+        """Non-streaming: logprobs absent when client doesn't request them."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x", input="hi", store=False
+        )
+
+        output_items = serving._make_response_output_items(
+            request,
+            "hello",
+            serving.tokenizer_manager.tokenizer,
+            require_reasoning=False,
+            output_token_logprobs=[(-0.1, 1, "hello")],
+            output_top_logprobs=None,
+        )
+
+        text_part = output_items[0].content[0]
+        self.assertIsNone(text_part.logprobs)
+
+
 class HarmonyResponsesTestCase(unittest.TestCase):
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
