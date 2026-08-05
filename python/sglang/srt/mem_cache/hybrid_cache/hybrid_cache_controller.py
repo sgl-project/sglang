@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -711,16 +712,12 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_backup(self, operation):
         # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. On follower ranks, only the rank-sharded Mamba/KDA pool is
-        # owned by the rank and must be written here. Do not replicate other
-        # sidecar pools (for example SWA or indexer state) accidentally.
-        backup_transfers = operation.pool_transfers
-        if self.backup_skip:
-            backup_transfers = [
-                transfer
-                for transfer in operation.pool_transfers or []
-                if transfer.name == PoolName.MAMBA
-            ]
+        # by TP0. Rank-sharded sidecars still need every TP rank.
+        backup_transfers = [
+            transfer
+            for transfer in operation.pool_transfers or []
+            if self.should_backup(transfer)
+        ]
 
         if backup_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
@@ -749,6 +746,28 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+    def should_backup(self, transfer: PoolTransfer) -> bool:
+        if not self.backup_skip:
+            return True
+
+        # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
+        # pool is replicated.
+        if transfer.name == PoolName.MAMBA:
+            return True
+
+        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
+        # MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type == "mooncake" and transfer.name in (
+            PoolName.DRAFT,
+            PoolName.DRAFT_SWA,
+        ):
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            return entry is not None and isinstance(
+                entry.host_pool, MHATokenToKVPoolHost
+            )
+
+        return False
 
     def backup_thread_func(self):
         """Back up rank-sharded sidecars on every TP rank.
