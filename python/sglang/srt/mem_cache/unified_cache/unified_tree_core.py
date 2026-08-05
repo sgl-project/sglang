@@ -990,6 +990,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
+    def _has_missing_host_component(self, node: UnifiedTreeNode) -> bool:
+        return any(
+            component.needs_incremental_backup(node)
+            for component in self.components
+            if component.component_type != BASE_COMPONENT_TYPE
+        )
+
     def _needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         """Whether a Host-backed node has auxiliary data missing from Host."""
         if (
@@ -1000,11 +1007,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ):
             return False
 
-        return any(
-            component.needs_incremental_backup(node)
-            for component in self.components
-            if component.component_type != BASE_COMPONENT_TYPE
-        )
+        return self._has_missing_host_component(node)
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
@@ -1175,13 +1178,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
-        """Evict one device leaf (demote if backuped, delete if write-through);
-        for an unbacked write-back node, the result carries the BackupKV for
-        the cache to execute and then demote."""
+        """Evict one device leaf.
+
+        A write-back node with missing Host data returns a BackupKV to execute
+        before demotion. A fully backed node is demoted directly.
+        """
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
-        if is_write_back:
+        if is_write_back and (
+            not node.backuped or self._has_missing_host_component(node)
+        ):
             result.backup_kv = self._build_backup_kv_action(node, write_back=True)
             return result
         if not node.backuped:
