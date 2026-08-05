@@ -4,23 +4,18 @@
 // --warmup-requests 64, --flush-cache), run1 landed. tokens_per_sec_per_gpu =
 // output_throughput / tp * (isl+osl)/osl (tp=1). LL @ conc 1+16, HT @ conc 1024+4096.
 //
-// Coverage: 32/44 measured — B200 (10) @ 0.5.15, H200 (7) + B300 (12) @ 0.5.16, H100 (3
-// LL) @ 0.5.16. Pending: H100 (5 — the 4 HT sweeps are impractical on one H100 node, and
-// 35b-a3b bf16 LL OOMs at 80GB), Xeon (4, no CPU box), and 2 config-updated cells (below).
+// Coverage: 35/44 measured — B200 (12) @ 0.5.15/0.5.16, H200 (8) + B300 (12) @ 0.5.16,
+// H100 (3 LL) @ 0.5.16. Pending: H100 (5 — the 4 HT sweeps are impractical on one H100
+// node, and 35b-a3b bf16 LL OOMs at 80GB), Xeon (4, no CPU box).
 //
 // 35B-A3B NVFP4 (MoE): on 0.5.16 the plain generator command crashes at CUDA-graph capture
 // (NVFP4-MoE unsupported on the FLASHINFER_TRTLLM runner), so the config carries the fix
-// --moe-runner-backend flashinfer_cutlass on Blackwell 35B-A3B NVFP4. B300 was measured
-// WITH it (0.5.16). B200 35B-A3B NVFP4 is PENDING: config shows the 0.5.16 target (with the
-// flag), but our only numbers are 0.5.15 on the plain path — dropped until re-benched on
-// 0.5.16 with the flag. (27B NVFP4 is dense, unaffected.)
+// --moe-runner-backend flashinfer_cutlass on Blackwell 35B-A3B NVFP4. B200 and B300 were
+// both re-benched WITH it on 0.5.16 (verified). (27B NVFP4 is dense, unaffected.)
 // NOTE: the nvidia/Qwen3.6-*-NVFP4 checkpoints quantize the MoE experts as W4A16 (4-bit
 // weights, 16-bit activations) — memory-oriented (~half the weight VRAM), NOT a throughput
 // win: the expert matmuls run in 16-bit and don't hit the NVFP4 (W4A4) tensor-core path.
 // So NVFP4 speed ~ FP8, with a smaller footprint. See the Qwen3.6.mdx §3.2 NVFP4 note.
-//
-// h200 35B-A3B bf16 high-throughput is PENDING: config updated to --mem-fraction-static
-// 0.92 (+13% A/B at conc 1024); re-bench conc 1024+4096 at 0.92 before marking verified.
 
 export const benchmarks = [
   {

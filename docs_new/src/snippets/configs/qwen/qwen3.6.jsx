@@ -7,7 +7,8 @@
 // Cells reproduce the generator's output verbatim EXCEPT the reasoning/tool-call parser
 // flags are omitted (a Playground feature, not part of a Deployment/benchmark command —
 // DSv4/Qwen3.5 convention). All variants tp=1 single-node. nvfp4 is Blackwell-only
-// (B200/B300). Xeon (CPU) is out of scope.
+// (B200/B300). Xeon (CPU) is supported via the balanced tier (Intel-vetted recipe,
+// declared in config.hardware with vendor:"intel").
 
 export const config = {
   modelName: "Qwen3.6",
