@@ -25,7 +25,7 @@ class RotaryEmbedding(CustomOp):
         base: Optional[int | float] = 10000,
         is_neox_style: bool = False,
         dtype: Optional[torch.dtype] = torch.float16,
-        use_precomputed_cache: bool = False,
+        use_precomputed_cache: Optional[bool] = True,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -196,6 +196,7 @@ class RotaryEmbedding(CustomOp):
         sin: Optional[torch.Tensor] = None,
         complex_freqs: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor | None] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
