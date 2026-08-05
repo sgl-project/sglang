@@ -43,7 +43,7 @@ TAEHV context 只保存在绑定 Worker 本地。H100 与 L4 使用独立 Spot N
 
 ## 回滚
 
-应用回滚只替换 Deployment 中四个角色的镜像 digest，并重新执行 server-side apply。
+应用回滚只替换各工作负载中四个角色的镜像 digest，并重新执行 server-side apply。
 模型回滚只替换 `MODEL_ARTIFACT_REVISION`。DynamoDB Schema 保持向后兼容；若控制面发布
 失败，现有 Session 不迁移，受影响用户重试。Spot Worker 不复制状态，节点中断时仅终止
 绑定 Session，Coordinator TTL 自动回收 Lease。

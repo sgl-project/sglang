@@ -23,6 +23,7 @@ DENOISER_BASE_REPLICAS="${DENOISER_BASE_REPLICAS:-1}"
 VAE_BASE_REPLICAS="${VAE_BASE_REPLICAS:-1}"
 DENOISER_PEAK_REPLICAS="${DENOISER_PEAK_REPLICAS:-1}"
 VAE_PEAK_REPLICAS="${VAE_PEAK_REPLICAS:-1}"
+DENOISER_NODEPOOL="${DENOISER_NODEPOOL:-}"
 
 if ! [[ "${MODEL_ARTIFACT_REVISION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
   echo "MODEL_ARTIFACT_REVISION is not immutable-path safe" >&2
@@ -51,6 +52,18 @@ if (( DENOISER_BASE_REPLICAS > DENOISER_PEAK_REPLICAS )); then
 fi
 if (( VAE_BASE_REPLICAS > VAE_PEAK_REPLICAS )); then
   echo "VAE base replicas cannot exceed peak replicas" >&2
+  exit 1
+fi
+if [[ -z "${DENOISER_NODEPOOL}" ]]; then
+  if (( DENOISER_PEAK_REPLICAS == 1 )); then
+    DENOISER_NODEPOOL=minwm-async-denoiser-h100
+  else
+    DENOISER_NODEPOOL=minwm-async-denoiser-h100-8x
+  fi
+fi
+if [[ "${DENOISER_NODEPOOL}" != "minwm-async-denoiser-h100" && \
+      "${DENOISER_NODEPOOL}" != "minwm-async-denoiser-h100-8x" ]]; then
+  echo "DENOISER_NODEPOOL must select an approved H100 Spot pool" >&2
   exit 1
 fi
 for SUSPEND in "${GPU_SCALE_UP_SUSPEND}" "${GPU_SCALE_DOWN_SUSPEND}"; do
@@ -108,6 +121,7 @@ sed -i.bak \
   -e "s|REPLACE_WITH_GPU_SCALE_DOWN_SUSPEND|${GPU_SCALE_DOWN_SUSPEND}|g" \
   -e "s|REPLACE_WITH_DENOISER_BASE_REPLICAS|${DENOISER_BASE_REPLICAS}|g" \
   -e "s|REPLACE_WITH_VAE_BASE_REPLICAS|${VAE_BASE_REPLICAS}|g" \
+  -e "s|REPLACE_WITH_DENOISER_NODEPOOL|${DENOISER_NODEPOOL}|g" \
   -e "s|REPLACE_WITH_GPU_SCALE_TIME_ZONE|${GPU_SCALE_TIME_ZONE}|g" \
   -e "s|REPLACE_WITH_DENOISER_PEAK_REPLICAS|${DENOISER_PEAK_REPLICAS}|g" \
   -e "s|REPLACE_WITH_VAE_PEAK_REPLICAS|${VAE_PEAK_REPLICAS}|g" \
@@ -118,5 +132,12 @@ rm -f "${RENDERED}.bak"
 if rg -n 'REPLACE_WITH_' "${RENDERED}"; then
   echo "unresolved production manifest placeholders" >&2
   exit 1
+fi
+
+# Kubernetes cannot change a workload's kind in place. Remove the legacy
+# Deployment before the first StatefulSet rollout so both controllers never
+# compete for the same H100s.
+if kubectl get deployment minwm-async-denoiser -n minwm-realtime >/dev/null 2>&1; then
+  kubectl delete deployment minwm-async-denoiser -n minwm-realtime --wait=true
 fi
 kubectl apply --server-side --field-manager=minwm-production -f "${RENDERED}"

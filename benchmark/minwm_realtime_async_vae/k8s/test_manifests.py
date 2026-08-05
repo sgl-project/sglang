@@ -14,6 +14,11 @@ def _container(deployment, name):
     return next(item for item in _containers(deployment) if item["name"] == name)
 
 
+def _gpu_workload(documents, name):
+    kind = "StatefulSet" if name == "minwm-async-denoiser" else "Deployment"
+    return find(documents, kind, name)
+
+
 def test_gpu_nodepools_are_spot_only_and_bounded():
     documents = load_documents()
     validate(documents)
@@ -47,7 +52,7 @@ def test_h100_pool_uses_one_fully_utilized_eight_gpu_node():
     documents = load_documents(("h100-denoiser.yaml",))
     single = find(documents, "NodePool", "minwm-async-denoiser-h100")
     packed = find(documents, "NodePool", "minwm-async-denoiser-h100-8x")
-    deployment = find(documents, "Deployment", "minwm-async-denoiser")
+    deployment = find(documents, "StatefulSet", "minwm-async-denoiser")
 
     assert requirement_values(single, "node.kubernetes.io/instance-type") == [
         "p5.4xlarge"
@@ -61,9 +66,21 @@ def test_h100_pool_uses_one_fully_utilized_eight_gpu_node():
     assert deployment["spec"]["replicas"] == "REPLACE_WITH_DENOISER_BASE_REPLICAS"
     selector = deployment["spec"]["template"]["spec"]["nodeSelector"]
     assert selector == {
-        "karpenter.sh/nodepool": "minwm-async-denoiser-h100-8x",
+        "karpenter.sh/nodepool": "REPLACE_WITH_DENOISER_NODEPOOL",
         "karpenter.sh/capacity-type": "spot",
     }
+
+
+def test_denoiser_uses_ordered_startup_to_avoid_a_cold_start_storm():
+    documents = load_documents(("h100-denoiser.yaml",))
+    stateful_set = find(documents, "StatefulSet", "minwm-async-denoiser")
+    service = find(documents, "Service", "minwm-async-denoiser-headless")
+
+    assert stateful_set["spec"]["podManagementPolicy"] == "OrderedReady"
+    assert stateful_set["spec"]["serviceName"] == "minwm-async-denoiser-headless"
+    assert stateful_set["spec"]["updateStrategy"]["type"] == "RollingUpdate"
+    assert service["spec"]["clusterIP"] == "None"
+    assert service["spec"]["publishNotReadyAddresses"] is True
 
 
 def test_l40s_alternate_is_spot_only_and_never_in_base_topology():
@@ -125,7 +142,7 @@ def test_west_model_artifact_uses_a_matching_read_only_s3_mount():
     )
     assert volume["spec"]["accessModes"] == ["ReadOnlyMany"]
 
-    deployment = find(documents, "Deployment", "minwm-async-denoiser")
+    deployment = find(documents, "StatefulSet", "minwm-async-denoiser")
     pod_spec = deployment["spec"]["template"]["spec"]
     container = pod_spec["containers"][0]
     model = next(
@@ -148,7 +165,7 @@ def test_west_model_artifact_uses_a_matching_read_only_s3_mount():
 
 def test_runtime_uses_one_owned_read_only_s3_claim_and_preconverted_model():
     documents = load_documents()
-    deployment = find(documents, "Deployment", "minwm-async-denoiser")
+    deployment = find(documents, "StatefulSet", "minwm-async-denoiser")
     pod_spec = deployment["spec"]["template"]["spec"]
     container = _container(deployment, "denoiser")
     env = {item["name"]: item.get("value") for item in container["env"]}
@@ -218,13 +235,14 @@ def test_gpu_pods_use_a_prebuilt_runtime_without_installing_at_startup():
 def test_eight_denoiser_workers_fit_on_one_p5_48xlarge_ephemeral_disk():
     deployment = find(
         load_documents(("h100-denoiser.yaml",)),
-        "Deployment",
+        "StatefulSet",
         "minwm-async-denoiser",
     )
     resources = _container(deployment, "denoiser")["resources"]
 
     assert resources["requests"]["ephemeral-storage"] == "24Gi"
-    assert resources["limits"]["ephemeral-storage"] == "100Gi"
+    assert resources["limits"]["ephemeral-storage"] == "40Gi"
+    assert 8 * 40 < 359
 
 
 def test_public_nlb_selects_only_the_gateway_control_plane():
@@ -297,7 +315,13 @@ def test_gpu_pools_have_independent_bounded_scheduled_elasticity():
         {
             "apiGroups": ["apps"],
             "resources": ["deployments/scale"],
-            "resourceNames": ["minwm-async-denoiser", "minwm-async-vae"],
+            "resourceNames": ["minwm-async-vae"],
+            "verbs": ["get", "patch", "update"],
+        },
+        {
+            "apiGroups": ["apps"],
+            "resources": ["statefulsets/scale"],
+            "resourceNames": ["minwm-async-denoiser"],
             "verbs": ["get", "patch", "update"],
         }
     ]
@@ -339,13 +363,13 @@ def test_gpu_pools_have_independent_bounded_scheduled_elasticity():
 
 def test_all_runtime_images_are_role_specific_and_immutable():
     files_and_roles = (
-        ("gateway.yaml", "minwm-realtime-gateway", "gateway"),
-        ("coordinator.yaml", "minwm-realtime-coordinator", "coordinator"),
-        ("h100-denoiser.yaml", "minwm-async-denoiser", "denoiser"),
-        ("l4-vae.yaml", "minwm-async-vae", "vae"),
+        ("gateway.yaml", "Deployment", "minwm-realtime-gateway", "gateway"),
+        ("coordinator.yaml", "Deployment", "minwm-realtime-coordinator", "coordinator"),
+        ("h100-denoiser.yaml", "StatefulSet", "minwm-async-denoiser", "denoiser"),
+        ("l4-vae.yaml", "Deployment", "minwm-async-vae", "vae"),
     )
-    for filename, deployment_name, container_name in files_and_roles:
-        deployment = find(load_documents((filename,)), "Deployment", deployment_name)
+    for filename, kind, deployment_name, container_name in files_and_roles:
+        deployment = find(load_documents((filename,)), kind, deployment_name)
         image = _container(deployment, container_name)["image"]
         assert image == f"REPLACE_WITH_{container_name.upper()}_IMAGE_DIGEST"
 
@@ -446,7 +470,7 @@ def test_gpu_workers_register_only_internal_pod_endpoints():
         ),
     }
     for deployment_name, (sidecar_name, role, endpoint) in expected.items():
-        deployment = find(documents, "Deployment", deployment_name)
+        deployment = _gpu_workload(documents, deployment_name)
         sidecar = _container(deployment, sidecar_name)
         args = " ".join(sidecar["args"])
         assert f"--role={role}" in args
@@ -497,13 +521,13 @@ def test_trace_uses_otlp_and_cloudwatch_with_five_day_retention():
     collector = find(documents, "Deployment", "minwm-realtime-adot")
     assert collector["spec"]["replicas"] == 2
 
-    for deployment_name in (
-        "minwm-realtime-gateway",
-        "minwm-realtime-coordinator",
-        "minwm-async-denoiser",
-        "minwm-async-vae",
+    for kind, deployment_name in (
+        ("Deployment", "minwm-realtime-gateway"),
+        ("Deployment", "minwm-realtime-coordinator"),
+        ("StatefulSet", "minwm-async-denoiser"),
+        ("Deployment", "minwm-async-vae"),
     ):
-        deployment = find(documents, "Deployment", deployment_name)
+        deployment = find(documents, kind, deployment_name)
         main = _containers(deployment)[0]
         env = {item["name"]: item.get("value") for item in main.get("env", [])}
         assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://minwm-realtime-adot:4317"

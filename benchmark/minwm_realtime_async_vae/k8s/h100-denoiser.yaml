@@ -85,8 +85,24 @@ spec:
           value: "true"
           effect: NoSchedule
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-async-denoiser-headless
+  namespace: minwm-realtime
+  labels:
+    app.kubernetes.io/name: minwm-async-denoiser
+    app.kubernetes.io/part-of: minwm-realtime
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: minwm-async-denoiser
+  ports:
+    - {name: api, port: 30000, targetPort: api}
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: minwm-async-denoiser
   namespace: minwm-realtime
@@ -98,9 +114,10 @@ metadata:
 spec:
   replicas: REPLACE_WITH_DENOISER_BASE_REPLICAS
   revisionHistoryLimit: 1
-  progressDeadlineSeconds: 5400
-  strategy:
-    type: Recreate
+  serviceName: minwm-async-denoiser-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app.kubernetes.io/name: minwm-async-denoiser
@@ -115,7 +132,7 @@ spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 90
       nodeSelector:
-        karpenter.sh/nodepool: minwm-async-denoiser-h100-8x
+        karpenter.sh/nodepool: REPLACE_WITH_DENOISER_NODEPOOL
         karpenter.sh/capacity-type: spot
       tolerations:
         - key: nvidia.com/gpu
@@ -205,7 +222,7 @@ spec:
             limits:
               cpu: "7"
               memory: 220Gi
-              ephemeral-storage: 100Gi
+              ephemeral-storage: 40Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}

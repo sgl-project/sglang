@@ -12,7 +12,11 @@ metadata:
 rules:
   - apiGroups: [apps]
     resources: [deployments/scale]
-    resourceNames: [minwm-async-denoiser, minwm-async-vae]
+    resourceNames: [minwm-async-vae]
+    verbs: [get, patch, update]
+  - apiGroups: [apps]
+    resources: [statefulsets/scale]
+    resourceNames: [minwm-async-denoiser]
     verbs: [get, patch, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

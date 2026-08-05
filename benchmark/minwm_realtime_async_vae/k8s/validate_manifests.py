@@ -71,20 +71,23 @@ def validate(documents: list[dict]) -> None:
     assert int(denoiser_8x["spec"]["limits"]["nvidia.com/gpu"]) == 8
     assert 1 <= int(vae["spec"]["limits"]["nvidia.com/gpu"]) <= 8
 
-    for deployment_name in ("minwm-async-denoiser", "minwm-async-vae"):
-        deployment = find(documents, "Deployment", deployment_name)
-        labels = deployment["metadata"]["labels"]
+    workloads = (
+        find(documents, "StatefulSet", "minwm-async-denoiser"),
+        find(documents, "Deployment", "minwm-async-vae"),
+    )
+    for workload in workloads:
+        labels = workload["metadata"]["labels"]
         assert labels["seedleap.ai/test-run"] == "minwm-async-vae-benchmark"
         assert labels["seedleap.ai/ttl-after-test"] == "required"
-        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        container = workload["spec"]["template"]["spec"]["containers"][0]
         resources = container["resources"]
         assert resources.get("requests")
         assert resources.get("limits")
         assert resources["requests"]["nvidia.com/gpu"] == "1"
         assert resources["limits"]["nvidia.com/gpu"] == "1"
 
-    denoiser_deployment = find(documents, "Deployment", "minwm-async-denoiser")
-    containers = denoiser_deployment["spec"]["template"]["spec"]["containers"]
+    denoiser = find(documents, "StatefulSet", "minwm-async-denoiser")
+    containers = denoiser["spec"]["template"]["spec"]["containers"]
     assert {container["name"] for container in containers} == {
         "denoiser",
         "denoiser-heartbeat",

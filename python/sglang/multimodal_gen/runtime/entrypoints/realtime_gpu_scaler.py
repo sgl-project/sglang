@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded Kubernetes Deployment scaler used by the production CronJobs."""
+"""Bounded Kubernetes GPU workload scaler used by the production CronJobs."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ from urllib.request import Request, urlopen
 
 
 SERVICE_ACCOUNT_ROOT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+WORKLOAD_RESOURCES = {
+    "minwm-async-denoiser": "statefulsets",
+    "minwm-async-vae": "deployments",
+}
 
 
 class KubernetesScaleClient:
@@ -33,14 +37,15 @@ class KubernetesScaleClient:
         self.opener = opener
         self.ssl_context = ssl_context or ssl.create_default_context(cafile=str(ca_path))
 
-    def scale(self, deployment: str, replicas: int) -> None:
-        if deployment not in {"minwm-async-denoiser", "minwm-async-vae"}:
-            raise ValueError("deployment is outside the production GPU worker allowlist")
+    def scale(self, workload: str, replicas: int) -> None:
+        resource = WORKLOAD_RESOURCES.get(workload)
+        if resource is None:
+            raise ValueError("workload is outside the production GPU worker allowlist")
         if replicas < 0 or replicas > 8:
             raise ValueError("GPU replicas must be between 0 and 8")
         url = (
             f"{self.base_url}/apis/apps/v1/namespaces/{self.namespace}/"
-            f"deployments/{deployment}/scale"
+            f"{resource}/{workload}/scale"
         )
         request = Request(
             url,
