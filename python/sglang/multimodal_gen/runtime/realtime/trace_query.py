@@ -145,7 +145,7 @@ class CloudWatchTraceQuery:
         end_time = int(self._wall_clock())
         query_string = (
             "fields @timestamp, @message, @ptr "
-            f'| filter @message like /\\"trace_id\\":\\"{trace_id}\\"/ '
+            f"| filter @message like /{trace_id}/ "
             "| sort @timestamp desc "
             f"| limit {limit}"
         )

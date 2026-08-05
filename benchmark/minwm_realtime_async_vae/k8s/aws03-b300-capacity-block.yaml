@@ -150,7 +150,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
-          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:7a3cb0a9ca04d1c82d71ad5a00d2b82107510eb8435cb823f58c248198369259
+          image: 107014413969.dkr.ecr.us-west-2.amazonaws.com/leap-world/minwm-realtime@sha256:311d01a7f85b05df8f4128186288d2fcd821313c7dd66f98aac26464432314de
           imagePullPolicy: IfNotPresent
           command: [/bin/sh, -ec]
           args:
@@ -171,6 +171,7 @@ spec:
             - {name: PYTHONPATH, value: /opt/sglang/python}
             - {name: SGLANG_LIGHTWEIGHT_RUNTIME, value: "1"}
             - {name: AWS_REGION, value: us-west-2}
+            - {name: AWS_DEFAULT_REGION, value: us-west-2}
             - name: POD_IP
               valueFrom:
                 fieldRef:

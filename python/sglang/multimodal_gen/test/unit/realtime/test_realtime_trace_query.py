@@ -56,7 +56,7 @@ def test_cloudwatch_trace_query_is_cached_and_returns_incremental_events():
         assert first["events"][0]["trace_seq"] == 8
         assert first["next_cursor"] == 8
         assert len(logs.started) == 1
-        assert "trace-a" in logs.started[0]["queryString"]
+        assert "filter @message like /trace-a/" in logs.started[0]["queryString"]
         assert "sort @timestamp desc" in logs.started[0]["queryString"]
 
         now[0] = 116.0
