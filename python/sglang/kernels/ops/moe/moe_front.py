@@ -137,6 +137,7 @@ def _jit_module() -> Module:
         cuda_files=["moe/route_radix.cuh"],
         cuda_wrappers=[
             ("front_epilogue", f"FusedFrontEpilogueKernel<{args}>::run"),
+            ("front_cast_epilogue", f"FrontCastEpilogueKernel<{args}>::run"),
         ],
         # No fast-math: scoring and expert-id selection must stay comparable to
         # route_radix / the Triton router under ties and NaN.
@@ -233,3 +234,55 @@ def fused_front(
         bool(config["cast_first"]),
     )
     return weights, ids, routed
+
+
+# plain-TP merged front: [gate_up | gate | latent] fp32 GEMM -> the two bf16 slices
+
+
+def front_cast_covered(
+    merged: torch.Tensor, prefix: int, latent: int, cast_vec: int = 8
+) -> bool:
+    """[M, prefix + 896 + latent] fp32 row-dense, with the prefix / latent
+    widths and every row stride a multiple of ``cast_vec``."""
+    return (
+        merged.dim() == 2
+        and merged.dtype == torch.float32
+        and merged.stride(1) == 1
+        and merged.shape[1] == prefix + NUM_EXPERTS + latent
+        and prefix > 0
+        and latent > 0
+        and prefix % cast_vec == 0
+        and latent % cast_vec == 0
+        and merged.stride(0) % cast_vec == 0
+    )
+
+
+def front_cast(
+    merged: torch.Tensor,
+    prefix: int,
+    latent: int,
+    config: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Cast epilogue of the plain-TP merged front.
+
+    ``merged`` is the fp32 ``[M, prefix + 896 + latent]`` GEMM output. Returns
+    the two dense bf16 slices ``(gate_up [M, prefix], routed_input [M, latent])``
+    in one launch; the caller keeps the gate slice as an fp32 view so routing
+    stays exact. Caller must have checked :func:`front_cast_covered`.
+    """
+    M = merged.shape[0]
+    device = merged.device
+    if config is None:
+        config = get_config("epilogue", M, device, DEFAULT_EPILOGUE_CONFIG)
+
+    pre_out = torch.empty((M, prefix), dtype=torch.bfloat16, device=device)
+    routed = torch.empty((M, latent), dtype=torch.bfloat16, device=device)
+
+    _jit_module().front_cast_epilogue(
+        merged,
+        pre_out,
+        routed,
+        int(config["block_size"]),
+        int(config["cast_vec"]),
+    )
+    return pre_out, routed

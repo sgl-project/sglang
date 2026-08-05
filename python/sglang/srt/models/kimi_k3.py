@@ -137,11 +137,21 @@ def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them."""
+    --bf16-gemm-backend cutedsl selection would silently skip them.
+
+    ``out_dtype`` (fp32) keeps a consumer that needs the unrounded result -- the
+    merged front's router-logit slice -- off a bf16 round-trip. Both backends
+    accumulate in fp32, so it only removes the epilogue's cast; measured free
+    on the merged-front shape (CUPTI, B300)."""
+    if out is None and out_dtype is not None and out_dtype != x.dtype:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
+        )
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
@@ -160,10 +170,18 @@ def _k3_bf16_gemm(
                     # UnquantizedLinearMethod out-buffer path uses); no
                     # staging tensor + copy.
                     return cutedsl_bf16_gemm_out(x, weight, out)
-                out.copy_(cutedsl_bf16_gemm(x, weight))
-                return out
+                if out.dtype == x.dtype:
+                    out.copy_(cutedsl_bf16_gemm(x, weight))
+                    return out
+                # A wider destination cannot be reached through a bf16 staging
+                # tensor without throwing away the precision it was asked for;
+                # let cuBLAS write the accumulator below instead.
     if out is None:
         return torch.nn.functional.linear(x, weight)
+    if out.dtype != x.dtype:
+        # cuBLAS emits the fp32 accumulator directly; out= alone rejects a
+        # differently-typed destination.
+        return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
     return torch.mm(x, weight.t(), out=out)
 
 
@@ -628,6 +646,7 @@ class KimiK3MoE(nn.Module):
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
+            "_front_fp32_epilogue",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
@@ -652,6 +671,26 @@ class KimiK3MoE(nn.Module):
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
+        )
+
+    @cached_property
+    def _front_fp32_epilogue(self) -> bool:
+        """Whether the merged front emits fp32 and converts its two bf16-consuming
+        slices in the fused cast epilogue, leaving the router the exact logits.
+
+        Without it the router would select experts from the bf16 GEMM output;
+        the epilogue only emits bf16, so an fp16 merge keeps the old path."""
+        if not self._eligible_for_fused_front or self._front_w.dtype != torch.bfloat16:
+            return False
+        from sglang.kernels.ops.moe import moe_front
+
+        gate_up, experts, latent = self._front_sizes
+        return (
+            experts == moe_front.NUM_EXPERTS
+            # the epilogue reads/writes 8-element vectors from each slice origin
+            and gate_up % 8 == 0
+            and latent % 8 == 0
+            and moe_front.available()
         )
 
     def _forward_mega_experts(
@@ -1051,14 +1090,30 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
+        if self._front_fp32_epilogue:
+            # Emit the merged GEMM in fp32 and cast only the two slices whose
+            # consumers want bf16, so the router sees the unrounded logits (the
+            # HF reference, vLLM and the EP front all route in fp32; a bf16
+            # merged GEMM moves the selected expert set on a few percent of
+            # rows). Both GEMM backends already accumulate in fp32.
+            from sglang.kernels.ops.moe import moe_front
+
+            fused = _k3_bf16_gemm(hidden_states, self._front_w, out_dtype=torch.float32)
+            router_logits = fused[
+                :, self._front_sizes[0] : self._front_sizes[0] + self._front_sizes[1]
+            ]
+            gate_up, routed_input = moe_front.front_cast(
+                fused, self._front_sizes[0], self._front_sizes[2]
+            )
+        else:
+            fused = _k3_bf16_gemm(hidden_states, self._front_w)
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
+            if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+                router_logits = router_logits.contiguous()
+            if num_tokens > 1 and self._moe_front_needs_contiguous:
+                routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a

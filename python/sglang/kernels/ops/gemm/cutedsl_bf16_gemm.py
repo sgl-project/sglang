@@ -995,6 +995,14 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
 }
 
+# Output dtypes the epilogue can emit. The accumulator is fp32 and the store is
+# a plain RMEM->GMEM st.global (no TMA descriptor), so fp32 output is just the
+# `acc.to(c_dtype)` cast turning into a no-op; the operands stay bf16.
+_TORCH_TO_CUTLASS_OUT_DTYPE = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
 # Per-process cache mapping (dtype, config…) → compiled cute_ext callable.
 # We need to construct concrete cute.Tensors once and reuse the resulting
 # compiled function across all live calls; a fresh build per call would
@@ -1029,7 +1037,12 @@ def _make_layout_tensor(
 
 
 def _make_compile_repr_tensors(
-    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+    dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
@@ -1051,7 +1064,7 @@ def _make_compile_repr_tensors(
         (L, K, M), dtype, b_leading
     )  # kernel B shape (L, K, M_pt)
     C_t = _make_layout_tensor(
-        (L, N, M), dtype, c_leading
+        (L, N, M), c_dtype, c_leading
     )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
@@ -1071,6 +1084,7 @@ def _make_compile_repr_tensors(
 
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
+    c_dtype: torch.dtype,
     cta_m: int,
     cta_n: int,
     cta_k: int,
@@ -1091,6 +1105,7 @@ def _get_compiled_cute_ext_kernel(
     """
     key = (
         dtype,
+        c_dtype,
         cta_m,
         cta_n,
         cta_k,
@@ -1110,6 +1125,11 @@ def _get_compiled_cute_ext_kernel(
         raise ValueError(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
         )
+    if c_dtype not in _TORCH_TO_CUTLASS_OUT_DTYPE:
+        raise ValueError(
+            f"TGV cute_ext output supports {list(_TORCH_TO_CUTLASS_OUT_DTYPE)}; "
+            f"got {c_dtype}."
+        )
 
     gemm = TgvGemmCuteExtKernel(
         acc_dtype=cutlass.Float32,
@@ -1124,6 +1144,7 @@ def _get_compiled_cute_ext_kernel(
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
         dtype,
+        c_dtype,
         has_bias,
         a_leading,
         b_leading,
@@ -1241,6 +1262,7 @@ def _run_tgv(
 
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
+        c_dtype=out.dtype,
         cta_m=cta_m,
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
@@ -1383,7 +1405,9 @@ def _tgv_bf16_gemm_out_run(
     if get_device_sm() not in (100, 103):
         raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    assert out.dtype == torch.bfloat16 and out.device == x.device
+    # fp32 out keeps a consumer that needs exact values (the K3 merged front's
+    # router-logit slice) off a bf16 round-trip; the accumulator is fp32 either way.
+    assert out.dtype in (torch.bfloat16, torch.float32) and out.device == x.device
     assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
