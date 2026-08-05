@@ -163,5 +163,68 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         self._run_device_to_host_indexer_copy(io_backend="direct")
 
 
+class TestDraftHostPoolStrideParity(unittest.TestCase):
+    """The draft host pool must keep the target host pool's per-token stride.
+
+    ``maybe_register_hicache_draft`` allocates the draft host pool with the same
+    slot count as the target host pool so that host indices stay 1-to-1. That
+    only holds if both sides also agree on bytes-per-token, which the target can
+    change through ``override_kv_cache_dim`` (the scaled fp8 KV layout).
+    """
+
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required to build a device pool.")
+        if is_npu() or is_xpu():
+            self.skipTest("Host pool tests only support CUDA/ROCm.")
+        if not (is_cuda() or is_hip()):
+            self.skipTest("CUDA/ROCm not available.")
+
+    def test_draft_pool_inherits_target_override(self):
+        page_size = 1 if is_hip() else 64
+        device_pool = DSATokenToKVPool(
+            size=page_size * 4,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=2,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+        )
+        common = dict(
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+
+        target = MLATokenToKVPoolHost(
+            device_pool=device_pool,
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+            **common,
+        )
+        draft = MLATokenToKVPoolHost(
+            device_pool=device_pool,
+            override_kv_cache_dim=getattr(target, "override_kv_cache_dim", None),
+            **common,
+        )
+        self.assertEqual(target.get_size_per_token(), draft.get_size_per_token())
+
+        # Guard against the assertion above passing for the wrong reason: with
+        # the override dropped, the draft side derives kv_lora_rank +
+        # qk_rope_head_dim instead, which is exactly what breaks the 1-to-1
+        # host index assumption.
+        without_override = MLATokenToKVPoolHost(device_pool=device_pool, **common)
+        self.assertNotEqual(
+            target.get_size_per_token(), without_override.get_size_per_token()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

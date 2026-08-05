@@ -117,7 +117,16 @@ def maybe_register_hicache_draft(
     if isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
-        draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
+        # The target host pool may use a scaled KV layout (fp8 storage with
+        # per-block scales plus rope dims kept in the original dtype), whose
+        # per-token stride differs from the one derived from the device pool
+        # alone. Propagate that override so the draft host pool keeps the same
+        # per-token stride -- otherwise the host indices that are 1-to-1 by
+        # construction address slots of a different size.
+        override_dim = getattr(primary, "override_kv_cache_dim", None)
+        draft_host_pool = MLATokenToKVPoolHost(
+            pool, **kw, override_kv_cache_dim=override_dim
+        )
     else:
         logger.warning(
             "Draft pool type %s not supported for HiCache, skipping.",
