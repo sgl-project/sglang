@@ -1017,9 +1017,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Engine.__init__ or CLI entry).
         load_plugins()
 
-        resolve_auto_parsers(server_args)
-
         server_args.check_server_args()
+        resolve_auto_parsers(server_args)
         _set_gc(server_args)
 
         # Allocate ports for inter-process communications
