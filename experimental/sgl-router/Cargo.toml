@@ -73,6 +73,10 @@ uuid = { version = "1", features = ["v4"] }
 # block hashing matching SGLang's `radix_cache`.  Wire format authority is
 # `python/sglang/srt/disaggregation/kv_events.py`.
 parking_lot = "0.12"
+# FxHash for the KV-event radix tree's trusted-key maps (block hashes are
+# i64, node ids are u64) — avoids the DoS-resistant SipHash default's cost on
+# the routing hot path.
+rustc-hash = "2"
 rmp-serde = "1"
 sha2 = "0.10"
 url = "2"
