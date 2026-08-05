@@ -450,15 +450,15 @@ class DynamoDBCoordinatorStore:
         vae_fingerprint: str,
         now_epoch: int,
     ) -> list[WorkerSlot]:
-        response = self._get_client().query(
-            TableName=self.table_name,
-            IndexName="allocation-index",
-            KeyConditionExpression="allocation_key = :allocation",
-            FilterExpression=(
+        query = {
+            "TableName": self.table_name,
+            "IndexName": "allocation-index",
+            "KeyConditionExpression": "allocation_key = :allocation",
+            "FilterExpression": (
                 "heartbeat_expires_at > :now AND "
                 "(attribute_not_exists(lease_token) OR lease_expires_at <= :now)"
             ),
-            ExpressionAttributeValues={
+            "ExpressionAttributeValues": {
                 ":allocation": {
                     "S": self._allocation_key(
                         role,
@@ -468,9 +468,20 @@ class DynamoDBCoordinatorStore:
                 },
                 ":now": {"N": str(now_epoch)},
             },
-            Limit=self.candidate_limit,
-        )
-        return [self._slot_from_item(item) for item in response.get("Items", [])]
+            "Limit": self.candidate_limit,
+        }
+        slots: list[WorkerSlot] = []
+        while len(slots) < self.candidate_limit:
+            response = self._get_client().query(**query)
+            slots.extend(
+                self._slot_from_item(item)
+                for item in response.get("Items", [])
+            )
+            last_evaluated_key = response.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+            query["ExclusiveStartKey"] = last_evaluated_key
+        return slots[: self.candidate_limit]
 
     async def acquire(
         self,

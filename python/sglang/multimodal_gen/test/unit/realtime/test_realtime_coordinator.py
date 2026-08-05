@@ -305,3 +305,59 @@ def test_dynamodb_coordinator_admission_is_one_four_item_transaction():
         }
 
     asyncio.run(run())
+
+
+def test_dynamodb_slot_query_paginates_past_filtered_stale_slots():
+    class FakeClient:
+        def __init__(self):
+            self.queries = []
+
+        def query(self, **kwargs):
+            self.queries.append(kwargs)
+            if "ExclusiveStartKey" not in kwargs:
+                return {
+                    "Items": [],
+                    "LastEvaluatedKey": {
+                        "allocation_key": {"S": "DENOISER#minwm-r1"},
+                        "allocation_sort": {"S": "stale-worker#0001"},
+                    },
+                }
+            return {
+                "Items": [
+                    {
+                        "pk": {"S": "SLOT#denoiser#denoiser-live#0000"},
+                        "sk": {"S": "LEASE"},
+                        "role": {"S": "denoiser"},
+                        "worker_id": {"S": "denoiser-live"},
+                        "endpoint": {"S": "ws://denoiser-live/generate"},
+                        "az": {"S": "us-east-2a"},
+                        "slot_index": {"N": "0"},
+                        "model_revision": {"S": "minwm-r1"},
+                        "vae_fingerprint": {"S": "taew2_2"},
+                        "heartbeat_expires_at": {"N": "9999999999"},
+                    }
+                ]
+            }
+
+    client = FakeClient()
+    store = DynamoDBCoordinatorStore(
+        "minwm-realtime-coordinator",
+        ttl_s=60,
+        worker_ttl_s=30,
+        client=client,
+        candidate_limit=2,
+    )
+
+    slots = store._query_slots_sync(
+        "denoiser",
+        model_revision="minwm-r1",
+        vae_fingerprint="taew2_2",
+        now_epoch=100,
+    )
+
+    assert [slot.worker_id for slot in slots] == ["denoiser-live"]
+    assert len(client.queries) == 2
+    assert client.queries[1]["ExclusiveStartKey"] == {
+        "allocation_key": {"S": "DENOISER#minwm-r1"},
+        "allocation_sort": {"S": "stale-worker#0001"},
+    }
