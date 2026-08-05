@@ -47,9 +47,14 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertEqual(resolve_min_free_slots(3, 512), 3)
         self.assertEqual(resolve_min_free_slots(2, 8), 2)
 
-    def test_dflash_formula_takes_precedence_over_user_value(self):
-        self.assertEqual(resolve_min_free_slots(16, 512, is_dflash_family=True), 4)
-        self.assertEqual(resolve_min_free_slots(16, 8, is_dflash_family=True), 2)
+    def test_user_value_overrides_dflash_default(self):
+        # An explicit user value wins over the DFlash auto-default.
+        self.assertEqual(resolve_min_free_slots(3, 512, is_dflash_family=True), 3)
+        self.assertEqual(resolve_min_free_slots(16, 512, is_dflash_family=True), 16)
+
+    def test_explicit_one_disables_dflash_default(self):
+        # Explicit 1 acts as an off switch for the DFlash auto-default.
+        self.assertIsNone(resolve_min_free_slots(1, 512, is_dflash_family=True))
 
 
 class TestMinFreeSlotsDelayer(unittest.TestCase):
