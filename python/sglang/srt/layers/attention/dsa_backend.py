@@ -138,6 +138,12 @@ def _should_all_gather_dsa_trtllm_fp8_kv(
     return save_kv_cache and cos_sin_cache is not None and dsa_prefill_cp
 
 
+def _should_return_dsa_trtllm_lse(
+    *, forward_mode: ForwardMode, dcp_enabled: bool
+) -> bool:
+    return dcp_enabled and (forward_mode.is_decode() or forward_mode.is_target_verify())
+
+
 def materialize_full_kv_cp(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -3845,6 +3851,10 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            return_lse=_should_return_dsa_trtllm_lse(
+                forward_mode=forward_batch.forward_mode,
+                dcp_enabled=get_parallel().dcp_enabled,
+            ),
         )
 
         return out
