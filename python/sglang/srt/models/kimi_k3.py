@@ -646,7 +646,7 @@ class KimiK3MoE(nn.Module):
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
-            "_front_fp32_epilogue",
+            "_front_fp32",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
@@ -674,23 +674,17 @@ class KimiK3MoE(nn.Module):
         )
 
     @cached_property
-    def _front_fp32_epilogue(self) -> bool:
-        """Whether the merged front emits fp32 and converts its two bf16-consuming
-        slices in the fused cast epilogue, leaving the router the exact logits.
+    def _front_fp32(self) -> bool:
+        """Whether the merged front emits fp32 so the router reads exact logits.
 
-        Without it the router would select experts from the bf16 GEMM output;
-        the epilogue only emits bf16, so an fp16 merge keeps the old path."""
-        if not self._eligible_for_fused_front or self._front_w.dtype != torch.bfloat16:
-            return False
-        from sglang.kernels.ops.moe import moe_front
-
-        gate_up, experts, latent = self._front_sizes
+        Every consumer of that one buffer must accept fp32: situ for the
+        shared-expert half, and the mxfp8 quantizers for the latent half. Only
+        the flashinfer_mxfp4 chain does, so other runners keep the bf16 front.
+        """
         return (
-            experts == moe_front.NUM_EXPERTS
-            # the epilogue reads/writes 8-element vectors from each slice origin
-            and gate_up % 8 == 0
-            and latent % 8 == 0
-            and moe_front.available()
+            self._eligible_for_fused_front
+            and self._front_w.dtype == torch.bfloat16
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
         )
 
     def _forward_mega_experts(
@@ -1090,30 +1084,22 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        if self._front_fp32_epilogue:
-            # Emit the merged GEMM in fp32 and cast only the two slices whose
-            # consumers want bf16, so the router sees the unrounded logits (the
-            # HF reference, vLLM and the EP front all route in fp32; a bf16
-            # merged GEMM moves the selected expert set on a few percent of
-            # rows). Both GEMM backends already accumulate in fp32.
-            from sglang.kernels.ops.moe import moe_front
-
-            fused = _k3_bf16_gemm(hidden_states, self._front_w, out_dtype=torch.float32)
-            router_logits = fused[
-                :, self._front_sizes[0] : self._front_sizes[0] + self._front_sizes[1]
-            ]
-            gate_up, routed_input = moe_front.front_cast(
-                fused, self._front_sizes[0], self._front_sizes[2]
-            )
-        else:
-            fused = _k3_bf16_gemm(hidden_states, self._front_w)
-            gate_up, router_logits, routed_input = torch.split(
-                fused, self._front_sizes, dim=-1
-            )
-            if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-                router_logits = router_logits.contiguous()
-            if num_tokens > 1 and self._moe_front_needs_contiguous:
-                routed_input = routed_input.contiguous()
+        # fp32 keeps the router's slice unrounded (the HF reference, vLLM and the
+        # EP front all route in fp32; a bf16 merged GEMM moves the selected
+        # expert set on a few percent of rows). The other two slices are read as
+        # fp32 by their consumers, so nothing casts.
+        fused = _k3_bf16_gemm(
+            hidden_states,
+            self._front_w,
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
+        gate_up, router_logits, routed_input = torch.split(
+            fused, self._front_sizes, dim=-1
+        )
+        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+            router_logits = router_logits.contiguous()
+        if num_tokens > 1 and self._moe_front_needs_contiguous:
+            routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a

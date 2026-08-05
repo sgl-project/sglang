@@ -7,11 +7,10 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
-#include <sgl_kernel/runtime.cuh>  // For host::runtime::get_sm_count
-#include <sgl_kernel/type.cuh>     // For dtype_trait, bf16_t, fp32_t, cast
-#include <sgl_kernel/utils.cuh>    // For LaunchKernel, SGL_DEVICE, PDL helpers
-#include <sgl_kernel/vec.cuh>      // For AlignedVector
-#include <sgl_kernel/warp.cuh>     // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -372,29 +371,20 @@ struct MoEFrontTrait : moe::radix::RadixSelectBase {
 
 struct MoEFrontParams {
   const fp32_t* __restrict__ bias;    // [E] fp32 correction bias
-  const fp32_t* __restrict__ logits;  // [M, logits_stride] fp32, row base
+  const fp32_t* __restrict__ logits;  // [M, logits_stride] fp32, gate slice first
   fp32_t* __restrict__ out_w;         // [M, topk] fp32
   int32_t* __restrict__ out_i;        // [M, topk] int32
   int M;
-  int logits_stride;  // merged row width: pre + E + latent
+  int logits_stride;  // E for the router-only entry, E + latent for the front
   long long out_w_stride;
   long long out_i_stride;
   float routed_scaling_factor;
   int renormalize;
   int apply_scale;
-  // Merged-front entries: the [M, latent] bf16 routed_input to emit, taken
-  // from column `routed_off` of the merged row.
+  // Merged-front entry only: the [M, latent] bf16 routed_input to emit.
   bf16_t* __restrict__ routed_out;
   int latent;
-  int routed_off;
   long long routed_stride;
-  // Leading slice of the merged row, cast fp32 -> bf16 unchanged: the
-  // shared-expert gate_up half of the plain-TP front. The gate slice the
-  // router reads therefore starts at column `pre`. 0 / nullptr when the
-  // merged GEMM carries no prefix (the EP front).
-  bf16_t* __restrict__ pre_out;
-  int pre;
-  long long pre_stride;
 };
 
 /// Radix-select top-k over one token's fp32 logits.  Lifted from
@@ -413,7 +403,7 @@ SGL_DEVICE void fgt_select_topk(
     device::AlignedVector<fp32x2_t, kVecSize / 2> bias_vec;
     bias_vec.load(params.bias, tx);
     device::AlignedVector<fp32x2_t, kVecSize / 2> lv;
-    lv.load(params.logits + (long long)m * params.logits_stride + params.pre, tx);
+    lv.load(params.logits + (long long)m * params.logits_stride, tx);
     float logit[kVecSize];
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -555,25 +545,6 @@ SGL_DEVICE void fgt_select_topk(
   __syncthreads();  // smem reuse across the token loop
 }
 
-/// Block-strided fp32 -> bf16 cast of one row slice, `kCastVec` elements per
-/// thread per step. `src` / `dst` are the slice's row starts and must be
-/// kCastVec-element aligned (host-checked).
-template <uint32_t kBlockSize, uint32_t kCastVec>
-SGL_DEVICE void fgt_cast_slice(const fp32_t* src, bf16_t* dst, int width, uint32_t tx) {
-  using namespace device;
-  for (int i = (int)tx * kCastVec; i < width; i += (int)kBlockSize * kCastVec) {
-    AlignedVector<fp32x2_t, kCastVec / 2> v;
-    v.load(src, i / kCastVec);
-    AlignedVector<bf16_t, kCastVec> o;
-#pragma unroll
-    for (uint32_t j = 0; j < kCastVec / 2; ++j) {
-      o[2 * j + 0] = cast<bf16_t>(v[j].x);
-      o[2 * j + 1] = cast<bf16_t>(v[j].y);
-    }
-    o.store(dst, i / kCastVec);
-  }
-}
-
 /// Tunables: `kBlockSize` sets the experts-per-thread of the radix select,
 /// `kCastVec` the fp32 elements each thread converts per step (the cast moves
 /// [T, 3584] fp32 in and bf16 out, which dominates the epilogue at large T), and
@@ -590,64 +561,26 @@ __global__ __launch_bounds__(kBlockSize)  //
 
   PDLWaitPrimary<kUsePDL>();
 
-  // Cast the latent slice: [routed_off, routed_off + latent) fp32 -> bf16.
+  // Cast the latent slice: [E, E + latent) fp32 -> [0, latent) bf16.
   auto cast_latent = [&]() {
-    fgt_cast_slice<kBlockSize, kCastVec>(
-        params.logits + (long long)m * params.logits_stride + params.routed_off,
-        params.routed_out + (long long)m * params.routed_stride,
-        params.latent,
-        tx);
+    const fp32_t* src = params.logits + (long long)m * params.logits_stride + T::kNumExperts;
+    bf16_t* dst = params.routed_out + (long long)m * params.routed_stride;
+    for (int i = (int)tx * kCastVec; i < params.latent; i += (int)kBlockSize * kCastVec) {
+      AlignedVector<fp32x2_t, kCastVec / 2> v;
+      v.load(src, i / kCastVec);
+      AlignedVector<bf16_t, kCastVec> o;
+#pragma unroll
+      for (uint32_t j = 0; j < kCastVec / 2; ++j) {
+        o[2 * j + 0] = cast<bf16_t>(v[j].x);
+        o[2 * j + 1] = cast<bf16_t>(v[j].y);
+      }
+      o.store(dst, i / kCastVec);
+    }
   };
 
   if (kCastFirst) cast_latent();
   fgt_select_topk<kUsePDL, T>(params, smem, m, tx, tx / 32, tx % 32);
   if (!kCastFirst) cast_latent();
-}
-
-/// Cast-only epilogue of the plain-TP merged front GEMM
-/// `[gate_up | gate | latent]`: emits the two bf16 slices the shared experts
-/// and the routed experts consume, and leaves the gate slice as the fp32 view
-/// the router reads. One launch instead of two aten casts; routing keeps the
-/// exact fp32 logits (see kernels/ops/moe/moe_front.py).
-///
-/// Unlike the select epilogue this is pure data movement, so the grid covers
-/// the whole `[M, pre + latent]` output instead of one CTA per token -- at
-/// decode M is 1..8 and a per-token grid leaves the kernel latency-bound on a
-/// single SM.
-template <bool kUsePDL, uint32_t kBlockSize, uint32_t kCastVec>
-__global__ __launch_bounds__(kBlockSize)  //
-    void front_cast_epilogue_kernel(const __grid_constant__ MoEFrontParams params) {
-  using namespace device;
-  const int out_width = params.pre + params.latent;
-  const long long num_vecs = (long long)params.M * out_width / kCastVec;
-  const int gate = params.routed_off - params.pre;  // columns the router keeps
-
-  PDLWaitPrimary<kUsePDL>();
-
-  for (long long v = (long long)blockIdx.x * kBlockSize + threadIdx.x; v < num_vecs;
-       v += (long long)gridDim.x * kBlockSize) {
-    const long long e = v * kCastVec;
-    const int row = (int)(e / out_width);
-    const int col = (int)(e - (long long)row * out_width);
-    // pre and latent are both kCastVec-aligned, so a vector never straddles
-    // the two slices and the gate columns are simply skipped in the source.
-    const bool in_pre = col < params.pre;
-    const fp32_t* src = params.logits + (long long)row * params.logits_stride + col + (in_pre ? 0 : gate);
-    bf16_t* dst = in_pre ? params.pre_out + (long long)row * params.pre_stride + col
-                         : params.routed_out + (long long)row * params.routed_stride + (col - params.pre);
-
-    AlignedVector<fp32x2_t, kCastVec / 2> in;
-    in.load(src, 0);
-    AlignedVector<bf16_t, kCastVec> o;
-#pragma unroll
-    for (uint32_t j = 0; j < kCastVec / 2; ++j) {
-      o[2 * j + 0] = cast<bf16_t>(in[j].x);
-      o[2 * j + 1] = cast<bf16_t>(in[j].y);
-    }
-    o.store(dst, 0);
-  }
-
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 }  // namespace sglang
@@ -778,7 +711,6 @@ struct FusedFrontEpilogueKernel {
     params.logits_stride = static_cast<int>(merged.stride(0));
     params.routed_out = static_cast<bf16_t*>(routed.data_ptr());
     params.latent = latent;
-    params.routed_off = static_cast<int>(sglang::kFGTNumExperts);  // no prefix here
     params.routed_stride = static_cast<long long>(routed.stride(0));
 
     // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
@@ -817,90 +749,5 @@ struct FusedFrontEpilogueKernel {
 #undef SGL_FRONT_DISPATCH_BS
 #undef SGL_FRONT_DISPATCH_CV
 #undef SGL_FRONT_LAUNCH
-  }
-};
-
-/// Cast-only epilogue of the plain-TP merged front `[gate_up | gate | latent]`.
-/// The merged GEMM emits fp32 so the router reads exact logits; this converts
-/// the two slices whose consumers want bf16, in one launch. The gate slice is
-/// left alone -- callers pass it on as an fp32 view.
-template <bool kUsePDL>
-struct FrontCastEpilogueKernel {
-  static void
-  run(const tvm::ffi::TensorView merged,      // [M, pre + E + latent] fp32, row-dense
-      const tvm::ffi::TensorView pre_out,     // [M, pre] bf16
-      const tvm::ffi::TensorView routed_out,  // [M, latent] bf16
-      int64_t block_size,
-      int64_t cast_vec) {
-    using namespace host;
-
-    auto M_ = SymbolicSize{"num_tokens"};
-    auto W_ = SymbolicSize{"merged_width"};
-    auto P_ = SymbolicSize{"prefix"};
-    auto L_ = SymbolicSize{"latent"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-
-    TensorMatcher({M_, W_}).with_dtype<fp32_t>().with_device(device).with_strides({-1, 1}).verify(merged);
-    TensorMatcher({M_, P_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(pre_out);
-    TensorMatcher({M_, L_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(routed_out);
-
-    const auto M = static_cast<int>(M_.unwrap());
-    const auto pre = static_cast<int>(P_.unwrap());
-    const auto latent = static_cast<int>(L_.unwrap());
-    RuntimeCheck(
-        static_cast<int>(W_.unwrap()) == pre + static_cast<int>(sglang::kFGTNumExperts) + latent,
-        "front_cast_epilogue: merged width must be prefix + num_experts + latent");
-    RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "front_cast_epilogue: cast_vec must be 2, 4 or 8");
-    // Every slice start and every row start must land on a cast_vec boundary:
-    // the loads/stores are cast_vec-wide vectors indexed from the slice origin.
-    RuntimeCheck(
-        pre % cast_vec == 0 && latent % cast_vec == 0,
-        "front_cast_epilogue: cast_vec must divide both the prefix and the latent width");
-    RuntimeCheck(
-        merged.stride(0) % cast_vec == 0 && pre_out.stride(0) % cast_vec == 0 && routed_out.stride(0) % cast_vec == 0,
-        "front_cast_epilogue: cast_vec must divide every row stride");
-    RuntimeCheck(block_size == 224 || block_size == 448, "front_cast_epilogue: block_size must be 224 or 448");
-    if (M == 0) return;
-
-    auto params = sglang::MoEFrontParams{};
-    params.logits = static_cast<fp32_t*>(merged.data_ptr());
-    params.M = M;
-    params.logits_stride = static_cast<int>(merged.stride(0));
-    params.routed_out = static_cast<bf16_t*>(routed_out.data_ptr());
-    params.latent = latent;
-    params.routed_off = pre + static_cast<int>(sglang::kFGTNumExperts);
-    params.routed_stride = static_cast<long long>(routed_out.stride(0));
-    params.pre_out = static_cast<bf16_t*>(pre_out.data_ptr());
-    params.pre = pre;
-    params.pre_stride = static_cast<long long>(pre_out.stride(0));
-
-    // Cover the output with a grid-stride loop, capped so a large M does not
-    // launch more CTAs than the device can keep resident.
-    static const int kNumSms = host::runtime::get_sm_count(device.unwrap().device_id);
-    const long long num_vecs = (long long)M * (pre + latent) / cast_vec;
-    const int num_ctas = static_cast<int>(std::min<long long>((num_vecs + block_size - 1) / block_size, 4LL * kNumSms));
-
-#define SGL_CAST_LAUNCH(BS, CV)               \
-  LaunchKernel(num_ctas, BS, device.unwrap()) \
-      .enable_pdl(kUsePDL)(sglang::front_cast_epilogue_kernel<kUsePDL, BS, CV>, params)
-#define SGL_CAST_DISPATCH_CV(BS) \
-  do {                           \
-    if (cast_vec == 2) {         \
-      SGL_CAST_LAUNCH(BS, 2);    \
-    } else if (cast_vec == 4) {  \
-      SGL_CAST_LAUNCH(BS, 4);    \
-    } else {                     \
-      SGL_CAST_LAUNCH(BS, 8);    \
-    }                            \
-  } while (0)
-
-    if (block_size == 448) {
-      SGL_CAST_DISPATCH_CV(448);
-    } else {
-      SGL_CAST_DISPATCH_CV(224);
-    }
-#undef SGL_CAST_DISPATCH_CV
-#undef SGL_CAST_LAUNCH
   }
 };

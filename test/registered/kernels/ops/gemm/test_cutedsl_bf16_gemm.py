@@ -20,7 +20,6 @@ if not torch.cuda.is_available():
 from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
     _K3_TGV_WIN_SHAPES,
     cutedsl_bf16_gemm,
-    cutedsl_bf16_gemm_out,
     use_cutedsl_bf16_gemm,
 )
 
@@ -51,33 +50,6 @@ def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     if bias is not None:
         ref = ref + bias.float()
     torch.testing.assert_close(out, ref.bfloat16(), rtol=2e-2, atol=2.5)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("n", N_VALUES)
-@pytest.mark.parametrize("k", K_VALUES)
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-def test_cutedsl_bf16_gemm_fp32_out(num_tokens, k, n, has_bias):
-    """An fp32 destination must expose the same fp32 accumulator the bf16
-    epilogue rounds: the K3 merged front routes off that slice, so rounding it
-    would move expert selection."""
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
-        pytest.skip("SM100/SM103 required")
-
-    torch.manual_seed(num_tokens)
-    x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
-    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
-
-    out = torch.empty(num_tokens, n, dtype=torch.float32, device="cuda")
-    cutedsl_bf16_gemm_out(x, weight, out, bias)
-    assert torch.equal(out.bfloat16(), cutedsl_bf16_gemm(x, weight, bias))
-
-    ref = x.float() @ weight.float().T
-    if bias is not None:
-        ref = ref + bias.float()
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2.5)
 
 
 @pytest.mark.parametrize("n, k", sorted(_K3_TGV_WIN_SHAPES) + [(1024, 2048)])

@@ -229,15 +229,37 @@ struct QuantTrait {
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
   static constexpr uint32_t kBlockSize = 256;
-  static constexpr uint32_t kVecSize = 32u / sizeof(InputType);
+  // Elements per lane, deliberately independent of the input width: consumers
+  // derive their CTA geometry from kNumLanes (see RouteQuantTrait's
+  // kQuantHidden_), so a wider input must cost more loads per lane, not more
+  // lanes per group. bf16 -> one 32B load, fp32 -> two.
+  static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
-  static_assert(sizeof(InputType) == 2, "only 16-bit inputs (bf16/fp16) are supported");
+  // 16-bit inputs take the packed path below; fp32 exists so a producer that
+  // must emit fp32 for another consumer (the K3 fused MoE front, whose router
+  // slice shares the GEMM output) can be quantized without a cast pass.
+  static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
+  static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
 
   SGL_DEVICE static void
   run(const QuantKernelParams& params,
+      const uint32_t expert_idx,
+      const uint32_t token_idx,
+      const uint32_t group_idx,
+      const uint32_t lane_id) {
+    if constexpr (sizeof(InputType) == 4) {
+      run_fp32(params, expert_idx, token_idx, group_idx, lane_id);
+    } else {
+      run_packed16(params, expert_idx, token_idx, group_idx, lane_id);
+    }
+  }
+
+  /// 16-bit (bf16/fp16) input: loads and reduces in the packed domain.
+  SGL_DEVICE static void run_packed16(
+      const QuantKernelParams& params,
       const uint32_t expert_idx,
       const uint32_t token_idx,
       const uint32_t group_idx,
@@ -311,6 +333,73 @@ struct QuantTrait {
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         out[i] = WTrait::quant(details::mul2(cast<float2>(in[i]), quant_scale2));
       }
+    }
+
+    out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
+    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+  }
+
+  /// fp32 input. Same scale derivation and the same rounding as the 16-bit
+  /// path -- only the load width and the amax reduction differ, since there is
+  /// no packed fp32 type to reduce in. Quantizing an fp32 source is strictly
+  /// more faithful: the 16-bit path's amax and product are taken after the
+  /// input has already been rounded to bf16.
+  SGL_DEVICE static void run_fp32(
+      const QuantKernelParams& params,
+      const uint32_t expert_idx,
+      const uint32_t token_idx,
+      const uint32_t group_idx,
+      const uint32_t lane_id) {
+    using deepseek_v4::fp8::cast_to_ue8m0;
+    using deepseek_v4::fp8::inv_scale_ue8m0;
+    using namespace device;
+    using Q = QuantType;
+    using WTrait = details::WeightTrait<Q>;
+    using Q2 = typename WTrait::packed2_t;
+    // 32B is the widest load, so kVecSize fp32 elements take kNumSubVecs of them.
+    constexpr uint32_t kSubVec = kMaxVecBytes / sizeof(fp32_t);
+    constexpr uint32_t kNumSubVecs = kVecSize / kSubVec;
+    using in_vec_t = AlignedVector<fp32_t, kSubVec>;
+    using out_vec_t = AlignedVector<Q2, kVecSize / 2>;
+    constexpr float kMaxValue = WTrait::kMaxValue;
+    constexpr float kMaxValueInv = 1.f / kMaxValue;
+
+    const fp32_t* token_in = params.input.get<const fp32_t>(expert_idx, token_idx);
+    const uint32_t group_offset = group_idx * kGroupSize;
+
+    in_vec_t in_vecs[kNumSubVecs];
+#pragma unroll
+    for (uint32_t v = 0; v < kNumSubVecs; ++v) {
+      in_vecs[v].load(token_in + group_offset, lane_id * kNumSubVecs + v);
+    }
+    const auto in = [&](const uint32_t i) { return in_vecs[i / kSubVec][i % kSubVec]; };
+
+    float local_amax = fabsf(in(0));
+#pragma unroll
+    for (uint32_t i = 1; i < kVecSize; ++i) {
+      local_amax = math::max(local_amax, fabsf(in(i)));
+    }
+    const auto amax = math::max(warp::reduce_max<kNumLanes>(local_amax), 1e-10f);
+    const float raw_scale = amax * kMaxValueInv;
+
+    out_vec_t out;
+    details::scale_t<kUe8m0> scale_inv;
+    float quant_scale;
+    if constexpr (kUe8m0) {
+      static_assert(std::is_same_v<Q, fp8_e4m3_t>, "ue8m0 scales imply fp8 quantization");
+      const auto exp = cast_to_ue8m0(raw_scale);
+      scale_inv = static_cast<uint8_t>(exp);
+      quant_scale = inv_scale_ue8m0(exp);
+    } else {
+      scale_inv = raw_scale;
+      quant_scale = kMaxValue / amax;
+    }
+    const float2 quant_scale2 = {quant_scale, quant_scale};
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      // 2^exp >= amax/kMaxValue keeps the ue8m0 product inside the fp8 range;
+      // the SATFINITE cast in WTrait::quant handles NaN / +-inf either way.
+      out[i] = WTrait::quant(details::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);

@@ -68,11 +68,17 @@ struct SituAndMulParams {
   uint32_t stride_in_vecs;  // input row stride in vector units (2*D/vec if dense)
 };
 
-template <typename T, bool kHasLinearBeta, bool kUsePDL>
+// TIn may be wider than TOut: the K3 fused MoE front emits fp32 so the router
+// reads unrounded logits, and this activation consumes its gate_up slice
+// directly rather than paying a separate cast pass. The activation math was
+// always fp32 internally, so a wider input only changes the load width.
+template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
 __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams params) {
   using namespace device;
-  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
-  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  constexpr auto kVecSize = kMaxVecBytes / kWidest;
+  using vec_t = AlignedVector<TIn, kVecSize>;
+  using out_vec_t = AlignedVector<TOut, kVecSize>;
 
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -98,24 +104,25 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   const float linear_beta = params.linear_beta;
   const float inv_linear_beta = params.inv_linear_beta;
 
-  vec_t out;
+  out_vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
     const float g = cast<fp32_t>(gate[i]);
     const float u = cast<fp32_t>(up[i]);
 
     out[i] =
-        cast<T>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
+        cast<TOut>(sglang::kimi_k3::situ_activate<kHasLinearBeta>(g, u, beta, inv_beta, linear_beta, inv_linear_beta));
   }
 
-  store_as<vec_t>(params.out, out, output_offset);
+  store_as<out_vec_t>(params.out, out, output_offset);
 }
 
 // Host launcher
 
-template <typename T, bool kUsePDL>
+template <typename TIn, typename TOut, bool kUsePDL>
 struct SituAndMulKernel {
-  static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
+  static constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
+  static constexpr auto kVecSize = device::kMaxVecBytes / kWidest;
   static constexpr auto kBlockSize = 256u;
 
   static void
@@ -133,11 +140,11 @@ struct SituAndMulKernel {
     device_.set_options<kDLCUDA>();
 
     TensorMatcher({N, D_out})  //
-        .with_dtype<T>()
+        .with_dtype<TOut>()
         .with_device(device_)
         .verify(out);
     TensorMatcher({N, D_in})  //
-        .with_dtype<T>()
+        .with_dtype<TIn>()
         .with_device(device_)
         .with_strides({-1, 1})
         .verify(input);
@@ -171,9 +178,11 @@ struct SituAndMulKernel {
     };
 
     if (has_linear_beta) {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, true, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, true, kUsePDL>, params);
     } else {
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(situ_and_mul_kernel<T, false, kUsePDL>, params);
+      LaunchKernel(num_blocks, kBlockSize, device)
+          .enable_pdl(kUsePDL)(situ_and_mul_kernel<TIn, TOut, false, kUsePDL>, params);
     }
   }
 };

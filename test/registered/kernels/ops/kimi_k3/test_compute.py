@@ -20,8 +20,6 @@ from sglang.kernels.ops.kimi_k3.mla_output_gate import (
 from sglang.kernels.ops.moe.moe_front import (
     NUM_EXPERTS,
     TOPK,
-    front_cast,
-    front_cast_covered,
     fused_front,
 )
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
@@ -281,31 +279,6 @@ class TestKimiK3ComputeKernels(CustomTestCase):
                 merged[:, NUM_EXPERTS:].to(torch.bfloat16),
             )
         )
-
-    def test_moe_front_cast(self):
-        """The plain-TP front's cast epilogue: the two bf16 slices must match
-        what a bf16 GEMM would have produced, so only the router-logit slice
-        gains precision from the fp32 merged GEMM."""
-        torch.manual_seed(7)
-        gate_up_dim, latent_dim = 64, 128
-        for num_tokens in (1, 5, 64):
-            merged = torch.randn(
-                num_tokens,
-                gate_up_dim + NUM_EXPERTS + latent_dim,
-                device="cuda",
-                dtype=torch.float32,
-            )
-            self.assertTrue(front_cast_covered(merged, gate_up_dim, latent_dim))
-            gate_up, routed = front_cast(merged, gate_up_dim, latent_dim)
-            self.assertTrue(
-                torch.equal(gate_up, merged[:, :gate_up_dim].to(torch.bfloat16))
-            )
-            self.assertTrue(
-                torch.equal(
-                    routed,
-                    merged[:, gate_up_dim + NUM_EXPERTS :].to(torch.bfloat16),
-                )
-            )
 
     def test_mtp_replayssm_ring(self):
         num_requests, num_heads, num_spec, key_dim = 2, 2, 2, 128

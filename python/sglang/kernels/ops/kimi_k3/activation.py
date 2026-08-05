@@ -32,9 +32,9 @@ def _fast_math_flags() -> list[str]:
 
 
 @cache_once
-def _jit_situ_and_mul_module(dtype: torch.dtype) -> Module:
-    """Compile and cache the JIT SiTU-and-mul module for a given dtype."""
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+def _jit_situ_and_mul_module(in_dtype: torch.dtype, out_dtype: torch.dtype) -> Module:
+    """Compile and cache the JIT SiTU-and-mul module for an (in, out) dtype pair."""
+    args = make_cpp_args(in_dtype, out_dtype, is_arch_support_pdl())
     return load_jit(
         _make_name("situ_and_mul"),
         *args,
@@ -50,7 +50,7 @@ def situ_and_mul(
     beta: float,
     linear_beta: Optional[float],
 ) -> torch.Tensor:
-    """Fused SiTU (SoftCap-GLU) activation: bf16 -> bf16.
+    """Fused SiTU (SoftCap-GLU) activation.
 
     gate_out = beta * tanh(gate / beta) * sigmoid(gate)
     up_out   = linear_beta * tanh(up / linear_beta)  [if linear_beta is not None]
@@ -58,14 +58,21 @@ def situ_and_mul(
 
     Parameters
     ----------
-    input       : bf16 CUDA tensor [*, 2*D]
-    out         : optional pre-allocated bf16 CUDA tensor [*, D]
+    input       : bf16 or fp32 CUDA tensor [*, 2*D]. fp32 lets a caller feed the
+                  K3 fused MoE front's gate_up slice straight in, with no cast
+                  pass: the activation math is fp32 internally either way.
+    out         : optional pre-allocated CUDA tensor [*, D]; its dtype selects
+                  the output dtype (defaults to the input's)
     beta        : gate softcap scalar (e.g. 4.0)
     linear_beta : up softcap scalar (e.g. 25.0), or None to skip
     """
     hidden_size = input.shape[-1] // 2
     if out is None:
-        out = input.new_empty(*input.shape[:-1], hidden_size)
+        # An fp32 input is a wider view of a bf16 activation (the K3 fused MoE
+        # front emits fp32 so its router slice stays exact), so the activation
+        # rejoins the bf16 chain rather than widening it.
+        out_dtype = torch.bfloat16 if input.dtype == torch.float32 else input.dtype
+        out = input.new_empty(*input.shape[:-1], hidden_size, dtype=out_dtype)
 
     # 2D inputs may be row-strided (e.g. a slice of a fused-GEMM output);
     # higher-rank inputs keep the dense-view path.
@@ -76,7 +83,7 @@ def situ_and_mul(
     out_2d = out.view(-1, hidden_size)
 
     has_linear_beta = linear_beta is not None
-    module = _jit_situ_and_mul_module(input.dtype)
+    module = _jit_situ_and_mul_module(input_2d.dtype, out_2d.dtype)
     module.run(
         input_2d,
         out_2d,
