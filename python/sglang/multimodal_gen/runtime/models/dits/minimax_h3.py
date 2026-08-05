@@ -61,6 +61,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_MPS_MLP_TOKEN_CHUNK_SIZE = 1024
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -727,6 +728,18 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "mps":
+            out = torch.empty_like(x)
+            for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
+                stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
+                hidden, _ = self.fc1(x[start:stop])
+                hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+                chunk, _ = self.fc2(hidden)
+                out[start:stop].copy_(chunk)
+                del hidden, chunk
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            return out
         hidden, _ = self.fc1(x)
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
