@@ -127,7 +127,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The mask token needs an embedding row, not a tokenizer entry, so bound it
         # by the embedding width. A padded vocab reserves rows past the real tokens
         # and drafts place the mask there (Inkling: 200058 real, 201024 padded).
-        target_model_config = self.target_worker.model_runner.model_config 
+        target_model_config = self.target_worker.model_runner.model_config
         target_vocab_size = (
             getattr(target_model_config.hf_text_config, "padded_vocab_size", None)
             or target_model_config.vocab_size
