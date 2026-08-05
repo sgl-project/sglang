@@ -1,10 +1,10 @@
-"""EAGLE3 tree drafting (topk > 1) at page_size > 1, flashinfer.
+"""EAGLE3 tree drafting (topk > 1) at page_size > 1, flashinfer (fa3 is
+Hopper-only).
 
-page_size=4 with 32 draft tokens puts the draft window across several pages,
-the layout the unit fixture refuses to build (it pins tree draft to
-page_size=1, see speculative_draft_runner.py). The window-inside-one-page
+page_size=4 with 32 draft tokens spreads the draft window over several pages --
+the layout the unit fixture refuses to build (tree draft is pinned to
+page_size=1 there, see speculative_draft_runner.py). The window-inside-one-page
 regime is covered by test_spec_eagle_fa3.py page256 on the Hopper runner.
-flashinfer is pinned since fa3 is Hopper-only.
 """
 
 import unittest
@@ -28,8 +28,8 @@ class TestEagle3Page4Topk8(Eagle3Base, SpecAccuracyKit, SpecLogprobKit, SpecFeat
     spec_topk = 8
     spec_tokens = 32
     disable_overlap = False
-    # The preset accept-length numbers are topk=1 values, so they are loose
-    # for a topk=8 tree; tighten once CI reports the actuals.
+    # Preset accept-length values are topk=1 numbers -- loose for a topk=8
+    # tree; tighten once CI reports the actuals.
     gsm8k_accept_len_thres = 2.0
     cuda_graph_max_bs_decode = 5
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)

@@ -23,10 +23,9 @@ register_cuda_ci(est_time=540, stage="base-b", runner_config="1-gpu-large")
 class TestEagle3Fa3(Eagle3Base, SpecAccuracyKit, SpecLogprobKit):
     """EAGLE3 topk=1 on fa3 (the H200 default backend), overlap on.
 
-    The accept-length / eos / batch-generation / first-token-finish checks are
-    scheduler and sampling behaviours, so the flashinfer and triton runs on the
-    5090 pool cover them. Logprob losslessness stays: it reads through the
-    verify output, which the attention unit cases do not reach.
+    No SpecCorrectnessKit: those checks are scheduler/sampling behaviour, which
+    the 5090 runs already cover. Logprob losslessness stays -- it reads through
+    the verify output, which the attention unit cases do not reach.
     """
 
     attention_backend = "fa3"

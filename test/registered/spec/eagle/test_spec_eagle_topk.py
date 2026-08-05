@@ -31,10 +31,9 @@ class TestEagle3Topk16(
     SpecFeatureKit,
     SpecHiddenStatesKit,
 ):
-    """EAGLE3 topk=16 tree with the overlap scheduler: guards the accepted-path
-    compaction (validated by logprob_decode_match_prefill) and, via
-    SpecHiddenStatesKit, the per-request hidden-state stride slicing that the
-    same tree compaction feeds.
+    """EAGLE3 topk=16 tree, overlap scheduler: guards the accepted-path
+    compaction (via logprob_decode_match_prefill) and the per-request
+    hidden-state stride slicing that the same compaction feeds.
     """
 
     spec_topk = 16
