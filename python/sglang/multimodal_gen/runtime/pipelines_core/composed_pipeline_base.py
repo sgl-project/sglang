@@ -686,11 +686,10 @@ class ComposedPipelineBase(ABC):
         group starts after every earlier stage completes, and later stages
         start after every member completes. Members must be independent of
         each other — no member may read request state another member writes,
-        each must return the request object it received, and at most one
-        member may issue collective communication (collectives issued
-        concurrently from one process can be ordered differently across
-        ranks and deadlock). Executors without concurrency support run the
-        members in declaration order, which is always a valid schedule.
+        and each must return the request object it received. Executors order
+        collective-issuing members by declaration while overlapping only
+        non-collective siblings. Executors without concurrency support run
+        all members in declaration order, which is always a valid schedule.
         """
         group_token = f"parallel_group_{len(self._stages)}"
         for item in stages:

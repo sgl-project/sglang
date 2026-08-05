@@ -128,6 +128,10 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     def scaling_factor(self) -> float | torch.Tensor:
         return cast(float | torch.Tensor, self.config.scaling_factor)
 
+    @property
+    def encode_uses_collectives(self) -> bool:
+        return False
+
     @abstractmethod
     def _encode(self, *args, **kwargs) -> torch.Tensor:
         pass

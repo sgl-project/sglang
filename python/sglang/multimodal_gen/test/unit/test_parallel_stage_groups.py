@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
 
 
 class _FakeStage:
@@ -91,6 +94,17 @@ class _CountingResidentStrategy(ResidentStrategy):
         self.finished.append((module, use, state))
 
 
+class _NoopComponentResidencyManager:
+    def __init__(self):
+        self.pipeline = SimpleNamespace(modules={})
+
+    def supports_parallel_stage_group(self, _stages, _server_args):
+        return True
+
+    def parallel_stage_group(self):
+        return _null_context()
+
+
 def _server_args(**overrides):
     defaults = dict(
         enable_layerwise_nvtx_marker=False,
@@ -110,7 +124,7 @@ def _server_args(**overrides):
 
 def _executor():
     executor = ParallelExecutor.__new__(ParallelExecutor)
-    executor.component_residency_manager = None
+    executor.component_residency_manager = _NoopComponentResidencyManager()
     return executor
 
 
@@ -179,6 +193,13 @@ class TestExecutionLevelDerivation(unittest.TestCase):
         b.set_execution_group("g2")
         levels = PipelineExecutor.group_stages_into_execution_levels([a, b])
         self.assertEqual(len(levels), 2)
+
+
+class TestStageCollectiveCapabilities(unittest.TestCase):
+    def test_image_vae_uses_explicit_collective_capability(self):
+        vae = SimpleNamespace(encode_uses_collectives=True)
+
+        self.assertTrue(ImageVAEEncodingStage(vae).may_use_collectives)
 
 
 class TestParallelLevelExecution(unittest.TestCase):

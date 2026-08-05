@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from typing import Any, Callable, List
 
 import torch
@@ -71,7 +70,7 @@ class ParallelExecutor(PipelineExecutor):
         # deployments keep the overlap
         allow_concurrency = (
             allow_concurrency
-            and getattr(server_args, "parallel_stage_execution", "auto") == "auto"
+            and server_args.parallel_stage_execution == "auto"
             and self._parallel_execution_supported()
             and not (
                 server_args.dit_cpu_offload
@@ -127,14 +126,8 @@ class ParallelExecutor(PipelineExecutor):
     def _parallel_level_uses_resident_components(
         self, level: List[PipelineStage], server_args: ServerArgs
     ) -> bool:
-        manager = self.component_residency_manager
-        supports_parallel_group = getattr(
-            manager, "supports_parallel_stage_group", None
-        )
-        return (
-            manager is None
-            or supports_parallel_group is None
-            or bool(supports_parallel_group(level, server_args))
+        return self.component_residency_manager.supports_parallel_stage_group(
+            level, server_args
         )
 
     @staticmethod
@@ -174,8 +167,7 @@ class ParallelExecutor(PipelineExecutor):
             is_layerwise_offloaded_module,
         )
 
-        pipeline = getattr(self.component_residency_manager, "pipeline", None)
-        modules = getattr(pipeline, "modules", None)
+        modules = self.component_residency_manager.pipeline.modules
         if not modules:
             return False
         return any(
@@ -238,13 +230,6 @@ class ParallelExecutor(PipelineExecutor):
         for stage in level:
             stage.set_component_residency_manager(self.component_residency_manager)
 
-        manager = self.component_residency_manager
-        residency_context = (
-            manager.parallel_stage_group()
-            if getattr(manager, "parallel_stage_group", None) is not None
-            else nullcontext()
-        )
-
         def run_member(member_index: int, stage: PipelineStage) -> Any:
             stage_name = stage._component_stage_name()
 
@@ -265,7 +250,7 @@ class ParallelExecutor(PipelineExecutor):
                     return call()
 
         results = {}
-        with residency_context:
+        with self.component_residency_manager.parallel_stage_group():
             for epoch in self._parallel_execution_epochs(level):
                 futures = [
                     self._level_thread_pool.submit(run_member, index, stage)
