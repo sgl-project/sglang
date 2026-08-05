@@ -1,8 +1,9 @@
-"""W4AFP8 MoE scheme: INT4 group-quantized weights + 8-bit dynamic activations.
+"""W4AFP8 MoE scheme: INT4 group-quantized weights + 8-bit FP8 activations
+(dynamic per-token or static per-tensor).
 
 Loads INT4 weights from compressed-tensors pack-quantized format,
 converts to CUTLASS W4A8 layout, and runs CUTLASS grouped GEMM
-with dynamic 8-bit (FP8 or INT8) activation quantization.
+with 8-bit FP8 activation quantization.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.utils import all_close_1d
 from sglang.srt.layers.quantization.w4afp8 import interleave_scales
 from sglang.srt.utils import set_weight_attrs
 
@@ -74,7 +76,8 @@ def _unpack_repack_int32_to_cutlass_int8(
 
 
 class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
-    """W4AFP8 MoE: INT4 weights (pack-quantized) + dynamic per-token 8-bit activations,
+    """W4AFP8 MoE: INT4 weights (pack-quantized) + 8-bit activations
+    (dynamic per-token or static per-tensor),
     using CUTLASS W4A8 grouped GEMM kernel."""
 
     def __init__(
@@ -90,6 +93,7 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         self.group_size = config.group_size
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        self.static_input_scales = not self.input_quant.dynamic
 
         assert config.symmetric, "Only symmetric quantization is supported"
         assert (
@@ -182,6 +186,23 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
             layer.register_parameter(name, p)
             set_weight_attrs(p, extra_weight_attrs)
 
+        # INPUT_SCALES
+        if self.static_input_scales:
+            a13_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            layer.register_parameter("a13_scale", a13_scale)
+            set_weight_attrs(a13_scale, extra_weight_attrs)
+
+            a2_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+            )
+            layer.register_parameter("a2_scale", a2_scale)
+            set_weight_attrs(a2_scale, extra_weight_attrs)
+        else:
+            layer.a13_scale = None
+            layer.a2_scale = None
+
         self._init_cutlass_buffers(
             num_experts,
             hidden_size,
@@ -203,9 +224,23 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         dtype = torch.bfloat16
         device = layer.w2_weight_packed.device
 
-        # TODO: currently only support per tensor quant.
-        layer.a13_scale = None
-        layer.a2_scale = None
+        # Handle static input scales if provided; otherwise kernel falls back
+        # to dynamic per-token quantization.
+        if self.static_input_scales:
+            if not all_close_1d(layer.a13_scale) or not all_close_1d(layer.a2_scale):
+                logger.warning(
+                    "Found input_scales that are not equal for "
+                    "W4AFP8 MoE layer. Using the maximum across experts "
+                    "for each layer."
+                )
+            if layer.a13_scale is not None:
+                layer.a13_scale = torch.nn.Parameter(
+                    layer.a13_scale.max(), requires_grad=False
+                )
+            if layer.a2_scale is not None:
+                layer.a2_scale = torch.nn.Parameter(
+                    layer.a2_scale.max(), requires_grad=False
+                )
 
         w13 = _unpack_repack_int32_to_cutlass_int8(
             layer.w13_weight_packed.data, self.num_bits
