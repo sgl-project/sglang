@@ -102,7 +102,7 @@ def _server_args(**overrides):
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
         layerwise_offload_components=None,
-        parallel_stage_execution="auto",
+        parallel_stage_execution="serial",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -196,7 +196,12 @@ class TestParallelLevelExecution(unittest.TestCase):
         second.set_execution_group("g")
         payload = SimpleNamespace()
 
-        result = _run(_executor(), [first, second], payload, _server_args())
+        result = _run(
+            _executor(),
+            [first, second],
+            payload,
+            _server_args(parallel_stage_execution="auto"),
+        )
 
         self.assertIs(result, payload)
         self.assertEqual(len(first.calls), 1)
@@ -220,7 +225,12 @@ class TestParallelLevelExecution(unittest.TestCase):
         right.set_execution_group("g")
         payload = SimpleNamespace()
 
-        _run(_executor(), [head, left, right, tail], payload, _server_args())
+        _run(
+            _executor(),
+            [head, left, right, tail],
+            payload,
+            _server_args(parallel_stage_execution="auto"),
+        )
 
         self.assertEqual(order[0], "head")
         self.assertEqual(order[-1], "tail")
@@ -237,7 +247,7 @@ class TestParallelLevelExecution(unittest.TestCase):
                 _executor(),
                 [replacing, passthrough],
                 SimpleNamespace(),
-                _server_args(),
+                _server_args(parallel_stage_execution="auto"),
             )
 
     def test_unsafe_member_downgrades_to_serial(self):
@@ -251,7 +261,12 @@ class TestParallelLevelExecution(unittest.TestCase):
         for token_stage in stages:
             token_stage.set_execution_group("g1")
         payload = SimpleNamespace()
-        _run(_executor(), stages, payload, _server_args())
+        _run(
+            _executor(),
+            stages,
+            payload,
+            _server_args(parallel_stage_execution="auto"),
+        )
         self.assertEqual(order, ["a", "b"])
 
     def test_two_collective_members_downgrade_to_serial(self):
@@ -265,7 +280,12 @@ class TestParallelLevelExecution(unittest.TestCase):
             stage.set_execution_group("g1")
             stage.may_use_collectives = True
 
-        _run(_executor(), stages, SimpleNamespace(), _server_args())
+        _run(
+            _executor(),
+            stages,
+            SimpleNamespace(),
+            _server_args(parallel_stage_execution="auto"),
+        )
 
         self.assertEqual(order, ["a", "b"])
 
@@ -300,7 +320,7 @@ class TestParallelLevelExecution(unittest.TestCase):
             _executor(),
             stages,
             SimpleNamespace(),
-            _server_args(),
+            _server_args(parallel_stage_execution="auto"),
             parallel_supported=False,
         )
 
@@ -330,7 +350,9 @@ class TestParallelLevelExecution(unittest.TestCase):
             _executor(),
             [first, second],
             SimpleNamespace(),
-            _server_args(text_encoder_cpu_offload=True),
+            _server_args(
+                parallel_stage_execution="auto", text_encoder_cpu_offload=True
+            ),
         )
 
         self.assertEqual(
@@ -373,7 +395,12 @@ class TestParallelLevelExecution(unittest.TestCase):
             ".layerwise_offload.is_layerwise_offloaded_module",
             return_value=True,
         ):
-            _run(executor, [first, second], SimpleNamespace(), _server_args())
+            _run(
+                executor,
+                [first, second],
+                SimpleNamespace(),
+                _server_args(parallel_stage_execution="auto"),
+            )
 
         self.assertEqual(
             order,
@@ -409,7 +436,12 @@ class TestParallelLevelExecution(unittest.TestCase):
         second.set_execution_group("g")
 
         with torch.inference_mode():
-            _run(_executor(), [first, second], SimpleNamespace(), _server_args())
+            _run(
+                _executor(),
+                [first, second],
+                SimpleNamespace(),
+                _server_args(parallel_stage_execution="auto"),
+            )
 
         self.assertEqual(states["first"], (True, False))
         self.assertEqual(states["second"], (True, False))
@@ -424,7 +456,12 @@ class TestParallelLevelExecution(unittest.TestCase):
         healthy.set_execution_group("g")
 
         with self.assertRaisesRegex(ValueError, "member failed"):
-            _run(_executor(), [failing, healthy], SimpleNamespace(), _server_args())
+            _run(
+                _executor(),
+                [failing, healthy],
+                SimpleNamespace(),
+                _server_args(parallel_stage_execution="auto"),
+            )
 
 
 class TestParallelComponentResidency(unittest.TestCase):
