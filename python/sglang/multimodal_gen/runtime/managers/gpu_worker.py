@@ -817,6 +817,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
+            usage=getattr(result, "usage", None),
             trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
             trajectory_latents=getattr(result, "trajectory_latents", None),
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
@@ -851,6 +852,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if output_batch.usage is not None:
+            if merged.usage is None:
+                merged.usage = {}
+            for key, value in output_batch.usage.items():
+                if isinstance(value, int):
+                    merged.usage[key] = int(merged.usage.get(key, 0)) + value
+                else:
+                    merged.usage[key] = value
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None
