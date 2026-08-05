@@ -11,9 +11,10 @@ Contract with the Triton KDA reference:
   - state layout is ``[N, HV, V, K]`` for committed and speculative state.
 
 The optional ``cake`` mode adapts SGLang's raw-gate/indexed-state calls to the
-exported CAKE contracts. Decode accepts precomputed BF16 gate/beta tensors;
-prefill consumes raw gate/beta logits. Both paths gather active state rows,
-launch CAKE, and scatter the updated rows back into SGLang's state pool.
+exported CAKE contracts. Decode accepts precomputed BF16 gate/beta tensors and
+updates 32-bit-addressable state pools directly by index; larger or otherwise
+unsupported pools use a dense gather/scatter fallback. Prefill consumes raw
+gate/beta logits and retains its gather/scatter adapter.
 """
 
 import inspect
@@ -193,6 +194,46 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
                 f"(HV, V, K)={expected_inner}; got {tuple(ssm_states.shape)}"
             )
 
+    @staticmethod
+    def _cake_direct_indexed_state_is_supported(
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        *,
+        batch_size: int,
+    ) -> bool:
+        """Return whether the frozen T=1 kernel can index the pool in place.
+
+        The exported direct-state ABI uses an int32 element offset for each
+        state slot. Keep the check allocation-free and value-independent so it
+        is safe during CUDA graph capture. Index values remain a caller-guaranteed
+        contract: ``-1`` is padding, and all active rows are unique and in bounds.
+        """
+        if (
+            not ssm_states.is_cuda
+            or not cache_indices.is_cuda
+            or ssm_states.device != cache_indices.device
+            or ssm_states.dtype != torch.bfloat16
+            or cache_indices.dtype != torch.int32
+            or cache_indices.ndim != 1
+            or cache_indices.numel() != batch_size
+            or not cache_indices.is_contiguous()
+            or ssm_states.ndim != 4
+            or ssm_states.shape[0] <= 0
+        ):
+            return False
+
+        _, num_value_heads, value_dim, head_dim = ssm_states.shape
+        slot_stride = ssm_states.stride(0)
+        int32_max = torch.iinfo(torch.int32).max
+        return (
+            ssm_states.stride()[1:] == (value_dim * head_dim, head_dim, 1)
+            and slot_stride >= num_value_heads * value_dim * head_dim
+            and slot_stride % 8 == 0
+            and slot_stride <= int32_max
+            and ssm_states.shape[0] * slot_stride <= int32_max
+            and ssm_states.data_ptr() % 16 == 0
+        )
+
     # ---- gate / beta normalization (shared by decode + verify) ----
 
     def _prep_gate_params(self, A_log: torch.Tensor, dt_bias: torch.Tensor):
@@ -310,12 +351,22 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             .reshape(batch_size, 1, num_v_heads)
         )
 
-        # Slot 0 is SGLang's reserved CUDA-graph padding row. Preserve existing
-        # zeros and map any legacy negative marker there as well. Multiple pad
-        # rows may race on slot 0 during index_copy_, but that row is never
-        # allocated to a request and its value is intentionally disposable.
-        state_indices = cache_indices.clamp(min=0).to(torch.int64)
-        state_batch = ssm_states.index_select(0, state_indices).contiguous()
+        direct_indexed_state = self._cake_direct_indexed_state_is_supported(
+            ssm_states,
+            cache_indices,
+            batch_size=batch_size,
+        )
+        if direct_indexed_state:
+            # Preserve the original int32 indices, including -1 CUDA-graph
+            # padding. The frozen direct-state kernel masks padded rows and
+            # updates active slots in the caller-owned pool in place.
+            state = ssm_states
+        else:
+            # The current cubin addresses state slots with int32 element
+            # offsets. Keep the previous dense adapter for larger envelope-
+            # strided page-major/unified pools and other unsupported layouts.
+            state_indices = cache_indices.clamp(min=0).to(torch.int64)
+            state = ssm_states.index_select(0, state_indices).contiguous()
 
         output_fi, _ = self._recurrent_kda(
             q=query_fi,
@@ -324,13 +375,15 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             g=gate_fi,
             beta=beta_fi,
             scale=None,
-            initial_state=state_batch,
+            initial_state=state,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=False,
+            ssm_state_indices=cache_indices if direct_indexed_state else None,
             backend="cake",
         )
-        ssm_states.index_copy_(0, state_indices, state_batch)
+        if not direct_indexed_state:
+            ssm_states.index_copy_(0, state_indices, state)
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
     @staticmethod
