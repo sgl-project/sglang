@@ -585,6 +585,12 @@ def test_internal_worker_ports_are_restricted_by_network_policy():
     }
 
 
+def test_gateway_output_queue_absorbs_one_complete_frame_burst():
+    gateway = (ROOT / "gateway.yaml").read_text()
+
+    assert "--output-queue-depth=32" in gateway
+
+
 def test_trace_uses_otlp_and_cloudwatch_with_five_day_retention():
     documents = load_documents(
         ("gateway.yaml", "coordinator.yaml", "h100-denoiser.yaml", "l4-vae.yaml", "observability.yaml")

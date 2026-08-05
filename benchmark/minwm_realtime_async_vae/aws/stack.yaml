@@ -153,6 +153,7 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                   - dynamodb:GetItem
+                  - dynamodb:DeleteItem
                   - dynamodb:Query
                   - dynamodb:TransactWriteItems
                   - dynamodb:DescribeTable

@@ -188,12 +188,16 @@ def create_app(
     vae_fingerprint: str,
     internal_output_url: str,
     output_queue_depth: int = 2,
+    output_enqueue_timeout_s: float = 1.0,
     lease_renew_interval_s: float = 10.0,
     connect_factory=connect,
     ui_config: dict[str, Any] | None = None,
     trace_query=None,
 ) -> FastAPI:
-    registry = GatewayOutputRegistry(queue_depth=output_queue_depth)
+    registry = GatewayOutputRegistry(
+        queue_depth=output_queue_depth,
+        enqueue_timeout_s=output_enqueue_timeout_s,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -467,6 +471,7 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("REALTIME_GATEWAY_OUTPUT_URL"),
     )
     parser.add_argument("--output-queue-depth", type=int, default=2)
+    parser.add_argument("--output-enqueue-timeout-s", type=float, default=1.0)
     parser.add_argument("--lease-renew-interval-s", type=float, default=10.0)
     parser.add_argument("--trace-log-group")
     return parser.parse_args()
@@ -496,6 +501,7 @@ def main() -> None:
         vae_fingerprint=args.vae_fingerprint,
         internal_output_url=args.internal_output_url,
         output_queue_depth=args.output_queue_depth,
+        output_enqueue_timeout_s=args.output_enqueue_timeout_s,
         lease_renew_interval_s=args.lease_renew_interval_s,
         trace_query=trace_query,
     )

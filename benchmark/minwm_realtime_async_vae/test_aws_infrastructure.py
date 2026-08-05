@@ -31,6 +31,7 @@ def test_iam_policies_are_scoped_to_each_data_plane():
     assert "logs:DeleteLogGroup" not in template
     assert "s3:DeleteObject" not in template
     assert "dynamodb:TransactWriteItems" in template
+    assert "dynamodb:DeleteItem" in template
     assert "logs:StartQuery" in template
     assert "xray:PutTraceSegments" in template
     assert "s3:PutObject" in template

@@ -94,6 +94,7 @@ class GatewayOutputRoute:
     generation_id: str
     token: str
     queue_depth: int
+    enqueue_timeout_s: float
     _queue: asyncio.Queue[bytes | None] = field(init=False)
     _last_chunk_index: int = field(default=-1, init=False)
     _last_frame_batch_index: int = field(default=-1, init=False)
@@ -109,8 +110,6 @@ class GatewayOutputRoute:
     async def put(self, wire: bytes) -> None:
         if self.closed:
             raise OutputRouteClosed("output route is closed")
-        if self._queue.full():
-            raise OutputBackpressureError("Gateway output queue is full")
         message = decode_message(wire)
         if message.get("type") != "frame_batch":
             raise OutputProtocolError("Gateway output accepts frame_batch only")
@@ -133,7 +132,14 @@ class GatewayOutputRoute:
             raise OutputProtocolError("new chunk must start at frame batch zero")
         self._last_chunk_index = chunk_index
         self._last_frame_batch_index = frame_batch_index
-        self._queue.put_nowait(wire)
+        try:
+            await asyncio.wait_for(
+                self._queue.put(wire), timeout=self.enqueue_timeout_s
+            )
+        except TimeoutError as exc:
+            raise OutputBackpressureError(
+                "Gateway output queue remained full"
+            ) from exc
 
     async def get(self) -> bytes:
         wire = await self._queue.get()
@@ -164,10 +170,15 @@ class GatewayOutputRoute:
 
 
 class GatewayOutputRegistry:
-    def __init__(self, *, queue_depth: int = 2) -> None:
+    def __init__(
+        self, *, queue_depth: int = 2, enqueue_timeout_s: float = 1.0
+    ) -> None:
         if queue_depth < 1:
             raise ValueError("queue_depth must be positive")
+        if enqueue_timeout_s <= 0:
+            raise ValueError("enqueue_timeout_s must be positive")
         self.queue_depth = queue_depth
+        self.enqueue_timeout_s = enqueue_timeout_s
         self._routes: dict[str, GatewayOutputRoute] = {}
         self._lock = asyncio.Lock()
 
@@ -189,6 +200,7 @@ class GatewayOutputRegistry:
                 generation_id=generation_id,
                 token=token,
                 queue_depth=self.queue_depth,
+                enqueue_timeout_s=self.enqueue_timeout_s,
             )
             self._routes[session_id] = route
             return route

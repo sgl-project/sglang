@@ -34,7 +34,7 @@ def _frame(chunk: int, batch: int = 0, *, generation: str = "g") -> bytes:
 
 def test_gateway_output_route_is_fenced_ordered_and_bounded():
     async def run():
-        registry = GatewayOutputRegistry(queue_depth=2)
+        registry = GatewayOutputRegistry(queue_depth=2, enqueue_timeout_s=0.01)
         route = await registry.register("s", "g", token="secret")
         with pytest.raises(OutputProtocolError, match="token"):
             await registry.bind("s", "g", token="wrong")
@@ -62,6 +62,25 @@ def test_gateway_output_route_is_fenced_ordered_and_bounded():
 
         await registry.unregister("s", "g", token="secret")
         assert route.closed
+
+    asyncio.run(run())
+
+
+def test_gateway_output_route_waits_for_bounded_capacity():
+    async def run():
+        registry = GatewayOutputRegistry(queue_depth=1, enqueue_timeout_s=0.1)
+        route = await registry.register("s", "g", token="secret")
+
+        await route.put(_frame(0, 0))
+        blocked_put = asyncio.create_task(route.put(_frame(0, 1)))
+        await asyncio.sleep(0.01)
+        assert not blocked_put.done()
+
+        assert await route.get() == _frame(0, 0)
+        route.task_done()
+        await blocked_put
+        assert await route.get() == _frame(0, 1)
+        route.task_done()
 
     asyncio.run(run())
 
