@@ -22,6 +22,36 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class _ChoiceOutputState:
+    """Per-choice state used to normalize both SGLang streaming modes."""
+
+    cumulative_output_ids: List[int] = dataclasses.field(default_factory=list)
+
+
+def _normalize_choice_output(
+    chunk: dict,
+    state: _ChoiceOutputState,
+    *,
+    incremental: bool,
+) -> dict:
+    """Return legacy cumulative IDs and new delta IDs for one choice."""
+    normalized = dict(chunk)
+    current_output_ids = list(chunk.get("output_ids") or [])
+    if incremental:
+        delta_output_ids = current_output_ids
+        state.cumulative_output_ids.extend(current_output_ids)
+    else:
+        previous_count = len(state.cumulative_output_ids)
+        delta_start = previous_count if previous_count <= len(current_output_ids) else 0
+        delta_output_ids = current_output_ids[delta_start:]
+        state.cumulative_output_ids = current_output_ids
+
+    normalized["output_ids"] = list(state.cumulative_output_ids)
+    normalized["delta_output_ids"] = delta_output_ids
+    return normalized
+
+
 class _BadOpenAIRequest(ValueError):
     pass
 
@@ -293,6 +323,7 @@ class RuntimeHandle:
         req_type: str,
         req_dict: dict,
         chunk_callback,
+        choice_aware: bool = False,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         mock_request = (
@@ -306,7 +337,13 @@ class RuntimeHandle:
             obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
             future = self._submit_on_tm_loop(
-                self._run_generate(obj, chunk_callback, stream, mock_request)
+                self._run_generate(
+                    obj,
+                    chunk_callback,
+                    stream,
+                    mock_request,
+                    choice_aware=choice_aware,
+                )
             )
             rid = req_dict.get("rid")
             if isinstance(rid, str):
@@ -321,54 +358,220 @@ class RuntimeHandle:
                 f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
             )
 
-    async def _run_generate(self, obj, chunk_callback, stream: bool, request):
+    @staticmethod
+    def _generation_error_meta(error: Exception) -> dict:
+        status_code = getattr(error, "status_code", None)
+        if status_code is None:
+            status_code = (
+                400 if isinstance(error, (ValidationError, ValueError)) else 500
+            )
+        detail = getattr(error, "detail", None)
+        return {
+            "finish_reason": {
+                "type": "error",
+                "status_code": int(status_code),
+                "message": str(detail if detail is not None else error),
+            }
+        }
+
+    async def _send_generation_errors(
+        self,
+        chunk_callback,
+        ready_event: Optional[asyncio.Event],
+        *,
+        error: Exception,
+        expected_choices: int,
+        terminal_choices: set,
+        timeout_abort_rid,
+    ) -> None:
+        unfinished = [
+            index for index in range(expected_choices) if index not in terminal_choices
+        ]
+        for position, index in enumerate(unfinished):
+            keep_going = await self._send_with_backpressure(
+                chunk_callback,
+                ready_event,
+                {
+                    "index": index,
+                    "output_ids": [],
+                    "delta_output_ids": [],
+                    "meta_info": self._generation_error_meta(error),
+                },
+                finished=position == len(unfinished) - 1,
+                timeout_abort_rid=timeout_abort_rid,
+            )
+            if not keep_going:
+                self._abort_request_id(timeout_abort_rid)
+                return
+
+    async def _run_generate(
+        self,
+        obj,
+        chunk_callback,
+        stream: bool,
+        request,
+        *,
+        choice_aware: bool = False,
+    ):
         ready_event = None
         gen = None
+        sampling_params = getattr(obj, "sampling_params", None)
+        if isinstance(sampling_params, dict):
+            parallel_sample_num = sampling_params.get("n", 1)
+        elif isinstance(sampling_params, list) and sampling_params:
+            parallel_sample_num = sampling_params[0].get("n", 1)
+        else:
+            parallel_sample_num = getattr(obj, "parallel_sample_num", 1)
+        expected_choices = max(1, int(parallel_sample_num))
+        terminal_choices = set()
         try:
             ready_event = self._install_on_ready(chunk_callback)
-            gen = self.tokenizer_manager.generate_request(obj, request=request)
+            generate_kwargs = {"request": request}
+            if choice_aware:
+                generate_kwargs["yield_scheduler_errors"] = True
+            gen = self.tokenizer_manager.generate_request(obj, **generate_kwargs)
             if stream:
-                completed_choices = set()
-                expected_choices = obj.batch_size * obj.parallel_sample_num
+                incremental = bool(
+                    getattr(
+                        getattr(self.tokenizer_manager, "server_args", None),
+                        "incremental_streaming_output",
+                        False,
+                    )
+                )
+                output_states = {
+                    index: _ChoiceOutputState() for index in range(expected_choices)
+                }
                 async for chunk in gen:
+                    choice_index = int(chunk.get("index") or 0)
+                    if not 0 <= choice_index < expected_choices:
+                        self._abort_request_id(obj.rid)
+                        self._send_native_error(
+                            chunk_callback,
+                            f"choice index {choice_index} is outside 0..{expected_choices}",
+                        )
+                        return
+                    if choice_index in terminal_choices:
+                        self._abort_request_id(obj.rid)
+                        self._send_native_error(
+                            chunk_callback,
+                            f"data after terminal for choice {choice_index}",
+                        )
+                        return
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
                     if choice_finished:
-                        choice_id = chunk.get(
-                            "index", chunk.get("meta_info", {}).get("id")
+                        terminal_choices.add(choice_index)
+                    finished = len(terminal_choices) == expected_choices
+                    callback_chunk = (
+                        _normalize_choice_output(
+                            chunk,
+                            output_states[choice_index],
+                            incremental=incremental,
                         )
-                        completed_choices.add(choice_id)
-                    finished = len(completed_choices) >= expected_choices
+                        if choice_aware
+                        else chunk
+                    )
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
-                        chunk,
+                        callback_chunk,
                         finished=finished,
                         timeout_abort_rid=obj.rid,
                     )
                     if finished or not keep_going:
                         return
                 # Defensive: generator exited without a finish_reason chunk.
-                self._safe_callback(chunk_callback, {}, finished=True)
+                missing = sorted(set(range(expected_choices)) - terminal_choices)
+                error = RuntimeError(
+                    f"SGLang stream ended without terminal choices: {missing}"
+                )
+                if choice_aware:
+                    await self._send_generation_errors(
+                        chunk_callback,
+                        ready_event,
+                        error=error,
+                        expected_choices=expected_choices,
+                        terminal_choices=terminal_choices,
+                        timeout_abort_rid=obj.rid,
+                    )
+                else:
+                    self._send_native_error(chunk_callback, str(error))
             else:
                 result = await gen.__anext__()
                 chunks = result if isinstance(result, list) else [result]
+                if len(chunks) != expected_choices:
+                    error = RuntimeError(
+                        f"SGLang returned {len(chunks)} choices; expected {expected_choices}"
+                    )
+                    if choice_aware:
+                        await self._send_generation_errors(
+                            chunk_callback,
+                            ready_event,
+                            error=error,
+                            expected_choices=expected_choices,
+                            terminal_choices=terminal_choices,
+                            timeout_abort_rid=obj.rid,
+                        )
+                    else:
+                        self._send_native_error(chunk_callback, str(error))
+                    return
                 for index, chunk in enumerate(chunks):
+                    callback_chunk = dict(chunk)
+                    callback_chunk.setdefault("index", index)
+                    if choice_aware:
+                        output_ids = list(chunk.get("output_ids") or [])
+                        callback_chunk["output_ids"] = output_ids
+                        callback_chunk["delta_output_ids"] = output_ids
+                    terminal_choices.add(index)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
-                        chunk,
+                        callback_chunk,
                         finished=index == len(chunks) - 1,
                         timeout_abort_rid=obj.rid,
                     )
                     if not keep_going:
                         return
         except StopAsyncIteration:
-            self._safe_callback(chunk_callback, {}, finished=True)
+            error = RuntimeError("SGLang returned no generation result")
+            if choice_aware:
+                await self._send_generation_errors(
+                    chunk_callback,
+                    ready_event,
+                    error=error,
+                    expected_choices=expected_choices,
+                    terminal_choices=terminal_choices,
+                    timeout_abort_rid=obj.rid,
+                )
+            else:
+                self._send_native_error(chunk_callback, str(error))
+        except asyncio.CancelledError:
+            if not choice_aware:
+                raise
+            error = RuntimeError(f"Request aborted: {obj.rid}")
+            error.status_code = 499
+            await self._send_generation_errors(
+                chunk_callback,
+                ready_event,
+                error=error,
+                expected_choices=expected_choices,
+                terminal_choices=terminal_choices,
+                timeout_abort_rid=obj.rid,
+            )
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
+            if choice_aware:
+                await self._send_generation_errors(
+                    chunk_callback,
+                    ready_event,
+                    error=e,
+                    expected_choices=expected_choices,
+                    terminal_choices=terminal_choices,
+                    timeout_abort_rid=obj.rid,
+                )
+            else:
+                self._send_native_error(chunk_callback, str(e))
         finally:
             if gen is not None:
                 await gen.aclose()

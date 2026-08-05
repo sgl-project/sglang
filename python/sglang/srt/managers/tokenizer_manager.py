@@ -745,6 +745,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         self.auto_create_handle_loop()
 
@@ -796,10 +797,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
+                    async for response in self._wait_one_response(
+                        obj,
+                        request,
+                        yield_scheduler_errors=yield_scheduler_errors,
+                    ):
                         yield response
                 else:
-                    async for response in self._handle_batch_request(obj, request):
+                    async for response in self._handle_batch_request(
+                        obj,
+                        request,
+                        yield_scheduler_errors=yield_scheduler_errors,
+                    ):
                         yield response
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
@@ -1620,6 +1629,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         out: dict,
         state: ReqState,
         is_stream: bool,
+        yield_scheduler_errors: bool = False,
     ) -> Optional[dict]:
         """Handle abort/error finish reasons from the scheduler.
 
@@ -1628,17 +1638,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """
         finish_reason = out["meta_info"]["finish_reason"]
 
+        status_code = finish_reason.get("status_code")
+
         if (
             finish_reason.get("type") == "abort"
-            and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+            and status_code == HTTPStatus.BAD_REQUEST
         ):
             if not is_stream:
+                if yield_scheduler_errors:
+                    return out
                 raise ValueError(finish_reason["message"])
             return out
 
-        if finish_reason.get("type") == "abort" and finish_reason.get(
-            "status_code"
-        ) in (
+        if finish_reason.get("type") == "abort" and status_code in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
@@ -1651,8 +1663,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
+                if yield_scheduler_errors:
+                    return out
                 raise fastapi.HTTPException(
-                    status_code=finish_reason["status_code"],
+                    status_code=status_code,
                     detail=finish_reason["message"],
                 )
             return out
@@ -1663,6 +1677,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
@@ -1737,7 +1752,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     abort_out = await self._handle_abort_finish_reason(
-                        out, state, is_stream
+                        out,
+                        state,
+                        is_stream,
+                        yield_scheduler_errors=yield_scheduler_errors,
                     )
                     if abort_out is not None:
                         yield abort_out
@@ -1771,6 +1789,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        yield_scheduler_errors: bool = False,
     ):
         batch_size = obj.batch_size
 
@@ -1788,7 +1807,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[tmp_obj.rid]
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj,
+                            request,
+                            yield_scheduler_errors=yield_scheduler_errors,
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1807,7 +1832,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
-                        generators.append(self._wait_one_response(tmp_obj, request))
+                        generators.append(
+                            self._wait_one_response(
+                                tmp_obj,
+                                request,
+                                yield_scheduler_errors=yield_scheduler_errors,
+                            )
+                        )
                         rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -1866,7 +1897,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj,
+                            request,
+                            yield_scheduler_errors=yield_scheduler_errors,
+                        )
+                    )
                     rids.append(tmp_obj.rid)
 
                 parent_state = self.rid_to_state.get(logical_rid)

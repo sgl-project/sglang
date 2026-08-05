@@ -133,9 +133,52 @@ message GenerateRequest {
 }
 
 message GenerateResponse {
+  // Legacy cumulative response fields. New clients should use the request,
+  // choice, delta, and terminal fields below for multi-choice generation.
   repeated int32 output_ids = 1;
   map<string, string> meta_info = 2;
   bool finished = 3;
+  string request_id = 4;
+  int32 choice_index = 5;
+  repeated int32 delta_output_ids = 6;
+  oneof terminal {
+    GenerationFinish finish = 10;
+    GenerationError error = 11;
+  }
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CANCELLED = 3;
+}
+
+message StopReason {
+  oneof reason {
+    string matched_string = 1;
+    int32 matched_token_id = 2;
+  }
+}
+
+message GenerationFinish {
+  FinishReason reason = 1;
+  optional StopReason stop_reason = 2;
+}
+
+enum GenerationErrorCode {
+  GENERATION_ERROR_CODE_UNSPECIFIED = 0;
+  GENERATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  GENERATION_ERROR_CODE_CANCELLED = 2;
+  GENERATION_ERROR_CODE_UNAVAILABLE = 3;
+  GENERATION_ERROR_CODE_INTERNAL = 4;
+  GENERATION_ERROR_CODE_DEADLINE_EXCEEDED = 5;
+}
+
+message GenerationError {
+  GenerationErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
 }
 
 // ---- Text-based embed (text in, embedding out) ----

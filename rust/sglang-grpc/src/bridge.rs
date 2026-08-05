@@ -28,7 +28,9 @@ impl ResponseChunk {
 pub struct ResponseData {
     pub text: Option<String>,
     pub output_ids: Option<Vec<i32>>,
+    pub delta_output_ids: Option<Vec<i32>>,
     pub embedding: Option<Vec<f32>>,
+    pub choice_index: i32,
     pub json_bytes: Option<Vec<u8>>,
     pub meta_info: HashMap<String, String>,
 }
@@ -67,6 +69,7 @@ struct BridgeState {
 struct ActiveChannel {
     incarnation: u64,
     sender: Sender<ResponseChunk>,
+    preserve_on_explicit_abort: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +159,11 @@ impl PyBridge {
     // Channel + callback helpers
     // ------------------------------------------------------------------
 
-    fn create_channel(&self, rid: &str) -> PyResult<SubmittedRequest> {
+    fn create_channel(
+        &self,
+        rid: &str,
+        preserve_on_explicit_abort: bool,
+    ) -> PyResult<SubmittedRequest> {
         let (sender, receiver) = mpsc::channel(self.response_channel_capacity);
         let mut state = lock_or_recover(self.state.as_ref(), "state");
         if state.abort_all_in_progress {
@@ -179,6 +186,7 @@ impl PyBridge {
             ActiveChannel {
                 incarnation: key.incarnation,
                 sender,
+                preserve_on_explicit_abort,
             },
         );
         Ok(SubmittedRequest { key, receiver })
@@ -219,8 +227,9 @@ impl PyBridge {
         rid: &str,
         req_type: &str,
         req_dict: HashMap<String, serde_json::Value>,
+        choice_aware: bool,
     ) -> PyResult<SubmittedRequest> {
-        let submitted = self.create_channel(rid)?;
+        let submitted = self.create_channel(rid, choice_aware)?;
 
         let result = Python::attach(|py| -> PyResult<()> {
             let py_req_dict = json_map_to_pydict(py, &req_dict)?;
@@ -230,6 +239,7 @@ impl PyBridge {
             kwargs.set_item("req_type", req_type)?;
             kwargs.set_item("req_dict", py_req_dict)?;
             kwargs.set_item("chunk_callback", callback)?;
+            kwargs.set_item("choice_aware", choice_aware)?;
 
             self.runtime_handle
                 .call_method(py, "submit_request", (), Some(&kwargs))?;
@@ -290,14 +300,7 @@ impl PyBridge {
 
         let mut state = lock_or_recover(self.state.as_ref(), "state");
         for key in &keys {
-            if remove_channel_refs_locked(&mut state, key) {
-                state.terminal_errors.insert(
-                    key.clone(),
-                    TerminalError::Aborted {
-                        rid: key.rid.clone(),
-                    },
-                );
-            }
+            finalize_explicit_abort_locked(&mut state, key);
         }
         if abort_all {
             state.abort_all_in_progress = false;
@@ -397,7 +400,7 @@ impl PyBridge {
         F: for<'py> FnOnce(Python<'py>, &Py<PyAny>, Py<PyAny>) -> PyResult<()>,
     {
         // Closure args are: current Python token, RuntimeHandle, and the JSON chunk callback.
-        let submitted = self.create_channel(rid)?;
+        let submitted = self.create_channel(rid, false)?;
 
         let result = Python::attach(|py| -> PyResult<()> {
             let callback = self.make_json_callback(py, submitted.key.clone())?;
@@ -558,6 +561,23 @@ fn remove_channel_refs_locked(state: &mut BridgeState, key: &RequestKey) -> bool
     }
     remove_auxiliary_refs_locked(state, key);
     is_active
+}
+
+fn finalize_explicit_abort_locked(state: &mut BridgeState, key: &RequestKey) {
+    let preserves_choice_terminals = state.channels.get(key.rid()).is_some_and(|channel| {
+        channel.incarnation == key.incarnation && channel.preserve_on_explicit_abort
+    });
+    if preserves_choice_terminals {
+        return;
+    }
+    if remove_channel_refs_locked(state, key) {
+        state.terminal_errors.insert(
+            key.clone(),
+            TerminalError::Aborted {
+                rid: key.rid.clone(),
+            },
+        );
+    }
 }
 
 fn remove_channel_refs(key: &RequestKey, state: &BridgeStateRef) {
@@ -766,16 +786,27 @@ impl ChunkCallback {
             .get_item("output_ids")?
             .and_then(|v| v.extract::<Vec<i32>>().ok());
 
+        let delta_output_ids: Option<Vec<i32>> = chunk
+            .get_item("delta_output_ids")?
+            .and_then(|v| v.extract::<Vec<i32>>().ok());
+
         let embedding: Option<Vec<f32>> = chunk
             .get_item("embedding")?
             .and_then(|v| v.extract::<Vec<f32>>().ok());
+
+        let choice_index = chunk
+            .get_item("index")?
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(0);
 
         let meta_info = extract_meta_info(chunk);
 
         let data = ResponseData {
             text,
             output_ids,
+            delta_output_ids,
             embedding,
+            choice_index,
             json_bytes: None,
             meta_info,
         };
@@ -864,7 +895,9 @@ impl JsonChunkCallback {
         let data = ResponseData {
             text: None,
             output_ids: None,
+            delta_output_ids: None,
             embedding: None,
+            choice_index: 0,
             json_bytes: Some(bytes_data),
             meta_info,
         };
