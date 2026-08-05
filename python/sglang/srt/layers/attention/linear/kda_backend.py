@@ -890,11 +890,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
         # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size, with a single-request width-16 split-V path.
-        if not (
-            2 <= draft_token_num <= 8
-            or (draft_token_num == 16 and mixed_qkv.shape[0] == 16)
-        ):
+        # specialized per block size. Width 16 is fully supported at any batch
+        # size: single request dispatches to the eight-CTA split-V kernel,
+        # batches run the serial-family kernel (both validated bitwise
+        # isolated per request; see benchmark/bench_linear_attention).
+        if not (2 <= draft_token_num <= 8 or draft_token_num == 16):
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -973,8 +973,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         seq_len = mixed_qkv.shape[0]
-        split_v = seq_len == 16 and query_start_loc.shape[0] == 2
-        if split_v:
+        num_req = query_start_loc.shape[0] - 1
+        draft_num = seq_len // num_req if num_req > 0 else 0
+        # Width-8/16 kernel dispatch (all validated bitwise per request; see
+        # benchmark/bench_linear_attention/WORKLOG.md for the measured table).
+        # With the two-stage onorm the split kernels never co-schedule V-slice
+        # clusters - the small onorm-apply kernel performs the cross-slice RMS
+        # reduce + gate/weight in a second cluster-free launch:
+        #   N==1      -> z16 cluster (fused onorm). The two-stage's bf16 raw
+        #                round-trip shifts rms by ~1 ulp vs the in-kernel fp32
+        #                sum, which measurably drops dflash accept length
+        #                (humaneval b16: 7.75 -> 7.63 aggregate). At N==1 the
+        #                cluster has no scheduling cliff, so fidelity wins.
+        #   N==2..3   -> z32 two-stage (w16: 14.4/15.0, w8: 10.5/11.0;
+        #                serial 21.3; bs=3 was a 28.8us cluster cliff)
+        #   N==4..6, w16 -> z64 cluster with a 512-thread CTA and the fused
+        #                fp32 onorm (20.0/20.4/20.8; paired vs the two-stage
+        #                0.974-0.989x; 96..144 CTAs stay one-wave, N>=7 needs
+        #                a second wave and serial wins back). w8 N>=4 -> serial
+        #                (z64 cluster paired 1.035-1.050x slower than serial).
+        if draft_num in (8, 16) and 2 <= num_req <= 3:
+            split_tile_v = 32
+        elif draft_num == 16 and 4 <= num_req <= 6:
+            split_tile_v = 64
+        else:
+            split_tile_v = None
+        # split_tile_v is a specialization of the split-file kernel: split_v
+        # must be on whenever a tile is selected.
+        split_v = draft_num in (8, 16) and (num_req == 1 or split_tile_v is not None)
+        if split_v or split_tile_v:
             from sglang.kernels.ops.kimi_k3.kda_decode_mtp_split import (
                 fused_kda_decode_mtp_dspark,
             )
@@ -1008,6 +1035,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
         apply_onorm = onorm_gate is not None and fused_static is not None
+        # z64 cells run the cluster's fused fp32 onorm; the cluster-free
+        # two-stage chain only wins for the four-CTA-slice z32 (N<=3).
+        two_stage = apply_onorm and split_tile_v == 32
         if apply_onorm:
             onorm_weight = fused_static[5]
             onorm_eps = fused_static[6]
@@ -1045,11 +1075,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
-            onorm_gate=onorm_gate,
-            onorm_weight=onorm_weight,
-            onorm_eps=onorm_eps,
+            onorm_gate=None if two_stage else onorm_gate,
+            onorm_weight=None if two_stage else onorm_weight,
+            onorm_eps=None if two_stage else onorm_eps,
+            pdl_late=two_stage,
             **({"split_v": True} if split_v else {}),
+            **({"split_tile_v": split_tile_v} if split_tile_v else {}),
         )
+        if two_stage:
+            from sglang.kernels.ops.kimi_k3.kda_onorm_apply import kda_onorm_apply
+
+            normed = torch.empty_like(out)
+            kda_onorm_apply(
+                raw=out,
+                gate=onorm_gate,
+                weight=onorm_weight,
+                out=normed,
+                eps=onorm_eps,
+            )
+            out = normed
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out

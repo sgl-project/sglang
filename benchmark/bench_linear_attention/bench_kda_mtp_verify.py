@@ -29,6 +29,7 @@ from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
 from sglang.kernels.ops.kimi_k3.kda_decode_mtp_split import (
     fused_kda_decode_mtp_dspark as fused_kda_decode_mtp_split,
 )
+from sglang.kernels.ops.kimi_k3.kda_onorm_apply import kda_onorm_apply
 
 K = 128
 W = 4
@@ -155,10 +156,16 @@ def clone_inputs(inp: Inputs) -> Inputs:
     return Inputs(**values)
 
 
+_BLOCK_THREADS: int | None = None
+
+
 def _run_cutedsl(
     inp: Inputs,
     *,
     split_v: bool,
+    resident_v: bool = False,
+    split_tile_v: int | None = None,
+    block_threads: int | None = None,
     cache_ring: bool = True,
     intermediate_ssm: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -175,7 +182,11 @@ def _run_cutedsl(
     cs_q, cs_k, cs_v = inp.conv_states.split(channels, dim=1)
     ic_q, ic_k, ic_v = inp.intermediate_conv.split(channels, dim=2)
 
-    kernel = fused_kda_decode_mtp_split if split_v else fused_kda_decode_mtp_serial
+    kernel = (
+        fused_kda_decode_mtp_split
+        if split_v or resident_v
+        else fused_kda_decode_mtp_serial
+    )
     return kernel(
         x_q=x_q,
         x_k=x_k,
@@ -208,15 +219,30 @@ def _run_cutedsl(
         onorm_weight=inp.onorm_weight,
         onorm_eps=inp.onorm_eps,
         **({"split_v": True} if split_v else {}),
+        **({"resident_v": True} if resident_v else {}),
+        **({"split_tile_v": split_tile_v} if split_tile_v else {}),
+        **(
+            {"block_threads": block_threads or _BLOCK_THREADS}
+            if (split_v and (block_threads or _BLOCK_THREADS))
+            else {}
+        ),
     )
 
 
 def run_cutedsl(inp: Inputs) -> torch.Tensor:
-    """Run the production CuTeDSL dispatch policy."""
-    return _run_cutedsl(
-        inp,
-        split_v=inp.batch_size == 1 and inp.width == 16,
-    )
+    """Run the production CuTeDSL dispatch policy (mirrors kda_backend;
+    all validated bitwise per request; see WORKLOG.md):
+    N==1 -> z16 cluster (accept-length fidelity; see [bs1-cluster-fidelity]),
+    N 2..3 -> z32 two-stage, N 4..6 w16 -> z64 cluster (512t, fused onorm),
+    else serial family."""
+    if inp.width in (8, 16):
+        if inp.batch_size == 1:
+            return _run_cutedsl(inp, split_v=True)
+        if inp.batch_size in (2, 3):
+            return _run_two_stage(inp, split_tile_v=32)
+        if inp.batch_size in (4, 5, 6) and inp.width == 16:
+            return _run_cutedsl(inp, split_v=True, split_tile_v=64)
+    return _run_cutedsl(inp, split_v=False)
 
 
 def run_cutedsl_serial(inp: Inputs) -> torch.Tensor:
@@ -227,10 +253,105 @@ def run_cutedsl_split(inp: Inputs) -> torch.Tensor:
     return _run_cutedsl(inp, split_v=True)
 
 
+def run_cutedsl_resident(inp: Inputs) -> torch.Tensor:
+    return _run_cutedsl(inp, split_v=False, resident_v=True)
+
+
+def run_cutedsl_split64(inp: Inputs) -> torch.Tensor:
+    return _run_cutedsl(inp, split_v=True, split_tile_v=64)
+
+
+def run_cutedsl_split32(inp: Inputs) -> torch.Tensor:
+    return _run_cutedsl(inp, split_v=True, split_tile_v=32)
+
+
+def _run_two_stage(
+    inp: Inputs,
+    *,
+    split_tile_v: int,
+    block_threads: int | None = None,
+    cache_ring: bool = True,
+    intermediate_ssm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    channels = inp.heads * K
+    tokens = inp.batch_size * inp.width
+    qkv = inp.mixed_qkv.reshape(tokens, 3 * channels)
+    x_q, x_k, x_v = qkv.split(channels, dim=-1)
+    x_q = x_q.reshape(1, tokens, inp.heads, K)
+    x_k = x_k.reshape(1, tokens, inp.heads, K)
+    x_v = x_v.reshape(1, tokens, inp.heads, K)
+    w_q, w_k, w_v = inp.conv_weights.split(channels, dim=0)
+    cs_q, cs_k, cs_v = inp.conv_states.split(channels, dim=1)
+    ic_q, ic_k, ic_v = inp.intermediate_conv.split(channels, dim=2)
+    raw = fused_kda_decode_mtp_split(
+        x_q=x_q,
+        x_k=x_k,
+        x_v=x_v,
+        w_q=w_q,
+        w_k=w_k,
+        w_v=w_v,
+        cs_q=cs_q,
+        cs_k=cs_k,
+        cs_v=cs_v,
+        g=inp.gate,
+        beta=inp.beta,
+        A_log=inp.A_log,
+        dt_bias=inp.dt_bias,
+        recurrent_state=inp.recurrent_state,
+        intermediate_ssm=intermediate_ssm,
+        intermediate_state_indices=inp.intermediate_state_indices,
+        intermediate_conv_q=ic_q,
+        intermediate_conv_k=ic_k,
+        intermediate_conv_v=ic_v,
+        ssm_state_indices=inp.cache_indices,
+        cu_seqlens=inp.query_start_loc,
+        lower_bound=LOWER_BOUND,
+        scale=K**-0.5,
+        split_v=True,
+        split_tile_v=split_tile_v,
+        block_threads=block_threads or _BLOCK_THREADS,
+        pdl_late=True,
+        replayssm_rawv=inp.rawv if cache_ring else None,
+        replayssm_rawk=inp.rawk if cache_ring else None,
+        replayssm_g=inp.ring_g if cache_ring else None,
+        replayssm_beta=inp.ring_beta if cache_ring else None,
+        onorm_gate=None,
+        onorm_weight=None,
+        onorm_eps=None,
+    )
+    out = torch.empty_like(x_v)
+    kda_onorm_apply(
+        raw=raw,
+        gate=inp.onorm_gate,
+        weight=inp.onorm_weight,
+        out=out,
+        eps=inp.onorm_eps,
+    )
+    return out
+
+
+def run_cutedsl_split32_2s(inp: Inputs) -> torch.Tensor:
+    return _run_two_stage(inp, split_tile_v=32)
+
+
+def run_cutedsl_split16_2s(inp: Inputs) -> torch.Tensor:
+    return _run_two_stage(inp, split_tile_v=16)
+
+
+def run_cutedsl_split64_2s(inp: Inputs) -> torch.Tensor:
+    return _run_two_stage(inp, split_tile_v=64)
+
+
 PROVIDERS: dict[str, Callable[[Inputs], torch.Tensor]] = {
     "cutedsl": run_cutedsl,
     "cutedsl_serial": run_cutedsl_serial,
     "cutedsl_split": run_cutedsl_split,
+    "cutedsl_resident": run_cutedsl_resident,
+    "cutedsl_split64": run_cutedsl_split64,
+    "cutedsl_split32": run_cutedsl_split32,
+    "cutedsl_split32_2s": run_cutedsl_split32_2s,
+    "cutedsl_split16_2s": run_cutedsl_split16_2s,
+    "cutedsl_split64_2s": run_cutedsl_split64_2s,
 }
 
 
@@ -261,66 +382,152 @@ def _committed_state(initial: torch.Tensor, inp: Inputs, accepted: int) -> torch
     return state
 
 
+def _slice_request(original: Inputs, request: int) -> Inputs:
+    """Build the bs=1 Inputs holding only ``request``'s tokens while keeping its
+    pool/scratch slot assignments, so the per-request run is comparable against
+    that same request inside a batch run."""
+    w = original.width
+    sliced = clone_inputs(original)
+    sliced.mixed_qkv = original.mixed_qkv[request : request + 1].clone()
+    sliced.intermediate_conv = original.intermediate_conv[request : request + 1].clone()
+    for name in ("gate", "beta", "onorm_gate"):
+        full = getattr(original, name)
+        setattr(sliced, name, full[:, request * w : (request + 1) * w].clone())
+    sliced.cache_indices = original.cache_indices[request : request + 1].clone()
+    sliced.query_start_loc = torch.arange(
+        0,
+        w + 1,
+        w,
+        dtype=original.query_start_loc.dtype,
+        device=original.query_start_loc.device,
+    )
+    # Rollback scratch rows are indexed by intermediate_state_indices: remap to
+    # row 0 of the sliced single-row buffer (compare against batch row
+    # ``request``). Keeping the original row would index out of bounds.
+    sliced.intermediate_state_indices = torch.zeros_like(
+        original.intermediate_state_indices[request : request + 1]
+    )
+    sliced.batch_size = 1
+    return sliced
+
+
 def check_invariants(args: argparse.Namespace) -> None:
-    if args.batch_size != 1 or args.width != 16:
-        raise ValueError("split-V invariant checks require --batch-size 1 --width 16")
+    """Strict checks for the cute-DSL verify kernel at the requested shape.
+
+    For every seed and every request: the ReplaySSM commit fold must reproduce
+    the per-step snapshots within bf16 ring-quantization slack (the serial
+    kernel carries fp32 intermediates the fold re-reads as bf16, ~2e-3 abs;
+    the split kernel round-trips quantized values and lands ~1e-6), the ring
+    and non-ring kernel modes must agree bitwise, graph replays must equal the
+    eager launch bitwise, and a padded request must not touch its former slot.
+    At batch > 1, each request's outputs must additionally equal its
+    standalone bs=1 run bitwise.
+    """
+    batch_size, width = args.batch_size, args.width
+    # split-V is production dispatch at the bs=1/w16 shape; the serial kernel
+    # covers everything else. Both are held to the same bar. --force-split
+    # validates the width-16 split-V kernel at larger batch sizes.
+    if getattr(args, "force_split", False) and width not in (8, 16):
+        raise ValueError("--force-split requires --width 8 or 16")
+    resident_v = getattr(args, "force_resident", False)
+    split_tile_v = getattr(args, "split_tile", None)
+    # two_stage_tile: 16/32 when the production policy dispatches a two-stage
+    # kernel; None for the classic cluster-split/serial/resident branches.
+    two_stage_tile = None
+    if getattr(args, "two_stage", False):
+        if width not in (8, 16):
+            raise ValueError("--two-stage requires --width 8 or 16")
+        two_stage_tile = split_tile_v if split_tile_v is not None else 32
+        split_v = False
+    elif getattr(args, "force_split", False):
+        split_v = True and not resident_v
+    elif resident_v:
+        split_v = False
+    else:
+        # production policy (mirrors kda_backend; see WORKLOG.md)
+        split_v = batch_size == 1 and width in (8, 16)
+        if batch_size in (2, 3) and width in (8, 16) and split_tile_v is None:
+            split_v = False
+            two_stage_tile = 32
+        if batch_size in (4, 5, 6) and width == 16 and split_tile_v is None:
+            split_v = True
+            split_tile_v = 64
+    if resident_v:
+        provider = "cutedsl_resident"
+    elif two_stage_tile == 16:
+        provider = "cutedsl_split16_2s"
+    elif two_stage_tile == 32:
+        provider = "cutedsl_split32_2s"
+    elif two_stage_tile == 64:
+        provider = "cutedsl_split64_2s"
+    elif split_v:
+        provider = {
+            64: "cutedsl_split64",
+            32: "cutedsl_split32",
+        }.get(split_tile_v, "cutedsl_split")
+    else:
+        provider = "cutedsl_serial"
+
+    def dispatch_call(x, **kw):
+        if two_stage_tile is not None:
+            return _run_two_stage(x, split_tile_v=two_stage_tile, **kw)
+        return _run_cutedsl(
+            x, split_v=split_v, resident_v=resident_v, split_tile_v=split_tile_v, **kw
+        )
 
     max_replay_snapshot_rel = 0.0
     for seed in args.check_seeds:
         original = make_inputs(
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             heads=args.heads,
-            width=args.width,
+            width=width,
             ring_len=args.ring_len,
             seed=seed,
         )
         cute_inp = clone_inputs(original)
-        cute_out = run_cutedsl(cute_inp)
+        cute_out = dispatch_call(cute_inp)
         torch.cuda.synchronize()
 
-        # ReplaySSM commit must reconstruct the same accepted state that
-        # the non-ring split-V path snapshots after each token. This is an
-        # internal invariant, not a comparison against another backend.
         snapshot_inp = clone_inputs(original)
         snapshots = torch.empty(
-            args.batch_size,
-            args.width,
+            batch_size,
+            width,
             args.heads,
             K,
             K,
             device="cuda",
             dtype=torch.float32,
         )
-        snapshot_out = _run_cutedsl(
+        snapshot_out = dispatch_call(
             snapshot_inp,
-            split_v=True,
             cache_ring=False,
             intermediate_ssm=snapshots,
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(snapshot_out, cute_out, rtol=0, atol=0)
-        slot = int(cute_inp.cache_indices[0].item())
-        scratch_row = int(cute_inp.intermediate_state_indices[0].item())
-        seed_replay_snapshot_rel = 0.0
-        for accepted in range(1, args.width + 1):
+        seed_rel = 0.0
+        for accepted in range(1, width + 1):
             committed = _committed_state(original.recurrent_state, cute_inp, accepted)
-            snapshot_rel = _relative_max(
-                committed[slot],
-                snapshots[scratch_row, accepted - 1],
-            )
-            seed_replay_snapshot_rel = max(seed_replay_snapshot_rel, snapshot_rel)
-            max_replay_snapshot_rel = max(max_replay_snapshot_rel, snapshot_rel)
-            torch.testing.assert_close(
-                committed[slot],
-                snapshots[scratch_row, accepted - 1],
-                rtol=1e-5,
-                atol=1e-5,
-            )
+            for r in range(batch_size):
+                slot = int(cute_inp.cache_indices[r].item())
+                scratch_row = int(cute_inp.intermediate_state_indices[r].item())
+                rel = _relative_max(
+                    committed[slot],
+                    snapshots[scratch_row, accepted - 1],
+                )
+                seed_rel = max(seed_rel, rel)
+                torch.testing.assert_close(
+                    committed[slot],
+                    snapshots[scratch_row, accepted - 1],
+                    rtol=1e-2,
+                    atol=3e-3,
+                )
+        max_replay_snapshot_rel = max(max_replay_snapshot_rel, seed_rel)
 
-        eager_out = run_cutedsl(cute_inp)
+        eager_out = dispatch_call(cute_inp)
         torch.cuda.synchronize()
         eager_out = eager_out.clone()
-        captured = capture_provider("cutedsl", [cute_inp])
+        captured = capture_provider(provider, [cute_inp])
         captured.graph.replay()
         torch.cuda.synchronize()
         graph_out = captured.outputs[0].clone()
@@ -329,9 +536,18 @@ def check_invariants(args: argparse.Namespace) -> None:
         torch.cuda.synchronize()
         torch.testing.assert_close(captured.outputs[0], graph_out, rtol=0, atol=0)
         torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+
+        extra = ""
+        if split_v or two_stage_tile is not None:
+            serial_out = _run_cutedsl(clone_inputs(original), split_v=False)
+            torch.cuda.synchronize()
+            serial_rel = _relative_max(cute_out, serial_out)
+            extra = f" serial_rel={serial_rel:.4g}"
+            if serial_rel > 1e-2:
+                raise AssertionError(f"split vs serial output rel={serial_rel:.4g}")
         print(
-            f"seed={seed} replay_snapshot_rel={seed_replay_snapshot_rel:.6g} "
-            f"checksum={cute_out.float().sum().item():.6g}"
+            f"seed={seed} replay_snapshot_rel={seed_rel:.6g} "
+            f"checksum={cute_out.float().sum().item():.6g}{extra}"
         )
 
     print(
@@ -339,28 +555,29 @@ def check_invariants(args: argparse.Namespace) -> None:
         f"max_replay_snapshot_rel={max_replay_snapshot_rel:.6g}"
     )
 
-    # Exercise the split kernel's CUDA-graph padding exit. The request uses
-    # the null slot; its old physical slot and rollback scratch must remain
-    # untouched across repeated graph replays.
+    # CUDA-graph padding exit: send the last request to the null slot. Its
+    # former physical slot and rollback scratch rows must stay untouched and
+    # its output rows must be zeroed across repeated graph replays.
     padded = make_inputs(
-        batch_size=1,
+        batch_size=batch_size,
         heads=args.heads,
-        width=args.width,
+        width=width,
         ring_len=args.ring_len,
         seed=args.seed,
     )
-    padded.cache_indices[0] = -1
-    pad_slot = padded.batch_size
+    pad_request = batch_size - 1
+    pad_slot = int(padded.cache_indices[pad_request].item())
+    padded.cache_indices[pad_request] = -1
     padded.rawv[pad_slot].normal_()
     padded.rawk[pad_slot].normal_()
     padded.ring_g[pad_slot].normal_()
     padded.ring_beta[pad_slot].normal_()
-    padded.intermediate_conv[0].normal_()
+    padded.intermediate_conv[pad_request].normal_()
     sentinels = {
         name: getattr(padded, name).clone()
         for name in ("rawv", "rawk", "ring_g", "ring_beta", "intermediate_conv")
     }
-    captured = capture_provider("cutedsl_split", [padded])
+    captured = capture_provider(provider, [padded])
     for _ in range(100):
         captured.graph.replay()
     torch.cuda.synchronize()
@@ -370,11 +587,60 @@ def check_invariants(args: argparse.Namespace) -> None:
             sentinels[name][pad_slot],
         ):
             raise AssertionError(f"padding request modified {name} slot {pad_slot}")
-    if not torch.equal(padded.intermediate_conv, sentinels["intermediate_conv"]):
+    if not torch.equal(
+        padded.intermediate_conv[pad_request],
+        sentinels["intermediate_conv"][pad_request],
+    ):
         raise AssertionError("padding request modified rollback convolution scratch")
-    pad_out = captured.outputs[0]
-    if torch.count_nonzero(pad_out).item() != 0:
+    pad_rows = captured.outputs[0].reshape(batch_size * width, -1)[
+        pad_request * width : (pad_request + 1) * width
+    ]
+    if torch.count_nonzero(pad_rows).item() != 0:
         raise AssertionError("padding request output was not zeroed")
+    print("padding exit ok")
+
+    # Batch isolation: a request inside a batch must match its standalone bs=1
+    # run bitwise (same kernel, same inputs, distinct random neighbors).
+    if batch_size > 1:
+        for seed in args.check_seeds:
+            original = make_inputs(
+                batch_size=batch_size,
+                heads=args.heads,
+                width=width,
+                ring_len=args.ring_len,
+                seed=seed,
+            )
+            batch_inp = clone_inputs(original)
+            batch_out = dispatch_call(batch_inp)
+            torch.cuda.synchronize()
+            for r in range(batch_size):
+                sliced = _slice_request(original, r)
+                iso_out = dispatch_call(sliced)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    iso_out[0],
+                    batch_out[0, r * width : (r + 1) * width],
+                    rtol=0,
+                    atol=0,
+                )
+                slot = int(original.cache_indices[r].item())
+                for name in ("rawv", "rawk", "ring_g", "ring_beta"):
+                    torch.testing.assert_close(
+                        getattr(sliced, name)[slot],
+                        getattr(batch_inp, name)[slot],
+                        rtol=0,
+                        atol=0,
+                    )
+                torch.testing.assert_close(
+                    sliced.intermediate_conv[0],
+                    batch_inp.intermediate_conv[r],
+                    rtol=0,
+                    atol=0,
+                )
+        print(
+            f"isolation ok: batch={batch_size} requests bitwise-match "
+            f"standalone runs"
+        )
 
 
 def sanitize_once(args: argparse.Namespace) -> None:
@@ -503,7 +769,7 @@ def warm_graphs(
 
 
 def _make_layer_inputs(args: argparse.Namespace) -> list[Inputs]:
-    return [
+    inputs = [
         make_inputs(
             batch_size=args.batch_size,
             heads=args.heads,
@@ -513,6 +779,21 @@ def _make_layer_inputs(args: argparse.Namespace) -> list[Inputs]:
         )
         for layer in range(args.layers)
     ]
+    if getattr(args, "shared_pool", False):
+        # Production keeps one cache pool resident (L2-friendlier); the bench
+        # default of 69 distinct pools pessimizes high-batch cells into the
+        # DRAM-bound regime. Share the layer-0 state/rings across layers.
+        base = inputs[0]
+        for inp in inputs[1:]:
+            inp.recurrent_state = base.recurrent_state
+            inp.conv_states = base.conv_states
+            inp.intermediate_conv = base.intermediate_conv
+            inp.rawv = base.rawv
+            inp.rawk = base.rawk
+            inp.ring_g = base.ring_g
+            inp.ring_beta = base.ring_beta
+            inp.intermediate_state_indices = base.intermediate_state_indices
+    return inputs
 
 
 def benchmark(args: argparse.Namespace) -> None:
@@ -639,12 +920,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=69)
     parser.add_argument("--warmup-seconds", type=float, default=3.0)
     parser.add_argument("--cache", choices=("warm", "cold"), default="warm")
+    parser.add_argument(
+        "--shared-pool",
+        action="store_true",
+        help="bench mode: all layers share the layer-0 state/ring tensors, "
+        "emulating production's single L2-resident cache pool",
+    )
     parser.add_argument("--profile-iterations", type=int, default=200)
+    parser.add_argument(
+        "--force-split",
+        action="store_true",
+        help="check mode: validate the width-16 split-V kernel at any batch size",
+    )
+    parser.add_argument(
+        "--force-resident",
+        action="store_true",
+        help="check mode: validate the full-width resident kernel at any shape",
+    )
+    parser.add_argument(
+        "--split-tile",
+        type=int,
+        default=None,
+        choices=(16, 32, 64),
+        help="split-V CTA tile rows (16 = z8, 64 = z2)",
+    )
+    parser.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="check mode: validate the cluster-free two-stage path (raw split "
+        "kernel + kda_onorm_apply) with --split-tile at any batch size",
+    )
+    parser.add_argument(
+        "--block-threads",
+        type=int,
+        default=None,
+        help="override the split-V kernel's CTA thread count (width sweeps)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.block_threads is not None:
+        global _BLOCK_THREADS
+        _BLOCK_THREADS = args.block_threads
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("KDA CuTeDSL verify benchmark requires an SM10x GPU")
     if args.mode == "check":
