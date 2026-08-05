@@ -212,7 +212,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
+        if not current_platform.is_mps():
+            torch.get_device_module().set_device(self.local_rank)
         intra_op_threads = _worker_cpu_intra_op_threads(self.server_args.num_gpus)
         if intra_op_threads is not None:
             torch.set_num_threads(intra_op_threads)
@@ -282,9 +283,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+        peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
+        peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
@@ -297,11 +297,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
+        pool_overhead_ratio = (
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb else 0.0
+        )
 
         logger.debug(
             f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
+            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_ratio:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
@@ -403,7 +406,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         output_batch = None
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            if (
+                self.rank == 0
+                and not current_platform.is_cpu()
+                and not current_platform.is_mps()
+            ):
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -609,8 +616,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        output_batch.peak_memory_mb = capture_memory_snapshot().peak_reserved_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None

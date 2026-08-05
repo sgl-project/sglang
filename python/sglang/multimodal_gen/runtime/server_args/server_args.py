@@ -1136,9 +1136,9 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
+            if self.num_gpus != 1:
+                raise ValueError("MPS currently supports only --num-gpus 1")
             self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-            self.layerwise_offload_components = None
             if (
                 self.dit_cpu_offload
                 or self.text_encoder_cpu_offload

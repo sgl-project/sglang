@@ -104,8 +104,24 @@ class VAELoader(ComponentLoader):
     ):
         return server_args.vae_cpu_offload
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
@@ -140,7 +156,11 @@ class VAELoader(ComponentLoader):
             vae_config.post_init()
 
         should_offload = self.should_offload(server_args)
-        target_device = self.target_device(should_offload)
+        target_device = (
+            torch.device("cpu")
+            if cpu_offload_flag
+            else self.target_device(should_offload)
+        )
 
         native_only = component_name in getattr(
             server_args.pipeline_config, "native_only_components", ()
@@ -194,7 +214,11 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
-        vae.load_state_dict(loaded, strict=strict_load)
+        vae.load_state_dict(
+            loaded,
+            strict=strict_load,
+            assign=bool(cpu_offload_flag and current_platform.is_mps()),
+        )
 
         if not strict_load:
             state_keys = set(vae.state_dict().keys())

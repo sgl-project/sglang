@@ -426,7 +426,7 @@ class TextEncoderLoader(ComponentLoader):
             )
             should_offload = False
 
-        if should_offload and not current_platform.is_mps():
+        if should_offload:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
@@ -458,6 +458,12 @@ class TextEncoderLoader(ComponentLoader):
                 model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
+            if current_platform.is_mps() and should_offload:
+                # the h3 encoder is layered immediately after this loader returns
+                # compatible CPU safetensors stay mapped instead of copying the
+                # full Qwen checkpoint into unified memory
+                model._mps_zero_copy_weight_loading = True
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
@@ -471,9 +477,9 @@ class TextEncoderLoader(ComponentLoader):
                 # Disable FSDP for MPS as it's not compatible
                 if current_platform.is_mps():
                     logger.info(
-                        "Disabling FSDP sharding for MPS platform as it's not compatible"
+                        "Keeping %s on CPU for MPS layerwise offload",
+                        model.__class__.__name__,
                     )
-                    model = model.to(local_torch_device)
                 elif fsdp_cpu_offload:
                     mesh = init_device_mesh(
                         current_platform.device_type,

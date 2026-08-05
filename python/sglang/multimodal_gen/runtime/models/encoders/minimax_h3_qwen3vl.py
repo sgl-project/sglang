@@ -41,6 +41,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     """
 
     supports_dp_encode = True
+    # the inherited text-layer list covers qwen's language stack
+    # reference modes also execute the embedded visual tower
+    layer_names = ["model.language_model.layers", "model.visual.blocks"]
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -177,7 +180,18 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
-                weight_loader(param, loaded_weight.to(param.dtype))
+                can_keep_checkpoint_tensor = bool(
+                    getattr(self, "_mps_zero_copy_weight_loading", False)
+                    and weight_loader is default_weight_loader
+                    and param.device.type == "cpu"
+                    and loaded_weight.device.type == "cpu"
+                    and loaded_weight.dtype == param.dtype
+                    and tuple(loaded_weight.shape) == tuple(param.shape)
+                )
+                if can_keep_checkpoint_tensor:
+                    param.data = loaded_weight
+                else:
+                    weight_loader(param, loaded_weight.to(param.dtype))
             except Exception as exc:
                 raise RuntimeError(
                     "Failed to load MiniMax H3 Qwen3-VL weight "

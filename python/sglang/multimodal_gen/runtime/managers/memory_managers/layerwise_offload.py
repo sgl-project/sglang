@@ -1,5 +1,6 @@
 import re
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
@@ -23,7 +24,8 @@ class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
 
     This utility offloads per-layer parameters/buffers from GPU to CPU, and
-    supports async H2D prefetch using a dedicated CUDA stream.
+    supports async H2D prefetch using a dedicated CUDA stream. MPS uses
+    synchronous per-layer transfers from the checkpoint-backed CPU tensors.
 
     Typical usage:
     - Construct the manager with the target model and the list-like module
@@ -47,7 +49,10 @@ class LayerwiseOffloadManager:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
-        self.pin_cpu_memory = pin_cpu_memory
+        self._synchronous_mps = current_platform.is_mps()
+        # mps shares physical memory with the CPU and has no pinned host memory
+        # or CUDA-style copy streams
+        self.pin_cpu_memory = bool(pin_cpu_memory and not self._synchronous_mps)
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
         # Leading layers held on GPU across denoise steps, instead of being
         # re-streamed every step like the tail.
@@ -62,10 +67,17 @@ class LayerwiseOffloadManager:
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
-        self.device = torch.device(
-            current_platform.device_type, torch.get_device_module().current_device()
+        self.device = (
+            current_platform.get_local_torch_device()
+            if current_platform.is_mps()
+            else torch.device(
+                current_platform.device_type,
+                torch.get_device_module().current_device(),
+            )
         )
-        self.copy_stream = torch.get_device_module().Stream()
+        self.copy_stream = (
+            None if self._synchronous_mps else torch.get_device_module().Stream()
+        )
 
         # ``named_parameters()`` is relative to ``model``, just like the path in
         # ``layers_attr_str``. Anchor the match so a manager for top-level
@@ -81,6 +93,9 @@ class LayerwiseOffloadManager:
         # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
         # stores tensors whose original non-contiguous stride/layout must be preserved
         self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        # mps keeps the original CPU tensor for each layer instead of building a
+        # second flattened host copy
+        self._mps_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         # layer_idx -> {name: {dtype, offset, numel, shape}}
         # stores the offset and numel of each weight from a same layer, of same dtype
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -156,6 +171,10 @@ class LayerwiseOffloadManager:
 
         self._named_parameters = dict(self.model.named_parameters())
         self._named_buffers = dict(self.model.named_buffers())
+
+        if self._synchronous_mps:
+            self._initialize_mps_cpu_weights()
+            return
 
         # 1. collect and group layer parameters by dtype. Keep buffers resident:
         # shared buffers such as RoPE caches may be referenced by many layers.
@@ -266,6 +285,35 @@ class LayerwiseOffloadManager:
             f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}"
         )
 
+    @torch.compiler.disable
+    def _initialize_mps_cpu_weights(self) -> None:
+        for name, tensor in self._named_parameters.items():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None or layer_idx >= self.num_layers:
+                continue
+            local_tensor = self._to_local_tensor(tensor).detach()
+            cpu_tensor = (
+                local_tensor
+                if local_tensor.device.type == "cpu"
+                else local_tensor.to("cpu")
+            )
+            self._mps_cpu_weights.setdefault(layer_idx, {})[name] = cpu_tensor
+            self._weight_metadata.setdefault(layer_idx, {})[name] = {
+                "dtype": cpu_tensor.dtype,
+            }
+            tensor.data = self._get_shared_empty_tensor_for_target(
+                tensor, cpu_tensor.dtype
+            )
+
+        torch.get_device_module().empty_cache()
+        self.model.to(self.device)
+        self.prepare_for_next_req(non_blocking=False)
+        self.register_forward_hooks()
+        self._configured = True
+        logger.info(
+            f"Initialized synchronous MPS layerwise offload with {self.num_layers} layers"
+        )
+
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
@@ -306,22 +354,41 @@ class LayerwiseOffloadManager:
         """
         idempotent
         """
-        if not self.enabled or self.device is None or self.copy_stream is None:
+        if not self.enabled or self.device is None:
             return
         if layer_idx < 0 or layer_idx >= self.num_layers:
             return
         if layer_idx in self._gpu_layers:
             return
+        if self._synchronous_mps:
+            cpu_weights = self._mps_cpu_weights.get(layer_idx)
+            if not cpu_weights:
+                return
+            with torch.inference_mode(False), torch.no_grad():
+                for name, cpu_tensor in cpu_weights.items():
+                    target = self.get_target_with_name(name)
+                    target.data = self._wrap_for_target(
+                        target,
+                        cpu_tensor.to(device=self.device, non_blocking=False),
+                    )
+            self._gpu_layers.add(layer_idx)
+            return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+        if self.copy_stream is not None:
+            self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+            stream_context = torch.get_device_module().stream(self.copy_stream)
+        else:
+            # the device has no CUDA-like stream or pinned-memory support
+            non_blocking = False
+            stream_context = nullcontext()
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
         with (
             torch.inference_mode(False),
             torch.no_grad(),
-            torch.get_device_module().stream(self.copy_stream),
+            stream_context,
         ):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
@@ -359,10 +426,11 @@ class LayerwiseOffloadManager:
                 ].view(meta["shape"])
                 target.data = self._wrap_for_target(target, local_tensor)
 
-        # record the prefetch event of this layer after all copies are enqueued
-        event = torch.get_device_module().Event()
-        event.record(self.copy_stream)
-        self._prefetch_events[layer_idx] = event
+        if self.copy_stream is not None:
+            # record after all copies so the consumer waits for every weight copy
+            event = torch.get_device_module().Event()
+            event.record(self.copy_stream)
+            self._prefetch_events[layer_idx] = event
 
         self._gpu_layers.add(layer_idx)
 
@@ -424,6 +492,15 @@ class LayerwiseOffloadManager:
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
         """Sync a layer's weights from GPU back to CPU."""
         if not self.enabled or layer_idx not in self._gpu_layers:
+            return
+        if self._synchronous_mps:
+            for name in self._mps_cpu_weights.get(layer_idx, {}):
+                target = self.get_target_with_name(name)
+                # checkpoint-backed safetensors can be read-only, so a writeback
+                # replaces the mapping with a new CPU tensor
+                self._mps_cpu_weights[layer_idx][name] = (
+                    self._to_local_tensor(target).to("cpu").detach()
+                )
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
@@ -487,6 +564,33 @@ class LayerwiseOffloadManager:
             return None
 
         updated_names: Set[str] = set()
+        if self._synchronous_mps:
+            for name, loaded_weight in weight_dict.items():
+                layer_idx = self._match_layer_idx(name)
+                if layer_idx is None:
+                    continue
+                cpu_tensor = self._mps_cpu_weights.get(layer_idx, {}).get(name)
+                if cpu_tensor is None:
+                    continue
+                if tuple(cpu_tensor.shape) != tuple(loaded_weight.shape):
+                    raise ValueError(
+                        f"Shape mismatch for {name}: "
+                        f"expected={tuple(cpu_tensor.shape)}, "
+                        f"loaded={tuple(loaded_weight.shape)}"
+                    )
+                replacement = loaded_weight.to(
+                    device="cpu", dtype=cpu_tensor.dtype
+                ).detach()
+                self._mps_cpu_weights[layer_idx][name] = replacement
+                if layer_idx in self._gpu_layers:
+                    target = self.get_target_with_name(name)
+                    target.data = self._wrap_for_target(
+                        target,
+                        replacement.to(device=target.device, dtype=target.dtype),
+                    )
+                updated_names.add(name)
+            return updated_names
+
         for name, loaded_weight in weight_dict.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None:
@@ -536,6 +640,11 @@ class LayerwiseOffloadManager:
         when offload is enabled, this method returns the real weights and
         can be used for checksum computation.
         """
+        if self._synchronous_mps:
+            for layer_idx in sorted(self._mps_cpu_weights):
+                yield from self._mps_cpu_weights[layer_idx].items()
+            return
+
         for layer_idx in sorted(self._weight_metadata):
             for name, meta in self._weight_metadata[layer_idx].items():
                 if meta.get("preserve_strides", False):
@@ -567,7 +676,7 @@ class LayerwiseOffloadManager:
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events:
+                if i in self._prefetch_events and self.copy_stream is not None:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
                     )

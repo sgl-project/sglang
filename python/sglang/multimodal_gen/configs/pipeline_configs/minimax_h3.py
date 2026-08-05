@@ -19,6 +19,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    normalize_layerwise_offload_components,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -168,6 +172,35 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if current_platform.is_mps():
+            layerwise_components = set(
+                normalize_layerwise_offload_components(
+                    server_args.layerwise_offload_components
+                )
+                or []
+            )
+            required_components = {
+                "transformer",
+                "text_encoder",
+                "video_vae",
+                "audio_vae",
+            }
+            missing_components = (
+                []
+                if LAYERWISE_OFFLOAD_ALL_COMPONENTS in layerwise_components
+                else sorted(required_components - layerwise_components)
+            )
+            if missing_components:
+                raise ValueError(
+                    "MiniMax-H3 on MPS requires synchronous layerwise offload for "
+                    f"{missing_components}; pass --layerwise-offload-components "
+                    "transformer text_encoder video_vae audio_vae"
+                )
+            if server_args.enable_torch_compile:
+                raise ValueError(
+                    "MiniMax-H3 MPS execution does not support torch.compile; "
+                    "pass --enable-torch-compile false"
+                )
         attention_backend = self._server_arg_value(server_args.attention_backend)
         if str(attention_backend).strip().lower() == "sage_attn":
             raise ValueError(

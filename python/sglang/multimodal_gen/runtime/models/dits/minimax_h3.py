@@ -580,6 +580,9 @@ class MiniMaxH3Attention(nn.Module):
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
+        # h3 checkpoints interleave each attention head's Q, K, and V rows
+        # this parameter needs reordering before the native QKV projection
+        weight.mps_zero_copy_unsafe = True
         base_loader = weight.weight_loader
 
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

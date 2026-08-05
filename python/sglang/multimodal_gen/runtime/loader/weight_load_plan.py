@@ -13,6 +13,9 @@ class WeightLoadPlan:
     weight_postprocess_device: torch.device | None = None
     # Delay non-FSDP component CPU offload until after weight postprocessing.
     defer_component_cpu_offload: bool = False
+    # mps layerwise loading retains compatible safetensors tensors as CPU-backed
+    # parameters instead of materializing a second unified-memory copy
+    mps_layerwise_cpu_staging: bool = False
 
     @classmethod
     def for_component(
@@ -21,6 +24,7 @@ class WeightLoadPlan:
         checkpoint_load_device: torch.device,
         needs_device_weight_postprocess: bool,
         component_cpu_offload: bool,
+        mps_layerwise_cpu_staging: bool = False,
     ) -> "WeightLoadPlan":
         # if on-device weight postprocessing is required, load directly to device to speedup loading
         weight_postprocess_device = (
@@ -32,4 +36,5 @@ class WeightLoadPlan:
             defer_component_cpu_offload=(
                 needs_device_weight_postprocess and component_cpu_offload
             ),
+            mps_layerwise_cpu_staging=mps_layerwise_cpu_staging,
         )
