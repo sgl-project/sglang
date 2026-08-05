@@ -104,15 +104,26 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         set_global_server_args(server_args=server_args)
 
-        # Inter-process Communication
+        # Inter-process Communication. Every DP replica is a contiguous rank
+        # block (dp is the outermost axis of the group layout), and its first
+        # rank is the driver: it owns the replica's ingress socket, and the
+        # existing sp/cfg/tp broadcast relay in recv_reqs -- whose groups are
+        # replica-internal by construction -- distributes each request to the
+        # rest of the replica and never across replicas.
+        dp_size = server_args.dp_size or 1
+        gpus_per_replica = max(1, server_args.num_gpus // dp_size)
+        self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint
-        if gpu_id == 0:
+        if gpu_id % gpus_per_replica == 0:
+            endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
-            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+            logger.info(
+                f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
+                f"{actual_endpoint}"
+            )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -1172,9 +1183,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self._disagg_event_loop()
             return
 
-        logger.debug(
-            f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
-        )
+        if self.receiver is not None:
+            logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
         while self._running:
             # Update queue depth for metrics
