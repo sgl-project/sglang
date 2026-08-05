@@ -1205,7 +1205,9 @@ def _to_cute_swap(
     M_ce = c_swap.shape[1]  # == PyTorch N
     N_ce = c_swap.shape[2]  # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
-    bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
+    bias_ = from_dlpack(bias_3d.detach(), assumed_align=2).mark_layout_dynamic(
+        leading_dim=1
+    )
     return a_, b_, c_, bias_, layout
 
 

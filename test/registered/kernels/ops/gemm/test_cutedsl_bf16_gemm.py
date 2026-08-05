@@ -39,14 +39,17 @@ def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
+    if bias is not None:
+        bias.requires_grad_(True)
 
-    out = cutedsl_bf16_gemm(x, weight, bias)
+    with torch.no_grad():
+        out = cutedsl_bf16_gemm(x, weight, bias)
     assert out.shape == (num_tokens, n)
     assert out.dtype == torch.bfloat16
 
     ref = x.float() @ weight.float().T
     if bias is not None:
-        ref = ref + bias.float()
+        ref = ref + bias.detach().float()
     torch.testing.assert_close(out, ref.bfloat16(), rtol=2e-2, atol=2.5)
 
 
