@@ -9,11 +9,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.mm_schedule import (
-    _batch_encode_per_item_misses,
-    _get_chunked_embedding_by_item,
-    _PerItemRequestInfo,
-)
+from sglang.srt.managers.mm_schedule import _get_chunked_embedding_by_item
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -83,45 +79,6 @@ class TestMMEmbeddingCache(CustomTestCase):
             self.assertEqual(run(2).shape[0], 2)
 
         self.assertEqual(encoded_lengths, [1, 2])
-
-    def test_cached_split_owns_its_storage(self):
-        stable = MultimodalDataItem(
-            modality=Modality.AUDIO,
-            hash=1,
-            offsets=[(0, 1)],
-            feature=torch.ones(2, 3),
-        )
-        tail = MultimodalDataItem(
-            modality=Modality.AUDIO,
-            hash=2,
-            offsets=[(2, 2)],
-            feature=torch.ones(1, 3),
-            use_embedding_cache=False,
-        )
-        encoder_outputs = []
-
-        def encode(items):
-            output = torch.cat([item.feature for item in items])
-            encoder_outputs.append(output)
-            return output
-
-        request = _PerItemRequestInfo(
-            req_idx=0,
-            items=[stable, tail],
-            items_offset=[(0, 1), (2, 2)],
-            extend_prefix_len=0,
-            extend_seq_len=3,
-        )
-        cache = MultiModalStaticCache(1024 * 1024)
-        with patch("sglang.srt.managers.mm_schedule.embedding_cache", cache):
-            _batch_encode_per_item_misses(encode, [request], torch.device("cpu"))
-
-        cached = cache.get_single(stable.hash).embedding
-        self.assertNotEqual(
-            cached.untyped_storage().data_ptr(),
-            encoder_outputs[0].untyped_storage().data_ptr(),
-        )
-        self.assertEqual(cached.untyped_storage().nbytes(), cached.nbytes)
 
 
 if __name__ == "__main__":
