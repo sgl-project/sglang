@@ -514,6 +514,29 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         head_v_dim = v.shape[3]
 
         if self._backend == "cake":
+            if num_v_heads != num_heads:
+                # The exported kernel accepts GQA, but its recurrent state has
+                # not yet matched SGLang's Triton path at the BF16 promotion
+                # tolerance. Keep the production contract to H == HV until the
+                # cross-implementation difference is attributed to an oracle.
+                from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+                    TritonKDAKernel,
+                )
+
+                return TritonKDAKernel().decode(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    lower_bound=lower_bound,
+                    **kwargs,
+                )
             self._check_cake_state_contract(
                 ssm_states,
                 num_v_heads=num_v_heads,
