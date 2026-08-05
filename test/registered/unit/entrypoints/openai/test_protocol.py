@@ -125,6 +125,27 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
+    def test_parallel_tool_calls_null_resolves_to_default(self):
+        """Explicit null must be accepted (not 422) and resolve to the default
+        True, so downstream tool-call constraints don't read it as False."""
+        messages = [{"role": "user", "content": "Hello"}]
+        self.assertTrue(
+            ChatCompletionRequest(
+                model="x", messages=messages, parallel_tool_calls=None
+            ).parallel_tool_calls
+        )
+        self.assertFalse(
+            ChatCompletionRequest(
+                model="x", messages=messages, parallel_tool_calls=False
+            ).parallel_tool_calls
+        )
+
+    def test_parallel_tool_calls_absent_is_not_injected_by_validator(self):
+        values = ChatCompletionRequest.set_tool_choice_default(
+            {"model": "x", "messages": [{"role": "user", "content": "Hello"}]}
+        )
+        self.assertNotIn("parallel_tool_calls", values)
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",
