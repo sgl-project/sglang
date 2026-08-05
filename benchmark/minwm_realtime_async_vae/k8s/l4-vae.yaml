@@ -54,7 +54,7 @@ metadata:
     seedleap.ai/test-run: minwm-async-vae-benchmark
     seedleap.ai/ttl-after-test: required
 spec:
-  replicas: 1
+  replicas: REPLACE_WITH_VAE_BASE_REPLICAS
   revisionHistoryLimit: 1
   progressDeadlineSeconds: 1800
   strategy:

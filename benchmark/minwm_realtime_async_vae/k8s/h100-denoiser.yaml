@@ -40,6 +40,51 @@ spec:
           value: "true"
           effect: NoSchedule
 ---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-async-denoiser-h100-8x
+  labels:
+    app.kubernetes.io/part-of: minwm-realtime
+    seedleap.ai/test-run: minwm-async-vae-benchmark
+    seedleap.ai/ttl-after-test: required
+spec:
+  limits:
+    cpu: "192"
+    nvidia.com/gpu: "8"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-async-denoiser-h100-8x
+        seedleap.ai/denoiser-worker: "true"
+        seedleap.ai/test-run: minwm-async-vae-benchmark
+    spec:
+      expireAfter: 24h
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: minwm-test-h100-ec2
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: [us-east-2a]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: [p5.48xlarge]
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,7 +96,7 @@ metadata:
     seedleap.ai/test-run: minwm-async-vae-benchmark
     seedleap.ai/ttl-after-test: required
 spec:
-  replicas: 1
+  replicas: REPLACE_WITH_DENOISER_BASE_REPLICAS
   revisionHistoryLimit: 1
   progressDeadlineSeconds: 5400
   strategy:
@@ -70,7 +115,7 @@ spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 90
       nodeSelector:
-        karpenter.sh/nodepool: minwm-async-denoiser-h100
+        karpenter.sh/nodepool: minwm-async-denoiser-h100-8x
         karpenter.sh/capacity-type: spot
       tolerations:
         - key: nvidia.com/gpu
@@ -155,12 +200,12 @@ spec:
             requests:
               cpu: "6"
               memory: 160Gi
-              ephemeral-storage: 100Gi
+              ephemeral-storage: 24Gi
               nvidia.com/gpu: "1"
             limits:
               cpu: "7"
               memory: 220Gi
-              ephemeral-storage: 300Gi
+              ephemeral-storage: 100Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - {name: checkpoint-archive, mountPath: /checkpoint-archive, readOnly: true}

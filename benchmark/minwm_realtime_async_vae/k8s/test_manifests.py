@@ -17,7 +17,11 @@ def _container(deployment, name):
 def test_gpu_nodepools_are_spot_only_and_bounded():
     documents = load_documents()
     validate(documents)
-    for pool_name in ("minwm-async-denoiser-h100", "minwm-async-vae-l4"):
+    for pool_name in (
+        "minwm-async-denoiser-h100",
+        "minwm-async-denoiser-h100-8x",
+        "minwm-async-vae-l4",
+    ):
         node_pool = find(documents, "NodePool", pool_name)
         assert node_pool["spec"]["template"]["spec"]["taints"] == [
             {
@@ -37,6 +41,29 @@ def test_kustomize_does_not_namespace_cluster_scoped_resources():
     ):
         nodepool = find(load_documents((filename,)), "NodePool", name)
         assert "namespace" not in nodepool["metadata"]
+
+
+def test_h100_pool_uses_one_fully_utilized_eight_gpu_node():
+    documents = load_documents(("h100-denoiser.yaml",))
+    single = find(documents, "NodePool", "minwm-async-denoiser-h100")
+    packed = find(documents, "NodePool", "minwm-async-denoiser-h100-8x")
+    deployment = find(documents, "Deployment", "minwm-async-denoiser")
+
+    assert requirement_values(single, "node.kubernetes.io/instance-type") == [
+        "p5.4xlarge"
+    ]
+    assert requirement_values(packed, "node.kubernetes.io/instance-type") == [
+        "p5.48xlarge"
+    ]
+    assert requirement_values(packed, "topology.kubernetes.io/zone") == [
+        "us-east-2a"
+    ]
+    assert deployment["spec"]["replicas"] == "REPLACE_WITH_DENOISER_BASE_REPLICAS"
+    selector = deployment["spec"]["template"]["spec"]["nodeSelector"]
+    assert selector == {
+        "karpenter.sh/nodepool": "minwm-async-denoiser-h100-8x",
+        "karpenter.sh/capacity-type": "spot",
+    }
 
 
 def test_l40s_alternate_is_spot_only_and_never_in_base_topology():
@@ -186,6 +213,18 @@ def test_gpu_pods_use_a_prebuilt_runtime_without_installing_at_startup():
         assert "pip install" not in manifest
         assert "curl --fail" not in manifest
         assert "REPLACE_WITH_GIT_SHA" not in manifest
+
+
+def test_eight_denoiser_workers_fit_on_one_p5_48xlarge_ephemeral_disk():
+    deployment = find(
+        load_documents(("h100-denoiser.yaml",)),
+        "Deployment",
+        "minwm-async-denoiser",
+    )
+    resources = _container(deployment, "denoiser")["resources"]
+
+    assert resources["requests"]["ephemeral-storage"] == "24Gi"
+    assert resources["limits"]["ephemeral-storage"] == "100Gi"
 
 
 def test_public_nlb_selects_only_the_gateway_control_plane():

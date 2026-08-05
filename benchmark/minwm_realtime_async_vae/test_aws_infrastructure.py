@@ -63,6 +63,7 @@ def test_cleanup_is_explicit_bounded_and_verifies_billed_resources_are_gone():
     assert "namespace/minwm-realtime" in script
     for nodepool in (
         "minwm-async-denoiser-h100",
+        "minwm-async-denoiser-h100-8x",
         "minwm-async-vae-l4",
         "minwm-model-artifact-publisher",
     ):

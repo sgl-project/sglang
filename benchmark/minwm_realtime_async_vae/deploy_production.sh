@@ -19,6 +19,8 @@ GPU_SCALE_DOWN_SCHEDULE="${GPU_SCALE_DOWN_SCHEDULE:-0 23 * * *}"
 GPU_SCALE_TIME_ZONE="${GPU_SCALE_TIME_ZONE:-Asia/Shanghai}"
 GPU_SCALE_UP_SUSPEND="${GPU_SCALE_UP_SUSPEND:-false}"
 GPU_SCALE_DOWN_SUSPEND="${GPU_SCALE_DOWN_SUSPEND:-false}"
+DENOISER_BASE_REPLICAS="${DENOISER_BASE_REPLICAS:-1}"
+VAE_BASE_REPLICAS="${VAE_BASE_REPLICAS:-1}"
 DENOISER_PEAK_REPLICAS="${DENOISER_PEAK_REPLICAS:-1}"
 VAE_PEAK_REPLICAS="${VAE_PEAK_REPLICAS:-1}"
 
@@ -33,12 +35,24 @@ aws s3api head-object \
   --key "world-model/minwm/serving-artifacts/wan22-5b-stage3-dmd-30-gs1800/${MODEL_ARTIFACT_REVISION}/model/_READY" \
   >/dev/null
 
-for REPLICAS in "${DENOISER_PEAK_REPLICAS}" "${VAE_PEAK_REPLICAS}"; do
+for REPLICAS in \
+  "${DENOISER_BASE_REPLICAS}" \
+  "${VAE_BASE_REPLICAS}" \
+  "${DENOISER_PEAK_REPLICAS}" \
+  "${VAE_PEAK_REPLICAS}"; do
   if ! [[ "${REPLICAS}" =~ ^[1-8]$ ]]; then
     echo "GPU peak replicas must be between 1 and 8" >&2
     exit 1
   fi
 done
+if (( DENOISER_BASE_REPLICAS > DENOISER_PEAK_REPLICAS )); then
+  echo "Denoiser base replicas cannot exceed peak replicas" >&2
+  exit 1
+fi
+if (( VAE_BASE_REPLICAS > VAE_PEAK_REPLICAS )); then
+  echo "VAE base replicas cannot exceed peak replicas" >&2
+  exit 1
+fi
 for SUSPEND in "${GPU_SCALE_UP_SUSPEND}" "${GPU_SCALE_DOWN_SUSPEND}"; do
   if [[ "${SUSPEND}" != "true" && "${SUSPEND}" != "false" ]]; then
     echo "GPU schedule suspend flags must be true or false" >&2
@@ -92,6 +106,8 @@ sed -i.bak \
   -e "s|REPLACE_WITH_GPU_SCALE_DOWN_SCHEDULE|${GPU_SCALE_DOWN_SCHEDULE}|g" \
   -e "s|REPLACE_WITH_GPU_SCALE_UP_SUSPEND|${GPU_SCALE_UP_SUSPEND}|g" \
   -e "s|REPLACE_WITH_GPU_SCALE_DOWN_SUSPEND|${GPU_SCALE_DOWN_SUSPEND}|g" \
+  -e "s|REPLACE_WITH_DENOISER_BASE_REPLICAS|${DENOISER_BASE_REPLICAS}|g" \
+  -e "s|REPLACE_WITH_VAE_BASE_REPLICAS|${VAE_BASE_REPLICAS}|g" \
   -e "s|REPLACE_WITH_GPU_SCALE_TIME_ZONE|${GPU_SCALE_TIME_ZONE}|g" \
   -e "s|REPLACE_WITH_DENOISER_PEAK_REPLICAS|${DENOISER_PEAK_REPLICAS}|g" \
   -e "s|REPLACE_WITH_VAE_PEAK_REPLICAS|${VAE_PEAK_REPLICAS}|g" \

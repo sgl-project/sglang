@@ -9,6 +9,7 @@ LABEL="seedleap.ai/test-run=minwm-async-vae-benchmark"
 NODEPOOLS=(
   minwm-realtime-cpu
   minwm-async-denoiser-h100
+  minwm-async-denoiser-h100-8x
   minwm-async-vae-l4
   minwm-async-vae-l40s
   minwm-model-artifact-publisher

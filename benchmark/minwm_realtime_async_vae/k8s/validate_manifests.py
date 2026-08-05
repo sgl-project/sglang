@@ -53,16 +53,22 @@ def requirement_values(nodepool: dict, key: str) -> list[str]:
 
 def validate(documents: list[dict]) -> None:
     denoiser = find(documents, "NodePool", "minwm-async-denoiser-h100")
+    denoiser_8x = find(documents, "NodePool", "minwm-async-denoiser-h100-8x")
     vae = find(documents, "NodePool", "minwm-async-vae-l4")
     assert requirement_values(denoiser, "karpenter.sh/capacity-type") == ["spot"]
+    assert requirement_values(denoiser_8x, "karpenter.sh/capacity-type") == ["spot"]
     assert requirement_values(vae, "karpenter.sh/capacity-type") == ["spot"]
     assert requirement_values(denoiser, "node.kubernetes.io/instance-type") == [
         "p5.4xlarge"
+    ]
+    assert requirement_values(denoiser_8x, "node.kubernetes.io/instance-type") == [
+        "p5.48xlarge"
     ]
     assert all(value.startswith("g6.") for value in requirement_values(
         vae, "node.kubernetes.io/instance-type"
     ))
     assert 1 <= int(denoiser["spec"]["limits"]["nvidia.com/gpu"]) <= 8
+    assert int(denoiser_8x["spec"]["limits"]["nvidia.com/gpu"]) == 8
     assert 1 <= int(vae["spec"]["limits"]["nvidia.com/gpu"]) <= 8
 
     for deployment_name in ("minwm-async-denoiser", "minwm-async-vae"):
