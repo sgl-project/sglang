@@ -396,20 +396,25 @@ import importlib.metadata as md
 import os
 import sys
 
+name = os.environ["WHEEL_DIST"]
+wanted = os.environ["WHEEL_WANTED"]
 try:
-    dist = md.distribution(os.environ["WHEEL_DIST"])
+    dist = md.distribution(name)
 except md.PackageNotFoundError:
+    print(f"{name} not installed (required: {wanted}); installing")
     sys.exit(1)
-if dist.version != os.environ["WHEEL_WANTED"]:
+if dist.version != wanted:
+    print(f"{name} mismatch (installed: {dist.version}, required: {wanted}); reinstalling")
     sys.exit(1)
 if os.environ["WHEEL_REJECT_LOCAL"] and "file://" in (dist.read_text("direct_url.json") or ""):
-    print(f"{dist.name} came from a locally built wheel; reinstalling from the index")
+    print(f"{name} came from a locally built wheel; reinstalling from the index")
     sys.exit(1)
 if dist.files is None:
+    print(f"{name} has no RECORD to verify; reinstalling")
     sys.exit(1)
 missing = [str(f) for f in dist.files if not dist.locate_file(f).exists()]
 if missing:
-    print(f"{dist.name} is missing {len(missing)} installed files (e.g. {missing[0]}); reinstalling")
+    print(f"{name} is missing {len(missing)} installed files (e.g. {missing[0]}); reinstalling")
     sys.exit(1)
 EOF
 }
@@ -481,8 +486,9 @@ install_sglang_kernel() {
     fi
 
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
-        # The PyPI default wheel tracks one CUDA version (currently cu130);
-        # other runners need the +${CU_VERSION}-tagged wheel from the sglang index.
+        # The PyPI default wheel tracks one CUDA version (currently cu130); other
+        # runners (e.g. h20 / cu129) need the +${CU_VERSION}-tagged wheel from the
+        # sglang index, linked against the right libnvrtc.
         SGL_KERNEL_WANTED="${SGL_KERNEL_VERSION_FROM_SRT}+${CU_VERSION}"
         if installed_wheel_ok sglang-kernel "${SGL_KERNEL_WANTED}" reject-local; then
             echo "sglang-kernel==${SGL_KERNEL_WANTED} already installed, keeping it"
