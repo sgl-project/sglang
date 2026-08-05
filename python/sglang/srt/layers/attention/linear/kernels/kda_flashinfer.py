@@ -365,6 +365,12 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             or q.shape[0] != 1
         ):
             return False
+        if torch.cuda.is_current_stream_capturing():
+            # The public frozen-prefill facade allocates its workspace/output
+            # unless the caller owns both buffers. SGLang's backend interface
+            # does not expose per-layer capture buffers, so keep explicit
+            # prefill CUDA graphs on the allocation-free Triton path.
+            return False
         if q.shape[1] <= query_start_loc.numel() - 1:
             # Every packed sequence has T=1, which is decode rather than prefill.
             return False

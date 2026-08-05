@@ -170,5 +170,20 @@ def test_kda_prefill_cake_falls_back_for_state_tracking():
     torch.testing.assert_close(state_cake, state_ref)
 
 
+def test_kda_prefill_cake_falls_back_during_cuda_graph_capture(monkeypatch):
+    seq_lens = [96]
+    data = _make_inputs(seq_lens, 12)
+    state_ref = data["state"].clone()
+    output_ref = _extend(TritonKDAKernel(), data, state_ref, seq_lens)
+
+    state_cake = data["state"].clone()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    output_cake = _extend(CakeKDAKernel(), data, state_cake, seq_lens)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output_cake, output_ref)
+    torch.testing.assert_close(state_cake, state_ref)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
