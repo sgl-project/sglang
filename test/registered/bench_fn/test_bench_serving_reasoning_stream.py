@@ -19,6 +19,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sglang.benchmark.serving import (
     RequestFuncInput,
+    RequestFuncOutput,
+    _steady_state_output_throughput,
     async_request_openai_chat_completions,
     calculate_metrics,
     set_global_args,
@@ -27,6 +29,99 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestSteadyStateOutputThroughput(unittest.TestCase):
+    def test_trims_low_concurrency_ramp_up_and_drain(self):
+        outputs = [
+            RequestFuncOutput(
+                generated_text="a b c d e",
+                success=True,
+                start_time=0.0,
+                latency=10.0,
+                ttft=1.0,
+                itl=[2.0, 2.0, 2.0, 2.0],
+                output_len=5,
+            ),
+            RequestFuncOutput(
+                generated_text="a b c",
+                success=True,
+                start_time=2.0,
+                latency=6.0,
+                ttft=1.0,
+                itl=[2.0, 2.0],
+                output_len=3,
+            ),
+            RequestFuncOutput(
+                generated_text="a b c",
+                success=True,
+                start_time=2.0,
+                latency=6.0,
+                ttft=1.0,
+                itl=[2.0, 2.0],
+                output_len=3,
+            ),
+        ]
+
+        throughput, retokenized_throughput, duration, threshold = (
+            _steady_state_output_throughput(outputs, [5, 3, 3], [5, 3, 3], 0.8)
+        )
+
+        self.assertEqual(duration, 6.0)
+        self.assertEqual(threshold, 3)
+        self.assertEqual(throughput, 1.5)
+        self.assertEqual(retokenized_throughput, 1.5)
+
+        metrics, output_lens = calculate_metrics(
+            input_requests=None,
+            outputs=outputs,
+            dur_s=10.0,
+            tokenizer=_StrictStringTokenizer(),
+            backend="sglang-oai-chat",
+            steady_state_concurrency_ratio=0.8,
+        )
+        self.assertEqual(output_lens, [5, 3, 3])
+        self.assertEqual(metrics.completed, 2)
+        self.assertEqual(metrics.total_output, 9.0)
+        self.assertEqual(metrics.request_throughput, 2 / 6)
+        self.assertEqual(metrics.output_throughput, 1.5)
+        self.assertEqual(metrics.total_throughput, 1.5)
+        self.assertEqual(metrics.measurement_duration, 6.0)
+        self.assertEqual(metrics.concurrency, 3.0)
+        self.assertEqual(metrics.max_concurrent_requests, 3)
+        self.assertEqual(metrics.max_output_tokens_per_s, 3.0)
+        self.assertEqual(metrics.mean_e2e_latency_ms, 6000.0)
+
+    def test_default_metrics_still_use_full_benchmark_duration(self):
+        outputs = [
+            RequestFuncOutput(
+                generated_text="a b",
+                success=True,
+                start_time=0.0,
+                latency=2.0,
+                ttft=1.0,
+                itl=[1.0],
+                output_len=2,
+            )
+        ]
+
+        metrics, _ = calculate_metrics(
+            input_requests=None,
+            outputs=outputs,
+            dur_s=4.0,
+            tokenizer=_StrictStringTokenizer(),
+            backend="sglang-oai-chat",
+        )
+
+        self.assertEqual(metrics.completed, 1)
+        self.assertEqual(metrics.output_throughput, 0.5)
+        self.assertEqual(metrics.concurrency, 0.5)
+        self.assertEqual(metrics.measurement_duration, 4.0)
+        self.assertEqual(metrics.steady_state_duration, 0.0)
+
+    def test_rejects_invalid_concurrency_ratio(self):
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            _steady_state_output_throughput([], [], [], 0.0)
 
 
 def _free_port() -> int:
