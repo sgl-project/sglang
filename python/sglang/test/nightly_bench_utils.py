@@ -72,7 +72,7 @@ Note: To view the traces through perfetto-ui, please:
             # Create a combined link or use the first available one
             trace_files = [self.profile_link_extend, self.profile_link_decode]
             if any(trace_file is None for trace_file in trace_files):
-                logger.error("Some trace files are None", f"{trace_files=}")
+                logger.error("Some trace files are None: %s", trace_files)
             trace_files_relay_links = [
                 (
                     f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"

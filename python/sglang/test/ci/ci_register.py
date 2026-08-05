@@ -170,7 +170,6 @@ REGISTER_MAPPING = {
     "register_musa_ci": HWBackend.MUSA,
     "register_npu_ci": HWBackend.NPU,
     "register_xpu_ci": HWBackend.XPU,
-    "register_musa_ci": HWBackend.MUSA,
     "register_mlx_ci": HWBackend.MLX,
 }
 

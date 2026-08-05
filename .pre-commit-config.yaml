@@ -35,7 +35,11 @@ repos:
     hooks:
       - id: ruff
         args:
-          - --select=F401,F821,UP037
+          - --select=F,PLE,UP037
+          # F403/F405: star imports, almost all in vendored third_party.
+          # F722: false positives on the `A[type, "help", NS(...)]` server-arg alias.
+          # F402/F541/F811/F823/F841/PLE0302: pre-existing hits, not yet triaged.
+          - --ignore=F402,F403,F405,F541,F722,F811,F823,F841,PLE0302
           - --fix
         files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
