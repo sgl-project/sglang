@@ -146,8 +146,18 @@ class OllamaServing:
                 delta = text[len(previous_text) :]
                 previous_text = text
 
+                # Send content chunk if there's new content
+                if delta:
+                    response = OllamaChatStreamResponse(
+                        model=model_name,
+                        created_at=self._get_timestamp(),
+                        message=OllamaMessage(role="assistant", content=delta),
+                        done=False,
+                    )
+                    yield orjson.dumps(response.model_dump()) + b"\n"
+
+                # Send final chunk if done
                 if is_done:
-                    # Final chunk
                     response = OllamaChatStreamResponse(
                         model=model_name,
                         created_at=self._get_timestamp(),
@@ -155,15 +165,7 @@ class OllamaServing:
                         done=True,
                         done_reason="stop",
                     )
-                else:
-                    response = OllamaChatStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        message=OllamaMessage(role="assistant", content=delta),
-                        done=False,
-                    )
-
-                yield orjson.dumps(response.model_dump()) + b"\n"
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
         return StreamingResponse(
             generate_stream(),
@@ -263,6 +265,17 @@ class OllamaServing:
                 delta = text[len(previous_text) :]
                 previous_text = text
 
+                # Send content chunk if there's new content
+                if delta:
+                    response = OllamaGenerateStreamResponse(
+                        model=model_name,
+                        created_at=self._get_timestamp(),
+                        response=delta,
+                        done=False,
+                    )
+                    yield orjson.dumps(response.model_dump()) + b"\n"
+
+                # Send final chunk if done
                 if is_done:
                     response = OllamaGenerateStreamResponse(
                         model=model_name,
@@ -271,15 +284,7 @@ class OllamaServing:
                         done=True,
                         done_reason="stop",
                     )
-                else:
-                    response = OllamaGenerateStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        response=delta,
-                        done=False,
-                    )
-
-                yield orjson.dumps(response.model_dump()) + b"\n"
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
         return StreamingResponse(
             generate_stream(),
