@@ -36,13 +36,22 @@ class HybridAttnBackend(AttentionBackend):
         self.spec_attn_is_prefill = (
             model_runner.server_args.speculative_attention_mode == "prefill"
         )
-        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
-        # delegation the base-class default (True) forces a per-step seq_lens
-        # D2H + host sync even when both sub-backends opted out.
-        self.needs_cpu_seq_lens = (
-            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens
+        # ORs it across backends). Count only what runs in the spec decode loop:
+        # decode always, prefill only when mode=prefill routes verify to it --
+        # else a cpu-lens prefill backend forces the D2H on steps it never serves.
+        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
+            self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
         self.max_context_len = model_runner.model_config.context_len
+
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
+        backend = (
+            self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
+        )
+        return backend.supports_ragged_verify_graph
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -112,6 +121,19 @@ class HybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Chunked-prefix / one-shot MHA metadata is a prefill concern. Without
+        # this delegation the MLA MHA path silently skips (re)planning its
+        # ragged wrappers when the full-attn backend is this prefill/decode
+        # split (e.g. --decode-attention-backend trtllm_mla), and any
+        # prefix-cache-hit extend batch then runs against a stale plan:
+        #   ValueError: q.shape[0] (...) does not match qo_indptr[-1] (...)
+        init = getattr(self.prefill_backend, "init_mha_chunk_metadata", None)
+        if init is not None:
+            init(forward_batch, disable_flashinfer_ragged)
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:

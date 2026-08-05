@@ -132,6 +132,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -367,10 +369,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            capture_time = time.perf_counter() - tic
+            self._specialized_graph_memory_usage["draft_decode"] = (
+                self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+                + before_mem
+                - after_mem
+            )
+            self._specialized_graph_time_usage["draft_decode"] = (
+                self._specialized_graph_time_usage.get("draft_decode", 0.0)
+                + capture_time
+            )
             log_info_on_rank0(
                 logger,
                 "Capture draft decode CUDA graph end. "
-                f"elapsed={time.perf_counter() - tic:.2f} s, "
+                f"elapsed={capture_time:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
@@ -452,10 +464,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft_extend is the step's last shared-buffer-reading phase; its
             # read-done event is what the scheduler's WAR barrier waits on.
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            capture_time = time.perf_counter() - tic
+            self._specialized_graph_memory_usage["draft_extend"] = (
+                self._specialized_graph_memory_usage.get("draft_extend", 0.0)
+                + before_mem
+                - after_mem
+            )
+            self._specialized_graph_time_usage["draft_extend"] = (
+                self._specialized_graph_time_usage.get("draft_extend", 0.0)
+                + capture_time
+            )
             log_info_on_rank0(
                 logger,
                 "Capture draft extend CUDA graph end. "
-                f"elapsed={time.perf_counter() - tic:.2f} s, "
+                f"elapsed={capture_time:.2f} s, "
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
@@ -990,6 +1012,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
@@ -1305,11 +1329,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 TargetGraphRunnerCls = (
                     NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
                 )
+                target_graph_before_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id
+                )
+                target_graph_tic = time.perf_counter()
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+                target_graph_after_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id
+                )
+                target_graph_time = time.perf_counter() - target_graph_tic
+                self._additional_graph_memory_usage["target_verify"] = (
+                    self._additional_graph_memory_usage.get("target_verify", 0.0)
+                    + target_graph_before_mem
+                    - target_graph_after_mem
+                )
+                self._additional_graph_time_usage["target_verify"] = (
+                    self._additional_graph_time_usage.get("target_verify", 0.0)
+                    + target_graph_time
                 )
 
             state = SpecRuntimeState(
