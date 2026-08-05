@@ -21,18 +21,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestLinearAttnConfig(CustomTestCase):
     def setUp(self):
-        saved = (
-            linear_utils.LINEAR_ATTN_DECODE_BACKEND,
-            linear_utils.LINEAR_ATTN_PREFILL_BACKEND,
-        )
-
-        def restore():
-            (
-                linear_utils.LINEAR_ATTN_DECODE_BACKEND,
-                linear_utils.LINEAR_ATTN_PREFILL_BACKEND,
-            ) = saved
-
-        self.addCleanup(restore)
+        self.addCleanup(linear_utils._BACKENDS.update, linear_utils._BACKENDS.copy())
 
     def _init(self, prefill_default=None, **fields):
         args = ServerArgs(model_path="dummy")
@@ -40,8 +29,8 @@ class TestLinearAttnConfig(CustomTestCase):
             setattr(args, key, value)
         initialize_linear_attn_config(args, prefill_default)
         return (
-            linear_utils.LINEAR_ATTN_PREFILL_BACKEND,
-            linear_utils.LINEAR_ATTN_DECODE_BACKEND,
+            linear_utils.get_linear_attn_prefill_backend(),
+            linear_utils.get_linear_attn_decode_backend(),
         )
 
     def test_default_applies_when_the_flag_is_unset(self):
