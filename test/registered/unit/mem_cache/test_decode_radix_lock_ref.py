@@ -28,17 +28,20 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.srt.utils.common import Range
 
 
@@ -103,6 +106,68 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
                 value=torch.tensor(prefix_values, dtype=torch.int64),
             )
         )
+
+    def test_match_prefix_preserves_complete_lock_ownership(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tree_cache = MagicMock()
+        queue._build_decode_prefix_match = MagicMock(return_value=MagicMock())
+
+        req = MagicMock()
+        req.origin_input_ids = [1, 2, 3, 4]
+        node = object()
+        match_result = MagicMock(last_device_node=node)
+        lock_result = IncLockRefResult(
+            swa_uuid_for_lock=17,
+            skip_lock_node_ids={ComponentType.SWA: {41, 42}},
+        )
+        queue.tree_cache.inc_lock_ref.return_value = lock_result
+
+        with patch(
+            "sglang.srt.disaggregation.decode.match_prefix_for_req",
+            return_value=match_result,
+        ):
+            queue._match_prefix_and_lock(req)
+
+        queue.tree_cache.inc_lock_ref.assert_called_once_with(node)
+        # The acquire's skip set must be recorded, else the matching release
+        # would drop a lock this request never took.
+        self.assertEqual(req.swa_uuid_for_lock, 17)
+        self.assertEqual(req.skip_lock_node_ids, {ComponentType.SWA: {41, 42}})
+
+    def test_swa_admission_charge_matches_the_allocator_path(self):
+        """`_pre_alloc` only takes the tail-only SWA path from an empty prefix
+        (`uses_swa_tail = ... and prefix_len == 0`). On a decode-radix hit it
+        falls back to `alloc_extend`, which debits the SWA pool for the whole
+        delta. If the admission budget still charged one sliding window, the
+        SWA pool would be over-subscribed by (delta - window) per request and
+        the `kv_loc is not None` assert in `_pre_alloc` would fire.
+        """
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.num_reserved_decode_tokens = 0
+        queue.scheduler = MagicMock()
+        queue.scheduler.sliding_window_size = 128
+        queue.scheduler.server_args.disable_radix_cache = False
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+
+        fill_len = 1024
+        req = MagicMock()
+        queue._pre_alloc_fill_len = MagicMock(return_value=fill_len)
+
+        # Miss: tail-only allocation, so one window is the honest charge.
+        _, swa_on_miss = queue._prealloc_kv_lens(req, prefix_len=0)
+        self.assertEqual(swa_on_miss, queue._swa_tail_len(fill_len))
+        self.assertEqual(swa_on_miss, 128)
+
+        # Hit: alloc_extend debits every new page, so the charge must be the
+        # delta, not the window -- otherwise we under-charge by 768 tokens.
+        prefix_len = 128
+        _, swa_on_hit = queue._prealloc_kv_lens(req, prefix_len=prefix_len)
+        self.assertEqual(
+            swa_on_hit,
+            queue._required_alloc_tokens(fill_len=fill_len, prefix_len=prefix_len),
+        )
+        self.assertEqual(swa_on_hit, fill_len - prefix_len)
 
     def test_incremental_transfer_success(self):
         """Scenario 1: prefix match > 0, transfer succeeds.
@@ -304,6 +369,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.finished_reason = None
         req.cache_protected_len = 0
         req.sampling_params.max_new_tokens = 16
+        # Ownership token recorded by the acquire in `_match_prefix_and_lock`
+        # (mocked out below); the budget-recheck release must replay it.
+        req.swa_uuid_for_lock = 17
+        req.skip_lock_node_ids = {ComponentType.SWA: {41}}
 
         decode_req = MagicMock()
         decode_req.req = req
@@ -362,7 +431,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=17, skip_lock_node_ids={ComponentType.SWA: {41}}
+            ),
+        )
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):

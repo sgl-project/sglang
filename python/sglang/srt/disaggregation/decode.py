@@ -70,7 +70,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -398,14 +402,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return len(req.origin_input_ids) + len(req.output_ids)
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
-    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = self._pre_alloc_fill_len(req)
-        if self._uses_swa_tail_prealloc():
-            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
-        return allocated_kv_len, allocated_kv_len
+    def _prealloc_kv_lens(self, req: Req, *, prefix_len: int = 0) -> Tuple[int, int]:
+        """(full, swa) token counts this request will debit from the two pools.
 
-    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
-        full_len, swa_len = self._prealloc_kv_lens(req)
+        `prefix_len` must be the device-resident prefix the request will reuse,
+        because it decides which allocator path `_pre_alloc` takes. Tail-only
+        SWA allocation is valid only from an empty prefix, so on a decode-radix
+        hit `_pre_alloc` falls back to `alloc_extend`, which debits the SWA pool
+        for the whole delta -- not one sliding window. Charging the window there
+        under-counts by (delta - window), which exhausts the SWA pool and trips
+        the `kv_loc is not None` assert in `_pre_alloc`.
+        """
+        allocated_kv_len = self._pre_alloc_fill_len(req)
+        if not self._uses_swa_tail_prealloc():
+            return allocated_kv_len, allocated_kv_len
+        if prefix_len > 0:
+            return allocated_kv_len, self._required_alloc_tokens(
+                fill_len=allocated_kv_len, prefix_len=prefix_len
+            )
+        return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+
+    def _prealloc_required_tokens(
+        self, req: Req, *, prefix_len: int = 0
+    ) -> Tuple[int, int]:
+        full_len, swa_len = self._prealloc_kv_lens(req, prefix_len=prefix_len)
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
@@ -562,8 +582,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
+        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        # Record what the acquire actually took. On a hybrid-SWA tree the matched
+        # path can carry component tombstones that inc_lock_ref skipped; without
+        # the skip set a later release would consume a lock this request never
+        # took (one another request acquired after that tombstone was restored).
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.skip_lock_node_ids = lock_result.skip_lock_node_ids
         return self._build_decode_prefix_match(req, result)
+
+    def _release_prefix_lock(self, req: Req) -> None:
+        """Release the prefix lock taken by ``_match_prefix_and_lock``, honoring
+        the components it skipped so it never drops a lock it never took."""
+        self.tree_cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skip_lock_node_ids=req.skip_lock_node_ids,
+            ),
+        )
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {}
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1063,16 +1102,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 break
 
             if uses_swa_tail_prealloc:
-                _, swa_required = self._prealloc_required_tokens(decode_req.req)
-                _, swa_len = self._prealloc_kv_lens(decode_req.req)
+                # prefix_len decides which allocator path `_pre_alloc` takes,
+                # so the SWA charge has to see it -- see `_prealloc_kv_lens`.
+                _, swa_required = self._prealloc_required_tokens(
+                    decode_req.req, prefix_len=prefix_len
+                )
+                _, swa_len = self._prealloc_kv_lens(
+                    decode_req.req, prefix_len=prefix_len
+                )
                 max_new_tokens = min(
                     decode_req.req.sampling_params.max_new_tokens,
                     CLIP_MAX_NEW_TOKEN,
@@ -1085,14 +1130,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self._release_prefix_lock(decode_req.req)
                     break
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_prefix_lock(decode_req.req)
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
@@ -1726,8 +1771,8 @@ def alloc_for_decode_prealloc(
         if uses_swa_tail:
             # Tail-only SWA allocation: only valid when prefix_len == 0.
             # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count; the
-            # SWA budget in that case may slightly under-estimate.
+            # alloc_extend which allocates SWA at full page count;
+            # `_prealloc_kv_lens` charges the admission budget accordingly.
             kv_loc = allocator.alloc_extend_swa_tail(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
