@@ -160,8 +160,9 @@ class PipelineStage(StageDedupMixin, ABC):
     # write conflicts between its members.
     concurrency_safe: bool = False
 
-    # executor permits at most one collective-issuing member per execution
-    # level, preserving a deterministic collective order across ranks
+    # Collectives are sequenced in declaration order when a parallel level has
+    # more than one collective-issuing member. Non-collective siblings can
+    # still overlap with the first collective epoch.
     may_use_collectives: bool = False
 
     def set_component_residency_manager(self, manager) -> None:

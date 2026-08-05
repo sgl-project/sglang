@@ -86,8 +86,11 @@ MOVA, LongLive2, and the independent text/image branches of LingBot realtime.
 Overlapping stages can increase the temporary activation and workspace peak, and
 its latency benefit is workload-dependent. Use `auto` only after confirming
 headroom and end-to-end performance for the deployment workload. SGLang selects
-serial execution automatically for CPU/layerwise offload, non-CUDA execution, or a group that can
-issue more than one distributed collective; these cases cannot safely overlap.
+serial execution automatically for CPU/layerwise offload, non-CUDA execution, or
+groups with an unsupported execution paradigm. Within an `auto` group,
+collective-issuing stages retain declaration order across ranks; non-collective
+siblings can still overlap with the first collective stage. This makes TP encoder
+plus VAE conditioning safe without allowing rank-dependent NCCL ordering.
 
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 

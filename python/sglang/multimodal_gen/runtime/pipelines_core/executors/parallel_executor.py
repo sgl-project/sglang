@@ -96,7 +96,6 @@ class ParallelExecutor(PipelineExecutor):
                         and member.concurrency_safe
                         for member in level
                     )
-                    and sum(member.may_use_collectives for member in level) <= 1
                     and self._parallel_level_uses_resident_components(
                         level, server_args
                     )
@@ -138,6 +137,32 @@ class ParallelExecutor(PipelineExecutor):
             or bool(supports_parallel_group(level, server_args))
         )
 
+    @staticmethod
+    def _parallel_execution_epochs(
+        level: List[PipelineStage],
+    ) -> list[list[PipelineStage]]:
+        """Build safe CUDA-overlap epochs for one declared stage level.
+
+        NCCL requires calls on a shared communicator to occur in the same
+        order on every rank. Two stage forwards launched from separate Python
+        threads can enqueue their TP collectives in different orders, even
+        when the pipeline declaration is identical. Keep collective stages in
+        declaration order, but overlap all non-collective siblings with the
+        first one. This preserves useful TP-encoder + VAE overlap without
+        allowing rank-dependent collective interleaving.
+        """
+        collective_members = [stage for stage in level if stage.may_use_collectives]
+        if len(collective_members) <= 1:
+            return [level]
+
+        non_collective_members = [
+            stage for stage in level if not stage.may_use_collectives
+        ]
+        return [
+            [collective_members[0], *non_collective_members],
+            *([stage] for stage in collective_members[1:]),
+        ]
+
     def _runtime_offload_active(self) -> bool:
         """Whether any pipeline module is currently layerwise-offloaded.
 
@@ -169,10 +194,11 @@ class ParallelExecutor(PipelineExecutor):
     ) -> Any:
         """Run one multi-stage level concurrently.
 
-        Member 0 runs on the calling thread and the current stream; the rest
-        run on pool threads, each pinned to a reused side stream that waits
-        on the current stream before starting and is waited on after joining,
-        so every cross-level ordering the serial schedule provided is kept.
+        Each collective epoch runs member 0 on the calling thread and current
+        stream; the remaining members run on pool threads, each pinned to a
+        reused side stream that waits on the current stream before starting
+        and is waited on after joining. Multiple collective members are split
+        into ordered epochs before entering this method.
         Members must return the payload they received: with concurrent
         members there is no defined chaining order, so in-place mutation of
         disjoint request state is the only composable contract.
@@ -184,11 +210,13 @@ class ParallelExecutor(PipelineExecutor):
                 [stage._component_stage_name() for stage in level],
             )
         cuda_ready = torch.cuda.is_available()
-        side_count = len(level) - 1
+        max_side_count = max(
+            len(epoch) - 1 for epoch in self._parallel_execution_epochs(level)
+        )
         if cuda_ready:
             if self._level_streams is None:
                 self._level_streams = []
-            while len(self._level_streams) < side_count:
+            while len(self._level_streams) < max_side_count:
                 self._level_streams.append(torch.cuda.Stream())
         if self._level_thread_pool is None:
             self._level_thread_pool = ThreadPoolExecutor(
@@ -236,29 +264,31 @@ class ParallelExecutor(PipelineExecutor):
                 with torch.cuda.stream(stream):
                     return call()
 
+        results = {}
         with residency_context:
-            futures = [
-                self._level_thread_pool.submit(run_member, index, stage)
-                for index, stage in enumerate(level[1:], start=1)
-            ]
-            first_error: BaseException | None = None
-            try:
-                results = [None] * len(level)
-                results[0] = run_member(0, level[0])
-            except BaseException as error:  # noqa: BLE001 - keep first error
-                first_error = error
-            for index, future in enumerate(futures, start=1):
+            for epoch in self._parallel_execution_epochs(level):
+                futures = [
+                    self._level_thread_pool.submit(run_member, index, stage)
+                    for index, stage in enumerate(epoch[1:], start=1)
+                ]
+                first_error: BaseException | None = None
                 try:
-                    results[index] = future.result()
+                    results[epoch[0]] = run_member(0, epoch[0])
                 except BaseException as error:  # noqa: BLE001 - keep first error
-                    if first_error is None:
-                        first_error = error
-        if cuda_ready:
-            for stream in self._level_streams[:side_count]:
-                current_stream.wait_stream(stream)
-        if first_error is not None:
-            raise first_error
-        for stage, result in zip(level, results):
+                    first_error = error
+                for stage, future in zip(epoch[1:], futures):
+                    try:
+                        results[stage] = future.result()
+                    except BaseException as error:  # noqa: BLE001 - keep first error
+                        if first_error is None:
+                            first_error = error
+                if cuda_ready:
+                    for stream in self._level_streams[: len(epoch) - 1]:
+                        current_stream.wait_stream(stream)
+                if first_error is not None:
+                    raise first_error
+        for stage in level:
+            result = results[stage]
             if result is not payload:
                 raise RuntimeError(
                     f"parallel stage {stage._component_stage_name()} must "

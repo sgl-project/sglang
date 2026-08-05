@@ -194,6 +194,7 @@ class TestParallelLevelExecution(unittest.TestCase):
         first, second = _FakeStage("first", body), _FakeStage("second", body)
         first.set_execution_group("g")
         second.set_execution_group("g")
+        first.may_use_collectives = True
         payload = SimpleNamespace()
 
         result = _run(
@@ -269,25 +270,57 @@ class TestParallelLevelExecution(unittest.TestCase):
         )
         self.assertEqual(order, ["a", "b"])
 
-    def test_two_collective_members_downgrade_to_serial(self):
-        """Two independent collective streams could order differently by rank."""
-        order = []
-        stages = [
-            _FakeStage("a", body=lambda p: (order.append("a"), p)[1]),
-            _FakeStage("b", body=lambda p: (order.append("b"), p)[1]),
-        ]
-        for stage in stages:
+    def test_multiple_collectives_use_ordered_epochs(self):
+        """A TP collective cannot race another TP collective, but can overlap
+        the non-collective VAE sibling in its first epoch."""
+        barrier = threading.Barrier(2, timeout=10)
+        completed = set()
+
+        def first_collective(payload):
+            barrier.wait()
+            completed.add("first")
+            return payload
+
+        def non_collective(payload):
+            barrier.wait()
+            completed.add("vae")
+            return payload
+
+        def second_collective(payload):
+            self.assertEqual(completed, {"first", "vae"})
+            completed.add("second")
+            return payload
+
+        first = _FakeStage("first", first_collective)
+        second = _FakeStage("second", second_collective)
+        vae = _FakeStage("vae", non_collective)
+        for stage in (first, second, vae):
             stage.set_execution_group("g1")
-            stage.may_use_collectives = True
+        first.may_use_collectives = True
+        second.may_use_collectives = True
 
         _run(
             _executor(),
-            stages,
+            [first, second, vae],
             SimpleNamespace(),
             _server_args(parallel_stage_execution="auto"),
         )
 
-        self.assertEqual(order, ["a", "b"])
+        self.assertEqual(completed, {"first", "vae", "second"})
+
+    def test_collective_epochs_keep_declared_collective_order(self):
+        first = _FakeStage("first")
+        second = _FakeStage("second")
+        vae = _FakeStage("vae")
+        first.may_use_collectives = True
+        second.may_use_collectives = True
+
+        epochs = ParallelExecutor._parallel_execution_epochs([first, vae, second])
+
+        self.assertEqual(
+            [[stage._name for stage in epoch] for epoch in epochs],
+            [["first", "vae"], ["second"]],
+        )
 
     def test_serial_policy_downgrades_to_serial(self):
         order = []
