@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -61,6 +62,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_USE_NPU_ROTARY_MUL = get_bool_env_var(
+    "SGLANG_MINIMAX_H3_USE_NPU_ROTARY_MUL", default="true"
+)
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -376,7 +380,7 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if q.device.type == "npu":
+    if q.device.type == "npu" and _USE_NPU_ROTARY_MUL:
         from sglang.kernels.ops.diffusion.triton.npu_fallback import (
             apply_rotary_embedding_native,
         )
