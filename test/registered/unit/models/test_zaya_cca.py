@@ -42,11 +42,6 @@ def _ensure_dist_initialized() -> None:
     init_single_process_dist()
 
 
-# ---------------------------------------------------------------------------
-# Mock centralized pool
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class _MockLayerCache:
     conv: List[torch.Tensor]
@@ -165,11 +160,6 @@ def _mock_pool_context(pool: _MockReqToTokenPool):
         yield backend
     finally:
         set_forward_context(prev)
-
-
-# ---------------------------------------------------------------------------
-# Helper factories
-# ---------------------------------------------------------------------------
 
 
 def _make_forward_batch(
