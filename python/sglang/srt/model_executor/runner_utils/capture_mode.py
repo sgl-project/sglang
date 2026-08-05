@@ -27,6 +27,7 @@ import torch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import is_gfx1250_supported
 
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
@@ -48,7 +49,7 @@ def compile_in_capture_mode(func):
     torch.compile during cuda-graph capture without paying the
     compilation cost in the eager forward path.
     """
-    if is_capture_mode:
+    if is_capture_mode and not is_gfx1250_supported():
         return torch.compile(func)
     return func
 
