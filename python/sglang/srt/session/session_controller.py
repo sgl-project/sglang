@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from array import array
+from copy import copy
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -95,6 +96,7 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        self._inflight_req: Optional[Req] = None
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
@@ -316,38 +318,80 @@ class Session:
             time_stats=req.time_stats,
         )
         if last_req is not None:
-            new_req.multimodal_inputs = last_req.multimodal_inputs
+            new_req.multimodal_inputs = (
+                copy(last_req.multimodal_inputs)
+                if req.mm_inputs is not None and last_req.multimodal_inputs is not None
+                else last_req.multimodal_inputs
+            )
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
+        new_req.drop_trailing_stop_token = bool(session_params.drop_trailing_stop_token)
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
+            self._inflight_req = new_req
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
         return new_req
 
-    def finish_req(self, req):
-        """Update req_nodes after a streaming request finishes successfully."""
-        self._inflight = False
+    def _set_streaming_boundary(self, req, *, inflight: bool) -> None:
+        if self._inflight_req is not req:
+            raise RuntimeError(
+                f"Request {req.rid} does not own streaming session {self.session_id}"
+            )
+        self._inflight = inflight
+        if not inflight:
+            self._inflight_req = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
-            prev_node.req.session = None
+            if prev_node.req is not req:
+                prev_node.req.session = None
             self.req_nodes.clear()
         self.req_nodes[req.rid] = SessionReqNode(req)
-        # Confirm this req's token arrays as the session's rollback point.
         self.committed_origin_len = len(req.origin_input_ids)
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
-    def abort_req(self):
-        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+    def finish_req(self, req):
+        """Update req_nodes after a streaming request finishes successfully."""
+        self._set_streaming_boundary(req, inflight=False)
+
+    def checkpoint_retracted_req(self, req) -> None:
+        """Save resumable progress while keeping the streaming turn active."""
+        self._set_streaming_boundary(req, inflight=True)
+
+    def abort_req(self, req) -> bool:
+        """Clear the inflight owner on abort (req_nodes stays unchanged)."""
+        if self._inflight_req is not req:
+            return False
         self._inflight = False
+        self._inflight_req = None
+        return True
+
+    def replace_streaming_boundary(self, req) -> None:
+        """Replace the retained append boundary with an already-spliced request."""
+        if req is None:
+            raise ValueError("A streaming session boundary cannot be None")
+        self._inflight = False
+        self._inflight_req = None
+        for node in self.req_nodes.values():
+            node.req.session = None
+        self.req_nodes.clear()
+        req.session = self
+        self.req_nodes[req.rid] = SessionReqNode(req)
+        # Re-anchor the committed lengths to the (post-splice) boundary req.
+        # _share_token_arrays trims carry_fill/origin back to these on the next
+        # turn; leaving them at the pre-truncate values would re-admit the
+        # removed range as the prefix-match key.
+        self.committed_origin_len = len(req.origin_input_ids)
+        self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
+        self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
 
 class SessionController:
@@ -399,7 +443,7 @@ class SessionController:
             assert len(session.req_nodes) == 1
             [last_node] = session.req_nodes.values()
             req = last_node.req
-            if not req.finished():
+            if not req.finished() and req.session is session:
                 has_unfinished_request = True
 
         if has_unfinished_request:
@@ -468,7 +512,10 @@ class SessionController:
     def _all_requests_finished(session: Session) -> bool:
         if not session.req_nodes:
             return True
-        return all(node.req.finished() for node in session.req_nodes.values())
+        return all(
+            node.req.finished() or node.req.session is not session
+            for node in session.req_nodes.values()
+        )
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

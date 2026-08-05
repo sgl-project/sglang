@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol
 
 import torch
 
@@ -127,6 +127,54 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
+class StreamingSessionLifecycle(Protocol):
+    def reset(self) -> None: ...
+
+    def on_request_start(self, req: Any, slot: SessionSlot) -> None: ...
+
+    def on_request_committed(
+        self, session_id: str, slot: SessionSlot, req: Any
+    ) -> None: ...
+
+    def on_session_released(self, session_id: str) -> None: ...
+
+    def next_prefill_chunk_end(self, req: Any, start: int, end: int) -> int: ...
+
+    def on_prefill_forward_complete(self, req: Any, start: int, end: int) -> None: ...
+
+    def on_decode_token(self, req: Any) -> None: ...
+
+    def held_mamba_slots(self) -> int: ...
+
+
+class _NoopStreamingSessionLifecycle:
+    def reset(self) -> None:
+        return None
+
+    def on_request_start(self, req: Any, slot: SessionSlot) -> None:
+        return None
+
+    def on_request_committed(
+        self, session_id: str, slot: SessionSlot, req: Any
+    ) -> None:
+        return None
+
+    def on_session_released(self, session_id: str) -> None:
+        return None
+
+    def next_prefill_chunk_end(self, req: Any, start: int, end: int) -> int:
+        return end
+
+    def on_prefill_forward_complete(self, req: Any, start: int, end: int) -> None:
+        return None
+
+    def on_decode_token(self, req: Any) -> None:
+        return None
+
+    def held_mamba_slots(self) -> int:
+        return 0
+
+
 class StreamingSession(BasePrefixCache):
     """Adds streaming-session KV save/restore on top of any BasePrefixCache.
 
@@ -140,6 +188,22 @@ class StreamingSession(BasePrefixCache):
     def __init__(self, inner: BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
+        self._session_lifecycle: StreamingSessionLifecycle = (
+            _NoopStreamingSessionLifecycle()
+        )
+        self._has_attached_lifecycle = False
+
+    @property
+    def has_attached_lifecycle(self) -> bool:
+        return self._has_attached_lifecycle
+
+    def attach_session_lifecycle(
+        self, session_control: StreamingSessionLifecycle
+    ) -> None:
+        if self._has_attached_lifecycle:
+            raise RuntimeError("A streaming session control is already attached")
+        self._session_lifecycle = session_control
+        self._has_attached_lifecycle = True
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -188,6 +252,11 @@ class StreamingSession(BasePrefixCache):
     def has_slot(self, session_id: str) -> bool:
         return session_id in self.slots
 
+    def is_retained_boundary(self, req: Any) -> bool:
+        if not _is_streaming(req) or req.session.session_id not in self.slots:
+            return False
+        return any(node.req is req for node in req.session.req_nodes.values())
+
     def any_holding_kv(self) -> bool:
         return any(s.is_holding_kv for s in self.slots.values())
 
@@ -220,15 +289,20 @@ class StreamingSession(BasePrefixCache):
         if slot is None or slot.kv is None:
             return None
         if req.to_finish is not None:
-            req.session.abort_req()
+            req.session.abort_req(req)
             req.session = None
             return None
         return slot
 
     # -- BasePrefixCache abstract methods --
 
-    def reset(self):
+    def reset_state(self) -> None:
+        """Clear session-owned state without resetting the composed cache."""
+        self._session_lifecycle.reset()
         self.slots.clear()
+
+    def reset(self):
+        self.reset_state()
         self.inner.reset()
 
     # -- Streaming entries: contract with embedded composers (e.g.
@@ -241,9 +315,11 @@ class StreamingSession(BasePrefixCache):
         otherwise None (caller falls back to its raw match)."""
         slot = self.find_active_slot(params.req)
         if slot is None:
+            self._limit_first_prefill_match(params)
             return None
 
         req = params.req
+        self._session_lifecycle.on_request_start(req, slot)
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -251,8 +327,8 @@ class StreamingSession(BasePrefixCache):
         # can exceed len(token_ids) by 1.
         prefix_len = min(req.kv_committed_len, len(params.key))
 
-        # Streaming sessions are append-only (session_controller rollback
-        # ensures req_nodes always points to the last successful req).
+        # Streaming sessions are append-only; truncation updates the session's
+        # append target before another request can start.
         assert prefix_len >= slot.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.cache_protected_len=}"
@@ -285,26 +361,57 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        from sglang.srt.managers.schedule_batch import (
+            FINISH_ABORT,
+            FINISH_MATCHED_TOKEN,
+            StreamingSessionAbortPolicy,
+        )
 
-        session_id = req.session.session_id
+        session = req.session
+        session_id = session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
+        is_abort = isinstance(req.finished_reason, FINISH_ABORT)
 
-        # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
-        if isinstance(req.finished_reason, FINISH_ABORT):
+        if is_abort and session._inflight_req is not req:
+            if not self.detach_queued_request(req):
+                raise RuntimeError(
+                    "A non-owning streaming request advanced beyond its "
+                    f"session boundary: session={session_id}"
+                )
+            self._release_unretained_multimodal_inputs(req, session)
+            return True
+
+        # Cancel keeps forwarded output. The sampled tail has not run a forward,
+        # so exclude it from both the token history and KV boundary.
+        if (
+            is_abort
+            and req.streaming_abort_policy
+            is StreamingSessionAbortPolicy.COMMIT_FORWARDED
+        ):
+            if is_first:
+                slot = SessionSlot()
+                self.slots[session_id] = slot
+            finished_len = max(0, len(req.output_ids) - 1)
+            self._trim_overshoot(req, finished_len)
+            slot.save_from_req(req, is_first=is_first)
+            target = len(req.origin_input_ids) + finished_len
+            slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
+            self._session_lifecycle.on_request_committed(session_id, slot, req)
+            req.session.finish_req(req)
+            return True
+
+        # Other mid-processing aborts release the slot. The session still points
+        # at its last successful request and can re-prefill on the next turn.
+        if is_abort:
+            retains_boundary = self.is_retained_boundary(req)
+            if not session.abort_req(req):
+                raise RuntimeError(
+                    f"Request {req.rid} lost ownership of session {session_id}"
+                )
             if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup.
-                # Include last_node/cache_protected_len from the req so
-                # release_session calls dec_lock_ref on the tree lock.
-                # Also carry the mamba refs over so _free_slot_mamba can
-                # return the (possibly extra_buffer ping-pong) slots to
-                # the mamba pool; otherwise the abort orphans them.
+                # Transfer first-request resources into a temporary slot so the
+                # normal release path frees KV, tree locks, and recurrent state.
                 slot = SessionSlot(
                     req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
@@ -326,8 +433,21 @@ class StreamingSession(BasePrefixCache):
             self.release_session(session_id)
             req.req_pool_idx = None
             req.kv = None
-            req.session.abort_req()
+            req.mamba_pool_idx = None
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
+            req.mamba_last_track_seqlen = None
+            req.mamba_branching_seqlen = None
+            if not retains_boundary:
+                self._release_unretained_multimodal_inputs(req, session)
+                req.session = None
             return True
+
+        is_retraction = not req.finished()
+        if is_retraction and is_insert:
+            raise RuntimeError(
+                "An unfinished streaming request can only be cached for retraction"
+            )
 
         if is_first:
             slot = SessionSlot()
@@ -336,6 +456,14 @@ class StreamingSession(BasePrefixCache):
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
+        # A matched stop is sampled but never forwarded, so it cannot be part of
+        # the next turn's committed context.
+        if (
+            req.drop_trailing_stop_token
+            and finished_len > 0
+            and isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        ):
+            finished_len -= 1
         target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
@@ -346,8 +474,12 @@ class StreamingSession(BasePrefixCache):
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
-        # Update req_nodes to this successfully finished request.
-        req.session.finish_req(req)
+        self._session_lifecycle.on_request_committed(session_id, slot, req)
+
+        if is_retraction:
+            req.session.checkpoint_retracted_req(req)
+        else:
+            req.session.finish_req(req)
 
         return True
 
@@ -409,6 +541,7 @@ class StreamingSession(BasePrefixCache):
     # -- Session lifecycle --
 
     def release_session(self, session_id: str) -> None:
+        self._session_lifecycle.on_session_released(session_id)
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
@@ -511,6 +644,7 @@ class StreamingSession(BasePrefixCache):
                 total += slot.mamba_pool_idx.numel()
             if slot.mamba_ping_pong_track_buffer is not None:
                 total += slot.mamba_ping_pong_track_buffer.numel()
+        total += self._session_lifecycle.held_mamba_slots()
         return total
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
@@ -525,7 +659,121 @@ class StreamingSession(BasePrefixCache):
             mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
             slot.mamba_ping_pong_track_buffer = None
 
+    def record_decode_token(self, req: Any) -> None:
+        self._session_lifecycle.on_decode_token(req)
+
+    def next_prefill_chunk_end(self, req: Any, start: int, end: int) -> int:
+        if not _is_streaming(req):
+            return end
+        return self._session_lifecycle.next_prefill_chunk_end(req, start, end)
+
+    def record_prefill_forward_complete(self, req: Any, start: int, end: int) -> None:
+        if _is_streaming(req):
+            self._session_lifecycle.on_prefill_forward_complete(req, start, end)
+
+    def detach_queued_request(self, req: Any) -> bool:
+        """Detach a request that has not advanced beyond its saved session slot."""
+        if not _is_streaming(req):
+            return False
+        slot = self.slots.get(req.session.session_id)
+        if req.req_pool_idx is not None:
+            if slot is None or req.req_pool_idx != slot.req_pool_idx:
+                return False
+            if (
+                req.kv_committed_len != slot.kv_committed_len
+                or req.kv.kv_allocated_len != slot.kv.kv_allocated_len
+            ):
+                return False
+
+        for name in (
+            "mamba_pool_idx",
+            "mamba_ping_pong_track_buffer",
+        ):
+            req_value = getattr(req, name)
+            slot_value = None if slot is None else getattr(slot, name)
+            if req_value is not None and not self._same_slot_reference(
+                req_value, slot_value
+            ):
+                return False
+
+        session = req.session
+        session_id = session.session_id
+        owns_session = session.abort_req(req)
+        req.session = None
+        req.req_pool_idx = None
+        req.kv = None
+        req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_seqlen = None
+        req.mamba_branching_seqlen = None
+        if owns_session and slot is None:
+            self._session_lifecycle.on_session_released(session_id)
+        return True
+
+    @staticmethod
+    def _same_slot_reference(left: Any, right: Any) -> bool:
+        if right is None:
+            return False
+        if torch.is_tensor(left) and torch.is_tensor(right):
+            return bool(torch.equal(left, right))
+        return bool(left == right)
+
+    def truncate_kv(self, session_id: str, target: int) -> SessionSlot:
+        slot = self.slots.get(session_id)
+        if slot is None or not slot.is_holding_kv:
+            raise RuntimeError(f"Session {session_id} has no committed KV state")
+        if not 0 <= target <= slot.kv_committed_len:
+            raise ValueError(
+                f"Truncate target {target} is outside " f"[0, {slot.kv_committed_len}]"
+            )
+        if target < slot.cache_protected_len:
+            raise ValueError(
+                f"Truncate target {target} is below the protected session prefix "
+                f"{slot.cache_protected_len}"
+            )
+        self._free_kv_aligned(slot.req_pool_idx, target, slot.kv.kv_allocated_len)
+        slot.kv.kv_allocated_len = target
+        slot.kv_committed_len = target
+        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, target)
+        return slot
+
+    def get_kv_state(self, session_id: str) -> Optional[dict[str, Any]]:
+        slot = self.slots.get(session_id)
+        if slot is None:
+            return None
+        state: dict[str, Any] = {
+            "found": True,
+            "kv_committed_len": slot.kv_committed_len,
+            "kv_allocated_len": (
+                slot.kv.kv_allocated_len if slot.kv is not None else 0
+            ),
+            "is_holding_kv": slot.is_holding_kv,
+        }
+        return state
+
     # -- Internal helpers (streaming body bits) --
+
+    def _limit_first_prefill_match(self, params: MatchPrefixParams) -> None:
+        if not _is_streaming(params.req) or not self._has_attached_lifecycle:
+            return
+        current_limit = (
+            len(params.key.token_ids)
+            if params.key.limit is None
+            else min(params.key.limit, len(params.key.token_ids))
+        )
+        full_end = len(params.req.full_untruncated_fill_ids)
+        if not full_end:
+            return
+        chunk_end = self.next_prefill_chunk_end(params.req, 0, full_end)
+        if not 0 < chunk_end <= full_end:
+            raise RuntimeError(
+                "Streaming lifecycle returned an invalid first prefill "
+                f"boundary: chunk_end={chunk_end} end={full_end}"
+            )
+        match_limit = min(current_limit, chunk_end - 1)
+        if match_limit < current_limit:
+            params.key.limit = match_limit
 
     def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
         """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
@@ -569,6 +817,26 @@ class StreamingSession(BasePrefixCache):
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
             self.token_to_kv_pool_allocator.free(tail)
+
+    @staticmethod
+    def _release_unretained_multimodal_inputs(req: Req, session: Any) -> None:
+        """Release aborted-turn features without clearing the saved boundary."""
+        mm_inputs = req.multimodal_inputs
+        if mm_inputs is None:
+            return
+
+        retained_item_ids = {
+            id(item)
+            for node in session.req_nodes.values()
+            if node.req is not req and node.req.multimodal_inputs is not None
+            for item in node.req.multimodal_inputs.mm_items
+        }
+        releasable = copy.copy(mm_inputs)
+        releasable.mm_items = [
+            item for item in mm_inputs.mm_items if id(item) not in retained_item_ids
+        ]
+        releasable.release_features()
+        req.multimodal_inputs = None
 
     # -- Pass-through methods --
 
@@ -640,3 +908,11 @@ class StreamingSession(BasePrefixCache):
     # sliding_window_size, all_values_flatten, etc.)
     def __getattr__(self, name):
         return getattr(self.inner, name)
+
+
+def get_streaming_session(cache: BasePrefixCache) -> Optional[StreamingSession]:
+    """Return a cache's direct or composed streaming-session component."""
+    if isinstance(cache, StreamingSession):
+        return cache
+    session = getattr(cache, "session", None)
+    return session if isinstance(session, StreamingSession) else None

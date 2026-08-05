@@ -4,11 +4,9 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefResult,
-    IncLockRefResult,
-)
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -97,6 +95,7 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
+        req.session = None
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -115,6 +114,22 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_mamba_budget_allows_preassigned_main_state(self):
+        adder = object.__new__(PrefillAdder)
+        adder.rem_mamba_slots = 0
+
+        self.assertTrue(
+            adder._has_mamba_budget_for_req(SimpleNamespace(mamba_pool_idx=object()))
+        )
+
+    def test_mamba_budget_rejects_new_state_when_pool_is_full(self):
+        adder = object.__new__(PrefillAdder)
+        adder.rem_mamba_slots = 0
+
+        self.assertFalse(
+            adder._has_mamba_budget_for_req(SimpleNamespace(mamba_pool_idx=None))
+        )
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
@@ -776,6 +791,171 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def _attach_streaming_lifecycle(self, chunk_end: int) -> MagicMock:
+        lifecycle = MagicMock()
+        lifecycle.next_prefill_chunk_end.side_effect = lambda _req, start, end: min(
+            max(chunk_end, start + 1), end
+        )
+        session_cache = StreamingSession(self.mock_tree_cache)
+        session_cache.attach_session_lifecycle(lifecycle)
+        self.mock_tree_cache.session = session_cache
+        return lifecycle
+
+    def _create_streaming_prefill_req(self, num_tokens: int):
+        req = self.create_mock_req("streaming", priority=0, max_new_tokens=8)
+        req.full_untruncated_fill_ids = list(range(num_tokens))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.session = SimpleNamespace(streaming=True, session_id="session")
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_lifecycle_boundary_forces_chunk(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        lifecycle = self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=100)
+        req = self._create_streaming_prefill_req(8)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        req.set_extend_range.assert_called_once_with(0, 3)
+        self.assertIs(adder.new_chunked_req, req)
+        lifecycle.next_prefill_chunk_end.assert_called_once_with(req, 0, 8)
+
+    def test_lifecycle_chunk_continues_at_next_boundary(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=6)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=100)
+        req = self._create_streaming_prefill_req(8)
+        req.prefix_indices = [0, 1, 2]
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_called_once_with(3, 6)
+
+    def test_resource_budget_can_cut_before_lifecycle_boundary(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=2)
+        req = self._create_streaming_prefill_req(8)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        req.set_extend_range.assert_called_once_with(0, 2)
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_existing_chunk_latch_defers_new_lifecycle_chunk(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=100)
+        req = self._create_streaming_prefill_req(8)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        req.set_extend_range.assert_not_called()
+        self.assertNotIn(req, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_existing_chunk_latch_defers_new_resource_chunk(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        lifecycle = self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=3)
+        req = self._create_streaming_prefill_req(8)
+        req.session = None
+
+        result = adder.add_one_req(
+            req, has_chunked_req=True, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        req.set_extend_range.assert_not_called()
+        self.assertNotIn(req, adder.can_run_list)
+        self.assertIsNone(adder.new_chunked_req)
+        lifecycle.next_prefill_chunk_end.assert_not_called()
+
+    def test_lifecycle_boundary_rejects_unsupported_page_alignment(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=4, rem_chunk_tokens=100
+        )
+        req = self._create_streaming_prefill_req(8)
+
+        with self.assertRaisesRegex(RuntimeError, "not page-aligned"):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+    def test_lifecycle_boundary_rejects_deterministic_alignment(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=100)
+        req = self._create_streaming_prefill_req(8)
+
+        with self.assertRaisesRegex(RuntimeError, "deterministic truncation"):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=2)
+
+    def test_non_streaming_request_ignores_lifecycle_boundary(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        lifecycle = self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch())
+        req = self._create_streaming_prefill_req(8)
+        req.session = None
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        req.set_extend_range.assert_called_once_with(0, 8)
+        lifecycle.next_prefill_chunk_end.assert_not_called()
+
+    def test_unattached_streaming_lifecycle_keeps_default_prefill_path(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self.mock_tree_cache.session = StreamingSession(self.mock_tree_cache)
+        adder = self.create_adder(self.create_running_batch())
+        req = self._create_streaming_prefill_req(8)
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        req.set_extend_range.assert_called_once_with(0, 8)
+
+    def test_lifecycle_boundary_requires_chunked_prefill(self):
+        self.mock_token_allocator.available_size.return_value = 10_000
+        self.mock_token_allocator.full_available_size.return_value = 10_000
+        self._attach_streaming_lifecycle(chunk_end=3)
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=None)
+        req = self._create_streaming_prefill_req(8)
+
+        with self.assertRaisesRegex(RuntimeError, "require chunked prefill"):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
 
 
 if __name__ == "__main__":

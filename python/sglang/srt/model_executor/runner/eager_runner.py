@@ -31,9 +31,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    build_eager_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
 )
@@ -237,6 +235,11 @@ class EagerRunner(BaseRunner):
             attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
+        if (
+            model_runner.forward_input_embeds_to_decode
+            and forward_batch.input_embeds is not None
+        ):
+            kwargs["input_embeds"] = forward_batch.input_embeds
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
