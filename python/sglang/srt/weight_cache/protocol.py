@@ -67,8 +67,9 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
-    # For quantization
+    # Quantization backends
     fp4_gemm_backend: str
+    fp8_gemm_backend: str
     moe_runner_backend: str
 
     def matches(self, other: CacheConfig) -> bool:
@@ -302,15 +303,9 @@ class WeightCacheQuantStates:
         self.module_attrs = {}
         self._capture_attrs = self._registry[quant_method].capture_attrs
 
-        # Resolve the backends the engine also resolves, for every method and
-        # not just FP4 ones: both feed compute_quant_stamp(), which fingerprints
-        # every CacheConfig, so a daemon that skipped either would stamp an
-        # unresolved value against a client's resolved one and never match.
         from sglang.srt.layers.moe import initialize_moe_config
-        from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 
         initialize_moe_config(server_args)
-        initialize_fp4_gemm_config(server_args)
 
         logger.info(
             f"[weight_cache:{where}] {type(self).__name__} for {quant_method!r}; "
@@ -386,27 +381,24 @@ class WeightCacheQuantStates:
 
     @classmethod
     def compute_quant_stamp(cls) -> Dict[str, str]:
-        fp4_gemm_backend = ""
-        moe_runner_backend = ""
-        try:
-            from sglang.srt.layers.quantization.fp4_utils import (
-                get_fp4_gemm_runner_backend,
-            )
+        from sglang.srt.layers.moe import get_moe_runner_backend
 
-            fp4_gemm_backend = str(get_fp4_gemm_runner_backend().value)
-        except Exception:
-            logger.warning("[weight_cache] failed to resolve the FP4 GEMM backend")
-        try:
-            from sglang.srt.layers.moe import get_moe_runner_backend
-
-            moe_runner_backend = str(get_moe_runner_backend().value)
-        except Exception:
-            logger.warning("[weight_cache] failed to resolve the MoE runner backend")
+        moe_runner_backend = str(get_moe_runner_backend().value)
 
         return {
-            "fp4_gemm_backend": fp4_gemm_backend,
+            "fp4_gemm_backend": "",
+            "fp8_gemm_backend": "",
             "moe_runner_backend": moe_runner_backend,
         }
+
+    @classmethod
+    def quant_stamp_for(cls, quant_method: str) -> Dict[str, str]:
+        """compute_quant_stamp() of the states class registered for a method.
+
+        Lets a caller stamp without constructing an instance (which needs
+        published server args); the per-class override still applies.
+        """
+        return cls._registry[quant_method].states_cls.compute_quant_stamp()
 
 
 @WeightCacheQuantStates.register("", is_supported_func=lambda _quant_config: True)
@@ -418,6 +410,31 @@ class TensorOnlyQuantStates(WeightCacheQuantStates):
     tensors, shapes are preserved, and no other object holds a reference to
     them.
     """
+
+    def __init__(
+        self,
+        quant_config: Any,
+        quant_method: str,
+        server_args: ServerArgs,
+        *,
+        where: str,
+    ) -> None:
+        super().__init__(quant_config, quant_method, server_args, where=where)
+        from sglang.srt.layers.quantization.fp8_utils import (
+            initialize_fp8_gemm_config,
+        )
+
+        initialize_fp8_gemm_config(server_args)
+
+    @classmethod
+    def compute_quant_stamp(cls) -> Dict[str, str]:
+        stamp = super().compute_quant_stamp()
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
+
+        stamp["fp8_gemm_backend"] = str(get_fp8_gemm_runner_backend().value)
+        return stamp
 
     def ipc_reshapes_weights(self) -> bool:
         return False
@@ -443,6 +460,31 @@ class TensorOnlyQuantStates(WeightCacheQuantStates):
     },
 )
 class ModeloptFP4QuantStates(WeightCacheQuantStates):
+
+    def __init__(
+        self,
+        quant_config: Any,
+        quant_method: str,
+        server_args: ServerArgs,
+        *,
+        where: str,
+    ) -> None:
+        super().__init__(quant_config, quant_method, server_args, where=where)
+        from sglang.srt.layers.quantization.fp4_utils import (
+            initialize_fp4_gemm_config,
+        )
+
+        initialize_fp4_gemm_config(server_args)
+
+    @classmethod
+    def compute_quant_stamp(cls) -> Dict[str, str]:
+        stamp = super().compute_quant_stamp()
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        stamp["fp4_gemm_backend"] = str(get_fp4_gemm_runner_backend().value)
+        return stamp
 
     def ipc_reshapes_weights(self) -> bool:
         # Weights are padded for kernel alignment and their block scales

@@ -60,6 +60,7 @@ def _make_cache_config(**overrides) -> CacheConfig:
         device_capability="8.0",
         torch_version="2.5.1",
         fp4_gemm_backend="",
+        fp8_gemm_backend="",
         moe_runner_backend="auto",
     )
     base.update(overrides)
@@ -132,6 +133,7 @@ class TestCacheConfig(CustomTestCase):
             # loads -- the tensors themselves would map without complaint.
             ("fp4_gemm_backend", "flashinfer_trtllm"),
             ("moe_runner_backend", "flashinfer_cutlass"),
+            ("fp8_gemm_backend", "deep_gemm"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),

@@ -549,7 +549,7 @@ class IpcModelLoader(BaseModelLoader):
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
                 **compute_env_stamp(),
-                **WeightCacheQuantStates.compute_quant_stamp(),
+                **WeightCacheQuantStates.quant_stamp_for(quant_method),
             )
 
             logger.info(
