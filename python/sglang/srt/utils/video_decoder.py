@@ -33,6 +33,19 @@ def _try_cuda_backend() -> bool:
     return _cuda_backend_enabled
 
 
+def _decord_batch_to_numpy(batch) -> np.ndarray:
+    """Coerce a decord ``get_batch`` return to ``np.ndarray`` (decord 3.3+ returns Tensor)."""
+    if hasattr(batch, "asnumpy"):
+        return batch.asnumpy()
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a hard dep
+        return np.asarray(batch)
+    if isinstance(batch, torch.Tensor):
+        return batch.cpu().numpy()
+    return np.asarray(batch)
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
@@ -107,7 +120,7 @@ class VideoDecoderWrapper:
             batch = self._decoder.get_frames_at(indices)
             return batch.data.numpy()
         else:
-            return self._decoder.get_batch(indices).asnumpy()
+            return _decord_batch_to_numpy(self._decoder.get_batch(indices))
 
     def get_frames_as_tensor(self, indices: list):
         """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
@@ -129,7 +142,7 @@ class VideoDecoderWrapper:
             batch = self._decoder.get_frames_at(indices)
             return batch.data.pin_memory()
         else:
-            arr = self._decoder.get_batch(indices).asnumpy()
+            arr = _decord_batch_to_numpy(self._decoder.get_batch(indices))
             return torch.from_numpy(arr).pin_memory()
 
     def _parallel_decode(self, indices, num_threads):
