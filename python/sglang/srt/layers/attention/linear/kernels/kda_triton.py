@@ -64,12 +64,16 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            lower_bound is None
-            and replayssm_d is not None
+            replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
+            if lower_bound is not None:
+                raise NotImplementedError(
+                    "KDA safe gate (lower_bound) is not implemented in the "
+                    "ReplaySSM decode kernel; disable --enable-linear-replayssm."
+                )
             K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
@@ -126,9 +130,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        lower_bound = kwargs.get("lower_bound", None)
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -165,6 +169,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
         lower_bound: Optional[float] = None,
+        # fused ReplaySSM ring-write (dense verify only; off elsewhere).
+        cache_ring: bool = False,
+        replayssm_rawv: Optional[torch.Tensor] = None,
+        replayssm_rawk: Optional[torch.Tensor] = None,
+        replayssm_g: Optional[torch.Tensor] = None,
+        replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -173,8 +183,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
-        # lower_bound must match the decode/extend gate so the verified state evolves
-        # identically to the committed decode state.
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -196,6 +204,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=lower_bound,
+            cache_ring=cache_ring,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
         )
 
     def extend(

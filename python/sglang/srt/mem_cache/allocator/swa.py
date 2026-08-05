@@ -365,17 +365,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
 
-    def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.swa_attn_allocator.backup_state(),
-        ]
-
-    def restore_state(self, state):
-        assert len(state) == 2
-        self.full_attn_allocator.restore_state(state[0])
-        self.swa_attn_allocator.restore_state(state[1])
-
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
@@ -511,12 +500,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.free_group:
             self.free(torch.cat(self.free_group))
         self.free_group = []
-
-    def backup_state(self):
-        return self.swa_attn_allocator.backup_state()
-
-    def restore_state(self, state):
-        self.swa_attn_allocator.restore_state(state)
 
     def clear(self):
         self.swa_attn_allocator.clear()

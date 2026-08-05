@@ -4,8 +4,8 @@ Loaded on demand by the `cookbook-add-model` skill. This is the field-by-field
 contract for when the clone needs more than a rename. The two engine files are
 the canonical specs — read their headers first:
 
-- [`_deployment.jsx`](../../../../docs_new/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
-- [`_playground.jsx`](../../../../docs_new/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
+- [`_deployment.jsx`](../../../../docs/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
+- [`_playground.jsx`](../../../../docs/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
 
@@ -13,7 +13,7 @@ Engine extension (adding a new playground axis) lives in [engine-axis.md](engine
 
 ## 2.1 Create the config file
 
-**Path**: `docs_new/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
+**Path**: `docs/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
 the HuggingFace org (`deepseek-ai`, `Qwen`, `moonshotai`, ...); the file
 name is a short hyphenated model id (`deepseek-v4`, `qwen3.5`, ...).
 
@@ -29,7 +29,7 @@ the full contract):
 |---|---|---|
 | `modelName` | string | Display label only. Not used for HF slug — see `modelNames`. |
 | `supportedHardware` | `string[]` | Which hw ids appear in the catalog. Subset of `HARDWARE_CATALOG` (in `_deployment.jsx`) ∪ `config.hardware`. Listing an id makes its button appear; if no cell uses it, the engine greys it out automatically. |
-| `hardware` | `{id,label,vram,vendor}[]` | Optional. GPUs the shared `HARDWARE_CATALOG` doesn't carry (workstation / desktop / future chips, e.g. RTX PRO 6000). The engine merges these into the catalog, so a model-specific GPU is config data — **no engine-catalog edit**. Also add the id to `supportedHardware`. |
+| `hardware` | `{id,label,vram,vendor}[]` | Optional. GPUs the shared `HARDWARE_CATALOG` doesn't carry (workstation / desktop / future chips, e.g. RTX PRO 6000). The engine merges these into the catalog, so a model-specific GPU is config data — **no engine-catalog edit**. Also add the id to `supportedHardware`. A catalog entry (shared or per-model) may add `multiNodeDockerFlags: string[]` — `docker run` flags the platform's multi-node fabric needs, emitted into the Docker command for multi-node cells only (e.g. DGX Spark's ConnectX-7 RDMA: `--ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`). Platform-invariant, so it lives on the hardware entry, not in each model's config. |
 | `variants` | `{id, label, subtitle?}[]` | 2nd-dim option list. Use `default` / single-element if the model has no variant axis. |
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
@@ -43,7 +43,7 @@ the full contract):
 
 | Field | Type | Purpose |
 |---|---|---|
-| `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. |
+| `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. Hints render above **both** run modes, so keep them mode-agnostic: `docker run` flags belong in the hardware entry's `multiNodeDockerFlags` (above), which the engine puts in the command itself. |
 | `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|quant` (most specific) then `hw`. Use a `hw\|quant` key only when one quant on a shared GPU needs a different image (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); otherwise key by plain `hw`. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
 | `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. `speed` should carry `--flush-cache` (bench_serving's `random` prompts are deterministic — warm reruns hit the radix cache and inflate throughput; measure cache-cold). Optional; the button only appears when this AND `benchmarks` are present. |
@@ -217,7 +217,7 @@ schemas (full reference in the `_playground.jsx` header):
 
 ## 2.4 Create the MDX page
 
-Path: `docs_new/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
+Path: `docs/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
 the per-model config, render them inside the relevant sections:
 
 ```mdx

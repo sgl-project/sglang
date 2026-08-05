@@ -13,6 +13,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -69,6 +70,18 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    if (
+        runner.server_args.dcp_size > 1
+        and runner.server_args.speculative_algorithm is not None
+    ):
+        _, decode_backend = runner.server_args.get_attention_backends()
+        if decode_backend == "trtllm_mla":
+            raise ValueError(
+                "trtllm_mla cannot serve decode context parallelism with speculative "
+                "decoding: it does not forward the cyclic DCP metadata to its decode "
+                "kernel and returns no rank-local LSE for the cross-rank merge. "
+                "Select cutedsl_mla or tokenspeed_mla."
+            )
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
@@ -89,9 +102,9 @@ def create_tokenspeed_mla_backend(runner):
 def create_cutedsl_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("cutedsl_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+    from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 
-    return TRTLLMMLABackend(runner, backend="cute-dsl")
+    return CuteDslMLABackend(runner)
 
 
 @register_attention_backend("aiter")
@@ -277,6 +290,22 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+def attn_backend_wrapper_for_draft_extend(
+    runner: "ModelRunner", full_attn_backend: "AttentionBackend"
+):
+    """Apply the model's attention wrapper to a DRAFT-EXTEND backend, if it needs one.
+
+    ``DraftBackendFactory`` skips :func:`attn_backend_wrapper`, which is right for
+    the mamba hybrids whose MTP draft is all softmax attention. Inkling's draft has
+    its own short convs, so it must expose ``conv_state_metadata`` too.
+    """
+    from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+
+    if isinstance(runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)):
+        return attn_backend_wrapper(runner, full_attn_backend)
+    return full_attn_backend
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't
@@ -305,7 +334,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         if isinstance(
             runner.model_config.hf_config, (InklingModelConfig, InklingMMConfig)
         ):
-            return full_attn_backend
+            from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
+                InklingShortConvAttnBackend,
+                InklingShortConvHybridAttnBackend,
+            )
+
+            return InklingShortConvHybridAttnBackend(
+                full_attn_backend,
+                InklingShortConvAttnBackend(runner),
+                cfg.full_attention_layer_ids,
+            )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
@@ -328,7 +366,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
             from sglang.srt.layers.attention.linear.gdn_backend import (
                 GDNAttnBackend,
-                maybe_set_default_flashinfer_gdn_prefill,
+                flashinfer_gdn_prefill_default,
             )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
@@ -342,9 +380,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
-            maybe_set_default_flashinfer_gdn_prefill(runner)
-        initialize_linear_attn_config(runner.server_args)
+            prefill_default = flashinfer_gdn_prefill_default(runner)
+        if prefill_default is not None:
+            get_context().override(
+                "gdn_backend.sm100_flashinfer_default",
+                linear_attn_prefill_backend=prefill_default,
+            )
+        initialize_linear_attn_config(
+            runner.server_args, prefill_default=prefill_default
+        )
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():

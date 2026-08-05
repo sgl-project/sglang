@@ -109,6 +109,9 @@ def kimi_linear_config(model_config: ModelConfig):
     # it must route to KDAAttnBackend rather than the lightning backend.
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
+    text_config = getattr(config, "text_config", None)
+    if isinstance(text_config, KimiLinearConfig):
+        return text_config
     return None
 
 

@@ -1,11 +1,10 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -178,7 +177,6 @@ def fused_moe_router_tensorcore_kernel(
     stride_bn: tl.constexpr,
     dp_attn_workaround_flag: tl.constexpr,
 ):
-
     # 1. get block id
     pid = tl.program_id(axis=0)
 
@@ -522,42 +520,3 @@ def router_gate_matvec(
         **pdl_kwargs,
     )
     return out
-
-
-class FusedMoeRouter:
-    def __init__(self, router_linear, topk, moe_softcapping) -> None:
-        self.router_linear = router_linear
-        self.topk = topk
-        self.moe_softcapping = moe_softcapping
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def forward(
-        self, x: torch.Tensor, residual: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if x.is_cuda:
-            return self.forward_cuda(x, residual)
-        else:
-            return self.forward_vllm(x, residual)
-
-    def forward_cuda(
-        self, x: torch.Tensor, autotune=False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return fused_moe_router_shim(
-            moe_softcapping=self.moe_softcapping,
-            hidden_states=x,
-            gating_output=self.router_linear.weight,
-            topk=self.topk,
-            renormalize=False,
-        )
-
-    def forward_torch(
-        self,
-        x: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        g = x.float() @ self.router_linear.weight.T.float()
-
-        g = torch.tanh(g.float() / self.moe_softcapping) * self.moe_softcapping
-
-        return fused_topk(x, g, self.topk, False)

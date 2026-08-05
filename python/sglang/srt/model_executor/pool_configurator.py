@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -119,6 +119,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -181,12 +182,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
+                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
                     draft_cell_size_per_token=(
                         compute_dflash_draft_kv_cell_size_per_token(
                             draft_model_config=kvc.spec_aux_config.dflash_draft_model_config,
                             kv_cache_dtype=kvc.kv_cache_dtype,
-                            draft_num_layers=int(draft_num_layers),
+                            draft_num_layers=int(draft_num_layers)
+                            * kvc.server_args.dcp_size,
                             tp_size=get_parallel().attn_tp_size,
                         )
                     ),
@@ -317,7 +319,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif get_model().kv_cache_dtype == "mxfp8":
+            elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
@@ -352,6 +354,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -381,7 +384,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if get_model().kv_cache_dtype == "mxfp8":
+        if self.kv_cache_dtype_str == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
@@ -514,6 +517,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
@@ -626,6 +630,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
