@@ -88,6 +88,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      # A no-op on the hosted default, which ships zstd; here for whatever
+      # restore_runs_on is pointed at, since a reader without it sees no entry.
+      - name: Ensure zstd so the saved entry is readable
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
       # setup.py counts because it selects which crates get built. pyproject.toml
       # is left out - it churns on bumps that cannot affect these modules.
       - name: Restore built modules
@@ -150,14 +155,29 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Same path ci_install_dependency.sh uses: one warm cargo cache per host.
+          # Same path ci_install_dependency.sh uses, so a runner that also runs test
+          # stages keeps one warm cache. Its guard is repeated here because nothing
+          # prunes the tree on a runner that only ever builds.
           export CARGO_TARGET_DIR="${HOME}/.cache/sglang-cargo-target"
+          mkdir -p "${CARGO_TARGET_DIR}"
+          used="$(df --output=pcent "${CARGO_TARGET_DIR}" 2>/dev/null | tr -dc '0-9')"
+          if [ "${used:-0}" -ge 85 ]; then
+              echo "cargo target dir filesystem at ${used}%; dropping ${CARGO_TARGET_DIR}"
+              rm -rf "${CARGO_TARGET_DIR}"
+              mkdir -p "${CARGO_TARGET_DIR}"
+          fi
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
           # build_rust needs only the build backend, not sglang's ~294 runtime deps.
-          uv venv /tmp/rust-ext-build --python python3.10 --seed
+          # Per-job path: these runners are persistent and shared, so a fixed one
+          # both inherits the previous job's venv and races a concurrent build.
+          venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
+          # would fail the step, and nothing here is worth keeping for a postmortem.
+          trap 'rm -rf "${venv}" || true' EXIT
+          uv venv "${venv}" --python python3.10 --seed
           # shellcheck disable=SC1091
-          source /tmp/rust-ext-build/bin/activate
+          source "${venv}/bin/activate"
           uv pip install "setuptools>=61.0" "setuptools-rust>=1.10" "setuptools-scm>=8.0" wheel
           cd python
           SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace
@@ -166,6 +186,11 @@ jobs:
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
+
+      # Without it the entry saved below lands under a version no reader with zstd
+      # can find. This runner's image ships without it.
+      - name: Ensure zstd so the restore job can read what this job saves
+        run: bash scripts/ci/utils/ensure_zstd.sh
 
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
