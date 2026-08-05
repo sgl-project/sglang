@@ -514,6 +514,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # True when an idle speculative batch was normalized during init_new so
+    # the worker observes its DP dummy rows before allocating draft buffers.
+    mlp_sync_prepared: bool = False
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -847,6 +850,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             if model_runner.server_args.enable_lora:
                 model_runner.lora_manager.reset_lora_batch()
+            if (
+                ret.global_num_tokens_cpu is not None
+                and ret.spec_info is not None
+                and ret.spec_info.is_draft_input()
+            ):
+                from sglang.srt.speculative.spec_info import SpecInputType
+
+                ret.prepare_mlp_sync_batch(model_runner)
+                # This normalized idle shape is the worker-visible baseline
+                # for every draft step.  Do not let post-forward restore the
+                # pre-normalization zero sizes between steps.
+                ret._original_batch_size = ret.batch_size
+                ret._original_num_tokens = ret.positions.shape[0]
+                # Real draft batches reserve every step's write location in
+                # prepare_for_draft.  The idle path skips that allocator, so
+                # synthesize the same flattened [N, topk, steps] layout with
+                # dummy slot 0 after DP normalization determines N.
+                if ret.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT:
+                    draft_cache_rows = (
+                        ret.batch_size
+                        * ret.spec_info.num_tokens_per_req
+                        * model_runner.server_args.speculative_num_steps
+                    )
+                    if ret.out_cache_loc.shape[0] < draft_cache_rows:
+                        ret.out_cache_loc = ret._pad_tensor_to_size(
+                            ret.out_cache_loc, draft_cache_rows
+                        )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1478,6 +1508,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
+        self.mlp_sync_prepared = True
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
@@ -1535,9 +1566,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=1,
             )
 
-        # TODO: check if we need to pad other tensors
+        # A speculative draft-extend row represents a fixed-width request, not
+        # a zero-token request.  DP overlap can append such rows after the
+        # worker has already built the real-request metadata; keep both the GPU
+        # tensors and their CPU mirrors aligned with the padded request count.
+        dummy_extend_len = 0
+        if (
+            self.spec_info is not None
+            and self.forward_mode.is_draft_extend_v2()
+            and self.spec_info.num_tokens_per_req > 0
+        ):
+            dummy_extend_len = self.spec_info.num_tokens_per_req
+
         if self.extend_seq_lens is not None:
-            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+            self.extend_seq_lens = self._pad_tensor_to_size(
+                self.extend_seq_lens, bs, value=dummy_extend_len
+            )
+        if self.extend_prefix_lens is not None:
+            self.extend_prefix_lens = self._pad_tensor_to_size(
+                self.extend_prefix_lens, bs
+            )
+        if self.extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu.extend(
+                [dummy_extend_len] * (bs - len(self.extend_seq_lens_cpu))
+            )
+        if self.extend_prefix_lens_cpu is not None:
+            self.extend_prefix_lens_cpu.extend(
+                [0] * (bs - len(self.extend_prefix_lens_cpu))
+            )
+        if self.extend_logprob_start_lens_cpu is not None:
+            self.extend_logprob_start_lens_cpu.extend(
+                [0] * (bs - len(self.extend_logprob_start_lens_cpu))
+            )
 
         if self.rids_int is not None:
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
@@ -1592,6 +1652,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
+        execution_num_tokens = self.positions.shape[0]
         if self._original_forward_mode is not None:
             self.forward_mode = self._original_forward_mode
         if self._original_batch_size is not None:
@@ -1611,7 +1672,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                num_tokens = self.hidden_states_backup.shape[0]
+                # An overlap idle rank may enter with zero/stale draft state
+                # while the scheduler already carries a dummy position, or DP
+                # sync may fabricate the execution row itself.  Keep enough
+                # output rows to match either source of the dummy.  Non-empty
+                # ranks still discard ordinary DP padding and retain only their
+                # original position/hidden-state rows.
+                num_tokens = max(
+                    self.hidden_states_backup.shape[0],
+                    self._original_num_tokens or 0,
+                    execution_num_tokens if self._original_batch_size == 0 else 0,
+                )
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
@@ -1639,6 +1710,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :bs
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
+            elif self.forward_mode.is_idle() and self.spec_info.is_draft_input():
+                # IDLE ranks still execute normalized draft rows for DP
+                # collectives.  Their scheduler positions/top-k tensors carry
+                # those rows, so do not collapse the model output back to the
+                # zero real-request batch size before the draft worker uses it.
+                num_tokens = max(
+                    self._original_num_tokens or 0,
+                    execution_num_tokens if self._original_batch_size == 0 else 0,
+                )
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
+                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[

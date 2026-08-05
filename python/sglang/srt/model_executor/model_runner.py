@@ -100,6 +100,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     has_forward_context,
 )
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -1414,7 +1415,10 @@ class ModelRunner:
         runner's capture/replay, so this is skipped there.
         """
         # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.mlp_sync_prepared
+        ):
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
@@ -1684,6 +1688,14 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+
+            # A speculative worker can pre-plan metadata before DP/MLP sync.
+            # Let the active per-step backend repair row-dependent metadata if
+            # padding changed the eager batch shape.  The base hook is a no-op
+            # for sparse backends whose pre-planned schedules must be kept.
+            get_attn_backend().normalize_forward_metadata_for_dp_padding(
+                forward_batch
+            )
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.

@@ -17,7 +17,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    normalize_page_table_rows,
+)
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -3139,6 +3142,28 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
 
+    def normalize_forward_metadata_for_dp_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Re-plan eager FA metadata when DP sync appended dummy requests.
+
+        EAGLE pre-plans every draft step before the model runner performs DP
+        padding.  On an empty overlap rank that produces a zero-row page table,
+        while the actual forward contains one dummy request.  Rebuilding just
+        this active dense backend preserves pre-planned sparse/DSA schedules
+        and gives every row-dependent FA tensor the same request dimension.
+        """
+        metadata = getattr(self, "forward_metadata", None)
+        page_table = getattr(metadata, "page_table", None)
+        original_bs = getattr(forward_batch, "_original_batch_size", None)
+        if (
+            original_bs is not None
+            and original_bs != forward_batch.batch_size
+            and page_table is not None
+            and page_table.shape[0] != forward_batch.batch_size
+        ):
+            self.init_forward_metadata(forward_batch)
+
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
@@ -3243,12 +3268,13 @@ class FlashAttentionBackend(AttentionBackend):
         if metadata.swa_page_table is None:
             raise RuntimeError("SWA latent attention requires an SWA page table.")
         bs = forward_batch.batch_size
+        block_table = normalize_page_table_rows(metadata.swa_page_table, bs)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,
-            block_table=metadata.swa_page_table[:bs],
+            block_table=block_table,
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
             layer=layer,
             kv_cache_dim=layer.head_dim,

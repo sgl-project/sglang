@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    normalize_page_table_rows,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -139,12 +142,13 @@ class DotsHybridAttnBackend(AttentionBackend):
             )
 
         bs = forward_batch.batch_size
+        block_table = normalize_page_table_rows(block_table, bs)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,
-            block_table=block_table[:bs],
+            block_table=block_table,
             cache_seqlens=forward_batch.seq_lens.to(torch.int32),
             layer=layer,
             kv_cache_dim=layer.head_dim,
