@@ -918,6 +918,26 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # DCP x spec draft chain: run the draft-side compute sites that live
+    # OUTSIDE ModelRunner.forward (multi-step chain metadata init, chain
+    # forwards, draft decode/extend graph replay) under draft_forward_guard,
+    # matching the guard ModelRunner.forward applies to draft forwards.
+    # Without it the TRTLLMMLA-family multi-step draft backend takes its
+    # decode-mode DCP branches (dcp-granular page size, rank-local lens)
+    # against the draft's UNSHARDED replicated pool: the chain consumes
+    # poisoned metadata and every chain token after the first degenerates
+    # (EAGLE3 accept-length drops under DCP; the 2nd chain token becomes a
+    # copy of the 1st and is always rejected). Set to 0 to revert for A/B.
+    SGLANG_DCP_DRAFT_CHAIN_GUARD = EnvBool(True)
+
+    # DCP extend path: prefetch the NEXT layer's prefix KV all-gather on a side
+    # stream while the current layer computes (the gather source is the
+    # historical prefix in the pool, static within a forward). Measured tax of
+    # the inline gather: +3.55 ms/step at cc16 mix. Layer 0 of each chunk and
+    # the first chunk (registry warm-up) stay inline. Default OFF until the
+    # same-node A/B proves it.
+    SGLANG_DCP_EXTEND_PREFETCH = EnvBool(False)
+
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
