@@ -157,7 +157,9 @@ class MambaComponent(TreeComponent):
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
-        # that lies beyond the current Mamba boundary.
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
         aligned_seqlen = (
             result.full_kv_hit_length // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size

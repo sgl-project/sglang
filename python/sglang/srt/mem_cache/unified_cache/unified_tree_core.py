@@ -1182,11 +1182,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
 
-        if is_write_back:
-            if not node.backuped or self._has_missing_host_component(node):
+        if not node.backuped:
+            if is_write_back:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
                 return result
-        elif not node.backuped:
             # Write-through: node has no backup, delete entirely.
             self._delete_unbacked_device_leaf(
                 node,

@@ -519,10 +519,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         if written > 0:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
-                        elif self.tree_core.is_backuped(node_id):
-                            # Full KV is already available in Host, so Device
-                            # state can be discarded if auxiliary backup fails.
-                            self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
@@ -871,7 +867,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self, action: BackupKV, write_back: bool = False
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
-        # Count Full KV tokens and auxiliary Host slots written.
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -889,12 +884,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
             written = len(host_indices)
-            for transfers in comp_xfers.values():
-                written += sum(
-                    len(transfer.host_indices)
-                    for transfer in transfers
-                    if transfer.host_indices is not None
-                )
         return written
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
