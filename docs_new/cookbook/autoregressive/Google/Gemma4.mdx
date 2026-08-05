@@ -7,6 +7,7 @@ description: "Deploy Gemma 4 with SGLang — Google's open multimodal family (E2
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/google/gemma4.jsx";
+import { benchmarks } from "/src/snippets/configs/google/gemma4-benchmarks.jsx";
 
 <a id="install" />
 
@@ -89,7 +90,7 @@ Pick your hardware + recipe to generate the launch command. The serving strategi
 - **Balanced** — general-purpose single-recipe operating point (AMD MI300X, where the draft-model toggle is not offered).
 - **High-Throughput** — most tokens per second across many concurrent users, with speculative decoding off. Best for batch jobs.
 
-<Deployment config={config} />
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## Playground
 

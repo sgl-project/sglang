@@ -3,9 +3,11 @@
 //
 // MIGRATED from the legacy Gemma 4 interactive command generator. Faithful port:
 // every cell mirrors the legacy generator's output for that combination verbatim
-// (modulo the {{HOST_IP}}/{{PORT}} tail + the EAGLE alias rewrite). No cell is
-// `verified` — the legacy page carried no per-combo green-badge data and
-// migration never flips a cell to verified.
+// (modulo the {{HOST_IP}}/{{PORT}} tail). The legacy generator emits
+// `--speculative-algorithm NEXTN` verbatim; NEXTN and EAGLE are DISTINCT sglang
+// builtins (both listed in server_args.py), so NEXTN is kept as-is — not aliased
+// to EAGLE. No cell is `verified` — the legacy page carried no per-combo
+// green-badge data and migration never flips a cell to verified.
 //
 // 5-dim mapping (legacy control -> new home):
 //   modelSize  -> variant (e2b/e4b/12b/31b/26b-a4b)
@@ -36,7 +38,7 @@
 export const config = {
   modelName: "Gemma 4",
 
-  supportedHardware: ["h200", "b200", "mi300x"],
+  supportedHardware: ["h200", "b200", "b300", "mi300x"],
 
   // 2nd dim — model sizes (the legacy "Model Variant" radio).
   variants: [
@@ -90,12 +92,14 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   // ⚡ Reproduce commands. The legacy benchmark numbers were measured on the
-  // "gemma4 branch" — a moving development ref, not a reproducible anchor — so the
-  // measured results (speed AND accuracy) are dropped (no -benchmarks.jsx). These
-  // commands stay so users can re-measure against a pinned build (e.g. the Gemma 4
-  // enabling PR #21952, or any release that ships it). GSM8K is the chat-template
-  // run_eval harness (the few-shot completion harness under-elicits the
-  // reasoning-oriented variants — see Configuration Tips).
+  // "gemma4 branch" — a moving development ref, not a reproducible build anchor.
+  // Per hard rule 2, the SPEED numbers (build-sensitive) are dropped, but the
+  // ACCURACY numbers (far less build-sensitive) are KEPT — see gemma4-benchmarks.jsx.
+  // These commands stay so users can re-measure against a pinned build (e.g. any
+  // release that ships the Gemma 4 encoder-free unified family,
+  // sgl-project/sglang#27167). GSM8K is the chat-template run_eval harness (the
+  // few-shot completion harness under-elicits the reasoning-oriented variants —
+  // see Configuration Tips).
   benchmarkCommands: {
     speed:
 `python3 -m sglang.bench_serving \\
@@ -106,7 +110,7 @@ export const config = {
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
-      gsm8k_pct:
+      gsm8k:
 `# Chat-template harness (robust answer extraction for the reasoning-oriented variants)
 python3 -m sglang.test.run_eval \\
   --eval-name gsm8k \\
@@ -116,6 +120,17 @@ python3 -m sglang.test.run_eval \\
     numPromptsByConc: { 1: 10, 100: 1000 },
   },
 
+  // Eval set shown in the Accuracy card + ⚡ Reproduce modal. REQUIRED whenever
+  // benchmarks carry accuracy data (the engine ships no default eval set). Keys
+  // match the `accuracy` fields in gemma4-benchmarks.jsx + benchmarkCommands.accuracy.
+  // Values are stored as the legacy page reported them (0–1 fractions, e.g. 0.720),
+  // so the unit is blank — the engine renders the value verbatim.
+  accuracyLabels: [
+    ["mmlu",  "MMLU",       ""],
+    ["mmmu",  "MMMU (val)", ""],
+    ["gsm8k", "GSM8K",      ""],
+  ],
+
   // Per-hw image for the `docker run` framing. The legacy page pinned dedicated
   // multi-arch (amd64 + arm64) Gemma-4 dev images; copy them verbatim. AMD ROCm
   // GPUs reuse the standard nightly ROCm tags (the page documented MI300X via
@@ -123,6 +138,7 @@ python3 -m sglang.test.run_eval \\
   dockerImages: {
     h200:   "lmsysorg/sglang:dev-gemma-4-12B",
     b200:   "lmsysorg/sglang:dev-gemma-4-12B",
+    b300:   "lmsysorg/sglang:dev-gemma-4-12B",
     mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
   },
 
@@ -195,7 +211,8 @@ python3 -m sglang.test.run_eval \\
 
   // ===== Cells — faithful 1:1 port of the legacy generator output (parsers
   // stripped to the Playground axis; spec flags baked into the low-latency tier;
-  // EAGLE = the NEXTN alias the legacy generator emitted). All YELLOW. =====
+  // --speculative-algorithm NEXTN is emitted verbatim from the legacy generator —
+  // NOT aliased to EAGLE, they are distinct builtins). All YELLOW. =====
   cells: [
     {
       match: { hw: "h200", variant: "e4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
@@ -212,7 +229,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E2B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -237,7 +254,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -262,7 +279,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E4B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -277,7 +294,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -302,7 +319,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-12B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -327,7 +344,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-12B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -353,7 +370,7 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-31B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -380,7 +397,7 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-31B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -407,7 +424,7 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-26B-A4B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -433,7 +450,7 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -458,7 +475,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E2B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -483,7 +500,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -508,7 +525,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E4B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -533,7 +550,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -558,7 +575,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-12B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -583,7 +600,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-12B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -608,7 +625,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-31B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -633,7 +650,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-31B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
@@ -659,12 +676,12 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-26B-A4B-it-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
         "--speculative-eagle-topk 1",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -674,7 +691,7 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -685,12 +702,12 @@ python3 -m sglang.test.run_eval \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 2",
-        "--speculative-algorithm EAGLE",
+        "--speculative-algorithm NEXTN",
         "--speculative-draft-model-path google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant",
         "--speculative-num-steps 5",
         "--speculative-num-draft-tokens 6",
         "--speculative-eagle-topk 1",
-        "--mem-fraction-static 0.9",
+        "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -700,6 +717,278 @@ python3 -m sglang.test.run_eval \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--mem-fraction-static 0.75",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-E2B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e2b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-E4B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "e4b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-12B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-12B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "12b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-31B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-31B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "31b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-26B-A4B-it-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "qat", strategy: "low-latency", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--speculative-algorithm NEXTN",
+        "--speculative-draft-model-path google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant",
+        "--speculative-num-steps 5",
+        "--speculative-num-draft-tokens 6",
+        "--speculative-eagle-topk 1",
+        "--attention-backend triton",
+        "--mem-fraction-static 0.9",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "26b-a4b", quant: "qat", strategy: "high-throughput", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--attention-backend triton",
         "--mem-fraction-static 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
