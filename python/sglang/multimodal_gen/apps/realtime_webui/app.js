@@ -220,7 +220,7 @@ const reactorPresets = [
     size: "832x480",
     fps: 16,
     prompt: "A locked first-person dragon-rider view matching the reference image: both tan forearms in brown leather gloves stay visible at the bottom, gripping leather reins around the green-brown scaled dragon neck; the dragon head, horns, and both wide wings frame the jungle valley, waterfalls, mist, and tall castle on the right. Smooth forward flight only, keep the same rider hands, dragon body, wing silhouette, castle placement, and humid daylight colors in every frame.",
-    referenceUrl: `${REACTOR_PRESET_BASE_URL}/dragon-ride.jpg`,
+    referenceUrl: "./assets/dragon-ride.jpg",
     source: "Reactor LingBot preset",
   },
   {
