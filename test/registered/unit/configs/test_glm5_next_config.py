@@ -61,6 +61,25 @@ class TestGlm5NextTextConfig(CustomTestCase):
 
         self.assertIsNone(config.linear_attn_config["gate_lower_bound"])
 
+    def test_legacy_linear_lower_bound_is_normalized(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=2,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            linear_lower_bound=-4.0,
+        )
+
+        self.assertEqual(config.linear_attn_config["gate_lower_bound"], -4.0)
+
+    def test_gate_lower_bound_takes_precedence(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=2,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            linear_lower_bound=-4.0,
+            gate_lower_bound=-5.0,
+        )
+
+        self.assertEqual(config.linear_attn_config["gate_lower_bound"], -5.0)
+
     def test_legacy_linear_attention_config_takes_precedence(self):
         linear_attn_config = {
             "full_attn_layers": [1],
