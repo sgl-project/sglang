@@ -6,17 +6,14 @@ from torch import nn
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_default_distributed_backend,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from sglang.srt.distributed.parallel_state import get_default_distributed_backend
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import add_prefix, get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 
 register_cuda_ci(
     est_time=9,
@@ -80,15 +77,7 @@ def init_weights(module):
 def test_model_forward_dump(tmp_path):
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     device = get_device()
-    backend = get_default_distributed_backend(device)
-    init_distributed_environment(
-        backend=backend,
-        world_size=1,
-        rank=0,
-        local_rank=0,
-        distributed_init_method="tcp://127.0.0.1:2646",
-    )
-    initialize_model_parallel()
+    init_single_process_dist(backend=get_default_distributed_backend(device))
     model = MockCausalLM()
     model.apply(init_weights)
     model = model.to(device=device, dtype=torch.bfloat16)
