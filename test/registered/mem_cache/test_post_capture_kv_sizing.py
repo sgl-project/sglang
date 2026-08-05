@@ -5,7 +5,7 @@ CUDA graphs, then sizes and physically backs the pool from measured free memory.
 This test launches a server with the feature enabled and asserts that:
   1. the post-capture sizing path actually ran (log line present, not a silent
      no-op skip via post_capture_kv_sizing_planned),
-  2. the pool was sized to a positive max_total_num_tokens, and
+  2. the pool was backed to a positive KV size, and
   3. gsm8k accuracy is unchanged vs. the default sizing path.
 """
 
@@ -69,14 +69,15 @@ class TestPostCaptureKVSizing(CustomTestCase):
     def test_post_capture_sizing_ran(self):
         """The post-capture path must actually execute, not silently skip."""
         m = re.search(
-            r"Post-capture KV sizing: max_total_num_tokens=(\d+)", self._server_logs()
+            r"Post-capture KV sizing: KV cache allocated\..*?KV size: ([\d.]+) GB",
+            self._server_logs(),
         )
         self.assertIsNotNone(
             m,
             "Post-capture KV sizing log line not found; the feature was gated off "
             "or the resize path did not run.",
         )
-        self.assertGreater(int(m.group(1)), 0)
+        self.assertGreater(float(m.group(1)), 0)
 
     def test_server_info_pool_sized(self):
         info = requests.get(f"{self.base_url}/server_info").json()

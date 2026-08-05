@@ -448,22 +448,19 @@ template <
     typename MainloopScheduleType,
     typename EpilogueScheduleType,
     typename TileSchedulerType = void,
-    bool WithBias = false,
-    bool ScalarA = false>
+    bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm100 {
   static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using VectorScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
-  using ScalarScaleA = cutlass::epilogue::fusion::Sm90ScalarBroadcast<float>;
-  using ScaleA = std::conditional_t<ScalarA, ScalarScaleA, VectorScaleA>;
 
   using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -554,11 +551,7 @@ struct DeviceGemmFp8RowwiseSm100 {
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
-    if constexpr (std::is_same_v<Descriptor, ScalarScaleA>) {
-      return Arguments{{}, {data_ptr}, {}};
-    } else {
-      return Arguments{data_ptr};
-    }
+    return Arguments{data_ptr};
   }
 
  public:
@@ -664,7 +657,7 @@ void launch_sm100_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType, bool ScalarA>
+template <typename OutType>
 void sm100_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -702,8 +695,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      true,
-      ScalarA>;
+      true>;
   using BiasGemm256 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -713,8 +705,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      true,
-      ScalarA>;
+      true>;
   using BiasGemm64 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -724,8 +715,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      true,
-      ScalarA>;
+      true>;
   using BiasGemm16 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -735,8 +725,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      true,
-      ScalarA>;
+      true>;
 
   // Gemm type without bias
   using GemmDefault = DeviceGemmFp8RowwiseSm100<
@@ -748,8 +737,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      false,
-      ScalarA>;
+      false>;
   using Gemm256 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -759,8 +747,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      false,
-      ScalarA>;
+      false>;
   using Gemm64 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -770,8 +757,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      false,
-      ScalarA>;
+      false>;
   using Gemm16 = DeviceGemmFp8RowwiseSm100<
       ElementInput,
       ElementOutput,
@@ -781,8 +767,7 @@ void sm100_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      false,
-      ScalarA>;
+      false>;
 
   // next power of 2 (minimum 16)
   uint32_t const m = a.size(0);
@@ -826,10 +811,7 @@ void sm100_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  if (scales_a.numel() == 1) {
-    return sm100_fp8_dispatch_bias<OutType, true>(out, a, b, scales_a, scales_b, bias);
-  }
-  return sm100_fp8_dispatch_bias<OutType, false>(out, a, b, scales_a, scales_b, bias);
+  return sm100_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
 }
 
 template <
@@ -841,22 +823,19 @@ template <
     typename MainloopScheduleType,
     typename EpilogueScheduleType,
     typename TileSchedulerType = void,
-    bool WithBias = false,
-    bool ScalarA = false>
+    bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm120 {
   static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
   using TileShape = CTAShape;
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using VectorScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
-  using ScalarScaleA = cutlass::epilogue::fusion::Sm90ScalarBroadcast<float>;
-  using ScaleA = std::conditional_t<ScalarA, ScalarScaleA, VectorScaleA>;
 
   using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -947,11 +926,7 @@ struct DeviceGemmFp8RowwiseSm120 {
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
-    if constexpr (std::is_same_v<Descriptor, ScalarScaleA>) {
-      return Arguments{{}, {data_ptr}, {}};
-    } else {
-      return Arguments{data_ptr};
-    }
+    return Arguments{data_ptr};
   }
 
  public:
@@ -1057,7 +1032,7 @@ void launch_sm120_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType, bool ScalarA>
+template <typename OutType>
 void sm120_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1085,8 +1060,7 @@ void sm120_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      true,
-      ScalarA>;
+      true>;
 
   using GemmDefault = DeviceGemmFp8RowwiseSm120<
       ElementInput,
@@ -1097,8 +1071,7 @@ void sm120_fp8_dispatch_bias(
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
-      false,
-      ScalarA>;
+      false>;
 
   if (bias) {
     return launch_sm120_fp8_scaled_mm<BiasGemmDefault, true>(out, a, b, scales_a, scales_b, bias);
@@ -1115,10 +1088,7 @@ void sm120_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  if (scales_a.numel() == 1) {
-    return sm120_fp8_dispatch_bias<OutType, true>(out, a, b, scales_a, scales_b, bias);
-  }
-  return sm120_fp8_dispatch_bias<OutType, false>(out, a, b, scales_a, scales_b, bias);
+  return sm120_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
 }
 #endif
 
@@ -1145,26 +1115,7 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
-  auto sm_version = getSMVersion();
-  TORCH_CHECK(
-      scales_a.numel() == 1 || scales_a.numel() == mat_a.size(0),
-      "scales_a must contain either one scalar scale or one scale per row; got ",
-      scales_a.numel(),
-      " elements for M=",
-      mat_a.size(0));
-  bool scalar_a_scale_supported = false;
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
-  scalar_a_scale_supported = sm_version == 90;
-#endif
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
-  scalar_a_scale_supported = scalar_a_scale_supported || sm_version >= 100;
-#endif
-  TORCH_CHECK(
-      scales_a.numel() != 1 || mat_a.size(0) == 1 || scalar_a_scale_supported,
-      "scalar scales_a with M > 1 is unsupported on SM",
-      sm_version,
-      " for this build; got M=",
-      mat_a.size(0));
+  TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
   TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
   TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
   TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
@@ -1179,6 +1130,8 @@ torch::Tensor fp8_scaled_mm(
 
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
+
+  auto sm_version = getSMVersion();
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
