@@ -21,10 +21,14 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -132,6 +136,12 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
+    def format_is_ascend_tp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[AscendTPDispatchOutput]:
+        return dispatch_output.format.is_ascend_tp()
+
+    @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPNormalDispatchOutput]:
@@ -149,15 +159,26 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput]]:
         return dispatch_output.format.is_deepep()
 
+    @staticmethod
+    def format_is_flashinfer(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[FlashinferDispatchOutput]:
+        return dispatch_output.format.is_flashinfer()
+
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    FLASHINFER = "flashinfer"
+    ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
+
+    def is_ascend_tp(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_TP
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -170,6 +191,9 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_NORMAL,
             DispatchOutputFormat.DEEPEP_LL,
         ]
+
+    def is_flashinfer(self) -> bool:
+        return self == DispatchOutputFormat.FLASHINFER
 
 
 @runtime_checkable
@@ -193,6 +217,12 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
+    def format_is_ascend_tp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[AscendTPCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_TP
+
+    @staticmethod
     def format_is_deepep_normal(
         combine_input: CombineInput,
     ) -> TypeGuard[DeepEPNormalCombineInput]:
@@ -213,11 +243,19 @@ class CombineInputChecker:
             CombineInputFormat.DEEPEP_LL,
         ]
 
+    @staticmethod
+    def format_is_flashinfer(
+        combine_input: CombineInput,
+    ) -> TypeGuard[FlashinferCombineInput]:
+        return combine_input.format == CombineInputFormat.FLASHINFER
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
+    FLASHINFER = "flashinfer"
+    ASCEND_TP = "ascend_tp"
 
 
 @runtime_checkable
@@ -243,7 +281,7 @@ class BaseDispatcher(ABC):
     """Base class for dispatchers."""
 
     def __init__(self):
-        self.quant_config: Optional[dict] = None
+        self.quant_config: dict = {}
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

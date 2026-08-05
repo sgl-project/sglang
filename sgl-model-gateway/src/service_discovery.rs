@@ -15,10 +15,19 @@ use kube::{
     Client,
 };
 use rustls;
+use smg_mesh::service::{
+    gossip::{NodeState, NodeStatus},
+    ClusterState,
+};
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
+use crate::{
+    app_context::AppContext,
+    core::Job,
+    observability::metrics::{metrics_labels, Metrics},
+    protocols::worker_spec::WorkerConfigRequest,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -33,6 +42,11 @@ pub struct ServiceDiscoveryConfig {
     pub decode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
     pub bootstrap_port_annotation: String,
+    // Router node discovery for mesh
+    pub router_selector: HashMap<String, String>,
+    pub router_mesh_port_annotation: String,
+    // When true (IGW mode), also discover selector pods as Regular workers alongside PD workers
+    pub igw_mode: bool,
 }
 
 impl Default for ServiceDiscoveryConfig {
@@ -47,6 +61,21 @@ impl Default for ServiceDiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
+        }
+    }
+}
+
+impl ServiceDiscoveryConfig {
+    pub fn warn_if_misconfigured(&self) {
+        if self.pd_mode && !self.igw_mode && !self.selector.is_empty() {
+            warn!(
+                "--selector is set in PD mode without IGW mode enabled; \
+                regular worker discovery alongside PD workers requires IGW mode, \
+                selector will be ignored"
+            );
         }
     }
 }
@@ -66,6 +95,8 @@ pub struct PodInfo {
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
     pub bootstrap_port: Option<u16>,
+    pub is_router: bool,
+    pub mesh_port: Option<u16>,
 }
 
 impl PodInfo {
@@ -82,12 +113,20 @@ impl PodInfo {
 
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.pd_mode {
-            if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
+            if config.prefill_selector.is_empty()
+                && config.decode_selector.is_empty()
+                && (!config.igw_mode || config.selector.is_empty())
+            {
                 warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
                 return false;
             }
-            Self::matches_selector(pod, &config.prefill_selector)
-                || Self::matches_selector(pod, &config.decode_selector)
+            let matches_pd = Self::matches_selector(pod, &config.prefill_selector)
+                || Self::matches_selector(pod, &config.decode_selector);
+            // In IGW mode, also discover regular workers via the selector field
+            let matches_regular = config.igw_mode
+                && !config.selector.is_empty()
+                && Self::matches_selector(pod, &config.selector);
+            matches_pd || matches_regular
         } else {
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
@@ -142,6 +181,29 @@ impl PodInfo {
             None
         };
 
+        // Check if this is a router pod
+        let is_router = if let Some(config) = config {
+            !config.router_selector.is_empty()
+                && Self::matches_selector(pod, &config.router_selector)
+        } else {
+            false
+        };
+
+        // Extract mesh port from annotation if this is a router pod
+        let mesh_port = if is_router {
+            if let Some(config) = config {
+                pod.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(&config.router_mesh_port_annotation))
+                    .and_then(|port_str| port_str.parse::<u16>().ok())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Some(PodInfo {
             name,
             ip: pod_ip,
@@ -149,6 +211,8 @@ impl PodInfo {
             is_ready,
             pod_type,
             bootstrap_port,
+            is_router,
+            mesh_port,
         })
     }
 
@@ -165,6 +229,8 @@ impl PodInfo {
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
+    mesh_cluster_state: Option<ClusterState>,
+    mesh_port: Option<u16>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     if !config.enabled {
         return Err(kube::Error::Api(kube::error::ErrorResponse {
@@ -213,6 +279,20 @@ pub async fn start_service_discovery(
         );
     }
 
+    // Log router discovery if enabled
+    if !config.router_selector.is_empty() {
+        let router_selector = config
+            .router_selector
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            "Router node discovery enabled | selector: '{}' | mesh port annotation: '{}'",
+            router_selector, config.router_mesh_port_annotation
+        );
+    }
+
     let handle = task::spawn(async move {
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
 
@@ -226,6 +306,27 @@ pub async fn start_service_discovery(
 
         let config_arc = Arc::new(config.clone());
         let port = config.port;
+
+        // Spawn router discovery task if enabled and mesh is available
+        // Router discovery requires mesh to be enabled to update cluster state
+        // If mesh is not enabled, router discovery is skipped and service discovery works independently
+        if !config_arc.router_selector.is_empty() {
+            if let (Some(cluster_state), Some(mesh_port)) = (mesh_cluster_state.clone(), mesh_port)
+            {
+                let router_config = config_arc.clone();
+                let router_pods = pods.clone();
+                tokio::spawn(async move {
+                    start_router_discovery(router_config, router_pods, cluster_state, mesh_port)
+                        .await;
+                });
+                info!("Router discovery enabled (requires mesh to be enabled)");
+            } else {
+                warn!(
+                    "Router selector configured but mesh is not enabled (mesh cluster state or mesh port not provided). \
+                    Router discovery requires mesh to be enabled. Skipping router discovery."
+                );
+            }
+        }
 
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
@@ -328,7 +429,8 @@ async fn handle_pod_event(
     let worker_url = pod_info.worker_url(port);
 
     if pod_info.is_healthy() {
-        let should_add = {
+        // Track whether to add and get count in single lock acquisition
+        let (should_add, tracked_count) = {
             let mut tracker = match tracked_pods.lock() {
                 Ok(tracker) => tracker,
                 Err(e) => {
@@ -338,10 +440,10 @@ async fn handle_pod_event(
             };
 
             if tracker.contains(pod_info) {
-                false
+                (false, tracker.len())
             } else {
                 tracker.insert(pod_info.clone());
-                true
+                (true, tracker.len())
             }
         };
 
@@ -391,6 +493,7 @@ async fn handle_pod_event(
                     .check_interval_secs,
                 health_success_threshold: app_context.router_config.health_check.success_threshold,
                 health_failure_threshold: app_context.router_config.health_check.failure_threshold,
+                disable_health_check: app_context.router_config.health_check.disable_health_check,
                 max_connection_attempts: app_context.router_config.health_check.success_threshold
                     * 20,
                 dp_aware: app_context.router_config.dp_aware,
@@ -404,12 +507,31 @@ async fn handle_pod_event(
                 match job_queue.submit(job).await {
                     Ok(_) => {
                         debug!("Worker addition job submitted for: {}", worker_url);
+
+                        // Layer 4: Record successful registration from K8s discovery
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_SUCCESS,
+                        );
+
+                        // Update workers discovered gauge (using count from initial lock)
+                        Metrics::set_discovery_workers_discovered(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            tracked_count,
+                        );
                     }
                     Err(e) => {
                         error!(
                             "Failed to submit worker addition job for {}: {}",
                             worker_url, e
                         );
+
+                        // Layer 4: Record failed registration
+                        Metrics::record_discovery_registration(
+                            metrics_labels::DISCOVERY_KUBERNETES,
+                            metrics_labels::REGISTRATION_FAILED,
+                        );
+
                         if let Ok(mut tracker) = tracked_pods.lock() {
                             tracker.remove(pod_info);
                         }
@@ -421,6 +543,12 @@ async fn handle_pod_event(
                     worker_url
                 );
             }
+        } else {
+            // Pod already tracked - this is a duplicate event
+            Metrics::record_discovery_registration(
+                metrics_labels::DISCOVERY_KUBERNETES,
+                metrics_labels::REGISTRATION_DUPLICATE,
+            );
         }
     }
 }
@@ -433,7 +561,8 @@ async fn handle_pod_deletion(
 ) {
     let worker_url = pod_info.worker_url(port);
 
-    let was_tracked = {
+    // Remove pod and get remaining count in single lock acquisition
+    let (was_tracked, remaining_count) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -441,7 +570,8 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        tracked.remove(pod_info)
+        let removed = tracked.remove(pod_info);
+        (removed, tracked.len())
     };
 
     if was_tracked {
@@ -462,6 +592,18 @@ async fn handle_pod_deletion(
                 );
             } else {
                 debug!("Submitted worker removal job for {}", worker_url);
+
+                // Layer 4: Record deregistration from K8s pod deletion
+                Metrics::record_discovery_deregistration(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::DEREGISTRATION_POD_DELETED,
+                );
+
+                // Update workers discovered gauge (using count from initial lock)
+                Metrics::set_discovery_workers_discovered(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    remaining_count,
+                );
             }
         } else {
             error!(
@@ -474,6 +616,139 @@ async fn handle_pod_deletion(
             "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
             pod_info.name, pod_info.pod_type, worker_url
         );
+    }
+}
+
+/// Start router node discovery for mesh cluster
+async fn start_router_discovery(
+    config: Arc<ServiceDiscoveryConfig>,
+    pods: Api<Pod>,
+    cluster_state: ClusterState,
+    default_mesh_port: u16,
+) {
+    use std::collections::HashMap;
+
+    let mut retry_delay = Duration::from_secs(1);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+    loop {
+        let watcher_config = Config::default();
+        let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
+
+        let config_clone = Arc::clone(&config);
+
+        let filtered_stream = watcher_stream.filter_map(move |obj_res| {
+            let config_inner = Arc::clone(&config_clone);
+
+            async move {
+                match obj_res {
+                    Ok(pod) => {
+                        // Check if this pod matches router selector
+                        if PodInfo::matches_selector(&pod, &config_inner.router_selector) {
+                            Some(Ok(pod))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        });
+
+        let config_clone2 = Arc::clone(&config);
+        let cluster_state_clone2 = cluster_state.clone();
+
+        match filtered_stream
+            .try_for_each(move |pod| {
+                let config_inner = Arc::clone(&config_clone2);
+                let cluster_state_inner = cluster_state_clone2.clone();
+
+                async move {
+                    let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
+
+                    if let Some(pod_info) = pod_info {
+                        if pod_info.is_router {
+                            let mesh_port = pod_info.mesh_port.unwrap_or(default_mesh_port);
+                            let node_address = format!("{}:{}", pod_info.ip, mesh_port);
+
+                            if pod.metadata.deletion_timestamp.is_some() {
+                                // Pod is being deleted, mark node as Down
+                                let mut state = cluster_state_inner.write();
+                                if let Some(node) = state.get_mut(&pod_info.name) {
+                                    node.status = NodeStatus::Down as i32;
+                                    node.version += 1;
+                                    info!(
+                                        "Router node {} marked as Down (pod deleted)",
+                                        pod_info.name
+                                    );
+                                } else {
+                                    debug!(
+                                        "Router node {} not found in cluster state (already removed)",
+                                        pod_info.name
+                                    );
+                                }
+                            } else if pod_info.is_healthy() {
+                                // Pod is healthy, add or update node in cluster state
+                                let mut state = cluster_state_inner.write();
+                                let existing_version = state
+                                    .get(&pod_info.name)
+                                    .map(|n| n.version)
+                                    .unwrap_or(0);
+
+                                let node_state = NodeState {
+                                    name: pod_info.name.clone(),
+                                    address: node_address,
+                                    status: NodeStatus::Alive as i32,
+                                    version: existing_version + 1,
+                                    metadata: HashMap::new(),
+                                };
+
+                                state.insert(pod_info.name.clone(), node_state.clone());
+                                info!(
+                                    "Router node {} added/updated in mesh cluster (address: {})",
+                                    pod_info.name, node_state.address
+                                );
+                            } else {
+                                // Pod is not healthy, mark as Suspected
+                                let mut state = cluster_state_inner.write();
+                                if let Some(node) = state.get_mut(&pod_info.name) {
+                                    if node.status != NodeStatus::Down as i32 {
+                                        node.status = NodeStatus::Suspected as i32;
+                                        node.version += 1;
+                                        debug!(
+                                            "Router node {} marked as Suspected (pod not healthy)",
+                                            pod_info.name
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        {
+            Ok(_) => {
+                retry_delay = Duration::from_secs(1);
+            }
+            Err(err) => {
+                error!("Error in router discovery watcher: {}", err);
+                warn!(
+                    "Retrying router discovery in {} seconds with exponential backoff",
+                    retry_delay.as_secs()
+                );
+                time::sleep(retry_delay).await;
+
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+            }
+        }
+
+        warn!(
+            "Router discovery watcher exited, restarting in {} seconds",
+            config.check_interval.as_secs()
+        );
+        time::sleep(config.check_interval).await;
     }
 }
 
@@ -564,11 +839,17 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::{config::RouterConfig, middleware::TokenBucket};
+        use crate::{
+            config::RouterConfig, core::WorkerService, middleware::TokenBucket,
+            observability::inflight_tracker::InFlightRequestTracker,
+        };
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
             .build_unchecked();
+
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let worker_job_queue = Arc::new(std::sync::OnceLock::new());
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -576,26 +857,32 @@ mod tests {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
+            worker_registry: worker_registry.clone(),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
-            tokenizer: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,
-            response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(crate::data_connector::MemoryConversationStorage::new()),
+            response_storage: Arc::new(data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
-                crate::data_connector::MemoryConversationItemStorage::new(),
+                data_connector::MemoryConversationItemStorage::new(),
             ),
             load_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
-            worker_job_queue: Arc::new(std::sync::OnceLock::new()),
-            workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            worker_job_queue: worker_job_queue.clone(),
+            workflow_engines: Arc::new(std::sync::OnceLock::new()),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
+            tokenizer_registry: Arc::new(crate::tokenizer::registry::TokenizerRegistry::new()),
             wasm_manager: None,
+            worker_service: Arc::new(WorkerService::new(
+                worker_registry,
+                worker_job_queue,
+                router_config,
+            )),
+            inflight_tracker: InFlightRequestTracker::new(),
         })
     }
 
@@ -618,6 +905,37 @@ mod tests {
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
+        }
+    }
+
+    fn create_regular_k8s_pod(name: &str, ip: &str) -> Pod {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "regular-worker".to_string());
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: Some(ip.to_string()),
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "True".to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    reason: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
         }
     }
 
@@ -642,6 +960,33 @@ mod tests {
 
         let regular_pod = create_pd_k8s_pod("worker-pod", "10.0.0.4", "worker", None);
         assert!(PodInfo::should_include(&regular_pod, &regular_config));
+    }
+
+    #[test]
+    fn test_should_include_regular_pod_in_pd_igw_mode() {
+        let mut config = create_pd_config();
+        config.igw_mode = true;
+        config
+            .selector
+            .insert("app".to_string(), "regular-worker".to_string());
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.0.5");
+        assert!(PodInfo::should_include(&regular_pod, &config));
+
+        let pod_info = PodInfo::from_pod(&regular_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+    }
+
+    #[test]
+    fn test_should_exclude_regular_pod_in_pd_mode_without_igw() {
+        let mut config = create_pd_config();
+        config.igw_mode = false;
+        config
+            .selector
+            .insert("app".to_string(), "regular-worker".to_string());
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.0.5");
+        assert!(!PodInfo::should_include(&regular_pod, &config));
     }
 
     #[test]
@@ -819,6 +1164,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -829,6 +1176,8 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -839,6 +1188,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -852,6 +1203,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
         };
 
         let pod2 = PodInfo {
@@ -861,6 +1214,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
         };
 
         let pod3 = PodInfo {
@@ -870,6 +1225,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
 
         assert_eq!(pod1, pod2);
@@ -887,6 +1244,8 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -913,6 +1272,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -938,6 +1299,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -969,6 +1332,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -1000,6 +1365,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
         };
 
         // Add pod to tracked set first
@@ -1033,6 +1400,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -1061,6 +1430,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Regular),
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -1093,6 +1464,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            mesh_port: None,
         };
         let port = 8080u16;
 
@@ -1124,6 +1497,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
         };
 
         // Add pod to tracked set first
@@ -1144,5 +1519,72 @@ mod tests {
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+    }
+
+    #[test]
+    fn test_should_include_mixed_pd_igw_regular_pod_included() {
+        let mut regular_selector = HashMap::new();
+        regular_selector.insert("app".to_string(), "regular-worker".to_string());
+
+        let mut prefill_selector = HashMap::new();
+        prefill_selector.insert("app".to_string(), "sglang".to_string());
+        prefill_selector.insert("component".to_string(), "prefill".to_string());
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "sglang".to_string());
+        decode_selector.insert("component".to_string(), "decode".to_string());
+
+        let config = ServiceDiscoveryConfig {
+            enabled: true,
+            selector: regular_selector,
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: true,
+        };
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
+        assert!(PodInfo::should_include(&regular_pod, &config));
+
+        let pod_info = PodInfo::from_pod(&regular_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+    }
+
+    #[test]
+    fn test_should_include_mixed_pd_no_igw_regular_pod_excluded() {
+        let mut regular_selector = HashMap::new();
+        regular_selector.insert("app".to_string(), "regular-worker".to_string());
+
+        let mut prefill_selector = HashMap::new();
+        prefill_selector.insert("app".to_string(), "sglang".to_string());
+        prefill_selector.insert("component".to_string(), "prefill".to_string());
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "sglang".to_string());
+        decode_selector.insert("component".to_string(), "decode".to_string());
+
+        let config = ServiceDiscoveryConfig {
+            enabled: true,
+            selector: regular_selector,
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
+        };
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
+        assert!(!PodInfo::should_include(&regular_pod, &config));
     }
 }

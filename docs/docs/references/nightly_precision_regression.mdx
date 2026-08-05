@@ -1,0 +1,372 @@
+# Nightly Precision Regression Testing
+
+## Overview
+
+The nightly precision regression framework detects silent numerical regressions in the SGLang serving engine by comparing **per-layer hidden states** between consecutive runs. It runs as a nightly CI job on 8×H200 GPUs and can also be invoked locally for development and debugging.
+
+The framework operates on a **rolling-baseline** model:
+
+1. **Baseline creation or comparison:** Launch the server, send a fixed prompt, dump per-layer hidden states to disk. If a previous baseline exists, compare the new tensors against it using the SGLang tensor comparator. If the comparison passes, the new tensors become the updated baseline.
+2. On the first run (or when the capture shape changes), the dumped tensors are saved as a new baseline with no comparison.
+
+Baselines are stored locally on disk and synced to a **HuggingFace dataset** so they survive across CI runners and can be shared across machines. The HF dataset store is **required** — the test errors if `SGLANG_PRECISION_HF_REPO` is unset.
+
+---
+
+## How It Works
+
+### Step-by-step flow
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  1. Resolve model config (layer count, capture layers)        │
+│     ↓                                                         │
+│  2. Compute capture_signature (schema, layers, TP, filter)    │
+│     ↓                                                         │
+│  3. Fetch baseline from HF dataset (signature-matched)        │
+│     ↓                                                         │
+│  4. Launch SGLang server with DUMPER enabled                   │
+│     ↓                                                         │
+│  5. POST /dumper/configure  (set layer filter + cleanup)      │
+│     ↓                                                         │
+│  6. POST /v1/chat/completions  (fixed prompt, 2 tokens,       │
+│     ignore_eos=true to force decode path)                      │
+│     ↓                                                         │
+│  7. Kill server; assert decode tensors were captured           │
+│     ↓                                                         │
+│  8. Baseline exists (with matching signature)?                 │
+│     ├── YES → Run comparator → pass/fail                      │
+│     │         ├── PASS  → update baseline, push to HF         │
+│     │         └── FAIL  → push diagnostics to HF              │
+│     └── NO  → copy today's tensors as initial baseline        │
+│                → push to HF as "baseline_established"          │
+│     ↓                                                         │
+│  9. Report summary (stdout + GitHub Step Summary)             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Key components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| Test entry point | `test/registered/debug_utils/test_nightly_precision_regression.py` | Orchestrates server launch, dump, compare, and reporting |
+| HF baseline store | `python/sglang/test/precision_baseline_store.py` | Push / fetch / prune baselines on a HuggingFace dataset |
+| Tensor comparator | `python/sglang/srt/debug_utils/comparator/` | Compares two directories of `.pt` tensors, emits JSONL report |
+| Dumper infrastructure | `python/sglang/srt/debug_utils/dumper.py` | Captures per-layer hidden states at runtime |
+| CI workflow | `.github/workflows/nightly-test-nvidia.yml` | Schedules the nightly job on 8×H200 |
+
+---
+
+## What Gets Dumped and Compared
+
+### Strided layer capture
+
+Not every layer is dumped — the framework uses a **strided capture** to reduce I/O and storage overhead. By default, it captures:
+
+- Layer 0 (always)
+- The last layer (always)
+- Every 8th layer in between (configurable via `LAYER_CAPTURE_STRIDE`)
+
+The layer count is resolved automatically from the model's HuggingFace `config.json` (`num_hidden_layers` or `num_layers`). If resolution fails, all layers are captured as a safe fallback.
+
+The dumper filter is built dynamically as a regex matching only the selected layer indices, e.g.:
+
+```
+match(r'^non_intrusive__model\.layers\.(0|7|15|23)\.inputs\.1$', name)
+```
+
+### Decode-path verification
+
+The test generates **2 tokens** with `ignore_eos=True` to ensure the model's decode path is exercised. After the dump, `_assert_decode_captured()` verifies that tensors from the decode step were actually captured (not just prefill). If only prefill tensors are found, the test fails immediately — this catches misconfigurations where `--max-total-tokens` is too low for the decode loop to run.
+
+### Comparator
+
+The comparator computes **relative differences** (`rel_diff`) for each tensor and checks them against a configurable threshold (default `1e-3`). For tensor-parallel models, the `--override-dims` flag tells the comparator how to reduce across TP ranks before comparing:
+
+```
+--override-dims ^non_intrusive__model\.layers\.\d+\.inputs\.1$:bs h[tp:partial]
+```
+
+This sums partial TP contributions along the hidden dimension before computing the diff, so the comparison is semantically correct even with TP > 1.
+
+If the comparator returns exit code 0 but compared **zero layers** (baseline/target name mismatch), the test fails with a diagnostic message rather than silently passing.
+
+### Capture signature
+
+A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP size, and dumper filter) is computed per run. The HF store uses this signature during fetch to ensure only baselines with an identical capture shape are considered. If the signature changes (e.g. you add layers to the capture set or change TP), the framework establishes a fresh baseline instead of erroring on incompatible tensors.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SGLANG_PRECISION_MODELS` | `zai-org/GLM-5.1-FP8` | Comma-separated HuggingFace model IDs to test |
+| `SGLANG_PRECISION_BASELINE_DIR` | `/tmp/sglang_precision_baselines` | Local directory for baseline tensors |
+| `SGLANG_PRECISION_DIFF_THRESHOLD` | `1e-3` | Per-tensor relative diff threshold |
+| `SGLANG_PRECISION_FORCE_UPDATE` | `0` | Set to `1` to skip comparison and unconditionally refresh baseline |
+| `SGLANG_PRECISION_COMMIT` | _(auto-detected from git)_ | Override the sglang commit SHA tagged on push |
+| `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
+| `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
+| `HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset |
+
+---
+
+## CI Integration
+
+### Workflow job
+
+The nightly job `nightly-test-precision-8-gpu-h200` is defined in `.github/workflows/nightly-test-nvidia.yml` and runs on an 8-GPU H200 runner. It is included in the nightly suite via `test/run_suite.py`.
+
+Key CI configuration:
+
+```yaml
+- name: Run precision regression test
+  timeout-minutes: 120
+  env:
+    SGLANG_PRECISION_BASELINE_DIR: /tmp/sglang_precision_baselines
+    SGLANG_PRECISION_HF_REPO: ${{ vars.SGLANG_PRECISION_HF_REPO }}
+    SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
+    HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
+    SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+  run: |
+    cd test
+    python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
+```
+
+### Required GitHub secrets/variables
+
+| Name | Type | Purpose |
+|------|------|---------|
+| `SGLANG_PRECISION_HF_REPO` | Repository variable | HF dataset repo ID (e.g. `org/sglang-precision-baselines`) — **required**, the test errors if unset |
+| `SGLANG_PRECISION_HF_REVISION` | Repository variable (optional) | Dataset branch (defaults to `main`) |
+| `HF_TOKEN_PRECISION_STORE` | Repository secret | HF token with write access to the dataset |
+
+### GitHub Step Summary
+
+When running in CI, the test writes a Markdown table to the GitHub Actions job summary showing each model's status (`PASSED`, `FAILED`, `BASELINE_ESTABLISHED`, or `ERROR`).
+
+---
+
+## HF Dataset Storage Layout
+
+Baselines are organized in the HF dataset as:
+
+```
+<model_sanitized>/<YYYY>/<MM>/<DD>/run-<sha7>/
+├── meta.json                    # Run metadata (model, commit, hardware, thresholds, stats)
+├── comparator_report.jsonl      # Per-tensor comparison results
+└── tensors/
+    ├── layer_0_inputs_1.pt
+    ├── layer_7_inputs_1.pt
+    └── ...
+```
+
+A top-level `manifest.jsonl` tracks all runs with one JSON object per line. Each manifest row carries a `capture_signature` field so that fetch selects only baselines with a matching capture shape.
+
+The `prune_old_runs()` function (callable manually) retains daily runs for 30 days and keeps one run per week beyond that window.
+
+---
+
+## How to Add a New Model
+
+### Option A: Add to the default model list (CI)
+
+Edit the default in `test/registered/debug_utils/test_nightly_precision_regression.py`:
+
+```python
+DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.1-FP8,your-org/your-model"
+```
+
+Or set the `SGLANG_PRECISION_MODELS` environment variable in the CI workflow to override the default.
+
+### Option B: Run locally for a specific model
+
+```bash
+export SGLANG_PRECISION_MODELS="your-org/your-model"
+export SGLANG_PRECISION_BASELINE_DIR="/tmp/my_precision_baselines"
+export SGLANG_PRECISION_DIFF_THRESHOLD="1e-3"
+export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
+export HF_TOKEN="hf_..."
+
+cd test
+python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
+```
+
+### Step-by-step: adding a model to the nightly CI
+
+1. **Verify the model works with the dumper.** Run locally first to ensure hidden states are captured correctly:
+
+   ```bash
+   export SGLANG_PRECISION_MODELS="your-org/your-model"
+   export SGLANG_PRECISION_BASELINE_DIR="/tmp/test_baselines"
+   export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
+   export HF_TOKEN="hf_..."
+   export SGLANG_PRECISION_FORCE_UPDATE="1"  # first run: establish baseline
+
+   cd test
+   python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v -k test_precision
+   ```
+
+2. **Run a comparison pass** (remove `FORCE_UPDATE`):
+
+   ```bash
+   unset SGLANG_PRECISION_FORCE_UPDATE
+   python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v -k test_precision
+   ```
+
+   This should report `PASSED` if the engine is numerically stable for the model.
+
+3. **Set the tensor-parallelism size.** If the model requires TP > 1, the test harness defaults to `tp_size=8` for all models. To customize, modify the `ModelLaunchSettings` construction in the test or pass extra server arguments:
+
+   ```python
+   # In setUpClass or via env-driven logic
+   cls.models = [ModelLaunchSettings("your-org/your-model", tp_size=4)]
+   ```
+
+4. **Adjust the diff threshold if needed.** FP8 or quantized models may exhibit larger numerical differences. Set `SGLANG_PRECISION_DIFF_THRESHOLD` to an appropriate value (e.g., `1e-2` for FP8).
+
+5. **Add to the default model list** or configure `SGLANG_PRECISION_MODELS` in the CI workflow.
+
+### Considerations for model-specific adjustments
+
+| Concern | How to handle |
+|---------|--------------|
+| TP size != 8 | Override `tp_size` in `ModelLaunchSettings` or add model-specific logic |
+| Quantized models (FP8, GPTQ) | Loosen `SGLANG_PRECISION_DIFF_THRESHOLD` (e.g., `1e-2`) |
+| Model needs extra server args | Pass them via `ModelLaunchSettings(model, extra_args=["--quantization", "fp8"])` |
+| Model needs different prompt | Modify `PROMPT` constant or make it model-configurable |
+| MoE models with TP partial sums | Already handled by `--override-dims` (`bs h[tp:partial]`) |
+| Fewer/more capture layers | Adjust `LAYER_CAPTURE_STRIDE` (default 8); set lower for smaller models |
+| Decode not captured | Ensure `--max-total-tokens` is well above the scheduler's decode reservation (default 512); the test uses 4096 |
+
+---
+
+## Running Locally
+
+### Prerequisites
+
+- SGLang installed in development mode
+- GPUs matching the model's requirements
+- `huggingface_hub` installed
+- A **HuggingFace dataset** for baseline storage and a write-capable `HF_TOKEN`. The HF store is **mandatory** — `SGLANG_PRECISION_HF_REPO` must be set or the test will error at startup. This is because the nightly CI runners are ephemeral (no persistent local disk), so baselines must survive across runs via the HF dataset. There is currently no local-only fallback.
+
+### Quick local test
+
+```bash
+# All three are required — the test errors if SGLANG_PRECISION_HF_REPO is unset.
+export SGLANG_PRECISION_MODELS="Qwen/Qwen2.5-0.5B-Instruct"
+export SGLANG_PRECISION_BASELINE_DIR="/tmp/precision_baselines"
+export SGLANG_PRECISION_HF_REPO="your-org/sglang-precision-baselines"
+export HF_TOKEN="hf_..."
+
+# First run: establish baseline
+cd test
+python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
+
+# Second run: compare against baseline
+python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
+```
+
+### Force-refresh a baseline
+
+```bash
+export SGLANG_PRECISION_FORCE_UPDATE="1"
+python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
+```
+
+---
+
+## Interpreting Results
+
+### Status codes
+
+| Status | Meaning |
+|--------|---------|
+| `BASELINE_ESTABLISHED` | No prior baseline with a matching signature existed; today's tensors saved as the new baseline |
+| `PASSED` | All per-layer hidden states are within the diff threshold; baseline updated |
+| `FAILED` | One or more layers exceeded the diff threshold, or 0 layers were compared (baseline/target mismatch); diagnostic data pushed to HF |
+| `ERROR` | Server launch, inference, or comparison encountered an unexpected error |
+
+### Output example
+
+```
+============================================================
+Nightly Precision Regression Summary
+============================================================
+Model                                          Status                   Details
+------------------------------------------------------------
+zai-org/GLM-5.1-FP8                           PASSED                   comparison ok, baseline updated
+Qwen/Qwen2.5-0.5B-Instruct                    FAILED                   tensor=layer_23.inputs_1 rel_diff=0.0152
+============================================================
+```
+
+### When a failure is detected
+
+1. The comparator output is saved to `/tmp/nightly_precision_<model>_*.log`
+2. The failing tensors and comparator report are pushed to the HF dataset with `pass_label="failed"` for offline diagnosis
+3. The GitHub Step Summary includes the failure details
+4. The CI job exits with a non-zero status
+
+---
+
+## Baseline Management
+
+### Local baselines
+
+Baselines are stored at:
+```
+$SGLANG_PRECISION_BASELINE_DIR/<model_sanitized>/nightly_precision/*.pt
+```
+
+A `baseline_meta.json` next to the tensors records the timestamp and commit that produced the baseline.
+
+### HF dataset baselines
+
+- **Fetch:** At test start, if no local baseline exists, the latest signature-matched baseline is downloaded from the HF dataset.
+- **Push:** After each run, tensors and metadata are uploaded to the dataset.
+- **Prune:** Use `prune_old_runs()` to garbage-collect old baselines (keeps 30 days of daily runs, one per week after that).
+
+### Refreshing a stale baseline
+
+If an intentional numerical change (e.g., kernel optimization, model refactor) causes a comparison failure:
+
+1. Verify the change is intentional
+2. Set `SGLANG_PRECISION_FORCE_UPDATE=1` and run the test once to establish a new baseline
+3. Commit any necessary threshold adjustments
+
+If you change the capture configuration (stride, TP size, etc.), the `capture_signature` will differ and the framework automatically establishes a fresh baseline — no manual intervention needed.
+
+---
+
+## Known Limitations
+
+### Baseline drift
+
+The framework uses a **rolling baseline**: every successful comparison updates the baseline to the current run's tensors. This means the reference shifts forward each day. While individual day-to-day diffs stay within the configured threshold, tiny numerical differences can **accumulate over time**, causing the baseline to silently drift away from the original golden values.
+
+**Implications:**
+- The framework detects **regressions** (a sudden, large numerical change between consecutive runs), not **absolute accuracy** relative to a fixed reference.
+- Over weeks or months, the cumulative drift may become significant enough to mask a real regression that happened gradually, or to cause a false-positive failure when the drift eventually crosses the threshold.
+
+**Mitigation strategies (not yet implemented):**
+- Periodically re-establish a fresh anchor baseline from a known-good reference commit.
+- Track the cumulative drift in the manifest metadata and alert when it exceeds a long-term budget.
+- Compare against a fixed "epoch" baseline in addition to the rolling one.
+
+### No local-only mode
+
+The test requires a HuggingFace dataset (`SGLANG_PRECISION_HF_REPO`) and a write-capable `HF_TOKEN`. There is no local-only fallback. This is by design — CI runners have no persistent local disk, so the HF dataset is the only way to carry baselines across runs. If you need to run the test locally, you must set up a HF dataset (even a private one) and provide the corresponding token.
+
+---
+
+## File Reference
+
+| File | Role |
+|------|------|
+| `test/registered/debug_utils/test_nightly_precision_regression.py` | Main test — server lifecycle, dump, compare, report |
+| `python/sglang/test/precision_baseline_store.py` | HF dataset store — push, fetch, prune baselines |
+| `python/sglang/srt/debug_utils/comparator/` | Tensor comparison engine |
+| `python/sglang/srt/debug_utils/dumper.py` | Runtime hidden-state capture |
+| `.github/workflows/nightly-test-nvidia.yml` | CI workflow definition |
+| `test/run_suite.py` | Test suite registration (includes `nightly-precision-8-gpu-h200`) |

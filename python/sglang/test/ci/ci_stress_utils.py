@@ -67,7 +67,7 @@ class StressTestRunner:
         command = [
             "python3",
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--backend",
             "sglang-oai",
             "--base-url",

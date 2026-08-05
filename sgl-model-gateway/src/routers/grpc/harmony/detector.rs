@@ -5,7 +5,7 @@ use crate::core::{Worker, WorkerRegistry};
 /// Harmony model detector
 ///
 /// Detects if a model name indicates support for Harmony encoding/parsing.
-pub struct HarmonyDetector;
+pub(crate) struct HarmonyDetector;
 
 impl HarmonyDetector {
     /// Check if a worker is a Harmony/GPT-OSS model.
@@ -62,7 +62,7 @@ impl HarmonyDetector {
     /// the model (e.g., during startup before workers are discovered).
     pub fn is_harmony_model_in_registry(registry: &WorkerRegistry, model_name: &str) -> bool {
         // Get workers for this model
-        let workers = registry.get_by_model_fast(model_name);
+        let workers = registry.get_by_model(model_name);
 
         if workers.is_empty() {
             // No workers found - fall back to string-based detection

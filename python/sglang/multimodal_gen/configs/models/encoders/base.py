@@ -19,6 +19,7 @@ class EncoderArchConfig(ArchConfig):
         default_factory=lambda: {
             AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.SAGE_ATTN_3,
         }
     )
     output_hidden_states: bool = False
@@ -74,6 +75,12 @@ class EncoderConfig(ModelConfig):
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
+
+    # Parallel folding: during the encoding stage the whole DiT replica is idle,
+    # so TP-shard the encoder across those otherwise-unused GPUs instead of
+    # running it on a single rank. None = replicated, else the group to fold
+    # over ("sp"|"ulysses"|"ring"|"world"); resolved by finalize_encoder_folding.
+    parallel_folding_mode: str | None = None
 
 
 @dataclass

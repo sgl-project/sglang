@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -5,10 +6,14 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
+from sglang.srt.debug_utils import cuda_coredump
 from sglang.srt.utils.common import kill_process_tree
+from sglang.test.ci.ci_register import CIRegistry
 
+# Configure logger to output to stdout
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +33,15 @@ RETRIABLE_PATTERNS = [
     r"score",
     r"latency",
     r"throughput",
+    r"timeout",
+]
+
+# XPU/B580 device-resource flakes. Matched BEFORE the non-retriable list so
+# transient GPU OOMs / slow cold-cache server starts get one clean re-run.
+INFRA_RETRIABLE_PATTERNS = [
+    r"UR_RESULT_ERROR_OUT_OF_RESOURCES",
+    r"XPU out of memory",
+    r"Server failed to start within the timeout",
 ]
 
 # Patterns that indicate non-retriable failures (real code errors)
@@ -55,6 +69,11 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     Returns:
         tuple: (is_retriable, reason)
     """
+    # XPU infra flakes take precedence over the non-retriable list.
+    for pattern in INFRA_RETRIABLE_PATTERNS:
+        if re.search(pattern, output, re.IGNORECASE):
+            return True, f"retriable XPU infra flake: {pattern}"
+
     # Check for non-retriable patterns first
     for pattern in NON_RETRIABLE_PATTERNS:
         if re.search(pattern, output, re.IGNORECASE):
@@ -105,8 +124,21 @@ def write_github_step_summary(content: str):
             f.write(content)
 
 
+def _repo_relative_path(p: str) -> str:
+    """Return path stripped to repo-relative form (e.g. 'test/srt/foo.py').
+
+    Used in the machine-readable TIMINGS block so downstream scrapers
+    get a stable key regardless of CI runner checkout layout.
+    """
+    if not os.path.isabs(p):
+        p = os.path.join(os.getcwd(), p)
+    marker = "/sglang/"
+    idx = p.rfind(marker)
+    return p[idx + len(marker) :] if idx >= 0 else p
+
+
 def run_unittest_files(
-    files: List[TestFile],
+    files: Union[List[TestFile], List[CIRegistry]],
     timeout_per_file: float,
     continue_on_error: bool = False,
     enable_retry: bool = False,
@@ -126,14 +158,26 @@ def run_unittest_files(
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
     """
+    coredump_enabled = cuda_coredump.is_enabled()
+    if coredump_enabled:
+        cuda_coredump.cleanup_dump_dir()
+
     tic = time.perf_counter()
     success = True
     passed_tests = []
     failed_tests = []
     retried_tests = []  # Track which tests were retried
+    # Per-file elapsed seconds, latest attempt wins. Consumed by the
+    # TIMINGS block emitted at the end of this function.
+    file_elapsed: Dict[str, float] = {}
 
     for i, file in enumerate(files):
-        filename, estimated_time = file.name, file.estimated_time
+        if isinstance(file, CIRegistry):
+            filename, estimated_time = file.filename, file.est_time
+        else:
+            # FIXME: remove this branch after migrating all tests to use CIRegistry
+            filename, estimated_time = file.name, file.estimated_time
+
         process = None
         output_lines = []
 
@@ -146,14 +190,16 @@ def run_unittest_files(
             )
             file_tic = time.perf_counter()
 
+            cmd = ["python3", full_path, "-f"]
+
             if capture_output:
                 # Capture output for retry decision
                 process = subprocess.Popen(
-                    ["python3", full_path],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    env=os.environ,
                     text=True,
+                    errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
                 )
                 output_lines = []
                 for line in process.stdout:
@@ -161,12 +207,11 @@ def run_unittest_files(
                     output_lines.append(line)
                 process.wait()
             else:
-                process = subprocess.Popen(
-                    ["python3", full_path], stdout=None, stderr=None, env=os.environ
-                )
+                process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
 
             elapsed = time.perf_counter() - file_tic
+            file_elapsed[filename] = elapsed
 
             logger.info(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
@@ -233,6 +278,21 @@ def run_unittest_files(
             except TimeoutError:
                 kill_process_tree(process.pid)
                 time.sleep(5)
+                # TimeoutError aborts run_one_file before its elapsed write;
+                # record the timeout cap as an upper bound so the file still
+                # appears in the TIMINGS block below.
+                file_elapsed[filename] = float(timeout_per_file)
+                # Retry once on timeout: usually a stuck server / hung device.
+                # A real hang times out again and is reported.
+                if enable_retry and attempt < max_attempts:
+                    logger.info(
+                        f"\n[CI Retry] {filename} timed out after "
+                        f"{timeout_per_file}s; waiting {retry_wait_seconds}s "
+                        f"before retry (attempt {attempt + 1}/{max_attempts})\n"
+                    )
+                    time.sleep(retry_wait_seconds)
+                    attempt += 1
+                    continue
                 logger.info(
                     f"\n✗ TIMEOUT: {filename} after {timeout_per_file} seconds\n"
                 )
@@ -247,6 +307,9 @@ def run_unittest_files(
                 break
 
     elapsed_total = time.perf_counter() - tic
+
+    if coredump_enabled and not success:
+        cuda_coredump.report()
 
     if success:
         logger.info(f"Success. Time elapsed: {elapsed_total:.2f}s")
@@ -273,14 +336,35 @@ def run_unittest_files(
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
 
-    # Write GitHub Step Summary
+    # Machine-readable timings block for downstream scrapers/dashboards.
+    # One JSON object per executed file (post-retry: only the latest
+    # attempt's elapsed is recorded). Files skipped via fail-fast
+    # (continue_on_error=False) are omitted. Job wall-clock is read
+    # separately from the GitHub Actions API by consumers, so we don't
+    # emit any aggregate fields here.
+    passed_set = set(passed_tests)
+    logger.info("========== TIMINGS BEGIN ==========")
+    for fname, elapsed in file_elapsed.items():
+        logger.info(
+            json.dumps(
+                {
+                    "file": _repo_relative_path(fname),
+                    "passed": fname in passed_set,
+                    "elapsed": round(elapsed),
+                }
+            )
+        )
+    logger.info("========== TIMINGS END ==========")
+
+    # Write GitHub Step Summary only if retries occurred
     if retried_tests:
-        summary = "\n### CI Retry Summary\n\n"
-        summary += "| Test File | Attempts | Result |\n"
-        summary += "|-----------|----------|--------|\n"
-        for test, attempts, result in retried_tests:
-            summary += f"| `{test}` | {attempts} | {result} |\n"
-        summary += "\n"
+        passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
+        failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
+        summary = f"**↻ Retried {len(retried_tests)} test(s):**\n"
+        if passed_on_retry:
+            summary += f"- ✓ Passed on retry: {', '.join(passed_on_retry)}\n"
+        if failed_after_retry:
+            summary += f"- ✗ Still failed: {', '.join(failed_after_retry)}\n"
         write_github_step_summary(summary)
 
     return 0 if success else -1

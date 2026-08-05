@@ -163,7 +163,7 @@ class StorageBackendFactory:
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
-            backend = backend_class(storage_config)
+            backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
@@ -182,6 +182,12 @@ class StorageBackendFactory:
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
         elif backend_name == "eic":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "simm":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "mori":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
@@ -220,4 +226,22 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "simm",
+    "sglang.srt.mem_cache.storage.simm.hicache_simm",
+    "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "mori",
+    "sglang.srt.mem_cache.storage.umbp.umbp_store",
+    "UMBPStore",
+)
+
+StorageBackendFactory.register_backend(
+    "shm",
+    "sglang.srt.mem_cache.storage.shm",
+    "HiCacheShm",
 )

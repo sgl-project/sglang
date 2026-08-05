@@ -18,7 +18,7 @@ use crate::routers::{
 /// Generate request building stage
 ///
 /// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
-pub struct GenerateRequestBuildingStage {
+pub(crate) struct GenerateRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
@@ -36,7 +36,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 function = "GenerateRequestBuildingStage::execute",
                 "Preparation not completed"
             );
-            error::internal_error("Preparation not completed")
+            error::internal_error("preparation_not_completed", "Preparation not completed")
         })?;
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
@@ -44,7 +44,10 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 function = "GenerateRequestBuildingStage::execute",
                 "Client acquisition not completed"
             );
-            error::internal_error("Client acquisition not completed")
+            error::internal_error(
+                "client_acquisition_not_completed",
+                "Client acquisition not completed",
+            )
         })?;
 
         let generate_request = ctx.generate_request_arc();
@@ -73,7 +76,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
-                        error::bad_request(e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
@@ -87,7 +90,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                     )
                     .map_err(|e| {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
-                        error::bad_request(e)
+                        error::bad_request("build_request_failed", e)
                     })?;
                 ProtoGenerateRequest::Vllm(Box::new(req))
             }
@@ -100,7 +103,9 @@ impl PipelineStage for GenerateRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(proto_request);
+        ctx.state.proto_request = Some(
+            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
+        );
         Ok(None)
     }
 

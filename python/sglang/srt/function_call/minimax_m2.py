@@ -1,5 +1,3 @@
-import ast
-import html
 import json
 import logging
 import re
@@ -14,17 +12,6 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_val(raw: str) -> Any:
-    raw = html.unescape(raw.strip())
-    try:
-        return json.loads(raw)
-    except Exception:
-        try:
-            return ast.literal_eval(raw)
-        except Exception:
-            return raw
 
 
 class MinimaxM2Detector(BaseFormatDetector):
@@ -72,6 +59,169 @@ class MinimaxM2Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
+
+    def _convert_param_value(self, value: str, param_type: str) -> Any:
+        """Convert parameter value to the correct type (legacy single-type version)."""
+        return self._convert_param_value_with_types(value, [param_type])
+
+    def _extract_types_from_schema(self, schema: Any) -> list[str]:
+        """
+        Extract all possible types from a JSON schema definition.
+        Handles anyOf, oneOf, allOf, type arrays, and enum fields.
+
+        Args:
+            schema: The JSON schema definition for a parameter
+
+        Returns:
+            List of type strings (e.g., ["string", "integer", "null"])
+        """
+        if schema is None:
+            return ["string"]
+
+        if not isinstance(schema, dict):
+            return ["string"]
+
+        types: set[str] = set()
+
+        # Handle direct "type" field
+        if "type" in schema:
+            type_value = schema["type"]
+            if isinstance(type_value, str):
+                types.add(type_value)
+            elif isinstance(type_value, list):
+                for t in type_value:
+                    if isinstance(t, str):
+                        types.add(t)
+
+        # Handle enum - infer types from enum values
+        if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+            for value in schema["enum"]:
+                if value is None:
+                    types.add("null")
+                elif isinstance(value, bool):
+                    types.add("boolean")
+                elif isinstance(value, int):
+                    types.add("integer")
+                elif isinstance(value, float):
+                    types.add("number")
+                elif isinstance(value, str):
+                    types.add("string")
+                elif isinstance(value, list):
+                    types.add("array")
+                elif isinstance(value, dict):
+                    types.add("object")
+
+        # Handle anyOf, oneOf, allOf - recursively extract types
+        for choice_field in ("anyOf", "oneOf", "allOf"):
+            if choice_field in schema and isinstance(schema[choice_field], list):
+                for choice in schema[choice_field]:
+                    extracted = self._extract_types_from_schema(choice)
+                    types.update(extracted)
+
+        # If no types found, default to string
+        if not types:
+            return ["string"]
+
+        return list(types)
+
+    def _convert_param_value_with_types(
+        self, value: str, param_types: list[str]
+    ) -> Any:
+        """
+        Convert parameter value to the correct type based on a list of possible types.
+        Tries each type in order until one succeeds.
+
+        Args:
+            value: The string value to convert
+            param_types: List of possible type strings
+
+        Returns:
+            The converted value
+        """
+        if value.lower() == "null":
+            return None
+
+        # Normalize types
+        normalized_types = [t.lower() for t in param_types]
+
+        # Try null first if it's in the list
+        if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+            return None
+
+        # Try each type in order of preference (most specific first, string as fallback)
+        # Priority: integer > number > boolean > object > array > string
+        type_priority = [
+            "integer",
+            "int",
+            "number",
+            "float",
+            "boolean",
+            "bool",
+            "object",
+            "array",
+            "string",
+            "str",
+            "text",
+        ]
+
+        for param_type in type_priority:
+            if param_type not in normalized_types:
+                continue
+
+            if param_type in ["string", "str", "text"]:
+                return value
+            elif param_type in ["integer", "int"]:
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    continue
+            elif param_type in ["number", "float"]:
+                try:
+                    val = float(value)
+                    return val if val != int(val) else int(val)
+                except (ValueError, TypeError):
+                    continue
+            elif param_type in ["boolean", "bool"]:
+                lower_val = value.lower().strip()
+                if lower_val in ["true", "1", "yes", "on"]:
+                    return True
+                elif lower_val in ["false", "0", "no", "off"]:
+                    return False
+                continue
+            elif param_type in ["object", "array"]:
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+
+        # Fallback: try JSON parse, then return as string
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    def _get_param_types_from_config(
+        self, param_name: str, param_config: dict
+    ) -> list[str]:
+        """
+        Get parameter types from parameter configuration.
+        Handles anyOf, oneOf, allOf, and direct type definitions.
+
+        Args:
+            param_name: The name of the parameter
+            param_config: The properties dict from the tool schema
+
+        Returns:
+            List of type strings
+        """
+        if param_name not in param_config:
+            return ["string"]
+
+        param_schema = param_config[param_name]
+        if not isinstance(param_schema, dict):
+            return ["string"]
+
+        return self._extract_types_from_schema(param_schema)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -166,7 +316,7 @@ class MinimaxM2Detector(BaseFormatDetector):
             # Parse parameters incrementally
             if self._function_name_sent:
                 # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf)
+                parameter_calls = self._parse_and_stream_parameters(self._buf, tools)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
@@ -204,7 +354,9 @@ class MinimaxM2Detector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(
+        self, text_to_parse: str, tools: List[Tool]
+    ) -> List[ToolCallItem]:
         """
         Parse complete parameter blocks from text and return any tool call items to emit.
 
@@ -236,7 +388,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         for match in param_matches:
             param_name = match.group(1).strip()
             param_value = match.group(2)
-            new_params[param_name] = _safe_val(param_value)
+            new_params[param_name] = self._parse_parameter(
+                self._current_function_name, param_name, param_value, tools
+            )
 
         # Calculate parameter diff to stream with proper incremental JSON building
         if new_params != self._current_parameters:
@@ -337,7 +491,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                 pidx = ptxt.index('">')
                 pname = ptxt[:pidx].strip()
                 pval = ptxt[pidx + 2 :].lstrip("\n").rstrip("\n")
-                params[pname] = _safe_val(pval)
+                params[pname] = self._parse_parameter(fname, pname, pval, tools)
             raw = {"name": fname, "arguments": params}
             try:
                 # TODO: fix idx in function call, the index for a function
@@ -346,6 +500,20 @@ class MinimaxM2Detector(BaseFormatDetector):
             except Exception:
                 logger.warning("invalid tool call for %s dropped", fname)
         return res
+
+    def _parse_parameter(
+        self, fname: str, pname: str, pval: str, tools: List[Tool]
+    ) -> Any:
+        param_config = {}
+        for tool in tools:
+            if tool.function.name == fname and tool.function.parameters is not None:
+                parameters = tool.function.parameters
+                if isinstance(parameters, dict) and "properties" in parameters:
+                    param_config = parameters["properties"]
+                    break
+
+        param_type = self._get_param_types_from_config(pname, param_config)
+        return self._convert_param_value_with_types(pval, param_type)
 
     def supports_structural_tag(self) -> bool:
         return False

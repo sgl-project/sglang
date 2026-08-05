@@ -203,7 +203,7 @@ python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake \
     --model-path [model_path] \
-    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "protocol": "rdma", "device_name": ""}'
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "protocol": "rdma", "device_name": "", "tenant_id": "tenant-a"}'
 ```
 
 **Using JSON file to configure Mooncake**
@@ -219,7 +219,8 @@ echo '{
     "master_server_address": "127.0.0.1:50051",
     "protocol": "rdma",
     "device_name": "",
-    "global_segment_size": "4gb"
+    "global_segment_size": "4gb",
+    "tenant_id": "tenant-a"
 }' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 
 python -m sglang.launch_server \
@@ -236,6 +237,7 @@ MOONCAKE_MASTER="127.0.0.1:50051" \
 MOONCAKE_PROTOCOL="rdma" \
 MOONCAKE_DEVICE="" \
 MOONCAKE_GLOBAL_SEGMENT_SIZE="4gb" \
+MOONCAKE_TENANT_ID="tenant-a" \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake\
@@ -250,18 +252,169 @@ In particular, for the `global segment size`, if at least one `store service` in
 
 **Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`.
 
+**Tenant Isolation (`tenant_id`):**
+
+When `tenant_id` is set, SGLang forwards it to `MooncakeDistributedStore.setup(..., tenant_id=...)`. Producers and consumers that should share HiCache data must use the same `tenant_id`.
+
+You can configure it through `tenant_id` in `--hicache-storage-backend-extra-config`, `tenant_id` in the JSON config file, or `MOONCAKE_TENANT_ID`.
+
+> **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` also requires a Mooncake version that supports the `tenant_id` parameter in `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client.
+
+**SSD Offload (`enable_ssd_offload`):**
+
+When `enable_ssd_offload` is set to `true`, SGLang will request that Mooncake enable SSD offloading for the KV cache. This allows Mooncake to spill overflow data from DRAM to local SSDs, effectively expanding the available L3 cache capacity.
+
+If you need to explicitly control the SSD spill directory, set `ssd_offload_path` or the `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` environment variable. SGLang forwards this value to `MooncakeDistributedStore.setup(..., ssd_offload_path=...)`, while other SSD offload tuning parameters continue to be read directly by the Mooncake C++ library.
+
+You can enable it in any of the three supported configuration methods:
+
+- **Via `--hicache-storage-backend-extra-config`:**
+  ```bash
+  python -m sglang.launch_server \
+      --enable-hierarchical-cache \
+      --hicache-storage-backend mooncake \
+      --model-path [model_path] \
+      --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_ssd_offload": true, "ssd_offload_path": "/mnt/mooncake-ssd"}'
+  ```
+
+- **Via JSON config file (`SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`):**
+  ```json
+  {
+      "master_server_address": "127.0.0.1:50051",
+      "enable_ssd_offload": true,
+      "ssd_offload_path": "/mnt/mooncake-ssd"
+  }
+  ```
+
+- **Via environment variable:**
+  ```bash
+  MOONCAKE_MASTER="127.0.0.1:50051" \
+  MOONCAKE_ENABLE_SSD_OFFLOAD=1 \
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="/mnt/mooncake-ssd" \
+  python -m sglang.launch_server \
+      --enable-hierarchical-cache \
+      --hicache-storage-backend mooncake \
+      --model-path [model_path]
+  ```
+
+> **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
+
+**Mooncake Group Semantics (`enable_group_semantics`):**
+
+When `enable_group_semantics` is set to `true`, SGLang passes Mooncake `group_ids` for physical objects derived from the same logical HiCache page. This allows Mooncake to apply group-aware metadata routing, lease refresh, and eviction behavior to related KV objects such as MHA K/V pairs, split-head shards, MLA objects, and supported sidecar objects.
+
+This option is disabled by default. It requires a Mooncake version that exposes `ReplicateConfig.group_ids`. If the installed Mooncake package does not support it, SGLang automatically falls back to the existing write path and prints a warning.
+
+Example:
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
+```
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
 
 
-Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.
+Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`,
+the regular Mooncake backend path still uses `page_first` or `page_first_direct`.
+When HiSparse provides an MLA host KV pool or DeepSeek V4 C4 side pool with
+layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
+APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
+each logical page across its per-layer buffers.
 
 ### Distributed Deployment
 
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
+
+### Deployment with Dummy Client (Experimental)
+
+In addition to the standard deployment where SGLang acts as a full Mooncake node, you can use the **Dummy Client** mode. In this mode, SGLang connects to a local **Mooncake Store Service** (Real Client) via RPC/IPC. This decouples the SGLang process from the heavy RDMA and memory management, potentially improving stability and allowing the cache to persist even if the SGLang process restarts.
+
+**Architecture:**
+* **Mooncake Master**: Manages the cluster topology (same as standard).
+* **Mooncake Store Service (Real Client)**: Manages the actual memory pool and RDMA connections. Must be running locally.
+* **SGLang Server (Dummy Client)**: Connects to the local Store Service to access the cache.
+
+#### 1. Launch Services (Master & Store)
+
+First, start the `master service` and the `store service`. The `store service` acts as the Real Client.
+
+**Start Master:**
+```bash
+mooncake_master --eviction_high_watermark_ratio=0.95
+```
+
+**Start Store Service (Real Client):** Crucially, the default port (50052) is used for internal RPC, which the Dummy Client will connect to.
+```bash
+mooncake_client --global_segment_size=4GB
+```
+
+**Parameter Explanation:**
+
+- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`port`**: (int, default: 50052): The port number the client service listens on.
+
+- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
+
+- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
+
+- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
+
+- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
+
+- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
+
+- **`threads`**: (int, default: 1): The number of threads used by the client.
+
+#### 2. Launch SGLang (Dummy Client)
+Configure SGLang to connect to the Real Client using the client_server_address parameter.
+
+**Using extra-config of sglang arguments to configure Mooncake**
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config '{"standalone_storage": true, "client_server_address": "127.0.0.1:50052"}'
+```
+
+**Using JSON file to configure Mooncake**
+
+SGLang server can load Mooncake config from `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`.
+
+```bash
+export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
+
+echo '{
+    "standalone_storage": true,
+    "client_server_address": "127.0.0.1:50052"
+}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
+
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path]
+```
+
+**Using env variables to configure Mooncake**
+
+```bash
+MOONCAKE_STANDALONE_STORAGE=1
+MOONCAKE_CLIENT="127.0.0.1:50052"
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path]
+```
 
 ### Prefill/Decode Disaggregation
 

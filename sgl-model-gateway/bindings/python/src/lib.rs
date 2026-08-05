@@ -1,7 +1,8 @@
-use pyo3::prelude::*;
-use sgl_model_gateway::*;
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
+
+use once_cell::sync::OnceCell;
+use pyo3::prelude::*;
+use smg::*;
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq)]
@@ -12,6 +13,9 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     Bucket,
+    Manual,
+    ConsistentHashing,
+    PrefixHash,
 }
 
 #[pyclass(eq)]
@@ -28,6 +32,167 @@ pub enum HistoryBackendType {
     None,
     Oracle,
     Postgres,
+    Redis,
+}
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug, Default)]
+pub enum PyRole {
+    Admin,
+    #[default]
+    User,
+}
+
+impl PyRole {
+    pub fn to_auth_role(&self) -> auth::Role {
+        match self {
+            PyRole::Admin => auth::Role::Admin,
+            PyRole::User => auth::Role::User,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PyApiKeyEntry {
+    #[pyo3(get, set)]
+    pub id: String,
+    #[pyo3(get, set)]
+    pub name: String,
+    #[pyo3(get, set)]
+    pub key: String,
+    #[pyo3(get, set)]
+    pub role: PyRole,
+}
+
+#[pymethods]
+impl PyApiKeyEntry {
+    #[new]
+    #[pyo3(signature = (id, name, key, role = PyRole::User))]
+    fn new(id: String, name: String, key: String, role: PyRole) -> Self {
+        PyApiKeyEntry {
+            id,
+            name,
+            key,
+            role,
+        }
+    }
+}
+
+impl PyApiKeyEntry {
+    pub fn to_auth_api_key_entry(&self) -> auth::ApiKeyEntry {
+        auth::ApiKeyEntry::new(&self.id, &self.name, &self.key, self.role.to_auth_role())
+    }
+}
+
+#[pyclass]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PyJwtConfig {
+    #[pyo3(get, set)]
+    pub issuer: String,
+    #[pyo3(get, set)]
+    pub audience: String,
+    #[pyo3(get, set)]
+    pub jwks_uri: Option<String>,
+    #[pyo3(get, set)]
+    pub role_mapping: HashMap<String, String>,
+    #[pyo3(get, set)]
+    pub role_claim: String,
+}
+
+#[pymethods]
+impl PyJwtConfig {
+    #[new]
+    // `role_claim` is appended at the end with a default so existing positional
+    // callers — `PyJwtConfig(issuer, audience, jwks_uri, role_mapping)` — keep
+    // working unchanged.
+    #[pyo3(signature = (
+        issuer,
+        audience,
+        jwks_uri = None,
+        role_mapping = HashMap::new(),
+        role_claim = String::from("roles"),
+    ))]
+    fn new(
+        issuer: String,
+        audience: String,
+        jwks_uri: Option<String>,
+        role_mapping: HashMap<String, String>,
+        role_claim: String,
+    ) -> Self {
+        PyJwtConfig {
+            issuer,
+            audience,
+            jwks_uri,
+            role_mapping,
+            role_claim,
+        }
+    }
+}
+
+impl PyJwtConfig {
+    pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
+        let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
+        config.role_claim = self.role_claim.clone();
+
+        // Conditionally set JWKS URI
+        if let Some(ref uri) = self.jwks_uri {
+            config = config.with_jwks_uri(uri);
+        }
+
+        // Add role mappings
+        for (idp_role, gateway_role) in &self.role_mapping {
+            let role = match gateway_role.to_lowercase().as_str() {
+                "admin" => auth::Role::Admin,
+                _ => auth::Role::User,
+            };
+            config = config.with_role_mapping(idp_role, role);
+        }
+
+        config
+    }
+}
+
+#[pyclass]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PyControlPlaneAuthConfig {
+    #[pyo3(get, set)]
+    pub jwt: Option<PyJwtConfig>,
+    #[pyo3(get, set)]
+    pub api_keys: Vec<PyApiKeyEntry>,
+    #[pyo3(get, set)]
+    pub audit_enabled: bool,
+}
+
+#[pymethods]
+impl PyControlPlaneAuthConfig {
+    #[new]
+    #[pyo3(signature = (
+        jwt = None,
+        api_keys = vec![],
+        audit_enabled = true,
+    ))]
+    fn new(jwt: Option<PyJwtConfig>, api_keys: Vec<PyApiKeyEntry>, audit_enabled: bool) -> Self {
+        PyControlPlaneAuthConfig {
+            jwt,
+            api_keys,
+            audit_enabled,
+        }
+    }
+}
+
+impl PyControlPlaneAuthConfig {
+    pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
+        auth::ControlPlaneAuthConfig {
+            jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
+            api_keys: self
+                .api_keys
+                .iter()
+                .map(|k| k.to_auth_api_key_entry())
+                .collect(),
+            audit_enabled: self.audit_enabled,
+        }
+    }
 }
 
 #[pyclass]
@@ -123,6 +288,40 @@ impl PyOracleConfig {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
+pub struct PyRedisConfig {
+    #[pyo3(get, set)]
+    pub url: String,
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub retention_days: Option<u64>,
+}
+
+#[pymethods]
+impl PyRedisConfig {
+    #[new]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+        Ok(PyRedisConfig {
+            url,
+            pool_max,
+            retention_days,
+        })
+    }
+}
+
+impl PyRedisConfig {
+    pub fn to_config_redis(&self) -> config::RedisConfig {
+        config::RedisConfig {
+            url: self.url.clone(),
+            pool_max: self.pool_max,
+            retention_days: self.retention_days,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PyPostgresConfig {
     #[pyo3(get, set)]
     pub db_url: Option<String>,
@@ -163,11 +362,14 @@ struct Router {
     balance_rel_threshold: f32,
     eviction_interval_secs: u64,
     max_tree_size: usize,
+    max_idle_secs: u64,
+    assignment_mode: String,
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
+    json_log: bool,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -179,6 +381,7 @@ struct Router {
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
     request_timeout_secs: u64,
+    shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
@@ -204,6 +407,7 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    disable_health_check: bool,
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
@@ -223,11 +427,29 @@ struct Router {
     history_backend: HistoryBackendType,
     oracle_config: Option<PyOracleConfig>,
     postgres_config: Option<PyPostgresConfig>,
+    redis_config: Option<PyRedisConfig>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
     enable_trace: bool,
     otlp_traces_endpoint: String,
+    control_plane_auth: Option<PyControlPlaneAuthConfig>,
+    // The following five fields expose `#[pyo3(get)]` so tests can verify the
+    // Python kwargs landed in the right slot. Without getters, a typo'd builder
+    // call (e.g. `.pool_idle_timeout_secs(self.connect_timeout_secs)`) is
+    // undetectable from Python.
+    #[pyo3(get)]
+    pool_idle_timeout_secs: u64,
+    #[pyo3(get)]
+    connect_timeout_secs: u64,
+    #[pyo3(get)]
+    pool_max_idle_per_host: usize,
+    #[pyo3(get)]
+    tcp_keepalive_secs: u64,
+    #[pyo3(get)]
+    enable_wasm: bool,
 }
 
 impl Router {
@@ -263,6 +485,21 @@ impl Router {
                     balance_abs_threshold: self.balance_abs_threshold,
                     balance_rel_threshold: self.balance_rel_threshold,
                     bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
+                },
+                PolicyType::Manual => ConfigPolicyConfig::Manual {
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_idle_secs: self.max_idle_secs,
+                    assignment_mode: match self.assignment_mode.as_str() {
+                        "random" => config::ManualAssignmentMode::Random,
+                        "min_load" => config::ManualAssignmentMode::MinLoad,
+                        "min_group" => config::ManualAssignmentMode::MinGroup,
+                        other => panic!("Unknown assignment mode: {}", other),
+                    },
+                },
+                PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
+                PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor: 1.25,
                 },
             }
         };
@@ -300,6 +537,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -323,6 +562,7 @@ impl Router {
             HistoryBackendType::None => config::HistoryBackend::None,
             HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
             HistoryBackendType::Postgres => config::HistoryBackend::Postgres,
+            HistoryBackendType::Redis => config::HistoryBackend::Redis,
         };
 
         let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
@@ -337,6 +577,12 @@ impl Router {
             self.postgres_config
                 .as_ref()
                 .map(|cfg| cfg.to_config_postgres())
+        } else {
+            None
+        };
+
+        let redis_config = if matches!(self.history_backend, HistoryBackendType::Redis) {
+            self.redis_config.as_ref().map(|cfg| cfg.to_config_redis())
         } else {
             None
         };
@@ -374,6 +620,7 @@ impl Router {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -395,6 +642,7 @@ impl Router {
             .maybe_chat_template(self.chat_template.as_ref())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
+            .maybe_redis(redis_config)
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
@@ -402,11 +650,20 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
+            .connect_timeout_secs(self.connect_timeout_secs)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .tcp_keepalive_secs(self.tcp_keepalive_secs)
+            .enable_wasm(self.enable_wasm)
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
             )
             .add_ca_certificates(self.ca_cert_paths.clone())
+            .maybe_server_cert_and_key(
+                self.server_cert_path.as_ref(),
+                self.server_key_path.as_ref(),
+            )
             .build()
     }
 }
@@ -426,11 +683,14 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
+        max_idle_secs = 14400,
+        assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
         log_dir = None,
         log_level = None,
+        json_log = false,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
@@ -442,6 +702,7 @@ impl Router {
         prometheus_host = None,
         prometheus_duration_buckets = None,
         request_timeout_secs = 1800,
+        shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
@@ -467,6 +728,7 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        disable_health_check = false,
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
@@ -485,11 +747,20 @@ impl Router {
         history_backend = HistoryBackendType::Memory,
         oracle_config = None,
         postgres_config = None,
+        redis_config = None,
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        server_cert_path = None,
+        server_key_path = None,
         enable_trace = false,
         otlp_traces_endpoint = String::from("localhost:4317"),
+        control_plane_auth = None,
+        pool_idle_timeout_secs = 50,
+        connect_timeout_secs = 10,
+        pool_max_idle_per_host = 500,
+        tcp_keepalive_secs = 30,
+        enable_wasm = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -504,11 +775,14 @@ impl Router {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        max_idle_secs: u64,
+        assignment_mode: String,
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
         log_dir: Option<String>,
         log_level: Option<String>,
+        json_log: bool,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
@@ -520,6 +794,7 @@ impl Router {
         prometheus_host: Option<String>,
         prometheus_duration_buckets: Option<Vec<f64>>,
         request_timeout_secs: u64,
+        shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
@@ -545,6 +820,7 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        disable_health_check: bool,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
@@ -563,11 +839,20 @@ impl Router {
         history_backend: HistoryBackendType,
         oracle_config: Option<PyOracleConfig>,
         postgres_config: Option<PyPostgresConfig>,
+        redis_config: Option<PyRedisConfig>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
         enable_trace: bool,
         otlp_traces_endpoint: String,
+        control_plane_auth: Option<PyControlPlaneAuthConfig>,
+        pool_idle_timeout_secs: u64,
+        connect_timeout_secs: u64,
+        pool_max_idle_per_host: usize,
+        tcp_keepalive_secs: u64,
+        enable_wasm: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -595,11 +880,14 @@ impl Router {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            max_idle_secs,
+            assignment_mode,
             max_payload_size,
             dp_aware,
             api_key,
             log_dir,
             log_level,
+            json_log,
             service_discovery,
             selector,
             service_discovery_port,
@@ -611,6 +899,7 @@ impl Router {
             prometheus_host,
             prometheus_duration_buckets,
             request_timeout_secs,
+            shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
             bucket_adjust_interval_secs,
@@ -636,6 +925,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            disable_health_check,
             enable_igw,
             queue_size,
             queue_timeout_secs,
@@ -655,11 +945,20 @@ impl Router {
             history_backend,
             oracle_config,
             postgres_config,
+            redis_config,
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            server_cert_path,
+            server_key_path,
             enable_trace,
             otlp_traces_endpoint,
+            control_plane_auth,
+            pool_idle_timeout_secs,
+            connect_timeout_secs,
+            pool_max_idle_per_host,
+            tcp_keepalive_secs,
+            enable_wasm,
         })
     }
 
@@ -678,7 +977,7 @@ impl Router {
         })?;
 
         let service_discovery_config = if self.service_discovery {
-            Some(service_discovery::ServiceDiscoveryConfig {
+            let config = service_discovery::ServiceDiscoveryConfig {
                 enabled: true,
                 selector: self.selector.clone(),
                 check_interval: std::time::Duration::from_secs(60),
@@ -688,7 +987,12 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
-            })
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                igw_mode: self.enable_igw,
+            };
+            config.warn_if_misconfigured();
+            Some(config)
         } else {
             None
         };
@@ -713,10 +1017,17 @@ impl Router {
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
+                json_log: self.json_log,
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
+                shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                control_plane_auth: self
+                    .control_plane_auth
+                    .as_ref()
+                    .map(|c| c.to_auth_control_plane_config()),
+                mesh_server_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -753,8 +1064,13 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;
+    m.add_class::<PyRole>()?;
+    m.add_class::<PyApiKeyEntry>()?;
+    m.add_class::<PyJwtConfig>()?;
+    m.add_class::<PyControlPlaneAuthConfig>()?;
     m.add_class::<PyOracleConfig>()?;
     m.add_class::<PyPostgresConfig>()?;
+    m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;

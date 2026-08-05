@@ -14,7 +14,7 @@ use crate::routers::{
 };
 
 /// Client acquisition stage: Get gRPC clients from selected workers
-pub struct ClientAcquisitionStage;
+pub(crate) struct ClientAcquisitionStage;
 
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {
@@ -24,7 +24,10 @@ impl PipelineStage for ClientAcquisitionStage {
                 function = "ClientAcquisitionStage::execute",
                 "Worker selection stage not completed"
             );
-            error::internal_error("Worker selection not completed")
+            error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection not completed",
+            )
         })?;
 
         let clients = match workers {
@@ -43,6 +46,7 @@ impl PipelineStage for ClientAcquisitionStage {
                         "vLLM backend does not support dual (PD disaggregated) mode"
                     );
                     return Err(error::bad_request(
+                        "vllm_pd_mode_not_supported",
                         "vLLM backend does not support prefill/decode disaggregated mode. \
                          Please use runtime_type: sglang for PD mode, or use a regular (non-PD) worker configuration."
                     ));
