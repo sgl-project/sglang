@@ -61,12 +61,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_MPS_MLP_TOKEN_CHUNK_SIZE = 1024
-# Keep the MPS attention projection below the allocator's high-watermark.  The
-# model's regular path materializes [tokens, 3 * hidden] at once, which is more
-# than 1 GiB for a 768px H3 request.  This only affects MPS; CUDA keeps its
-# fused full-sequence projection.
-_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 1024
+_MPS_MLP_TOKEN_CHUNK_SIZE = 256
+# keep MPS activation chunks below the allocator high-watermark; CUDA keeps
+# its fused full-sequence projection
+_MPS_QKV_PROJECTION_TOKEN_CHUNK_SIZE = 256
 _MPS_ATTENTION_QUERY_TOKEN_CHUNK_SIZE = 128
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
