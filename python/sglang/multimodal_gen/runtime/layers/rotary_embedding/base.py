@@ -24,7 +24,6 @@ class RotaryEmbedding(CustomOp):
         max_position_embeddings: Optional[int] = 4096,
         base: Optional[int | float] = 10000,
         is_neox_style: bool = False,
-        is_interleaved: bool = True,
         dtype: Optional[torch.dtype] = torch.float16,
         use_precomputed_cache: bool = False,
     ) -> None:
@@ -34,7 +33,6 @@ class RotaryEmbedding(CustomOp):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.is_neox_style = is_neox_style
-        self.interleaved = is_interleaved
         self.dtype = dtype
 
         if use_precomputed_cache:
@@ -83,7 +81,7 @@ class RotaryEmbedding(CustomOp):
 
         batch_size, seq_len, num_heads, head_dim = query.shape
         total_tokens = batch_size * seq_len
-        if self.interleaved:
+        if not self.is_neox_style:
             can_use_complex = (
                 complex_freqs is not None
                 and query.dim() == 4
@@ -96,32 +94,25 @@ class RotaryEmbedding(CustomOp):
                     _apply_rotary_emb_complex(query, complex_freqs),
                     _apply_rotary_emb_complex(key, complex_freqs),
                 )
-            if self.is_neox_style:
-                raise ValueError("Requested interleaved=True, but neox_style=True.")
 
             if complex_freqs is None:
-                if cos is None or sin is None:
-                    raise ValueError("Freqs are none for interleaved form.")
-                q_flat = query.reshape(total_tokens, num_heads, head_dim)
-                k_flat = key.reshape(total_tokens, num_heads, head_dim)
-                q_rot = _apply_rotary_emb(
-                    q_flat, cos, sin, is_neox_style=self.is_neox_style, interleaved=True
-                )
-                k_rot = _apply_rotary_emb(
-                    k_flat, cos, sin, is_neox_style=self.is_neox_style, interleaved=True
-                )
-                return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
-                    batch_size, seq_len, num_heads, head_dim
-                )
+                if cos is not None and sin is not None:
+                    q_flat = query.reshape(total_tokens, num_heads, head_dim)
+                    k_flat = key.reshape(total_tokens, num_heads, head_dim)
+                    q_rot = _apply_rotary_emb(
+                        q_flat, cos, sin, is_neox_style=False, interleaved=True
+                    )
+                    k_rot = _apply_rotary_emb(
+                        k_flat, cos, sin, is_neox_style=False, interleaved=True
+                    )
+                    return q_rot.view(
+                        batch_size, seq_len, num_heads, head_dim
+                    ), k_rot.view(batch_size, seq_len, num_heads, head_dim)
         if cos is not None and sin is not None:
             q_flat = query.reshape(total_tokens, num_heads, head_dim)
             k_flat = key.reshape(total_tokens, num_heads, head_dim)
-            q_rot = _apply_rotary_emb(
-                q_flat, cos, sin, is_neox_style=self.is_neox_style
-            )
-            k_rot = _apply_rotary_emb(
-                k_flat, cos, sin, is_neox_style=self.is_neox_style
-            )
+            q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox_style=True)
+            k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox_style=True)
             return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
                 batch_size, seq_len, num_heads, head_dim
             )
@@ -232,7 +223,7 @@ class RotaryEmbedding(CustomOp):
                 )
             positions = positions.to(device=query.device, dtype=torch.long)
 
-        if self.interleaved:
+        if not self.is_neox_style:
             if complex_freqs is not None:
                 return (
                     _apply_rotary_emb_complex(query, complex_freqs),
@@ -253,7 +244,7 @@ class RotaryEmbedding(CustomOp):
                     k=key,
                     cos_sin_cache=cos_sin_cache,
                     head_size=head_dim,
-                    is_neox=self.is_neox_style,
+                    is_neox=False,
                     positions=positions,
                 )
 
@@ -265,12 +256,8 @@ class RotaryEmbedding(CustomOp):
             if cos is not None and sin is not None:
                 q_flat = query.reshape(total_tokens, num_heads, head_dim)
                 k_flat = key.reshape(total_tokens, num_heads, head_dim)
-                q_rot = _apply_rotary_emb(
-                    q_flat, cos, sin, is_neox_style=self.is_neox_style
-                )
-                k_rot = _apply_rotary_emb(
-                    k_flat, cos, sin, is_neox_style=self.is_neox_style
-                )
+                q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox_style=True)
+                k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox_style=True)
                 return q_rot.view(batch_size, seq_len, num_heads, head_dim), k_rot.view(
                     batch_size, seq_len, num_heads, head_dim
                 )
@@ -281,7 +268,7 @@ class RotaryEmbedding(CustomOp):
                     k=key,
                     cos_sin_cache=cos_sin_cache,
                     head_size=head_dim,
-                    is_neox=self.is_neox_style,
+                    is_neox=True,
                     positions=positions,
                 )
 
