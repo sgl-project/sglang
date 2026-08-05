@@ -1,13 +1,8 @@
 """Numerics for the FP8 dense-linear GEMM backends (--fp8-gemm-backend).
 
-Runs the quant-method layer path (create_weights ->
-process_weights_after_loading -> apply) against a dequantized-reference
-matmul, covering the per-backend weight preparation (e.g. UE8M0 scale requant
-for DeepGEMM, per-backend MXFP8 scale packing) and the GEMM dispatch.
-Three formats: FP8 blockwise (Fp8LinearMethod), MXFP8 (Fp8LinearMethod with
-use_mxfp8), and per-tensor FP8 (ModelOptFp8LinearMethod, auto dispatch).
-The backend set adapts to the device SM version, so the same file covers
-Hopper (SM90), B200-class (SM100/103), and consumer Blackwell (SM120).
+Real layer path vs a dequantized-reference matmul, in three formats: FP8
+blockwise, MXFP8, and per-tensor FP8 (auto dispatch). Backend sets adapt to
+the device SM, so one file covers SM90 / SM100 / SM120.
 """
 
 import unittest

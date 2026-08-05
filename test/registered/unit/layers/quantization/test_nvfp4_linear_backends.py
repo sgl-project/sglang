@@ -1,11 +1,8 @@
 """Numerics for the NVFP4 dense-linear GEMM backends (--fp4-gemm-backend).
 
-Runs the real linear layer path (ColumnParallelLinear -> weight_loader ->
-process_weights_after_loading -> forward) for each SM100 backend choice and
-checks the output against a dequantized-reference matmul. This covers both
-the per-backend weight preparation (padding / interleave / TRTLLM shuffle)
-and the GEMM kernel dispatch; a MergedColumnParallelLinear case guards the
-per-partition scale gathering of fused gate_up / QKV layers.
+Real layer path (ColumnParallelLinear -> weight_loader -> weight processing
+-> forward) per SM100 backend vs a dequantized-reference matmul; a merged
+two-shard case guards the per-partition scale gathering of fused layers.
 """
 
 import unittest
@@ -20,13 +17,15 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
-    FLOAT4_E2M1_MAX,
-    FLOAT8_E4M3_MAX,
     assert_output_close,
-    dequantize_nvfp4_to_dtype,
     init_single_process_dist,
     load_linear_weights,
     make_tp1_column_parallel_linear,
+)
+from sglang.test.quant_ref_utils import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    dequantize_nvfp4_to_dtype,
     quantize_nvfp4_shard,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -46,8 +45,7 @@ ACT_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
 
 
 def _make_quantized_layer(n: int, k: int):
-    """ColumnParallelLinear with NVFP4 checkpoint-format weights fed through
-    the real weight_loader; returns (layer, w_dequant)."""
+    """NVFP4 checkpoint-format weights through the real weight_loader."""
     quant_config = ModelOptFp4Config(
         is_checkpoint_nvfp4_serialized=True,
         group_size=16,
@@ -70,9 +68,8 @@ def _make_quantized_layer(n: int, k: int):
 
 
 def _make_merged_layer(n_half: int, k: int):
-    """MergedColumnParallelLinear (two fused output shards, e.g. gate_up_proj)
-    loaded per shard with distinct global scales; exercises the per-partition
-    scale_2 / input_scale gathering that fused-QKV regressions hit."""
+    """Two fused output shards (gate_up_proj) loaded per shard; exercises the
+    per-partition scale_2 / input_scale gathering that fused-QKV regressions hit."""
     from sglang.srt.layers.linear import MergedColumnParallelLinear
 
     quant_config = ModelOptFp4Config(
@@ -92,10 +89,9 @@ def _make_merged_layer(n_half: int, k: int):
         tp_size=1,
     ).cuda()
 
-    # process_weights_after_loading collapses per-shard weight_scale_2 with
-    # max() and does not requant block scales, so unequal shard scales are a
-    # known accuracy hazard; modelopt fused exports ship equal scale_2 and the
-    # fixture mirrors that.
+    # process_weights_after_loading collapses shard scale_2 with max() without
+    # requanting block scales, so shards must share one gs (modelopt fused
+    # exports ship equal scale_2).
     shards = [
         torch.randn((n_half, k), device="cuda", dtype=torch.bfloat16) / 10
         for _ in (0, 1)

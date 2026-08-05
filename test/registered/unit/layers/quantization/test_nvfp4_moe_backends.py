@@ -1,11 +1,8 @@
 """Numerics for the NVFP4 FusedMoE runner backends (--moe-runner-backend).
 
-Runs the real FusedMoE layer path (construct -> load NVFP4 checkpoint-format
-shards through the real weight_loader -> process_weights_after_loading ->
-forward) per backend against a dequantized torch MoE reference, covering
-the per-backend weight preparation
-(TRTLLM shuffle / CUTLASS swizzle / CuteDSL v2 interleave + MMA blockscales)
-and the MoE runner dispatch. Single GPU, tp=ep=1.
+Real FusedMoE path (NVFP4 checkpoint shards through the real weight_loader
+-> weight processing -> forward) per backend vs a dequantized torch MoE
+reference. Single GPU, tp=ep=1.
 """
 
 import unittest
@@ -17,12 +14,11 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.layer_ut_utils import (
+from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
+from sglang.test.quant_ref_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
-    assert_output_close,
     dequantize_nvfp4_to_dtype,
-    init_single_process_dist,
     quantize_nvfp4_shard,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -70,8 +66,8 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 gate_up_interleaved=False,
             ).cuda()
 
-            # Feed checkpoint-format shards through the real weight_loader so
-            # gate/up placement and scale gathering stay the loader's job.
+            # Checkpoint-format shards through the real weight_loader;
+            # gate/up placement stays the loader's job.
             refs = {
                 "w1": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
                 "w3": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
@@ -128,11 +124,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
-        # The kernels quantize the input and the GEMM1->GEMM2 intermediate to
-        # NVFP4; mirror both round trips or the comparison carries ~7% noise.
-        # Shards were fed through the real weight_loader, so the reference
-        # stays in checkpoint semantics (w1=gate, w3=up); physical gate/up
-        # placement is the loader's job.
+        # Mirror the kernels' two fp4 activation round trips (input and
+        # GEMM1->GEMM2) or the comparison carries ~7% noise. The reference
+        # stays in checkpoint semantics (w1=gate, w3=up).
         act_gs = torch.tensor(
             FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, dtype=torch.float32, device="cuda"
         )
