@@ -24,6 +24,59 @@ mark_step_done() {
 }
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Check out <url> at <commit> under ~/.cache and echo the path. Kept out of the
+# workspace because actions/checkout runs `git clean -ffdx`, so an in-tree clone
+# is deleted before the next job and re-cloned every time - and an editable
+# install pointing there dangles in between. Takes a commit rather than a
+# branch or tag for two reasons: HEAD alone then tells whether the cached copy
+# is current, and a reused checkout installs exactly what a fresh clone would.
+cached_checkout() {
+    local url=$1 commit=$2 dest="${HOME}/.cache/sglang-repos/$3"
+
+    if [ "$(git -C "${dest}" rev-parse HEAD 2>/dev/null)" = "${commit}" ]; then
+        echo "${dest}"
+        return
+    fi
+
+    rm -rf "${dest}"
+    mkdir -p "$(dirname "${dest}")"
+    git init -q "${dest}"
+    # fetch the commit, not clone --branch: a shallow clone of a branch cannot
+    # reach a pinned commit once that branch moves past it.
+    git -C "${dest}" fetch -q --depth 1 "${url}" "${commit}"
+    git -C "${dest}" checkout -q FETCH_HEAD
+    echo "${dest}"
+}
+
+# ---------------------------------------------------------------------------
+# Installed-version lookup
+# ---------------------------------------------------------------------------
+
+# Print an installed distribution's version, or nothing when absent. Reads
+# metadata with the stdlib rather than `pip show`, which imports pip and its
+# vendored deps on every call (~6x slower) and needs a grep/awk pipe to parse.
+# Names are normalized per PEP 503, so any spelling of the requested name
+# matches regardless of the interpreter's importlib.metadata vintage.
+pkg_version() {
+    PKG_QUERY="$1" python3 - <<'EOF'
+import importlib.metadata as md
+import os
+import re
+
+wanted = re.sub(r"[-_.]+", "-", os.environ["PKG_QUERY"]).lower()
+for dist in md.distributions():
+    name = re.sub(r"[-_.]+", "-", dist.metadata["Name"] or "").lower()
+    if name == wanted:
+        # First match wins, as pip reports the first one on sys.path.
+        print(dist.version)
+        break
+EOF
+}
+
+# ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
 
@@ -134,22 +187,34 @@ cleanup_stale_shm() {
 }
 
 install_apt_packages() {
-    apt-get update || true
     CI_APT_PACKAGES=(
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
-    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-        echo "Warning: apt-get install failed, checking if required packages are available..."
-        for pkg in "${CI_APT_PACKAGES[@]}"; do
-            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                echo "ERROR: Required package $pkg is not installed and apt-get failed"
-                exit 1
-            fi
-        done
-        echo "All required packages are already installed, continuing..."
-    }
+
+    # The images bake these in, so the common case installs nothing while still
+    # paying apt-get update's round trips to every source. Ask dpkg first - a
+    # local status read - and only reach the network for what is missing. The
+    # image, not this script, is what pins these versions: apt-get install only
+    # ever considers the packages named here, so it is not the mechanism keeping
+    # the runner current (a passing run reports 100+ other packages not upgraded).
+    local pkg
+    local -a MISSING_APT_PACKAGES=()
+    for pkg in "${CI_APT_PACKAGES[@]}"; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || MISSING_APT_PACKAGES+=("$pkg")
+    done
+
+    if [ ${#MISSING_APT_PACKAGES[@]} -eq 0 ]; then
+        echo "All required apt packages are already installed, skipping apt-get"
+    else
+        echo "Installing missing apt packages: ${MISSING_APT_PACKAGES[*]}"
+        apt-get update || true
+        apt-get install -y --no-install-recommends "${MISSING_APT_PACKAGES[@]}" || {
+            echo "ERROR: apt-get failed to install: ${MISSING_APT_PACKAGES[*]}"
+            exit 1
+        }
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -268,7 +333,15 @@ remove_stale_cuda12_nvidia_wheels() {
     fi
 
     mapfile -t INSTALLED_NVIDIA_WHEELS < <(
-        python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
+        python3 - <<'EOF'
+import importlib.metadata as md
+import re
+
+for dist in sorted(md.distributions(), key=lambda d: d.metadata["Name"] or ""):
+    name = re.sub(r"[-_.]+", "-", dist.metadata["Name"] or "").lower()
+    if name.startswith("nvidia-"):
+        print(f"{name}=={dist.version}")
+EOF
     )
     for spec in "${INSTALLED_NVIDIA_WHEELS[@]}"; do
         package_name="${spec%%==*}"
@@ -307,9 +380,14 @@ uninstall_stale_flashinfer() {
     FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     # flashinfer-cubin is no longer a pyproject dependency (installed explicitly below), tracks the same version as flashinfer_python
     FLASHINFER_CUBIN_REQUIRED="$FLASHINFER_PYTHON_REQUIRED"
-    FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
-    FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
+    FLASHINFER_CUBIN_INSTALLED=$(pkg_version flashinfer-cubin)
+    FLASHINFER_JIT_RAW=$(pkg_version flashinfer-jit-cache)
+    # Split "<version>+<cu tag>"; the tag is absent on a wheel built without one.
+    FLASHINFER_JIT_INSTALLED="${FLASHINFER_JIT_RAW%%+*}"
+    case "$FLASHINFER_JIT_RAW" in
+        *+*) FLASHINFER_JIT_CU_VERSION="${FLASHINFER_JIT_RAW##*+}" ;;
+        *) FLASHINFER_JIT_CU_VERSION="" ;;
+    esac
 
     UNINSTALL_CUBIN=true
     UNINSTALL_JIT_CACHE=true
@@ -389,7 +467,7 @@ install_sglang() {
     # If the file is missing, force-reinstall the wheel before downstream steps.
     SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
     if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
-       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+       && [ -n "$(pkg_version nvidia-cusparselt-cu13)" ]; then
         echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
         $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
     fi
@@ -472,8 +550,11 @@ install_sglang_kernel() {
         printf '%s\n' "${TORCH_IMPORT_ERROR}"
         REINSTALL_TORCH=true
     fi
-    TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
+    TORCHAUDIO_RAW=$(pkg_version torchaudio)
+    TORCHVISION_RAW=$(pkg_version torchvision)
+    # Only a +cuNNN local tag counts; other local segments mean "no CUDA tag".
+    TORCHAUDIO_CUDA_VER=$(printf '%s' "$TORCHAUDIO_RAW" | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p')
+    TORCHVISION_CUDA_VER=$(printf '%s' "$TORCHVISION_RAW" | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p')
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         REINSTALL_TORCH=true
     else
@@ -485,12 +566,13 @@ install_sglang_kernel() {
         done
     fi
     if [ "${REINSTALL_TORCH}" = true ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+        TORCH_RAW=$(pkg_version torch)
+        TORCH_VER="${TORCH_RAW%%+*}"
+        TORCHAUDIO_VER="${TORCHAUDIO_RAW%%+*}"
+        TORCHVISION_VER="${TORCHVISION_RAW%%+*}"
         if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
             echo "ERROR: could not determine installed torch package versions before reinstall."
-            pip show torch torchaudio torchvision || true
+            echo "torch=${TORCH_RAW:-none} torchaudio=${TORCHAUDIO_RAW:-none} torchvision=${TORCHVISION_RAW:-none}"
             exit 1
         fi
         echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
@@ -632,14 +714,14 @@ install_extra_deps() {
     # files that the live variant's RECORD still references, so we force a
     # reinstall to restore them — pip would otherwise see "already satisfied"
     # and skip.
-    if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
+    if [ -n "$(pkg_version "${MOONCAKE_STALE_PKG}")" ]; then
         $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
-    NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    NIXL_INSTALLED=$(pkg_version nixl)
+    NIXL_BIN_INSTALLED=$(pkg_version "${NIXL_BIN_NAME}")
     if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
         echo "nixl==${NIXL_VERSION} and ${NIXL_BIN_NAME}==${NIXL_VERSION} already installed, keeping them"
     else
@@ -654,8 +736,11 @@ install_extra_deps() {
     $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+        # v0.5
+        LMMS_EVAL_REF="8f142bc3082100dbb39aa9b15916c586f3237d09"
+        LMMS_EVAL_DIR=$(cached_checkout https://github.com/EvolvingLMMs-Lab/lmms-eval.git \
+            "${LMMS_EVAL_REF}" lmms-eval)
+        $PIP_CMD install -e "${LMMS_EVAL_DIR}" $PIP_INSTALL_SUFFIX
         # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
@@ -674,13 +759,13 @@ install_test_tools() {
     mkdir -p "${HOME}/.cache/sglang/"
     mv python/kernels.lock "${HOME}/.cache/sglang/" || true
 
-    # Install human-eval (subshell keeps cd local)
+    # Install human-eval. Its setup.py needs the pinned setuptools above, hence
+    # --no-build-isolation; the ref is pinned so the cached checkout is stable.
+    HUMAN_EVAL_REF="b8ab15e93948ebb01fe7d5ba2c57ebdaefb4bfb9"
     $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
-    (
-        cd human-eval
-        $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
-    )
+    HUMAN_EVAL_DIR=$(cached_checkout https://github.com/merrymercy/human-eval.git \
+        "${HUMAN_EVAL_REF}" human-eval)
+    $PIP_CMD install -e "${HUMAN_EVAL_DIR}" --no-build-isolation $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
