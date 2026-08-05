@@ -252,7 +252,6 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
 
         is_firsts = {}
         for response in generator:
-            print(f"{response=}")
             usage = response.usage
             if usage is not None:
                 assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
