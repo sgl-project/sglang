@@ -56,7 +56,7 @@ It is a hybrid-reasoning model with thinking enabled by default, and it supports
 - BF16 tensor parallelism follows the GPU: `--tp 4` on 141 GB-class cards (H20-3e, H200) and 4-GPU Blackwell nodes (B200, GB300); `--tp 8` on 80 GB cards (H100, H800).
 - The FP8 recipes pair `--tp` with a matching `--ep-size` (`--tp 4 --ep-size 4` on 4-GPU nodes, `--tp 8 --ep-size 8` on H100/H800). The checkpoint uses blockwise (128×128) E4M3 expert weights, so a pure tensor-parallel shard must satisfy `(768 / TP) % 128 == 0` — only TP2 qualifies; expert parallelism splits experts whole instead of by column, which lifts that restriction and uses the full node. SGLang detects the quantization format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed.
 - `--reasoning-parser ling3` and `--tool-call-parser ling3` enable Ling-3.0-specific reasoning and structured tool-call parsing; toggle them in the **Parsers** card of the [Playground](#playground).
-- Both the chat template and the `ling3` reasoning parser default to thinking on; the recipes additionally pin it server-wide with `--default-chat-template-kwargs '{"enable_thinking":true}'` so the deployment is explicit about the mode it serves. A single request can still turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
+- Both the chat template and the `ling3` reasoning parser default to thinking on. A single request can turn it off with `"chat_template_kwargs": {"enable_thinking": false}` (see §3.1).
 - `--mem-fraction-static 0.8` reserves headroom for CUDA graphs and concurrent decoding; with the default allocation the NEXTN recipes can OOM under concurrent requests (e.g. a 32-thread GSM8K run).
 - The checkpoint ships a built-in MTP layer (`num_nextn_predict_layers: 1`); enable it with `--speculative-algorithm NEXTN` — no separate draft model is needed. The Low-Latency recipes have it on; toggle it in the **Speculative Decoding** card of the [Playground](#playground).
 - Native context is 128K. The recipes set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` to acknowledge the longer context explicitly, then use `--context-length 262144` and YaRN with factor 2.0 to extend it to 256K.
@@ -101,7 +101,7 @@ curl -s http://localhost:30000/v1/chat/completions \
 </Accordion>
 
 <Note>
-Thinking is controlled by the chat template's `enable_thinking` kwarg. The generated recipes enable it server-wide with `--default-chat-template-kwargs '{"enable_thinking":true}'`, which the reasoning parser currently requires to split `reasoning_content`. Disable thinking per request with `"chat_template_kwargs": {"enable_thinking": false}`, or server-wide by switching the launch flag to `false`.
+Thinking is controlled by the chat template's `enable_thinking` kwarg and is on by default. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
 </Note>
 
 ### 3.2 Tool Calling
