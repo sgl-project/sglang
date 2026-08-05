@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
@@ -30,6 +31,7 @@ from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
+    compute_moe_parallel_ranks,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -54,6 +56,14 @@ def _make_cache_config(**overrides) -> CacheConfig:
         pp_rank=0,
         dp_size=1,
         ep_size=1,
+        moe_dp_size=1,
+        moe_dp_rank=0,
+        moe_ep_rank=0,
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        attn_cp_size=1,
+        moe_dense_tp_size=None,
+        moe_a2a_backend="none",
         quant_method="",
         quant_config_hash="",
         dtype="torch.float16",
@@ -120,6 +130,11 @@ class TestCacheConfig(CustomTestCase):
         base = _make_cache_config()
         for field, value in (
             ("tp_rank", 1),
+            ("moe_dp_rank", 1),
+            ("moe_ep_rank", 1),
+            ("enable_dp_attention", True),
+            ("moe_dense_tp_size", 1),
+            ("moe_a2a_backend", "mooncake"),
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
             ("model_path", "/models/other"),
@@ -208,6 +223,74 @@ class TestGlobalRankAndPaths(CustomTestCase):
                 0, 2, pp_size_per_node=1, tp_size_per_node=4, gpu_id_step=2
             ),
             4,
+        )
+
+    def test_compute_moe_parallel_ranks(self):
+        ranks = [
+            compute_moe_parallel_ranks(
+                tp_size=8, tp_rank=rank, ep_size=4, moe_dp_size=2
+            )
+            for rank in range(8)
+        ]
+        self.assertEqual(
+            ranks,
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+            ],
+        )
+
+    def test_invalid_moe_parallel_layout_is_rejected(self):
+        with self.assertRaises(ValueError):
+            compute_moe_parallel_ranks(tp_size=8, tp_rank=0, ep_size=3, moe_dp_size=2)
+
+
+class TestDaemonLaunchConfiguration(CustomTestCase):
+    def test_forwards_non_default_deepep_mode(self):
+        from sglang.srt.weight_cache import daemon as daemon_module
+
+        commands = []
+
+        class _Process:
+            pid = 123
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout):
+                return 0
+
+        def _interrupt_monitor(_):
+            raise KeyboardInterrupt
+
+        with (
+            patch.object(daemon_module, "cleanup_stale_daemon_files"),
+            patch.object(daemon_module.os.path, "exists", return_value=True),
+            patch(
+                "subprocess.Popen",
+                side_effect=lambda cmd: commands.append(cmd) or _Process(),
+            ),
+            patch.object(daemon_module.time, "sleep", side_effect=_interrupt_monitor),
+        ):
+            daemon_module.launch_weight_cache_daemons(
+                model_path="/models/demo",
+                moe_a2a_backend="mooncake",
+                deepep_mode="low_latency",
+            )
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--deepep-mode", commands[0])
+        self.assertEqual(
+            commands[0][commands[0].index("--deepep-mode") + 1], "low_latency"
         )
 
 

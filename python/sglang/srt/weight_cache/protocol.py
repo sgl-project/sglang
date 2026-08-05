@@ -42,6 +42,14 @@ class CacheConfig(msgspec.Struct):
     pp_rank: int
     dp_size: int
     ep_size: int
+    moe_dp_size: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+    enable_dp_attention: bool
+    enable_dp_lm_head: bool
+    attn_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    moe_a2a_backend: str
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
@@ -274,6 +282,27 @@ def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
     loader, model_runner, daemon) must go through this so the copies can't drift.
     """
     return tp_size * pp_rank + tp_rank
+
+
+def compute_moe_parallel_ranks(
+    *, tp_size: int, tp_rank: int, ep_size: int, moe_dp_size: int
+) -> tuple[int, int]:
+    """Return the MoE DP and EP ranks for a global TP rank.
+
+    Weight loading uses this same hierarchy as ``initialize_model_parallel``.
+    Keeping the calculation with the cache protocol makes the daemon's shard
+    fingerprint independent from an Engine import.
+    """
+    if tp_size % (ep_size * moe_dp_size) != 0:
+        raise ValueError(
+            "tp_size must be divisible by ep_size * moe_dp_size for MoE weight "
+            f"cache loading, got tp_size={tp_size}, ep_size={ep_size}, "
+            f"moe_dp_size={moe_dp_size}"
+        )
+    moe_tp_size = tp_size // ep_size // moe_dp_size
+    moe_dp_rank = tp_rank // (ep_size * moe_tp_size)
+    moe_ep_rank = (tp_rank // moe_tp_size) % ep_size
+    return moe_dp_rank, moe_ep_rank
 
 
 def compute_local_gpu_id(

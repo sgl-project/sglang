@@ -635,12 +635,6 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if server_args.dp_size > 1:
-            raise ValueError(
-                "Weight cache daemon mode does not support dp_size > 1. "
-                "Please set --dp-size 1 when using --weight-cache-mode daemon."
-            )
-
         # Multi-node needs an explicit rendezvous address; otherwise each node
         # picks its own local 127.0.0.1 port (below) and the per-node daemons
         # can never form the joint process group.
@@ -723,9 +717,13 @@ class Engine(EngineScoreMixin, EngineBase):
                     "--pp-rank",
                     str(pp_rank),
                     "--dp-size",
-                    "1",
+                    str(server_args.dp_size),
                     "--ep-size",
                     str(server_args.ep_size),
+                    "--moe-dp-size",
+                    str(server_args.moe_dp_size),
+                    "--attn-cp-size",
+                    str(server_args.attn_cp_size),
                     "--load-format",
                     server_args.load_format,
                     "--dtype",
@@ -733,6 +731,16 @@ class Engine(EngineScoreMixin, EngineBase):
                     "--dist-init-method",
                     dist_init_method,
                 ]
+                if server_args.enable_dp_attention:
+                    cmd.append("--enable-dp-attention")
+                if server_args.enable_dp_lm_head:
+                    cmd.append("--enable-dp-lm-head")
+                if server_args.moe_dense_tp_size is not None:
+                    cmd += ["--moe-dense-tp-size", str(server_args.moe_dense_tp_size)]
+                if server_args.moe_a2a_backend != "none":
+                    cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
+                if server_args.deepep_mode != "auto":
+                    cmd += ["--deepep-mode", server_args.deepep_mode]
                 if server_args.quantization:
                     cmd += ["--quantization", server_args.quantization]
                 if (

@@ -56,6 +56,7 @@ from .protocol import (
     compute_env_stamp,
     compute_global_rank,
     compute_local_gpu_id,
+    compute_moe_parallel_ranks,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -90,6 +91,13 @@ class WeightCacheDaemon:
         pp_rank: int = 0,
         dp_size: int = 1,
         ep_size: int = 1,
+        moe_dp_size: int = 1,
+        enable_dp_attention: bool = False,
+        enable_dp_lm_head: bool = False,
+        attn_cp_size: int = 1,
+        moe_dense_tp_size: Optional[int] = None,
+        moe_a2a_backend: str = "none",
+        deepep_mode: str = "auto",
         load_format: str = "auto",
         dtype: str = "auto",
         quantization: Optional[str] = None,
@@ -106,6 +114,13 @@ class WeightCacheDaemon:
         self.pp_rank = pp_rank
         self.dp_size = dp_size
         self.ep_size = ep_size
+        self.moe_dp_size = moe_dp_size
+        self.enable_dp_attention = enable_dp_attention
+        self.enable_dp_lm_head = enable_dp_lm_head
+        self.attn_cp_size = attn_cp_size
+        self.moe_dense_tp_size = moe_dense_tp_size
+        self.moe_a2a_backend = moe_a2a_backend
+        self.deepep_mode = deepep_mode
         self.load_format = load_format
         self.dtype = dtype
         self.quantization = quantization
@@ -163,12 +178,18 @@ class WeightCacheDaemon:
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend=current_platform.get_torch_distributed_backend_str(),
+                moe_a2a_backend=server_args.moe_a2a_backend,
             )
 
         initialize_model_parallel(
             tensor_model_parallel_size=self.tp_size,
             pipeline_model_parallel_size=self.pp_size,
             expert_model_parallel_size=self.ep_size,
+            attention_data_parallel_size=(
+                self.dp_size if self.enable_dp_attention else 1
+            ),
+            attention_context_model_parallel_size=self.attn_cp_size,
+            moe_data_model_parallel_size=self.moe_dp_size,
         )
 
         # Initialize DP attention state (required by some models like Qwen3 MoE)
@@ -220,10 +241,21 @@ class WeightCacheDaemon:
             pp_size=self.pp_size,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
+            moe_dp_size=self.moe_dp_size,
+            enable_dp_attention=self.enable_dp_attention,
+            enable_dp_lm_head=self.enable_dp_lm_head,
+            attn_cp_size=self.attn_cp_size,
+            moe_dense_tp_size=self.moe_dense_tp_size,
+            moe_a2a_backend=self.moe_a2a_backend,
+            deepep_mode=self.deepep_mode,
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
         publish(server_args, role="weight_cache_daemon")
+
+        from sglang.srt.layers.moe import initialize_moe_config
+
+        initialize_moe_config(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -249,6 +281,12 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
+        moe_dp_rank, moe_ep_rank = compute_moe_parallel_ranks(
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            ep_size=self.ep_size,
+            moe_dp_size=self.moe_dp_size,
+        )
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -262,6 +300,14 @@ class WeightCacheDaemon:
             pp_rank=self.pp_rank,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
+            moe_dp_size=self.moe_dp_size,
+            moe_dp_rank=moe_dp_rank,
+            moe_ep_rank=moe_ep_rank,
+            enable_dp_attention=self.enable_dp_attention,
+            enable_dp_lm_head=self.enable_dp_lm_head,
+            attn_cp_size=self.attn_cp_size,
+            moe_dense_tp_size=self.moe_dense_tp_size,
+            moe_a2a_backend=self.moe_a2a_backend,
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
@@ -545,6 +591,13 @@ def run_weight_cache_daemon(
     pp_rank: int = 0,
     dp_size: int = 1,
     ep_size: int = 1,
+    moe_dp_size: int = 1,
+    enable_dp_attention: bool = False,
+    enable_dp_lm_head: bool = False,
+    attn_cp_size: int = 1,
+    moe_dense_tp_size: Optional[int] = None,
+    moe_a2a_backend: str = "none",
+    deepep_mode: str = "auto",
     load_format: str = "auto",
     dtype: str = "auto",
     quantization: Optional[str] = None,
@@ -576,6 +629,13 @@ def run_weight_cache_daemon(
         pp_rank=pp_rank,
         dp_size=dp_size,
         ep_size=ep_size,
+        moe_dp_size=moe_dp_size,
+        enable_dp_attention=enable_dp_attention,
+        enable_dp_lm_head=enable_dp_lm_head,
+        attn_cp_size=attn_cp_size,
+        moe_dense_tp_size=moe_dense_tp_size,
+        moe_a2a_backend=moe_a2a_backend,
+        deepep_mode=deepep_mode,
         load_format=load_format,
         dtype=dtype,
         quantization=quantization,
@@ -595,6 +655,13 @@ def launch_weight_cache_daemons(
     pp_size: int = 1,
     dp_size: int = 1,
     ep_size: int = 1,
+    moe_dp_size: int = 1,
+    enable_dp_attention: bool = False,
+    enable_dp_lm_head: bool = False,
+    attn_cp_size: int = 1,
+    moe_dense_tp_size: Optional[int] = None,
+    moe_a2a_backend: str = "none",
+    deepep_mode: str = "auto",
     nnodes: int = 1,
     node_rank: int = 0,
     base_gpu_id: int = 0,
@@ -704,6 +771,10 @@ def launch_weight_cache_daemons(
                 str(dp_size),
                 "--ep-size",
                 str(ep_size),
+                "--moe-dp-size",
+                str(moe_dp_size),
+                "--attn-cp-size",
+                str(attn_cp_size),
                 "--pp-size",
                 str(pp_size),
                 "--pp-rank",
@@ -715,6 +786,16 @@ def launch_weight_cache_daemons(
                 "--dist-init-method",
                 dist_init_method,
             ]
+            if enable_dp_attention:
+                cmd.append("--enable-dp-attention")
+            if enable_dp_lm_head:
+                cmd.append("--enable-dp-lm-head")
+            if moe_dense_tp_size is not None:
+                cmd += ["--moe-dense-tp-size", str(moe_dense_tp_size)]
+            if moe_a2a_backend != "none":
+                cmd += ["--moe-a2a-backend", moe_a2a_backend]
+            if deepep_mode != "auto":
+                cmd += ["--deepep-mode", deepep_mode]
             if quantization:
                 cmd += ["--quantization", quantization]
             if model_loader_extra_config and model_loader_extra_config != "{}":
@@ -834,6 +915,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
     parser.add_argument("--ep-size", type=int, default=1, help="Expert parallel size")
+    parser.add_argument("--moe-dp-size", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
+    parser.add_argument("--enable-dp-lm-head", action="store_true")
+    parser.add_argument("--attn-cp-size", type=int, default=1)
+    parser.add_argument("--moe-dense-tp-size", type=int, default=None)
+    parser.add_argument("--moe-a2a-backend", default="none")
+    parser.add_argument("--deepep-mode", default="auto")
     parser.add_argument("--pp-size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--pp-rank", type=int, default=0, help="Pipeline parallel rank")
     parser.add_argument("--nnodes", type=int, default=1, help="Total number of nodes")
@@ -912,6 +1000,13 @@ if __name__ == "__main__":
             pp_rank=args.pp_rank,
             dp_size=args.dp_size,
             ep_size=args.ep_size,
+            moe_dp_size=args.moe_dp_size,
+            enable_dp_attention=args.enable_dp_attention,
+            enable_dp_lm_head=args.enable_dp_lm_head,
+            attn_cp_size=args.attn_cp_size,
+            moe_dense_tp_size=args.moe_dense_tp_size,
+            moe_a2a_backend=args.moe_a2a_backend,
+            deepep_mode=args.deepep_mode,
             load_format=args.load_format,
             dtype=args.dtype,
             quantization=args.quantization,
@@ -928,6 +1023,13 @@ if __name__ == "__main__":
             pp_size=args.pp_size,
             dp_size=args.dp_size,
             ep_size=args.ep_size,
+            moe_dp_size=args.moe_dp_size,
+            enable_dp_attention=args.enable_dp_attention,
+            enable_dp_lm_head=args.enable_dp_lm_head,
+            attn_cp_size=args.attn_cp_size,
+            moe_dense_tp_size=args.moe_dense_tp_size,
+            moe_a2a_backend=args.moe_a2a_backend,
+            deepep_mode=args.deepep_mode,
             nnodes=args.nnodes,
             node_rank=args.node_rank,
             base_gpu_id=args.base_gpu_id,
