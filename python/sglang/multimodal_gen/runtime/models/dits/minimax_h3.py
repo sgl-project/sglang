@@ -259,11 +259,13 @@ def _modulate_gate(
     indices: torch.Tensor,
     *,
     dtype: torch.dtype,
+    allow_inplace: bool = True,
 ) -> torch.Tensor:
     """Apply indexed gated residual, reusing disposable CUDA BF16 input."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
-        x.is_cuda
+        allow_inplace
+        and x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and gate.dtype == _BF16_DTYPE
@@ -915,6 +917,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         if adaln_params is None:
             adaln_params = self.adaln_proj(adaln_input)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
+        allow_inplace = not getattr(
+            self, "_sglang_cache_dit_force_out_of_place_residual", False
+        )
 
         residual = x
         h = self.norm1(x)
@@ -929,7 +934,14 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
+        x = _modulate_gate(
+            residual,
+            gate_msa,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=allow_inplace,
+        )
 
         residual = x
         h = self.norm2(x)
@@ -938,7 +950,12 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
         h = self.mlp(h)
         return _modulate_gate(
-            residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE
+            residual,
+            gate_mlp,
+            h,
+            combined_indices,
+            dtype=_BF16_DTYPE,
+            allow_inplace=allow_inplace,
         )
 
 
@@ -1055,8 +1072,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             if value % tp_size:
                 raise ValueError(
-                    f"MiniMax H3 {name}={value} must be divisible by "
-                    f"TP size {tp_size}."
+                    f"MiniMax H3 {name}={value} must be divisible by TP size {tp_size}."
                 )
 
     @staticmethod

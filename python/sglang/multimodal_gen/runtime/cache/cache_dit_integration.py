@@ -36,6 +36,39 @@ from cache_dit.parallelism import ParallelismBackend, ParallelismConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 _original_similarity = None
+_MINIMAX_H3_OUT_OF_PLACE_ATTR = "_sglang_cache_dit_force_out_of_place_residual"
+_MINIMAX_H3_TRACKED_BLOCKS_ATTR = "_sglang_cache_dit_out_of_place_blocks"
+
+
+def _set_minimax_h3_cache_dit_compat(
+    transformer: torch.nn.Module, *, enabled: bool
+) -> bool:
+    """Keep Cache-DiT residual snapshots valid for MiniMax-H3.
+
+    MiniMax-H3 normally applies its gated residual with an in-place Triton
+    kernel. Cache-DiT's Pattern_3 adapter retains block inputs by reference when
+    it measures the first-block residual and when it stores the middle-block
+    residual. Mark the H3 blocks so they use their out-of-place fallback while
+    caching is attached; otherwise both snapshots alias the mutated output.
+    """
+
+    if transformer.__class__.__name__ != "MiniMaxH3DiTModel":
+        return False
+
+    if enabled:
+        blocks = tuple(transformer.blocks)
+        for block in blocks:
+            setattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR, True)
+        setattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR, blocks)
+        return True
+
+    blocks = getattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR, ())
+    for block in blocks:
+        if hasattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR):
+            delattr(block, _MINIMAX_H3_OUT_OF_PLACE_ATTR)
+    if hasattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR):
+        delattr(transformer, _MINIMAX_H3_TRACKED_BLOCKS_ATTR)
+    return bool(blocks)
 
 
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
@@ -44,6 +77,7 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
     cache_dit.disable_cache(target)
+    _set_minimax_h3_cache_dit_compat(transformer, enabled=False)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
@@ -421,12 +455,18 @@ def enable_cache_on_transformer(
             model_name,
             custom_adapter.forward_pattern,
         )
-    cache_dit.enable_cache(
-        target,
-        cache_config=cache_config,
-        calibrator_config=calibrator_config,
-        parallelism_config=None,
-    )
+    h3_compat_enabled = _set_minimax_h3_cache_dit_compat(transformer, enabled=True)
+    try:
+        cache_dit.enable_cache(
+            target,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
+    except Exception:
+        if h3_compat_enabled:
+            _set_minimax_h3_cache_dit_compat(transformer, enabled=False)
+        raise
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter
 
