@@ -10,7 +10,7 @@ LOG_DIR="${LOG_DIR:-${REPO_DIR}/logs}"
 mkdir -p "${LOG_DIR}"
 
 MODEL_PATH="${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-moe}"
-DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/RadixArk-Kimi-K3-DSpark}"
+DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/home/weights/Kimi-K3-DSpark}"
 DIST_INIT_ADDR="${DIST_INIT_ADDR:-192.168.25.209:29600}"
 SERVER_PORT="${SERVER_PORT:-30000}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.72}"
@@ -56,6 +56,10 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 export SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
+# Keep the draft transformer in CUDA Graph, but run the proposal head eagerly.
+# The folded proposal remains available as an explicit A/B opt-in while its
+# candidate-token equivalence on Ascend is being validated.
+export SGLANG_DSPARK_FOLDED_PROPOSAL="${SGLANG_DSPARK_FOLDED_PROPOSAL:-0}"
 export SGLANG_K3_SHARED_EXPERTS_ATTN_TP="${SGLANG_K3_SHARED_EXPERTS_ATTN_TP:-1}"
 export SGLANG_K3_DENSE_MLP_ATTN_TP="${SGLANG_K3_DENSE_MLP_ATTN_TP:-1}"
 export SGLANG_RAGGED_VERIFY_MODE=static
