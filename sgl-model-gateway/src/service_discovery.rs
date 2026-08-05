@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::Api,
+    api::{Api, ListParams},
     runtime::{
         watcher::{watcher, Config},
         WatchStreamExt,
@@ -34,6 +37,11 @@ pub struct ServiceDiscoveryConfig {
     pub enabled: bool,
     pub selector: HashMap<String, String>,
     pub check_interval: Duration,
+    /// Period of the authoritative full-LIST reconcile that repairs the
+    /// worker set independently of watch health. Keep this comfortably below
+    /// the pod termination-drain budget so a draining pod stops receiving new
+    /// traffic early enough for its in-flight requests to complete.
+    pub resync_interval: Duration,
     pub port: u16,
     pub namespace: Option<String>,
     // PD mode specific configuration
@@ -55,6 +63,7 @@ impl Default for ServiceDiscoveryConfig {
             enabled: false,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8000,
             namespace: None,
             pd_mode: false,
@@ -328,10 +337,74 @@ pub async fn start_service_discovery(
             }
         }
 
-        let mut retry_delay = Duration::from_secs(1);
+        // Authoritative periodic full-LIST reconcile. The watch alone cannot
+        // guarantee convergence: `.applied_objects()` drops the watcher's
+        // Delete events, and environments that frequently drop long-lived
+        // watch connections leave extended windows where nothing is observed.
+        // This task repairs both missed adds and missed removes on a fixed
+        // cadence, independent of watch health. `time::interval` fires
+        // immediately, so the first reconcile also seeds the worker set at
+        // startup.
+        //
+        // Both this timer and the watch-restart path below drive reconciles,
+        // so they share state (a lock taken inside `reconcile_from_list` to
+        // keep the passes from interleaving, plus the failure counter).
+        let reconcile_state = Arc::new(ReconcileState::default());
+        {
+            let pods_resync = pods.clone();
+            let config_resync = Arc::clone(&config_arc);
+            let tracked_resync = Arc::clone(&tracked_pods);
+            let app_context_resync = Arc::clone(&app_context);
+            let state_resync = Arc::clone(&reconcile_state);
+            // Clamp to >= 1s: time::interval panics on a zero period.
+            let resync_period = config_arc.resync_interval.max(Duration::from_secs(1));
+            tokio::spawn(async move {
+                let mut ticker = time::interval(resync_period);
+                // Delay, not the default Burst: if a LIST ever takes longer
+                // than the period, Burst fires every missed tick with no gap,
+                // so a slow API server would be answered with back-to-back
+                // cluster-wide LISTs — a feedback loop that cannot recover on
+                // its own. Delay keeps consecutive reconciles at least
+                // `resync_period` apart no matter how slow the LIST is.
+                ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    reconcile_from_list(
+                        &pods_resync,
+                        &config_resync,
+                        Arc::clone(&tracked_resync),
+                        Arc::clone(&app_context_resync),
+                        config_resync.port,
+                        &state_resync,
+                    )
+                    .await;
+                }
+            });
+        }
+
+        const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+        // A watch session that lasted at least this long counts as healthy, so
+        // the drop that ended it is treated as a fresh incident rather than a
+        // continuation of an earlier one.
+        const HEALTHY_STREAM_THRESHOLD: Duration = Duration::from_secs(60);
+
+        let mut retry_delay = INITIAL_RETRY_DELAY;
 
         loop {
+            // Reconcile against a fresh LIST before (re)starting the watch so
+            // a reconnect immediately repairs the adds/removes missed during
+            // the outage, rather than waiting for the next periodic tick.
+            reconcile_from_list(
+                &pods,
+                &config_arc,
+                Arc::clone(&tracked_pods),
+                Arc::clone(&app_context),
+                port,
+                &reconcile_state,
+            )
+            .await;
+
             let watcher_config = Config::default();
             let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
 
@@ -359,7 +432,8 @@ pub async fn start_service_discovery(
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
 
-            match filtered_stream
+            let stream_started = time::Instant::now();
+            let watch_result = filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let app_context_inner = Arc::clone(&app_context_clone);
@@ -391,28 +465,32 @@ pub async fn start_service_discovery(
                         Ok(())
                     }
                 })
-                .await
-            {
-                Ok(_) => {
-                    retry_delay = Duration::from_secs(1);
-                }
-                Err(err) => {
-                    error!("Error in Kubernetes watcher: {}", err);
-                    warn!(
-                        "Retrying in {} seconds with exponential backoff",
-                        retry_delay.as_secs()
-                    );
-                    time::sleep(retry_delay).await;
+                .await;
 
-                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                }
+            // `watcher()` is an infinite stream — it recovers internally and
+            // surfaces failures as Err items — so `try_for_each` returns only
+            // by aborting on an error. A clean end is not expected, but it is
+            // handled on the same path so the restart is never a hot loop if
+            // that ever changes.
+            match watch_result {
+                Ok(()) => warn!("Kubernetes watcher stream ended unexpectedly"),
+                Err(err) => error!("Error in Kubernetes watcher: {}", err),
             }
 
-            warn!(
-                "Kubernetes watcher exited, restarting in {} seconds",
-                config_arc.check_interval.as_secs()
-            );
-            time::sleep(config_arc.check_interval).await;
+            // Reset the backoff after a session that ran long enough to be
+            // considered healthy. Without this, retry_delay only ever grows:
+            // in environments that drop long-lived watches every few minutes,
+            // a handful of unrelated drops ratchets the reconnect interval to
+            // MAX_RETRY_DELAY and pins it there for the lifetime of the
+            // process, leaving the periodic reconcile as the only thing still
+            // observing the cluster.
+            if stream_started.elapsed() >= HEALTHY_STREAM_THRESHOLD {
+                retry_delay = INITIAL_RETRY_DELAY;
+            }
+
+            warn!("Restarting Kubernetes watcher in {:?}", retry_delay);
+            time::sleep(retry_delay).await;
+            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
         }
     });
 
@@ -617,6 +695,200 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
     }
+}
+
+/// Page size for the reconcile's LIST, matching the watcher's own initial
+/// list (`watcher::Config::default().page_size`) and client-go's default.
+const LIST_PAGE_SIZE: u32 = 500;
+
+/// Consecutive failed resyncs after which the log is escalated to `error!`.
+/// A single failed LIST is unremarkable; a run of them means the worker set
+/// is frozen and may be routing to pods that no longer exist.
+const RESYNC_FAILURES_BEFORE_ESCALATION: u32 = 3;
+
+/// State shared by the two reconcile drivers (the periodic timer and the
+/// watch-restart path).
+#[derive(Default)]
+struct ReconcileState {
+    /// Held for the duration of a pass so the two drivers never interleave.
+    lock: tokio::sync::Mutex<()>,
+    /// Consecutive failed passes, used only to escalate the log level.
+    consecutive_failures: AtomicU32,
+}
+
+/// Full LIST + reconcile of the tracked worker set against the API server.
+///
+/// Adds any healthy, selector-matching pod not yet tracked, and removes any
+/// tracked pod that has disappeared from the API server or begun terminating
+/// (mirroring the watch path's deletion_timestamp handling). This is the
+/// authoritative resync that makes worker correctness independent of
+/// watch-stream reliability: `.applied_objects()` drops Delete events and
+/// unstable environments drop the long-lived watch, so the watch alone
+/// cannot converge.
+///
+/// The LIST is paged; any page failing aborts the whole pass and leaves the
+/// worker set untouched, so a partial view can never drive removals.
+async fn reconcile_from_list(
+    pods: &Api<Pod>,
+    config: &ServiceDiscoveryConfig,
+    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    app_context: Arc<AppContext>,
+    port: u16,
+    state: &ReconcileState,
+) {
+    // One reconcile at a time. The periodic timer and the watch-restart path
+    // both call this, and letting two passes interleave lets the one holding
+    // the older LIST snapshot delete a pod the newer one has just added.
+    let _guard = state.lock.lock().await;
+    let started = time::Instant::now();
+
+    // Snapshot the tracked set BEFORE issuing the LIST; only pods that were
+    // already tracked at that instant are eligible for removal below. The
+    // watch runs concurrently, so a pod it registers while the LIST is in
+    // flight is legitimately missing from the response through no fault of
+    // its own. Removing it would open exactly the zero-worker window this
+    // reconcile exists to close, and the watch would not re-emit an Apply to
+    // repair it — the pod would stay unregistered until the next resync.
+    let tracked_before: HashSet<PodInfo> = match tracked_pods.lock() {
+        Ok(tracker) => tracker.clone(),
+        Err(e) => {
+            error!("SD resync: failed to lock tracked_pods: {}", e);
+            return;
+        }
+    };
+
+    // Names currently present in the API for matching pods, and add-missing.
+    // A pod with a deletion_timestamp is deliberately NOT counted as present:
+    // the watch path deregisters a pod as soon as it starts terminating, and
+    // the reconcile must mirror that semantic watch-independently. If it
+    // waited for the pod to disappear from the API instead, a draining pod
+    // would keep receiving new traffic whenever the watch is down — which
+    // both fails those requests once the pod finishes shutting down and can
+    // prevent a graceful-drain hook from ever reaching zero in-flight.
+    // handle_pod_deletion is idempotent (removes only if tracked), so the
+    // watch and the reconcile processing the same termination never conflict.
+    let mut present: HashSet<String> = HashSet::new();
+
+    // Page through the LIST rather than pulling the whole collection in one
+    // response. With no namespace configured this is an Api::all over every
+    // pod in the cluster, once per resync per router replica, so an unbounded
+    // list would hand the API server a multi-megabyte response on a large
+    // cluster; the watch's own initial list already pages at the same size.
+    // Chunked list is still a consistent snapshot: the server pins the
+    // resourceVersion to the continue token.
+    //
+    // Only `present` is accumulated across pages — pods are processed and
+    // dropped page by page, so peak memory is one page rather than the whole
+    // cluster.
+    //
+    // Same client-side filtering as the watch (Config::default() => no server
+    // label filter); we match via should_include below.
+    let mut params = ListParams::default().limit(LIST_PAGE_SIZE);
+    loop {
+        let page = match pods.list(&params).await {
+            Ok(page) => page,
+            Err(e) => {
+                // Bail before the removal pass. Adds already applied are
+                // harmless (those pods really do exist), but `present` is now
+                // partial and removing against it would deregister live
+                // workers. An expired continue token (410) lands here too and
+                // is simply retried by the next resync.
+                Metrics::record_discovery_sync(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::RESULT_ERROR,
+                );
+                let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= RESYNC_FAILURES_BEFORE_ESCALATION {
+                    // The gauge cannot show this: it just stops moving, so a
+                    // frozen worker set looks identical to a quiet cluster.
+                    error!(
+                        "SD resync LIST has failed {} times in a row; the worker set is \
+                         frozen and may still route to pods that no longer exist: {}",
+                        failures, e
+                    );
+                } else {
+                    warn!(
+                        "SD resync LIST failed ({} in a row), keeping current worker set: {}",
+                        failures, e
+                    );
+                }
+                return;
+            }
+        };
+
+        let continue_token = page.metadata.continue_.clone();
+
+        for pod in &page.items {
+            if !PodInfo::should_include(pod, config) {
+                continue;
+            }
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            if let Some(name) = pod.metadata.name.clone() {
+                present.insert(name);
+            }
+            if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
+                // handle_pod_event dedups via tracked_pods and gates on
+                // is_healthy(), so re-adds are cheap no-ops.
+                handle_pod_event(
+                    &pod_info,
+                    Arc::clone(&tracked_pods),
+                    Arc::clone(&app_context),
+                    port,
+                    config.pd_mode,
+                )
+                .await;
+            }
+        }
+
+        match continue_token {
+            Some(token) if !token.is_empty() => params = params.continue_token(&token),
+            _ => break,
+        }
+    }
+
+    // Every page landed, so `present` is a complete view and the removal pass
+    // below is safe to run.
+    state.consecutive_failures.store(0, Ordering::Relaxed);
+    Metrics::record_discovery_sync(
+        metrics_labels::DISCOVERY_KUBERNETES,
+        metrics_labels::RESULT_SUCCESS,
+    );
+    Metrics::record_discovery_sync_duration(
+        metrics_labels::DISCOVERY_KUBERNETES,
+        started.elapsed(),
+    );
+
+    // Remove-absent: any pod tracked before the LIST whose name is no longer
+    // in the API. Iterate the STORED PodInfo values so handle_pod_deletion's
+    // exact-struct `tracked.remove(pod_info)` always matches; that call also
+    // re-checks membership under the lock, so a pod the watch removed in the
+    // meantime is a no-op rather than a duplicate deregistration.
+    for pod_info in stale_tracked_pods(&tracked_before, &present) {
+        handle_pod_deletion(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            port,
+        )
+        .await;
+    }
+}
+
+/// Tracked pods whose name is absent from a fresh LIST of the API server.
+///
+/// Selection is by pod NAME (the stable key), never by full `PodInfo`
+/// equality: a tracked pod whose status/readiness has flipped since it was
+/// added must still be treated as present. The returned values are the
+/// stored `PodInfo` structs so the caller's `HashSet::remove` matches
+/// exactly.
+fn stale_tracked_pods(tracked: &HashSet<PodInfo>, present: &HashSet<String>) -> Vec<PodInfo> {
+    tracked
+        .iter()
+        .filter(|pod_info| !present.contains(&pod_info.name))
+        .cloned()
+        .collect()
 }
 
 /// Start router node discovery for mesh cluster
@@ -899,6 +1171,7 @@ mod tests {
             enabled: true,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1538,6 +1811,7 @@ mod tests {
             enabled: true,
             selector: regular_selector,
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1573,6 +1847,7 @@ mod tests {
             enabled: true,
             selector: regular_selector,
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1586,5 +1861,346 @@ mod tests {
 
         let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
         assert!(!PodInfo::should_include(&regular_pod, &config));
+    }
+
+    fn tracked_pod_info(name: &str, ip: &str, status: &str, is_ready: bool) -> PodInfo {
+        PodInfo {
+            name: name.to_string(),
+            ip: ip.to_string(),
+            status: status.to_string(),
+            is_ready,
+            pod_type: Some(PodType::Regular),
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        }
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_removes_only_absent_names() {
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Running", true));
+        tracked.insert(tracked_pod_info("pod-c", "10.0.0.3", "Running", true));
+
+        let mut present = HashSet::new();
+        present.insert("pod-a".to_string());
+        present.insert("pod-c".to_string());
+
+        let stale = stale_tracked_pods(&tracked, &present);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "pod-b");
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_keeps_pod_with_changed_status() {
+        // The stored PodInfo was captured while the pod was Ready/Running; the
+        // live pod has since flipped (e.g. is_ready=false). Presence is keyed
+        // by name, so the tracked entry must NOT be selected for removal —
+        // full-struct equality would wrongly treat it as gone.
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+
+        let mut present = HashSet::new();
+        present.insert("pod-a".to_string());
+
+        let stale = stale_tracked_pods(&tracked, &present);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_empty_list_removes_everything() {
+        // A fresh LIST that returns no matching pods must drain the whole
+        // tracked set (e.g. all workers were deleted while the watch was
+        // down).
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Pending", false));
+
+        let stale = stale_tracked_pods(&tracked, &HashSet::new());
+        assert_eq!(stale.len(), 2);
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_returns_stored_struct() {
+        // The returned PodInfo must be the STORED struct (not a re-parsed
+        // one) so the caller's exact-struct HashSet::remove always matches.
+        let stored = tracked_pod_info("pod-gone", "10.0.0.9", "Running", true);
+        let mut tracked = HashSet::new();
+        tracked.insert(stored.clone());
+
+        let stale = stale_tracked_pods(&tracked, &HashSet::new());
+        assert_eq!(stale, vec![stored]);
+    }
+
+    // ---- reconcile_from_list ----
+    //
+    // These drive the real `reconcile_from_list` against a fake API server
+    // built from a `tower::service_fn`, which `kube::Client::new` accepts
+    // directly — no cluster and no extra dependencies.
+    //
+    // Two traps worth knowing if you extend these: a `k8s_openapi::List<Pod>`
+    // serialized with serde_json does not round-trip into kube's `ObjectList`
+    // (the items come back empty), so the body is assembled as explicit
+    // PodList JSON; and the config selector must actually match the pod
+    // labels, or `should_include` filters everything out and the test
+    // silently asserts nothing.
+
+    fn reconcile_test_config() -> ServiceDiscoveryConfig {
+        // Matches the labels set by `create_regular_k8s_pod`.
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "regular-worker".to_string());
+        ServiceDiscoveryConfig {
+            enabled: true,
+            selector,
+            ..Default::default()
+        }
+    }
+
+    fn pod_list_json(pods: &[Pod], continue_token: Option<&str>) -> String {
+        let mut metadata = serde_json::json!({ "resourceVersion": "1" });
+        if let Some(token) = continue_token {
+            metadata["continue"] = serde_json::Value::String(token.to_string());
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": metadata,
+            "items": pods
+                .iter()
+                .map(|pod| serde_json::to_value(pod).unwrap())
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    fn json_response(
+        status: u16,
+        body: String,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .unwrap()
+    }
+
+    /// Fake `Api<Pod>` that replays `responses` in order and records the
+    /// request URIs it was asked for.
+    fn fake_pod_api(responses: Vec<(u16, String)>) -> (Api<Pod>, Arc<Mutex<Vec<String>>>) {
+        let pending = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_service = Arc::clone(&seen);
+
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let pending = Arc::clone(&pending);
+            let seen = Arc::clone(&seen_for_service);
+            async move {
+                seen.lock().unwrap().push(req.uri().to_string());
+                let (status, body) = pending
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("fake API server got more requests than it had responses");
+                Ok::<_, std::convert::Infallible>(json_response(status, body))
+            }
+        });
+
+        (Api::all(Client::new(service, "default")), seen)
+    }
+
+    fn tracked_names(tracked: &Arc<Mutex<HashSet<PodInfo>>>) -> HashSet<String> {
+        tracked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod_info| pod_info.name.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_adds_listed_pods_and_removes_absent_ones() {
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+
+        let live = create_regular_k8s_pod("pod-live", "10.0.0.2");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let names = tracked_names(&tracked);
+        assert!(
+            names.contains("pod-live"),
+            "a listed healthy pod should be tracked"
+        );
+        assert!(
+            !names.contains("pod-gone"),
+            "a tracked pod absent from the LIST should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_treats_terminating_pod_as_absent() {
+        // The pod is still in the API but has begun terminating. It must be
+        // deregistered now rather than when it finally disappears, so it stops
+        // receiving new traffic while its drain hook runs.
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked.lock().unwrap().insert(tracked_pod_info(
+            "pod-draining",
+            "10.0.0.3",
+            "Running",
+            true,
+        ));
+
+        let mut draining = create_regular_k8s_pod("pod-draining", "10.0.0.3");
+        draining.metadata.deletion_timestamp = Some(Time(chrono::Utc::now()));
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[draining], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            !tracked_names(&tracked).contains("pod-draining"),
+            "a terminating pod should be treated as absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_keeps_worker_set_when_list_fails() {
+        // The most consequential branch: a failed LIST must never be read as
+        // "no pods exist" and drain every worker.
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+
+        let forbidden = serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": "pods is forbidden",
+            "reason": "Forbidden",
+            "code": 403,
+        })
+        .to_string();
+        let (api, _) = fake_pod_api(vec![(403, forbidden)]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            tracked_names(&tracked).contains("pod-a"),
+            "a failed LIST must leave the worker set untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_remove_pod_registered_during_the_list() {
+        // The watch registers a pod while the LIST is in flight. It cannot
+        // appear in that response through no fault of its own, and the watch
+        // will not re-emit an Apply for it, so removing it here would strand
+        // the worker until the next resync.
+        let tracked: Arc<Mutex<HashSet<PodInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_for_service = Arc::clone(&tracked);
+
+        let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+            let tracked = Arc::clone(&tracked_for_service);
+            async move {
+                tracked
+                    .lock()
+                    .unwrap()
+                    .insert(tracked_pod_info("late-pod", "10.0.0.9", "Running", true));
+                Ok::<_, std::convert::Infallible>(json_response(200, pod_list_json(&[], None)))
+            }
+        });
+        let api: Api<Pod> = Api::all(Client::new(service, "default"));
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            tracked_names(&tracked).contains("late-pod"),
+            "a pod registered while the LIST was in flight must survive the reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_follows_continue_token_across_pages() {
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+
+        let first = create_regular_k8s_pod("pod-page1", "10.0.0.2");
+        let second = create_regular_k8s_pod("pod-page2", "10.0.0.3");
+        let (api, seen) = fake_pod_api(vec![
+            (200, pod_list_json(&[first], Some("next-page-token"))),
+            (200, pod_list_json(&[second], None)),
+        ]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let names = tracked_names(&tracked);
+        assert!(names.contains("pod-page1"), "first page should be applied");
+        assert!(names.contains("pod-page2"), "second page should be applied");
+        assert!(
+            !names.contains("pod-gone"),
+            "removal should consider every page, not just the last"
+        );
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "expected exactly two pages");
+        assert!(
+            requests[0].contains(&format!("limit={}", LIST_PAGE_SIZE)),
+            "first page should be bounded, got {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("continue=next-page-token"),
+            "second page should carry the continue token, got {}",
+            requests[1]
+        );
     }
 }

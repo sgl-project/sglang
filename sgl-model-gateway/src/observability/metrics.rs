@@ -295,6 +295,10 @@ pub(crate) fn init_metrics() {
         "smg_discovery_sync_duration_seconds",
         "Discovery sync duration by source"
     );
+    describe_counter!(
+        "smg_discovery_syncs_total",
+        "Discovery sync passes by source and result"
+    );
     describe_gauge!(
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
@@ -1068,6 +1072,22 @@ impl Metrics {
             "source" => source
         )
         .record(duration.as_secs_f64());
+    }
+
+    /// Record the outcome of a discovery sync pass.
+    ///
+    /// A sync that fails leaves the worker set frozen at its last known
+    /// state, which the `smg_discovery_workers_discovered` gauge cannot show —
+    /// it simply stops moving. This counter is what makes a persistently
+    /// failing sync (revoked RBAC, expired token, unreachable API server)
+    /// distinguishable from a quiet, healthy cluster.
+    pub fn record_discovery_sync(source: &'static str, result: &'static str) {
+        counter!(
+            "smg_discovery_syncs_total",
+            "source" => source,
+            "result" => result
+        )
+        .increment(1);
     }
 
     /// Set workers discovered count
