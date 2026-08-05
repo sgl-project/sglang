@@ -405,6 +405,74 @@ def test_dynamodb_candidate_pairing_spreads_bursts_across_workers():
     assert first_denoisers == {slot.worker_id for slot in denoisers}
 
 
+def test_dynamodb_admission_requeries_after_a_stale_candidate_snapshot():
+    class TransactionCanceledException(Exception):
+        pass
+
+    class FakeExceptions:
+        pass
+
+    FakeExceptions.TransactionCanceledException = TransactionCanceledException
+
+    class FakeClient:
+        exceptions = FakeExceptions()
+
+        def __init__(self):
+            self.query_counts = {"denoiser": 0, "vae": 0}
+            self.transactions = 0
+
+        @staticmethod
+        def _slot(role, index):
+            worker_id = f"{role}-{index}"
+            return {
+                "pk": {"S": f"SLOT#{role}#{worker_id}#{index:04d}"},
+                "sk": {"S": "LEASE"},
+                "role": {"S": role},
+                "worker_id": {"S": worker_id},
+                "endpoint": {"S": f"ws://{worker_id}/generate"},
+                "az": {"S": "us-east-2a"},
+                "slot_index": {"N": str(index)},
+                "model_revision": {"S": "minwm-r1"},
+                "vae_fingerprint": {"S": "taew2_2"},
+                "heartbeat_expires_at": {"N": "9999999999"},
+            }
+
+        def query(self, **kwargs):
+            allocation_key = kwargs["ExpressionAttributeValues"][":allocation"]["S"]
+            role = "denoiser" if allocation_key.startswith("DENOISER#") else "vae"
+            self.query_counts[role] += 1
+            indices = [0, 1] if self.query_counts[role] == 1 else [1]
+            return {"Items": [self._slot(role, index) for index in indices]}
+
+        def transact_write_items(self, *, TransactItems):
+            self.transactions += 1
+            if self.transactions <= 2:
+                raise TransactionCanceledException("candidate was leased concurrently")
+
+    async def run():
+        client = FakeClient()
+        store = DynamoDBCoordinatorStore(
+            "minwm-realtime-coordinator",
+            ttl_s=60,
+            worker_ttl_s=30,
+            client=client,
+        )
+        assignment = await store.acquire(
+            user_id="user-a",
+            session_id="session-a",
+            generation_id="generation-a",
+            model_revision="minwm-r1",
+            vae_fingerprint="taew2_2",
+        )
+
+        assert assignment.denoiser.worker_id == "denoiser-1"
+        assert assignment.vae.worker_id == "vae-1"
+        assert client.query_counts == {"denoiser": 2, "vae": 2}
+        assert client.transactions == 3
+
+    asyncio.run(run())
+
+
 def test_dynamodb_heartbeat_retries_a_transient_transaction_conflict():
     class TransactionConflictException(Exception):
         pass

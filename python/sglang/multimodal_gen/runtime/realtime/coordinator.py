@@ -558,149 +558,178 @@ class DynamoDBCoordinatorStore:
         ):
             raise CoordinatorRejected("INVALID_SESSION_IDENTITY")
         client = self._get_client()
-        now_epoch = int(self._wall_clock())
-        expires_epoch = now_epoch + max(1, int(self.ttl_s))
-        denoisers = self._query_slots_sync(
-            "denoiser",
-            model_revision=model_revision,
-            vae_fingerprint=vae_fingerprint,
-            now_epoch=now_epoch,
-        )
-        vaes = self._query_slots_sync(
-            "vae",
-            model_revision=model_revision,
-            vae_fingerprint=vae_fingerprint,
-            now_epoch=now_epoch,
-        )
-        pairs = self._candidate_pairs(
-            denoisers,
-            vaes,
-            identity=f"{user_id}:{session_id}:{generation_id}",
-        )
-        if not pairs:
-            raise CoordinatorRejected("CAPACITY_EXHAUSTED", retry_after_s=0.25)
+        for query_round in range(4):
+            now_epoch = int(self._wall_clock())
+            expires_epoch = now_epoch + max(1, int(self.ttl_s))
+            denoisers = self._query_slots_sync(
+                "denoiser",
+                model_revision=model_revision,
+                vae_fingerprint=vae_fingerprint,
+                now_epoch=now_epoch,
+            )
+            vaes = self._query_slots_sync(
+                "vae",
+                model_revision=model_revision,
+                vae_fingerprint=vae_fingerprint,
+                now_epoch=now_epoch,
+            )
+            pairs = self._candidate_pairs(
+                denoisers,
+                vaes,
+                identity=(
+                    f"{user_id}:{session_id}:{generation_id}:{query_round}"
+                ),
+            )
+            if not pairs:
+                break
+            for denoiser, vae in pairs:
+                assignment = self._try_acquire_pair_sync(
+                    client,
+                    user_id=user_id,
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    denoiser=denoiser,
+                    vae=vae,
+                    now_epoch=now_epoch,
+                    expires_epoch=expires_epoch,
+                )
+                if assignment is not None:
+                    return assignment
+            if query_round < 3:
+                time.sleep(0.005 * (2**query_round))
+        raise CoordinatorRejected("CAPACITY_EXHAUSTED", retry_after_s=0.25)
 
-        for denoiser, vae in pairs:
-            token = uuid4().hex
-            identity = {
-                "user_id": {"S": user_id},
-                "session_id": {"S": session_id},
-                "generation_id": {"S": generation_id},
-                "lease_token": {"S": token},
-                "lease_expires_at": {"N": str(expires_epoch)},
-                "ttl": {"N": str(expires_epoch + 86400)},
-            }
-            values = {
-                ":token": {"S": token},
-                ":user": {"S": user_id},
-                ":session": {"S": session_id},
-                ":generation": {"S": generation_id},
-                ":now": {"N": str(now_epoch)},
-                ":expires": {"N": str(expires_epoch)},
-                ":ttl": {"N": str(expires_epoch + 86400)},
-            }
-            slot_updates = []
-            for slot in (denoiser, vae):
-                slot_updates.append(
-                    {
-                        "Update": {
-                            "TableName": self.table_name,
-                            "Key": {
-                                "pk": {
-                                    "S": self._slot_pk(
-                                        slot.role, slot.worker_id, slot.slot_index
-                                    )
-                                },
-                                "sk": {"S": "LEASE"},
+    def _try_acquire_pair_sync(
+        self,
+        client: Any,
+        *,
+        user_id: str,
+        session_id: str,
+        generation_id: str,
+        denoiser: WorkerSlot,
+        vae: WorkerSlot,
+        now_epoch: int,
+        expires_epoch: int,
+    ) -> SessionAssignment | None:
+        token = uuid4().hex
+        identity = {
+            "user_id": {"S": user_id},
+            "session_id": {"S": session_id},
+            "generation_id": {"S": generation_id},
+            "lease_token": {"S": token},
+            "lease_expires_at": {"N": str(expires_epoch)},
+            "ttl": {"N": str(expires_epoch + 86400)},
+        }
+        values = {
+            ":token": {"S": token},
+            ":user": {"S": user_id},
+            ":session": {"S": session_id},
+            ":generation": {"S": generation_id},
+            ":now": {"N": str(now_epoch)},
+            ":expires": {"N": str(expires_epoch)},
+            ":ttl": {"N": str(expires_epoch + 86400)},
+        }
+        slot_updates = []
+        for slot in (denoiser, vae):
+            slot_updates.append(
+                {
+                    "Update": {
+                        "TableName": self.table_name,
+                        "Key": {
+                            "pk": {
+                                "S": self._slot_pk(
+                                    slot.role, slot.worker_id, slot.slot_index
+                                )
                             },
-                            "UpdateExpression": (
-                                "SET lease_token = :token, user_id = :user, "
-                                "session_id = :session, generation_id = :generation, "
-                                "lease_expires_at = :expires, #ttl = :ttl"
-                            ),
-                            "ConditionExpression": (
-                                "heartbeat_expires_at > :now AND "
-                                "(attribute_not_exists(lease_token) OR "
-                                "lease_expires_at <= :now)"
-                            ),
-                            "ExpressionAttributeNames": {"#ttl": "ttl"},
-                            "ExpressionAttributeValues": values,
-                        }
-                    }
-                )
-            session_item = {
-                **identity,
-                "pk": {"S": f"SESSION#{session_id}"},
-                "sk": {"S": "ASSIGNMENT"},
-                "item_type": {"S": "session_assignment"},
-                "denoiser_worker_id": {"S": denoiser.worker_id},
-                "denoiser_slot": {"N": str(denoiser.slot_index)},
-                "denoiser_endpoint": {"S": denoiser.endpoint},
-                "vae_worker_id": {"S": vae.worker_id},
-                "vae_slot": {"N": str(vae.slot_index)},
-                "vae_endpoint": {"S": vae.endpoint},
-            }
-            try:
-                client.transact_write_items(
-                    TransactItems=[
-                        {
-                            "Put": {
-                                "TableName": self.table_name,
-                                "Item": {
-                                    **identity,
-                                    "pk": {"S": f"USER#{user_id}"},
-                                    "sk": {"S": "LEASE"},
-                                    "item_type": {"S": "user_lease"},
-                                },
-                                "ConditionExpression": (
-                                    "attribute_not_exists(lease_token) OR "
-                                    "lease_expires_at <= :now"
-                                ),
-                                "ExpressionAttributeValues": {
-                                    ":now": {"N": str(now_epoch)}
-                                },
-                            }
-                        },
-                        {
-                            "Put": {
-                                "TableName": self.table_name,
-                                "Item": session_item,
-                                "ConditionExpression": (
-                                    "attribute_not_exists(lease_token) OR "
-                                    "lease_expires_at <= :now"
-                                ),
-                                "ExpressionAttributeValues": {
-                                    ":now": {"N": str(now_epoch)}
-                                },
-                            }
-                        },
-                        *slot_updates,
-                    ]
-                )
-            except client.exceptions.TransactionCanceledException as exc:
-                getter = getattr(client, "get_item", None)
-                if getter is not None:
-                    current_user = getter(
-                        TableName=self.table_name,
-                        Key={
-                            "pk": {"S": f"USER#{user_id}"},
                             "sk": {"S": "LEASE"},
                         },
-                        ConsistentRead=True,
-                    ).get("Item")
-                    if self._is_active_item(current_user, now_epoch):
-                        raise CoordinatorRejected("USER_SESSION_LIMIT") from exc
-                continue
-            return SessionAssignment(
-                user_id=user_id,
-                session_id=session_id,
-                generation_id=generation_id,
-                token=token,
-                expires_at=self._lease_clock() + self.ttl_s,
-                denoiser=denoiser,
-                vae=vae,
+                        "UpdateExpression": (
+                            "SET lease_token = :token, user_id = :user, "
+                            "session_id = :session, generation_id = :generation, "
+                            "lease_expires_at = :expires, #ttl = :ttl"
+                        ),
+                        "ConditionExpression": (
+                            "heartbeat_expires_at > :now AND "
+                            "(attribute_not_exists(lease_token) OR "
+                            "lease_expires_at <= :now)"
+                        ),
+                        "ExpressionAttributeNames": {"#ttl": "ttl"},
+                        "ExpressionAttributeValues": values,
+                    }
+                }
             )
-        raise CoordinatorRejected("CAPACITY_EXHAUSTED", retry_after_s=0.25)
+        session_item = {
+            **identity,
+            "pk": {"S": f"SESSION#{session_id}"},
+            "sk": {"S": "ASSIGNMENT"},
+            "item_type": {"S": "session_assignment"},
+            "denoiser_worker_id": {"S": denoiser.worker_id},
+            "denoiser_slot": {"N": str(denoiser.slot_index)},
+            "denoiser_endpoint": {"S": denoiser.endpoint},
+            "vae_worker_id": {"S": vae.worker_id},
+            "vae_slot": {"N": str(vae.slot_index)},
+            "vae_endpoint": {"S": vae.endpoint},
+        }
+        try:
+            client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": {
+                                **identity,
+                                "pk": {"S": f"USER#{user_id}"},
+                                "sk": {"S": "LEASE"},
+                                "item_type": {"S": "user_lease"},
+                            },
+                            "ConditionExpression": (
+                                "attribute_not_exists(lease_token) OR "
+                                "lease_expires_at <= :now"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":now": {"N": str(now_epoch)}
+                            },
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.table_name,
+                            "Item": session_item,
+                            "ConditionExpression": (
+                                "attribute_not_exists(lease_token) OR "
+                                "lease_expires_at <= :now"
+                            ),
+                            "ExpressionAttributeValues": {
+                                ":now": {"N": str(now_epoch)}
+                            },
+                        }
+                    },
+                    *slot_updates,
+                ]
+            )
+        except client.exceptions.TransactionCanceledException as exc:
+            getter = getattr(client, "get_item", None)
+            if getter is not None:
+                current_user = getter(
+                    TableName=self.table_name,
+                    Key={
+                        "pk": {"S": f"USER#{user_id}"},
+                        "sk": {"S": "LEASE"},
+                    },
+                    ConsistentRead=True,
+                ).get("Item")
+                if self._is_active_item(current_user, now_epoch):
+                    raise CoordinatorRejected("USER_SESSION_LIMIT") from exc
+            return None
+        return SessionAssignment(
+            user_id=user_id,
+            session_id=session_id,
+            generation_id=generation_id,
+            token=token,
+            expires_at=self._lease_clock() + self.ttl_s,
+            denoiser=denoiser,
+            vae=vae,
+        )
 
     async def renew(self, assignment: SessionAssignment) -> SessionAssignment:
         return await asyncio.to_thread(self._renew_sync, assignment)

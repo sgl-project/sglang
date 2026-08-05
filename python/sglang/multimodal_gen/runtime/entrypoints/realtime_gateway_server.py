@@ -377,8 +377,11 @@ def create_app(
             )
 
             async def browser_to_worker():
-                while True:
-                    await upstream.send(await _receive_browser(websocket))
+                try:
+                    while True:
+                        await upstream.send(await _receive_browser(websocket))
+                except ConnectionClosedOK:
+                    return
 
             async def worker_to_browser():
                 try:

@@ -165,6 +165,23 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                     "?user_id=user-a&trace_id=trace-a"
                 )
                 async with connect(url, max_size=None, compression=None) as browser:
+                    async def send_actions_until_closed():
+                        event_id = 1
+                        while True:
+                            try:
+                                await browser.send(
+                                    encode_message(
+                                        "camera_actions",
+                                        event_id=event_id,
+                                        actions=["w"],
+                                    )
+                                )
+                            except ConnectionClosedOK:
+                                return
+                            event_id += 1
+                            await asyncio.sleep(0)
+
+                    action_task = asyncio.create_task(send_actions_until_closed())
                     messages = []
                     try:
                         while True:
@@ -175,6 +192,7 @@ def test_gateway_routes_control_and_direct_vae_media_and_queries_trace_over_http
                             )
                     except ConnectionClosedOK:
                         pass
+                    await action_task
                 assert {message["type"] for message in messages} == {
                     "session_ready",
                     "frame_batch",
