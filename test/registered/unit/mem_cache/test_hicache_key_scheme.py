@@ -486,5 +486,159 @@ class TestFileBackendSuffix(CustomTestCase):
             self.assertEqual(backend.config_suffix, "_meta-llama-Llama-3-70B_1_4_2_1")
 
 
+class TestLayerPartition(CustomTestCase):
+    """Canonical layer partition (PP read-back): a stage spanning several
+    canonical ranges owns one cell per range, so readers consume cells
+    written under a different pipeline split by name alone."""
+
+    def _mla_partition_namespace(self):
+        return _mla_namespace(layer_boundaries=[0, 30, 61])
+
+    def _suffixes(self, start_layer, end_layer, namespace=None):
+        return build_canonical_cell_suffixes(
+            namespace or self._mla_partition_namespace(),
+            attn_tp_rank=0,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            local_kv_heads=0,
+            dtype="bfloat16",
+            page_size=64,
+            model_id="deepseek-ai/DeepSeek-V3",
+            rank_replicated=True,
+        )
+
+    def test_pp_read_back_coverage(self):
+        # DeepSeek-V3, partition [0,30,61] (the default uneven PP2 split):
+        # PP2 stages own one cell each; a PP1 rank fans out to exactly their
+        # union — PP1 reads PP2-written cells and vice versa.
+        digest = namespace_digest(self._mla_partition_namespace())
+        stage0 = self._suffixes(0, 30)
+        stage1 = self._suffixes(30, 61)
+        pp1 = self._suffixes(0, 61)
+        self.assertEqual(stage0, [f"{digest}_L0-30"])
+        self.assertEqual(stage1, [f"{digest}_L30-61"])
+        self.assertEqual(pp1, stage0 + stage1)
+
+    def test_misaligned_stage_rejected(self):
+        with self.assertRaisesRegex(ValueError, "boundaries"):
+            self._suffixes(0, 45)
+
+    def test_mha_layer_fan_out_rejected(self):
+        namespace = _gqa_namespace(layer_boundaries=[0, 30, 61])
+        with self.assertRaisesRegex(NotImplementedError, "rank-replicated"):
+            build_canonical_cell_suffixes(
+                namespace,
+                attn_tp_rank=0,
+                attn_tp_size=4,
+                attn_cp_size=1,
+                start_layer=0,
+                end_layer=61,
+                local_kv_heads=2,
+                dtype="bfloat16",
+                page_size=64,
+                model_id="meta-llama/Llama-3-70B",
+                rank_replicated=False,
+            )
+        # A single-range MHA stage under the same partition is fine.
+        single = build_canonical_cell_suffixes(
+            namespace,
+            attn_tp_rank=0,
+            attn_tp_size=4,
+            attn_cp_size=1,
+            start_layer=0,
+            end_layer=30,
+            local_kv_heads=2,
+            dtype="bfloat16",
+            page_size=64,
+            model_id="meta-llama/Llama-3-70B",
+            rank_replicated=False,
+        )
+        self.assertEqual(len(single), 1)
+
+    def test_partition_enters_digest(self):
+        self.assertNotEqual(
+            namespace_digest(self._mla_partition_namespace()),
+            namespace_digest(_mla_namespace(layer_boundaries=[0, 61])),
+        )
+        self.assertNotEqual(
+            namespace_digest(self._mla_partition_namespace()),
+            namespace_digest(_mla_namespace()),
+        )
+
+    def test_bad_boundaries_rejected(self):
+        for bad in ([0], [5, 30], [0, 30, 30]):
+            with self.assertRaises(ValueError):
+                derive_namespace(
+                    model_id="m",
+                    dtype="bfloat16",
+                    page_size=64,
+                    rank_replicated=True,
+                    total_kv_heads=0,
+                    head_group=0,
+                    layer_boundaries=bad,
+                )
+
+
+class TestMlaLayerRangeBufferMeta(CustomTestCase):
+    """Pointer math of the layer fan-out zero-copy metas (page_first_direct:
+    layer-major page blocks, one contiguous slab per cell)."""
+
+    def _stub_pool(self, layout="page_first_direct"):
+        import torch
+
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+        pool.layout = layout
+        pool.page_size = 4
+        pool.kv_cache_dim = 8
+        pool.layer_num = 6
+        pool.dtype = torch.bfloat16
+        pool.kv_buffer = torch.zeros(
+            (3, pool.layer_num, pool.page_size, 1, pool.kv_cache_dim),
+            dtype=pool.dtype,
+        )
+        return pool
+
+    def test_pointer_math(self):
+        import torch
+
+        pool = self._stub_pool()
+        itemsize = pool.dtype.itemsize
+        layer_stride = pool.page_size * pool.kv_cache_dim * itemsize
+        page_stride = pool.layer_num * layer_stride
+        base = pool.kv_buffer.data_ptr()
+        # Two pages (host indices 8..11 -> page 2, 0..3 -> page 0), two ranges.
+        indices = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
+        ptrs, sizes = pool.get_layer_range_page_buffer_meta(indices, [(0, 2), (2, 6)])
+        self.assertEqual(
+            ptrs,
+            [
+                base + 2 * page_stride,
+                base + 2 * page_stride + 2 * layer_stride,
+                base,
+                base + 2 * layer_stride,
+            ],
+        )
+        self.assertEqual(
+            sizes,
+            [2 * layer_stride, 4 * layer_stride] * 2,
+        )
+
+    def test_rejects_wrong_layout_and_range(self):
+        import torch
+
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            self._stub_pool(layout="page_first").get_layer_range_page_buffer_meta(
+                torch.tensor([0, 1, 2, 3]), [(0, 2)]
+            )
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self._stub_pool().get_layer_range_page_buffer_meta(
+                torch.tensor([0, 1, 2, 3]), [(0, 7)]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

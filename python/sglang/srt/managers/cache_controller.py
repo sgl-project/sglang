@@ -627,13 +627,21 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
         canonical_suffix = None
+        canonical_layer_ranges = None
+        layer_partition = storage_backend_extra_config.pop("layer_partition", None)
         if get_memory().hicache_storage_key_scheme == "canonical-grid":
-            canonical_suffix = self._build_canonical_suffix(
+            canonical_suffix, canonical_layer_ranges = self._build_canonical_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
                 tp_lcm_size=tp_lcm_size,
                 should_split_heads=should_split_heads,
+                layer_partition=layer_partition,
+            )
+        elif layer_partition is not None:
+            raise ValueError(
+                "layer_partition in --hicache-storage-backend-extra-config "
+                "requires --hicache-storage-key-scheme canonical-grid."
             )
 
         return HiCacheStorageConfig(
@@ -652,6 +660,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
             canonical_suffix=canonical_suffix,
+            canonical_layer_ranges=canonical_layer_ranges,
         )
 
     def _build_canonical_suffix(
@@ -661,6 +670,7 @@ class HiCacheController:
         attn_cp_size: int,
         tp_lcm_size: Optional[int],
         should_split_heads: bool,
+        layer_partition: Optional[List[int]] = None,
     ):
         """Attach-time construction of the canonical-grid cell suffix(es).
 
@@ -668,12 +678,17 @@ class HiCacheController:
         the remedy in the message; nothing degrades silently to rank-suffix
         keys (see DESIGN_l3_canonical_shard_grid.md section 2.2).
 
-        Returns one suffix string when this rank owns a single cell per page,
-        or the list of owned-cell suffixes under head fan-out
-        (``tp_lcm_size`` > tp_size): the fleet head grid is
-        ``head_group = total_kv_heads / tp_lcm_size``, and the canonical H
-        indices coincide with the split-heads virtual ranks, so the existing
-        multi-key machinery carries the fan-out.
+        Returns ``(suffix, layer_ranges)``: one suffix string when this rank
+        owns a single cell per page, or the list of owned-cell suffixes under
+        fan-out. Head fan-out (``tp_lcm_size`` > tp_size): the fleet head
+        grid is ``head_group = total_kv_heads / tp_lcm_size``, and the
+        canonical H indices coincide with the split-heads virtual ranks, so
+        the existing multi-key machinery carries it. Layer fan-out
+        (``layer_partition`` boundaries, PP read-back): the rank's stage
+        spans several canonical layer ranges; ``layer_ranges`` then carries
+        the LOCAL (start, end) ranges for the per-cell buffer metas and is
+        None otherwise. Layer fan-out is rank-replicated (MLA-family) only,
+        on mooncake with the page_first_direct layout.
         """
         from sglang.srt.mem_cache.hicache_key_scheme import (
             build_canonical_cell_suffixes,
@@ -763,6 +778,7 @@ class HiCacheController:
             rank_replicated=is_rank_replicated,
             total_kv_heads=local_kv_heads * self.tp_size,
             head_group=0 if is_rank_replicated else local_kv_heads // split_factor,
+            layer_boundaries=layer_partition,
         )
 
         suffixes = build_canonical_cell_suffixes(
@@ -778,12 +794,38 @@ class HiCacheController:
             model_id=model_id,
             rank_replicated=is_rank_replicated,
         )
+
+        canonical_layer_ranges = None
+        if layer_partition and is_rank_replicated and len(suffixes) > 1:
+            # Layer fan-out (PP read-back): the module validated boundary
+            # alignment; here the physical prerequisites. Local ranges feed
+            # get_layer_range_page_buffer_meta in page-major/range-minor
+            # order matching the suffix list.
+            if self.storage_backend_type != "mooncake":
+                raise NotImplementedError(
+                    "canonical-grid layer fan-out needs a multi-key-per-page "
+                    "backend; only mooncake supports it."
+                )
+            if self.mem_pool_host.layout != "page_first_direct":
+                raise ValueError(
+                    "canonical-grid layer fan-out requires "
+                    "--hicache-mem-layout page_first_direct (layer-major "
+                    "page blocks give one contiguous slab per cell)."
+                )
+            boundaries = [b for b in layer_partition if start_layer <= b <= end_layer]
+            canonical_layer_ranges = [
+                (a - start_layer, b - start_layer)
+                for a, b in zip(boundaries, boundaries[1:])
+            ]
+            assert len(canonical_layer_ranges) == len(suffixes)
+
         logger.info(
             "HiCache canonical-grid L3 keys: namespace=%s cells=%s",
             namespace_digest(namespace),
             suffixes,
         )
-        return suffixes[0] if len(suffixes) == 1 else suffixes
+        suffix = suffixes[0] if len(suffixes) == 1 else suffixes
+        return suffix, canonical_layer_ranges
 
     def reset(self):
         self.storage_stop_event.set()

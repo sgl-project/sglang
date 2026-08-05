@@ -596,14 +596,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and storage_config.canonical_suffix is not None
             ):
                 # canonical-grid key scheme: topology-free cell coordinates
-                # replace the rank/pp suffixes for both pool families. Under
-                # head fan-out this is a list of owned-cell suffixes, in the
-                # same ascending-head order as the split-heads virtual-rank
-                # list it replaces (the buffer-meta fan-out relies on that
-                # order). CP and side pools are rejected upstream at attach.
+                # replace the rank/pp suffixes for both pool families. A list
+                # means fan-out — for MHA a list of head-group cells (same
+                # ascending-head order as the split-heads virtual-rank list
+                # it replaces), for rank-replicated pools a list of
+                # layer-range cells (page-major/range-minor order shared with
+                # get_layer_range_page_buffer_meta). CP and side pools are
+                # rejected upstream at attach.
                 self.mha_suffix = storage_config.canonical_suffix
-                if isinstance(storage_config.canonical_suffix, str):
-                    self.mla_suffix = storage_config.canonical_suffix
+                self.mla_suffix = storage_config.canonical_suffix
 
             self.registered_pools = {}
 
@@ -987,6 +988,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return key_list, ptr_list, element_size_list
 
+    def _get_mla_layer_ranges_buffer_meta(self, keys, indices):
+        # Canonical-grid layer fan-out (PP read-back): one key and one
+        # contiguous slab per (page, canonical layer range); both sides are
+        # page-major, range-minor.
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_layer_range_page_buffer_meta(
+                indices, self.storage_config.canonical_layer_ranges
+            )
+        )
+        key_list = []
+        for key_ in keys:
+            for suffix in self.mla_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
@@ -1002,6 +1019,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
+            if isinstance(self.mla_suffix, list):
+                return self._get_mla_layer_ranges_buffer_meta(keys, host_indices)
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
             if self.should_split_heads:
@@ -1021,7 +1040,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = (
+                    len(self.mla_suffix) if isinstance(self.mla_suffix, list) else 1
+                )
             else:
                 key_multiplier = 2
                 if self.should_split_heads:
@@ -1257,8 +1278,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            if isinstance(self.mla_suffix, list):
+                query_keys = [
+                    f"{key}_{suffix}_k" for key in keys for suffix in self.mla_suffix
+                ]
+                key_multiplier = len(self.mla_suffix)
+            else:
+                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+                key_multiplier = 1
         else:
             query_keys = []
             if self.should_split_heads:

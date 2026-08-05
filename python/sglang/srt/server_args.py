@@ -7221,9 +7221,12 @@ class ServerArgs:
         extra = self.hicache_storage_backend_extra_config
         if extra and not extra.startswith("@"):
             try:
-                tp_lcm_size = json.loads(extra).get("tp_lcm_size")
+                extra_dict = json.loads(extra)
+                tp_lcm_size = extra_dict.get("tp_lcm_size")
+                layer_partition = extra_dict.get("layer_partition")
             except (ValueError, AttributeError):
                 tp_lcm_size = None
+                layer_partition = None
             if tp_lcm_size and tp_lcm_size > self.tp_size:
                 if self.hicache_storage_backend != "mooncake":
                     raise NotImplementedError(
@@ -7236,6 +7239,27 @@ class ServerArgs:
                         "canonical-grid head fan-out requires "
                         "--hicache-mem-layout page_head (per-head-group "
                         "contiguous buffer metas)."
+                    )
+            if layer_partition is not None:
+                # Layer fan-out (PP read-back) prerequisites. layer_partition
+                # only matters when a stage spans >1 canonical range, which
+                # depends on the PP split — but the backend/layout
+                # requirements are static, so check them here.
+                if self.hicache_storage_backend != "mooncake":
+                    raise NotImplementedError(
+                        "canonical-grid layer_partition needs a "
+                        "multi-key-per-page backend; only mooncake supports "
+                        "it."
+                    )
+                # The page_first_direct layout requirement only binds when a
+                # stage actually spans >1 canonical range, which depends on
+                # the PP split — validated at attach.
+                if tp_lcm_size and tp_lcm_size > self.tp_size:
+                    raise NotImplementedError(
+                        "canonical-grid layer fan-out and head fan-out "
+                        "cannot combine yet (they require different host "
+                        "layouts); set either layer_partition or "
+                        "tp_lcm_size, not both."
                     )
 
     def _resolve_hicache_dcp_compatibility(self):

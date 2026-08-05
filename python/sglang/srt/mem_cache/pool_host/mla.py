@@ -569,6 +569,44 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+    def get_layer_range_page_buffer_meta(self, indices, layer_ranges):
+        """Zero-copy metas for canonical-grid layer fan-out cells.
+
+        ``layer_ranges`` are half-open (start, end) ranges in LOCAL layer
+        indices (global canonical boundaries minus this pool's start_layer).
+        Under ``page_first_direct`` the page block is layer-major
+        ``(page, layer, page_size, 1, dim)``, so each (page, layer-range)
+        cell is one contiguous slab — one pointer per cell, in page-major,
+        range-minor order (must match the storage key fan-out order).
+        """
+        if self.layout != "page_first_direct":
+            raise ValueError(
+                "layer-range cells require the page_first_direct layout "
+                f"(layer-major page blocks); got {self.layout!r}."
+            )
+        assert len(indices) % self.page_size == 0
+        for start, end in layer_ranges:
+            if not 0 <= start < end <= self.layer_num:
+                raise ValueError(
+                    f"local layer range ({start}, {end}) outside this pool's "
+                    f"{self.layer_num} layers."
+                )
+        base_ptr = self.kv_buffer.data_ptr()
+        itemsize = self.dtype.itemsize
+        layer_stride = self.page_size * self.kv_cache_dim * itemsize
+        page_stride = self.layer_num * layer_stride
+        ptr_list = []
+        element_size_list = []
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.page_size):
+            real_index = indices[index] // self.page_size
+            for start, end in layer_ranges:
+                ptr_list.append(
+                    base_ptr + real_index * page_stride + start * layer_stride
+                )
+                element_size_list.append((end - start) * layer_stride)
+        return ptr_list, element_size_list
+
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.
 

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from typing import Optional
 
 import msgspec
 
@@ -98,6 +99,13 @@ class KVCacheNamespace(
     # Optional kernel/build ABI digest; deployments whose numerics must not
     # mix set distinct values and thereby get distinct namespaces.
     numerics_id: str = ""
+    # Canonical layer partition (the fleet agreement for PP read-back):
+    # strictly increasing boundaries starting at 0 and ending at the model's
+    # layer count, e.g. [0, 30, 61]. Every deployment's stage must start and
+    # end on boundaries; a stage spanning several ranges owns one cell per
+    # range (layer fan-out). Empty = per-stage ranges (same-partition
+    # deployments share; differing partitions miss).
+    layer_boundaries: list[int] = []
 
 
 def namespace_digest(namespace: KVCacheNamespace) -> str:
@@ -139,16 +147,19 @@ def derive_namespace(
     rank_replicated: bool,
     total_kv_heads: int,
     head_group: int,
+    layer_boundaries: Optional[list[int]] = None,
 ) -> KVCacheNamespace:
-    """Derive the namespace from deployment facts plus the fleet head grid.
+    """Derive the namespace from deployment facts plus the fleet agreements.
 
-    ``head_group`` is the fleet agreement: deployments that pass the same
+    ``head_group`` is the head-grid agreement: deployments that pass the same
     ``tp_lcm_size`` derive ``head_group = total_kv_heads / tp_lcm_size`` and
     land in one keyspace; without it, ``head_group`` = the rank's local head
-    count and only same-TP deployments share. Layer cells are per-stage
-    ranges, so the derived namespace is PP-partition-independent. All other
-    mismatches (model, logical dtype, page size) partition into disjoint
-    keyspaces — safe, never a geometry collision.
+    count and only same-TP deployments share. ``layer_boundaries`` is the
+    layer-partition agreement (``layer_partition`` in the extra config) that
+    enables PP read-back across different pipeline splits; without it, layer
+    cells are per-stage ranges and only same-partition deployments share.
+    All other mismatches (model, logical dtype, page size) partition into
+    disjoint keyspaces — safe, never a geometry collision.
     """
     namespace = KVCacheNamespace(
         model_id=model_id,
@@ -157,6 +168,7 @@ def derive_namespace(
         rank_replicated=rank_replicated,
         total_kv_heads=0 if rank_replicated else total_kv_heads,
         head_group=0 if rank_replicated else head_group,
+        layer_boundaries=list(layer_boundaries) if layer_boundaries else [],
     )
     _validate_grid(namespace)
     return namespace
@@ -169,6 +181,17 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
             f"multi-cell fan-out are not implemented; v1 uses per-stage layer "
             f"ranges (layer_group=0)."
         )
+    boundaries = namespace.layer_boundaries
+    if boundaries:
+        if len(boundaries) < 2 or boundaries[0] != 0:
+            raise ValueError(
+                f"layer_boundaries must start at 0 and contain at least one "
+                f"range: {boundaries}"
+            )
+        if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
+            raise ValueError(
+                f"layer_boundaries must be strictly increasing: {boundaries}"
+            )
     if namespace.page_size <= 0:
         raise ValueError(f"page_size must be positive: {namespace}")
     if not namespace.model_id:
@@ -240,14 +263,41 @@ def build_canonical_cell_suffixes(
 
     if not 0 <= start_layer < end_layer:
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
-    # Absolute per-stage range: any PP partition (uneven stages included)
-    # yields valid, collision-free names; differing partitions miss instead
-    # of colliding.
-    layer_coord = f"L{start_layer}-{end_layer}"
+    # Layer coordinates are absolute ranges: any PP partition (uneven stages
+    # included) yields valid, collision-free names; differing partitions miss
+    # instead of colliding. With a canonical layer partition, the stage must
+    # align to boundaries and owns one cell per contained range (layer
+    # fan-out — this is what lets a reader consume cells written under a
+    # different pipeline split).
+    if namespace.layer_boundaries:
+        boundaries = namespace.layer_boundaries
+        if start_layer not in boundaries or end_layer not in boundaries:
+            raise ValueError(
+                f"this rank's layer range [{start_layer}, {end_layer}) does "
+                f"not start and end on canonical layer boundaries "
+                f"{boundaries}; every deployment sharing this namespace must "
+                f"partition layers on these boundaries."
+            )
+        first = boundaries.index(start_layer)
+        last = boundaries.index(end_layer)
+        layer_coords = [
+            f"L{boundaries[i]}-{boundaries[i + 1]}" for i in range(first, last)
+        ]
+    else:
+        layer_coords = [f"L{start_layer}-{end_layer}"]
 
     digest = namespace_digest(namespace)
     if namespace.rank_replicated:
-        return [f"{digest}_{layer_coord}"]
+        return [f"{digest}_{coord}" for coord in layer_coords]
+
+    if len(layer_coords) > 1:
+        raise NotImplementedError(
+            "layer fan-out is only supported for rank-replicated (MLA-family)"
+            " pools in this PR: an MHA layer-range cell is not contiguous "
+            "under the layouts the head axis requires. Partition this "
+            "deployment's stages on the canonical boundaries, or drop "
+            "layer_partition."
+        )
 
     if namespace.total_kv_heads != local_kv_heads * attn_tp_size:
         raise ValueError(
@@ -266,7 +316,8 @@ def build_canonical_cell_suffixes(
     cells_per_rank = local_kv_heads // namespace.head_group
     first_head_index = attn_tp_rank * cells_per_rank
     return [
-        f"{digest}_{layer_coord}_H{first_head_index + i}" for i in range(cells_per_rank)
+        f"{digest}_{layer_coords[0]}_H{first_head_index + i}"
+        for i in range(cells_per_rank)
     ]
 
 

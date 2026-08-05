@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -47,6 +47,12 @@ class HiCacheStorageConfig:
     # in HiCacheController._generate_storage_config via hicache_key_scheme.py;
     # None under the legacy rank-suffix scheme.
     canonical_suffix: Optional[Union[str, List[str]]] = None
+    # Layer fan-out (PP read-back): the LOCAL half-open layer ranges of this
+    # rank's cells, one per canonical range the stage spans, in the same
+    # order as the canonical_suffix list. Set only when the stage spans more
+    # than one canonical range (rank-replicated pools on mooncake with the
+    # page_first_direct layout); None otherwise.
+    canonical_layer_ranges: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
