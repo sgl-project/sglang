@@ -894,15 +894,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         state.phase = _InsertPhase.TAIL
 
-    def _needs_incremental_mamba_backup(self, node: UnifiedTreeNode) -> bool:
-        """Whether a Host-backed node has a device Mamba state missing from Host."""
-        return (
-            self.enable_hicache
-            and not self.is_write_back
-            and node.backuped
-            and node.write_through_pending_id is None
-            and node.component_data[ComponentType.MAMBA].value is not None
-            and node.component_data[ComponentType.MAMBA].host_value is None
+    def _needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether a Host-backed node has auxiliary data missing from Host."""
+        if (
+            not self.enable_hicache
+            or self.is_write_back
+            or not node.backuped
+            or node.write_through_pending_id is not None
+        ):
+            return False
+
+        return any(
+            component.needs_incremental_backup(node)
+            for component in self.components
+            if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
@@ -912,7 +917,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.target_node, state.params.chunked
             )
 
-        return self._needs_incremental_mamba_backup(state.target_node)
+        return self._needs_incremental_backup(state.target_node)
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
         """Refresh the LRUs and append terminal backup actions."""

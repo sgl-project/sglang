@@ -70,6 +70,10 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,

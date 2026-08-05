@@ -75,6 +75,9 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        return False
+
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             full_indices
