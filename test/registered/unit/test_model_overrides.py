@@ -1665,6 +1665,52 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
             )
         )
+        # Kimi K3's CAKE decode uses the common post-kernel tracking hook;
+        # tracked CAKE prefill falls back to Triton to materialize snapshots.
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(
+                    linear_attn_backend="cake",
+                    linear_attn_decode_backend=None,
+                    linear_attn_prefill_backend=None,
+                ),
+                "KimiK3ForConditionalGeneration",
+            )
+        )
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(
+                    linear_attn_backend="triton",
+                    linear_attn_decode_backend="cake",
+                    linear_attn_prefill_backend="triton",
+                ),
+                "KimiK3ForConditionalGeneration",
+            )
+        )
+        self.assertFalse(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(
+                    linear_attn_backend="cake",
+                    linear_attn_decode_backend="cake",
+                    linear_attn_prefill_backend="cutedsl",
+                ),
+                "KimiK3ForConditionalGeneration",
+            )
+        )
+        cake_k3 = _mamba_radix_cache_resolution(
+            _view(
+                "KimiK3ForConditionalGeneration",
+                linear_attn_backend="cake",
+                page_size=512,
+            )
+        )
+        self.assertEqual(
+            cake_k3,
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
