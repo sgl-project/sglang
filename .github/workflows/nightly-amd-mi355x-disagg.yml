@@ -120,7 +120,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix: ${{ fromJson(needs.setup.outputs.matrix-2n) }}
-    env:
+    env: &mi355x-env
       FRAMEWORK: sglang
       HW: mi355x
       MODEL: ${{ matrix.config.model }}
@@ -139,7 +139,7 @@ jobs:
       # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
       MODEL_PATH: ${{ matrix.config.model_path }}
 
-    steps:
+    steps: &mi355x-steps
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -263,135 +263,8 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix: ${{ fromJson(needs.setup.outputs.matrix-4n) }}
-    env:
-      FRAMEWORK: sglang
-      HW: mi355x
-      MODEL: ${{ matrix.config.model }}
-      MODEL_PREFIX: ${{ matrix.config.model_prefix }}
-      PRECISION: ${{ matrix.config.precision }}
-      ISL: ${{ matrix.config.isl }}
-      OSL: ${{ matrix.config.osl }}
-      CONFIG_FILE: ${{ matrix.config.config_file }}
-      RESULT_FILENAME: mi355x-${{ matrix.config.name }}
-      MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
-      # NOTE: RUNNER_NAME is a built-in default env var on every runner, so the
-      # launch + cleanup steps read it directly. Do NOT set it here from
-      # ${{ runner.name }} -- the `runner` context is not available in job-level
-      # env and makes the whole workflow file invalid.
-      # Shared-NFS HuggingFace cache dir; the launcher resolves the live snapshot
-      # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
-      MODEL_PATH: ${{ matrix.config.model_path }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Clean up prior Slurm jobs from this runner
-        continue-on-error: true
-        run: |
-          # launch_mi355x.sh names the allocation
-          #   mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>
-          # Here we clear THIS runner's leftovers from a crashed previous run, so
-          # we match the RUNNER_NAME prefix (older runs have a different run id).
-          # Never a blanket `squeue --me`, which would kill a concurrent leg.
-          # %200j: squeue truncates the job name (%j) by default -- widen it so
-          # the grep sees the full name.
-          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
-          STALE_JOBS=$(squeue --me --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
-          if [ -n "$STALE_JOBS" ]; then
-            echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
-            scancel $STALE_JOBS
-          fi
-
-      - name: Launch MI355X benchmark
-        timeout-minutes: 180
-        env:
-          # Manual dispatch input wins; otherwise use the latest image resolved
-          # by the setup job; otherwise the launcher falls back to the recipe default.
-          IMAGE_OVERRIDE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
-        run: bash scripts/ci/slurm/launch_mi355x.sh
-
-      - name: Pack logs
-        if: always()
-        run: |
-          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
-          LOG_BUNDLE="${GITHUB_WORKSPACE}/${RESULT_FILENAME}_logs.tar.gz"
-          if [ ! -d "$LOG_DIR" ]; then
-            echo "WARN: log directory not found: $LOG_DIR"
-            exit 0
-          fi
-
-          mapfile -d '' LOG_FILES < <(
-            find "$LOG_DIR" -maxdepth 1 -type f \
-              \( -name '*.log' -o -name 'server_exit_*' -o -name 'bench_exit' \) \
-              -printf '%P\0' | sort -z
-          )
-          if [ "${#LOG_FILES[@]}" -eq 0 ]; then
-            echo "WARN: no log files found in $LOG_DIR"
-            exit 0
-          fi
-
-          STAGING_DIR="$(mktemp -d)"
-          trap 'rm -rf "$STAGING_DIR"' EXIT
-          for log_file in "${LOG_FILES[@]}"; do
-            cp -a "$LOG_DIR/$log_file" "$STAGING_DIR/$log_file" || true
-          done
-          tar czf "$LOG_BUNDLE" -C "$STAGING_DIR" .
-          echo "Packed ${#LOG_FILES[@]} log file(s) -> $LOG_BUNDLE"
-
-      - name: Process results
-        if: always()
-        run: |
-          pip install tabulate pyyaml -q
-          for result_file in ${{ github.workspace }}/${RESULT_FILENAME}_*.json; do
-            [ -f "$result_file" ] || continue
-            basename_file=$(basename "$result_file")
-            ctx=$(echo "$basename_file" | sed -n 's/.*_ctx_\([0-9]*\)_gen.*/\1/p')
-            gen=$(echo "$basename_file" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')
-            [ -n "$ctx" ] && [ -n "$gen" ] || continue
-            RESULT_FILENAME="${result_file%.json}" PREFILL_GPUS="$ctx" DECODE_GPUS="$gen" \
-              RECIPE_FILE="${{ github.workspace }}/$CONFIG_FILE" \
-              python3 scripts/ci/slurm/process_result.py
-          done
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mi355x-${{ matrix.config.name }}-${{ github.run_id }}
-          path: |
-            ${{ github.workspace }}/*.json
-            ${{ github.workspace }}/*_logs.tar.gz
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Clean up Slurm jobs on failure/cancel
-        if: failure() || cancelled()
-        continue-on-error: true
-        run: |
-          # Cancel only THIS leg's allocation -- match the full job name
-          # mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>. GITHUB_RUN_ID +
-          # config are unique per matrix leg, so a concurrent leg is never hit.
-          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
-          JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-${MATRIX_CONFIG_NAME}"
-          ACTIVE_JOBS=$(squeue --me --noheader --format="%i %200j" | grep -F "$JOB_TAG" | awk '{print $1}' || true)
-          if [ -n "$ACTIVE_JOBS" ]; then
-            echo "Cancelling jobs for ${JOB_TAG}: $ACTIVE_JOBS"
-            scancel $ACTIVE_JOBS
-          fi
-
-      - name: Clean up MI355X scratch
-        if: always()
-        continue-on-error: true
-        run: |
-          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
-          if [ -d "$LOG_DIR" ]; then
-            echo "Removing MI355X scratch directory: $LOG_DIR"
-            rm -rf "$LOG_DIR"
-          fi
+    env: *mi355x-env
+    steps: *mi355x-steps
 
   collect-results:
     needs:
