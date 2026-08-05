@@ -39,11 +39,15 @@ impl PolicyFactory {
                 balance_abs_threshold,
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
+                prefill_short_count,
+                prefill_length_threshold,
             } => {
                 let config = BucketConfig {
                     balance_abs_threshold: *balance_abs_threshold,
                     balance_rel_threshold: *balance_rel_threshold,
                     bucket_adjust_interval_secs: *bucket_adjust_interval_secs,
+                    short_count: *prefill_short_count,
+                    length_threshold: *prefill_length_threshold,
                 };
                 Arc::new(BucketPolicy::with_config(config))
             }
@@ -121,6 +125,8 @@ mod tests {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             bucket_adjust_interval_secs: 5,
+            prefill_short_count: 0,
+            prefill_length_threshold: 4096,
         });
         assert_eq!(policy.name(), "bucket");
 

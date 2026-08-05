@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+    },
     thread,
     time::{Duration, SystemTime},
 };
@@ -20,6 +23,10 @@ use crate::core::Worker;
 #[derive(Debug)]
 pub struct BucketPolicy {
     config: BucketConfig,
+    /// Per-model round-robin counter for short group (only used when short_count > 0)
+    short_rr: Arc<DashMap<String, AtomicUsize>>,
+    /// Per-model round-robin counter for long group
+    long_rr: Arc<DashMap<String, AtomicUsize>>,
     buckets: Arc<DashMap<String, Arc<RwLock<Bucket>>>>,
     adjustment_handle: Option<thread::JoinHandle<()>>,
 }
@@ -46,14 +53,12 @@ impl BucketPolicy {
     pub fn with_config(config: BucketConfig) -> Self {
         let buckets = Arc::new(DashMap::<String, Arc<RwLock<Bucket>>>::new());
 
-        let adjustment_handle = {
+        // Only spawn adjustment thread when NOT in grouped_threshold mode
+        let adjustment_handle = if config.short_count == 0 {
             let buckets_clone = Arc::clone(&buckets);
-
             let interval_secs = config.bucket_adjust_interval_secs;
-
             Some(thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(interval_secs as u64));
-
                 for bucket_ref in buckets_clone.iter() {
                     let model_id = bucket_ref.key();
                     let bucket = bucket_ref.value();
@@ -70,10 +75,14 @@ impl BucketPolicy {
                     }
                 }
             }))
+        } else {
+            None
         };
 
         Self {
             config,
+            short_rr: Arc::new(DashMap::new()),
+            long_rr: Arc::new(DashMap::new()),
             buckets,
             adjustment_handle,
         }
@@ -91,6 +100,35 @@ impl BucketPolicy {
         }
         // Initialize bucket for each model
         for (model_key, model_workers) in model_workers {
+            // In grouped_threshold mode, skip dynamic boundary init — routing uses worker position
+            if self.config.short_count > 0 {
+                let bucket = self
+                    .buckets
+                    .entry(model_key)
+                    .or_insert_with(|| {
+                        Arc::new(RwLock::new(Bucket::new(
+                            self.config.bucket_adjust_interval_secs * 1000,
+                        )))
+                    })
+                    .clone();
+                let worker_urls: Vec<String> = model_workers
+                    .iter()
+                    .map(|worker| worker.url().to_string())
+                    .collect();
+                let cnt = worker_urls.len();
+                let urls = worker_urls.clone();
+
+                let lock_result = bucket.write();
+                if let Ok(mut bucket_guard) = lock_result {
+                    bucket_guard.prefill_worker_urls = Arc::new(Mutex::new(urls));
+                    bucket_guard.bucket_cnt = cnt;
+                    bucket_guard.chars_per_url = Arc::new(Mutex::new(
+                        worker_urls.iter().map(|u| (u.clone(), 0)).collect(),
+                    ));
+                }
+                continue;
+            }
+
             let bucket = self
                 .buckets
                 .entry(model_key)
@@ -223,9 +261,77 @@ impl LoadBalancingPolicy for BucketPolicy {
         };
 
         // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
         let model_key = normalize_model_key(workers[healthy_indices[0]].model_id());
 
+        // === Grouped threshold mode (short_count > 0): fixed two-group routing with round-robin ===
+        if self.config.short_count > 0 {
+            let short_count = self.config.short_count.min(workers.len());
+            let is_short = char_count < self.config.length_threshold;
+
+            // Sort by URL so group assignment is deterministic regardless of registration order.
+            // Workers with lower URLs (e.g. http://127.0.0.1:30001) always come first.
+            let mut sorted: Vec<(usize, &str)> = healthy_indices
+                .iter()
+                .map(|&i| (i, workers[i].url()))
+                .collect();
+            sorted.sort_by_key(|(_, url)| *url);
+
+            let group_indices: Vec<usize> = if is_short {
+                // Short group: first short_count workers by URL order
+                sorted
+                    .iter()
+                    .take(short_count)
+                    .map(|(i, _)| *i)
+                    .collect()
+            } else {
+                // Long group: workers from short_count onward by URL order
+                sorted
+                    .iter()
+                    .skip(short_count)
+                    .map(|(i, _)| *i)
+                    .collect()
+            };
+
+            let group_indices = if group_indices.is_empty() {
+                warn!(
+                    "No healthy {} workers for model {}, falling back to all workers",
+                    if is_short { "short-group" } else { "long-group" },
+                    model_key
+                );
+                healthy_indices.clone()
+            } else {
+                group_indices
+            };
+
+            let counter = if is_short {
+                self.short_rr
+                    .entry(model_key.to_string())
+                    .or_insert_with(|| AtomicUsize::new(0))
+            } else {
+                self.long_rr
+                    .entry(model_key.to_string())
+                    .or_insert_with(|| AtomicUsize::new(0))
+            };
+            let idx_in_group =
+                counter.fetch_add(1, Ordering::Relaxed) % group_indices.len();
+            let selected = group_indices[idx_in_group];
+
+            let prefill_url = workers[selected].url().to_string();
+
+            // Track load for observability
+            let bucket = self
+                .buckets
+                .get(model_key)
+                .map(|entry| entry.value().clone());
+            if let Some(bucket) = bucket {
+                let mut buc = bucket.write().unwrap();
+                buc.post_process_request(char_count, prefill_url.clone());
+            }
+
+            return workers.iter().position(|w| w.url() == prefill_url);
+        }
+
+        // === Original bucket mode: dynamic boundary-based routing ===
         let bucket = self
             .buckets
             .get(model_key)
@@ -393,14 +499,13 @@ impl Bucket {
             Vec::new()
         } else {
             let gap = self.l_max / worker_cnt;
-            self.l_max = usize::MAX;
             prefill_worker_urls
                 .iter()
                 .enumerate()
                 .map(|(i, url)| {
                     let min = i * gap;
                     let max = if i == worker_cnt - 1 {
-                        self.l_max
+                        usize::MAX
                     } else {
                         (i + 1) * gap - 1
                     };
