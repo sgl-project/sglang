@@ -145,7 +145,7 @@ export const Llama31Deployment = () => {
     const { hardware, optimization, modelsize, category, toolcall, quantization } = values;
 
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    const isArcB = hardware === 'Arc B';
+
     const isXeon = hardware === 'xeon';
     const effectiveModelSize = isXeon ? '8b' : modelsize;
 
@@ -160,7 +160,7 @@ export const Llama31Deployment = () => {
 
     // Determine model path
     let modelPath;
-    if (quantization === 'fp8' && category === 'instruct' && !isXeon && !isArcB) {
+    if (quantization === 'fp8' && category === 'instruct' && !isXeon && hardware !== 'Arc B') {
       if (effectiveModelSize === '405b') {
         // Meta official FP8 for 405B
         modelPath = `meta-llama/Llama-3.1-${sizeToken}${categorySuffix}-FP8`;
@@ -201,7 +201,7 @@ export const Llama31Deployment = () => {
     } else if (isXeon) {
       // Intel Xeon CPU TP configuration
       tpSize = 3;
-    } else if (isArcB) {
+    } else if (hardware === 'Arc B') {
       tpSize = 1;
     } else {
       // NVIDIA GPU TP configuration
@@ -219,7 +219,7 @@ export const Llama31Deployment = () => {
     if (isXeon) {
       args.push(`--device cpu`);
       args.push(`--disable-overlap-schedule`);
-    } else if (isArcB) {
+    } else if (hardware === 'Arc B') {
       args.push(`--device xpu`);
     }
 
@@ -228,12 +228,12 @@ export const Llama31Deployment = () => {
     }
 
     // Add quantization flag only if not using FP8 variant model
-    if (quantization === 'fp8' && (isArcB || (category !== 'instruct' && !isXeon))) {
+    if (quantization === 'fp8' && (hardware === 'Arc B' || (category !== 'instruct' && !isXeon))) {
       args.push(`--quantization fp8`);
     }
 
     // NVIDIA-specific optimizations
-    if (!isAMD && !isXeon && !isArcB) {
+    if (!isAMD && !isXeon && hardware !== 'Arc B') {
       if (optimization === 'throughput') {
         args.push(`--enable-dp-attention`);
         args.push(`--mem-fraction-static 0.85`);
@@ -260,6 +260,9 @@ export const Llama31Deployment = () => {
     }
 
     let cmd = 'sglang serve \\\n';
+    if (hardware === 'Arc B') {
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd; 
+    }
     cmd += `  ${args.join(' \\\n  ')}`;
 
     return cmd;

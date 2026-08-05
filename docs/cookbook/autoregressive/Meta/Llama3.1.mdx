@@ -54,6 +54,10 @@ import { Llama31Deployment } from "/src/snippets/autoregressive/llama31-deployme
   - 70B/8B: Use AMD's optimized `amd/Llama-3.1-{size}-Instruct-FP8-KV`
 - **Tool Calling**: Enable with `--tool-call-parser llama3` for Instruct models
 
+**Xeon CPU Deployment:**
+
+- Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
