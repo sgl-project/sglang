@@ -10,7 +10,6 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
-    SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
@@ -18,11 +17,17 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=540, stage="base-b", runner_config="1-gpu-large")
 
 
-class TestEagle3Fa3(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogprobKit):
-    """EAGLE3 topk=1 on fa3 (the H200 default backend), overlap on."""
+class TestEagle3Fa3(Eagle3Base, SpecAccuracyKit, SpecLogprobKit):
+    """EAGLE3 topk=1 on fa3 (the H200 default backend), overlap on.
+
+    The accept-length / eos / batch-generation / first-token-finish checks are
+    scheduler and sampling behaviours, so the flashinfer and triton runs on the
+    5090 pool cover them. Logprob losslessness stays: it reads through the
+    verify output, which the attention unit cases do not reach.
+    """
 
     attention_backend = "fa3"
     disable_overlap = False
