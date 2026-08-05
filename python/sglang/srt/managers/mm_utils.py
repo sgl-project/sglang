@@ -33,7 +33,13 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+    get_serving,
+)
 from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
@@ -474,9 +480,32 @@ def _get_precomputed_embedding(
     return None
 
 
+# A modality's embedding function. May return the combined [tokens, hidden]
+# tensor, an EVSEmbeddingResult, or one tensor per input item. The per-item
+# form lets encoders that naturally produce per-item outputs (e.g. a wav
+# AutoEncoder looping over clips) skip an encoder-side torch.cat that
+# per-item consumers (_get_chunked_embedding_by_item) would immediately
+# split back apart — and each cached entry then owns its storage instead of
+# being a view pinning the concatenated buffer.
 DataEmbeddingFunc = Callable[
-    [List[MultimodalDataItem]], torch.Tensor | EVSEmbeddingResult
+    [List[MultimodalDataItem]],
+    torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult,
 ]
+
+
+def _flatten_embedding_result(
+    embedding: torch.Tensor | List[torch.Tensor],
+) -> torch.Tensor:
+    """Normalize a DataEmbeddingFunc result to one [tokens, hidden] tensor."""
+    if isinstance(embedding, list):
+        if not embedding:
+            raise ValueError(
+                "DataEmbeddingFunc returned an empty per-item list; expected "
+                "one entry per input item"
+            )
+        flat = [e.reshape(-1, e.shape[-1]) for e in embedding]
+        return flat[0] if len(flat) == 1 else torch.cat(flat, dim=0)
+    return embedding
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
@@ -524,10 +553,9 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
-    server_args = get_server_args()
-    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+    # The pool's recycler counts the whole TP group, so the acknowledgement must
     # match that count even when an attention subgroup is smaller.
-    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+    consumer_count = max(parallel.tp_size, 1)
     for item in items:
         item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
@@ -553,6 +581,10 @@ def _get_chunked_embedding_full(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
+        if isinstance(embedding, list):
+            # This path caches the combined per-request embedding, so the
+            # per-item form is flattened here.
+            embedding = _flatten_embedding_result(embedding)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
             if isinstance(embedding, torch.Tensor)
@@ -644,11 +676,24 @@ def _batch_encode_per_image_misses(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
         all_miss_embedding = data_embedding_func(miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
 
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached). Mirrors
+            # _get_chunked_embedding_by_item.
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for h, emb in zip(ordered_hashes, split_embeddings):
             embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
@@ -700,12 +745,25 @@ def _get_chunked_embedding_by_item(
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
 
-        token_counts = [end - start + 1 for _, _, start, end in miss_items]
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+        if isinstance(all_miss_embedding, list):
+            # Per-item embeddings: no split needed, and each cache entry owns
+            # its storage (a torch.split view would pin the whole concatenated
+            # buffer for as long as any single item stays cached).
+            assert len(all_miss_embedding) == len(miss_items), (
+                f"per-item embedding count {len(all_miss_embedding)} != "
+                f"cache-miss item count {len(miss_items)}"
+            )
+            split_embeddings = [
+                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+            ]
+        else:
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            # Split output by per-item token count
+            token_counts = [end - start + 1 for _, _, start, end in miss_items]
+            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
@@ -878,7 +936,7 @@ def _adjust_embedding_length(
             f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_server_args().chunked_prefill_size
+            chunked_prefill_size = get_schedule().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
@@ -1242,7 +1300,7 @@ def general_mm_embed_routine(
             # encoder/ViT execution and multimodal feature placement, while
             # the language model range below excludes both.
             with torch.profiler.record_function("sglang.vlm.mm_embedding"):
-                if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
                     # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                     input_embeds, other_info = _embed_mm_inputs_with_split(
                         mm_inputs_list=mm_inputs_list,
@@ -1287,7 +1345,7 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_server_args().language_only:
+                            if get_disagg().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )
@@ -1967,7 +2025,7 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
 
     if obj.mm_inputs:
@@ -2028,7 +2086,7 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):

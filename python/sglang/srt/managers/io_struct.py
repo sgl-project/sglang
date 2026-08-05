@@ -38,6 +38,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     Union,
 )
@@ -52,7 +53,11 @@ from pydantic import PlainValidator
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    ReturnHiddenStatesMode,
+    get_return_hidden_states_mode,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -153,8 +158,9 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class GenerateReqInput:
-    # Request ID(s). If omitted, generated during normalization. For batch
-    # requests, a string is expanded to per-item IDs using it as a prefix.
+    # Logical request ID(s). If omitted, generated during normalization. For
+    # batch requests, a string is expanded to one ID per original batch item.
+    # Parallel-sampling child IDs are internal to TokenizerManager.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
@@ -208,12 +214,19 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Return prompt top logprobs as flat arrays plus shape metadata instead of
+    # the nested per-position [logprob, token_id, text] lists.
+    return_flat_raw_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
-    return_hidden_states: Union[List[bool], bool] = False
+    return_hidden_states: Union[
+        List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
+    ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -264,6 +277,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
+    # Per-request thinking budget. Requires strict thinking so the runtime can
+    # enforce the limit rather than silently treating it as metadata.
+    max_thinking_tokens: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -307,12 +323,17 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    def regenerate_rid(self):
+    def regenerate_rid(self, prefix: Optional[str] = None):
         """Generate a new request ID and return it."""
+
+        def new_rid() -> str:
+            suffix = uuid.uuid4().hex
+            return f"{prefix}_{suffix}" if prefix is not None else suffix
+
         if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+            self.rid = [new_rid() for _ in range(len(self.rid))]
         else:
-            self.rid = uuid.uuid4().hex
+            self.rid = new_rid()
         return self.rid
 
     def _validate_rid_uniqueness(self):
@@ -368,6 +389,22 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
+            )
+        if (
+            self.return_flat_raw_top_logprobs
+            and self.multi_item_delimiter_indices is not None
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs does not support multi-item "
+                "scoring: delimiter-sparse top logprob rows have no contiguous "
+                "position mapping."
+            )
+        if (
+            self.return_flat_raw_top_logprobs_b64
+            and not self.return_flat_raw_top_logprobs
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -452,13 +489,14 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid(num)
+        self._normalize_rid()
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
+        self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
@@ -561,16 +599,16 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self, num):
-        """Normalize request IDs for batch processing."""
+    def _normalize_rid(self):
+        """Normalize one logical request ID per original batch item."""
         if self.rid is None:
-            self.rid = [uuid.uuid4().hex for _ in range(num)]
+            self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
+            if self.batch_size == 1:
+                self.rid = [self.rid]
+            else:
+                self.rid = [f"{self.rid}_{i}" for i in range(self.batch_size)]
         elif isinstance(self.rid, list):
-            # Note: the length of rid shall be the same as the batch_size,
-            # as the rid would be expanded for parallel sampling in tokenizer_manager
             if len(self.rid) != self.batch_size:
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
@@ -621,6 +659,22 @@ class GenerateReqInput:
             raise ValueError(
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
+
+    def _normalize_return_hidden_states(self, num):
+        """Normalize and validate per-request hidden-state return modes."""
+        if isinstance(self.return_hidden_states, list):
+            if len(self.return_hidden_states) != self.batch_size:
+                raise ValueError(
+                    "The length of return_hidden_states should be equal to the batch size."
+                )
+            for mode in self.return_hidden_states:
+                get_return_hidden_states_mode(mode)
+            self.return_hidden_states = (
+                self.return_hidden_states * self.parallel_sample_num
+            )
+        else:
+            get_return_hidden_states_mode(self.return_hidden_states)
+            self.return_hidden_states = [self.return_hidden_states] * num
 
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
@@ -706,8 +760,9 @@ class GenerateReqInput:
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
         if i in cache:
             return cache[i]
+        logical_index = i % self.batch_size
         sub = GenerateReqInput(
-            rid=self.rid[i],
+            rid=self.rid[logical_index],
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -724,6 +779,8 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -766,6 +823,8 @@ class GenerateReqInput:
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
+            require_reasoning=self.require_reasoning,
+            max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
@@ -808,9 +867,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     stream: bool
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
+    # Assemble prompt top logprobs as flat arrays scheduler-side (see
+    # GenerateReqInput.return_flat_raw_top_logprobs). The b64 flag stays
+    # tokenizer-manager-side: the scheduler ships arrays either way.
+    return_flat_raw_top_logprobs: bool = False
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: ReturnHiddenStatesMode = False
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1206,6 +1269,39 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
+def build_flat_input_top_logprobs_arrays(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position prompt top logprob rows into the flat
+    arrays of the `return_flat_raw_top_logprobs` response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays. Raises ValueError when the rows are not
+    representable by (shape, null_prefix): interior nulls or ragged k,
+    e.g. multi-item scoring.
+    """
+    num_rows = len(input_top_logprobs_val)
+    null_prefix = 0
+    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+        null_prefix += 1
+    val_rows = input_top_logprobs_val[null_prefix:]
+    idx_rows = input_top_logprobs_idx[null_prefix:]
+    k = len(val_rows[0]) if val_rows else top_logprobs_num
+    for offset, row in enumerate(val_rows):
+        if row is None or len(row) != k:
+            raise ValueError(
+                "return_flat_raw_top_logprobs requires rectangular top logprob "
+                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                f"has {None if row is None else len(row)} entries (expected {k})."
+            )
+    val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
+    idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
+    return val_arr, idx_arr, null_prefix
+
+
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1296,6 +1392,15 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
+    # Scheduler-side flat assembly of prompt top logprobs for requests with
+    # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
+    # leading-null count (see build_flat_input_top_logprobs_arrays). For such
+    # requests the nested input_top_logprobs_val/idx entry is empty. None when
+    # no request in the batch uses the flat format.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1377,6 +1482,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
+    # Detokenizer pass-through for the scheduler-side flat prompt top logprob
+    # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -2036,7 +2147,10 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    # One serialized copy of the adapter tensors per TP rank; each rank
+    # deserializes only its own copy. Same normalization conventions as
+    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None

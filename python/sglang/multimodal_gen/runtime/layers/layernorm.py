@@ -11,13 +11,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
-from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.kernels.ops.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
+from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -51,8 +54,11 @@ if USE_AITER:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
+if _is_xpu:
+    from sgl_kernel import fused_inplace_qknorm_rope
+
 if not _is_cpu:
-    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
+    from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -154,9 +160,24 @@ class RMSNorm(CustomOp):
 
             x_var = x[..., : self.variance_size_override]
 
+        if x.device.type == "mps" and self.variance_size_override is None:
+            weight = self.weight.to(dtype=torch.float32)
+            x = F.rms_norm(
+                x,
+                (self.hidden_size,),
+                weight,
+                self.variance_epsilon,
+            ).to(orig_dtype)
+            if residual is None:
+                return x
+            return x, residual
+
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = (x * self.weight).to(orig_dtype)
+        weight = self.weight
+        if x.device.type == "mps" and weight.dtype != x.dtype:
+            weight = weight.to(dtype=x.dtype)
+        x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:
@@ -577,7 +598,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if residual.numel() == 0 or x.numel() == 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             import warnings
 
             warnings.warn(
@@ -586,7 +607,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_scale_residual_norm_scale_shift,
         )
 
@@ -619,7 +640,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
-            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
@@ -755,7 +776,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
             import warnings
 
             warnings.warn(
@@ -764,7 +785,7 @@ class _NormScaleShift(CustomOp):
             )
             return self.forward_native(x, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        from sglang.kernels.ops.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_norm_scale_shift,
         )
 
@@ -788,7 +809,7 @@ class _NormScaleShift(CustomOp):
             return self.forward_native(x, shift, scale)
 
         try:
-            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+            from sglang.kernels.ops.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )
@@ -846,81 +867,6 @@ class RMSNormScaleShift(_NormScaleShift):
     norm_type = "rms"
 
 
-################################################################################
-# NormTanhMulAdd
-# y = norm(x) * tanh(scale) + shift (where norm is layernorm or rmsnorm)
-# See details in norm_tanh_mul_add_norm_scale.py
-################################################################################
-class _NormTanhMulAdd(CustomOp):
-    norm_type: str
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        affine: bool = False,
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-        self.eps = eps
-        if self.norm_type == "rms":
-            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
-        elif self.norm_type == "layer":
-            self.norm = FP32LayerNorm(
-                hidden_size, elementwise_affine=affine, eps=eps, dtype=dtype
-            )
-        else:
-            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
-
-    def forward_cuda(
-        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-    ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
-            return self.forward_native(x, scale, shift)
-
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
-
-        x, scale, shift = x.contiguous(), scale.contiguous(), shift.contiguous()
-        weight = _ensure_contiguous(getattr(self.norm, "weight", None))
-        bias = _ensure_contiguous(getattr(self.norm, "bias", None))
-        return fused_norm_tanh_mul_add(
-            x,
-            weight,
-            bias,
-            scale,
-            shift,
-            self.norm_type,
-            self.eps,
-        )
-
-    def forward_hip(self, *args, **kwargs):
-        # Fallback to native because ROCm does not support CuTeDSL.
-        return self.forward_native(*args, **kwargs)
-
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
-    def forward_native(
-        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-    ) -> torch.Tensor:
-        y = self.norm(x) * torch.tanh(scale) + shift
-        return y.to(x.dtype)
-
-
-class LayerNormTanhMulAdd(_NormTanhMulAdd):
-    norm_type = "layer"
-
-
-class RMSNormTanhMulAdd(_NormTanhMulAdd):
-    norm_type = "rms"
-
-
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -938,6 +884,7 @@ def apply_qk_norm(
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
+    # The in-place kernel needs a real view (no copy), so it also requires contiguity.
     if (
         _is_cuda
         and allow_inplace
@@ -945,6 +892,8 @@ def apply_qk_norm(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -959,8 +908,9 @@ def apply_qk_norm(
 
     q_shape = q.shape
     k_shape = k.shape
-    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
-    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    # reshape (not view) so a non-contiguous q/k (e.g. a chunked qkv view) is handled.
+    q_out = q_norm(q.reshape(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.reshape(-1, head_dim)).view(k_shape)
     return q_out, k_out
 
 
@@ -1016,7 +966,7 @@ def apply_qk_norm_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -1072,6 +1022,7 @@ def apply_qk_norm_rope(
     if (
         fused_enabled
         and _is_cuda
+        and not torch.compiler.is_compiling()
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -1084,6 +1035,32 @@ def apply_qk_norm_rope(
         fused_inplace_qknorm_rope(
             q=q.reshape(-1, q.shape[-2], head_dim),
             k=k.reshape(-1, k.shape[-2], head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=q_eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+        return q, k
+
+    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
+    # merge this path with the CUDA fused qknorm+rope branch.
+    if (
+        _is_xpu
+        and allow_inplace
+        and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and head_dim in (64, 128, 256)
+        and rope_dim in (32, 64, 128, 256)
+    ):
+        fused_inplace_qknorm_rope(
+            q=q,
+            k=k,
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
@@ -1111,34 +1088,6 @@ def apply_qk_norm_rope(
         is_neox=is_neox,
         positions=positions,
     )
-
-
-def apply_rmsnorm_tanh_mul_add(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    residual: torch.Tensor,
-    norm: "RMSNorm",
-) -> torch.Tensor:
-    """Compute residual + tanh(gate) * rmsnorm(x), with a fused CUDA fast path."""
-    if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
-        return residual + torch.tanh(gate) * norm(x)
-
-    if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
-
-        return fused_norm_tanh_mul_add(
-            x.contiguous(),
-            norm.weight.data.contiguous(),
-            None,
-            gate.contiguous(),
-            residual.contiguous(),
-            "rms",
-            norm.variance_epsilon,
-        )
-
-    return residual + torch.tanh(gate) * norm(x)
 
 
 def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:

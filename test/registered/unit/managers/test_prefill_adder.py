@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -532,16 +532,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
+        # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
+        # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
+        # request adds to its own sliding window (extend + decode), capped at the
+        # window -- a cached prefix funds the rest -- rather than a constant
+        # window, which over-charged short requests into an admission livelock.
         cases = [
-            # (extend, rem_chunk, window, page, expected, label)
-            (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
-            (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
-            (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
-            (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
+            # (extend, max_new, rem_chunk, window, page, expected, label)
+            (64, 512, None, 128, 16, 128 + 16, "long_decode_hits_window_floor"),
+            (64, 32, None, 128, 16, 96 + 16, "short_req_reserves_below_window"),
+            (10, 20, None, 512, 8, 30 + 8, "short_resume_tiny_budget"),
+            (300, 512, None, 128, 16, 300 + 16, "big_extend_over_window"),
+            (200, 512, 50, 64, 8, 64 + 8, "chunk_capped_alloc_hits_floor"),
+            # Multi-chunk: alloc = rem_chunk (1024) caps a huge extend, and the
+            # chunk itself exceeds the window, so term1 = alloc - window is driven
+            # by the chunk, not the full extend -> budget = chunk + page.
+            (2000, 256, 1024, 512, 16, 1024 + 16, "multichunk_alloc_over_window"),
+            (0, 512, None, 128, 16, 128 + 16, "extend_zero_long_decode"),
+            (0, 40, None, 128, 16, 40 + 16, "extend_zero_short_decode"),
         ]
-        for extend, rem_chunk, window, page, expected, label in cases:
+        for extend, max_new, rem_chunk, window, page, expected, label in cases:
             with self.subTest(label=label):
                 self.mock_tree_cache.sliding_window_size = window
                 adder = self.create_adder(
@@ -549,7 +559,80 @@ class TestPrefillAdder(CustomTestCase):
                     page_size=page,
                     rem_chunk_tokens=rem_chunk,
                 )
-                self.assertEqual(adder._swa_budget_for_req(extend), expected)
+                self.assertEqual(adder._swa_budget_for_req(extend, max_new), expected)
+
+    def test_swa_admission_admits_short_cached_resume_at_two_window_pool(self):
+        # Livelock regression (real incident). At an SWA pool ~= 2 sliding
+        # windows, a cached-prefix resume matches >= 1 window (locked, excluded
+        # from rem_swa) and has only a short uncached tail + a little decode
+        # left. The pre-fix constant-window reservation charged a second full
+        # window, so the admission gate (swa_needed >= rem_swa_tokens) rejected
+        # it every scheduler iteration while LPM kept it at the queue head --
+        # 100% scheduler CPU, idle GPU. Capping the reservation at
+        # min(extend + decode, window) admits it.
+        WINDOW, PAGE, REM_SWA = 128, 8, 100
+        PREFIX, EXTEND = 200, 16  # cached prefix > window; short uncached tail
+        self.mock_token_allocator.swa_available_size.return_value = REM_SWA
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = WINDOW
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req(
+            "resume", priority=0, max_new_tokens=40, output_len=10
+        )
+        req.prefix_indices = list(range(PREFIX))
+        req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
+
+        # Pre-fix: a constant sliding-window reservation rejects the resume.
+        with patch.object(adder, "_swa_reserved_tokens", return_value=WINDOW + PAGE):
+            self.assertIs(
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.NO_TOKEN,
+            )
+        self.assertEqual(len(adder.can_run_list), 0)
+
+        # Fix: min(extend + decode, window) reservation admits it.
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        self.assertIn(req, adder.can_run_list)
+
+    def test_swa_new_tokens_clamps_remaining_not_total(self):
+        # Remaining decode headroom must be min(max_new - generated, CLIP)
+        # (subtract-then-clip). The reversed order (clip-then-subtract) zeroes
+        # out a request that has already generated >= CLIP tokens but still has a
+        # long decode ahead, under-reserving its SWA window -> OOM risk on resume
+        # of a long-generation request.
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
+
+        adder = self.create_adder(self.create_running_batch())
+        cases = [
+            # (max_new, generated, expected, label)
+            (100, 10, 90, "below_clip_normal"),
+            (40, 100, 0, "already_finished"),
+            # clip-then-subtract would give 3996; subtract-then-clip caps at CLIP.
+            (CLIP + 6000, 100, CLIP, "long_gen_small_output_caps_at_clip"),
+            # clip-then-subtract would give 0; the long decode still needs CLIP.
+            (CLIP + 6000, CLIP + 100, CLIP, "long_gen_output_over_clip"),
+        ]
+        for max_new, generated, expected, label in cases:
+            with self.subTest(label=label):
+                req = self.create_mock_req(
+                    label, priority=0, max_new_tokens=max_new, output_len=generated
+                )
+                self.assertEqual(adder._swa_new_tokens(req), expected)
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT
