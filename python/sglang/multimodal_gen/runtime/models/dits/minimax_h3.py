@@ -63,8 +63,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
-_USE_NPU_ROTARY_MUL = get_bool_env_var(
-    "SGLANG_MINIMAX_H3_USE_NPU_ROTARY_MUL", default="true"
+_USE_NPU_KERNELS = get_bool_env_var(
+    "SGLANG_MINIMAX_H3_USE_NPU_KERNELS", default="true"
 )
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
@@ -277,7 +277,10 @@ def _modulate_gate(
         and other.is_contiguous()
     ):
         return indexed_gate_bf16_(x, gate, other, indices)
-    return torch.addcmul(x, gate.index_select(0, indices), other).to(dtype)
+    selected_gate = gate.index_select(0, indices)
+    if current_platform.is_npu() and not _USE_NPU_KERNELS:
+        return (x + selected_gate * other).to(dtype)
+    return torch.addcmul(x, selected_gate, other).to(dtype)
 
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
@@ -381,7 +384,7 @@ def _apply_rope_qk(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if q.device.type == "npu" and _USE_NPU_ROTARY_MUL:
+    if current_platform.is_npu() and _USE_NPU_KERNELS:
         from sglang.kernels.ops.diffusion.triton.npu_fallback import (
             apply_rotary_embedding_native,
         )
@@ -764,7 +767,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        if hidden.device.type == "npu":
+        if current_platform.is_npu() and _USE_NPU_KERNELS:
             hidden = self.act_fn(hidden)
         else:
             hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
