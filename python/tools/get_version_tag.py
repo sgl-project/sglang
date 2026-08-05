@@ -13,9 +13,17 @@ which would cause CI to build the wrong version.
 Strategy:
 1. If the current commit has an exact version tag, use it directly.
    This handles CI release builds (both stable and rc).
-2. Otherwise, find the highest version tag across all branches
-   and describe relative to it. This handles local dev installs
-   from main where release tags only exist on release branches.
+2. Otherwise, find the best tag to describe relative to:
+   a. Prefer ancestor tags (reachable from HEAD) so checking out a
+      commit between v0.5.10 and v0.5.11 reports 0.5.11.devN correctly.
+   b. Fall back to the globally highest tag via merge-base distance
+      when no ancestor tags exist (e.g., on main where release tags
+      live on separate release branches).
+3. When the chosen tag has a .postN suffix, strip it back to the base
+   release (e.g., v0.5.10.post1 -> v0.5.10). setuptools-scm's
+   guess-next-dev scheme bumps the last integer, so v0.5.10 becomes
+   0.5.11.devN (correct), whereas v0.5.10.post1 would become
+   0.5.10.post2.devN (wrong).
 """
 
 import re
@@ -87,42 +95,106 @@ def get_exact_version_tag() -> str:
     )
 
 
-def get_latest_version_tag_describe() -> str:
-    """Find the highest version tag and build a describe string relative to it.
+def strip_post_suffix(tag: str) -> str:
+    """Strip .postN suffix from a tag so setuptools-scm bumps correctly.
 
-    Uses PEP 440 version ordering so that stable releases sort above
-    pre-release tags (e.g., v0.5.10 > v0.5.10rc0).
-
-    The highest tag may live on a release branch and not be a direct
-    ancestor of HEAD (e.g., main diverged before the release tag was
-    created). In that case, we compute the commit distance from the
-    merge-base and build the describe string manually.
+    setuptools-scm's guess-next-dev increments the last integer:
+      v0.5.10       -> 0.5.11.devN   (correct)
+      v0.5.10.post1 -> 0.5.10.post2.devN  (wrong)
+    By stripping .postN we ensure the micro version gets bumped instead.
     """
-    tag = get_latest_version_tag()
-    if not tag:
-        print("WARNING: No version tags (v*.*.*) found in repo", file=sys.stderr)
-        return ""
+    return re.sub(r"\.post\d+$", "", tag)
 
-    # Fast path: tag is an ancestor of HEAD, git describe works directly
+
+def get_latest_ancestor_version_tag() -> str:
+    """Return the highest version tag that is an ancestor of HEAD.
+
+    Uses ``git tag --merged HEAD`` to restrict to reachable tags, then
+    sorts by PEP 440 ordering.  Returns empty string when no ancestor
+    tags exist (e.g., main diverged before any release tag was created).
+    """
+    tags_raw = run_git("tag", "--merged", "HEAD", "--list", "v*.*.*")
+    if not tags_raw:
+        return ""
+    tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
+    return tag_list[0] if tag_list else ""
+
+
+def _describe_from_tag(tag: str) -> str:
+    """Build a describe string relative to *tag*, stripping .postN.
+
+    If the tag is an ancestor of HEAD, uses ``git describe`` directly.
+    Otherwise computes the distance from the merge-base manually.
+
+    The .postN suffix is stripped so that setuptools-scm bumps the micro
+    version (0.5.10 -> 0.5.11.devN) instead of the post number.
+    """
+    base_tag = strip_post_suffix(tag)
+
+    # Fast path: base tag is an ancestor of HEAD
     result = run_git(
-        "describe", "--tags", "--long", "--match", tag, "HEAD", allow_failure=True
+        "describe",
+        "--tags",
+        "--long",
+        "--match",
+        base_tag,
+        "HEAD",
+        allow_failure=True,
     )
     if result:
         return result
 
-    # Tag is not an ancestor (e.g., release branch diverged from main).
+    # Tag is not an ancestor (release branch scenario).
     # Build describe string manually: {tag}-{distance}-g{hash}
     merge_base = run_git("merge-base", tag, "HEAD", allow_failure=True)
     if not merge_base:
-        print(
-            f"WARNING: No common ancestor between {tag} and HEAD. "
-            f"Is this a shallow clone? Try: git fetch --unshallow --tags",
-            file=sys.stderr,
-        )
         return ""
     distance = run_git("rev-list", "--count", f"{merge_base}..HEAD")
     short_hash = run_git("rev-parse", "--short", "HEAD")
-    return f"{tag}-{distance}-g{short_hash}"
+    return f"{base_tag}-{distance}-g{short_hash}"
+
+
+def get_latest_version_tag_describe() -> str:
+    """Find the best version tag and build a describe string relative to it.
+
+    Uses PEP 440 version ordering so that stable releases sort above
+    pre-release tags (e.g., v0.5.10 > v0.5.10rc0).
+
+    Compares the highest ancestor tag with the globally highest tag:
+    - If the ancestor IS the global highest (or equivalent after stripping
+      .postN), use the ancestor — we're on or past the latest release.
+    - If the global tag is newer, use it via merge-base distance — this is
+      the main-branch case where release tags live on release branches and
+      we want ``pip install -e`` to show the upcoming release version.
+    """
+    global_tag = get_latest_version_tag()
+    if not global_tag:
+        print("WARNING: No version tags (v*.*.*) found in repo", file=sys.stderr)
+        return ""
+
+    ancestor_tag = get_latest_ancestor_version_tag()
+
+    # Pick the tag to describe relative to.
+    # Use the ancestor tag only when it represents the latest release
+    # (i.e., no newer global tag exists). Otherwise use the global tag
+    # so main shows the next dev version correctly.
+    if ancestor_tag and parse_version_tuple(ancestor_tag) >= parse_version_tuple(
+        global_tag
+    ):
+        tag = ancestor_tag
+    else:
+        tag = global_tag
+
+    result = _describe_from_tag(tag)
+    if result:
+        return result
+
+    print(
+        f"WARNING: No common ancestor between {tag} and HEAD. "
+        f"Is this a shallow clone? Try: git fetch --unshallow --tags",
+        file=sys.stderr,
+    )
+    return ""
 
 
 def get_version_describe() -> str:
