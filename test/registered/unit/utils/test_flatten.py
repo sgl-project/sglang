@@ -6,6 +6,8 @@ from array import array
 
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
+    NestedRowColumns,
+    RaggedPairColumns,
     flatten_hidden,
     flatten_ragged,
 )
@@ -118,6 +120,59 @@ class TestFlatPairColumns(CustomTestCase):
             "scores: request 0 has 1 idx entries but 2 vals",
         ):
             columns.accept(0)
+
+
+class TestNestedColumns(CustomTestCase):
+    def test_ragged_pairs_accumulate_request_and_position_lengths(self):
+        values = [
+            [[0.1, 0.2], None, [0.3]],
+            None,
+            [[], [1.5]],
+        ]
+        token_ids = [
+            [[11, 12], None, [13]],
+            None,
+            [[], [14]],
+        ]
+        columns = RaggedPairColumns("top", values, token_ids)
+
+        for request_index in range(3):
+            columns.accept(request_index)
+
+        self.assertEqual(
+            columns.columns(),
+            (("top_val", values), ("top_idx", token_ids)),
+        )
+        self.assertEqual(columns.header_cols(), [[3, 0, 2], [2, 0, 1, 0, 1]])
+
+        value_bytes, index_bytes = columns.data_cols()
+        self.assertEqual(len(value_bytes), 4 * 4)
+        self.assertEqual(len(index_bytes), 4 * 4)
+
+        decoded_values = _decode_array("f", value_bytes)
+        for actual, expected in zip(decoded_values, [0.1, 0.2, 0.3, 1.5]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(_decode_array("i", index_bytes), [11, 12, 13, 14])
+
+    def test_hidden_rows_accumulate_request_and_row_lengths(self):
+        rows = [
+            [[1, 2], [[3], [4.5]]],
+            None,
+            [[], 6],
+        ]
+        columns = NestedRowColumns("hidden_states", rows)
+
+        for request_index in range(3):
+            columns.accept(request_index)
+
+        self.assertEqual(columns.columns(), (("hidden_states", rows),))
+        self.assertEqual(columns.header_cols(), [[2, 0, 2], [2, 2, 0, 1]])
+
+        (value_bytes,) = columns.data_cols()
+        self.assertEqual(len(value_bytes), 5 * 4)
+        decoded_values = _decode_array("f", value_bytes)
+        for actual, expected in zip(decoded_values, [1, 2, 3, 4.5, 6]):
+            self.assertAlmostEqual(actual, expected)
 
 
 if __name__ == "__main__":
