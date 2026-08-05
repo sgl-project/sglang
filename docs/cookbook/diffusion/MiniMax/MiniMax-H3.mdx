@@ -1,0 +1,819 @@
+---
+title: MiniMax-H3
+description: Run native MiniMax-H3 video-and-audio generation with SGLang Diffusion.
+metatags:
+    description: "Serve MiniMax-H3 with SGLang Diffusion for text-to-video-and-audio, first/last-frame conditioning, video-to-video, and multimodal reference conditioning."
+---
+
+## 1. Model introduction
+
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) generates a video and a synchronized stereo audio track in one request. SGLang Diffusion provides a native pipeline for the three public task profiles, split across the released FL2VA (First-and-Last-Frame-to-Video-and-Audio) and Ref2VA (Reference-to-Video-and-Audio) checkpoint partitions:
+
+| Task | `task` value | Conditioning |
+| --- | --- | --- |
+| Text to video and audio | `t2va` | Text prompt only |
+| First/last frame to video and audio | `fl2va` | First frame, last frame, or both |
+| Reference to video and audio | `ref2va` | Image, video, and audio references |
+
+Video-to-video (V2V) is a supported `ref2va` use case, not a fourth task
+value. Run the `Ref2VA` partition and provide a video reference in
+`conditions`.
+
+Use the selected Hub's root model ID: `MiniMaxAI/MiniMax-H3` on Hugging Face
+or `MiniMax/MiniMax-H3` on ModelScope. Select the checkpoint variant with
+`--model-variant`: `fl2va` serves both `t2va` and `fl2va`, while `ref2va`
+serves reference-conditioned requests. SGLang owns the checkpoint-directory
+mapping; do not point `--model-path` at a manually downloaded subdirectory.
+
+<Warning>
+Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
+</Warning>
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Serve MiniMax-H3
+
+Use the interactive selector to choose a hardware platform, deployment profile,
+one of the two checkpoint partitions, a request mode, and deployment features.
+It generates Python and, where available, Docker launch forms. AMD selections
+use the Python form until an H3-capable ROCm image is validated. The **$ cURL**
+button follows the selected request mode and switches the payload across
+text-only, all three first/last-frame signatures, and the image/audio/video
+reference combinations listed below.
+Set **Outputs per prompt** in the picker’s **Env** panel to generate more than
+one output without mixing request sampling controls into the deployment
+matrix.
+
+The Docker form does not assume the base SGLang image contains optional
+diffusion dependencies. It installs the platform-specific diffusion extra from
+the source bundled in the image before starting the server. Set **Host media
+directory** in the **Env** panel for FL2VA, V2V, or Ref2VA; the picker mounts
+that directory read-only at `/data/minimax-h3` inside the container.
+
+Every hardware/topology cell in this picker has completed a real request on
+that exact GPU model. Approximate load-time features such as online
+quantization are called out separately in the generated command. Sampling
+behavior such as Cache-DiT is documented separately below.
+
+**Deployment Profile** exposes resident and FSDP placement on B200, B300,
+H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
+weight residency at the cost of per-block parameter collectives. **Online
+Quantization** appears only on B200 and B300. AMD keeps its resident AITER
+recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3.jsx";
+
+<Deployment config={config} />
+
+<Note>
+The ready-to-run request template lives behind the **$ cURL** button in the
+picker above. It regenerates as you change the selection, so the payload it
+shows always matches the serve command next to it.
+</Note>
+
+The selector uses the verified Hugging Face ID. To use ModelScope through the
+same normal `sglang serve` path, prefix the copied command with
+`SGLANG_USE_MODELSCOPE=true` and replace the model path with
+`MiniMax/MiniMax-H3`; keep its selected variant and topology flags unchanged.
+
+For a four-card H200 host, keep the full BF16/FP32 model resident by default.
+The model fits without FSDP, so this path avoids the per-block parameter
+all-gathers of the memory-oriented FSDP profile:
+
+```bash 4×H200 resident
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --port 30010
+```
+
+Pure Ulysses4 is also the faster measured topology on H200, not just a
+capacity default. The 4×H100 TP2 + Ulysses2 recipe below fits on 141 GB H200
+cards, but it replaces the Ulysses all-to-all exchange with two per-block
+tensor-parallel all-reduces and measured slower end-to-end, at about 30 GB
+lower peak memory per GPU. See the **H200 topology comparison** in the
+Benchmarks section for the measured numbers; treat TP2 + Ulysses2 on H200 as
+a deliberate memory trade, not a latency default.
+
+For 4×H100 80 GB, balance the large packed activation with resident weight
+sharding. TP2 + Ulysses2 was the fastest measured lossless topology while the
+Qwen encoder still folds across all four GPUs:
+
+```bash 4×H100 fastest
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+Pure Ulysses4 could not keep the full pipeline resident on 80 GB H100s. Use
+`--tp-size 4 --ulysses-degree 1` when lower resident memory matters more than
+the last few percent of latency. FSDP remains a verified capacity option, but
+its per-block weight all-gathers do not make it the H100 speed default:
+
+```bash 4×H100 FSDP capacity
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --use-fsdp-inference true \
+  --port 30010
+```
+
+For a two-card RTX 5090 host, use TP2 and keep 20 DiT blocks
+resident. Layerwise placement is lossless: it changes parameter placement and
+transfer scheduling, not the BF16/FP32 denoising or VAE math. This is the
+fastest measured 32 GB operating point:
+
+```bash 2×RTX 5090 fastest lossless
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --ulysses-degree 1 \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 20 \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+The DiT residency and prefetch knobs apply only to the repeatedly executed DiT
+blocks. The text encoder and the video VAE decoder blocks use one-layer
+prefetch with zero resident layers. The video VAE encoder stays resident
+because its indexed down blocks cannot host executable layerwise hooks; the
+roughly 577 MiB audio VAE also stays resident because offloading it only adds
+transfer overhead. This exact recipe was validated on
+2× RTX 5090 (32 GB each) and a 377 GiB host; use a 384 GiB-class machine. The
+latency and memory comparison is collected in the benchmark section below.
+
+The first launch downloads the model through the selected Hub. If the Hugging
+Face repository requires authentication, export a Hugging Face token in the
+server environment.
+
+For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+
+## 4. Generate video and audio
+
+MiniMax-H3 uses the asynchronous OpenAI-compatible video endpoint. Choose a
+generation mode below, submit a job, poll its status, and then download the
+completed MP4.
+
+<Tabs>
+
+<Tab title="T2VA">
+
+MiniMax-H3 supports output durations from 4 through 15 seconds, inclusive. The
+following request keeps the verified 5-second profile at a 768-pixel short
+edge. MiniMax-H3 resolves the aligned output canvas and frame count from
+`target`.
+
+```bash Command
+video_id=$(
+  curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "MiniMaxAI/MiniMax-H3",
+      "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+      "seconds": 5,
+      "task": "t2va",
+      "conditions": [],
+      "target": {
+        "short_edge": 768,
+        "aspect_ratio": "16:9",
+        "duration_seconds": 5.0
+      },
+      "num_outputs_per_prompt": 1,
+      "num_inference_steps": 50,
+      "flow_shift": 12.0,
+      "audio_flow_shift": 3.0,
+      "seed": 1101
+    }' |
+    jq -r '.id'
+)
+
+while true; do
+  status=$(curl -sS "http://127.0.0.1:30010/v1/videos/${video_id}" | jq -r '.status')
+  [ "$status" = "completed" ] && break
+  [ "$status" = "failed" ] && exit 1
+  sleep 1
+done
+
+curl -sS -L "http://127.0.0.1:30010/v1/videos/${video_id}/content" \
+  -o minimax-h3-t2va.mp4
+```
+
+The output contract is an MP4 containing H.264 video at 24 fps and one AAC stereo audio stream at 32 kHz.
+
+</Tab>
+
+<Tab title="FL2VA">
+
+For `fl2va`, provide one or two image conditions with role `keyframe`. The supported frame-index sets are `[0]`, `[-1]`, and `[0, -1]`.
+
+The following request uses one server-local first frame. Use
+`frame_index: -1` for a last frame, or include both entries for first-and-last
+conditioning.
+
+Choose FL2VA when the supplied image should be the actual first or last frame
+of the generated clip. Use image-based Ref2VA instead when the image should
+guide identity, style, or composition without being preserved as an endpoint;
+Ref2VA may recompose or crop the reference.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "prompt": "The supplied frame continues with calm, natural motion and synchronized ambient sound.",
+    "seconds": 5,
+    "task": "fl2va",
+    "conditions": [
+      {
+        "type": "image",
+        "uri": "file:///data/minimax-h3/first-frame.png",
+        "role": "keyframe",
+        "frame_index": 0
+      }
+    ],
+    "target": {
+      "short_edge": 768,
+      "aspect_ratio": "auto",
+      "duration_seconds": 5.0
+    },
+    "num_outputs_per_prompt": 1,
+    "num_inference_steps": 50,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "seed": 2101
+  }'
+```
+
+</Tab>
+
+<Tab title="V2V">
+
+V2V uses the reference-conditioning weights. Launch the server with
+`--model-variant ref2va`, keep the request `task` set to `ref2va`, and provide a video
+reference in `conditions`. There is no separate `v2v` task value.
+
+Use `type: "video"` when the input may be silent. If the file has a soundtrack,
+H3 also uses it as an audio reference. Use `type: "video_audio"` only when both
+streams are required; that form rejects an input without audio. The prompt tag
+for the visual stream is `<Video 1>`; an available soundtrack is exposed as
+`<Audio 1>`.
+
+<Note>
+Ref2VA treats the input video as reference material, not as a pixel-aligned
+edit source. It can resynthesize or reorder motion and cuts, and it does not
+expose a denoising-strength control. Do not rely on it to preserve every source
+frame or exact timing.
+</Note>
+
+Set `conditions[].start_time_seconds` to select a segment from a longer source.
+The default is `0`. SGLang seeks the visual stream and soundtrack to the same
+offset, then decodes at most the requested target duration in one pass; the
+source is not re-encoded into an intermediate clip.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "prompt": "Follow the motion and appearance of <Video 1>, changing the setting to a moonlit bedroom while preserving coherent timing.",
+    "seconds": 5,
+    "task": "ref2va",
+    "conditions": [
+      {
+        "type": "video",
+        "uri": "file:///data/minimax-h3/input.mp4",
+        "role": "reference",
+        "start_time_seconds": 35.0
+      }
+    ],
+    "target": {
+      "short_edge": 768,
+      "aspect_ratio": "16:9",
+      "duration_seconds": 5.0
+    },
+    "num_outputs_per_prompt": 1,
+    "num_inference_steps": 50,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "seed": 4101
+  }'
+```
+
+Use `conditions[].uri` for H3 V2V. The generic top-level `video_path`,
+`video_url`, and `video_reference` upload fields are not lowered into H3
+reference conditions.
+
+</Tab>
+
+<Tab title="Multimodal Ref2VA">
+
+For `ref2va`, first launch the reference-conditioning capability with
+`--model-variant ref2va`, then provide conditions with role `reference`.
+Image, video, and audio references can be combined. Material tags in the
+prompt use the one-based order for each modality.
+
+An image condition here is semantic reference material rather than a
+pixel-aligned first frame. Use the FL2VA tab when animating a screenshot from
+that exact starting composition.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "prompt": "Use <Picture 1> as the visual subject and <Audio 1> as the sound reference, with coherent natural motion.",
+    "seconds": 5,
+    "task": "ref2va",
+    "conditions": [
+      {
+        "type": "image",
+        "uri": "file:///data/minimax-h3/reference.png",
+        "role": "reference"
+      },
+      {
+        "type": "audio",
+        "uri": "file:///data/minimax-h3/reference.mp3",
+        "role": "reference"
+      }
+    ],
+    "target": {
+      "short_edge": 768,
+      "aspect_ratio": "auto",
+      "duration_seconds": 5.0
+    },
+    "num_outputs_per_prompt": 1,
+    "num_inference_steps": 50,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "seed": 3101
+  }'
+```
+
+</Tab>
+
+</Tabs>
+
+Poll and download any conditioned request with the same job-status and
+content endpoints used in the T2VA example. Server-local `file://` URIs must
+refer to files visible inside the SGLang server environment.
+
+## 5. Sampling and output controls
+
+MiniMax-H3 supports more than one output per prompt. The video API accepts
+`num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
+generation accepts `--num-outputs-per-prompt N`; `--num-outputs N` is the short
+alias. A scalar seed is expanded deterministically as `seed + output_index`, so
+the outputs do not reuse the same noise.
+
+Same-prompt fan-out reuses text conditioning. On the verified 2× RTX 5090
+recipe, a 5-step two-output request completed in 155.39 seconds versus 78.11
+seconds for one output, while producing two distinct valid MP4 files. The
+independent denoise and decode passes remain sequential on this 32 GB profile
+to keep peak memory bounded; the grouped path adds essentially no orchestration
+overhead. Use server replicas when lower wall-clock latency for many variants
+matters more than per-server memory efficiency.
+
+For example, set `"num_outputs_per_prompt": 2` in any request above. After the
+job completes, download both outputs by selecting each zero-based variant:
+
+```bash Command
+video_id="<completed-job-id>"
+for variant in 0 1; do
+  curl -sS -L \
+    "http://127.0.0.1:30010/v1/videos/${video_id}/content?variant=${variant}" \
+    -o "minimax-h3-${variant}.mp4"
+done
+```
+
+### Choose the quality level
+
+`quality` is a request-scoped sampling parameter with two validated levels:
+
+- `"lossless"` (default): the exact reference path. Output is bit-exact
+  against the reference implementation and the CI ground truth.
+- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
+  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
+  `lossless`), but output is no longer bit-identical to the reference.
+
+One resident server serves both levels; a `quality: "high"` request mounts
+its audited Cache-DiT policy at the batch boundary, and a later
+`quality: "lossless"` request removes the hooks before denoising.
+
+Start the validated server once:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --tp-size 1 \
+  --sp-degree 4 \
+  --ulysses-degree 4 \
+  --ring-degree 1 \
+  --performance-mode speed \
+  --use-fsdp-inference false \
+  --enable-torch-compile false \
+  --port 30010
+```
+
+Then choose a request level:
+
+<Tabs>
+
+<Tab title="lossless (default)">
+
+Native denoising with no feature-cache approximation. This is the default;
+omitting the field is equivalent.
+
+```json Request field
+{
+  "quality": "lossless"
+}
+```
+
+</Tab>
+
+<Tab title="high">
+
+The audited accelerated path. Use it when you can trade bit-exactness for
+latency while keeping output closest to the same-seed lossless trajectory.
+
+```json Request field
+{
+  "quality": "high"
+}
+```
+
+</Tab>
+
+</Tabs>
+
+The measured trade-off is:
+
+| `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
+| `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
+
+These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
+video flow shift 12, audio flow shift 3, and three fixed prompt/seed pairs on
+4×H200. The prompts cover a quiet detailed scene, fast multi-subject action,
+and a moving close-up portrait. `inference_time_s` is averaged across the three
+prompts; the quiet-scene point is itself the mean of two repeats.
+
+SSIM and PSNR compare decoded, frame-aligned output with the `lossless`
+result for the same prompt and seed. They measure trajectory deviation, not
+absolute perceptual quality: the `high` path can produce a different but
+still plausible realization. It also changes the joint audio-video denoise
+trajectory, while these two metrics cover video only.
+
+`quality: "high"` currently accepts only the exact workload and 4×H200
+deployment above; other hardware, task modes, request shapes, step counts, or
+flow shifts fail before denoising. Offline generation uses the same level
+name, for example `sglang generate --quality high`.
+
+<Note>
+`quality` selects a model sampling level and can change generated content.
+`output_quality` controls only output-file compression; it is a separate field.
+</Note>
+
+For manually tuned Cache-DiT experiments outside that validated path, omit
+the request `quality` field and set the process-wide environment controls
+directly. An explicit `quality: "lossless"` request overrides those controls
+and restores native denoising:
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=1 \
+SGLANG_CACHE_DIT_BN=0 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.12 \
+SGLANG_CACHE_DIT_MC=2 \
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --performance-mode speed \
+  --port 30010
+```
+
+<Warning>
+Cache-DiT skips selected block computation and is approximate. It cannot be
+combined with FSDP inference or DiT layerwise offload. Breakable CUDA graph
+execution takes precedence and leaves Cache-DiT disabled. Tune the cache
+thresholds only after comparing both video and audio quality on the target
+task profile. A real B200 request has completed, but the `quality: "high"`
+path above remains fail-closed to the audited 4×H200 workload.
+</Warning>
+
+## 6. Runtime feature recipes
+
+<Tabs>
+
+<Tab title="Lossless runtime">
+
+The recommended `speed` launch already combines resident components with
+Ulysses sequence parallelism. Validation status below applies only to the
+listed hardware and topology; it is not inherited by a similar GPU family.
+
+| Feature | Validation status | Notes |
+| --- | --- | --- |
+| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`; Ring is not compatible with H3's packed multi-segment attention. |
+| Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
+| FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
+| Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
+| CPU and layerwise offload | Verified: 2× RTX 5090 TP2 | The measured lossless recipe keeps 20 DiT blocks plus both VAE encoders resident, streams the remaining DiT blocks, text encoder, and video VAE decoder blocks, and leaves the small audio VAE resident. This status applies only to the listed topology. |
+| Breakable CUDA graph | Verified: B200 Ref2VA, opt-in | Matching eager output was observed for the captured signature, without a measured speedup. Re-capture for other shapes and reference sets. |
+| `torch.compile` | Measured: H200, opt-in | Steady-state benefit was below measurement noise, while startup increased and numerical output changed. Do not use it for consistency ground truth. |
+
+The verified parallel, placement, and matching-signature BCG paths keep the
+BF16/FP32 weights and denoising math. `torch.compile` is the exception called
+out above. Always use the eager BF16/FP32 launch when producing CI consistency
+ground truth.
+
+For the validated 1344×768 Ref2VA profile, use a 5504-row text bucket so both
+the server warmup and reference-conditioned requests share the captured
+signature:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --performance-mode speed \
+  --enable-breakable-cuda-graph true \
+  --warmup-resolutions 1344x768 \
+  --bcg-text-buckets 5504 \
+  --port 30010
+```
+
+BCG is lossless for a matching captured signature, but capture reserves extra
+GPU memory. Re-measure the live H3 text length before reusing this bucket for a
+different task profile, reference set, resolution, or prompt template.
+
+</Tab>
+
+<Tab title="Online quantization">
+
+On the verified 8× B200 topology, quantize the BF16 transformer at server load:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --performance-mode speed \
+  --quantization fp8 \
+  --port 30010
+```
+
+H3 automatically keeps its video/audio patch projections, timestep MLP, and
+final video/audio heads in FP32. All other linear layers have stable full
+module prefixes, so additional layers can be kept unquantized:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --quantization fp8 \
+  --quantization-ignored-layers blocks.0.attn token_refiner \
+  --port 30010
+```
+
+<Warning>
+Online FP8 is approximate and is not a consistency ground-truth mode. It can
+be combined with Cache-DiT, but the two approximations compound. Validate
+visual quality, audio quality, memory use, and latency on the target workload.
+The picker exposes this option only on the B200 and B300 topologies used for
+real H3 validation runs.
+</Warning>
+
+</Tab>
+
+</Tabs>
+
+## 7. Configuration notes
+
+- MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
+- `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
+- Use a 768-pixel short edge for the released quality recipe. The aligned output dimensions are derived from `target.aspect_ratio`.
+- `flow_shift` controls video diffusion and `audio_flow_shift` controls audio diffusion.
+- V2V uses `task: "ref2va"` with a `video` or `video_audio` reference; it is served by the `Ref2VA` partition and is not a separate public task value.
+- `conditions[].start_time_seconds` selects a non-negative offset for a video reference. Its visual and audio streams are always sought together.
+- Ref2VA condition order is semantic and must match the one-based material tags in the prompt. For Ref2VA, `target.aspect_ratio: "auto"` resolves to the model's 16:9 fallback rather than inheriting a reference asset's geometry.
+- The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Do not enable it: `--enable-cfg-parallel true` or `--cfg-parallel-size` greater than 1 is rejected instead of duplicating the positive branch. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
+- The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
+- H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
+- Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
+- For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
+- Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
+- `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
+- `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
+- Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
+
+## 8. Benchmarks
+
+The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
+counts are properties of the selected recipes, not a claim that every platform
+requires that many GPUs. The detailed tables below report performance only for
+the configurations with collected measurements:
+
+| Hardware | Default resident recipe | Other profile or topology |
+| --- | --- | --- |
+| B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
+| B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
+| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2 |
+| H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
+| MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
+| RTX 5090 | 2× TP2 + layerwise offload | — |
+
+### B300 precision and encoder placement
+
+A 12-configuration sweep on a single 8× B300 host, covering both checkpoint
+partitions, both transformer precisions, and all three text-encoder
+placements. It answers one question — *how long does one request take, and how
+much memory does it need*.
+
+### What was measured
+
+**Hardware.** 8× NVIDIA B300 SXM6, single node.
+
+**Model.** `MiniMaxAI/MiniMax-H3`, both released weight partitions.
+
+**Serve command.** Exactly the recipe the picker emits for B300, plus the one
+or two overlay flags under test:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --performance-mode speed \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+The swept axes are `--model-variant` (`fl2va` / `ref2va`), `--quantization`
+(unset for BF16 / `fp8`), and `--encoder-parallel` (`auto` / `fold` /
+`replicate`). Nothing else differs between the 12 servers.
+
+This is a single-request latency sweep (`batching_max_size: 1`), so encoder DP
+is intentionally excluded: it cannot distribute a batch of one. Use the
+picker’s **DP (batched throughput)** option for a multi-request throughput
+deployment; the table below does not claim a measured H3 DP speedup.
+
+**Driver.**
+
+```bash Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+  --host 127.0.0.1 --port 30010 \
+  --model MiniMaxAI/MiniMax-H3 \
+  --dataset vbench --task text-to-video \
+  --num-prompts 1 --max-concurrency 1 \
+  --warmup-requests 1 --warmup-inference-steps 50 \
+  --extra-body '{"task":"t2va","conditions":[],"target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5.0},"seconds":5,"flow_shift":12.0,"audio_flow_shift":3.0}'
+```
+
+**Workload**
+
+| Property | Value |
+| --- | --- |
+| Output duration | 5.167 s |
+| Resolution | 1344×768 |
+| Frames | 124 @ 24 fps |
+| Denoising steps | 50 |
+| `flow_shift` / `audio_flow_shift` | 12.0 / 3.0 |
+| Requests in flight | 1 (`--max-concurrency 1`, server at `batching_max_size: 1`) |
+| Requests measured | 1 per cell, after 1 warmup request |
+
+### Results
+
+| Weights | Precision | Encoder | Load | Warmup | Latency | Peak/GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| FL2VA | BF16 | auto | 118.1 s | 29.65 s | **19.04 s** | 83,578 MB |
+| FL2VA | BF16 | fold | 114.0 s | 28.72 s | **19.04 s** | 83,578 MB |
+| FL2VA | BF16 | replicate | 116.0 s | 28.33 s | **19.04 s** | 124,158 MB |
+| FL2VA | FP8 | auto | 116.0 s | 27.16 s | **18.03 s** | 51,926 MB |
+| FL2VA | FP8 | fold | 116.0 s | 25.99 s | **18.04 s** | 51,926 MB |
+| FL2VA | FP8 | replicate | 118.0 s | 27.97 s | **18.04 s** | 92,506 MB |
+| Ref2VA | BF16 | auto | 114.0 s | 38.69 s | **29.12 s** | 83,968 MB |
+| Ref2VA | BF16 | fold | 118.0 s | 36.58 s | **29.13 s** | 83,968 MB |
+| Ref2VA | BF16 | replicate | 116.0 s | 35.17 s | **29.13 s** | 124,490 MB |
+| Ref2VA | FP8 | auto | 124.0 s | 34.30 s | **27.12 s** | 52,816 MB |
+| Ref2VA | FP8 | fold | 112.0 s | 34.44 s | **27.12 s** | 52,816 MB |
+| Ref2VA | FP8 | replicate | 116.0 s | 33.42 s | **27.12 s** | 93,396 MB |
+
+### H200 topology comparison
+
+The same four-card H200 host completed both lossless resident placements with
+the standard 1344×768, 5-second, 50-step T2VA request (fixed prompt and seed,
+eager BF16/FP32, back-to-back runs on an otherwise idle host). Latency is the
+warmed-up request; the first pair uses the default warmup request, the second
+pair adds `--warmup-resolutions 1344x768` so warmup already covers the served
+resolution:
+
+| Topology | Warmup | Denoise | Decode | E2E | Peak/GPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Ulysses4 | default | 79.04 s | 3.77 s | **84.14 s** | 94,288 MB |
+| TP2 + Ulysses2 | default | 81.17 s | 2.97 s | 85.51 s | 63,490 MB |
+| Ulysses4 | `--warmup-resolutions 1344x768` | 71.73 s | 1.32 s | **74.38 s** | 94,290 MB |
+| TP2 + Ulysses2 | `--warmup-resolutions 1344x768` | 75.52 s | 1.29 s | 78.33 s | 63,490 MB |
+
+Ulysses4 stays the H200 latency default: 5.0 % faster end-to-end than
+TP2 + Ulysses2 once warmup covers the served resolution (1.6 % with the
+default warmup, where first-request cold start masks the topology gap).
+TP2 + Ulysses2 shards the DiT weights and holds peak memory about 30 GB per
+GPU lower, which is why it remains the 80 GB H100 recipe. Matching the warmup
+request to the served resolution removes the cold first-request cost on both
+topologies (about 10 s end-to-end on this workload).
+
+### H100 topology comparison
+
+The same four-card H100 host completed three lossless placements. TP2 with
+Ulysses2 was the fastest; TP4 used the least memory:
+
+| Topology | Pipeline latency | Peak/GPU |
+| --- | ---: | ---: |
+| TP2 + Ulysses2 | 13.25 s | 66.04 GB |
+| FSDP + Ulysses4 | 13.36 s | 57.01 GB |
+| TP4 + Ulysses1 | 13.86 s | 49.80 GB |
+
+### RTX 5090 capacity run
+
+The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
+50-step, 1344×768, 5-second request completed in 559.67 seconds: 525.05
+seconds of denoising and 33.61 seconds of decoding, with a 26.3 GiB sampled
+peak per GPU.
+
+| DiT settings | 5-step denoise | Inference | Peak/GPU | Result |
+| --- | ---: | ---: | ---: | --- |
+| prefetch 1, resident 20 | 43.48 s | 78.11 s | 26.3 GiB | Selected recipe |
+| prefetch 2, resident 20 | 43.37 s | 78.06 s | 27.5 GiB | No measurable gain |
+| Ulysses2, prefetch 2, resident 10 | Did not reach warmup | — | — | Rejected |
+
+### AMD Instinct task and scaling runs
+
+The AMD recipes keep the released BF16/FP32 precision policy and use AITER
+packed attention. The picker emits the fastest measured topology, 8 GPUs with
+Ulysses degree 8. All runs below completed full H.264/AAC decoding and
+representative-frame inspection.
+
+| Hardware | Task | Denoise | Decode | Peak/GPU |
+| --- | --- | ---: | ---: | ---: |
+| MI355X | T2VA | 55.2907 s | 9.5344 s | 97,444 MB |
+| MI355X | FL2VA | 53.7978 s | 9.4477 s | 96,922 MB |
+| MI355X | Ref2VA | 41.3812 s | 6.8247 s | 94,518 MB |
+| MI300X | T2VA | 167.4878 s | 25.3244 s | 97,272 MB |
+| MI300X | FL2VA | 150.2311 s | 12.5684 s | 96,750 MB |
+| MI300X | Ref2VA | 107.6232 s | 11.3768 s | 94,268 MB |
+
+The task matrix used 8 GPUs and 50 denoising steps. The scaling matrix uses
+one 1344×768, 209-frame T2VA request and changes only the GPU count and
+matching Ulysses degree:
+
+| Hardware | GPUs | Denoise | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| MI355X | 8 | 55.2907 s | 9.5344 s | 97,444 MB |
+| MI355X | 4 | 104.2294 s | 11.1824 s | 103,350 MB |
+| MI355X | 2 | 223.0246 s | 15.5330 s | 115,250 MB |
+| MI355X | 1 | 288.7968 s | 24.0472 s | 137,676 MB |
+| MI300X | 8 | 167.4878 s | 25.3244 s | 97,272 MB |
+| MI300X | 4 | 297.3727 s | 26.5067 s | 103,436 MB |
+| MI300X | 2 | 585.5401 s | 29.4909 s | 115,010 MB |
+| MI300X | 1 | 978.0886 s | 36.0142 s | 137,626 MB |
+
+For a measured lower-count AMD deployment, set both `--num-gpus` and
+`--ulysses-degree` to 4, 2, or 1. AITER packed attention matched segment-wise
+BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
+MI300X.
