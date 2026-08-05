@@ -71,6 +71,30 @@ STOP_REASON_MAP = {
     "tool_calls": "tool_use",
 }
 
+
+def _resolve_stop_reason_and_sequence(
+    finish_reason: Optional[str], matched_stop: Union[None, int, str]
+) -> tuple[str, Optional[str]]:
+    """Map an OpenAI finish_reason + matched_stop to an Anthropic
+    (stop_reason, stop_sequence) pair.
+
+    sglang's OpenAI adapter carries the matched stop in ``matched_stop``: a
+    ``str`` means a user ``stop`` / ``stop_sequences`` string matched; an
+    ``int`` or ``None`` means an EOS / system stop token. Only the former is a
+    genuine Anthropic ``stop_sequence`` — otherwise ``end_turn`` (or the
+    mapped reason for length / tool_use) is correct. Without this, every stop
+    match (including user stop_sequences) is reported as ``end_turn`` because
+    the engine flattens both into OpenAI ``finish_reason="stop"``.
+    """
+    if matched_stop is not None and isinstance(matched_stop, str):
+        return "stop_sequence", matched_stop
+    if finish_reason not in STOP_REASON_MAP:
+        logger.warning(
+            "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
+            finish_reason,
+        )
+    return STOP_REASON_MAP.get(finish_reason or "stop", "end_turn"), None
+
 ERROR_TYPE_MAP = {
     400: "invalid_request_error",
     401: "authentication_error",
@@ -840,6 +864,7 @@ class AnthropicServing:
         content_block_type: Optional[str] = None
         captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
+        matched_stop: Union[None, int, str] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
@@ -1053,18 +1078,18 @@ class AnthropicServing:
                 for event in _close_content_block_events():
                     yield _emit(event)
 
-                # Emit message_delta with stop_reason and usage
-                effective_finish = finish_reason or "stop"
-                if effective_finish not in STOP_REASON_MAP:
-                    logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
-                        effective_finish,
-                    )
-                stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
+                # Emit message_delta with stop_reason and usage. Distinguish
+                # user stop_sequences hits (matched_stop is a str) from EOS so
+                # the Anthropic stop_reason is accurate.
+                stop_reason, stop_sequence = _resolve_stop_reason_and_sequence(
+                    finish_reason, matched_stop
+                )
                 yield _emit(
                     MessageDeltaEvent(
-                        delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
+                        delta=AnthropicMessageEndDelta(
+                            stop_reason=stop_reason,
+                            stop_sequence=stop_sequence,
+                        ),
                         usage=final_usage or AnthropicUsage(output_tokens=0),
                     )
                 )
@@ -1127,6 +1152,7 @@ class AnthropicServing:
             # one-token reply. Fall through to the delta handlers below.
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
+                matched_stop = choice.matched_stop
 
             delta = choice.delta
 
@@ -1295,14 +1321,12 @@ class AnthropicServing:
                     )
                 )
 
-        # Map stop reason
-        finish_reason = choice.finish_reason or "stop"
-        if finish_reason not in STOP_REASON_MAP:
-            logger.warning(
-                "Unmapped OpenAI finish_reason %r; defaulting to end_turn",
-                finish_reason,
-            )
-        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+        # Map stop reason. Distinguish user stop_sequences hits
+        # (matched_stop is a str) from natural EOS so the Anthropic
+        # stop_reason is accurate.
+        stop_reason, stop_sequence = _resolve_stop_reason_and_sequence(
+            choice.finish_reason, choice.matched_stop
+        )
 
         # Anthropic requires ``content`` to contain at least one block.
         # Empty string completions (max_tokens=1 stop, content filter, etc.)
@@ -1315,6 +1339,7 @@ class AnthropicServing:
             content=content,
             model=response.model,
             stop_reason=stop_reason,
+            stop_sequence=stop_sequence,
             usage=_anthropic_usage_from_openai(
                 response.usage,
                 include_input=True,
