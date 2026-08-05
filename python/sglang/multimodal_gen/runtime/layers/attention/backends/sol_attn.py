@@ -82,7 +82,7 @@ class SolAttnBackend(AttentionBackend):
         return AttentionBackendEnum.SOL_ATTN
 
     @staticmethod
-    def get_impl_cls() -> type["SolAttnImpl"]:
+    def get_impl_cls() -> type[SolAttnImpl]:
         return SolAttnImpl
 
 
@@ -166,9 +166,7 @@ class SolAttnImpl(AttentionImpl):
         k = key.unsqueeze(0).contiguous()
         v = value.unsqueeze(0).contiguous()
         if q.dtype != torch.bfloat16:
-            raise TypeError(
-                f"Sol-Attn requires bfloat16 activations, got {q.dtype}"
-            )
+            raise TypeError(f"Sol-Attn requires bfloat16 activations, got {q.dtype}")
         out = sol_attn(
             q,
             k,
