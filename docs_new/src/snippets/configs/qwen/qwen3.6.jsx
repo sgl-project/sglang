@@ -12,9 +12,17 @@
 export const config = {
   modelName: "Qwen3.6",
 
+  // TTFT/TPOT in the benchmarks file are P50 (median_ttft_ms / median_tpot_ms
+  // from bench_serving), not means. Engine renders the "(P50)" label from this.
+  latencyPercentile: "P50",
+
   supportedHardware: ["h100", "h200", "b200", "b300", "xeon"],
 
-  hardware: [],
+  // Xeon (CPU) isn't in the shared HARDWARE_CATALOG — declare it here so its
+  // cells render. `vendor: "intel"` puts it in its own selector group.
+  hardware: [
+    { id: "xeon", label: "Xeon", vram: "host RAM", vendor: "intel" },
+  ],
 
   variants: [
     { id: "35b-a3b", label: "35B-A3B", subtitle: "MoE A3B" },
@@ -200,8 +208,12 @@ export const config = {
 
   cells: [
     {
+      // OOMs on a single 80GB H100: the mamba state cache can't fit alongside the
+      // ~70GB bf16 weights + EAGLE draft at mem-fraction 0.8 (server crashes on
+      // startup). Benchmark pending — needs a lower mem-fraction or multi-GPU tp
+      // before it can be marked verified.
       match: { hw: "h100", variant: "35b-a3b", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -216,8 +228,10 @@ export const config = {
       ],
     },
     {
+      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
+      // benchmarked/verified (no benchmarks entry). Pending.
       match: { hw: "h100", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -243,8 +257,10 @@ export const config = {
       ],
     },
     {
+      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
+      // benchmarked/verified (no benchmarks entry). Pending.
       match: { hw: "h100", variant: "35b-a3b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -270,8 +286,10 @@ export const config = {
       ],
     },
     {
+      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
+      // benchmarked/verified (no benchmarks entry). Pending.
       match: { hw: "h100", variant: "27b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -297,8 +315,10 @@ export const config = {
       ],
     },
     {
+      // HT conc-1024/4096 sweep is impractical on a single H100 node → not yet
+      // benchmarked/verified (no benchmarks entry). Pending.
       match: { hw: "h100", variant: "27b", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -325,10 +345,9 @@ export const config = {
     },
     {
       // mem-fraction-static 0.92 (vs generator default 0.8): +13% throughput on this
-      // KV-bound MoE cell (A/B screened at conc 1024). Benchmark pending — re-bench at
-      // 0.92 (conc 1024+4096) before marking verified.
+      // KV-bound MoE cell. Re-benched at 0.92 (conc 1024+4096 on 0.5.16) → verified.
       match: { hw: "h200", variant: "35b-a3b", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -535,11 +554,10 @@ export const config = {
       ],
     },
     {
-      // 0.5.16 target config: NVFP4-MoE needs --moe-runner-backend flashinfer_cutlass
-      // (default crashes). Benchmark pending — measured b200 numbers were on 0.5.15
-      // (plain path); re-bench on 0.5.16 with this flag to unify the Blackwell backend.
+      // NVFP4-MoE needs --moe-runner-backend flashinfer_cutlass (default crashes).
+      // Re-benched on 0.5.16 with this flag (conc 1+16) → verified.
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -556,9 +574,9 @@ export const config = {
       ],
     },
     {
-      // 0.5.16 target config (see LL note): flashinfer_cutlass moe runner; benchmark pending.
+      // flashinfer_cutlass moe runner (see LL note). Re-benched on 0.5.16 (conc 1024+4096) → verified.
       match: { hw: "b200", variant: "35b-a3b", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
