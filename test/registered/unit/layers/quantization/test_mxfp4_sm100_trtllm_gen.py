@@ -115,6 +115,7 @@ def _build_method(num_experts, hidden, inter, precision):
     method.intermediate_size_per_partition = inter
     method.flashinfer_mxfp4_moe_precision = precision
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
+    method.moe_runner_config = method.runner.config
     return method
 
 
@@ -164,10 +165,24 @@ def _quant_input(x, precision, hidden_size):
                 x_quant, (0, hidden_size - origin), mode="constant", value=0.0
             )
     elif precision == "default":
-        from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
+        if x.shape[-1] == hidden_size:
+            if x.dim() > 2:
+                x = x.view(-1, x.shape[-1])
+            from sglang.kernels.ops.quantization.per_token_group_quant import (
+                per_token_group_quant,
+            )
 
-        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
-        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+            x_quant, x_scale = per_token_group_quant(x, group_size=32, scale_ue8m0=True)
+            x_scale = x_scale.view(torch.float8_e4m3fn)
+        else:
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
+
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                x, False, alignment=hidden_size
+            )
+            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         raise AssertionError(precision)
     return x_quant, x_scale
