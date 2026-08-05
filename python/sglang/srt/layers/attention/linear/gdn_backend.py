@@ -290,6 +290,12 @@ class GDNKernelDispatcher:
         if not self.uses_flashinfer_prefill:
             return None
 
+        can_use_fused_prefill = getattr(
+            self.extend_kernel, "can_use_fused_prefill", None
+        )
+        if can_use_fused_prefill is None:
+            return None
+
         shape = dict(
             num_q_heads=num_q_heads,
             num_k_heads=num_k_heads,
@@ -298,7 +304,7 @@ class GDNKernelDispatcher:
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
         )
-        if not self.extend_kernel.can_use_fused_prefill(mixed_qkv, **shape):
+        if not can_use_fused_prefill(mixed_qkv, **shape):
             return None
 
         return self.extend_kernel.extend_fused(
@@ -616,7 +622,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        if not is_target_verify:
+        # Tracked extends need the checkpoint states produced by the established
+        # kernel path; the fused FlashInfer prefill path does not return them.
+        if not is_target_verify and not forward_metadata.has_mamba_track_mask:
             fused_result = self.kernel_dispatcher.try_fused_extend(
                 mixed_qkv,
                 a,
