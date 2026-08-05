@@ -24,6 +24,7 @@ from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_ke
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
+from sglang.srt.platforms import current_platform
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -97,7 +98,7 @@ def _run_both_plan(
         req_to_verify_expected_tokens_valid_lens=req_to_verify_expected_tokens_valid_lens,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     if assert_equal:
         _assert_plans_byte_equal(
@@ -225,7 +226,7 @@ def _run_both_verify(
         plan=plan_ref,
         check_verify_expected_token=check_verify_expected_token,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     if assert_equal:
         assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
@@ -297,7 +298,7 @@ def _run_both_write(
         expected_input_tokens=expected_tokens_for_launch,
         expected_input_positions=expected_positions_for_launch,
     )
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     if assert_equal:
         assert_canary_buf_equal(buf_a=cuda_canary_buf, buf_b=ref_canary_buf)

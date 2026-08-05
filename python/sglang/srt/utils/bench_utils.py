@@ -5,6 +5,8 @@ from contextlib import nullcontext
 
 import torch
 
+from sglang.srt.platforms import current_platform
+
 
 # NOTE copied and modified from DeepGEMM
 class suppress_stdout_stderr:
@@ -91,7 +93,7 @@ def bench_kineto(
                         ).zero_()
                     fn()
                 if not using_nsys:
-                    torch.cuda.synchronize()
+                    current_platform.synchronize()
                     profiler.step()
 
     # Return 1 if using Nsight Systems
@@ -116,11 +118,11 @@ def bench_kineto(
         )
         import time
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start = time.perf_counter()
         for _ in range(num_tests):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         elapsed = (time.perf_counter() - start) / num_tests
         return tuple([elapsed] * len(kernel_names)) if is_tuple else elapsed
 

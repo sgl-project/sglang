@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -387,7 +388,7 @@ class WeightsUpdater:
                 self.pipeline.model_path = local_model_path
 
         gc.collect()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         if success and flush_cache:
             for _, module in modules_to_update:
@@ -536,7 +537,7 @@ class WeightsUpdater:
                 return False, error_msg
 
         gc.collect()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         names = ", ".join(updated_modules)
         message = f"Updated {len(updated_modules)} modules from tensor ({names})."
         logger.info(message)
@@ -659,7 +660,7 @@ class WeightsUpdater:
                 updated += 1
 
         gc.collect()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         if updated == 0:
             sample = unknown_layers[:5]

@@ -151,9 +151,9 @@ class Pi05PolicyModel(nn.Module):
                 self._set_prefix_output_device()
                 self._move_offloaded_prefix_modules_to_empty_cpu()
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    current_platform.empty_cache()
             self._load_weights()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
         else:
             self._load_weights()
             self.core_model.to(device)
@@ -297,7 +297,7 @@ class Pi05PolicyModel(nn.Module):
         )
         self._move_action_modules_to_empty_device(action_device)
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def _move_action_modules_to_empty_device(self, device: torch.device) -> None:
         gemma_expert = self.core_model.paligemma_with_expert.gemma_expert
@@ -1087,7 +1087,7 @@ class Pi05PolicyModel(nn.Module):
             x_t = sequence_model_parallel_all_gather(x_t.contiguous(), dim=1)
         if offload_action:
             self._move_action_modules_to_device(torch.device("cpu"))
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
         return x_t
 
     def warmup_actions(self, batch_size: int = 1) -> torch.Tensor:

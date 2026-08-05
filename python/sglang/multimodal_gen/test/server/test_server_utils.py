@@ -280,8 +280,8 @@ class ServerContext:
 
             for i in range(torch.cuda.device_count()):
                 with torch.cuda.device(i):
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    current_platform.empty_cache()
+                    current_platform.synchronize()
         except Exception:
             pass
 

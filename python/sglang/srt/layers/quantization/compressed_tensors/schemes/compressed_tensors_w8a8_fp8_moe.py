@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
@@ -320,12 +321,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
-                torch.cuda.empty_cache()
+                current_platform.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
-                torch.cuda.empty_cache()
+                current_platform.empty_cache()
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK

@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 class PatchEmbed3D(nn.Module):
     """Conv3d-based PatchEmbed (upstream/main)."""
@@ -97,7 +99,7 @@ def bench_one(fn, warmup, iters):
     """Returns list of per-iteration latencies in ms using CUDA events."""
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     times = []
     for _ in range(iters):
@@ -106,7 +108,7 @@ def bench_one(fn, warmup, iters):
         start.record()
         fn()
         end.record()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         times.append(start.elapsed_time(end))
     return times
 

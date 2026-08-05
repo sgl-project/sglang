@@ -4,6 +4,8 @@ import pytest
 import torch
 from sgl_kernel import apply_token_bitmask_inplace_cuda
 
+from sglang.srt.platforms import current_platform
+
 
 def test_apply_token_bitmask_inplace_kernel():
     neginf = float("-inf")
@@ -16,7 +18,7 @@ def test_apply_token_bitmask_inplace_kernel():
     logits_gpu = logits.to("cuda")
     bitmask = torch.tensor([0b1010101010], dtype=torch.int32).to("cuda")
     apply_token_bitmask_inplace_cuda(logits_gpu, bitmask)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.testing.assert_close(logits_gpu, expected.to("cuda"))
 
 

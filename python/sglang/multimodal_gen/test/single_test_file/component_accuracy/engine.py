@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import ForwardContext
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -366,15 +367,15 @@ class AccuracyEngine:
             destroy_model_parallel()
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            current_platform.synchronize()
+            current_platform.empty_cache()
             torch.cuda.ipc_collect()
 
     @staticmethod
     def clear_memory() -> None:
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     @staticmethod
     def _execute_with_native_hook(call) -> Any:

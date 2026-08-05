@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
 )
@@ -137,7 +138,7 @@ class MemoryOccupationController:
                     module.to(device, non_blocking=True)
                 moved.append(name)
                 _move_unregistered_tensors(module, device)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         except Exception as e:
             logger.warning(
                 f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",

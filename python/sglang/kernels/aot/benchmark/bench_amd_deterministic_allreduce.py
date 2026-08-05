@@ -30,6 +30,7 @@ sys.path.insert(0, python_dir)
 
 # Try to import custom all-reduce if available
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 
 try:
     import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as custom_ar_ops
@@ -170,10 +171,10 @@ def worker(world_size, rank, port, results_queue):
             inp_flat_ar = inp_ar.view(-1)
 
             # Measure latency
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             start = time.perf_counter()
             dist.all_reduce(inp_flat_ar, op=dist.ReduceOp.SUM)
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             end = time.perf_counter()
             latencies_ar.append(end - start)
 
@@ -191,12 +192,12 @@ def worker(world_size, rank, port, results_queue):
             inp_flat_rs_ag = inp_rs_ag.view(-1)
 
             # Measure latency
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             start = time.perf_counter()
             reduce_scatter_then_all_gather(
                 inp_flat_rs_ag, rank, world_size, custom_ar=None
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             end = time.perf_counter()
             latencies_rs_ag.append(end - start)
 
@@ -221,12 +222,12 @@ def worker(world_size, rank, port, results_queue):
                 inp_flat_custom = inp_custom.view(-1)
 
                 # Measure latency
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 start = time.perf_counter()
                 reduce_scatter_then_all_gather(
                     inp_flat_custom, rank, world_size, custom_ar=custom_ar
                 )
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 end = time.perf_counter()
                 latencies_custom_ar.append(end - start)
 
@@ -256,10 +257,10 @@ def worker(world_size, rank, port, results_queue):
                         inp_kernel = base_input.clone()
 
                         # Measure latency
-                        torch.cuda.synchronize()
+                        current_platform.synchronize()
                         start = time.perf_counter()
                         result_kernel = custom_ar.custom_all_reduce(inp_kernel)
-                        torch.cuda.synchronize()
+                        current_platform.synchronize()
                         end = time.perf_counter()
                         latencies_deterministic_kernel.append(end - start)
 

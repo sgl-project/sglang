@@ -7,6 +7,7 @@ import deep_gemm
 import torch
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
 
+from sglang.srt.platforms import current_platform
 from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
@@ -106,7 +107,7 @@ def bench_deepgemm(
     # warmup
     for _ in range(num_warmup):
         run_deepgemm()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # run
     start_event = torch.cuda.Event(enable_timing=True)
@@ -117,7 +118,7 @@ def bench_deepgemm(
         run_deepgemm()
     end_event.record()
     end_event.synchronize()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, m
@@ -227,7 +228,7 @@ def bench_cutlass(
     # warmup
     for _ in range(num_warmup):
         run_cutlass()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # run
     start_event = torch.cuda.Event(enable_timing=True)
@@ -237,7 +238,7 @@ def bench_cutlass(
         run_cutlass()
     end_event.record()
     end_event.synchronize()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, expert_offsets[-1]

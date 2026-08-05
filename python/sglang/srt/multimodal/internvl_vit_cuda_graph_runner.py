@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.platforms import current_platform
 
 
 class InternViTCudaGraphRunner:
@@ -132,7 +133,7 @@ class InternViTCudaGraphRunner:
                 f"InternVL ViT CUDA graph does not support attention backend: {backend}"
             )
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         with torch.cuda.graph(g):
             y = self.inp[key]

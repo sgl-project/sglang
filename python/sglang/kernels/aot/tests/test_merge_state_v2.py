@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 from sgl_kernel import merge_state_v2
 
+from sglang.srt.platforms import current_platform
+
 
 @triton.jit
 def merge_state_kernel(
@@ -267,7 +269,7 @@ def test_merge_attn_states(
                     output_fn,
                     output_lse_fn,
                 )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             for _ in range(repeat_times):
                 start.record()
@@ -280,7 +282,7 @@ def test_merge_attn_states(
                     output_lse_fn,
                 )
                 end.record()
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 total_time += start.elapsed_time(end)
 
             avg_time = total_time / repeat_times

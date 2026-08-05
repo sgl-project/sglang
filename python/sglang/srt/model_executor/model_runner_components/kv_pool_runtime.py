@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
-import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_world_group
@@ -43,7 +42,7 @@ def compute_post_capture_kv_resize(
     orchestrator to assign. Takes the live ModelRunner because it reads
     post-capture GPU memory + the pool objects it must resize in place."""
     pool = model_runner.token_to_kv_pool
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,

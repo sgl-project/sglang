@@ -4509,7 +4509,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
         page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
@@ -4521,7 +4521,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     chunk_page_indices
                 ].to("cpu", non_blocking=True)
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
@@ -4532,7 +4532,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
@@ -4544,7 +4544,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.index_k_with_scale_buffer[0].device, non_blocking=True
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     def get_state_buf_infos(self):
         data_ptrs = [

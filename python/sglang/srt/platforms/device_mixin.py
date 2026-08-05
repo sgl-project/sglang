@@ -16,12 +16,16 @@ Hierarchy example (OOT plugin)::
     └── MMPlatform(DeviceMixin)           # + attention backend, VAE, …
         └── MyMMPlatform(MMPlatform, MyDeviceMixin)
 
+The MM half of that diagram is the target state: the diffusion subsystem still
+has its own standalone ``Platform``, so device ops added here must be mirrored
+there.
+
 Method status annotations:
 
 - ``[Active]``  — SGLang core calls this method through ``current_platform``.
   OOT implementations take effect immediately.
 - ``[Planned]`` — Reserved interface. SGLang core still uses hardcoded calls
-  (e.g. ``torch.cuda.empty_cache()``). OOT implementations will NOT take
+  (e.g. ``torch.cuda.set_device()``). OOT implementations will NOT take
   effect until the core is migrated in a future PR.
 """
 
@@ -163,10 +167,24 @@ class DeviceMixin:
         """[Active] Whether pinned host memory is available for a target device."""
         return False
 
+    def empty_cache(self) -> None:
+        """[Active] Release cached device memory. No-op for CPU-like platforms."""
+        pass
+
+    def synchronize(self, device: "torch.device | int | None" = None) -> None:
+        """[Active] Synchronize device operations. No-op for CPU-like platforms.
+
+        ``device`` selects which device to wait on; ``None`` means the current
+        one. Overrides must accept it: some call sites pass a concrete device.
+        ``torch.mps.synchronize()`` is argless, so a platform dispatching over
+        device modules generically must forward ``device`` only when set.
+        """
+        pass
+
     # ------------------------------------------------------------------
-    # Planned methods — reserved interface.  Core still uses hardcoded
-    # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
-    # effect until the core is migrated in a future PR.
+    # Planned methods — reserved interface.  Core still reaches these via
+    # hardcoded calls (e.g. torch.cuda.set_device()).  OOT implementations
+    # will NOT take effect until the core is migrated in a future PR.
     # ------------------------------------------------------------------
 
     # ---- Device management ----
@@ -190,14 +208,6 @@ class DeviceMixin:
     def get_device_capability(self, device_id: int = 0) -> Optional["DeviceCapability"]:
         """[Planned] Get device compute capability. None if N/A."""
         raise NotImplementedError
-
-    def empty_cache(self) -> None:
-        """[Planned] Release cached device memory. No-op for CPU-like platforms."""
-        pass
-
-    def synchronize(self) -> None:
-        """[Planned] Synchronize device operations. No-op for CPU-like platforms."""
-        pass
 
     # ---- Memory ----
 

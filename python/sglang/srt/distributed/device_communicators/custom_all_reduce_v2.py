@@ -36,6 +36,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms import current_platform
 
 from .configs.custom_all_reduce_v2 import get_all_reduce_config
 from .custom_all_reduce_utils import (
@@ -215,7 +216,7 @@ class CustomAllReduceV2:
             for i in range(self.world_size)
         ]
         workspaces[self.rank].zero_()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         dist.barrier(group=self.group)
 
         def slice_ws(rank: int, shape: List[int], offset: int) -> torch.Tensor:
@@ -426,7 +427,7 @@ class CustomAllReduceV2:
         rows = torch.tensor(peer_ptrs, dtype=torch.uint64, device=self.device)
         self.graph_params[self._graph_counter : self._graph_counter + count].copy_(rows)
         # the rows must be visible before any (PDL-chained) graph replay
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._graph_counter += count
         self._graph_inputs.clear()
 

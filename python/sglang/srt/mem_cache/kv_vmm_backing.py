@@ -11,6 +11,8 @@ import torch
 import torch.utils.cpp_extension
 from torch.cuda.memory import CUDAPluggableAllocator
 
+from sglang.srt.platforms import current_platform
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KvBufferDesc
 
@@ -253,7 +255,7 @@ class KvVmmArena:
         self._closed = True
         drv = _driver()
         try:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         except Exception as e:  # pragma: no cover
             logger.warning("KvVmmArena.close synchronize failed: %s", e)
         for addr, (size, handle) in self._ranges.items():

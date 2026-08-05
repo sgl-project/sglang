@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_bool_env_var
 
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
@@ -237,7 +238,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         self._register_static_scale_ones(layer)
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
         device = layer.w13_weight.device

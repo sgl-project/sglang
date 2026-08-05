@@ -36,6 +36,7 @@ RCP_LN2 = 1.4426950408889634  # fla.ops.utils.constant (1/ln2)
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
+from sglang.srt.platforms import current_platform
 
 try:
     from .Akk_inverse_lower_triangle_bf16 import akk_inv_host as _akk_inv_host
@@ -1113,7 +1114,7 @@ def chunk_kda_fwd(
 
     if _TIMING_ENABLED:
         k4_e.record(stream=cute_wrappers["main_stream"])
-        torch.cuda.synchronize(device)
+        current_platform.synchronize(device)
         _TIMING_STATS["k123_us"] += k123_s.elapsed_time(k123_e) * 1000.0
         _TIMING_STATS["k4_us"] += k4_s.elapsed_time(k4_e) * 1000.0
         _TIMING_STATS["count"] += 1

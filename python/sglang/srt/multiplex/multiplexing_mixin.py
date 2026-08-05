@@ -21,6 +21,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
@@ -108,7 +109,7 @@ class SchedulerMultiplexMixin:
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
         decode_stream = stream_group[1]
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
 

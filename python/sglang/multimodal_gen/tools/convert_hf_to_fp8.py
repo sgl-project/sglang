@@ -37,6 +37,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 FP8_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_MAX, FP8_MIN = FP8_INFO.max, FP8_INFO.min
 
@@ -280,7 +282,7 @@ def convert_fp8(input_path, output_path, strategy, block_size=None, max_workers=
     )
 
     gc.collect()
-    torch.cuda.empty_cache()
+    current_platform.empty_cache()
 
 
 if __name__ == "__main__":

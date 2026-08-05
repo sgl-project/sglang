@@ -13,6 +13,7 @@ import triton
 import triton.testing
 from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+from sglang.srt.platforms import current_platform
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
@@ -159,7 +160,7 @@ def benchmark(kernel, dtype, batch_size, seq_len, dim, provider):
     def timed(fn):
         for _ in range(5):
             fn()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         ms, qmin, qmax = triton.testing.do_bench_cudagraph(
             fn, quantiles=[0.5, 0.2, 0.8]
         )

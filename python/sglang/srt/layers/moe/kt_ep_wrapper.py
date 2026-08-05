@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
 
@@ -243,7 +244,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             # Get expert location metadata for CPU expert mapping
             from sglang.srt.eplb.expert_location_dispatch import (
