@@ -240,6 +240,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_exec().kernel.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
+        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -431,6 +432,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
                 not get_exec().kernel.flashinfer_mla_disable_ragged
+                and self.qk_rope_head_dim > 0
                 and extend_no_prefix
                 # Captured prefill (tc_piecewise or breakable) must use paged
                 # prefill: it stays compatible with prefix cache, and the ragged
@@ -625,6 +627,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
                 else:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        if self.qk_rope_head_dim == 0:
+            q_rope = None
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -706,6 +710,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     )
 
         # Reshape inputs
+        if self.qk_rope_head_dim == 0:
+            q_rope = None
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
