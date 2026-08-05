@@ -91,6 +91,8 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    miss_top_k_indices: torch.Tensor | None,
+    miss_counts: torch.Tensor | None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -112,6 +114,16 @@ def _load_cache_to_device_buffer_mla(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
 
+    # CUDA generic MLA resolves misses and copies them in separate kernels. The
+    # coordinator provides persistent scratch during CUDA-graph replay; allocate
+    # a temporary only for direct, non-graph callers such as kernel tests.
+    if miss_top_k_indices is None:
+        miss_top_k_indices = torch.empty_like(top_k_tokens)
+    if miss_counts is None:
+        miss_counts = torch.empty(
+            top_k_tokens.size(0), dtype=torch.int32, device=top_k_tokens.device
+        )
+
     module.load_cache_to_device_buffer(
         top_k_tokens,
         device_buffer_tokens,
@@ -126,6 +138,8 @@ def _load_cache_to_device_buffer_mla(
         seq_lens,
         lru_slots,
         num_real_reqs,
+        miss_top_k_indices,
+        miss_counts,
         page_size,
         item_size_bytes,
     )
@@ -148,6 +162,8 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    miss_top_k_indices: torch.Tensor | None = None,
+    miss_counts: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
     _load_cache_to_device_buffer_mla(
@@ -168,6 +184,8 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        miss_top_k_indices=miss_top_k_indices,
+        miss_counts=miss_counts,
     )
 
 
@@ -188,6 +206,8 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    miss_top_k_indices: torch.Tensor | None = None,
+    miss_counts: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +228,6 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        miss_top_k_indices=miss_top_k_indices,
+        miss_counts=miss_counts,
     )

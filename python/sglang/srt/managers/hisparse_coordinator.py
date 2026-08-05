@@ -175,6 +175,14 @@ class HiSparseCoordinator:
         self.top_k_device_locs_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        # CUDA generic MLA resolves cache hits/LRU first and copies misses in a
+        # second kernel. Keep the intermediary buffers static for graph replay.
+        self.miss_top_k_indices_buffer = torch.empty(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=device
+        )
+        self.miss_counts_buffer = torch.empty(
+            max_num_req_slots, dtype=torch.int32, device=device
+        )
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
@@ -836,5 +844,7 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            miss_top_k_indices=self.miss_top_k_indices_buffer[:num_reqs],
+            miss_counts=self.miss_counts_buffer[:num_reqs],
         )
         return top_k_indices
