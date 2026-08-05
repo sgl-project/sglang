@@ -498,10 +498,15 @@ class MinimaxM3Detector(BaseFormatDetector):
             {"tag": "", "schema": parameters_schema, "value": root}
         ]
 
-        for chunk in body.split(MINIMAX_NS_TOKEN):
-            chunk = chunk.strip()
+        for raw_chunk in body.split(MINIMAX_NS_TOKEN):
+            chunk = raw_chunk.strip()
             if not chunk:
                 continue
+            # How much leading whitespace strip() removed, so the opening-tag
+            # branch below can recover the parameter value from raw_chunk. The
+            # stripped copy is fine for tag detection, but its trailing end is
+            # the start of the value and must not be trimmed.
+            lead = len(raw_chunk) - len(raw_chunk.lstrip())
 
             if chunk.startswith("</"):
                 gt = chunk.find(">", 2)
@@ -520,7 +525,12 @@ class MinimaxM3Detector(BaseFormatDetector):
             if chunk.startswith("<"):
                 gt = chunk.index(">")
                 tag = chunk[1:gt].strip()
-                text = chunk[gt + 1 :]
+                # Slice the value out of raw_chunk, not chunk: str.strip()
+                # removes all Unicode whitespace, so reading the value off the
+                # stripped copy silently dropped trailing spaces, newlines,
+                # NBSP and ideographic spaces that are part of the argument.
+                # The streaming path never trimmed them, so the two disagreed.
+                text = raw_chunk[lead + gt + 1 :]
                 parent_frame = stack[-1]
                 child_schema = self._get_child_schema(
                     parent_frame["schema"], tag, parent_frame["value"]

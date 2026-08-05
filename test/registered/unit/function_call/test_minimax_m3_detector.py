@@ -175,6 +175,35 @@ class TestMinimaxM3DetectAndParse(CustomTestCase):
         self.assertEqual(len(calls), 0)
         self.assertEqual(normal, text)
 
+    def test_trailing_whitespace_in_string_value_is_preserved(self):
+        """Trailing whitespace belongs to the value, not to the markup.
+
+        _parse_parameter read the value off a str.strip()ed copy of the chunk,
+        which removes every kind of Unicode whitespace, so a value ending in a
+        space, newline, NBSP or ideographic space was silently truncated. The
+        streaming path never trimmed it, so the same tool call produced
+        different arguments depending only on `stream`.
+        """
+        for label, value in (
+            ("ascii space", "remember this "),
+            ("newline", "remember this\n"),
+            ("tab", "remember this\t"),
+            ("nbsp", "remember this "),
+            ("ideographic space", "　中　"),
+        ):
+            with self.subTest(label):
+                text = _wire(
+                    "<tool_call>",
+                    '<invoke name="add_note">',
+                    f"<note>{value}",
+                    "</note>",
+                    "</invoke>",
+                    "</tool_call>",
+                )
+                calls, _ = _parse_segments_text(text, self.tools)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["args"]["note"], value)
+
     def test_single_tool_call(self):
         segments = (
             "<tool_call>",
