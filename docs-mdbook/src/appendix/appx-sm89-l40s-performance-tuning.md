@@ -43,6 +43,7 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 | 11.9 | 当前机制 | 优先调度 + 代理限流 + 自适应 + 监控（附录 G 详述监控平台） |
 | 11.10 | 扩展分析 | 96K → 256K 可行性 |
 | 11.11 | **后续观察点** | 监控阈值与行动矩阵 |
+| 11.12 | 扩展分析 | 6 卡 PD 分离可行性 |
 
 ## 1. 问题现象
 
@@ -1026,3 +1027,34 @@ bash sglang_start.sh --model-path /usr1/project/models/Qwen3.6-27B-FP8 \
 | TTFT p90 >10s 且 queue 高 | 确认 priority 生效（`num_queue_reqs` 有 `priority="10"` label） | 降 thinking 并发（保 tool call） |
 | token_usage 持续 >0.92 | 降 `max-running-requests` 或 mem 回 0.85 | 评估是否真需要 96K（见 11.10） |
 | 一切正常但想压 TTFT | 确认 `--adaptive-limit` 开启且无震荡 | 按附录 G 6 节流程评估固化默认值 |
+
+### 11.12 PD 分离可行性（6 卡 L40S）
+
+**结论：6 卡做 PD 分离收益不大，大概率负收益。** PD 分离的典型收益场景是大规模部署（几十卡），6 卡拆完后每个角色都太小，且 L40S 无 NVLink，KV 传输走 PCIe。
+
+**6 卡拆法对比**
+
+| 方案 | P/D 分配 | D 组 KV 池 | 总并发 | 对比现状 |
+|------|---------|-----------|--------|----------|
+| 现状（统一） | — | 6 卡 × ~16GB ≈ 96GB | 36 | 基准 |
+| 2P + 4D | 2 卡 prefill + 4 卡 decode | 4 卡 × ~16GB ≈ 64GB | 24 | 池子 −1/3，并发 −1/3 |
+| 4P + 2D | 4 卡 prefill + 2 卡 decode | 2 卡 × ~16GB ≈ 32GB | 12 | 不可行 |
+
+根因：PD 分离需要 P/D 两套实例**各自完整加载 27GB FP8 权重**，L40S 46GB 显存下权重吃掉一大半，拆完 D 组显存池反而缩小，总容量下降。
+
+**收益与代价**
+
+| 维度 | 影响 |
+|------|------|
+| TTFT | 会降（P 组专卡 prefill 不被 decode 拖累，8.37s → 可能 3~4s），是 PD 唯一大卖点 |
+| KV 传输 | L40S 无 NVLink，PCIe 4.0 ~25GB/s 实际；96K 单请求 KV ≈ 1.5GB，传一次 ~60ms+，36 并发下传输总量可观 |
+| MTP 兼容 | draft/verify 跨实例复杂，3.4x decode 加速可能打折，支持度需现验证 |
+| 总吞吐 | 并发 36 → 24，E2E 不一定变好（只省 TTFT 几秒，decode 长输出固有省不掉） |
+| 运维 | 两套实例 + bootstrap 服务 + KV 路由，故障面翻倍；RadixTree 前缀缓存跨实例命中复杂化 |
+
+**判断依据**（见第 13 章 13.6 节"什么时候不该用"）：单机低负载、短输出场景、无独立网络——6 卡 L40S 全中。
+
+**建议**
+
+1. 当前 TTFT 8.37s 是 MTP 高并发的正常水位（对照实测 8.76s），不是"prefill 被 decode 拖到极限"，PD 是为那种极限场景设计的；
+2. 想压 TTFT 的性价比排序：自适应限流（0 成本）→ tool call 专享低并发（低并发 MTP 实测 TTFT 1.35s）→ 扩容到 12+ 卡再考虑 PD（4P + 8D 才摊得开权重与池子）。
