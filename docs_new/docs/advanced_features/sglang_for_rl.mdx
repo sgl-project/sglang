@@ -578,6 +578,25 @@ Training workers gather weights (typically on TP rank 0), broadcast them to the 
 - `engine.update_weights_from_distributed(names, dtypes, shapes, ...)`
 - `engine.destroy_weights_update_group(group_name)`
 
+### Per-Token Weight Version Attribution
+
+A request can outlive a version change: the RL flow retracts it with `pause_generation`, refits, and continues it, or `POST /update_weight_version` relabels while it is still generating. `meta_info` then reports which tokens came from which weights:
+
+```json Output
+"weight_version": "42",
+"weight_versions": [
+    {"version": "41", "start": 0, "end": 57},
+    {"version": "42", "start": 57, "end": 128}
+]
+```
+
+- `weight_versions` holds one span per version change the request lived through, so the usual case is a single span. Ranges are half-open `[start, end)` over output-token indices, prompt excluded. The older `weight_version` field reports the version that sampled the last output token (the newest span) — not the server's current version, which can already be newer when an update lands after the final token.
+- A span records the version that **sampled** those tokens, not the weights their KV was later recomputed under.
+- The refit APIs above advance the version through their `weight_version` field. They take the model-update lock, so unless the engine is already paused they wait for in-flight requests to drain first — pausing with mode `retract` is what lets a request straddle a refit, and its span boundaries are exact because retract quiesces the batch.
+- `POST /update_weight_version` only relabels, takes no such lock, and returns once every scheduler has applied it. It can therefore land mid-batch, where a boundary can be off by one scheduling step.
+- Aborted requests carry both fields too, with spans clamped to the tokens actually returned. OpenAI-compatible non-streaming responses surface them under `metadata`, for the first choice when `n > 1`.
+- Not covered at update time yet: requests parked in PD-disaggregation or dLLM staging queues, and schedulers added by elastic scale-up before their first update.
+
 ## Easy To Postpone Generation
 
 Multi-turn RL rollouts often suffer from long-tail requests that block the entire batch. A small number of slow interactions can stall all GPUs, and the long-tail behavior makes profiling and monitoring difficult.
