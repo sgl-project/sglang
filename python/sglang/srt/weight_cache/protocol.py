@@ -30,7 +30,6 @@ from sglang.srt.utils.common import safe_pickle_loads
 if TYPE_CHECKING:
     import torch.nn as nn
 
-    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -251,7 +250,7 @@ class WeightCacheQuantStates:
     here and constructing the base dispatches to it.
     """
 
-    quant_config: QuantizationConfig
+    quant_config: Any
     quant_method: str
     module_attrs: Dict[str, Dict[str, Any]]
 
@@ -279,7 +278,7 @@ class WeightCacheQuantStates:
 
     def __new__(
         cls,
-        quant_config: QuantizationConfig,
+        quant_config: Any,
         quant_method: str,
         server_args: ServerArgs,
         *,
@@ -292,7 +291,7 @@ class WeightCacheQuantStates:
 
     def __init__(
         self,
-        quant_config: QuantizationConfig,
+        quant_config: Any,
         quant_method: str,
         server_args: ServerArgs,
         *,
