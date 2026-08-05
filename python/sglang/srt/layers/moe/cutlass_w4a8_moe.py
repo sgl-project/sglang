@@ -425,6 +425,9 @@ def cutlass_w4a8_moe_deepep_normal(
         topk_weights,
         topk,
         c2.shape[1],
+        # DeepEP models apply routed_scaling_factor after the cross-rank
+        # combine, so this rank-local reduction must remain unscaled.
+        1.0,
         BLOCK_SIZE=512,
     )
 
