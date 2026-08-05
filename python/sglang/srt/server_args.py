@@ -2670,6 +2670,28 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    hicache_storage_key_scheme: A[
+        str,
+        Arg(
+            help="How L3 storage object keys encode what an object holds. "
+            "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
+            "so only bit-identical topologies can share cache. "
+            "'canonical-grid': keys carry topology-free canonical cell "
+            "coordinates (namespace digest + layer/head group indices; see "
+            "DESIGN_l3_canonical_shard_grid.md). v1 supports the file and "
+            "mooncake backends with plain KV pools only.",
+            choices=["rank-suffix", "canonical-grid"],
+        ),
+        NS("memory"),
+    ] = "rank-suffix"
+    hicache_storage_namespace_descriptor: A[
+        Optional[str],
+        "Path to a JSON KV-namespace descriptor for the canonical-grid key "
+        "scheme. Deployments sharing one descriptor file share one L3 "
+        "keyspace; if omitted, a single-topology namespace is derived from "
+        "this deployment.",
+        NS("memory"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -7151,6 +7173,34 @@ class ServerArgs:
 
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
+
+        # Step 4: L3 key-scheme validation (canonical-grid v1 scope).
+        self._resolve_hicache_key_scheme()
+
+    def _resolve_hicache_key_scheme(self):
+        if self.hicache_storage_key_scheme == "rank-suffix":
+            if self.hicache_storage_namespace_descriptor is not None:
+                raise ValueError(
+                    "--hicache-storage-namespace-descriptor requires "
+                    "--hicache-storage-key-scheme canonical-grid."
+                )
+            return
+        if self.hicache_storage_backend is None:
+            raise ValueError(
+                "--hicache-storage-key-scheme canonical-grid requires an L3 "
+                "backend (--hicache-storage-backend)."
+            )
+        if self.hicache_storage_backend not in ("file", "mooncake"):
+            raise NotImplementedError(
+                "canonical-grid v1 supports --hicache-storage-backend file "
+                f"or mooncake; got {self.hicache_storage_backend!r}. Other "
+                "backends need cell-granular key support first."
+            )
+        if self.speculative_algorithm is not None:
+            raise NotImplementedError(
+                "canonical-grid does not cover speculative-decoding draft "
+                "pools yet; use --hicache-storage-key-scheme rank-suffix."
+            )
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:

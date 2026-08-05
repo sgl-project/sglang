@@ -575,6 +575,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+            if (
+                storage_config is not None
+                and storage_config.canonical_suffix is not None
+            ):
+                # canonical-grid key scheme: one topology-free cell coordinate
+                # replaces the rank/pp suffixes for both pool families. CP,
+                # split-heads, and side pools are rejected upstream at attach.
+                self.mha_suffix = storage_config.canonical_suffix
+                self.mla_suffix = storage_config.canonical_suffix
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads

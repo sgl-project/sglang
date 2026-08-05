@@ -38,6 +38,12 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # canonical-grid key scheme: when set, backends MUST use this topology-free
+    # cell coordinate ("{ns_digest}_L{i}[_H{j}]") verbatim as the key suffix
+    # instead of their hand-rolled rank/pp/cp suffixes. Built and validated in
+    # HiCacheController._generate_storage_config via hicache_key_scheme.py;
+    # None under the legacy rank-suffix scheme.
+    canonical_suffix: Optional[str] = None
 
 
 @dataclass
@@ -375,15 +381,22 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        if storage_config.canonical_suffix is not None:
+            # canonical-grid scheme: the topology-free cell coordinate (model
+            # identity lives inside the namespace digest) replaces the whole
+            # rank/pp/cp suffix family. CP is rejected upstream at attach.
+            self.config_suffix = f"_{storage_config.canonical_suffix}"
+        else:
+            self.config_suffix = f"_{model_name}"
+            if not is_mla_model:
+                self.config_suffix += f"_{tp_rank}_{tp_size}"
+            if enable_pp:
+                self.config_suffix += f"_{pp_size}_{pp_rank}"
+            # Under NSA context parallel each CP rank holds a disjoint slice of
+            # every page, so give each rank its own file key to avoid a
+            # cross-rank write race.
+            if attn_cp_size > 1:
+                self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)

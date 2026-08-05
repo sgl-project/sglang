@@ -39,7 +39,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -623,6 +623,18 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        canonical_suffix = None
+        if get_memory().hicache_storage_key_scheme == "canonical-grid":
+            if tp_lcm_size:
+                raise ValueError(
+                    "canonical-grid and tp_lcm_size split-heads are mutually "
+                    "exclusive: the namespace head_group subsumes tp_lcm_size "
+                    "(multi-cell head fan-out is the follow-up)."
+                )
+            canonical_suffix = self._build_canonical_suffix(
+                model_name=model_name, is_rank_replicated=is_rank_replicated
+            )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -638,7 +650,84 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            canonical_suffix=canonical_suffix,
         )
+
+    def _build_canonical_suffix(
+        self, model_name: Optional[str], is_rank_replicated: bool
+    ) -> str:
+        """Attach-time construction of the canonical-grid cell suffix.
+
+        Fail-fast attach validation: every unsupported combination raises with
+        the remedy in the message; nothing degrades silently to rank-suffix
+        keys (see DESIGN_l3_canonical_shard_grid.md section 2.2).
+        """
+        from sglang.srt.mem_cache.hicache_key_scheme import (
+            build_canonical_cell_suffix,
+            derive_namespace,
+            load_namespace_descriptor,
+            namespace_digest,
+            normalize_dtype,
+        )
+
+        if type(self) is not HiCacheController:
+            raise NotImplementedError(
+                "canonical-grid is not supported for hybrid/side-pool cache "
+                "controllers yet (per-component grids are the follow-up); use "
+                "--hicache-storage-key-scheme rank-suffix."
+            )
+        if self.storage_backend_type not in ("file", "mooncake"):
+            raise NotImplementedError(
+                f"canonical-grid v1 supports the file and mooncake backends; "
+                f"got {self.storage_backend_type!r}."
+            )
+        if self.has_draft:
+            raise NotImplementedError(
+                "canonical-grid does not cover speculative-decoding draft "
+                "pools yet (the draft model needs its own namespace identity)."
+            )
+
+        dtype = normalize_dtype(self.mem_pool_host.dtype)
+        start_layer = self.mem_pool_host.start_layer
+        end_layer = self.mem_pool_host.end_layer
+        local_kv_heads = 0 if is_rank_replicated else self.mem_pool_host.head_num
+        model_id = model_name or ""
+
+        descriptor_path = get_memory().hicache_storage_namespace_descriptor
+        if descriptor_path is not None:
+            namespace = load_namespace_descriptor(descriptor_path)
+        else:
+            namespace = derive_namespace(
+                model_id=model_id,
+                dtype=dtype,
+                page_size=self.page_size,
+                rank_replicated=is_rank_replicated,
+                total_kv_heads=local_kv_heads * self.tp_size,
+                stage_layer_count=end_layer - start_layer,
+                local_kv_heads=local_kv_heads,
+            )
+
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        suffix = build_canonical_cell_suffix(
+            namespace,
+            attn_tp_rank=self.tp_rank,
+            attn_tp_size=self.tp_size,
+            attn_cp_size=attn_cp_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            local_kv_heads=local_kv_heads,
+            dtype=dtype,
+            page_size=self.page_size,
+            model_id=model_id,
+            rank_replicated=is_rank_replicated,
+        )
+        logger.info(
+            "HiCache canonical-grid L3 keys: namespace=%s cell=%s " "(descriptor=%s)",
+            namespace_digest(namespace),
+            suffix,
+            descriptor_path or "derived-from-deployment",
+        )
+        return suffix
 
     def reset(self):
         self.storage_stop_event.set()
@@ -866,6 +955,13 @@ class HiCacheController:
         self.draft_page_set_func = None
         if not self.has_draft or not self.enable_storage:
             return
+        if self.storage_config.canonical_suffix is not None:
+            # Draft pools can register after attach, so the attach-time guard
+            # in _build_canonical_suffix cannot cover this order.
+            raise NotImplementedError(
+                "canonical-grid does not cover speculative-decoding draft "
+                "pools yet (the draft model needs its own namespace identity)."
+            )
 
         backend = self.storage_backend_type
 
