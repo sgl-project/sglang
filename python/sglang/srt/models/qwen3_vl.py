@@ -1210,6 +1210,18 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # Explicit capability opt-in read by the breakable-CUDA-graph runner
+    # (see prefill_cuda_graph_runner._run_forward and .replay_layer_forward).
+    # Declares that this arch supplies a non-empty ``input_deepstack_embeds``
+    # kwarg to ``language_model.forward`` on image requests and needs a
+    # stable BCG replay slot for it. Instances further gate on
+    # ``num_deepstack_embeddings > 0`` — an instance configured with an
+    # empty deepstack list (i.e. deepstack_visual_indexes=[]) leaves this
+    # attribute True but reports num_deepstack_embeddings=0, so the runner
+    # allocates no slot and adds no copy. Non-Qwen3-VL archs do not set
+    # this attribute; the runner reads False via getattr default.
+    supports_bcg_deepstack_replay: bool = True
+
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={

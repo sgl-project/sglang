@@ -296,6 +296,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        # DeepStack replay-slot plumbing activates only when the model
+        # explicitly opts in via `supports_bcg_deepstack_replay=True`
+        # AND reports a positive `num_deepstack_embeddings`. All
+        # other archs (including Qwen3-VL configured with an empty
+        # DeepStack list) hit the zero branch → no allocation on the
+        # PrefillInputBuffers side, no slot on the registry side.
+        deepstack_replay_width = (
+            self.model_runner.model_config.hidden_size
+            * getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+            if getattr(
+                self.model_runner.model,
+                "supports_bcg_deepstack_replay",
+                False,
+            )
+            else 0
+        )
+
         # --- buffers ---------------------------------------------------
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
@@ -306,6 +323,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            deepstack_replay_width=deepstack_replay_width,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -319,6 +337,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
+            deepstack_replay_width=deepstack_replay_width,
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
             require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
@@ -666,6 +685,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                # When the model opted into DeepStack replay (Qwen3-VL
+                # family with num_deepstack_embeddings > 0), pass the
+                # registered slot buffer at capture time so the LM's
+                # DeepStack add_ branch is traced into the graph rather
+                # than left cold. The has_slot() check is the only
+                # activation gate — no allocation exists for models
+                # that did not opt in.
+                if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                    deepstack_slot = self.buffer_registry.get_slot(
+                        "input_deepstack_embeds"
+                    ).slice_for(1, num_tokens)
+                    return self.layer_model.forward(
+                        forward_batch.input_ids,
+                        positions,
+                        forward_batch,
+                        forward_batch.input_embeds,
+                        input_deepstack_embeds=deepstack_slot,
+                    )
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
@@ -1634,6 +1671,38 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.buffer_registry.get_slot("input_embeds").slice_for(
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
+            # DeepStack: mirror of the input_embeds copy, gated on the
+            # optional slot registered by build_prefill_registry when
+            # the model opted in via supports_bcg_deepstack_replay.
+            # Non-opted-in models never allocate the slot; has_slot()
+            # short-circuits and this whole block is skipped for them.
+            # For opted-in models we always leave the slot in a well-
+            # defined state to prevent one request's DeepStack from
+            # bleeding into the next replay at the same bucket:
+            #   - valid live tensor with matching contract → copy in +
+            #     zero the padded tail;
+            #   - missing kwarg / empty tensor / shape-dtype-device
+            #     mismatch → zero the whole slice so a stale image
+            #     contribution cannot leak into a text-only or empty-
+            #     DeepStack request that reuses the bucket.
+            if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                slot = self.buffer_registry.get_slot(
+                    "input_deepstack_embeds"
+                ).slice_for(1, static_num_tokens)
+                de = layer_kwargs.get("input_deepstack_embeds")
+                if (
+                    de is not None
+                    and de.numel() > 0
+                    and de.shape[0] <= static_num_tokens
+                    and de.shape[1:] == slot.shape[1:]
+                    and de.dtype == slot.dtype
+                    and de.device == slot.device
+                ):
+                    slot[: de.shape[0]].copy_(de)
+                    if de.shape[0] < static_num_tokens:
+                        slot[de.shape[0] :].zero_()
+                else:
+                    slot.zero_()
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
