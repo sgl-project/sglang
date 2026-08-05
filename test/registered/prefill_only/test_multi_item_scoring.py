@@ -145,21 +145,20 @@ class TestMultiItemScoringOptimization(CustomTestCase):
 
 
 class TestMultiItemScoringClassification(CustomTestCase):
-    """MIS on a classification model: basics, MIS-vs-single-item parity, and
-    score distinctness / determinism / concurrency.
+    """MIS on a classification model: basics, MIS-vs-single-item parity, score
+    distinctness / determinism / concurrency.
 
-    Uses a pre-trained Qwen3ForSequenceClassification model so the head
-    weights are deterministic. All three groups share one engine: the CI
-    harness requires an idle GPU at every setUpClass, so separate classes
-    would mean re-booting the same config instead of sharing it.
+    Pre-trained Qwen3ForSequenceClassification, so the head weights are
+    deterministic. One class rather than four because the CI harness demands an
+    idle GPU at every setUpClass -- splitting these means re-booting the same
+    two engines instead of sharing them. score() is stateless and the radix
+    cache is off, so sharing is safe.
     """
 
     NUM_LABELS = _CLS_NUM_LABELS
 
     @classmethod
     def setUpClass(cls):
-        # Two engines for the whole class: score() is stateless and the radix
-        # cache is off, so booting either config per test bought nothing.
         cls.engine = Engine(
             model_path=TEST_CLASSIFICATION_BASE_MODEL,
             disable_radix_cache=True,
