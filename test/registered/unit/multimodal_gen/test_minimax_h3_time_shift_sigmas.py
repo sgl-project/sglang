@@ -29,6 +29,22 @@ class TestMiniMaxH3TimeShiftSigmas(CustomTestCase):
                 f"num_steps={num_steps} should yield {num_steps + 1} points",
             )
 
+    def test_exact_n_plus_one_cardinality_across_shift_scales(self):
+        """The N+1 cardinality contract must hold for every shift_scale:
+        the schedule is strictly monotonic, so deduplication can never be
+        needed and must never shrink the returned list."""
+        for shift_scale in (1e-6, 0.01, 1.0, 6.0, 12.0, 1e4, 1e6, 1e9):
+            for num_steps in (1, 8, 50, 1000):
+                sigmas = minimax_h3_time_shift_sigmas(
+                    num_steps=num_steps, shift_scale=shift_scale
+                )
+                self.assertEqual(
+                    len(sigmas),
+                    num_steps + 1,
+                    f"shift_scale={shift_scale:g}, num_steps={num_steps} "
+                    f"must yield exactly {num_steps + 1} points, got {len(sigmas)}",
+                )
+
     def test_schedule_span_and_endpoints(self):
         sigmas = minimax_h3_time_shift_sigmas(num_steps=10, shift_scale=6.0)
         self.assertAlmostEqual(sigmas[0], 1.0, places=6)
