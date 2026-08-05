@@ -10,11 +10,12 @@ scheduler holds an `Optional[RustServer]` and delegates to it.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Tuple
 
 import msgspec
 
@@ -78,6 +79,62 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
+class NativeMmFamily(msgspec.Struct, frozen=True, kw_only=True):
+    """The Python half of one Rust MM family (an arm of
+    `sglang_mm::registry::pipeline_from_spec`): which models it serves.
+    Supporting a new model family = one entry in :data:`NATIVE_MM_FAMILIES`
+    plus its Rust arm — the launch gate is data-driven."""
+
+    name: str
+    # The registered Python mm-processor the native pipeline replaces, as
+    # "module:Class". Compared by identity, so an
+    # SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE override still disables the native path.
+    mm_processor: str
+    # Model types whose image-only M-RoPE matches the family's fast path.
+    model_types: FrozenSet[str]
+    # HF image processors the native resize reproduces bit-exactly, each mapped
+    # to the `resample` the Rust pipeline must use (see `NativeMmSpec.resample`).
+    image_processors: Dict[str, str]
+
+    def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
+        module_name, _, class_name = self.mm_processor.partition(":")
+        cls = getattr(importlib.import_module(module_name), class_name)
+        return mm_processor_cls is cls and model_type in self.model_types
+
+
+NATIVE_MM_FAMILIES: Tuple[NativeMmFamily, ...] = (
+    NativeMmFamily(
+        name="qwen_vl",
+        mm_processor="sglang.srt.multimodal.processors.qwen_vl:QwenVLImageProcessor",
+        model_types=frozenset(
+            (
+                "qwen2_vl",
+                "qwen2_5_vl",
+                "qwen3_vl",
+                "qwen3_vl_moe",
+                "qwen3_5",
+                "qwen3_5_moe",
+            )
+        ),
+        image_processors={
+            "Qwen2VLImageProcessor": "aten_u8",
+            "Qwen2VLImageProcessorFast": "aten_u8",
+            "Qwen2VLImageProcessorPil": "pil",
+        },
+    ),
+)
+
+
+def native_mm_family_for(
+    mm_processor_cls: Any, model_type: Optional[str]
+) -> Optional[NativeMmFamily]:
+    """The declared family serving this model, or ``None`` — which
+    :meth:`RustServer.launch` turns into a hard error (no Python fallback)."""
+    return next(
+        (f for f in NATIVE_MM_FAMILIES if f.serves(mm_processor_cls, model_type)), None
+    )
+
+
 class NativeMmHost:
     """Builds and validates the native Rust MM pipeline for one model.
 
@@ -95,19 +152,6 @@ class NativeMmHost:
     # Rust mm-worker threads when --mm-processor-worker-num is 0. They are
     # GIL-free, so unlike the Python processor pool more than one always helps.
     AUTO_MM_WORKERS = 8
-
-    # Model types whose image-only M-RoPE matches the native fast path.
-    NATIVE_QWEN_MODEL_TYPES = frozenset(
-        ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
-    )
-
-    # HF image processors the native resize reproduces bit-exactly, each mapped
-    # to the `resample` the Rust pipeline must use (see `NativeMmSpec.resample`).
-    NATIVE_IMAGE_PROCESSORS = {
-        "Qwen2VLImageProcessor": "aten_u8",
-        "Qwen2VLImageProcessorFast": "aten_u8",
-        "Qwen2VLImageProcessorPil": "pil",
-    }
 
     def __init__(
         self,
@@ -143,20 +187,18 @@ class NativeMmHost:
         design: an unrecognized knob disables the native path rather than being
         approximated."""
         from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
-        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
         hf_config = self.model_config.hf_config
-        if (
-            get_mm_processor_cls(
-                hf_config, self.server_args, model_config=self.model_config
-            )
-            is not QwenVLImageProcessor
-            or getattr(hf_config, "model_type", None)
-            not in self.NATIVE_QWEN_MODEL_TYPES
-        ):
+        mm_processor_cls = get_mm_processor_cls(
+            hf_config, self.server_args, model_config=self.model_config
+        )
+        family = native_mm_family_for(
+            mm_processor_cls, getattr(hf_config, "model_type", None)
+        )
+        if family is None:
             return None
         ip = getattr(self._processor, "image_processor", None)
-        resample = self.NATIVE_IMAGE_PROCESSORS.get(type(ip).__name__)
+        resample = family.image_processors.get(type(ip).__name__)
         if resample is None:
             return None
         # The native pipeline always resizes, rescales by 1/255 and normalizes;
@@ -185,7 +227,7 @@ class NativeMmHost:
         )
         try:
             spec = NativeMmSpec(
-                family="qwen_vl",
+                family=family.name,
                 feature_shm=self._use_feature_shm(),
                 image_token_id=hf_config.image_token_id,
                 patch_size=ip.patch_size,
@@ -202,7 +244,7 @@ class NativeMmHost:
             )
         except (AttributeError, TypeError):  # missing/odd processor attrs
             return None
-        logger.info("rust server: native MM pipeline enabled (family=qwen_vl)")
+        logger.info("rust server: native MM pipeline enabled (family=%s)", family.name)
         return spec
 
     def _use_feature_shm(self) -> bool:
@@ -391,10 +433,13 @@ class RustServer:
             )
             mm_spec = mm_host.resolve_native_spec()
             if mm_spec is None:
+                supported = sorted(
+                    set(chain.from_iterable(f.model_types for f in NATIVE_MM_FAMILIES))
+                )
                 raise RuntimeError(
                     "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
                     f"model_type={scheduler.model_config.hf_config.model_type!r} "
-                    f"(supported: {', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}; "
+                    f"(supported: {', '.join(supported)}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
                 )
             server.start_mm_workers(mm_spec.rust_json(), mm_host.mm_workers)

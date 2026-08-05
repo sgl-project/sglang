@@ -360,7 +360,7 @@ impl GenerateBody {
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
-        let requests = izip!(
+        let mut requests: Vec<GenerateRequest> = izip!(
             rids,
             texts,
             id_lists,
@@ -428,7 +428,6 @@ impl GenerateBody {
             },
         )
         .collect();
-        let mut requests: Vec<GenerateRequest> = requests;
         // Single requests only (batches rejected above). Malformed entries are
         // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
         if !is_batch

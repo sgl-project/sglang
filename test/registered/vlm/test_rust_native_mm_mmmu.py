@@ -138,8 +138,8 @@ class TestRustNativeMmMMMU(CustomTestCase):
         return "\n".join(text)
 
     def test_mmmu_accuracy(self):
-        # Guard the path under test: if the family ever drops off
-        # NativeMmHost.NATIVE_QWEN_MODEL_TYPES, launch fails and this names why.
+        # Guard the path under test: if the model ever drops off
+        # NATIVE_MM_FAMILIES, launch fails and this names why.
         self.assertIn(
             "native MM pipeline enabled",
             self._read_server_log(),
