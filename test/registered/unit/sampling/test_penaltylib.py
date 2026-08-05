@@ -10,18 +10,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.sampling.penaltylib.frequency_penalty import (
-    BatchedFrequencyPenalizer,
-)
-from sglang.srt.sampling.penaltylib.min_new_tokens import (
-    BatchedMinNewTokensPenalizer,
-)
-from sglang.srt.sampling.penaltylib.orchestrator import (
-    BatchedPenalizerOrchestrator,
-)
-from sglang.srt.sampling.penaltylib.presence_penalty import (
-    BatchedPresencePenalizer,
-)
+from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPenalizer
+from sglang.srt.sampling.penaltylib.min_new_tokens import BatchedMinNewTokensPenalizer
+from sglang.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
+from sglang.srt.sampling.penaltylib.presence_penalty import BatchedPresencePenalizer
+from sglang.srt.sampling.penaltylib.repetition_penalty import BatchedRepetitionPenalizer
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -29,11 +22,14 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(
+    freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2, repetition=1.0
+):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = repetition
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.tokenizer.additional_stop_token_ids = None
@@ -515,6 +511,148 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+# Multi-token accumulation (speculative decoding commits >1 token per step)
+class TestMultiTokenCumulation(CustomTestCase):
+    """A speculative decode step commits `accept_len` tokens at once. Penalty
+    state is per-token, so all of them have to be accumulated, not just the
+    last one."""
+
+    ALL_PENALIZERS = {
+        BatchedFrequencyPenalizer,
+        BatchedPresencePenalizer,
+        BatchedRepetitionPenalizer,
+        BatchedMinNewTokensPenalizer,
+    }
+
+    def _setup(self, batch_size=1, min_tokens=1):
+        # min_tokens > 0 keeps BatchedMinNewTokensPenalizer required, and so
+        # prepared, which is what makes its token counter observable.
+        reqs = [
+            _make_req(freq=0.5, presence=0.25, repetition=1.5, min_tokens=min_tokens)
+            for _ in range(batch_size)
+        ]
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch(reqs), self.ALL_PENALIZERS
+        )
+        return orch
+
+    @staticmethod
+    def _state(orch):
+        return {
+            "frequency": orch.penalizers[
+                BatchedFrequencyPenalizer
+            ].cumulated_frequency_penalties.clone(),
+            "presence": orch.penalizers[
+                BatchedPresencePenalizer
+            ].cumulated_presence_penalties.clone(),
+            "repetition": orch.penalizers[
+                BatchedRepetitionPenalizer
+            ].cumulated_repetition_penalties.clone(),
+            "min_new_tokens": orch.penalizers[
+                BatchedMinNewTokensPenalizer
+            ].len_output_tokens.clone(),
+        }
+
+    def test_every_accepted_token_is_counted(self):
+        """Test that a 4-token step counts all 4, not just the last one."""
+        orch = self._setup()
+        ids = torch.tensor([[3, 3, 7, 3]], dtype=torch.int64)
+        orch.cumulate_output_tokens(ids, torch.ones_like(ids, dtype=torch.bool))
+
+        freq = self._state(orch)["frequency"]
+        self.assertAlmostEqual(freq[0, 3].item(), 1.5, places=5)  # 3 x 0.5
+        self.assertAlmostEqual(freq[0, 7].item(), 0.5, places=5)  # 1 x 0.5
+
+    def test_frequency_total_matches_token_count(self):
+        """Test the accounting invariant: total penalty mass / per-token penalty
+        equals the number of tokens fed."""
+        orch = self._setup()
+        ids = torch.tensor([[3, 4, 5, 6, 7]], dtype=torch.int64)
+        orch.cumulate_output_tokens(ids, torch.ones_like(ids, dtype=torch.bool))
+
+        freq = self._state(orch)["frequency"]
+        self.assertAlmostEqual(freq.sum().item() / 0.5, 5.0, places=5)
+
+    def test_batched_step_matches_sequential_steps(self):
+        """Test that one N-token step leaves the exact state of N 1-token steps."""
+        tokens = [3, 3, 7, 3]
+
+        sequential = self._setup()
+        for token in tokens:
+            sequential.cumulate_output_tokens(torch.tensor([token], dtype=torch.int64))
+
+        batched = self._setup()
+        ids = torch.tensor([tokens], dtype=torch.int64)
+        batched.cumulate_output_tokens(ids, torch.ones_like(ids, dtype=torch.bool))
+
+        for name, expected in self._state(sequential).items():
+            self.assertTrue(
+                torch.equal(expected, self._state(batched)[name]),
+                f"{name} diverged between sequential and batched accumulation",
+            )
+
+    def test_masked_slots_are_noops(self):
+        """Test that padding in ragged rows never reaches the penalty state."""
+        orch = self._setup(batch_size=2)
+        # Row 0 accepted 3 tokens, row 1 accepted 1; the tail of row 1 is padding
+        # carrying token id 0, which must stay untouched.
+        ids = torch.tensor([[3, 4, 5], [9, 0, 0]], dtype=torch.int64)
+        mask = torch.tensor(
+            [[True, True, True], [True, False, False]], dtype=torch.bool
+        )
+        orch.cumulate_output_tokens(ids, mask)
+
+        state = self._state(orch)
+        self.assertAlmostEqual(state["frequency"][0].sum().item(), 1.5, places=5)
+        self.assertAlmostEqual(state["frequency"][1].sum().item(), 0.5, places=5)
+        # Padding id 0 must be at its untouched default for every penalizer.
+        self.assertAlmostEqual(state["frequency"][1, 0].item(), 0.0, places=5)
+        self.assertAlmostEqual(state["presence"][1, 0].item(), 0.0, places=5)
+        self.assertAlmostEqual(state["repetition"][1, 0].item(), 1.0, places=5)
+        # The one real token of row 1 still landed.
+        self.assertAlmostEqual(state["repetition"][1, 9].item(), 1.5, places=5)
+
+    def test_min_new_tokens_counts_tokens_not_steps(self):
+        """Test that min_new_tokens gates on accepted tokens, not decode steps."""
+        orch = self._setup(min_tokens=8)
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+        ids = torch.tensor([[1, 1, 1, 1]], dtype=torch.int64)
+        mask = torch.ones_like(ids, dtype=torch.bool)
+
+        orch.cumulate_output_tokens(ids, mask)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertEqual(logits[0, 2].item(), float("-inf"))  # 4 tokens < 8
+
+        orch.cumulate_output_tokens(ids, mask)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertTrue(torch.isfinite(logits[0, 2]))  # 8 tokens, EOS unblocked
+
+    def test_ragged_min_new_tokens_is_per_request(self):
+        """Test that each request advances by its own accepted length."""
+        orch = self._setup(batch_size=2)
+        ids = torch.tensor([[3, 4, 5], [9, 0, 0]], dtype=torch.int64)
+        mask = torch.tensor(
+            [[True, True, True], [True, False, False]], dtype=torch.bool
+        )
+        orch.cumulate_output_tokens(ids, mask)
+
+        lens = self._state(orch)["min_new_tokens"]
+        self.assertEqual(int(lens[0, 0]), 3)
+        self.assertEqual(int(lens[1, 0]), 1)
+
+    def test_one_dim_path_needs_no_mask(self):
+        """Test that the non-speculative 1-D call still works without a mask."""
+        orch = self._setup(batch_size=2)
+        orch.cumulate_output_tokens(torch.tensor([3, 5], dtype=torch.int64))
+
+        state = self._state(orch)
+        self.assertAlmostEqual(state["frequency"][0, 3].item(), 0.5, places=5)
+        self.assertAlmostEqual(state["frequency"][1, 5].item(), 0.5, places=5)
+        self.assertEqual(int(state["min_new_tokens"][0, 0]), 1)
 
 
 if __name__ == "__main__":

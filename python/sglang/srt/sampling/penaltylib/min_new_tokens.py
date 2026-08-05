@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -67,8 +69,13 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             device=self.orchestrator.device,
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        self.len_output_tokens += 1
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
+        if mask is None:
+            self.len_output_tokens += 1
+        else:
+            self.len_output_tokens += mask.unsqueeze(1).to(self.len_output_tokens.dtype)
 
     def _apply(self, logits: torch.Tensor):
         # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
