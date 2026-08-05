@@ -95,7 +95,7 @@ class HashTopK(nn.Module):
 
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
-    ):
+    ) -> StandardTopKOutput:
         topk = self.topk - self.num_fused_shared_experts
         if layer_id is not None:
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
