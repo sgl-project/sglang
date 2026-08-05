@@ -405,8 +405,8 @@ class _attention(torch.autograd.Function):
         capability = torch.cuda.get_device_capability()
         if capability[0] < 8:
             raise RuntimeError(
-                "Flash attention currently only supported",
-                "for compute capability >= 80",
+                "Flash attention currently only supported "
+                "for compute capability >= 80"
             )
 
         # Get input dimensions
