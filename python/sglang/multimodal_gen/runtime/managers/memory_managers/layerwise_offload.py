@@ -467,7 +467,9 @@ class LayerwiseOffloadManager:
 
         self._gpu_layers.discard(layer_idx)
         if self._synchronous_mps:
-            # release cached unified-memory allocations before streaming the next layer
+            # mps dispatch is asynchronous, so a tensor rebinding alone leaves
+            # prior layer allocations live until the command buffer drains
+            torch.mps.synchronize()
             torch.mps.empty_cache()
 
     @torch.compiler.disable
