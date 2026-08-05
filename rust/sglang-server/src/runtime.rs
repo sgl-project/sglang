@@ -19,7 +19,7 @@ mod config;
 mod runnable;
 mod threads;
 
-pub use config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+pub use config::{DefaultSamplingParams, RuntimeConfig, RustServerServerArgs, ServerArgs};
 
 use crate::message::DetokMsg;
 use crate::ring::{
@@ -27,6 +27,7 @@ use crate::ring::{
 };
 use crate::runtime::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::utils::sock::bind_tcp_listener;
 use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
 
 // Re-export so stages keep importing `crate::runtime::Runnable`.
@@ -92,14 +93,6 @@ impl Drop for Runtime {
 /// so the Python caller regains control of the GIL immediately. `Err` on a
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
-    // Bind the API server port before spawning any thread, so an unavailable
-    // port (EADDRINUSE) is a hard startup error.
-    let listener = std::net::TcpListener::bind(cfg.rust_server_args.http_addr)
-        .map_err(|e| format!("bind {} failed: {e}", cfg.rust_server_args.http_addr))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
-
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -249,6 +242,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let senders = senders.clone();
         let api_activity = egress_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
+        // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
+        // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
+        // launcher process.
+        let http_addr = cfg.rust_server_args.http_addr;
+        let listener = bind_tcp_listener(http_addr)
+            .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
