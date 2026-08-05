@@ -242,7 +242,7 @@ step[DECODE bs=64 g_sq=64 g_sqsq=64 g_sqsk=100032 g_sk=100032]
 step[MIXED bs=66 c=2 g=64 c_sq=2048 c_sk=2048 c_sqsq=2097152 c_sqsk=2097152 g_sq=64 g_sk=65600 g_sqsq=64 g_sqsk=65600]
 ```
 
-With speculative decoding (EAGLE/MTP) each request contributes multiple query tokens per step, so `sq` no longer equals `bs`. Both draft-decode and target-verify (`TARGET_VERIFY`) steps are emitted in the **generation** group (`g_sq = bs × num_tokens_per_req`), classified by request phase to match vLLM's convention. Target-verify's query tokens do self-attend, but that quadratic cost is still captured numerically in `g_sqsq`. For example, a verify step with 3 draft tokens across 2 requests (`seq_lens=[10, 20]`):
+With speculative decoding (EAGLE/MTP) each request contributes multiple query tokens per step, so `sq` no longer equals `bs`. Both draft-decode and target-verify (`TARGET_VERIFY`) steps are emitted in the **generation** group. For example, a verify step with 3 draft tokens across 2 requests (`seq_lens=[10, 20]`):
 
 ```text
 step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]
