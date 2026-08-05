@@ -990,6 +990,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return key_list, ptr_list, element_size_list
 
+    def _get_mha_layer_ranges_buffer_meta(self, keys, indices):
+        # Canonical-grid layer fan-out (PP read-back) for MHA/GQA: per
+        # (page, canonical layer range) one K slab and one V slab; key and
+        # pointer lists are both page-major, range-minor, K then V.
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_layer_range_page_buffer_meta(
+                indices, self.storage_config.canonical_layer_ranges
+            )
+        )
+        key_list = []
+        for key_ in keys:
+            for suffix in self.mha_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _get_mla_layer_ranges_buffer_meta(self, keys, indices):
         # Canonical-grid layer fan-out (PP read-back): one key and one
         # contiguous slab per (page, canonical layer range); both sides are
@@ -1026,6 +1043,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
             if isinstance(self.mha_suffix, list):
+                if (
+                    self.storage_config is not None
+                    and self.storage_config.canonical_layer_ranges is not None
+                ):
+                    return self._get_mha_layer_ranges_buffer_meta(keys, host_indices)
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)

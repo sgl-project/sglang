@@ -538,6 +538,50 @@ class MHATokenToKVPoolHost(HostKVCache):
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
 
+    def get_layer_range_page_buffer_meta(self, indices, layer_ranges):
+        """Zero-copy metas for canonical-grid layer fan-out cells (MHA/GQA).
+
+        ``layer_ranges`` are half-open (start, end) ranges in LOCAL layer
+        indices. Under ``page_first_direct`` the page block is layer-major
+        ``(2, page, layer, page_size, head, dim)``, so each
+        (page, layer-range) cell is one contiguous slab per K/V half. Order:
+        page-major, range-minor, K then V per range — matching the storage
+        key fan-out order (``.._L{a}-{b}_H{j}_k`` / ``_v``).
+        """
+        if self.layout != "page_first_direct":
+            raise ValueError(
+                "layer-range cells require the page_first_direct layout "
+                f"(layer-major page blocks); got {self.layout!r}."
+            )
+        if self.kv_buffer is None:
+            raise NotImplementedError(
+                "layer-range cells are not supported for split K/V host "
+                "pools (asymmetric MHA)."
+            )
+        assert len(indices) % self.page_size == 0
+        for start, end in layer_ranges:
+            if not 0 <= start < end <= self.layer_num:
+                raise ValueError(
+                    f"local layer range ({start}, {end}) outside this pool's "
+                    f"{self.layer_num} layers."
+                )
+        base_ptr = self.kv_buffer.data_ptr()
+        itemsize = self.dtype.itemsize
+        layer_stride = self.page_size * self.head_num * self.head_dim * itemsize
+        page_stride = self.layer_num * layer_stride
+        v_offset = self.layer_num * self.size * self.head_num * self.head_dim * itemsize
+        ptr_list = []
+        element_size_list = []
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.page_size):
+            real_index = indices[index] // self.page_size
+            for start, end in layer_ranges:
+                k_ptr = base_ptr + real_index * page_stride + start * layer_stride
+                ptr_list.append(k_ptr)
+                ptr_list.append(k_ptr + v_offset)
+                element_size_list.extend([(end - start) * layer_stride] * 2)
+        return ptr_list, element_size_list
+
     def get_page_buffer_meta(self, indices):
         """
         meta data for zero copy

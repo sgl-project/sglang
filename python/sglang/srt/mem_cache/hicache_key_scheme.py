@@ -36,8 +36,10 @@ knob (heads per cell — e.g. ``total_kv_heads / lcm`` of the fleet's TP
 sizes). The multi-key read/write transport
 (``get_split_heads_page_buffer_meta``, mooncake list-suffix fan-out) is
 shared with, but not coupled to, the legacy split-heads mechanism. Rank-replicated pools (MLA-family) have no head axis,
-so cross-TP-size reuse needs no head-grid agreement at all. Uniform layer
-grids with layer fan-out remain the follow-up and are rejected explicitly.
+so cross-TP-size reuse needs no head-grid agreement at all. Layer
+fan-out applies to both families (MLA single-slab cells; MHA/GQA K+V slab
+pairs), always under the page_first_direct layout; combining head and layer
+fan-out is rejected (conflicting layouts).
 
 The namespace is derived from deployment facts (model, logical KV dtype,
 page size, head grid) and its digest prefixes every key: deployments share
@@ -300,15 +302,6 @@ def build_canonical_cell_suffixes(
     if namespace.rank_replicated:
         return [f"{digest}_{coord}" for coord in layer_coords]
 
-    if len(layer_coords) > 1:
-        raise NotImplementedError(
-            "layer fan-out is only supported for rank-replicated (MLA-family)"
-            " pools in this PR: an MHA layer-range cell is not contiguous "
-            "under the layouts the head axis requires. Partition this "
-            "deployment's stages on the canonical boundaries, or drop "
-            "layer_partition."
-        )
-
     if namespace.total_kv_heads != local_kv_heads * attn_tp_size:
         raise ValueError(
             f"namespace total_kv_heads={namespace.total_kv_heads} != "
@@ -325,6 +318,15 @@ def build_canonical_cell_suffixes(
         )
     cells_per_rank = local_kv_heads // namespace.head_group
     first_head_index = attn_tp_rank * cells_per_rank
+    if len(layer_coords) > 1:
+        if cells_per_rank > 1:
+            raise NotImplementedError(
+                "head fan-out and layer fan-out cannot combine yet: they "
+                "require different host layouts (page_head vs "
+                "page_first_direct). Set either head_group or a "
+                "layer_partition your stages span, not both."
+            )
+        return [f"{digest}_{coord}_H{first_head_index}" for coord in layer_coords]
     return [
         f"{digest}_{layer_coords[0]}_H{first_head_index + i}"
         for i in range(cells_per_rank)

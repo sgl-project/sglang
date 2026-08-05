@@ -823,7 +823,11 @@ class HiCacheController:
         )
 
         canonical_layer_ranges = None
-        if layer_partition and is_rank_replicated and len(suffixes) > 1:
+        if (
+            layer_partition
+            and len(suffixes) > 1
+            and (is_rank_replicated or head_group == local_kv_heads)
+        ):
             # Layer fan-out (PP read-back): the module validated boundary
             # alignment; here the physical prerequisites. Local ranges feed
             # get_layer_range_page_buffer_meta in page-major/range-minor

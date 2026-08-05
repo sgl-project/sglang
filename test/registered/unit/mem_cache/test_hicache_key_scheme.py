@@ -538,39 +538,52 @@ class TestLayerPartition(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "boundaries"):
             self._suffixes(0, 45)
 
-    def test_mha_layer_fan_out_rejected(self):
-        namespace = _gqa_namespace(layer_boundaries=[0, 30, 61])
-        with self.assertRaisesRegex(NotImplementedError, "rank-replicated"):
-            build_canonical_cell_suffixes(
-                namespace,
-                attn_tp_rank=0,
-                attn_tp_size=4,
-                attn_cp_size=1,
-                start_layer=0,
-                end_layer=61,
-                local_kv_heads=2,
-                dtype="bfloat16",
-                page_size=64,
-                model_id="meta-llama/Llama-3-70B",
-                rank_replicated=False,
-                object_layout="page_head",
-            )
-        # A single-range MHA stage under the same partition is fine.
-        single = build_canonical_cell_suffixes(
+    def _gqa_partition_suffixes(self, *, tp_rank, tp_size, start_layer, end_layer):
+        namespace = _gqa_namespace(
+            layer_boundaries=[0, 30, 61], object_layout="page_first_direct"
+        )
+        return build_canonical_cell_suffixes(
             namespace,
-            attn_tp_rank=0,
-            attn_tp_size=4,
+            attn_tp_rank=tp_rank,
+            attn_tp_size=tp_size,
             attn_cp_size=1,
-            start_layer=0,
-            end_layer=30,
-            local_kv_heads=2,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            local_kv_heads=8 // tp_size,
             dtype="bfloat16",
             page_size=64,
             model_id="meta-llama/Llama-3-70B",
             rank_replicated=False,
-            object_layout="page_head",
+            object_layout="page_first_direct",
         )
-        self.assertEqual(len(single), 1)
+
+    def test_mha_pp_read_back_coverage(self):
+        # GQA layer fan-out: TP4 rank 2 (head_group == local, no head
+        # fan-out) — PP1's cells are the union of the PP2 stages', with the
+        # H coordinate constant.
+        stage0 = self._gqa_partition_suffixes(
+            tp_rank=2, tp_size=4, start_layer=0, end_layer=30
+        )
+        stage1 = self._gqa_partition_suffixes(
+            tp_rank=2, tp_size=4, start_layer=30, end_layer=61
+        )
+        pp1 = self._gqa_partition_suffixes(
+            tp_rank=2, tp_size=4, start_layer=0, end_layer=61
+        )
+        self.assertEqual(pp1, stage0 + stage1)
+        self.assertTrue(all(sfx.endswith("_H2") for sfx in pp1))
+
+    def test_combined_head_and_layer_fan_out_rejected(self):
+        # TP2 (2 head cells) x PP1-over-PP2-partition (2 layer ranges).
+        with self.assertRaisesRegex(NotImplementedError, "cannot combine"):
+            self._gqa_partition_suffixes(
+                tp_rank=0, tp_size=2, start_layer=0, end_layer=61
+            )
+        # Head fan-out with a single range stays legal.
+        r = self._gqa_partition_suffixes(
+            tp_rank=0, tp_size=2, start_layer=0, end_layer=30
+        )
+        self.assertEqual(len(r), 2)
 
     def test_partition_enters_digest(self):
         self.assertNotEqual(
@@ -653,6 +666,72 @@ class TestMlaLayerRangeBufferMeta(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             self._stub_pool().get_layer_range_page_buffer_meta(
                 torch.tensor([0, 1, 2, 3]), [(0, 7)]
+            )
+
+
+class TestMhaLayerRangeBufferMeta(CustomTestCase):
+    """MHA/GQA layer fan-out metas: one K slab and one V slab per
+    (page, range), page-major, range-minor, K then V."""
+
+    def _stub_pool(self, layout="page_first_direct"):
+        import torch
+
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.layout = layout
+        pool.page_size = 4
+        pool.head_num = 2
+        pool.head_dim = 8
+        pool.layer_num = 6
+        pool.dtype = torch.bfloat16
+        page_num = 3
+        pool.size = page_num * pool.page_size
+        pool.kv_buffer = torch.zeros(
+            (
+                2,
+                page_num,
+                pool.layer_num,
+                pool.page_size,
+                pool.head_num,
+                pool.head_dim,
+            ),
+            dtype=pool.dtype,
+        )
+        return pool
+
+    def test_pointer_math(self):
+        import torch
+
+        pool = self._stub_pool()
+        itemsize = pool.dtype.itemsize
+        layer_stride = pool.page_size * pool.head_num * pool.head_dim * itemsize
+        page_stride = pool.layer_num * layer_stride
+        v_offset = pool.layer_num * pool.size * pool.head_num * pool.head_dim * itemsize
+        base = pool.kv_buffer.data_ptr()
+        indices = torch.tensor([8, 9, 10, 11])  # page 2
+        ptrs, sizes = pool.get_layer_range_page_buffer_meta(indices, [(0, 2), (2, 6)])
+        k0 = base + 2 * page_stride
+        self.assertEqual(
+            ptrs,
+            [
+                k0,
+                k0 + v_offset,
+                k0 + 2 * layer_stride,
+                k0 + 2 * layer_stride + v_offset,
+            ],
+        )
+        self.assertEqual(
+            sizes,
+            [2 * layer_stride, 2 * layer_stride, 4 * layer_stride, 4 * layer_stride],
+        )
+
+    def test_rejects_wrong_layout(self):
+        import torch
+
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            self._stub_pool(layout="page_head").get_layer_range_page_buffer_meta(
+                torch.tensor([0, 1, 2, 3]), [(0, 2)]
             )
 
 
