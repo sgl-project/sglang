@@ -509,11 +509,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
-        # full-attn layers; budget into the full term. A banded MTP depth
-        # (Inkling mtp_local_layer_ids) instead allocates an swa-geometry ring
-        # at FULL draft capacity, so budget those depths at swa_per_token.
+        # EAGLE/STANDALONE draft layers share the target allocator but own their
+        # KV tensors. Full-attention layers use full capacity, ordinary SWA
+        # layers use the target SWA capacity, and an Inkling banded MTP depth
+        # uses SWA geometry at full capacity.
         self._draft_full_layers_num = 0
+        self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
@@ -533,8 +534,22 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                             if i < draft_layers
                         ]
                     )
-                self._draft_swa_full_layers_num = banded_depths
-                self._draft_full_layers_num = draft_layers - banded_depths
+                    self._draft_swa_full_layers_num = banded_depths
+                else:
+                    draft_swa_layers = getattr(
+                        kvc.spec_aux_config,
+                        "eagle_draft_swa_num_layers",
+                        None,
+                    )
+                    if draft_swa_layers is not None:
+                        self._draft_swa_layers_num = min(
+                            max(int(draft_swa_layers), 0), draft_layers
+                        )
+                self._draft_full_layers_num = (
+                    draft_layers
+                    - self._draft_swa_layers_num
+                    - self._draft_swa_full_layers_num
+                )
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
@@ -551,6 +566,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
                 + self._full_per_token * self._draft_full_layers_num
+                + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._draft_cell_size
             )
@@ -561,7 +577,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
-                * self._swa_layers_num
+                * (self._swa_layers_num + self._draft_swa_layers_num)
                 + self._draft_cell_size
             )
 
