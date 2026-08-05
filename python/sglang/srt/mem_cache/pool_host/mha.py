@@ -314,12 +314,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
+                    device_k, device_v = device_pool.get_hicache_transfer_buffers()
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
+                        device_k=device_k,
                         host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
+                        device_v=device_v,
                         host_v=self.v_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
@@ -419,12 +420,13 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
+                device_k, device_v = device_pool.get_hicache_transfer_buffers()
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
+                    device_k=device_k,
                     host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
+                    device_v=device_v,
                     host_v=self.v_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -28,6 +29,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+transfer_state_dim_exchange = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -44,9 +46,42 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    pass
+    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+
+    try:
+        from sgl_kernel_npu.kvcacheio import transfer_state_dim_exchange
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
+
+
+_ASCEND_HICACHE_MAMBA_IO_ENV = "SGLANG_ASCEND_HICACHE_MAMBA_IO"
+_ASCEND_HICACHE_MAMBA_IO_MODES = {"sync", "async", "auto"}
+_ascend_hicache_mamba_fallback_warnings: set[str] = set()
+_ascend_hicache_mamba_fallback_warning_lock = threading.Lock()
+
+
+def _ascend_hicache_mamba_io_mode() -> str:
+    mode = os.getenv(_ASCEND_HICACHE_MAMBA_IO_ENV, "sync").strip().lower()
+    if mode not in _ASCEND_HICACHE_MAMBA_IO_MODES:
+        raise ValueError(
+            f"{_ASCEND_HICACHE_MAMBA_IO_ENV} must be one of "
+            f"{sorted(_ASCEND_HICACHE_MAMBA_IO_MODES)}, got {mode!r}."
+        )
+    return mode
+
+
+def _warn_ascend_hicache_mamba_fallback_once(reason: str) -> None:
+    with _ascend_hicache_mamba_fallback_warning_lock:
+        if reason in _ascend_hicache_mamba_fallback_warnings:
+            return
+        _ascend_hicache_mamba_fallback_warnings.add(reason)
+    logger.warning(
+        "Ascend HiCache Mamba async state transfer is unavailable; "
+        "using the synchronous torch fallback: %s",
+        reason,
+    )
 
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -155,9 +190,184 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.init_kv_buffer()
+        self._configure_ascend_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
+
+    def _state_components(
+        self, device_pool
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        device_states = list(device_pool.mamba_cache.conv)
+        host_states = list(self.conv_buffer)
+        if self.temporal_state_elem_size > 0:
+            device_states.insert(0, device_pool.mamba_cache.temporal)
+            host_states.insert(0, self.temporal_buffer)
+        return device_states, host_states
+
+    @staticmethod
+    def _dense_device_slot_payload_unavailable_reason(
+        state: torch.Tensor, component: int
+    ) -> Optional[str]:
+        """Validate the physical slot payload consumed by the native 2D DMA."""
+        slot_elements = int(np.prod(state.shape[2:]))
+        payload_dims = sorted(
+            (int(state.stride(dim)), int(state.shape[dim]))
+            for dim in range(2, state.dim())
+            if state.shape[dim] > 1
+        )
+        expected_stride = 1
+        for stride, size in payload_dims:
+            if stride != expected_stride:
+                return (
+                    f"device component {component} slot payload is not "
+                    f"physically dense: shape={tuple(state.shape)}, "
+                    f"stride={tuple(state.stride())}, expected payload "
+                    f"stride {expected_stride}, got {stride}"
+                )
+            expected_stride *= size
+        if expected_stride != slot_elements:
+            return (
+                f"device component {component} slot payload span differs "
+                f"from its element count: shape={tuple(state.shape)}, "
+                f"stride={tuple(state.stride())}"
+            )
+        if state.stride(1) != slot_elements:
+            return (
+                f"device component {component} slots are not densely packed: "
+                f"shape={tuple(state.shape)}, stride={tuple(state.stride())}, "
+                f"slot_elements={slot_elements}"
+            )
+        if state.stride(0) < state.shape[1] * state.stride(1):
+            return (
+                f"device component {component} layer pitch overlaps slots: "
+                f"shape={tuple(state.shape)}, stride={tuple(state.stride())}"
+            )
+        return None
+
+    @classmethod
+    def _state_component_unavailable_reason(
+        cls,
+        device_state: torch.Tensor,
+        host_state: torch.Tensor,
+        component: int,
+    ) -> Optional[str]:
+        if device_state.device.type != "npu":
+            return (
+                f"device component {component} is on "
+                f"{device_state.device.type}, expected npu"
+            )
+        if host_state.device.type != "cpu":
+            return (
+                f"host component {component} is on "
+                f"{host_state.device.type}, expected cpu"
+            )
+        try:
+            is_pinned = bool(host_state.is_pinned())
+        except Exception as error:
+            return (
+                f"host component {component} pinned-memory query failed: "
+                f"{type(error).__name__}"
+            )
+        if not is_pinned:
+            return f"host component {component} is not pinned"
+        if not host_state.is_contiguous():
+            return f"host component {component} is not contiguous"
+        if device_state.dtype != host_state.dtype:
+            return f"component {component} has different device/host dtypes"
+        if device_state.dim() < 3 or host_state.dim() != device_state.dim() + 1:
+            return f"component {component} has an unsupported rank"
+        if (
+            device_state.shape[0] != host_state.shape[1]
+            or host_state.shape[2] != 1
+            or tuple(device_state.shape[2:]) != tuple(host_state.shape[3:])
+        ):
+            return f"component {component} has an unsupported layout"
+        return cls._dense_device_slot_payload_unavailable_reason(
+            device_state, component
+        )
+
+    def _ascend_async_unavailable_reason(self) -> Optional[str]:
+        if transfer_state_dim_exchange is None or not hasattr(
+            torch.ops.npu, "transfer_state_dim_exchange"
+        ):
+            return (
+                "sgl-kernel-npu does not provide "
+                "torch.ops.npu.transfer_state_dim_exchange"
+            )
+        if self.layout != "page_first_direct":
+            return f"unsupported host layout {self.layout!r}"
+
+        device_states, host_states = self._state_components(self.device_pool)
+        if len(device_states) != len(host_states):
+            return "device/host state component counts differ"
+        for component, (device_state, host_state) in enumerate(
+            zip(device_states, host_states)
+        ):
+            unavailable_reason = self._state_component_unavailable_reason(
+                device_state, host_state, component
+            )
+            if unavailable_reason is not None:
+                return unavailable_reason
+        return None
+
+    def _configure_ascend_mamba_io(self) -> None:
+        self.ascend_mamba_io_mode = "sync"
+        self.ascend_mamba_async_enabled = False
+        if not _is_npu:
+            return
+
+        self.ascend_mamba_io_mode = _ascend_hicache_mamba_io_mode()
+        if self.ascend_mamba_io_mode == "sync":
+            logger.info(
+                "Ascend HiCache Mamba state transfer mode: sync torch fallback."
+            )
+            return
+
+        unavailable_reason = self._ascend_async_unavailable_reason()
+        if unavailable_reason is None:
+            self.ascend_mamba_async_enabled = True
+            device_states, _ = self._state_components(self.device_pool)
+            logger.info(
+                "Ascend HiCache Mamba state transfer mode: native async "
+                "(requested=%s, components=%d).",
+                self.ascend_mamba_io_mode,
+                len(device_states),
+            )
+            return
+
+        if self.ascend_mamba_io_mode == "async":
+            raise RuntimeError(
+                "Ascend HiCache Mamba async state transfer was explicitly "
+                f"requested but is unavailable: {unavailable_reason}"
+            )
+        _warn_ascend_hicache_mamba_fallback_once(unavailable_reason)
+
+    def _transfer_state_async(
+        self,
+        device_pool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        direction,
+        layer_begin: int,
+        layer_count: int,
+    ) -> None:
+        device_states, host_states = self._state_components(device_pool)
+        transfer_op = transfer_state_dim_exchange
+        if transfer_op is None:
+            raise RuntimeError(
+                "Ascend HiCache Mamba async transfer was enabled without "
+                "the native state transfer operator."
+            )
+        transfer_op(
+            device_states=device_states,
+            host_states=host_states,
+            device_indices=device_indices,
+            host_indices=host_indices,
+            direction=direction,
+            layer_begin=layer_begin,
+            layer_count=layer_count,
+        )
 
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -379,6 +589,12 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            host_indices = src_indices.to(dtype=torch.int64, device=src.device)
+            device_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+            # Host: [slot, layer, 1, *state]; device: [slot, *state].
+            values = src.select(1, layer_id).index_select(0, host_indices).select(1, 0)
+            dst.index_copy_(0, device_indices, values.to(device=dst.device))
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -422,6 +638,18 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            device_indices = src_indices.to(dtype=torch.int64, device=src_layers.device)
+            host_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+            # Device: [layer, slot, *state]; host: [slot, layer, 1, *state].
+            values = (
+                src_layers.index_select(1, device_indices)
+                .movedim(0, 1)
+                .unsqueeze(2)
+                .contiguous()
+                .to(device=dst.device)
+            )
+            dst.index_copy_(0, host_indices, values)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -433,6 +661,18 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
+        if io_backend == "kernel_ascend" and getattr(
+            self, "ascend_mamba_async_enabled", False
+        ):
+            self._transfer_state_async(
+                device_pool=device_pool,
+                host_indices=host_indices,
+                device_indices=device_indices,
+                direction=TransferDirection.H2D,
+                layer_begin=layer_id,
+                layer_count=1,
+            )
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: nothing to transfer
             if self.temporal_state_elem_size > 0:
@@ -475,6 +715,18 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        if io_backend == "kernel_ascend" and getattr(
+            self, "ascend_mamba_async_enabled", False
+        ):
+            self._transfer_state_async(
+                device_pool=device_pool,
+                host_indices=host_indices,
+                device_indices=device_indices,
+                direction=TransferDirection.D2H,
+                layer_begin=0,
+                layer_count=self.num_mamba_layers,
+            )
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
