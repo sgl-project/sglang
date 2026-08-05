@@ -104,6 +104,7 @@ class MooncakeStoreConfig:
     client_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: Optional[str] = None
+    replica_num: Optional[int] = None
     tenant_id: str = DEFAULT_TENANT_ID
 
     @staticmethod
@@ -161,6 +162,7 @@ class MooncakeStoreConfig:
             ssd_offload_path=config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
+            replica_num=config.get("replica_num"),
             tenant_id=_normalize_tenant_id(
                 config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
             ),
@@ -205,6 +207,7 @@ class MooncakeStoreConfig:
             client_server_address=envs.MOONCAKE_CLIENT.get(),
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
+            replica_num=envs.MOONCAKE_REPLICA_NUM.get(),
             tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
         )
 
@@ -254,6 +257,7 @@ class MooncakeStoreConfig:
             ssd_offload_path=extra_config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
+            replica_num=extra_config.get("replica_num"),
             tenant_id=_normalize_tenant_id(
                 extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
             ),
@@ -399,6 +403,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.replica_num = self.config.replica_num
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -1290,6 +1295,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+
+        if self.replica_num is not None:
+            if config is None:
+                config = self._replicate_config_cls()
+            config.replica_num = self.replica_num
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
