@@ -121,9 +121,7 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
-_k3_shared_experts_attn_tp = get_bool_env_var(
-    "SGLANG_K3_SHARED_EXPERTS_ATTN_TP"
-)
+_k3_shared_experts_attn_tp = get_bool_env_var("SGLANG_K3_SHARED_EXPERTS_ATTN_TP")
 _k3_dense_mlp_attn_tp = get_bool_env_var("SGLANG_K3_DENSE_MLP_ATTN_TP")
 
 # ---------------------------------------------------------------------------
@@ -327,9 +325,7 @@ class KimiK3MLP(nn.Module):
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
         use_dp = (
-            self._dp_attention
-            and forward_batch is not None
-            and not self._dense_attn_tp
+            self._dp_attention and forward_batch is not None and not self._dense_attn_tp
         )
         if use_dp:
             local_hidden_states = hidden_states
@@ -547,9 +543,7 @@ class KimiK3MoE(nn.Module):
         # a2a: the block runs on partial batches (shard / DP-local rows), and
         # a TP-sharded partial sum could never be reduced across ranks that
         # hold different tokens.
-        self._shared_experts_tp1 = (
-            self._ep_a2a and not _k3_shared_experts_attn_tp
-        )
+        self._shared_experts_tp1 = self._ep_a2a and not _k3_shared_experts_attn_tp
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
@@ -964,9 +958,7 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _forward_shared_experts(
-        self, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
         if not self._shared_experts_attn_tp_comm:
             return self.shared_experts(hidden_states)
@@ -1001,6 +993,7 @@ class KimiK3MoE(nn.Module):
         # bandwidth away from the critical path.
         shared_output = None
         shared_event = None
+
         def issue_shared():
             nonlocal shared_output, shared_event
             if self.shared_experts is None or hidden_states.shape[0] == 0:
@@ -1852,6 +1845,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ) -> None:
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
+        # The fused Ascend split+RMSNorm path is not numerically equivalent for
+        # Kimi-K3. Other MLA models retain the existing fused fast path.
+        self._disable_npu_fused_split_qk_norm = True
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,

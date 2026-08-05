@@ -347,17 +347,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
     # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
     needs_cpu_seq_lens: bool = False
-    supports_speculative_conv_state_snapshots: bool = True
-
-    @staticmethod
-    def _channel_first_conv_states(conv_states: torch.Tensor) -> torch.Tensor:
-        """Expose the convolution state as ``[pool, channels, window]``.
-
-        The shared pool layout is ``[pool, window, channels]``. Platform
-        backends with a native channel-first pool can override this one hook
-        instead of adding device checks throughout the KDA implementation.
-        """
-        return conv_states.transpose(-1, -2)
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -365,10 +354,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
-        self.conv_states_shape = self._channel_first_conv_states(
+        self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
+            .transpose(-1, -2)
+            .shape
         )
-        self.conv_states_shape = self.conv_states_shape.shape
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         verify_backend = get_linear_attn_verify_backend()
@@ -514,7 +504,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         qkv = causal_conv1d_update(
             mixed_qkv,
-            self._channel_first_conv_states(conv_states),
+            conv_states.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
             activation="silu",
@@ -594,7 +584,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = self._channel_first_conv_states(mamba_cache_params.conv[0])
+        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
 
@@ -611,11 +601,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # source). The KDA pool stores conv states as [kernel-1, dim], so
             # rows of the raw [tokens, dim] pre-conv input index in directly
             # (GDN needs a transpose here; KDA does not).
-            conv_states[
+            mamba_cache_params.conv[0][
                 self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv[
-                self.forward_metadata.track_conv_indices
-            ].transpose(-1, -2)
+            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
@@ -628,56 +616,56 @@ class KDAAttnBackend(MambaAttnBackendBase):
         else:
             q_bias, k_bias, v_bias = None, None, None
 
-        q = self._causal_conv1d_extend(
+        q = causal_conv1d_fn(
             q,
             q_conv_weight,
             q_bias,
-            q_conv_state,
+            activation="silu",
+            conv_states=q_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        )
-        k = self._causal_conv1d_extend(
+        ).transpose(0, 1)
+        k = causal_conv1d_fn(
             k,
             k_conv_weight,
             k_bias,
-            k_conv_state,
+            activation="silu",
+            conv_states=k_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        )
-        v = self._causal_conv1d_extend(
+        ).transpose(0, 1)
+        v = causal_conv1d_fn(
             v,
             v_conv_weight,
             v_bias,
-            v_conv_state,
+            activation="silu",
+            conv_states=v_conv_state,
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        )
+        ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        g, beta, extend_A_log, extend_dt_bias = self._prepare_extend_gate_inputs(
-            layer, a, b
-        )
         track_ssm = self.forward_metadata.has_mamba_track_mask
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
+            g=a,
+            beta=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-            A_log=extend_A_log,
-            dt_bias=extend_dt_bias,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
@@ -701,49 +689,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
         return core_attn_out
-
-    def _causal_conv1d_extend(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        state: torch.Tensor,
-        *,
-        has_initial_state: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-    ) -> torch.Tensor:
-        return causal_conv1d_fn(
-            x,
-            weight,
-            bias,
-            activation="silu",
-            conv_states=state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=seq_lens_cpu,
-        ).transpose(0, 1)
-
-    def _prepare_extend_gate_inputs(
-        self,
-        layer: RadixLinearAttention,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        """Return the gate contract consumed by the extend kernel.
-
-        Shared GPU backends keep the current raw-gate contract. Platform
-        backends may override this hook when their proven kernel path expects
-        model-side gate activation instead.
-        """
-        return g, beta, layer.A_log, layer.dt_bias
 
     def _forward_target_verify(
         self,

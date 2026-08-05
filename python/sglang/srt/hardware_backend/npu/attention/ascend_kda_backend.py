@@ -13,7 +13,10 @@ from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
-from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+from sgl_kernel_npu.mamba.causal_conv1d import (
+    causal_conv1d_fn_npu,
+    causal_conv1d_update_npu,
+)
 from sgl_kernel_npu.mamba.causal_conv1d_verify import (
     causal_conv1d_linear_verify_npu,
 )
@@ -121,14 +124,187 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     differences required by Ascend.
     """
 
-    @staticmethod
-    def _channel_first_conv_states(conv_states: torch.Tensor) -> torch.Tensor:
-        # The NPU pool is allocated directly as [pool, channels, window].
-        return conv_states
+    supports_speculative_conv_state_snapshots: bool = True
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        # The NPU pool is allocated directly as [pool, channels, window].
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+
+    def forward_decode(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """Run KDA decode against the native channel-first Ascend cache."""
+        assert isinstance(mixed_qkv, torch.Tensor)
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = layer_cache.conv[0]
+        ssm_states = layer_cache.temporal
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+
+        qkv = causal_conv1d_update_npu(
+            mixed_qkv,
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+        )
+
+        if self.kernel_dispatcher.supports_packed_decode:
+            assert qkv.shape[0] == cache_indices.shape[0], (
+                "KDA packed decode requires one token per sequence (T=1): "
+                f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
+            )
+            core_attn_out = self.kernel_dispatcher.packed_decode(
+                mixed_qkv=qkv,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
+                lower_bound=layer.lower_bound,
+                replayssm_d=layer_cache.replayssm_d,
+                replayssm_k=layer_cache.replayssm_k,
+                replayssm_g=layer_cache.replayssm_g,
+                replayssm_write_pos=getattr(
+                    self.forward_metadata, "replayssm_write_pos", None
+                ),
+                replayssm_force_flush=getattr(
+                    self.forward_metadata, "replayssm_force_flush", None
+                ),
+            )
+        else:
+            q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+            q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+            k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+            v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+            core_attn_out = self.kernel_dispatcher.decode(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                lower_bound=layer.lower_bound,
+            )
+
+        self._track_mamba_state_decode(
+            forward_batch,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            layer.layer_id,
+        )
+        return core_attn_out
+
+    def forward_extend(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """Run Ascend prefill without changing the shared KDA backend."""
+        assert isinstance(mixed_qkv, torch.Tensor)
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = cache.conv[0]
+        ssm_states = cache.temporal
+
+        if forward_batch.extend_prefix_lens is None:
+            raise RuntimeError(
+                "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
+            )
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+
+        if self.forward_metadata.has_mamba_track_mask:
+            conv_states[self.forward_metadata.conv_states_mask_indices] = mixed_qkv[
+                self.forward_metadata.track_conv_indices
+            ].transpose(-1, -2)
+
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        if layer.bias is not None:
+            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        else:
+            q_bias, k_bias, v_bias = None, None, None
+
+        conv_kwargs = dict(
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
+        q = self._causal_conv1d_extend(
+            q, q_conv_weight, q_bias, q_conv_state, **conv_kwargs
+        )
+        k = self._causal_conv1d_extend(
+            k, k_conv_weight, k_bias, k_conv_state, **conv_kwargs
+        )
+        v = self._causal_conv1d_extend(
+            v, v_conv_weight, v_bias, v_conv_state, **conv_kwargs
+        )
+
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+        g, beta, extend_A_log, extend_dt_bias = self._prepare_extend_gate_inputs(
+            layer, a, b
+        )
+        track_ssm = self.forward_metadata.has_mamba_track_mask
+        core_attn_out = self.kernel_dispatcher.extend(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=extend_A_log,
+            dt_bias=extend_dt_bias,
+            lower_bound=layer.lower_bound,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+            return_intermediate_states=track_ssm,
+            track_ssm_h_src=(
+                self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
+        )
+        if track_ssm:
+            core_attn_out, h = core_attn_out
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, self.forward_metadata
+            )
+        return core_attn_out
 
     def _causal_conv1d_extend(
         self,

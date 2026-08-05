@@ -249,14 +249,12 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
-        self.is_kimi_k3 = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and "KimiK3ForConditionalGeneration"
-            in getattr(
-                self.tokenizer_manager.model_config.hf_config,
-                "architectures",
-                [],
-            )
+        self.is_kimi_k3 = hasattr(
+            self.tokenizer_manager.model_config, "hf_config"
+        ) and "KimiK3ForConditionalGeneration" in getattr(
+            self.tokenizer_manager.model_config.hf_config,
+            "architectures",
+            [],
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.

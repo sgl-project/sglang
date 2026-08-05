@@ -278,8 +278,8 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     from sglang.srt.utils import is_npu
 
-    npu_enabled = is_npu()
-    if not (server_args.device.startswith("cuda") or npu_enabled):
+    _is_npu = is_npu()
+    if not (server_args.device.startswith("cuda") or _is_npu):
         raise ValueError(
             "DSpark speculative decoding only supports CUDA and NPU devices."
         )
@@ -287,7 +287,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not npu_enabled and server_args.moe_a2a_backend != "none":
+        if not _is_npu and server_args.moe_a2a_backend != "none":
             raise ValueError(
                 "DSpark with dp attention only supports the built-in TP MoE "
                 f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
@@ -298,7 +298,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
-            not npu_enabled
+            not _is_npu
             and server_args.speculative_moe_a2a_backend is not None
             and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
         ):

@@ -205,9 +205,7 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-            prefix_in_quant_config = self._resolve_quant_prefix(
-                prefix_in_quant_config
-            )
+            prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -320,9 +318,7 @@ class ModelSlimConfig(QuantizationConfig):
                         f"{candidate}.0.{up_name}.weight",
                     ]
                     w2_key = f"{candidate}.0.{down_name}.weight"
-                    w13_found = any(
-                        k in self.quant_description for k in w13_keys
-                    )
+                    w13_found = any(k in self.quant_description for k in w13_keys)
                     w2_found = w2_key in self.quant_description
                     status = (
                         f"{candidate} "

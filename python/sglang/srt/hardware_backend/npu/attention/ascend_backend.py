@@ -68,6 +68,7 @@ def _reshape_kv_for_fia_nz(
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
+
 @dataclass
 class ForwardMetadata:
 
