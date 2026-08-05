@@ -595,8 +595,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
+            if (
+                storage_config is not None
+                and storage_config.canonical_suffix is not None
+            ):
+                # canonical-grid key scheme: topology-free cell coordinates
+                # replace the rank/pp suffixes. A list means the cell adapter
+                # is active (one suffix per owned cell).
+                self.mha_suffix = storage_config.canonical_suffix
+                self.mla_suffix = storage_config.canonical_suffix
 
             self.registered_pools = {}
+            # Cell adapter state; set up in register_mem_pool_host. Two
+            # arenas because the backup and prefetch threads run
+            # concurrently; both stay None when every cell is
+            # pool-contiguous (pure zero-copy).
+            self.cell_adapter = False
+            self.cell_arena_set = None
+            self.cell_arena_get = None
+            self.cell_arena_pages = 0
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -696,6 +713,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+        if (
+            self.storage_config is not None
+            and self.storage_config.canonical_layer_ranges is not None
+        ):
+            # Cell adapter: objects use the layout-neutral canonical byte
+            # order. Slabs already pool-contiguous transfer zero-copy; the
+            # rest stage through pinned, store-registered arenas (sized by
+            # extra-config cell_arena_mb, default 256, floored at one page).
+            self.cell_adapter = True
+            cfg = self.storage_config
+            if self.mem_pool_host.cells_all_direct(
+                cfg.canonical_layer_ranges, cfg.canonical_head_ranges
+            ):
+                logger.info(
+                    "HiCache cell adapter: all cells pool-contiguous, "
+                    "zero-copy (no staging arenas)."
+                )
+                return
+            extra = cfg.extra_config or {}
+            arena_mb = extra.get("cell_arena_mb", 256)
+            page_cell_bytes = self.mem_pool_host.cell_bytes(
+                cfg.canonical_layer_ranges, cfg.canonical_head_ranges
+            )
+            arena_bytes = max(int(arena_mb) << 20, page_cell_bytes)
+            self.cell_arena_pages = arena_bytes // page_cell_bytes
+            arena_numel = self.cell_arena_pages * page_cell_bytes
+            self.cell_arena_set = torch.empty(
+                arena_numel, dtype=torch.uint8, pin_memory=True
+            )
+            self.cell_arena_get = torch.empty(
+                arena_numel, dtype=torch.uint8, pin_memory=True
+            )
+            super().register_buffer(self.cell_arena_set)
+            super().register_buffer(self.cell_arena_get)
+            logger.info(
+                "HiCache cell adapter: 2 x %d-page staging arenas (%.1f MB "
+                "each) for the backup and prefetch threads.",
+                self.cell_arena_pages,
+                arena_numel / (1 << 20),
+            )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -946,9 +1004,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        # One cell per entry of the mha_suffix list (legacy split-heads
+        # virtual ranks).
         ptr_list, element_size_list = (
             self.mem_pool_host.get_split_heads_page_buffer_meta(
-                indices, self.split_factor
+                indices, len(self.mha_suffix)
             )
         )
         key_list = []
@@ -1011,11 +1071,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
-        else:
-            if self.should_split_heads:
-                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-            else:
-                return self._get_mha_buffer_meta(keys, host_indices)
+        if isinstance(self.mha_suffix, list):
+            # Legacy split-heads (rank-suffix tp_lcm_size); canonical cell
+            # fan-out goes through the adapter path instead.
+            return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+        return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(
         self, results: List[int], is_set_operate=False, key_multiplier=None
@@ -1029,11 +1089,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = (
+                    len(self.mla_suffix) if isinstance(self.mla_suffix, list) else 1
+                )
             else:
                 key_multiplier = 2
-                if self.should_split_heads:
-                    key_multiplier *= self.split_factor
+                if isinstance(self.mha_suffix, list):
+                    key_multiplier *= len(self.mha_suffix)
 
         result_groups = [
             results[i : i + key_multiplier]
@@ -1048,6 +1110,124 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    def _adapter_cell_keys(self, page_keys: List[str]) -> List[str]:
+        # Page-major, then the suffix list (layer-major, head-minor); MHA
+        # splits each cell into K and V slabs — matching the pool adapter's
+        # slab order exactly.
+        key_list = []
+        if self.is_mla_backend:
+            for key_ in page_keys:
+                for suffix in self.mla_suffix:
+                    key_list.append(f"{key_}_{suffix}_k")
+            return key_list
+        for key_ in page_keys:
+            for suffix in self.mha_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        return key_list
+
+    def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
+        """Cell-adapter write: gather canonical cells (zero-copy where the
+        pool is already contiguous, staged through the arena otherwise) and
+        put per sub-batch."""
+        start_time = time.perf_counter()
+        cfg = self.storage_config
+        page_size = self.mem_pool_host.page_size
+        results: List[bool] = []
+        pages_per_batch = self.cell_arena_pages or len(keys)
+        for start in range(0, len(keys), pages_per_batch):
+            page_keys = keys[start : start + pages_per_batch]
+            indices = host_indices[
+                start * page_size : (start + len(page_keys)) * page_size
+            ]
+            ptrs, sizes = self.mem_pool_host.gather_cells_canonical(
+                indices,
+                cfg.canonical_layer_ranges,
+                cfg.canonical_head_ranges,
+                self.cell_arena_set,
+            )
+            key_strs = self._adapter_cell_keys(page_keys)
+            assert len(key_strs) == len(ptrs)
+            multiplier = len(key_strs) // len(page_keys)
+            exist_result = self._batch_exist(key_strs)
+            put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
+            set_results = [-1] * len(key_strs)
+            for i, key_str in enumerate(key_strs):
+                if exist_result[i] != 1:
+                    put_keys.append(key_str)
+                    put_ptrs.append(ptrs[i])
+                    put_sizes.append(sizes[i])
+                    put_slots.append(i)
+                else:
+                    set_results[i] = 0
+            if put_keys:
+                group_ids = (
+                    self._expand_group_ids(page_keys, multiplier)
+                    if self._can_use_group_semantics()
+                    else None
+                )
+                if group_ids is not None:
+                    group_ids = [group_ids[i] for i in put_slots]
+                put_results = self._put_batch_zero_copy_impl(
+                    put_keys, put_ptrs, put_sizes, group_ids=group_ids
+                )
+                for slot, res in zip(put_slots, put_results):
+                    set_results[slot] = res
+            results.extend(
+                self._batch_postprocess(
+                    set_results, is_set_operate=True, key_multiplier=multiplier
+                )
+            )
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(len(keys))
+            self.backup_bandwidth.append(
+                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
+            )
+        return results
+
+    def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
+        """Cell-adapter read: fetch each slab straight into the pool when it
+        is contiguous there, else into the arena; then scatter the staged
+        slabs of successful pages."""
+        start_time = time.perf_counter()
+        cfg = self.storage_config
+        page_size = self.mem_pool_host.page_size
+        results: List[bool] = []
+        pages_per_batch = self.cell_arena_pages or len(keys)
+        for start in range(0, len(keys), pages_per_batch):
+            page_keys = keys[start : start + pages_per_batch]
+            indices = host_indices[
+                start * page_size : (start + len(page_keys)) * page_size
+            ]
+            key_strs = self._adapter_cell_keys(page_keys)
+            multiplier = len(key_strs) // len(page_keys)
+            ptrs, sizes = self.mem_pool_host.cell_read_metas(
+                indices,
+                cfg.canonical_layer_ranges,
+                cfg.canonical_head_ranges,
+                self.cell_arena_get,
+            )
+            assert len(key_strs) == len(ptrs)
+            get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
+            page_ok = self._batch_postprocess(
+                get_results, is_set_operate=False, key_multiplier=multiplier
+            )
+            if self.cell_arena_get is not None and any(page_ok):
+                self.mem_pool_host.scatter_cells_canonical(
+                    indices,
+                    cfg.canonical_layer_ranges,
+                    cfg.canonical_head_ranges,
+                    self.cell_arena_get,
+                    page_ok,
+                )
+            results.extend(page_ok)
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
+            )
+        return results
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1060,6 +1240,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
+
+        if self.cell_adapter:
+            return self._batch_get_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
@@ -1089,6 +1272,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
+
+        if self.cell_adapter:
+            return self._batch_set_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
@@ -1265,16 +1451,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            if isinstance(self.mla_suffix, list):
+                query_keys = [
+                    f"{key}_{suffix}_k" for key in keys for suffix in self.mla_suffix
+                ]
+                key_multiplier = len(self.mla_suffix)
+            else:
+                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+                key_multiplier = 1
         else:
             query_keys = []
-            if self.should_split_heads:
+            if isinstance(self.mha_suffix, list):
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
                         query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
+                key_multiplier = 2 * len(self.mha_suffix)
             else:
                 for key in keys:
                     query_keys.append(f"{key}_{self.mha_suffix}_k")

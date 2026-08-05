@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -23,6 +24,10 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    # Step 0: L3 key-scheme validation. Runs before the early return so
+    # canonical-grid flags are never silently inert.
+    resolve_hicache_key_scheme(server_args)
+
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
         cfg.enable_hierarchical_cache
@@ -66,6 +71,88 @@ def handle_hicache_ratio_default(server_args: Any):
                 1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
             ),
         )
+
+
+def resolve_hicache_key_scheme(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.hicache_storage_key_scheme == "rank-suffix":
+        return
+    if not (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
+        raise ValueError(
+            "--hicache-storage-key-scheme canonical-grid has no effect "
+            "without --enable-hierarchical-cache (or decode KV offload); "
+            "refusing a silently inert flag."
+        )
+    if cfg.hicache_storage_backend is None:
+        raise ValueError(
+            "--hicache-storage-key-scheme canonical-grid requires an L3 "
+            "backend (--hicache-storage-backend)."
+        )
+    if cfg.hicache_storage_backend not in ("file", "mooncake"):
+        raise NotImplementedError(
+            "canonical-grid v1 supports --hicache-storage-backend file "
+            f"or mooncake; got {cfg.hicache_storage_backend!r}. Other "
+            "backends need cell-granular key support first."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(
+            "canonical-grid does not cover speculative-decoding draft "
+            "pools yet; use --hicache-storage-key-scheme rank-suffix."
+        )
+    # Topologies whose at-rest KV is not a dense per-rank rectangle of
+    # whole pages cannot be named by canonical cells yet. Checked here
+    # (not only at attach) because the decode-offload attach path has no
+    # CP/DCP group wired into its controller.
+    if cfg.dcp_size > 1:
+        raise NotImplementedError(
+            "canonical-grid with --dcp-size > 1 is not supported: each "
+            "DCP rank holds an interleaved token shard (needs the "
+            "token-granule extension)."
+        )
+    # attn_cp_size is resolvable (prefill-CP overrides stash it without
+    # mutating the raw field), so read it through the resolved view.
+    if cfg.attn_cp_size > 1:
+        raise NotImplementedError(
+            "canonical-grid with --attn-cp-size > 1 is not supported: "
+            "CP ranks hold sub-page slices or replicated pages (needs "
+            "token-granule cells / writer election)."
+        )
+    # Best-effort early check of the partition knobs when the extra
+    # config is inline JSON (the '@file' form is re-validated at attach).
+    # Any knob selects the cell adapter: objects use the layout-neutral
+    # canonical byte order, so there is no host-layout requirement, but
+    # the per-cell key fan-out needs a multi-key backend.
+    extra = cfg.hicache_storage_backend_extra_config
+    if extra and not extra.startswith("@"):
+        try:
+            extra_dict = json.loads(extra)
+            tp_lcm_size = extra_dict.get("tp_lcm_size")
+            head_group = extra_dict.get("head_group")
+            layer_partition = extra_dict.get("layer_partition")
+        except (ValueError, AttributeError):
+            tp_lcm_size = None
+            head_group = None
+            layer_partition = None
+        if tp_lcm_size:
+            raise ValueError(
+                "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                "canonical-grid uses head_group in the extra config "
+                "(heads per cell)."
+            )
+        # head_group is ignored on rank-replicated (MLA-family) pools, so
+        # a shared fleet extra-config must not be rejected for them here.
+        adapter = layer_partition is not None or (
+            head_group and not use_mla_backend(server_args)
+        )
+        if adapter and cfg.hicache_storage_backend != "mooncake":
+            raise NotImplementedError(
+                "canonical-grid partition knobs (head_group / "
+                "layer_partition) need a multi-key-per-page backend; "
+                "only mooncake supports them."
+            )
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
