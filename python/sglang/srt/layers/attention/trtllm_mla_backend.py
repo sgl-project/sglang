@@ -19,6 +19,20 @@ from sglang.kernels.ops.attention.pad import (
 from sglang.kernels.ops.attention.pad import (
     unpad_draft_extend_output as unpad_draft_extend_output_triton,
 )
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    can_use_set_mla_kv_concat_q,
+    can_use_set_mla_kv_concat_q_fp8,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    covered as set_mla_kv_concat_q_covered,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    covered_fp8 as set_mla_kv_concat_q_fp8_covered,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    set_mla_kv_concat_q,
+    set_mla_kv_concat_q_fp8,
+)
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -146,6 +160,13 @@ class TRTLLMMLAPrefillMetadata:
     fallback_to_flashinfer_impl: bool = False
 
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
+# Arm PDL on the trtllm-gen decode launch so its prolog overlaps the tail of
+# the query-prep kernels (which already trigger their PDL secondary).
+_ENABLE_PDL = is_arch_support_pdl()
+
+
 @dataclass
 class TRTLLMMLADecodeMetadata:
     """Metadata for TRTLLM MLA decode operations."""
@@ -166,6 +187,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # trtllm-gen kernels rebuild metadata from preallocated buffers and never
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
+
+    # Ragged verify: the packed query is front-aligned into the dense
+    # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
+    supports_ragged_verify_graph: bool = True
 
     def __init__(
         self,
@@ -266,6 +291,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # write translates through the pool's _full_translate hook instead).
         self._decode_dense_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_dense: Optional[torch.Tensor] = None
+        # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
+        # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
+        # async asserts: the fused path writes the pool directly and would
+        # skip the pool's OOB probe.
+        self._fused_set_kv_concat_q = (
+            self.data_type == torch.bfloat16
+            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+            and can_use_set_mla_kv_concat_q(
+                self.kv_lora_rank * 2, self.qk_rope_head_dim * 2
+            )
+        )
+        # fp8 sibling: quantize + KV scatter + q concat in one launch
+        # (replaces mla_quantize_without_rope_for_fp8's concat + three aten
+        # casts plus the KV-row write on the fp8 decode path).
+        self._fused_set_kv_concat_q_fp8 = (
+            self.data_type == torch.float8_e4m3fn
+            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and can_use_set_mla_kv_concat_q_fp8()
+        )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -415,6 +461,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         device: torch.device,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
+        if forward_mode.is_target_verify() and bs in self.decode_cuda_graph_metadata:
+            # Token tiers at the same slot count must share one per-bs buffer
+            # set (each graph bakes in the tensors it captured).
+            self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
+            return
         metadata = TRTLLMMLADecodeMetadata()
 
         if forward_mode.is_target_verify():
@@ -436,6 +487,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_q = torch.full(
                 (bs,), num_tokens_per_req, dtype=torch.int32, device=device
             )
+            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+        if metadata.seq_lens_k is None:
+            # Plain decode: static int32 seq_lens buffer, refreshed by the
+            # capture+replay body below (same pattern as target-verify).
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
         # Capture with full width so future longer sequences are safe during replay.
@@ -476,6 +532,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+        elif metadata.seq_lens_k is not None:
+            # Plain decode: int64 -> int32 downcast copy into the static
+            # buffer (once per step, replacing the per-layer conversion).
+            metadata.seq_lens_k.copy_(seq_lens[:bs])
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[
@@ -643,6 +703,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.global_seq_lens_k = (
                     self.forward_decode_metadata.seq_lens_k
                 )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                # One int32 conversion per step; forward_decode reads it back
+                # so the per-layer .to(int32) in _run_decode_kernel stays a
+                # no-op (24 elementwise copies/step otherwise).
+                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -699,14 +764,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cu_seqlens_q: torch.Tensor,
         seq_lens_q: torch.Tensor,
         sum_seq_lens_q: int,
+        zero_uncovered: bool = False,
     ) -> torch.Tensor:
-        """Unpad draft extended output using Triton kernel."""
+        """Unpad draft extended output using Triton kernel.
+
+        zero_uncovered: ragged verify's clamped rows leave output positions
+        unwritten; zero the destination so those discarded rows stay finite
+        (draft_extend writes every position and does not need this).
+        """
+        output_buffer = self.unpad_output_buffer
+        if zero_uncovered:
+            if output_buffer is not None:
+                output_buffer[:sum_seq_lens_q].zero_()
+            else:
+                # No persistent buffer without cuda graph state; the triton
+                # wrapper's dynamic fallback is torch.empty.
+                output_buffer = torch.zeros(
+                    (sum_seq_lens_q, raw_out.shape[2], raw_out.shape[3]),
+                    dtype=raw_out.dtype,
+                    device=raw_out.device,
+                )
         return unpad_draft_extend_output_triton(
             raw_out,
             cu_seqlens_q,
             seq_lens_q,
             sum_seq_lens_q,
-            self.unpad_output_buffer,
+            output_buffer,
         )
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
@@ -738,8 +821,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        *,
+        causal_seqs: Optional[torch.Tensor] = None,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        return_lse: bool = False,
     ) -> torch.Tensor:
-        """Hook for subclasses to swap the decode/spec-verify kernel."""
+        """Hook for subclasses to swap the decode/spec-verify kernel.
+
+        The DCP arguments belong to the hook contract because forward_extend
+        passes them on the DCP target-verify path. This implementation does not
+        forward them to the kernel and returns no LSE, so only the DCP-capable
+        subclasses serve them."""
+        if cp_world > 1 or return_lse:
+            raise NotImplementedError(
+                "trtllm_mla does not forward the cyclic DCP metadata to its "
+                "decode kernel and returns no rank-local LSE for the cross-rank "
+                "merge; select cutedsl_mla or tokenspeed_mla for a DCP "
+                "target-verify run"
+            )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
@@ -761,6 +861,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
+            enable_pdl=_ENABLE_PDL,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -818,6 +919,101 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
 
+    def _set_kv_and_concat_q_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Decode: scatter the KV row at ``loc`` (already physical — the
+        dense-loc buffer on the unified pool, or out_cache_loc on the static
+        pool where ``_full_translate`` is identity) and build the
+        [q_nope | q_rope] fmha query in one kernel launch (saves one launch
+        per MLA layer and keeps the PDL chain intact).
+
+        Returns the concatenated query, or None when the fused kernel does
+        not cover the inputs (caller falls back to the two-kernel path).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # Same raw per-layer buffer the decode kernel reads below (bf16-only
+        # gate means store_dtype == dtype, so no view); get_key_buffer applies
+        # the hybrid pool's full-attention layer-id mapping.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        return set_mla_kv_concat_q(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        )
+
+    def _set_kv_and_concat_q_fp8_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """fp8-KV decode: quantize + scatter the KV row at ``loc`` (already
+        physical) and build the fp8 [q_nope | q_rope] query in one launch.
+
+        Returns the fp8 query, or None when the fused kernel does not cover
+        the inputs (caller falls back to the aten quantize chain).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # fp8 view of the pool's uint8 store; same buffer the decode kernel
+        # reads below.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_fp8_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        parallel = get_parallel()
+        return set_mla_kv_concat_q_fp8(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
+            # (identity when attn_dcp_size == 1).
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -834,12 +1030,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = (
+                        self._decode_dense_loc
+                        if self._decode_dense_loc is not None
+                        else (
+                            None if self._unified_mla else forward_batch.out_cache_loc
+                        )
+                    )
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -854,34 +1071,65 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        if save_kv_cache:
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        query = fused_fp8_query
+        if query is None and save_kv_cache:
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             if self._decode_dense_loc is not None:
                 # cuda-graph path: dense write loc precomputed out-of-graph, so
                 # the in-graph write captures no translate allocation.
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
-                )
+                if merge_query and self._fused_set_kv_concat_q:
+                    # Fused: KV scatter + [q_nope | q_rope] concat in one
+                    # launch; None when the inputs are not covered.
+                    query = self._set_kv_and_concat_q_fused(
+                        layer=layer,
+                        loc=self._decode_dense_loc,
+                        k=k,
+                        k_rope=k_rope,
+                        q=q,
+                        q_rope=q_rope,
+                    )
+                if query is None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                    )
             else:
                 # eager (or static pool): the pool's _full_translate handles it.
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+                if (
+                    merge_query
+                    and self._fused_set_kv_concat_q
+                    and not self._unified_mla
+                ):
+                    # Static pool: _full_translate is identity, so
+                    # out_cache_loc is already the physical write loc.
+                    query = self._set_kv_and_concat_q_fused(
+                        layer=layer,
+                        loc=forward_batch.out_cache_loc,
+                        k=k,
+                        k_rope=k_rope,
+                        q=q,
+                        q_rope=q_rope,
+                    )
+                if query is None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
 
-        # Prepare query tensor inline
-        if merge_query:
-            # For FP16 path, we merge the query and rope parts into a single tensor
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-            query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
-        else:
-            # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        # Prepare query tensor inline (already built when the fused save-KV
+        # path ran)
+        if query is None:
+            if merge_query:
+                # For FP16 path, we merge the query and rope parts into a single tensor
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope_reshaped = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+                query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            else:
+                # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
+                query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
@@ -915,7 +1163,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query=query,
             kv_cache=kv_cache,
             block_tables=metadata.block_kv_indices,
-            seq_lens=forward_batch.seq_lens,
+            seq_lens=(
+                metadata.seq_lens_k
+                if metadata.seq_lens_k is not None
+                else forward_batch.seq_lens
+            ),
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
         )
@@ -1038,9 +1290,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len = metadata.max_seq_len_k + (
                     0 if dcp_enabled else draft_token_num
                 )
-                # For target_verify, all sequences have the same number of draft tokens
-                q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-                needs_unpad = False
+                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                if ragged_layout is None or dcp_enabled:
+                    q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+                    needs_unpad = False
+                else:
+                    if ragged_layout.bs != bs:
+                        # Capped variant: the dense [bs, draft_token_num] q
+                        # buffer below cannot take a row the full-coverage pad
+                        # may inflate past the verify window, and it keeps
+                        # qo_indptr consistent with the clamped lens (same
+                        # contract as the KDA dense path).
+                        ragged_layout = ragged_layout.padded_to_bucket(
+                            padded_bs=bs, cap=draft_token_num
+                        )
+                    total_tokens = q.shape[0]
+                    seq_lens_q = torch.clamp(
+                        ragged_layout.verify_lens, max=draft_token_num
+                    )
+                    cu_seqlens_q = ragged_layout.qo_indptr_device
+                    padded_q = torch.zeros(
+                        (bs, draft_token_num, layer.tp_q_head_num, layer.head_dim),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    q = self.pad_draft_extend_query(
+                        q, padded_q, seq_lens_q, cu_seqlens_q
+                    )
+                    needs_unpad = True
+                    unpad_zero_uncovered = True
+                    unpad_seq_lens_q = seq_lens_q
+                    unpad_cu_seqlens_q = cu_seqlens_q
+                    unpad_sum_seq_lens_q = total_tokens
             else:
                 # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
                 # we can directly reshape q; otherwise, pad to max_seq_len_q.
@@ -1084,6 +1365,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
                     )
                     needs_unpad = True
+                    unpad_zero_uncovered = False
                     unpad_seq_lens_q = actual_seq_lens_q
                     unpad_cu_seqlens_q = actual_cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
@@ -1145,6 +1427,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q,
                     unpad_seq_lens_q,
                     unpad_sum_seq_lens_q,
+                    zero_uncovered=unpad_zero_uncovered,
                 )
                 output = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             else:
