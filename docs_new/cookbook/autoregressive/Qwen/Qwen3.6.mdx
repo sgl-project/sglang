@@ -76,7 +76,7 @@ Both variants share the same hybrid reasoning, tool-calling, and multimodal inte
 
 ## 2. SGLang Installation
 
-SGLang `>=0.5.10` is required for Qwen3.6. You can install from PyPI, from source, or use a Docker image:
+The recipes on this page were validated on **SGLang 0.5.15–0.5.16** (each benchmark cell records its exact `sglang_version`); use a recent release. You can install from PyPI, from source, or use a Docker image:
 
 ```bash Command
 # Install from PyPI
@@ -103,10 +103,6 @@ This section provides deployment configurations optimized for different hardware
 
 
 <Deployment config={config} benchmarks={benchmarks} />
-
-<a id="playground" />
-
-<Playground config={config} />
 
 ### 3.2 Configuration Tips
 
@@ -182,6 +178,19 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. 
 
 
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+The knobs come in two flavors:
+
+- **Built-in SGLang features** — parallelism overrides (TP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding (MTP) presets, prefill/decode disaggregation, and HiCache tiers.
+- **Qwen3.6-specific** — the **Mamba Radix Cache** strategy (V1 vs V2 `extra_buffer`).
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
+
+<Playground config={config} />
 
 ## 4. Model Invocation
 
