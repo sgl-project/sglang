@@ -85,22 +85,21 @@ export const Llama33Deployment = () => {
   // Generate command
   const generateCommand = () => {
     const { hardware, quantization, toolcall } = values;
-    const isArcB = hardware === 'Arc B';
-    const isXeon = hardware === 'xeon';
 
     // Select model based on quantization
-    const modelPath = quantization === 'fp8' && !isXeon && !isArcB
+    const modelPath = quantization === 'fp8' && hardware !== 'xeon' && hardware !== 'Arc B'
       ? 'amd/Llama-3.3-70B-Instruct-FP8-KV'
       : 'meta-llama/Llama-3.3-70B-Instruct';
 
     // Build command
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath} \\\n`;
-    if (isXeon) {
+    if (hardware === 'xeon') {
       cmd += `  --device cpu \\\n`;
       cmd += `  --disable-overlap-schedule \\\n`;
       cmd += `  --tp 6`;
-    } else if (isArcB) {
+    } else if (hardware === 'Arc B') {
+      cmd = `SGLANG_USE_SGL_XPU=1 ` + cmd;
       cmd += `  --device xpu \\\n`;
       cmd += `  --tp 8`;
     } else {
