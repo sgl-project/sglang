@@ -129,6 +129,15 @@ def _all_gather_dsa_trtllm_fp8_kv(
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
+def _should_all_gather_dsa_trtllm_fp8_kv(
+    *,
+    save_kv_cache: bool,
+    cos_sin_cache: Optional[torch.Tensor],
+    dsa_prefill_cp: bool,
+) -> bool:
+    return save_kv_cache and cos_sin_cache is not None and dsa_prefill_cp
+
+
 def materialize_full_kv_cp(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -3717,7 +3726,11 @@ class DeepseekSparseAttnBackend(
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
                 )
-            if save_kv_cache and dsa_use_prefill_cp(forward_batch):
+            if _should_all_gather_dsa_trtllm_fp8_kv(
+                save_kv_cache=save_kv_cache,
+                cos_sin_cache=cos_sin_cache,
+                dsa_prefill_cp=dsa_use_prefill_cp(forward_batch),
+            ):
                 if is_cp_v2_active(forward_batch):
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
