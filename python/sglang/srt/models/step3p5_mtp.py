@@ -79,7 +79,15 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.enorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
+        # Step-3.7 NVFP4 stores the grafted shared-head tensor in BF16. Its
+        # rewritten draft name does not match ModelOpt's layer exclusions.
+        qname = str(quant_config.get_name()) if quant_config is not None else ""
+        shared_head_quant_config = (
+            None if "fp4" in qname.lower() else quant_config
+        )
+        self.shared_head = SharedHead(
+            config=config, quant_config=shared_head_quant_config
+        )
         self.mtp_block = Step3p5DecoderLayer(
             config=config, layer_id=layer_id, prefix=f"{prefix}.mtp_block"
         )
