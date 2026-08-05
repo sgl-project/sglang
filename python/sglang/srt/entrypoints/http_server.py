@@ -253,6 +253,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(
         _GlobalState(
@@ -794,6 +795,7 @@ async def server_info():
                 dataclasses.asdict(server_args)
             ),
             **_global_state.scheduler_info,
+            "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
@@ -893,7 +895,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -2046,7 +2048,8 @@ async def vertex_generate(
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
@@ -2521,7 +2524,12 @@ def _setup_and_run_http_server(
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:
