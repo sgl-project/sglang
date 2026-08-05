@@ -1078,7 +1078,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=None if two_stage else onorm_gate,
             onorm_weight=None if two_stage else onorm_weight,
             onorm_eps=None if two_stage else onorm_eps,
-            pdl_late=two_stage,
+            # two_stage implies split_tile_v == 32, i.e. the split module's
+            # kernel; the serial module's fused_kda_decode_mtp_dspark has no
+            # pdl_late parameter, so only forward the flag when it can be set.
+            **({"pdl_late": True} if two_stage else {}),
             **({"split_v": True} if split_v else {}),
             **({"split_tile_v": split_tile_v} if split_tile_v else {}),
         )
