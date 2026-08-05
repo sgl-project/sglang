@@ -331,6 +331,7 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.ps = ParallelState.trivial()
         self.is_draft_worker = False
+        self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
         # this dense mock declares none.
         self.model = nn.Module()
