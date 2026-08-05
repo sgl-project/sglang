@@ -292,6 +292,10 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        # Scale cohorts create new groups containing only their own ranks.
+        # PyTorch's default new_group protocol requires non-members to enter
+        # group creation too, which would stall the already-serving ranks.
+        use_local_synchronization = rank_offset > 0 and not recovered_rank
 
         if is_cuda_alike():
             device_id = (
@@ -348,12 +352,14 @@ class GroupCoordinator:
                     backend="mooncake",
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    use_local_synchronization=use_local_synchronization,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    use_local_synchronization=use_local_synchronization,
                 )
             else:
                 active_ranks = torch.ones(
@@ -366,11 +372,15 @@ class GroupCoordinator:
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    use_local_synchronization=use_local_synchronization,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    use_local_synchronization=use_local_synchronization,
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -2256,10 +2266,11 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # Joiners construct their local TP/PP layout in global rank space.
+    # Joiners construct their local TP/PP layout in global rank space. Scale
+    # cohorts are static local groups with a non-zero global rank offset.
     world_size: int = (
         tensor_model_parallel_size * pipeline_model_parallel_size
-        if recovered_rank
+        if recovered_rank or rank_offset > 0
         else torch.distributed.get_world_size()
     )
 
@@ -2348,6 +2359,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(

@@ -288,17 +288,19 @@ def all_gather_kv_cache_for_mla_extend(
     )
     dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # Attention TP may append dummy tokens to align an extend batch to its
+    # group width. The DCP buffer tracks only real sequence tokens.
+    extend_num_tokens = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         :kv_lora_rank,
-    ] = k_nope
+    ] = k_nope[:extend_num_tokens]
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         kv_lora_rank:,
-    ] = k_pe
+    ] = k_pe[:extend_num_tokens]
 
 
 # all gather kv cache and re-org to query orders

@@ -349,13 +349,18 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
+    _, attn_tp_size, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
-        _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
+    if (
+        server_args.elastic_ep_backend is not None
+        and server_args.max_ep_size
+        and server_args.max_ep_size > server_args.tp_size
+    ):
+        attn_replica_size = attn_tp_size * attn_cp_size
+        _ATTN_DP_RANK += server_args.ep_join_rank_offset // attn_replica_size
         if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 

@@ -53,6 +53,10 @@ from sglang.srt.elastic_ep.elastic_ep import (
     try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
+from sglang.srt.elastic_ep.topology import (
+    physical_ep_rank_to_dp_rank,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -436,6 +440,10 @@ class ModelRunner:
             return
 
         join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
+        attn_replica_size = self.ps.attn_tp_size * self.ps.attn_cp_size
+        join_effective_dp_size = physical_ep_size_to_dp_size(
+            join_effective_ep_size, attn_replica_size
+        )
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
@@ -467,10 +475,10 @@ class ModelRunner:
 
         enable_joiner_all_gather()
         update_dp_attention_post_scale(
-            new_dp_size=join_effective_ep_size,
-            new_dp_rank=global_ep_rank,
+            new_dp_size=join_effective_dp_size,
+            new_dp_rank=physical_ep_rank_to_dp_rank(global_ep_rank, attn_replica_size),
         )
-        get_context().override("elastic_ep.scale_join", dp_size=join_effective_ep_size)
+        get_context().override("elastic_ep.scale_join", dp_size=join_effective_dp_size)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
                 "EPLB rebalance is disabled while elastic EP scale-up "
@@ -1906,11 +1914,18 @@ class ModelRunner:
 
         from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
 
-        update_dp_attention_post_scale(
-            new_dp_size=target_size,
-            new_dp_rank=self._elastic_global_rank(),
+        attn_replica_size = self.ps.attn_tp_size * self.ps.attn_cp_size
+        target_dp_size = physical_ep_size_to_dp_size(target_size, attn_replica_size)
+        effective_dp_size = physical_ep_size_to_dp_size(
+            effective_size, attn_replica_size
         )
-        get_context().override("elastic_ep.scale", dp_size=target_size)
+        update_dp_attention_post_scale(
+            new_dp_size=target_dp_size,
+            new_dp_rank=physical_ep_rank_to_dp_rank(
+                self._elastic_global_rank(), attn_replica_size
+            ),
+        )
+        get_context().override("elastic_ep.scale", dp_size=target_dp_size)
 
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
@@ -1930,8 +1945,8 @@ class ModelRunner:
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
-                slot_offset=effective_size,
-                slot_count=target_size - effective_size,
+                slot_offset=effective_dp_size,
+                slot_count=target_dp_size - effective_dp_size,
             )
             logger.info(
                 "[Elastic EP] Scale completed: old_ep_size=%d "

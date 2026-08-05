@@ -566,7 +566,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
         output_parallel = self._embed_local_shard(input_)
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        # Replicated attention-TP peers have matching shapes, so all of them
+        # can skip the collective for an empty idle batch.
+        if (
+            output_parallel.numel() > 0
+            and self.tp_size > 1
+            and not get_attn_tp_context().input_scattered
+        ):
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
             else:

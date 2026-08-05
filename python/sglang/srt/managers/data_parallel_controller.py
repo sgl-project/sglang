@@ -26,6 +26,11 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.elastic_ep.topology import (
+    derive_attn_tp_size,
+    physical_ep_rank_to_dp_rank,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -168,9 +173,24 @@ class DataParallelController:
         )
 
         self.launch_dp_size: int = server_args.dp_size
-        self.max_dp_size: int = server_args.max_ep_size or server_args.dp_size
+        self.attn_tp_size = derive_attn_tp_size(
+            tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size if server_args.enable_dp_attention else 1,
+            attn_cp_size=server_args.attn_cp_size,
+        )
+        if (
+            server_args.elastic_ep_backend is not None
+            and server_args.max_ep_size is not None
+            and server_args.max_ep_size > server_args.tp_size
+        ):
+            self.max_dp_size = physical_ep_size_to_dp_size(
+                server_args.max_ep_size,
+                self.attn_tp_size * server_args.attn_cp_size,
+            )
+        else:
+            self.max_dp_size = server_args.dp_size
         assert self.max_dp_size >= self.launch_dp_size, (
-            f"--max-ep-size ({self.max_dp_size}) must be >= "
+            f"maximum DP size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
         )
 
@@ -537,12 +557,6 @@ class DataParallelController:
         finally:
             req_socket.close()
 
-    def _joiner_local_tp_span(self, server_args: ServerArgs) -> int:
-        return server_args.tp_size
-
-    def _joiner_slot_offset(self, server_args: ServerArgs) -> int:
-        return server_args.ep_join_rank_offset
-
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
     ):
@@ -561,9 +575,11 @@ class DataParallelController:
             all_ports = self._receive_ports_as_client(
                 primary_endpoint, server_args.node_rank
             )
-            offset = self._joiner_slot_offset(server_args)
-            local_tp_span = self._joiner_local_tp_span(server_args)
-            broadcasted_ports = all_ports[offset : offset + local_tp_span]
+            offset = physical_ep_rank_to_dp_rank(
+                server_args.ep_join_rank_offset,
+                self.attn_tp_size * server_args.attn_cp_size,
+            )
+            broadcasted_ports = all_ports[offset : offset + server_args.dp_size]
         elif server_args.node_rank == 0:
             # Elastic primaries reserve sockets for the maximum DP size.
             bind_count = (
@@ -694,9 +710,12 @@ class DataParallelController:
 
                 # Scheduler internals use local ranks; logs use global ranks.
                 offset = server_args.ep_join_rank_offset
+                dp_offset = physical_ep_rank_to_dp_rank(
+                    offset, self.attn_tp_size * server_args.attn_cp_size
+                )
                 display_tp_rank = tp_rank + offset
                 display_moe_ep_rank = moe_ep_rank + offset
-                display_dp_rank = dp_rank + offset if dp_rank is not None else None
+                display_dp_rank = dp_rank + dp_offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
