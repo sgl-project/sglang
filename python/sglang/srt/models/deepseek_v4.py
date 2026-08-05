@@ -141,7 +141,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -660,14 +666,11 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.utils import is_blackwell_supported
 
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
-        prefill_multi_stream_max_tokens = (
-            envs.SGLANG_OPT_DSV4_PREFILL_MULTI_STREAM_MAX_TOKENS.get()
-        )
-        if prefill_multi_stream_max_tokens is None:
-            prefill_multi_stream_max_tokens = (
-                get_server_args().cuda_graph_config.prefill.max_bs or 4096
-            )
-        self._prefill_multi_stream_max_tokens = prefill_multi_stream_max_tokens
+        prefill_max_bs = get_server_args().cuda_graph_config.prefill.max_bs
+        assert (
+            prefill_max_bs is not None
+        ), "prefill CUDA graph max_bs must be resolved before model initialization"
+        self._prefill_multi_stream_max_tokens = prefill_max_bs
 
         self.compressor = None
         self.indexer = None
