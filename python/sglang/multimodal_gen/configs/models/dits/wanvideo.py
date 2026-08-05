@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
@@ -116,6 +117,9 @@ class WanVideoArchConfig(DiTArchConfig):
         self.out_channels = self.out_channels or self.in_channels
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
+        self._supported_attention_backends = set(
+            self._supported_attention_backends
+        ) | {AttentionBackendEnum.SOL_ATTN}
 
 
 @dataclass

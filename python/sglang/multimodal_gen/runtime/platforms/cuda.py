@@ -236,6 +236,30 @@ class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
             ) from e
 
 
+class _SolAttnBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SOL_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from sol_attn import sol_attn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn import (  # noqa: F401
+                SolAttnBackend,
+            )
+
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn."
+                "SolAttnBackend"
+            )
+        except ImportError as e:
+            logger.error("Failed to import Sol-Attn backend: %s", str(e))
+            raise ImportError(
+                "Sol-Attn backend is not installed. Install it with "
+                "`pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends`."
+            ) from e
+
+
 class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VMOBA_ATTN
 
@@ -293,6 +317,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _VideoSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
+        _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,

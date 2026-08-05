@@ -43,6 +43,7 @@ class AttentionBackendEnum(enum.Enum):
     LASER_ATTN = enum.auto()
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
+    SOL_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -60,6 +61,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.SOL_ATTN,
         }
 
 
