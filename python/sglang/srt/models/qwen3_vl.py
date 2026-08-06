@@ -1318,13 +1318,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def _require_vision(self) -> None:
-        if self.language_model_only:
-            raise RuntimeError(
-                "Checkpoint is marked language_model_only=True and was loaded "
-                "without a vision encoder; multimodal inputs are not supported."
-            )
-
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -1350,12 +1343,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         if mm_inputs and mm_inputs.mm_items:
-            self._require_vision()
+            _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        self._require_vision()
+        _require_vision(self)
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
             device=self.visual.device,
@@ -1376,7 +1369,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        self._require_vision()
+        _require_vision(self)
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
             device=self.visual.device,
@@ -1582,6 +1575,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+def _require_vision(model) -> None:
+    if (
+        getattr(model, "language_model_only", False)
+        and getattr(model, "visual", None) is None
+    ):
+        raise RuntimeError(
+            "Checkpoint is marked language_model_only=True and was loaded "
+            "without a vision encoder; multimodal inputs are not supported."
+        )
 
 
 EntryClass = Qwen3VLForConditionalGeneration
