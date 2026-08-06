@@ -481,8 +481,8 @@ class KimiK3MoE(nn.Module):
 
         # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
         # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # so the fused-front split view can be consumed as is; other runners
-        # (e.g. marlin) require a dense buffer.
+        # which also takes the fp32 front, so the split view can be consumed as
+        # is; other runners (e.g. marlin) require a dense bf16 buffer.
         self._moe_front_needs_contiguous = (
             not get_moe_runner_backend().is_flashinfer_mxfp4()
         )
@@ -660,12 +660,13 @@ class KimiK3MoE(nn.Module):
     def _front_fp32(self) -> bool:
         """Emit the merged front in fp32 so the router reads exact logits.
 
-        Every consumer of that buffer must accept fp32; only the
-        flashinfer_mxfp4 chain does."""
+        The situ activation and the flashinfer_mxfp4 quantizer read the fp32
+        slices directly. Every other runner takes routed_input rounded back to
+        bf16 in _forward_fused, which is bit-identical to the bf16 front."""
         return (
-            self._eligible_for_fused_front
+            not _is_hip
+            and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
-            and get_moe_runner_backend().is_flashinfer_mxfp4()
         )
 
     def _forward_mega_experts(
@@ -1075,8 +1076,12 @@ class KimiK3MoE(nn.Module):
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
+        if self._moe_front_needs_contiguous:
+            if self._front_fp32:
+                # the cast also densifies the strided slice
+                routed_input = routed_input.to(hidden_states.dtype)
+            elif num_tokens > 1:
+                routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
