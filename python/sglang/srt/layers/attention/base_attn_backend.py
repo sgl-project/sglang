@@ -9,7 +9,9 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+        BaseIndexerMetadata,
+    )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -105,6 +107,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    # Whether prefill metadata initialization finishes all scheduler-shared reads.
+    prefill_shared_reads_end_at_metadata_init: bool = False
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not

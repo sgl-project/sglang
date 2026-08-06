@@ -54,6 +54,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    UnifiedSessionRefTracker,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
@@ -69,6 +72,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -78,6 +82,14 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
+
+# Metric label per component, matching the host pool names used by
+# hicache_backup_tokens_total and the host occupancy gauges.
+_COMPONENT_POOL_LABEL = {
+    ComponentType.FULL: PoolName.KV.value,
+    ComponentType.SWA: PoolName.SWA.value,
+    ComponentType.MAMBA: PoolName.MAMBA.value,
+}
 
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
@@ -135,6 +147,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self.enable_session_radix_cache = params.enable_session_radix_cache
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -170,6 +183,13 @@ class UnifiedRadixCache(BasePrefixCache):
         for component in self.components.values():
             component.tree_core = self.tree_core
 
+        # Session ref tracking (--enable-session-radix-cache).
+        self.session_refs = UnifiedSessionRefTracker(
+            components=self._components_tuple,
+            tree_core=self.tree_core,
+            enable_session_radix_cache=self.enable_session_radix_cache,
+        )
+
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
         # Streaming session: embedded StreamingSession with self as inner.
@@ -202,7 +222,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
-        logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+        logger.info(
+            f"Init Unified Radix Cache. Components: {self.tree_components}. "
+            f"Tree Core: {type(self.tree_core).__name__}"
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -276,6 +299,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
+        self.session_refs.reset()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -298,17 +322,6 @@ class UnifiedRadixCache(BasePrefixCache):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
-
-        # Direct IO layout fixup (must happen before pool creation)
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
 
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
@@ -356,6 +369,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        # Pre-seed the dropped-tokens series at 0 per pool
+        if self.metrics_collector is not None and self.cache_controller is not None:
+            for ct in self.tree_components:
+                self.metrics_collector.increment_dropped_tokens(
+                    num_tokens=0,
+                    reason="host_pressure",
+                    pool=_COMPONENT_POOL_LABEL[ct],
+                )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
@@ -432,7 +453,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.writing_check(write_back=True)
 
-        self.update_eviction_metrics(sum(tracker.values()), start_time)
+        # Report full-layer tokens only
+        self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -515,10 +537,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        freed_before_drop = dict(tracker)
                         if written > 0:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
+                            self._record_dropped_tokens(tracker, freed_before_drop)
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
                                 "due to host memory pressure, root node %d",
@@ -534,6 +558,23 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _record_dropped_tokens(
+        self,
+        tracker: dict[ComponentType, int],
+        freed_before_drop: dict[ComponentType, int],
+    ) -> None:
+        """Record per-pool tokens dropped without backup under host pressure."""
+        if self.metrics_collector is None:
+            return
+        for ct, freed in tracker.items():
+            dropped = freed - freed_before_drop[ct]
+            if dropped > 0:
+                self.metrics_collector.increment_dropped_tokens(
+                    num_tokens=dropped,
+                    reason="host_pressure",
+                    pool=_COMPONENT_POOL_LABEL[ct],
+                )
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -668,11 +709,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
+        if is_insert and result is not None and result.last_device_node is not None:
+            req.last_node = result.last_device_node
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        if self.enable_session_radix_cache and result is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            if req.finished_reason is not None and not isinstance(
+                req.finished_reason, FINISH_ABORT
+            ):
+                self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1817,6 +1869,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
+                    self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1839,7 +1892,23 @@ class UnifiedRadixCache(BasePrefixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
+            self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
+        if self.metrics_collector is None:
+            return
+        for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_backup_num_tokens(
+                    num_tokens=num_tokens, pool=pool
+                )
+        if ack.num_bytes > 0:
+            self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
+        if ack.timing_enabled:
+            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
@@ -1867,7 +1936,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -1998,6 +2073,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
 
+    # ---- Session radix cache API (delegates to composed UnifiedSessionRefTracker) ----
+
+    def open_radix_session(self, session_id: str) -> Optional[int]:
+        return self.session_refs.open_radix_session(session_id)
+
+    def ensure_session_generation(self, session_id: str) -> int:
+        return self.session_refs.ensure_session_generation(session_id)
+
+    def release_radix_session(self, session_id: str) -> int:
+        return self.session_refs.release_radix_session(session_id)
+
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:
@@ -2055,6 +2141,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.all_mamba_values_flatten()
 
     def available_and_evictable_str(self) -> str:
+        # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         else:
@@ -2167,4 +2254,4 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
-        return self.tree_core.root_node.id
+        return self.tree_core.root_node_handle(extra_key)
