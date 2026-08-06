@@ -36,9 +36,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_ctx,
+    get_ulysses_ctx,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -116,51 +121,6 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "refiner_packed_seq_params",
     }
 )
-
-
-def _ulysses_ctx() -> tuple[int, int]:
-    """(world_size, rank) of the Ulysses sequence-parallel group.
-
-    Returns (1, 0) when model parallelism is not initialized (unit tests /
-    single-process debug paths init tp=1 sp=1 which also yields ws=1).
-    """
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ulysses_parallel_rank,
-        get_ulysses_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
-
-
-def _ring_world_size() -> int:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ring_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1
-    return get_ring_parallel_world_size()
-
-
-def _ring_ctx() -> tuple[int, int]:
-    """(world_size, rank) of the Ring sequence-parallel group.
-
-    Returns (1, 0) when model parallelism is not initialized, mirroring
-    `_ulysses_ctx`.
-    """
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        get_ring_parallel_rank,
-        get_ring_parallel_world_size,
-        model_parallel_is_initialized,
-    )
-
-    if not model_parallel_is_initialized():
-        return 1, 0
-    return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
 def _reorder_grouped_qkv_to_qkv(
@@ -474,145 +434,6 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
-def _ring_merge_attention(
-    out_acc: torch.Tensor | None,
-    lse_acc: torch.Tensor | None,
-    step_out: torch.Tensor,
-    step_lse: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Online-softmax combine of one more ring step's partial attention.
-
-    `step_out` is `[T, H, D]`; `step_lse` is FlashAttention's varlen LSE
-    layout `[H, T]`. Both are already self-normalized over their own KV
-    chunk, so combining chunks is the standard two-term logsumexp merge
-    (exact up to float rounding); done in fp32 for stability, matching how
-    every other accumulation-order-sensitive path in this model is handled.
-    """
-    step_lse = step_lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
-    step_out = step_out.to(torch.float32)
-    if out_acc is None:
-        return step_out, step_lse
-    new_lse = torch.logaddexp(lse_acc, step_lse)
-    out_acc = out_acc * torch.exp(lse_acc - new_lse) + step_out * torch.exp(
-        step_lse - new_lse
-    )
-    return out_acc, new_lse
-
-
-def _ring_attention_varlen(
-    attention: MiniMaxH3Attention,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    real_seq_len: int,
-    ring_ws: int,
-) -> torch.Tensor:
-    """Ring-rotated varlen attention over one rank's local packed chunk.
-
-    `q, k, v` are this rank's full local ring chunk (`ring_chunk_len` rows,
-    real rows followed by however many of this chunk's rows are padding).
-    KV is P2P-rotated around the ring one hop per step (send this step's
-    buffer to the next rank, receive the following step's buffer from the
-    previous rank) so the hop for step+1 overlaps this step's attention
-    compute -- unlike a single blocking all_gather, no step waits on the
-    full ring's transfer before its own compute can start. Each hop's
-    *real* prefix is attended locally and merged via online softmax.
-    Padding rows never contribute to any KV chunk (their output is unused
-    downstream, but must not be corrupted by attending across the padding
-    boundary), and a chunk that is entirely padding is skipped outright.
-    """
-    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
-    from sglang.multimodal_gen.runtime.layers.attention.backends import (
-        flash_attn as _fa_backend,
-    )
-
-    ring_pg = get_sp_group().ring_group
-    assert ring_pg is not None, "Ring process group is not initialized."
-    ring_chunk_len = q.shape[0]
-    _, ring_rank = _ring_ctx()
-
-    # `isend`/`irecv` (unlike collectives) address peers by global rank even
-    # under a sub-group, so resolve this ring's neighbors once up front.
-    next_global_rank = torch.distributed.get_global_rank(
-        ring_pg, (ring_rank + 1) % ring_ws
-    )
-    prev_global_rank = torch.distributed.get_global_rank(
-        ring_pg, (ring_rank - 1) % ring_ws
-    )
-
-    # K and V travel as one stacked buffer so each hop is a single P2P
-    # send/recv pair instead of two; stacking also makes the buffer
-    # contiguous, so no separate .contiguous() call is needed.
-    kv0 = torch.stack((k, v))
-    kv_bufs = [kv0, torch.empty_like(kv0)]
-    cur = 0
-
-    q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
-    out_acc: torch.Tensor | None = None
-    lse_acc: torch.Tensor | None = None
-    pending_ops = None
-    for step in range(ring_ws):
-        nxt = 1 - cur
-        if step < ring_ws - 1:
-            # kick off next hop before this step's compute so the transfer
-            # overlaps it; wait for completion only after issuing compute.
-            pending_ops = torch.distributed.batch_isend_irecv(
-                [
-                    torch.distributed.P2POp(
-                        torch.distributed.isend,
-                        kv_bufs[cur],
-                        next_global_rank,
-                        group=ring_pg,
-                    ),
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv,
-                        kv_bufs[nxt],
-                        prev_global_rank,
-                        group=ring_pg,
-                    ),
-                ]
-            )
-
-        src_rank = (ring_rank - step) % ring_ws
-        remote_used = min(
-            max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
-        )
-        if remote_used > 0:
-            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
-            result = flash_attn_varlen_func(
-                q,
-                kv_bufs[cur][0, :remote_used],
-                kv_bufs[cur][1, :remote_used],
-                cu_seqlens_q=q_cu,
-                cu_seqlens_k=k_cu,
-                max_seqlen_q=ring_chunk_len,
-                max_seqlen_k=remote_used,
-                softmax_scale=attention.softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
-                return_softmax_lse=True,
-            )
-            if not isinstance(result, tuple):
-                raise RuntimeError(
-                    "flash_attn_varlen_func did not return softmax_lse; ring "
-                    "parallelism requires a backend that supports "
-                    "return_softmax_lse=True."
-                )
-            step_out, step_lse, *_ = result
-            out_acc, lse_acc = _ring_merge_attention(
-                out_acc, lse_acc, step_out, step_lse
-            )
-
-        if pending_ops is not None:
-            for op in pending_ops:
-                op.wait()
-            pending_ops = None
-            cur = nxt
-    return out_acc.to(q.dtype)
-
-
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -650,7 +471,7 @@ def _minimax_h3_attention_core_impl(
         )
 
     if ring_active:
-        ring_ws, _ = _ring_ctx()
+        ring_ws, _ = get_ring_ctx()
         if attention._attention_backend_enum is not AttentionBackendEnum.FA:
             raise NotImplementedError(
                 "MiniMax H3 ring parallelism requires the FlashAttention "
@@ -659,7 +480,12 @@ def _minimax_h3_attention_core_impl(
         # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
         # non-padding row count ring needs, already a host int here.
         out = _ring_attention_varlen(
-            attention, q, k, v, real_seq_len=max_seqlen, ring_ws=ring_ws
+            q,
+            k,
+            v,
+            softmax_scale=attention.softmax_scale,
+            real_seq_len=max_seqlen,
+            ring_ws=ring_ws,
         )
     else:
         out = attention._attention_impl.forward_varlen(
@@ -1287,13 +1113,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
         tp_size = get_tp_world_size()
-        ulysses_size, _ = _ulysses_ctx()
+        ulysses_size, _ = get_ulysses_ctx()
         self._validate_tp_config(arch=arch, tp_size=tp_size)
         self._validate_sequence_parallel_config(
             arch=arch,
             tp_size=tp_size,
             ulysses_size=ulysses_size,
-            ring_size=_ring_world_size(),
+            ring_size=get_ring_ctx()[0],
         )
 
         self.video_patch_proj = ColumnParallelLinear(
@@ -1461,8 +1287,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 f"{list(img_position_ids.shape)}"
             )
         seq_len = int(img_position_ids.shape[1])
-        ulysses_ws, ulysses_rank = _ulysses_ctx()
-        ring_ws, ring_rank = _ring_ctx()
+        ulysses_ws, ulysses_rank = get_ulysses_ctx()
+        ring_ws, ring_rank = get_ring_ctx()
         sp_ws = ulysses_ws * ring_ws
         if seq_len % sp_ws:
             raise ValueError(
@@ -1731,8 +1557,8 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # attention -- ring instead ring-rotates each rank's local KV chunk
         # and online-softmax merges partial outputs (see
         # _minimax_h3_attention_core_impl), so it has no head constraint.
-        ulysses_ws, ulysses_rank = _ulysses_ctx()
-        ring_ws, ring_rank = _ring_ctx()
+        ulysses_ws, ulysses_rank = get_ulysses_ctx()
+        ring_ws, ring_rank = get_ring_ctx()
         sp_ws = ulysses_ws * ring_ws
         local_seq_len = seq_len
         if sp_ws > 1:
