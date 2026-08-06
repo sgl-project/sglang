@@ -1047,7 +1047,28 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        # PP + MTP fix: on non-last PP ranks, spec-only aux slots
+        # (topk_p / topk_index / hidden_states) contain local zeros because
+        # MetadataBuffers.set_buf only fills them when
+        # ``req.hidden_states_tensor is not None`` -- true only on the last
+        # PP rank. RDMA-ing those zeros races with the last rank's valid
+        # write on the same decode aux row and can leave decode reading
+        # zeros -> constant garbage draft input -> deterministic garbled
+        # output. Skip them here so only the last PP rank writes.
+        skip_spec_aux = (
+            self.pp_size is not None
+            and self.pp_size > 1
+            and self.pp_rank != self.pp_size - 1
+        )
+        spec_aux_set = (
+            set(getattr(self.kv_args, "spec_aux_indices", ()) or ())
+            if skip_spec_aux
+            else frozenset()
+        )
+
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+            if i in spec_aux_set:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
@@ -1064,7 +1085,22 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        # See send_aux for the rationale of skipping spec-only aux slots on
+        # non-last PP ranks under PP + MTP.
+        skip_spec_aux = (
+            self.pp_size is not None
+            and self.pp_size > 1
+            and self.pp_rank != self.pp_size - 1
+        )
+        spec_aux_set = (
+            set(getattr(self.kv_args, "spec_aux_indices", ()) or ())
+            if skip_spec_aux
+            else frozenset()
+        )
+
         for i in range(len(prefill_aux_ptrs)):
+            if i in spec_aux_set:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)

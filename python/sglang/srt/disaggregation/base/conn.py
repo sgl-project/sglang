@@ -45,6 +45,13 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
+    # Absolute indices within aux_data_ptrs of slots holding spec-decoding-
+    # only fields (topk_p, topk_index, hidden_states). Populated on the
+    # engine side by MetadataBuffers.get_spec_only_aux_indices(). Consulted
+    # by transfer backends (see mooncake send_aux) to skip these slots on
+    # non-last PP ranks; empty list disables the skip (safe default for
+    # backends that do not populate it).
+    spec_aux_indices: List[int]
     state_types: List[StateType]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
