@@ -800,7 +800,11 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
             ):
-                if not q_replicate_active:
+                # Triton gathers Q and reduces DCP output inside its backend.
+                if (
+                    not q_replicate_active
+                    and self.current_attention_backend != "triton"
+                ):
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
@@ -1032,7 +1036,10 @@ class DeepseekMLAForwardMixin:
         if (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
-        ) and get_parallel().dcp_enabled:
+        ) and (
+            get_parallel().dcp_enabled
+            and self.current_attention_backend != "triton"
+        ):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
